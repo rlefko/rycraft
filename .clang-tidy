@@ -8,17 +8,14 @@ Checks: >-
   modernize-*,
   readability-*,
   -bugprone-easily-copyable-unique-ptr,
-  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
   -cppcoreguidelines-avoid-magic-numbers,
   -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
   -cppcoreguidelines-non-private-member-variables-in-classes,
   -cppcoreguidelines-init-variables,
   -cppcoreguidelines-missing-std-forward,
-  -cppcoreguidelines-c-copy-assignment-signature,
   -cppcoreguidelines-pro-type-member-init,
   -cppcoreguidelines-avoid-c-arrays,
   -cppcoreguidelines-special-member-functions,
-  -cppcoreguidelines-use-default-member-init,
   -cppcoreguidelines-explicit-virtual-functions,
   -cppcoreguidelines-virtual-class-destructor,
   -cppcoreguidelines-owning-memory,
@@ -38,7 +35,6 @@ Checks: >-
   -modernize-use-override,
   -modernize-avoid-c-arrays,
   -modernize-use-auto,
-  -modernize-use-default-member-init,
   -readability-avoid-unconditional-preprocessor-if,
   -readability-convert-member-functions-to-static,
   -readability-identifier-naming,
@@ -51,7 +47,6 @@ Checks: >-
   -*misc-const-correctness,
   -*misc-confusable-identifiers,
   -*misc-no-recursion,
-WarningsAsErrors: '-*'
 FormatLanguage: cpp
 HeaderFilterRegex: '.*\.(hpp|h|hxx|hh)$'
 AnalyzeTemporaryDtors: false
