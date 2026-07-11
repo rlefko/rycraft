@@ -72,6 +72,7 @@ struct Chunk {
 
     // Meshing state
     bool needsMeshUpdate = false;
+    bool meshed = false;
     bool generated = false;
 
     Chunk(int cx, int cz);
@@ -93,6 +94,9 @@ struct Chunk {
 
     // Mark for mesh rebuild
     void markDirty();
+
+    // Mark chunk as meshed (clear dirty flag)
+    void setMeshed(bool value);
 
     // Get AABB of this chunk in world space
     AABB getAABB() const;

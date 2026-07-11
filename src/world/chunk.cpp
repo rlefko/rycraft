@@ -65,6 +65,11 @@ void Chunk::markDirty() {
     needsMeshUpdate = true;
 }
 
+void Chunk::setMeshed(bool value) {
+    meshed = value;
+    needsMeshUpdate = false;
+}
+
 AABB Chunk::getAABB() const {
     Vec3 min{static_cast<float>(chunkX * CHUNK_WIDTH),
              0.f,

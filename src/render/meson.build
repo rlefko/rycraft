@@ -1,4 +1,4 @@
-render_sources = files('render.cpp')
+render_sources = files('render.cpp', 'mesher.cpp')
 
 librender = static_library('render',
   render_sources,

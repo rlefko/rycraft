@@ -10,6 +10,8 @@
 #include <world/world.hpp>
 #include <world/serialization.hpp>
 #include <world/save_manager.hpp>
+#include <render/vertex.hpp>
+#include <render/mesher.hpp>
 
 #include <cmath>
 #include <thread>
@@ -1041,4 +1043,159 @@ TEST_CASE("SaveManager LZ4 compression produces smaller data", "[save]") {
     REQUIRE(loaded.has_value());
   }
   std::system(("rm -rf " + tempDir).c_str());
+}
+
+// ============================================================================
+// Vertex Format Tests
+// ============================================================================
+TEST_CASE("Vertex size is 16 bytes", "[render][vertex]") {
+    REQUIRE(sizeof(Vertex) == 16);
+}
+
+TEST_CASE("Vertex alignment is 16 bytes", "[render][vertex]") {
+    REQUIRE(alignof(Vertex) == 16);
+}
+
+TEST_CASE("Vertex fields have expected sizes", "[render][vertex]") {
+    REQUIRE(sizeof(float16_t) == 2);
+    REQUIRE(sizeof(uint8_t) == 1);
+    REQUIRE(sizeof(uint32_t) == 4);
+}
+
+// ============================================================================
+// Greedy Mesher Tests
+// ============================================================================
+TEST_CASE("GreedyMesher empty chunk produces no geometry", "[render][mesher]") {
+    Chunk chunk(0, 0);
+    // All AIR — no solid blocks
+
+    GreedyMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk);
+
+    REQUIRE(output.vertices.empty());
+    REQUIRE(output.indices.empty());
+}
+
+TEST_CASE("GreedyMesher single block produces 6 faces", "[render][mesher]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::STONE);
+
+    GreedyMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk);
+
+    // 6 faces × 4 vertices = 24 vertices
+    REQUIRE(output.vertices.size() == 24);
+    // 6 faces × 2 triangles × 3 indices = 36 indices
+    REQUIRE(output.indices.size() == 36);
+}
+
+TEST_CASE("GreedyMesher 2x2 flat merges top face", "[render][mesher]") {
+    Chunk chunk(0, 0);
+    // 2x2 square of STONE at y=64
+    chunk.setBlock(0, 64, 0, BlockType::STONE);
+    chunk.setBlock(1, 64, 0, BlockType::STONE);
+    chunk.setBlock(0, 64, 1, BlockType::STONE);
+    chunk.setBlock(1, 64, 1, BlockType::STONE);
+
+    GreedyMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk);
+
+    // Without greedy merge: 4 top faces = 16 vertices
+    // With greedy merge: 1 top face = 4 vertices
+    // Total expected:
+    //   Top (+Y): 1 merged quad = 4 vertices, 6 indices
+    //   Bottom (-Y): 1 merged quad = 4 vertices, 6 indices
+    //   +X face (right side of x=1 column): 2 quads (z=0 and z=1) = 8 vertices, 12 indices
+    //   -X face (left side of x=0 column): 2 quads = 8 vertices, 12 indices
+    //   +Z face (front of z=1 row): 2 quads = 8 vertices, 12 indices
+    //   -Z face (back of z=0 row): 2 quads = 8 vertices, 12 indices
+    // Total: 40 vertices, 60 indices
+    //
+    // But +X and -X faces can also merge vertically since all 4 blocks are at same Y
+    // +X: blocks at (1,64,0) and (1,64,1) — both have +X exposed, same type
+    //   They're adjacent in Z direction, so they merge into 1 quad: 4 vertices, 6 indices
+    // Same for -X, +Z, -Z
+    //
+    // Total: 6 faces × 4 vertices = 24 vertices, 6 × 6 = 36 indices
+
+    REQUIRE(output.vertices.size() == 24);
+    REQUIRE(output.indices.size() == 36);
+
+    // Verify the top face is a single quad (first 4 vertices)
+    // All 4 top-face vertices should have normalIdx == FaceNormal::PlusY (4)
+    bool foundTopQuad = false;
+    for (size_t i = 0; i + 3 < output.vertices.size(); ++i) {
+        if (output.vertices[i].normalIdx == static_cast<uint8_t>(FaceNormal::PlusY) &&
+            output.vertices[i + 1].normalIdx == static_cast<uint8_t>(FaceNormal::PlusY) &&
+            output.vertices[i + 2].normalIdx == static_cast<uint8_t>(FaceNormal::PlusY) &&
+            output.vertices[i + 3].normalIdx == static_cast<uint8_t>(FaceNormal::PlusY)) {
+            foundTopQuad = true;
+            break;
+        }
+    }
+    REQUIRE(foundTopQuad);
+}
+
+TEST_CASE("GreedyMesher vertical column merges side faces", "[render][mesher]") {
+    Chunk chunk(0, 0);
+    // 4-block tall column of STONE at (8, 64..67, 8)
+    chunk.setBlock(8, 64, 8, BlockType::STONE);
+    chunk.setBlock(8, 65, 8, BlockType::STONE);
+    chunk.setBlock(8, 66, 8, BlockType::STONE);
+    chunk.setBlock(8, 67, 8, BlockType::STONE);
+
+    GreedyMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk);
+
+    // Top (+Y): 1 quad at y=67 top = 4 vertices, 6 indices
+    // Bottom (-Y): 1 quad at y=64 bottom = 4 vertices, 6 indices
+    // +X, -X, +Z, -Z: each has 1 merged quad spanning y=64..67 = 4 vertices each, 6 indices each
+    // Total: 6 faces × 4 vertices = 24 vertices
+    // Total: 6 faces × 6 indices = 36 indices
+
+    REQUIRE(output.vertices.size() == 24);
+    REQUIRE(output.indices.size() == 36);
+
+    // Verify side faces span the full column height
+    // Each side quad should have vertices at y=64 and y=68 (height=4)
+    bool foundSideQuad = false;
+    for (size_t i = 0; i + 3 < output.vertices.size(); ++i) {
+        uint8_t ni = output.vertices[i].normalIdx;
+        // Check side faces (normalIdx 0-3)
+        if (ni <= 3 &&
+            output.vertices[i + 1].normalIdx == ni &&
+            output.vertices[i + 2].normalIdx == ni &&
+            output.vertices[i + 3].normalIdx == ni) {
+            // Check that the quad spans 4 units in Y
+            float minY = std::min({
+                static_cast<float>(output.vertices[i].py),
+                static_cast<float>(output.vertices[i + 1].py),
+                static_cast<float>(output.vertices[i + 2].py),
+                static_cast<float>(output.vertices[i + 3].py)
+            });
+            float maxY = std::max({
+                static_cast<float>(output.vertices[i].py),
+                static_cast<float>(output.vertices[i + 1].py),
+                static_cast<float>(output.vertices[i + 2].py),
+                static_cast<float>(output.vertices[i + 3].py)
+            });
+            if (maxY - minY >= 3.5f) { // height=4, account for float16 precision
+                foundSideQuad = true;
+                break;
+            }
+        }
+    }
+    REQUIRE(foundSideQuad);
+}
+
+TEST_CASE("GreedyMesher marks chunk as meshed", "[render][mesher]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::STONE);
+    REQUIRE(chunk.needsMeshUpdate == true);
+
+    GreedyMesher mesher;
+    mesher.buildMesh(chunk);
+
+    REQUIRE(chunk.needsMeshUpdate == false);
+    REQUIRE(chunk.meshed == true);
 }
