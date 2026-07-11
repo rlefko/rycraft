@@ -10,11 +10,13 @@
 
 #include "common/math.hpp"
 #include "render/mega_buffer.hpp"
+#include "render/texture_atlas.hpp"
 #include "render/vertex.hpp"
 
 // Forward declarations
 class World;
 class Camera;
+class UIOverlay;
 
 // GPU-side per-chunk mesh allocation tracking.
 struct ChunkMeshState {
@@ -38,6 +40,8 @@ public:
                    id<MTLLibrary> shaderLibrary,
                    uint32_t width,
                    uint32_t height);
+
+    ~RenderPipeline();
 
     // Render a single frame.
     // Handles empty world gracefully (sky-only output).
@@ -65,6 +69,15 @@ private:
 
     // Uniform buffer (256 bytes — fits Uniforms struct with padding).
     id<MTLBuffer> _uniformsBuffer;
+
+    // MegaBuffer for centralized GPU memory management.
+    MegaBuffer* _megaBuffer;
+
+    // Texture atlas for procedural block textures.
+    TextureAtlas* _textureAtlas;
+
+    // UI overlay for HUD rendering (crosshair, hotbar).
+    UIOverlay* _uiOverlay;
 
     uint32_t _width;
     uint32_t _height;

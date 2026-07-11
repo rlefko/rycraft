@@ -2,6 +2,7 @@
 
 #include "common/error.hpp"
 #include "render/mesher.hpp"
+#include "render/ui_overlay.hpp"
 #include "render/uniforms.hpp"
 #include "world/chunk.hpp"
 #include "world/world.hpp"
@@ -19,6 +20,9 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
                                uint32_t width,
                                uint32_t height)
     : _device(device)
+    , _megaBuffer(nullptr)
+    , _textureAtlas(nullptr)
+    , _uiOverlay(nullptr)
     , _width(width)
     , _height(height)
     , _frustumPlanes{}
@@ -136,10 +140,19 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     // ---- Uniforms buffer (256 bytes) ----
     _uniformsBuffer = [_device newBufferWithLength:256
-                                            options:MTLResourceStorageModeShared];
+                                             options:MTLResourceStorageModeShared];
     if (!_uniformsBuffer) {
         RY_LOG_FATAL("Failed to allocate uniforms buffer");
     }
+
+    // ---- MegaBuffer (centralized GPU memory for chunk meshes) ----
+    _megaBuffer = new MegaBuffer(_device);
+
+    // ---- TextureAtlas (procedural block textures) ----
+    _textureAtlas = new TextureAtlas(_device);
+
+    // ---- UIOverlay (screen-space HUD rendering) ----
+    _uiOverlay = new UIOverlay(_device, shaderLibrary, _width, _height);
 }
 
 // ---------------------------------------------------------------------------
@@ -245,25 +258,35 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
         if (chunk->needsMeshUpdate) {
             auto it = _chunkMeshes.find(key);
             if (it != _chunkMeshes.end() && it->second.uploaded) {
-                // TODO: free old allocation via MegaBuffer
+                // Free old GPU allocation before remeshing
+                _megaBuffer->free(it->second.alloc);
             }
 
             GreedyMesher mesher;
             MeshOutput mesh = mesher.buildMesh(*chunk);
 
             if (!mesh.vertices.empty()) {
-                ChunkMeshState state;
-                state.alloc.vertexBuffer = nullptr;
-                state.alloc.indexBuffer = nullptr;
-                state.alloc.vertexOffset = 0;
-                state.alloc.indexOffset = 0;
-                state.alloc.vertexCount = static_cast<uint32_t>(mesh.vertices.size());
-                state.alloc.indexCount = static_cast<uint32_t>(mesh.indices.size());
-                state.uploaded = true;
+                uint32_t vertCount = static_cast<uint32_t>(mesh.vertices.size());
+                uint32_t idxCount = static_cast<uint32_t>(mesh.indices.size());
 
-                // TODO: allocate via MegaBuffer and upload vertices/indices
-                // For now, store metadata; actual GPU upload will be wired
-                // when MegaBuffer is integrated into the render pipeline.
+                // Allocate GPU memory via MegaBuffer
+                auto alloc = _megaBuffer->allocate(vertCount, idxCount);
+
+                // Upload vertex and index data to GPU
+                _megaBuffer->uploadVertices(
+                    mesh.vertices.data(),
+                    vertCount * sizeof(Vertex),
+                    alloc.vertexOffset
+                );
+                _megaBuffer->uploadIndices(
+                    mesh.indices.data(),
+                    idxCount * sizeof(uint32_t),
+                    alloc.indexOffset
+                );
+
+                ChunkMeshState state;
+                state.alloc = alloc;
+                state.uploaded = true;
 
                 _chunkMeshes[key] = state;
             }
@@ -278,26 +301,73 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
 
         const auto& meshState = it->second;
 
-        // TODO: bind vertex/index buffers from MegaBuffer allocation
-        // and call drawPrimitives:triangle vertexCount:...
-        // Placeholder draw call (will be filled when MegaBuffer is wired):
-        if (meshState.alloc.vertexCount > 0 && meshState.alloc.vertexBuffer) {
-            [encoder setVertexBuffer:meshState.alloc.vertexBuffer
-                               offset:meshState.alloc.vertexOffset
-                             atIndex:0];
-            [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
+        // Skip if no geometry
+        if (meshState.alloc.indexCount == 0) continue;
 
-            [encoder drawPrimitives:MTLPrimitiveTypeTriangle
-                         vertexStart:0
-                       vertexCount:meshState.alloc.vertexCount];
-        }
+        // Bind vertex buffer from MegaBuffer allocation
+        [encoder setVertexBuffer:meshState.alloc.vertexBuffer
+                           offset:meshState.alloc.vertexOffset
+                         atIndex:0];
+        // Bind uniforms buffer
+        [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
+        // Bind fragment resources
+        [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
+        [encoder setFragmentTexture:_textureAtlas->texture() atIndex:0];
+        [encoder setFragmentSamplerState:_textureAtlas->sampler() atIndex:0];
+
+        // Draw indexed primitives (triangles)
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                             indexCount:meshState.alloc.indexCount
+                              indexType:MTLIndexTypeUInt32
+                            indexBuffer:meshState.alloc.indexBuffer
+                        indexBufferOffset:meshState.alloc.indexOffset];
     }
 
     [encoder endEncoding];
 
+    // ---- UI Overlay Pass (screen-space HUD) ----
+    auto uiPassDesc = [[MTLRenderPassDescriptor alloc] init];
+    uiPassDesc.colorAttachments[0].texture = drawable.texture;
+    uiPassDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    uiPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    id<MTLRenderCommandEncoder> uiEncoder = [commandBuffer renderCommandEncoderWithDescriptor:uiPassDesc];
+    if (uiEncoder) {
+        // Draw crosshair at screen center (white, thin lines)
+        float centerX = 0.5f;
+        float centerY = 0.5f;
+        float crossH = 1.0f / static_cast<float>(_height);  // 1 pixel height
+        float crossW = 20.0f / static_cast<float>(_width);  // 20 pixel width
+        float crossV = 20.0f / static_cast<float>(_height); // 20 pixel height
+        float crossLineW = 1.0f / static_cast<float>(_width); // 1 pixel width
+
+        // Horizontal line
+        _uiOverlay->drawQuad(uiEncoder,
+                             centerX - crossW * 0.5f, centerY - crossH * 0.5f,
+                             crossW, crossH,
+                             1.0f, 1.0f, 1.0f, 0.8f);
+
+        // Vertical line
+        _uiOverlay->drawQuad(uiEncoder,
+                             centerX - crossLineW * 0.5f, centerY - crossV * 0.5f,
+                             crossLineW, crossV,
+                             1.0f, 1.0f, 1.0f, 0.8f);
+
+        [uiEncoder endEncoding];
+    }
+
     // Present and commit
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
+}
+
+// ---------------------------------------------------------------------------
+// Destructor
+// ---------------------------------------------------------------------------
+RenderPipeline::~RenderPipeline() {
+    delete _megaBuffer;
+    delete _textureAtlas;
+    delete _uiOverlay;
 }
 
 // ---------------------------------------------------------------------------
@@ -350,13 +420,16 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
     }
 
     auto depthResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                width:_width
-                                                                               height:_height
-                                                                           mipmapped:false];
+                                                                                 width:_width
+                                                                                height:_height
+                                                                            mipmapped:false];
     _depthResolve = [_device newTextureWithDescriptor:depthResolveDesc];
     if (!_depthResolve) {
         RY_LOG_FATAL("Failed to reallocate depth resolve texture after resize");
     }
+
+    // Resize UI overlay for new viewport
+    _uiOverlay->resize(_width, _height);
 }
 
 // ---------------------------------------------------------------------------

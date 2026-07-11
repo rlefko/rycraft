@@ -1,7 +1,7 @@
 # Metal shader compilation pipeline
 
-# Compile .metal source files to .air intermediate representation
-metal_air = custom_target(
+# Compile pipeline.metal to .air intermediate representation
+pipeline_air = custom_target(
   'pipeline.air',
   input : 'pipeline.metal',
   output : 'pipeline.air',
@@ -15,14 +15,29 @@ metal_air = custom_target(
   ],
 )
 
-# Compile .air to .metallib for runtime loading
+# Compile ui_overlay.metal to .air intermediate representation
+ui_overlay_air = custom_target(
+  'ui_overlay.air',
+  input : 'ui_overlay.metal',
+  output : 'ui_overlay.air',
+  command : [
+    'xcrun', 'metal',
+    '-c',
+    '-mmacos-version-min=13.0',
+    '-std=metal3.0',
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+)
+
+# Combine all .air files into a single .metallib for runtime loading
 metallib = custom_target(
   'pipeline.metallib',
-  input : metal_air,
+  input : [pipeline_air, ui_overlay_air],
   output : 'pipeline.metallib',
   command : [
     'xcrun', 'metallib',
-    '@INPUT@',
+    '@INPUT0@', '@INPUT1@',
     '-o', '@OUTPUT@',
   ],
   build_by_default : true,

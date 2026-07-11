@@ -10,15 +10,15 @@ std::vector<uint8_t> ChunkSerializer::serialize(const Chunk& chunk) {
     size_t offset = 0;
 
     // Write header
-    ChunkHeader header;
+    ChunkSaveHeader header;
     header.magic = CHUNK_MAGIC;
     header.version = CHUNK_VERSION;
     header.chunkX = static_cast<int32_t>(chunk.chunkX);
     header.chunkZ = static_cast<int32_t>(chunk.chunkZ);
     header.blockCount = static_cast<uint32_t>(chunk.blocks.size());
 
-    std::memcpy(buffer.data() + offset, &header, sizeof(ChunkHeader));
-    offset += sizeof(ChunkHeader);
+    std::memcpy(buffer.data() + offset, &header, sizeof(ChunkSaveHeader));
+    offset += sizeof(ChunkSaveHeader);
 
     // Write blocks
     std::memcpy(buffer.data() + offset, chunk.blocks.data(), chunk.blocks.size());
@@ -44,8 +44,8 @@ std::optional<Chunk> ChunkSerializer::deserialize(const std::span<const uint8_t>
     }
 
     // Parse header
-    ChunkHeader header;
-    std::memcpy(&header, data.data(), sizeof(ChunkHeader));
+    ChunkSaveHeader header;
+    std::memcpy(&header, data.data(), sizeof(ChunkSaveHeader));
 
     // Validate magic number
     if (header.magic != CHUNK_MAGIC) {

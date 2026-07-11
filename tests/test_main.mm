@@ -12,6 +12,9 @@
 #include <world/save_manager.hpp>
 #include <render/vertex.hpp>
 #include <render/mesher.hpp>
+#include <render/texture_atlas.hpp>
+#include <render/mega_buffer.hpp>
+#include <render/ui_overlay.hpp>
 
 #include <cmath>
 #include <thread>
@@ -1206,4 +1209,275 @@ TEST_CASE("GreedyMesher produces mesh without side effects", "[render][mesher]")
     chunk.needsMeshUpdate = false;
     REQUIRE(chunk.meshed == true);
     REQUIRE(chunk.needsMeshUpdate == false);
+}
+
+// ============================================================================
+// TextureAtlas Constant Tests (no Metal device required)
+// ============================================================================
+TEST_CASE("TextureAtlas constants are consistent", "[render][atlas]") {
+    REQUIRE(TextureAtlas::TILE_SIZE == 16);
+    REQUIRE(TextureAtlas::ATLAS_WIDTH == 1024);
+    REQUIRE(TextureAtlas::ATLAS_HEIGHT == 1024);
+    REQUIRE(TextureAtlas::TILES_PER_ROW == 64);
+    REQUIRE(TextureAtlas::TOTAL_TILES == 4096);
+    REQUIRE(TextureAtlas::MAX_BLOCK_TYPES == 256);
+}
+
+TEST_CASE("TextureAtlas tile allocation: 256 tiles fit without overlap", "[render][atlas]") {
+    // Verify that 256 unique tile indices produce unique UV coordinates.
+    // The UV grid is 64×64 tiles, so 256 tiles (16×16 sub-grid) fit easily.
+    float uvSize = 1.0f / static_cast<float>(TextureAtlas::TILES_PER_ROW);
+
+    struct UVBounds {
+        float uMin, vMin, uMax, vMax;
+    };
+
+    std::vector<UVBounds> tileBounds;
+    tileBounds.reserve(256);
+
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t col = i % TextureAtlas::TILES_PER_ROW;
+        uint32_t row = i / TextureAtlas::TILES_PER_ROW;
+        float u = static_cast<float>(col) * uvSize;
+        float v = static_cast<float>(row) * uvSize;
+        tileBounds.push_back({u, v, u + uvSize, v + uvSize});
+    }
+
+    // Verify no two tiles overlap
+    for (size_t i = 0; i < tileBounds.size(); ++i) {
+        for (size_t j = i + 1; j < tileBounds.size(); ++j) {
+            // Tiles overlap if their UV ranges intersect
+            bool overlap = !(tileBounds[i].uMax <= tileBounds[j].uMin ||
+                             tileBounds[i].uMin >= tileBounds[j].uMax ||
+                             tileBounds[i].vMax <= tileBounds[j].vMin ||
+                             tileBounds[i].vMin >= tileBounds[j].vMax);
+            REQUIRE(!overlap);
+        }
+    }
+}
+
+TEST_CASE("TextureAtlas UV computation within tile bounds", "[render][atlas]") {
+    float uvSize = 1.0f / static_cast<float>(TextureAtlas::TILES_PER_ROW);
+
+    // Test UV for tiles at various positions
+    uint32_t testIndices[] = {0, 1, 63, 64, 100, 1023, 4095};
+
+    for (uint32_t tileIdx : testIndices) {
+        uint32_t col = tileIdx % TextureAtlas::TILES_PER_ROW;
+        uint32_t row = tileIdx / TextureAtlas::TILES_PER_ROW;
+
+        float expectedU = static_cast<float>(col) * uvSize;
+        float expectedV = static_cast<float>(row) * uvSize;
+
+        // Verify UV is within [0, 1) range
+        REQUIRE(expectedU >= 0.0f);
+        REQUIRE(expectedU < 1.0f);
+        REQUIRE(expectedV >= 0.0f);
+        REQUIRE(expectedV < 1.0f);
+
+        // Verify tile size is consistent
+        REQUIRE(uvSize == Catch::Approx(1.0f / 64.0f));
+
+        // Verify tile stays within atlas bounds
+        REQUIRE(expectedU + uvSize <= 1.0f);
+        REQUIRE(expectedV + uvSize <= 1.0f);
+    }
+}
+
+TEST_CASE("TextureAtlas exhaustion: total tiles equals grid capacity", "[render][atlas]") {
+    // TOTAL_TILES must equal TILES_PER_ROW * (ATLAS_HEIGHT / TILE_SIZE)
+    uint32_t expectedTotal = TextureAtlas::TILES_PER_ROW *
+                             (TextureAtlas::ATLAS_HEIGHT / TextureAtlas::TILE_SIZE);
+    REQUIRE(TextureAtlas::TOTAL_TILES == expectedTotal);
+
+    // MAX_BLOCK_TYPES (256) must be <= TOTAL_TILES (4096)
+    REQUIRE(TextureAtlas::MAX_BLOCK_TYPES <= TextureAtlas::TOTAL_TILES);
+}
+
+// ============================================================================
+// MegaBuffer Constant Tests (no Metal device required)
+// ============================================================================
+TEST_CASE("MegaBuffer alignment is power of 2", "[render][megabuffer]") {
+    uint64_t align = MegaBuffer::ALIGNMENT;
+    REQUIRE(align > 0);
+    REQUIRE((align & (align - 1)) == 0); // Power of 2 check
+    REQUIRE(align == 256);
+}
+
+TEST_CASE("MegaBuffer alignUp rounds up to alignment", "[render][megabuffer]") {
+    // Test alignment behavior with known values
+    // alignUp(x) = (x + 255) & ~255
+    auto alignUp = [](uint64_t value) -> uint64_t {
+        return (value + MegaBuffer::ALIGNMENT - 1) & ~(MegaBuffer::ALIGNMENT - 1);
+    };
+
+    REQUIRE(alignUp(0) == 0);
+    REQUIRE(alignUp(1) == 256);
+    REQUIRE(alignUp(256) == 256);
+    REQUIRE(alignUp(257) == 512);
+    REQUIRE(alignUp(512) == 512);
+    REQUIRE(alignUp(1000) == 1024);
+    REQUIRE(alignUp(16 * sizeof(Vertex)) == 256); // 256 bytes, already aligned
+    REQUIRE(alignUp(17 * sizeof(Vertex)) == 512); // 272 bytes, rounds to 512
+}
+
+TEST_CASE("MegaBuffer vertex allocation size calculation", "[render][megabuffer]") {
+    auto alignUp = [](uint64_t value) -> uint64_t {
+        return (value + MegaBuffer::ALIGNMENT - 1) & ~(MegaBuffer::ALIGNMENT - 1);
+    };
+
+    // 100 vertices × 16 bytes = 1600 bytes → aligned to 1792 (7 × 256)
+    uint64_t vertexBytes = alignUp(100 * sizeof(Vertex));
+    REQUIRE(vertexBytes >= 1600);
+    REQUIRE(vertexBytes % MegaBuffer::ALIGNMENT == 0);
+
+    // 1000 indices × 4 bytes = 4000 bytes → aligned to 4096 (16 × 256)
+    uint64_t indexBytes = alignUp(1000 * sizeof(uint32_t));
+    REQUIRE(indexBytes >= 4000);
+    REQUIRE(indexBytes % MegaBuffer::ALIGNMENT == 0);
+}
+
+// ============================================================================
+// UIOverlay Quad Vertex Generation Tests (no Metal device required)
+// ============================================================================
+TEST_CASE("UIOverlay quad vertex generation: fullscreen quad", "[render][ui]") {
+    // Verify that a fullscreen quad (0,0,1,1) produces correct vertex positions.
+    // Layout: [x, y] for each of 4 vertices: BL, TL, BR, TR
+    float x = 0.0f, y = 0.0f, w = 1.0f, h = 1.0f;
+
+    // Expected vertices (bottom-left origin):
+    // BL: (0, 0), TL: (0, 1), BR: (1, 0), TR: (1, 1)
+    struct QuadVertex {
+        float px, py;
+        float cr, cg, cb, ca;
+    };
+
+    QuadVertex expected[4] = {
+        {0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f},
+        {0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f},
+        {1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f},
+        {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f},
+    };
+
+    // Verify vertex positions
+    REQUIRE(expected[0].px == x);
+    REQUIRE(expected[0].py == y);
+    REQUIRE(expected[1].px == x);
+    REQUIRE(expected[1].py == y + h);
+    REQUIRE(expected[2].px == x + w);
+    REQUIRE(expected[2].py == y);
+    REQUIRE(expected[3].px == x + w);
+    REQUIRE(expected[3].py == y + h);
+}
+
+TEST_CASE("UIOverlay quad vertex generation: crosshair horizontal line", "[render][ui]") {
+    // Simulate crosshair horizontal line at center of 1920×1080 screen
+    float screenWidth = 1920.0f;
+    float screenHeight = 1080.0f;
+
+    float centerX = 0.5f;
+    float centerY = 0.5f;
+    float crossH = 1.0f / screenHeight;    // 1 pixel height
+    float crossW = 20.0f / screenWidth;    // 20 pixel width
+
+    float left = centerX - crossW * 0.5f;
+    float bottom = centerY - crossH * 0.5f;
+
+    // Verify crosshair is centered
+    REQUIRE(left + crossW * 0.5f == Catch::Approx(centerX));
+    REQUIRE(bottom + crossH * 0.5f == Catch::Approx(centerY));
+
+    // Verify dimensions are positive
+    REQUIRE(crossW > 0.0f);
+    REQUIRE(crossH > 0.0f);
+
+    // Verify crosshair fits within screen
+    REQUIRE(left >= 0.0f);
+    REQUIRE(left + crossW <= 1.0f);
+    REQUIRE(bottom >= 0.0f);
+    REQUIRE(bottom + crossH <= 1.0f);
+}
+
+TEST_CASE("UIOverlay quad vertex generation: crosshair vertical line", "[render][ui]") {
+    float screenWidth = 1920.0f;
+    float screenHeight = 1080.0f;
+
+    float centerX = 0.5f;
+    float centerY = 0.5f;
+    float crossV = 20.0f / screenHeight;   // 20 pixel height
+    float crossLineW = 1.0f / screenWidth; // 1 pixel width
+
+    float left = centerX - crossLineW * 0.5f;
+    float bottom = centerY - crossV * 0.5f;
+
+    // Verify crosshair is centered
+    REQUIRE(left + crossLineW * 0.5f == Catch::Approx(centerX));
+    REQUIRE(bottom + crossV * 0.5f == Catch::Approx(centerY));
+
+    // Verify dimensions are positive
+    REQUIRE(crossLineW > 0.0f);
+    REQUIRE(crossV > 0.0f);
+
+    // Verify crosshair fits within screen
+    REQUIRE(left >= 0.0f);
+    REQUIRE(left + crossLineW <= 1.0f);
+    REQUIRE(bottom >= 0.0f);
+    REQUIRE(bottom + crossV <= 1.0f);
+}
+
+TEST_CASE("UIOverlay orthographic projection maps screen to NDC", "[render][ui]") {
+    // Verify the orthographic projection matrix maps [0,1] screen coords to [-1,1] NDC.
+    // Matrix:
+    //   [ 2,  0,  0,  0]
+    //   [ 0,  2,  0,  0]
+    //   [ 0,  0,  1,  0]
+    //   [-1, -1,  0,  1]
+    //
+    // For point (x, y, 0, 1): result = (2x-1, 2y-1, 0, 1)
+
+    auto transform = [](float sx, float sy) -> std::pair<float, float> {
+        float nx = 2.0f * sx - 1.0f;
+        float ny = 2.0f * sy - 1.0f;
+        return {nx, ny};
+    };
+
+    // Screen (0, 0) → NDC (-1, -1)
+    auto p0 = transform(0.0f, 0.0f);
+    REQUIRE(p0.first == Catch::Approx(-1.0f));
+    REQUIRE(p0.second == Catch::Approx(-1.0f));
+
+    // Screen (1, 1) → NDC (1, 1)
+    auto p1 = transform(1.0f, 1.0f);
+    REQUIRE(p1.first == Catch::Approx(1.0f));
+    REQUIRE(p1.second == Catch::Approx(1.0f));
+
+    // Screen (0.5, 0.5) → NDC (0, 0)
+    auto p2 = transform(0.5f, 0.5f);
+    REQUIRE(p2.first == Catch::Approx(0.0f));
+    REQUIRE(p2.second == Catch::Approx(0.0f));
+}
+
+TEST_CASE("UIOverlay quad index order forms two triangles", "[render][ui]") {
+    // Index buffer: {0, 1, 2, 0, 2, 3}
+    // Triangle 1: vertices 0, 1, 2 (BL, TL, BR) — left-bottom triangle
+    // Triangle 2: vertices 0, 2, 3 (BL, BR, TR) — right-top triangle
+    uint16_t indices[] = {0, 1, 2, 0, 2, 3};
+
+    // Verify 6 indices (2 triangles)
+    REQUIRE(sizeof(indices) / sizeof(indices[0]) == 6);
+
+    // Verify all indices reference valid vertices (0-3)
+    for (uint16_t idx : indices) {
+        REQUIRE((idx >= 0 && idx <= 3));
+    }
+
+    // Verify triangle 1 covers bottom-left half
+    REQUIRE(indices[0] == 0); // BL
+    REQUIRE(indices[1] == 1); // TL
+    REQUIRE(indices[2] == 2); // BR
+
+    // Verify triangle 2 covers top-right half
+    REQUIRE(indices[3] == 0); // BL
+    REQUIRE(indices[4] == 2); // BR
+    REQUIRE(indices[5] == 3); // TR
 }

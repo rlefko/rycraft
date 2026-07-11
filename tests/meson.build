@@ -12,7 +12,7 @@ if not lz4_dep.found()
 endif
 
 test_exe = executable('test_rycraft',
-  'test_main.cpp',
+  'test_main.mm',
   include_directories : inc,
   link_with : [libcommon, libworld, librender],
   dependencies : [catch2_with_main_dep, lz4_dep],

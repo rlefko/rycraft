@@ -17,7 +17,7 @@
 //   256 bytes of Biome (16x16)
 //   256 bytes of int8_t height map (16x16)
 
-struct ChunkHeader {
+struct ChunkSaveHeader {
     uint32_t magic;
     uint32_t version;
     int32_t chunkX;
@@ -28,7 +28,7 @@ struct ChunkHeader {
 constexpr uint32_t CHUNK_MAGIC = 0x52594348;
 constexpr uint32_t CHUNK_VERSION = 1;
 
-constexpr size_t HEADER_SIZE = sizeof(ChunkHeader);
+constexpr size_t HEADER_SIZE = sizeof(ChunkSaveHeader);
 constexpr size_t BIOME_DATA_SIZE = CHUNK_WIDTH * CHUNK_DEPTH * sizeof(Biome);
 constexpr size_t HEIGHT_MAP_SIZE = CHUNK_WIDTH * CHUNK_DEPTH * sizeof(int8_t);
 
