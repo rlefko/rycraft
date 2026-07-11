@@ -7,6 +7,7 @@ catch2_with_main_dep = catch2_proj.get_variable('catch2_with_main_dep')
 test_exe = executable('test_rycraft',
   'test_main.cpp',
   include_directories : inc,
+  link_with : [libcommon],
   dependencies : [catch2_with_main_dep],
 )
 
