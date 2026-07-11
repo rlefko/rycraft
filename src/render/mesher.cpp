@@ -138,40 +138,36 @@ MeshOutput GreedyMesher::buildMesh(Chunk& chunk) {
                 float v = static_cast<float>(static_cast<int>(bt) / 16) / 16.0f;
                 // +Y face: y = ly+1, CCW from above
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + wx),
                     static_cast<float16_t>(ly + 1),
                     static_cast<float16_t>(row + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + width + wx),
                     static_cast<float16_t>(ly + 1),
                     static_cast<float16_t>(row + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + width + wx),
                     static_cast<float16_t>(ly + 1),
                     static_cast<float16_t>(row + height + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + wx),
                     static_cast<float16_t>(ly + 1),
                     static_cast<float16_t>(row + height + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
                 idx.push_back(bi);
@@ -221,40 +217,36 @@ MeshOutput GreedyMesher::buildMesh(Chunk& chunk) {
                 float v = static_cast<float>(static_cast<int>(bt) / 16) / 16.0f;
                 // -Y face: y = ly, CCW from below
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + wx),
                     static_cast<float16_t>(ly),
                     static_cast<float16_t>(row + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + width + wx),
                     static_cast<float16_t>(ly),
                     static_cast<float16_t>(row + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + width + wx),
                     static_cast<float16_t>(ly),
                     static_cast<float16_t>(row + height + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + wx),
                     static_cast<float16_t>(ly),
                     static_cast<float16_t>(row + height + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
                 idx.push_back(bi);
@@ -303,40 +295,36 @@ MeshOutput GreedyMesher::buildMesh(Chunk& chunk) {
                 // +X face: x = lx+1, CCW from +X
                 int y0 = yBase + row;
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(lx + wx),
                     static_cast<float16_t>(y0),
                     static_cast<float16_t>(col + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(lx + wx),
                     static_cast<float16_t>(y0 + height),
                     static_cast<float16_t>(col + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(lx + wx),
                     static_cast<float16_t>(y0 + height),
                     static_cast<float16_t>(col + width + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(lx + wx),
                     static_cast<float16_t>(y0),
                     static_cast<float16_t>(col + width + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
                 idx.push_back(bi);
@@ -384,40 +372,36 @@ MeshOutput GreedyMesher::buildMesh(Chunk& chunk) {
                 // -X face: x = lx, CCW from -X
                 int y0 = yBase + row;
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(lx + wx),
                     static_cast<float16_t>(y0),
                     static_cast<float16_t>(col + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(lx + wx),
                     static_cast<float16_t>(y0),
                     static_cast<float16_t>(col + width + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(lx + wx),
                     static_cast<float16_t>(y0 + height),
                     static_cast<float16_t>(col + width + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(lx + wx),
                     static_cast<float16_t>(y0 + height),
                     static_cast<float16_t>(col + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
                 idx.push_back(bi);
@@ -465,40 +449,36 @@ MeshOutput GreedyMesher::buildMesh(Chunk& chunk) {
                 // +Z face: z = lz+1, CCW from +Z
                 int y0 = yBase + row;
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + wx),
                     static_cast<float16_t>(y0),
                     static_cast<float16_t>(lz + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + wx),
                     static_cast<float16_t>(y0 + height),
                     static_cast<float16_t>(lz + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + width + wx),
                     static_cast<float16_t>(y0 + height),
                     static_cast<float16_t>(lz + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + width + wx),
                     static_cast<float16_t>(y0),
                     static_cast<float16_t>(lz + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
                 idx.push_back(bi);
@@ -546,40 +526,36 @@ MeshOutput GreedyMesher::buildMesh(Chunk& chunk) {
                 // -Z face: z = lz, CCW from -Z
                 int y0 = yBase + row;
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + wx),
                     static_cast<float16_t>(y0),
                     static_cast<float16_t>(lz + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + width + wx),
                     static_cast<float16_t>(y0),
                     static_cast<float16_t>(lz + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + width + wx),
                     static_cast<float16_t>(y0 + height),
                     static_cast<float16_t>(lz + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 verts.push_back(Vertex{
+                    normalIdx,
                     static_cast<float16_t>(col + wx),
                     static_cast<float16_t>(y0 + height),
                     static_cast<float16_t>(lz + wz),
-                    normalIdx,
                     static_cast<float16_t>(u),
-                    static_cast<float16_t>(v),
-                    0xFFFFFFFFu
+                    static_cast<float16_t>(v)
                 });
                 uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
                 idx.push_back(bi);

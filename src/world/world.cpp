@@ -163,7 +163,7 @@ Biome World::getBiome(int x, int z) const {
     return biomeGen_.getBiome(static_cast<double>(x), static_cast<double>(z), height);
 }
 
-std::vector<std::shared_ptr<Chunk>> World::getLoadedChunks() {
+std::vector<std::shared_ptr<Chunk>> World::getLoadedChunks() const {
     std::lock_guard<std::mutex> lock(chunksMutex_);
 
     std::vector<std::shared_ptr<Chunk>> result;

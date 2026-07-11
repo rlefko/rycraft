@@ -94,7 +94,7 @@ struct InputState {
 // keyboard and mouse events before they reach the responder chain.
 // ---------------------------------------------------------------------------
 #ifdef __OBJC__
-class InputManager : public NSResponder {
+class InputManager {
 public:
     explicit InputManager(NSWindow* window);
     ~InputManager();

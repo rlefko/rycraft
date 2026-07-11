@@ -18,17 +18,15 @@ struct Uniforms {
 // Vertex input — bound through the vertex descriptor (not argument buffer)
 //
 // Attribute layout matches include/render/vertex.hpp:
-//   attribute(0)  float3   px, py, pz       offset 0   6 bytes
-//   attribute(1)  uint8_t  normalIdx         offset 6   1 byte
-//   attribute(2)  float2   u, v              offset 8   4 bytes
-//   attribute(3)  float4   color (uint32)    offset 12  4 bytes
+//   attribute(0)  uint     normalIdx         offset 0   4 bytes  (UInt)
+//   attribute(1)  float3   px, py, pz        offset 4   6 bytes  (Half3)
+//   attribute(2)  float2   u, v              offset 10  4 bytes  (Half2)
 //   stride = 16 bytes
 // ---------------------------------------------------------------------------
 struct VertexInput {
-    float3 position [[attribute(0)]];
-    uint normalIdx [[attribute(1)]];
+    uint normalIdx [[attribute(0)]];
+    float3 position [[attribute(1)]];
     float2 uv [[attribute(2)]];
-    float4 color [[attribute(3)]];
 };
 
 // ---------------------------------------------------------------------------

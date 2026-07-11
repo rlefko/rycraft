@@ -46,7 +46,7 @@ public:
     Biome getBiome(int x, int z) const;
 
     // Get all loaded chunks
-    std::vector<std::shared_ptr<Chunk>> getLoadedChunks();
+    std::vector<std::shared_ptr<Chunk>> getLoadedChunks() const;
 
     // Get chunks that need mesh updates
     std::vector<std::shared_ptr<Chunk>> getDirtyChunks();

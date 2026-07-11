@@ -4,6 +4,9 @@
 
 #include <common/error.hpp>
 #include <common/math.hpp>
+#include <render/render_pipeline.hpp>
+#include <engine/camera.hpp>
+#include <world/world.hpp>
 
 #include <chrono>
 #include <memory>
@@ -35,6 +38,9 @@ struct EngineState {
     MTKView* _view;
     id<MTLDevice> _device;
     id<MTLCommandQueue> _queue;
+
+    // Render pipeline (created after device/queue + shader library)
+    std::unique_ptr<RenderPipeline> _renderPipeline;
 
     // C++ game state
     std::unique_ptr<EngineState> _state;
@@ -139,6 +145,27 @@ static EngineState* _engineGetState(Engine* engine) {
     // Set as window content
     [_window setContentView: _view];
 
+    // 6. Load shader library and create render pipeline
+    NSString* exePath = [[NSBundle mainBundle] executablePath];
+    NSString* dirPath = [exePath stringByDeletingLastPathComponent];
+    NSString* libPath = [dirPath stringByAppendingPathComponent:@"pipeline.metallib"];
+    NSURL* libURL = [NSURL fileURLWithPath:libPath];
+    NSError* libError = nil;
+    id<MTLLibrary> library = [_device newLibraryWithURL:libURL
+                                                    error:&libError];
+    if (libError) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to load shader library: %@",
+                         libError.localizedDescription];
+        RY_LOG_FATAL([msg UTF8String]);
+    }
+
+    _renderPipeline = std::make_unique<RenderPipeline>(
+        _device,
+        library,
+        static_cast<uint32_t>(_view.bounds.size.width),
+        static_cast<uint32_t>(_view.bounds.size.height)
+    );
+
     return YES;
 }
 
@@ -190,9 +217,13 @@ static EngineState* _engineGetState(Engine* engine) {
 }
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)newSize {
-    // Projection matrix is recomputed in render() each frame.
+    if (_renderPipeline && newSize.width > 0 && newSize.height > 0) {
+        _renderPipeline->resize(
+            static_cast<uint32_t>(newSize.width),
+            static_cast<uint32_t>(newSize.height)
+        );
+    }
     (void)view;
-    (void)newSize;
 }
 
 // ---- Render ----
@@ -214,16 +245,27 @@ static EngineState* _engineGetState(Engine* engine) {
         );
     }
 
-    // Render pipeline — will be filled in Phase 4
-    // For now, create and present an empty command buffer to keep the view alive
     id<CAMetalDrawable> drawable = _view.currentDrawable;
     if (!drawable) return;
 
-    id<MTLCommandBuffer> commandBuffer = [_queue commandBuffer];
-    if (!commandBuffer) return;
+    if (!_renderPipeline) return;
 
-    [commandBuffer presentDrawable: drawable];
-    [commandBuffer commit];
+    // Camera view matrix (default identity until camera is wired)
+    Mat4 viewMatrix = Mat4::identity();
+
+    // TODO: Wire up real World from Phase 3
+    // For now, render pipeline handles empty world gracefully (sky only)
+    static World dummyWorld(42);
+    static Camera dummyCamera;
+
+    _renderPipeline->render(
+        _queue,
+        drawable,
+        viewMatrix,
+        state->projectionMatrix,
+        dummyWorld,
+        dummyCamera
+    );
 }
 
 - (double)deltaTime {
