@@ -1,4 +1,9 @@
-world_sources = files('world.cpp')
+world_sources = files(
+  'world.cpp',
+  'noise.cpp',
+  'terrain.cpp',
+  'biome.cpp',
+)
 
 libworld = static_library('world',
   world_sources,

@@ -4,6 +4,9 @@
 #include <common/result.hpp>
 #include <common/thread_pool.hpp>
 #include <world/chunk.hpp>
+#include <world/noise.hpp>
+#include <world/terrain.hpp>
+#include <world/biome.hpp>
 
 #include <cmath>
 #include <thread>
@@ -409,4 +412,254 @@ TEST_CASE("BlockType enum values are as expected", "[block]") {
   REQUIRE(static_cast<int>(BlockType::DIRT) == 1);
   REQUIRE(static_cast<int>(BlockType::GRASS) == 2);
   REQUIRE(static_cast<int>(BlockType::STONE) == 3);
+}
+
+// ============================================================================
+// Simplex Noise Tests
+// ============================================================================
+TEST_CASE("SimplexNoise deterministic output for same seed", "[noise]") {
+  SimplexNoise noise1(42);
+  SimplexNoise noise2(42);
+
+  double v1 = noise1.noise2D(1.0, 2.0);
+  double v2 = noise2.noise2D(1.0, 2.0);
+  REQUIRE(v1 == v2);
+
+  double v3 = noise1.noise3D(1.0, 2.0, 3.0);
+  double v4 = noise2.noise3D(1.0, 2.0, 3.0);
+  REQUIRE(v3 == v4);
+}
+
+TEST_CASE("SimplexNoise same input gives same output", "[noise]") {
+  SimplexNoise noise(123);
+
+  double a = noise(10.0, 20.0);
+  double b = noise(10.0, 20.0);
+  REQUIRE(a == b);
+
+  double c = noise.noise3D(5.0, 5.0, 5.0);
+  double d = noise.noise3D(5.0, 5.0, 5.0);
+  REQUIRE(c == d);
+}
+
+TEST_CASE("SimplexNoise output range within [-1, 1]", "[noise]") {
+  SimplexNoise noise(99);
+
+  // Sample a grid of points
+  for (int ix = -10; ix <= 10; ++ix) {
+    for (int iy = -10; iy <= 10; ++iy) {
+      double v2d = noise.noise2D(static_cast<double>(ix), static_cast<double>(iy));
+      REQUIRE(v2d >= -1.0);
+      REQUIRE(v2d <= 1.0);
+    }
+  }
+
+  for (int ix = -5; ix <= 5; ++ix) {
+    for (int iy = -5; iy <= 5; ++iy) {
+      for (int iz = -5; iz <= 5; ++iz) {
+        double v3d = noise.noise3D(
+            static_cast<double>(ix),
+            static_cast<double>(iy),
+            static_cast<double>(iz)
+        );
+        REQUIRE(v3d >= -1.0);
+        REQUIRE(v3d <= 1.0);
+      }
+    }
+  }
+}
+
+TEST_CASE("SimplexNoise different seeds give different outputs", "[noise]") {
+  SimplexNoise noiseA(1);
+  SimplexNoise noiseB(2);
+
+  // Different seeds should produce different noise fields
+  bool different = false;
+  for (int i = 0; i < 20; ++i) {
+    double a = noiseA.noise2D(static_cast<double>(i), static_cast<double>(i));
+    double b = noiseB.noise2D(static_cast<double>(i), static_cast<double>(i));
+    if (a != b) {
+      different = true;
+      break;
+    }
+  }
+  REQUIRE(different == true);
+}
+
+TEST_CASE("SimplexNoise octave2D is deterministic", "[noise]") {
+  SimplexNoise noise(77);
+  double a = noise.octave2D(10.0, 20.0, 4, 0.5, 2.0);
+  double b = noise.octave2D(10.0, 20.0, 4, 0.5, 2.0);
+  REQUIRE(a == b);
+}
+
+TEST_CASE("SimplexNoise octave output range within [-1, 1]", "[noise]") {
+  SimplexNoise noise(42);
+
+  for (int i = 0; i < 20; ++i) {
+    double v = noise.octave2D(static_cast<double>(i) * 0.1, static_cast<double>(i) * 0.1, 6, 0.5, 2.0);
+    REQUIRE(v >= -1.0);
+    REQUIRE(v <= 1.0);
+  }
+}
+
+TEST_CASE("SimplexNoise ridged noise is deterministic", "[noise]") {
+  SimplexNoise noise(55);
+  double a = noise.ridged2D(10.0, 20.0, 4, 0.5, 2.0);
+  double b = noise.ridged2D(10.0, 20.0, 4, 0.5, 2.0);
+  REQUIRE(a == b);
+}
+
+TEST_CASE("SimplexNoise ridged output range within [0, 1]", "[noise]") {
+  SimplexNoise noise(42);
+
+  for (int i = 0; i < 20; ++i) {
+    double v = noise.ridged2D(static_cast<double>(i) * 0.1, static_cast<double>(i) * 0.1, 4, 0.5, 2.0);
+    REQUIRE(v >= 0.0);
+    REQUIRE(v <= 1.0);
+  }
+}
+
+TEST_CASE("SimplexNoise operator() equals noise2D", "[noise]") {
+  SimplexNoise noise(42);
+  REQUIRE(noise(1.0, 2.0) == noise.noise2D(1.0, 2.0));
+  REQUIRE(noise(10.5, -3.7) == noise.noise2D(10.5, -3.7));
+}
+
+// ============================================================================
+// Terrain Generator Tests
+// ============================================================================
+TEST_CASE("TerrainGenerator height within [minHeight, maxHeight]", "[terrain]") {
+  TerrainGenerator terrain(42);
+  TerrainConfig config;
+  config.minHeight = 20.0;
+  config.maxHeight = 128.0;
+
+  for (int ix = -100; ix <= 100; ix += 10) {
+    for (int iz = -100; iz <= 100; iz += 10) {
+      double h = terrain.getHeight(static_cast<double>(ix), static_cast<double>(iz), config);
+      REQUIRE(h >= config.minHeight);
+      REQUIRE(h <= config.maxHeight);
+    }
+  }
+}
+
+TEST_CASE("TerrainGenerator deterministic output", "[terrain]") {
+  TerrainGenerator t1(123);
+  TerrainGenerator t2(123);
+
+  double a = t1.getHeight(100.0, 200.0);
+  double b = t2.getHeight(100.0, 200.0);
+  REQUIRE(a == b);
+}
+
+TEST_CASE("TerrainGenerator getNoise is deterministic", "[terrain]") {
+  TerrainGenerator terrain(42);
+  double a = terrain.getNoise(10.0, 20.0);
+  double b = terrain.getNoise(10.0, 20.0);
+  REQUIRE(a == b);
+}
+
+// ============================================================================
+// Biome Generator Tests
+// ============================================================================
+TEST_CASE("BiomeGenerator lookup: DeepOcean for very low elevation", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.5, 0.5, 50.0);
+  REQUIRE(b == Biome::DeepOcean);
+}
+
+TEST_CASE("BiomeGenerator lookup: Ocean for below sea level", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.5, 0.5, 62.0);
+  REQUIRE(b == Biome::Ocean);
+}
+
+TEST_CASE("BiomeGenerator lookup: Swamp for low elevation + wet", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.6, 0.7, 66.0);
+  REQUIRE(b == Biome::Swamp);
+}
+
+TEST_CASE("BiomeGenerator lookup: ExtremeHills for cold + dry", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.2, 0.2, 80.0);
+  REQUIRE(b == Biome::ExtremeHills);
+}
+
+TEST_CASE("BiomeGenerator lookup: IceSpikes for cold + medium moisture", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.2, 0.4, 80.0);
+  REQUIRE(b == Biome::IceSpikes);
+}
+
+TEST_CASE("BiomeGenerator lookup: Taiga for cold + wet", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.2, 0.7, 80.0);
+  REQUIRE(b == Biome::Taiga);
+}
+
+TEST_CASE("BiomeGenerator lookup: Desert for hot + dry", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.8, 0.2, 80.0);
+  REQUIRE(b == Biome::Desert);
+}
+
+TEST_CASE("BiomeGenerator lookup: Forest for warm + wet", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.5, 0.6, 80.0);
+  REQUIRE(b == Biome::Forest);
+}
+
+TEST_CASE("BiomeGenerator lookup: Plains for warm + dry", "[biome]") {
+  BiomeGenerator bg(42);
+  Biome b = bg.lookupBiome(0.5, 0.4, 80.0);
+  REQUIRE(b == Biome::Plains);
+}
+
+TEST_CASE("BiomeGenerator temperature in [0, 1]", "[biome]") {
+  BiomeGenerator bg(42);
+  for (int i = 0; i < 20; ++i) {
+    double t = bg.getTemperature(static_cast<double>(i) * 10.0, static_cast<double>(i) * 10.0);
+    REQUIRE(t >= 0.0);
+    REQUIRE(t <= 1.0);
+  }
+}
+
+TEST_CASE("BiomeGenerator moisture in [0, 1]", "[biome]") {
+  BiomeGenerator bg(42);
+  for (int i = 0; i < 20; ++i) {
+    double m = bg.getMoisture(static_cast<double>(i) * 10.0, static_cast<double>(i) * 10.0);
+    REQUIRE(m >= 0.0);
+    REQUIRE(m <= 1.0);
+  }
+}
+
+TEST_CASE("BiomeGenerator height modifier values", "[biome]") {
+  BiomeGenerator bg(42);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::ExtremeHills) == 30.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::Desert) == 5.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::Plains) == 0.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::Forest) == 10.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::Taiga) == 15.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::Swamp) == -5.0);
+}
+
+TEST_CASE("BiomeGenerator surface block values", "[biome]") {
+  BiomeGenerator bg(42);
+  REQUIRE(bg.getSurfaceBlock(Biome::Plains) == BlockType::GRASS);
+  REQUIRE(bg.getSurfaceBlock(Biome::Forest) == BlockType::GRASS);
+  REQUIRE(bg.getSurfaceBlock(Biome::Taiga) == BlockType::GRASS);
+  REQUIRE(bg.getSurfaceBlock(Biome::Desert) == BlockType::AIR);
+  REQUIRE(bg.getSurfaceBlock(Biome::ExtremeHills) == BlockType::STONE);
+  REQUIRE(bg.getSurfaceBlock(Biome::IceSpikes) == BlockType::STONE);
+}
+
+TEST_CASE("BiomeGenerator getBiome is deterministic", "[biome]") {
+  BiomeGenerator bg1(42);
+  BiomeGenerator bg2(42);
+
+  Biome b1 = bg1.getBiome(100.0, 200.0, 80.0);
+  Biome b2 = bg2.getBiome(100.0, 200.0, 80.0);
+  REQUIRE(b1 == b2);
 }
