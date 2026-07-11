@@ -7,7 +7,6 @@
 #include <sstream>
 #include <string>
 #include <filesystem>
-#include <sys/stat.h>
 
 namespace fs = std::filesystem;
 
@@ -20,13 +19,11 @@ namespace fs = std::filesystem;
 
 // Create directories recursively (like mkdir -p)
 static bool ensureDirectory(const std::string& path) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
-        // Directory doesn't exist — create it
-        int ret = mkdir(path.c_str(), 0755);
-        if (ret != 0) {
-            return false;
-        }
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    if (ec) {
+        RY_LOG_ERROR(std::string("Failed to create directory: ") + path);
+        return false;
     }
     return true;
 }
@@ -81,14 +78,15 @@ Result<InputBindings, EngineError> InputBindings::save(const std::string& path) 
     }
 
     file << json.str();
-    file.close();
 
     if (file.fail()) {
+        file.close();
         return Result<InputBindings, EngineError>::err(
             EngineError{ErrorCode::Fatal,
                 "Failed to write bindings file: " + path});
     }
 
+    file.close();
     return Result<InputBindings, EngineError>::ok(*this);
 }
 
@@ -136,8 +134,13 @@ Result<InputBindings, EngineError> InputBindings::load(const std::string& path) 
         if (quoteEnd == std::string::npos) return false;
 
         std::string value = content.substr(quoteStart + 1,
-                                           quoteEnd - quoteStart - 1);
-        field.key = keyFromString(value);
+                                            quoteEnd - quoteStart - 1);
+        auto parsedKey = keyFromString(value);
+        if (parsedKey == Key::None && !value.empty()) {
+            RY_LOG_ERROR(std::string("Invalid binding value '") + value +
+                         "' for '" + jsonKey + "', using default");
+        }
+        field.key = parsedKey;
         return true;
     };
 

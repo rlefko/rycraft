@@ -155,6 +155,8 @@ static EngineState* _engineGetState(Engine* engine) {
 // ---- MTKViewDelegate: game loop with fixed timestep ----
 
 - (void)drawInMTKView:(MTKView*)view {
+    if (!_device || !_queue) return;
+
     EngineState* state = _state.get();
 
     // 1. Calculate elapsed time

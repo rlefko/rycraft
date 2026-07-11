@@ -129,8 +129,9 @@ float Camera::mouseSensitivity() const {
 void Camera::updateFront() {
     // Forward vector from spherical coordinates
     // yaw rotates around Y axis, pitch rotates around local X axis
+    // cos^2(pitch)*(sin^2(yaw)+cos^2(yaw)) + sin^2(pitch) = 1,
+    // so the result is already a unit vector — no normalize needed.
     front_.x = std::cos(pitch_) * std::sin(yaw_);
     front_.y = std::sin(pitch_);
     front_.z = std::cos(pitch_) * std::cos(yaw_);
-    front_ = front_.normalize();
 }

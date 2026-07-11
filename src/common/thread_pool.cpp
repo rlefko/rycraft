@@ -49,7 +49,12 @@ ThreadPool::ThreadPool(size_t numWorkers) {
 }
 
 ThreadPool::~ThreadPool() {
-  stop_ = true;
+  {
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    stop_ = true;
+    // Drain remaining tasks to avoid hanging futures
+    while (!tasks_.empty()) tasks_.pop();
+  }
   condition_.notify_all();
   // jthread destructor requests stop and joins automatically.
   // Workers exit their loop after seeing stop_ and return from emplace_back's lambda.

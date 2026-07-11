@@ -15,7 +15,5 @@ int main() {
 
     [engine run];
 
-    [engine terminate];
-
     return 0;
 }

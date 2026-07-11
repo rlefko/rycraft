@@ -3,6 +3,7 @@
 #include <common/error.hpp>
 #include <common/math.hpp>
 
+#include <cassert>
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------
@@ -193,6 +194,7 @@ InputManager::InputManager(NSWindow* window)
     , mouseDraggedMonitor_(nil)
     , mouseDownMonitor_(nil)
     , mouseUpMonitor_(nil) {
+    assert(window_ != nil && "InputManager requires a non-nil window");
 
     // Register local event monitors
     auto self = this;

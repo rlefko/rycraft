@@ -440,19 +440,25 @@ struct AABB {
     float tMin = -std::numeric_limits<float>::infinity();
     float tMax = std::numeric_limits<float>::infinity();
 
-    float invDir[3] = {1.f / dir.x, 1.f / dir.y, 1.f / dir.z};
-    float boxMin[3] = {this->min.x, this->min.y, this->min.z};
-    float boxMax[3] = {this->max.x, this->max.y, this->max.z};
-    float originC[3] = {origin.x, origin.y, origin.z};
-
     for (int axis = 0; axis < 3; ++axis) {
-      float t1 = (boxMin[axis] - originC[axis]) * invDir[axis];
-      float t2 = (boxMax[axis] - originC[axis]) * invDir[axis];
+      float originC = axis == 0 ? origin.x : (axis == 1 ? origin.y : origin.z);
+      float dirC = axis == 0 ? dir.x : (axis == 1 ? dir.y : dir.z);
+      float boxMinC = axis == 0 ? this->min.x : (axis == 1 ? this->min.y : this->min.z);
+      float boxMaxC = axis == 0 ? this->max.x : (axis == 1 ? this->max.y : this->max.z);
 
-      if (invDir[axis] < 0.f) std::swap(t1, t2);
+      // Ray parallel to this slab — reject if origin outside slab bounds
+      if (std::abs(dirC) < 1e-8f) {
+        if (originC < boxMinC || originC > boxMaxC) return false;
+        continue;
+      }
 
-      tMin = std::max(tMin, t1);
-      tMax = std::min(tMax, t2);
+      float invDir = 1.f / dirC;
+      float t1 = (boxMinC - originC) * invDir;
+      float t2 = (boxMaxC - originC) * invDir;
+
+      if (t1 > t2) std::swap(t1, t2);
+      if (t1 > tMin) tMin = t1;
+      if (t2 < tMax) tMax = t2;
 
       if (tMin > tMax) return false;
     }
