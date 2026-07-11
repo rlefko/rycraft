@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <iostream>
 #include <string>
@@ -44,7 +45,7 @@ inline std::string timestamp() {
 #define RY_LOG_FATAL(msg)                                                    \
   do {                                                                       \
     std::cerr << "[" << timestamp() << "] [FATAL] " << msg << std::endl;     \
-    std::terminate();                                                        \
+    std::abort();                                                            \
   } while (0)
 
 #define RY_LOG_ERROR(msg)                                                    \

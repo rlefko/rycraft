@@ -1,4 +1,4 @@
-project('rycraft', 'cpp',
+project('rycraft', 'cpp', 'objcpp',
   version : '0.1.0',
   default_options : [
     'cpp_std=c++23',

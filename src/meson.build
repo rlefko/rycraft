@@ -12,7 +12,8 @@ copy_metallib = run_command(
 )
 
 rycraft_exe = executable('rycraft',
-  'engine/main.cpp',
+  'engine/main.mm',
+  include_directories : inc,
   link_with : [
     libcommon,
     libengine,
