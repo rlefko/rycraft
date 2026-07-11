@@ -15,6 +15,9 @@
 #include <render/texture_atlas.hpp>
 #include <render/mega_buffer.hpp>
 #include <render/ui_overlay.hpp>
+#include <entity/physics.hpp>
+#include <entity/player.hpp>
+#include <entity/voxel_traversal.hpp>
 
 #include <cmath>
 #include <thread>
@@ -1480,4 +1483,347 @@ TEST_CASE("UIOverlay quad index order forms two triangles", "[render][ui]") {
     REQUIRE(indices[3] == 0); // BL
     REQUIRE(indices[4] == 2); // BR
     REQUIRE(indices[5] == 3); // TR
+}
+
+// ============================================================================
+// Physics Engine Tests (Phase 5)
+// ============================================================================
+TEST_CASE("AABB sweep collision: entity moves through empty space unchanged", "[physics]") {
+    auto world = std::make_shared<World>(42);
+    // Force-load the chunk at (0,0) so setBlock works
+    world->getChunk(0, 0);
+
+    // Place entity at high Y (200) where there's no terrain
+    AABB entityAABB{Vec3{5.f, 200.f, 5.f}, Vec3{5.6f, 201.8f, 5.6f}};
+    Vec3 movement{1.f, 0.f, 1.f};
+
+    PhysicsEngine physics;
+    Vec3 resolved = physics.sweepCollision(entityAABB, movement, *world);
+
+    // In empty space (y=200), movement should pass through unchanged
+    REQUIRE(resolved.x == Catch::Approx(1.f).margin(0.01f));
+    REQUIRE(resolved.y == Catch::Approx(0.f).margin(0.01f));
+    REQUIRE(resolved.z == Catch::Approx(1.f).margin(0.01f));
+}
+
+TEST_CASE("AABB sweep collision: entity blocked by solid block", "[physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place a wall of stone blocks at x=10, high Y (200)
+    for (int y = 195; y <= 210; ++y) {
+        for (int z = 0; z <= 10; ++z) {
+            world->setBlock(10, y, z, BlockType::STONE);
+        }
+    }
+
+    PhysicsEngine physics;
+    // Entity at x=8, y=200 moving toward the wall
+    AABB entityAABB{Vec3{8.f, 200.f, 5.f}, Vec3{8.6f, 201.8f, 5.6f}};
+    Vec3 movement{5.f, 0.f, 0.f}; // Would move to x=13, but wall is at x=10
+
+    Vec3 resolved = physics.sweepCollision(entityAABB, movement, *world);
+
+    // X movement should be blocked (entity max.x = 8.6, wall min.x = 10)
+    // Entity can move up to 10 - 8.6 = 1.4 blocks
+    REQUIRE(resolved.x >= 0.f);
+    REQUIRE(resolved.x < 5.f); // Movement reduced by wall
+}
+
+TEST_CASE("AABB sweep collision: entity slides along wall (Y-first, then X)", "[physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place floor at y=199 and wall at x=10, high Y
+    for (int x = 0; x <= 15; ++x) {
+        for (int z = 0; z <= 10; ++z) {
+            world->setBlock(x, 199, z, BlockType::STONE); // Floor
+        }
+    }
+    for (int y = 190; y <= 210; ++y) {
+        for (int z = 0; z <= 10; ++z) {
+            world->setBlock(10, y, z, BlockType::STONE); // Wall
+        }
+    }
+
+    PhysicsEngine physics;
+    // Entity above floor, moving down and toward wall
+    AABB entityAABB{Vec3{8.f, 202.f, 5.f}, Vec3{8.6f, 203.8f, 5.6f}};
+    Vec3 movement{5.f, -3.f, 0.f};
+
+    Vec3 resolved = physics.sweepCollision(entityAABB, movement, *world);
+
+    // Y should be resolved first (land on floor at y=199), then X blocked by wall
+    REQUIRE(resolved.y >= -3.f);
+    REQUIRE(resolved.x < 5.f); // X reduced by wall collision
+}
+
+TEST_CASE("Obstacle collection: returns correct blocks in range", "[physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place blocks at high Y to avoid terrain
+    world->setBlock(5, 200, 5, BlockType::STONE);
+    world->setBlock(6, 200, 5, BlockType::STONE);
+    world->setBlock(5, 200, 6, BlockType::AIR); // Not solid
+
+    AABB queryAABB{Vec3{4.f, 199.f, 4.f}, Vec3{7.f, 201.f, 7.f}};
+
+    std::vector<AABB> obstacles = PhysicsEngine::collectObstacles(queryAABB, *world);
+
+    // Should find at least the two STONE blocks
+    REQUIRE(obstacles.size() >= 2);
+
+    // Verify each obstacle is a 1x1x1 block at integer coords
+    for (const auto& obs : obstacles) {
+        Vec3 size = obs.max - obs.min;
+        REQUIRE(size.x == Catch::Approx(1.f));
+        REQUIRE(size.y == Catch::Approx(1.f));
+        REQUIRE(size.z == Catch::Approx(1.f));
+    }
+}
+
+TEST_CASE("isSolid: returns true for STONE, false for AIR/WATER/GLASS", "[physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Set blocks at high Y (200) to avoid terrain interference
+    world->setBlock(1, 200, 1, BlockType::STONE);
+    world->setBlock(2, 200, 2, BlockType::AIR);
+    world->setBlock(3, 200, 3, BlockType::WATER);
+    world->setBlock(4, 200, 4, BlockType::GLASS);
+    world->setBlock(5, 200, 5, BlockType::DIRT);
+    world->setBlock(6, 200, 6, BlockType::BEDROCK);
+
+    REQUIRE(PhysicsEngine::isSolid(*world, 1, 200, 1) == true);  // STONE
+    REQUIRE(PhysicsEngine::isSolid(*world, 2, 200, 2) == false); // AIR
+    REQUIRE(PhysicsEngine::isSolid(*world, 3, 200, 3) == false); // WATER
+    REQUIRE(PhysicsEngine::isSolid(*world, 4, 200, 4) == false); // GLASS
+    REQUIRE(PhysicsEngine::isSolid(*world, 5, 200, 5) == true);  // DIRT
+    REQUIRE(PhysicsEngine::isSolid(*world, 6, 200, 6) == true);  // BEDROCK
+}
+
+TEST_CASE("isInWater: returns true when entity AABB overlaps water block", "[physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->setBlock(5, 200, 5, BlockType::WATER);
+
+    // Entity overlapping the water block at high Y
+    AABB inWater{Vec3{4.5f, 199.5f, 4.5f}, Vec3{5.5f, 200.5f, 5.5f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, inWater) == true);
+
+    // Entity not overlapping water (far away in empty space)
+    AABB notInWater{Vec3{50.f, 200.f, 50.f}, Vec3{50.6f, 201.8f, 50.6f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, notInWater) == false);
+}
+
+// ============================================================================
+// Player Tests (Phase 5)
+// ============================================================================
+TEST_CASE("Player AABB: correct dimensions (0.6x1.8x0.6)", "[player]") {
+    Player player;
+    player.position = Vec3{10.f, 64.f, 10.f};
+
+    AABB aabb = player.getAABB();
+
+    Vec3 size = aabb.max - aabb.min;
+    REQUIRE(size.x == Catch::Approx(0.6f));
+    REQUIRE(size.y == Catch::Approx(1.8f));
+    REQUIRE(size.z == Catch::Approx(0.6f));
+
+    // Center X/Z should match player position, Y should start at player position
+    REQUIRE(aabb.min.y == Catch::Approx(64.f));
+    REQUIRE(aabb.max.y == Catch::Approx(65.8f));
+}
+
+TEST_CASE("Player gravity: velocity.y decreases by 0.08 per tick", "[player]") {
+    auto world = std::make_shared<World>(42);
+    // Place floor far below so player falls freely
+    for (int x = -10; x <= 10; ++x) {
+        for (int z = -10; z <= 10; ++z) {
+            world->setBlock(x, 0, z, BlockType::STONE);
+        }
+    }
+
+    Player player;
+    player.position = Vec3{0.f, 100.f, 0.f}; // High up
+    player.velocity = Vec3::zero();
+
+    InputState input;
+    player.tick(*world, input, false);
+
+    // After one tick: gravity (-0.08) applied, then vertical drag (0.98)
+    // velocity.y = (0 + (-0.08)) * 0.98 = -0.0784
+    REQUIRE(player.velocity.y < 0.f);
+    REQUIRE(player.velocity.y == Catch::Approx(-0.08f * 0.98f).margin(0.01f));
+}
+
+TEST_CASE("Player terminal velocity: clamped to -3.92", "[player]") {
+    auto world = std::make_shared<World>(42);
+    // Place floor very far below
+    for (int x = -10; x <= 10; ++x) {
+        for (int z = -10; z <= 10; ++z) {
+            world->setBlock(x, 0, z, BlockType::STONE);
+        }
+    }
+
+    Player player;
+    player.position = Vec3{0.f, 200.f, 0.f};
+    player.velocity = Vec3{0.f, -10.f, 0.f}; // Start below terminal
+
+    InputState input;
+    player.tick(*world, input, false);
+
+    // Velocity should be clamped to terminal velocity (after drag)
+    // -10 * 0.98 = -9.8, then clamped to -3.92
+    REQUIRE(player.velocity.y >= Player::TERMINAL_VELOCITY);
+}
+
+TEST_CASE("Player jump: velocity.y = +0.42 when on ground", "[player]") {
+    Player player;
+    player.position = Vec3{0.f, 64.f, 0.f};
+    player.velocity = Vec3::zero();
+    player.onGround = true;
+    player.jumpCooldown = 0;
+
+    player.jump();
+
+    REQUIRE(player.velocity.y == Catch::Approx(Player::JUMP_VELOCITY));
+    REQUIRE(player.jumpCooldown == Player::JUMP_COOLDOWN_TICKS);
+}
+
+TEST_CASE("Player fall damage: ceil(fallDistance - 3) hearts", "[player]") {
+    Player player;
+    player.health = 20;
+
+    // Fall distance of 8 → damage = ceil(8 - 3) = 5
+    player.fallDistance = 8;
+    player.applyFallDamage();
+    REQUIRE(player.health == 15);
+
+    // Fall distance of 3 → no damage
+    player.health = 20;
+    player.fallDistance = 3;
+    player.applyFallDamage();
+    REQUIRE(player.health == 20);
+
+    // Fall distance of 4 → damage = ceil(4 - 3) = 1
+    player.health = 20;
+    player.fallDistance = 4;
+    player.applyFallDamage();
+    REQUIRE(player.health == 19);
+}
+
+TEST_CASE("Player fall damage capped at zero health", "[player]") {
+    Player player;
+    player.health = 2;
+    player.fallDistance = 20; // damage = ceil(20 - 3) = 17
+    player.applyFallDamage();
+    REQUIRE(player.health == 0);
+}
+
+TEST_CASE("Player resetFallDistance clears fall tracking", "[player]") {
+    Player player;
+    player.fallDistance = 10;
+    player.resetFallDistance();
+    REQUIRE(player.fallDistance == 0);
+}
+
+// ============================================================================
+// DDA Voxel Traversal Tests (Phase 5)
+// ============================================================================
+TEST_CASE("DDA traversal: ray hits block at expected position", "[voxel]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place a stone block at (5, 200, 0) — high Y to avoid terrain
+    world->setBlock(5, 200, 0, BlockType::STONE);
+
+    // Ray from (0, 200, 0) going +X toward the block
+    Vec3 origin{0.f, 200.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    auto hit = VoxelTraversal::traceRay(origin, direction, *world, 10.f);
+
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->x == Catch::Approx(5.f));
+    REQUIRE(hit->y == Catch::Approx(200.f));
+    REQUIRE(hit->z == Catch::Approx(0.f));
+}
+
+TEST_CASE("DDA traversal: ray misses all blocks in empty space", "[voxel]") {
+    auto world = std::make_shared<World>(42);
+    // Don't place any blocks near the ray path
+
+    // Shoot at very high Y (250) where there's definitely no terrain
+    Vec3 origin{0.f, 250.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    auto hit = VoxelTraversal::traceRay(origin, direction, *world, 6.f);
+
+    REQUIRE(hit.has_value() == false);
+}
+
+TEST_CASE("DDA traversal: face normal computation", "[voxel]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place a stone block at (5, 200, 0) — high Y
+    world->setBlock(5, 200, 0, BlockType::STONE);
+
+    // Ray from (2, 200, 0) going +X — hits the -X face of the block
+    Vec3 origin{2.f, 200.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
+
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->first.x == Catch::Approx(5.f));
+    REQUIRE(hit->first.y == Catch::Approx(200.f));
+    REQUIRE(hit->first.z == Catch::Approx(0.f));
+
+    // Normal should point in -X direction (the face we hit)
+    REQUIRE(hit->second.x == Catch::Approx(-1.f));
+    REQUIRE(hit->second.y == Catch::Approx(0.f));
+    REQUIRE(hit->second.z == Catch::Approx(0.f));
+}
+
+TEST_CASE("DDA traversal: ray along diagonal hits block", "[voxel]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place stone block at (3, 203, 3) — high Y
+    world->setBlock(3, 203, 3, BlockType::STONE);
+
+    Vec3 origin{0.f, 200.f, 0.f};
+    Vec3 direction{1.f, 1.f, 1.f}; // Diagonal up-forward
+    direction = direction.normalize();
+
+    auto hit = VoxelTraversal::traceRay(origin, direction, *world, 10.f);
+
+    // Should hit the block at (3, 203, 3)
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->x == Catch::Approx(3.f));
+    REQUIRE(hit->y == Catch::Approx(203.f));
+    REQUIRE(hit->z == Catch::Approx(3.f));
+}
+
+TEST_CASE("DDA traversal: maxDistance limits traversal range", "[voxel]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place stone block far away at high Y
+    world->setBlock(10, 200, 0, BlockType::STONE);
+
+    Vec3 origin{0.f, 200.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    // maxDistance too short to reach the block at x=10
+    auto hit = VoxelTraversal::traceRay(origin, direction, *world, 5.f);
+    REQUIRE(hit.has_value() == false);
+
+    // maxDistance long enough to reach the block
+    auto hitFar = VoxelTraversal::traceRay(origin, direction, *world, 15.f);
+    REQUIRE(hitFar.has_value());
+    REQUIRE(hitFar->x == Catch::Approx(10.f));
 }

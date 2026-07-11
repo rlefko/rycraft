@@ -14,7 +14,7 @@ endif
 test_exe = executable('test_rycraft',
   'test_main.mm',
   include_directories : inc,
-  link_with : [libcommon, libworld, librender],
+  link_with : [libcommon, libworld, librender, libentity, libengine],
   dependencies : [catch2_with_main_dep, lz4_dep],
 )
 
