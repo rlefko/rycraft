@@ -409,9 +409,14 @@ TEST_CASE("Chunk coordinates are multiples of CHUNK_SIZE", "[chunk]") {
 
 TEST_CASE("BlockType enum values are as expected", "[block]") {
   REQUIRE(static_cast<int>(BlockType::AIR) == 0);
-  REQUIRE(static_cast<int>(BlockType::DIRT) == 1);
+  REQUIRE(static_cast<int>(BlockType::STONE) == 1);
   REQUIRE(static_cast<int>(BlockType::GRASS) == 2);
-  REQUIRE(static_cast<int>(BlockType::STONE) == 3);
+  REQUIRE(static_cast<int>(BlockType::DIRT) == 3);
+  REQUIRE(static_cast<int>(BlockType::SAND) == 4);
+  REQUIRE(static_cast<int>(BlockType::BEDROCK) == 7);
+  REQUIRE(static_cast<int>(BlockType::LOG) == 8);
+  REQUIRE(static_cast<int>(BlockType::LEAVES) == 9);
+  REQUIRE(static_cast<int>(BlockType::COUNT) == 17);
 }
 
 // ============================================================================

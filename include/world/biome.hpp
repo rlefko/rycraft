@@ -5,20 +5,6 @@
 
 #include <cstdint>
 
-enum class Biome : uint8_t {
-    DeepOcean = 0,
-    Ocean = 1,
-    Plains = 2,
-    Forest = 3,
-    Taiga = 4,
-    Desert = 5,
-    ExtremeHills = 6,
-    Swamp = 7,
-    MushroomIsland = 8,
-    IceSpikes = 9,
-    Count = 10
-};
-
 struct BiomeConfig {
     double temperatureFrequency = 0.025;
     double moistureFrequency = 0.05;

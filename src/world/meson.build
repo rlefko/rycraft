@@ -3,6 +3,12 @@ world_sources = files(
   'noise.cpp',
   'terrain.cpp',
   'biome.cpp',
+  'chunk.cpp',
+  'surface.cpp',
+  'caves.cpp',
+  'ores.cpp',
+  'trees.cpp',
+  'structures.cpp',
 )
 
 libworld = static_library('world',
