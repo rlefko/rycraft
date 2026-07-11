@@ -2,29 +2,14 @@
 
 #include "common/error.hpp"
 #include "render/mesher.hpp"
+#include "render/uniforms.hpp"
 #include "world/chunk.hpp"
 #include "world/world.hpp"
 #include "engine/camera.hpp"
 
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
-
-// ---------------------------------------------------------------------------
-// Uniforms — matches the Metal shader's Uniforms struct exactly.
-// ---------------------------------------------------------------------------
-struct alignas(16) Uniforms {
-    float modelMatrix[16];
-    float viewMatrix[16];
-    float projectionMatrix[16];
-    float sunDirection[3];
-    float _pad0;
-    float sunColor[3];
-    float _pad1;
-    float ambientColor[3];
-    float _pad2;
-};
-
-static_assert(sizeof(Uniforms) <= 256, "Uniforms must fit in 256-byte buffer");
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -187,10 +172,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(0.53f, 0.81f, 0.92f, 1.0f);
 
-    // Depth attachment: render to MSAA depth
+    // Depth attachment: render to MSAA depth, resolve to single-sample
     renderPassDesc.depthAttachment.texture = _depthMSAA;
+    renderPassDesc.depthAttachment.resolveTexture = _depthResolve;
     renderPassDesc.depthAttachment.loadAction = MTLLoadActionClear;
-    renderPassDesc.depthAttachment.storeAction = MTLStoreActionStore;
+    renderPassDesc.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.depthAttachment.clearDepth = 1.0;
 
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
@@ -237,9 +223,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     // Upload to GPU
     std::memcpy((void*)_uniformsBuffer.contents, &uniforms, sizeof(Uniforms));
 
-    // Bind uniforms buffer to both vertex and fragment stages
-    [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:0];
-    [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:0];
+    // Bind uniforms buffer at index 1 (index 0 is for vertex data)
+    [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
+    [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
 
     // ---- Draw chunks (with frustum culling) ----
     auto loadedChunks = world.getLoadedChunks();
@@ -297,13 +283,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
         // Placeholder draw call (will be filled when MegaBuffer is wired):
         if (meshState.alloc.vertexCount > 0 && meshState.alloc.vertexBuffer) {
             [encoder setVertexBuffer:meshState.alloc.vertexBuffer
-                              offset:meshState.alloc.vertexOffset
-                            atIndex:0];
+                               offset:meshState.alloc.vertexOffset
+                             atIndex:0];
             [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
-
-            [encoder setVertexBuffer:meshState.alloc.indexBuffer
-                              offset:meshState.alloc.indexOffset
-                            atIndex:0];
 
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle
                          vertexStart:0
@@ -383,6 +365,7 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
 void RenderPipeline::extractFrustumPlanes(const Mat4& vpMatrix) {
     // Extract 6 frustum planes from view-projection matrix.
     // Each plane is stored as [A, B, C, D] representing Ax + By + Cz + D = 0.
+    // After extraction, each plane is normalized so that (A,B,C) is unit length.
     //
     // VP matrix is column-major: data[col * 4 + row]
     // Column 0: data[0..3],  Column 1: data[4..7],
@@ -425,6 +408,21 @@ void RenderPipeline::extractFrustumPlanes(const Mat4& vpMatrix) {
     _frustumPlanes[5][1] = m[13] - m[9];
     _frustumPlanes[5][2] = m[14] - m[10];
     _frustumPlanes[5][3] = m[15] - m[11];
+
+    // Normalize all planes so (A,B,C) is unit length
+    for (int i = 0; i < 6; ++i) {
+        float len = std::sqrt(
+            _frustumPlanes[i][0] * _frustumPlanes[i][0] +
+            _frustumPlanes[i][1] * _frustumPlanes[i][1] +
+            _frustumPlanes[i][2] * _frustumPlanes[i][2]
+        );
+        if (len > 0.0f) {
+            _frustumPlanes[i][0] /= len;
+            _frustumPlanes[i][1] /= len;
+            _frustumPlanes[i][2] /= len;
+            _frustumPlanes[i][3] /= len;
+        }
+    }
 }
 
 bool RenderPipeline::isChunkInFrustum(const AABB& chunkAABB) const {

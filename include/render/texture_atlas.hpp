@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 
 class TextureAtlas {
 public:
@@ -23,8 +24,8 @@ public:
 
     explicit TextureAtlas(id<MTLDevice> device);
 
-    // Allocate a tile for a block type, returns UV coords
-    TileInfo allocate(uint32_t blockType);
+    // Allocate a tile for a block type, returns UV coords (or nullopt if exhausted)
+    std::optional<TileInfo> allocate(uint32_t blockType);
 
     // Get UV for a block type (allocates if not yet cached)
     TileInfo getUV(uint32_t blockType);
@@ -46,4 +47,7 @@ private:
 
     void generateBlockTexture(uint32_t blockType, uint32_t tileIndex);
     TileInfo computeTileUV(uint32_t tileIndex) const;
+
+    // Allocate a tile slot (thread-safe, returns tile index) — does not call Metal API.
+    std::optional<uint32_t> allocateTile(uint32_t blockType);
 };

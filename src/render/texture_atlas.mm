@@ -1,11 +1,13 @@
 #include "render/texture_atlas.hpp"
 
+#include "common/error.hpp"
 #include "world/chunk.hpp"
 #include "world/noise.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <optional>
 #include <stdexcept>
 
 // BGRA8Unorm pixel — 4 bytes per pixel
@@ -309,16 +311,10 @@ TextureAtlas::TextureAtlas(id<MTLDevice> device)
     }
 }
 
-TextureAtlas::TileInfo TextureAtlas::allocate(uint32_t blockType) {
-    if (blockType >= MAX_BLOCK_TYPES) {
-        throw std::invalid_argument("blockType out of range for texture atlas");
-    }
-
-    std::lock_guard lock(_mutex);
-
-    // Already allocated — return cached UV
+std::optional<uint32_t> TextureAtlas::allocateTile(uint32_t blockType) {
+    // Caller must hold _mutex. Already allocated — return cached index.
     if (_cacheValid[blockType]) {
-        return _tileCache[blockType];
+        return std::nullopt;
     }
 
     // Find next free tile
@@ -326,17 +322,41 @@ TextureAtlas::TileInfo TextureAtlas::allocate(uint32_t blockType) {
         ++_nextTile;
     }
     if (_nextTile >= TOTAL_TILES) {
-        throw std::runtime_error("texture atlas exhausted — no free tiles remaining");
+        RY_LOG_ERROR("texture atlas exhausted — no free tiles remaining");
+        return std::nullopt;
     }
 
     uint32_t tileIndex = _nextTile++;
     _allocated[tileIndex] = true;
 
+    return tileIndex;
+}
+
+std::optional<TextureAtlas::TileInfo> TextureAtlas::allocate(uint32_t blockType) {
+    if (blockType >= MAX_BLOCK_TYPES) {
+        throw std::invalid_argument("blockType out of range for texture atlas");
+    }
+
+    // Step 1: Allocate tile slot under lock
+    uint32_t tileIndex;
+    {
+        std::lock_guard lock(_mutex);
+        auto maybeIndex = allocateTile(blockType);
+        if (!maybeIndex) {
+            return std::nullopt;
+        }
+        tileIndex = *maybeIndex;
+    }
+
+    // Step 2: Generate texture (Metal API) outside lock
     generateBlockTexture(blockType, tileIndex);
 
     TileInfo uv = computeTileUV(tileIndex);
-    _tileCache[blockType] = uv;
-    _cacheValid[blockType] = true;
+    {
+        std::lock_guard lock(_mutex);
+        _tileCache[blockType] = uv;
+        _cacheValid[blockType] = true;
+    }
 
     return uv;
 }
@@ -346,13 +366,22 @@ TextureAtlas::TileInfo TextureAtlas::getUV(uint32_t blockType) {
         throw std::invalid_argument("blockType out of range for texture atlas");
     }
 
-    std::lock_guard lock(_mutex);
-
-    if (_cacheValid[blockType]) {
-        return _tileCache[blockType];
+    // Check cache under lock
+    {
+        std::lock_guard lock(_mutex);
+        if (_cacheValid[blockType]) {
+            return _tileCache[blockType];
+        }
     }
 
-    return allocate(blockType);
+    // Not cached — allocate (handles locking internally)
+    auto maybeUV = allocate(blockType);
+    if (!maybeUV) {
+        // Atlas exhausted — return safe default UV
+        return TileInfo{.u = 0.0f, .v = 0.0f, .uSize = 0.0f, .vSize = 0.0f};
+    }
+
+    return *maybeUV;
 }
 
 id<MTLTexture> TextureAtlas::texture() const {

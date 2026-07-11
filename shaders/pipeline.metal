@@ -59,7 +59,7 @@ float3 getFaceNormal(uint index) {
 // ---------------------------------------------------------------------------
 vertex VertexOutput vertexMain(
     VertexInput in [[stage_in]],
-    constant Uniforms &uniforms [[buffer(0)]]
+    constant Uniforms &uniforms [[buffer(1)]]
 ) {
     VertexOutput out;
 
@@ -91,7 +91,7 @@ vertex VertexOutput vertexMain(
 fragment float4 fragmentMain(
     VertexOutput in [[stage_in]],
     texture2d<float> atlas [[texture(0)]],
-    constant Uniforms &uniforms [[buffer(0)]]
+    constant Uniforms &uniforms [[buffer(1)]]
 ) {
     // Nearest-neighbor sampling for crisp voxel textures
     constexpr sampler atlasSampler(mag_filter::nearest,

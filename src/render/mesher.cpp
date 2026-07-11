@@ -73,7 +73,7 @@ static void meshFace(
     }
 }
 
-MeshOutput GreedyMesher::buildMesh(Chunk& chunk) {
+MeshOutput GreedyMesher::buildMesh(const Chunk& chunk) {
     MeshOutput output;
 
     // Pre-allocate reasonable capacity
@@ -570,9 +570,6 @@ MeshOutput GreedyMesher::buildMesh(Chunk& chunk) {
                      output.vertices, output.indices, emitQuad);
         }
     }
-
-    // Mark chunk as meshed
-    chunk.setMeshed(true);
 
     return output;
 }

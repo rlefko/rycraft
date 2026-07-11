@@ -168,11 +168,35 @@ void MegaBuffer::free(ChunkAllocation& alloc) {
     if (alloc.vertexCount > 0) {
         uint64_t vertexBytes = alignUp(alloc.vertexCount * sizeof(Vertex));
         _vertexFreeList.push_back({alloc.vertexOffset, vertexBytes});
+        // Merge adjacent regions
+        std::sort(_vertexFreeList.begin(), _vertexFreeList.end());
+        auto writeIt = _vertexFreeList.begin();
+        for (auto readIt = _vertexFreeList.begin(); readIt != _vertexFreeList.end(); ++readIt) {
+            if (readIt != writeIt &&
+                (*writeIt).first + (*writeIt).second == readIt->first) {
+                (*writeIt).second += readIt->second;
+            } else {
+                *(++writeIt) = *readIt;
+            }
+        }
+        _vertexFreeList.erase(writeIt, _vertexFreeList.end());
     }
 
     if (alloc.indexCount > 0) {
         uint64_t indexBytes = alignUp(alloc.indexCount * sizeof(uint32_t));
         _indexFreeList.push_back({alloc.indexOffset, indexBytes});
+        // Merge adjacent regions
+        std::sort(_indexFreeList.begin(), _indexFreeList.end());
+        auto writeIt = _indexFreeList.begin();
+        for (auto readIt = _indexFreeList.begin(); readIt != _indexFreeList.end(); ++readIt) {
+            if (readIt != writeIt &&
+                (*writeIt).first + (*writeIt).second == readIt->first) {
+                (*writeIt).second += readIt->second;
+            } else {
+                *(++writeIt) = *readIt;
+            }
+        }
+        _indexFreeList.erase(writeIt, _indexFreeList.end());
     }
 
     alloc.vertexBuffer = nil;
@@ -184,19 +208,9 @@ void MegaBuffer::free(ChunkAllocation& alloc) {
 }
 
 uint64_t MegaBuffer::vertexUsed() const {
-    std::lock_guard lock(_mutex);
-    uint64_t totalFree = 0;
-    for (const auto& region : _vertexFreeList) {
-        totalFree += region.second;
-    }
-    return _vertexSize > totalFree ? _vertexSize - totalFree : 0;
+    return _vertexPtr;
 }
 
 uint64_t MegaBuffer::indexUsed() const {
-    std::lock_guard lock(_mutex);
-    uint64_t totalFree = 0;
-    for (const auto& region : _indexFreeList) {
-        totalFree += region.second;
-    }
-    return _indexSize > totalFree ? _indexSize - totalFree : 0;
+    return _indexPtr;
 }

@@ -1188,14 +1188,22 @@ TEST_CASE("GreedyMesher vertical column merges side faces", "[render][mesher]") 
     REQUIRE(foundSideQuad);
 }
 
-TEST_CASE("GreedyMesher marks chunk as meshed", "[render][mesher]") {
+TEST_CASE("GreedyMesher produces mesh without side effects", "[render][mesher]") {
     Chunk chunk(0, 0);
     chunk.setBlock(8, 64, 8, BlockType::STONE);
     REQUIRE(chunk.needsMeshUpdate == true);
 
     GreedyMesher mesher;
-    mesher.buildMesh(chunk);
+    MeshOutput mesh = mesher.buildMesh(chunk);
 
-    REQUIRE(chunk.needsMeshUpdate == false);
+    // buildMesh is pure — it does not modify the chunk
+    REQUIRE(chunk.needsMeshUpdate == true);
+    REQUIRE(mesh.vertices.size() > 0u);
+    REQUIRE(mesh.indices.size() > 0u);
+
+    // Caller is responsible for marking the chunk as meshed
+    chunk.setMeshed(true);
+    chunk.needsMeshUpdate = false;
     REQUIRE(chunk.meshed == true);
+    REQUIRE(chunk.needsMeshUpdate == false);
 }

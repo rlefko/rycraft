@@ -11,6 +11,10 @@ struct Chunk;
 struct MeshOutput {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
+
+    MeshOutput() = default;
+    MeshOutput(MeshOutput&&) = default;
+    MeshOutput& operator=(MeshOutput&&) = default;
 };
 
 // Binary greedy mesher — builds triangle mesh from a Chunk's block data.
@@ -23,6 +27,6 @@ struct MeshOutput {
 // Target: <200 us per 16×16×256 chunk.
 class GreedyMesher {
 public:
-    // Build mesh for the given chunk. Marks chunk as meshed on success.
-    MeshOutput buildMesh(Chunk& chunk);
+    // Build mesh for the given chunk (pure: no side effects on chunk).
+    MeshOutput buildMesh(const Chunk& chunk);
 };
