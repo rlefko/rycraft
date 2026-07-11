@@ -9,19 +9,18 @@
 // ---------------------------------------------------------------------------
 ThreadPool::ThreadPool(size_t numWorkers) {
   for (size_t i = 0; i < numWorkers; ++i) {
-    workers_.emplace_back([this](std::stop_token stopToken) {
+    workers_.emplace_back([this]() {
       while (true) {
         std::function<void()> task;
 
         {
           std::unique_lock<std::mutex> lock(queueMutex_);
-          condition_.wait(lock, [this, &stopToken]() {
-            return stop_ || !tasks_.empty() ||
-                   stopToken.stop_requested();
+          condition_.wait_for(lock, std::chrono::milliseconds(50), [this]() {
+            return stop_.load() || !tasks_.empty();
           });
 
-          // Exit if shutdown requested and no work remaining
-          if (tasks_.empty() && (stop_ || stopToken.stop_requested())) {
+          // Exit only when stop is requested AND queue is drained
+          if (stop_.load() && tasks_.empty()) {
             return;
           }
 
@@ -49,13 +48,14 @@ ThreadPool::ThreadPool(size_t numWorkers) {
 }
 
 ThreadPool::~ThreadPool() {
-  {
-    std::lock_guard<std::mutex> lock(queueMutex_);
-    stop_ = true;
-    // Drain remaining tasks to avoid hanging futures
-    while (!tasks_.empty()) tasks_.pop();
-  }
+  // Signal shutdown
+  stop_.store(true);
   condition_.notify_all();
-  // jthread destructor requests stop and joins automatically.
-  // Workers exit their loop after seeing stop_ and return from emplace_back's lambda.
+
+  // Explicitly join all worker threads
+  for (auto& worker : workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
 }

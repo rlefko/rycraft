@@ -71,7 +71,7 @@ struct Chunk {
     std::array<int, CHUNK_WIDTH * CHUNK_DEPTH> heightMap;
 
     // Meshing state
-    bool needsMeshUpdate = true;
+    bool needsMeshUpdate = false;
     bool generated = false;
 
     Chunk(int cx, int cz);

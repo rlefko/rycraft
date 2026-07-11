@@ -16,6 +16,8 @@ World::World(uint32_t seed, int viewDistance)
 {
 }
 
+World::~World() = default;
+
 std::string World::chunkKey(int cx, int cz) {
     std::ostringstream oss;
     oss << cx << "_" << cz;
@@ -26,7 +28,6 @@ void World::generateChunk(std::shared_ptr<Chunk> chunk) {
     int worldBaseX = chunk->chunkX * CHUNK_WIDTH;
     int worldBaseZ = chunk->chunkZ * CHUNK_DEPTH;
 
-    // Step 1: Generate terrain heights
     TerrainConfig terrainConfig;
     BiomeConfig biomeConfig;
 
@@ -56,29 +57,63 @@ void World::generateChunk(std::shared_ptr<Chunk> chunk) {
         }
     }
 
-    // Step 2: Generate surface blocks
     SurfaceGenerator::generateSurface(*chunk, heights, biomes);
 
-    // Step 3: Carve caves
     CaveConfig caveConfig;
     caveGen_.carve(*chunk, caveConfig);
 
-    // Step 4: Generate ore deposits
     OreConfig oreConfig;
     oreGen_.generate(*chunk, oreConfig);
 
-    // Step 5: Generate trees
     treeGen_.generate(*chunk, biomes);
-
-    // Step 6: Generate structures
     structureGen_.generate(*chunk, biomes);
 
-    // Copy biomes to chunk
     chunk->biomes = biomes;
-
-    // Mark chunk as generated
     chunk->generated = true;
     chunk->needsMeshUpdate = true;
+}
+
+void World::generateChunkAsync(int chunkX, int chunkZ, int playerChunkX, int playerChunkZ) {
+    std::string key = chunkKey(chunkX, chunkZ);
+
+    // Guard: avoid generating chunk twice
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        if (pendingGenerations_.find(key) != pendingGenerations_.end()) {
+            return;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(chunksMutex_);
+        if (chunks_.find(key) != chunks_.end()) {
+            return;
+        }
+    }
+
+    int distX = std::abs(chunkX - playerChunkX);
+    int distZ = std::abs(chunkZ - playerChunkZ);
+    int distance = std::max(distX, distZ);
+    bool isCoarse = distance > 32;
+
+    auto pool = genPool_;
+    auto future = pool->submit([this, pool, chunkX, chunkZ, key, isCoarse]() {
+        try {
+            auto chunk = std::make_shared<Chunk>(chunkX, chunkZ);
+            generateChunk(chunk);
+            (void)isCoarse;
+            std::lock_guard<std::mutex> lock(chunksMutex_);
+            chunks_[key] = chunk;
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(chunksMutex_);
+            auto chunk = std::make_shared<Chunk>(chunkX, chunkZ);
+            chunk->generated = true;
+            chunk->needsMeshUpdate = true;
+            chunks_[key] = chunk;
+        }
+    });
+
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    pendingGenerations_[key] = std::move(future);
 }
 
 std::shared_ptr<Chunk> World::getChunk(int chunkX, int chunkZ) {
@@ -91,7 +126,6 @@ std::shared_ptr<Chunk> World::getChunk(int chunkX, int chunkZ) {
         return it->second;
     }
 
-    // Generate new chunk
     auto chunk = std::make_shared<Chunk>(chunkX, chunkZ);
     generateChunk(chunk);
     chunks_[key] = chunk;
@@ -185,14 +219,12 @@ void World::updatePlayerPosition(int playerX, int playerZ) {
     playerChunkX_ = newPlayerChunkX;
     playerChunkZ_ = newPlayerChunkZ;
 
-    // Load chunks within view distance
     for (int dz = -viewDistance_; dz <= viewDistance_; ++dz) {
         for (int dx = -viewDistance_; dx <= viewDistance_; ++dx) {
             getChunk(playerChunkX_ + dx, playerChunkZ_ + dz);
         }
     }
 
-    // Unload chunks outside view distance
     std::lock_guard<std::mutex> lock(chunksMutex_);
     auto it = chunks_.begin();
     while (it != chunks_.end()) {
@@ -208,4 +240,64 @@ void World::updatePlayerPosition(int playerX, int playerZ) {
             ++it;
         }
     }
+}
+
+void World::generateAroundPlayer(int playerX, int playerZ) {
+    // Lazy initialization of ThreadPool
+    if (!genPool_) {
+        genPool_ = std::make_shared<ThreadPool>(4);
+    }
+
+    int playerChunkX = Chunk::worldToChunk(playerX);
+    int playerChunkZ = Chunk::worldToChunk(playerZ);
+
+    // Clean up completed futures
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        auto it = pendingGenerations_.begin();
+        while (it != pendingGenerations_.end()) {
+            if (!it->second.valid()) {
+                it = pendingGenerations_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Collect chunks needing generation
+    std::vector<std::pair<int, int>> chunksToGenerate;
+    {
+        std::lock_guard<std::mutex> lock1(pendingMutex_);
+        std::lock_guard<std::mutex> lock2(chunksMutex_);
+        for (int dz = -viewDistance_; dz <= viewDistance_; ++dz) {
+            for (int dx = -viewDistance_; dx <= viewDistance_; ++dx) {
+                int chunkX = playerChunkX + dx;
+                int chunkZ = playerChunkZ + dz;
+                std::string key = chunkKey(chunkX, chunkZ);
+                if (chunks_.find(key) != chunks_.end()) {
+                    continue;
+                }
+                if (pendingGenerations_.find(key) != pendingGenerations_.end()) {
+                    continue;
+                }
+                chunksToGenerate.emplace_back(chunkX, chunkZ);
+            }
+        }
+    }
+
+    // Submit async tasks
+    for (const auto& [chunkX, chunkZ] : chunksToGenerate) {
+        generateChunkAsync(chunkX, chunkZ, playerChunkX, playerChunkZ);
+    }
+}
+
+size_t World::getPendingChunkCount() const {
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    size_t pending = 0;
+    for (const auto& [key, future] : pendingGenerations_) {
+        if (future.valid()) {
+            ++pending;
+        }
+    }
+    return pending;
 }

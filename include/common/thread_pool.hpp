@@ -42,18 +42,21 @@ public:
     auto task = std::make_shared<std::packaged_task<ReturnType()>>(
         [f = std::forward<F>(f),
          t = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-          try {
-            return std::apply(std::move(f), std::move(t));
-          } catch (...) {
-            std::cerr << "[ThreadPool] Task threw an exception" << std::endl;
-            throw;
-          }
-        });
+         try {
+           return std::apply(std::move(f), std::move(t));
+         } catch (...) {
+           std::cerr << "[ThreadPool] Task threw an exception" << std::endl;
+           throw;
+         }
+       });
 
     std::future<ReturnType> result = task->get_future();
 
     {
       std::lock_guard<std::mutex> lock(queueMutex_);
+      if (stop_.load()) {
+        throw std::runtime_error("ThreadPool is shutting down");
+      }
       tasks_.emplace([task]() { (*task)(); });
     }
 
@@ -65,7 +68,7 @@ public:
   [[nodiscard]] size_t size() const { return workers_.size(); }
 
 private:
-  std::vector<std::jthread> workers_;
+  std::vector<std::thread> workers_;
   std::queue<std::function<void()>> tasks_;
   std::mutex queueMutex_;
   std::condition_variable condition_;

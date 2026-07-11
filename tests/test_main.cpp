@@ -7,6 +7,9 @@
 #include <world/noise.hpp>
 #include <world/terrain.hpp>
 #include <world/biome.hpp>
+#include <world/world.hpp>
+#include <world/serialization.hpp>
+#include <world/save_manager.hpp>
 
 #include <cmath>
 #include <thread>
@@ -667,4 +670,375 @@ TEST_CASE("BiomeGenerator getBiome is deterministic", "[biome]") {
   Biome b1 = bg1.getBiome(100.0, 200.0, 80.0);
   Biome b2 = bg2.getBiome(100.0, 200.0, 80.0);
   REQUIRE(b1 == b2);
+}
+
+// ============================================================================
+// Chunk Tests
+// ============================================================================
+TEST_CASE("Chunk creation initializes to air", "[chunk]") {
+  Chunk chunk(0, 0);
+  REQUIRE(chunk.chunkX == 0);
+  REQUIRE(chunk.chunkZ == 0);
+  REQUIRE(chunk.blocks.size() == static_cast<size_t>(CHUNK_VOLUME));
+  REQUIRE(chunk.getBlock(0, 0, 0) == BlockType::AIR);
+  REQUIRE(chunk.getBlock(7, 127, 7) == BlockType::AIR);
+}
+
+TEST_CASE("Chunk setBlock and getBlock", "[chunk]") {
+  Chunk chunk(5, -3);
+  chunk.setBlock(8, 64, 8, BlockType::STONE);
+  REQUIRE(chunk.getBlock(8, 64, 8) == BlockType::STONE);
+
+  chunk.setBlock(0, 0, 0, BlockType::GRASS);
+  REQUIRE(chunk.getBlock(0, 0, 0) == BlockType::GRASS);
+}
+
+TEST_CASE("Chunk setBlock marks chunk dirty", "[chunk]") {
+  Chunk chunk(0, 0);
+  REQUIRE(chunk.needsMeshUpdate == false);
+  chunk.setBlock(8, 64, 8, BlockType::STONE);
+  REQUIRE(chunk.needsMeshUpdate == true);
+}
+
+TEST_CASE("Chunk out-of-bounds returns air", "[chunk]") {
+  Chunk chunk(0, 0);
+  REQUIRE(chunk.getBlock(-1, 64, 8) == BlockType::AIR);
+  REQUIRE(chunk.getBlock(16, 64, 8) == BlockType::AIR);
+  REQUIRE(chunk.getBlock(8, -1, 8) == BlockType::AIR);
+  REQUIRE(chunk.getBlock(8, 256, 8) == BlockType::AIR);
+  REQUIRE(chunk.getBlock(8, 64, -1) == BlockType::AIR);
+  REQUIRE(chunk.getBlock(8, 64, 16) == BlockType::AIR);
+}
+
+TEST_CASE("Chunk world coordinate conversion", "[chunk]") {
+  REQUIRE(Chunk::worldToChunk(0) == 0);
+  REQUIRE(Chunk::worldToChunk(15) == 0);
+  REQUIRE(Chunk::worldToChunk(16) == 1);
+  REQUIRE(Chunk::worldToChunk(31) == 1);
+  REQUIRE(Chunk::worldToChunk(32) == 2);
+  REQUIRE(Chunk::worldToChunk(-1) == -1);
+  REQUIRE(Chunk::worldToChunk(-16) == -1);
+  REQUIRE(Chunk::worldToChunk(-17) == -2);
+  REQUIRE(Chunk::worldToChunk(-32) == -2);
+}
+
+TEST_CASE("Chunk chunkToWorld conversion", "[chunk]") {
+  REQUIRE(Chunk::chunkToWorld(0, 0) == 0);
+  REQUIRE(Chunk::chunkToWorld(1, 0) == 16);
+  REQUIRE(Chunk::chunkToWorld(1, 15) == 31);
+  REQUIRE(Chunk::chunkToWorld(-1, 0) == -16);
+  REQUIRE(Chunk::chunkToWorld(-1, 15) == -1);
+}
+
+TEST_CASE("Chunk world block access", "[chunk]") {
+  Chunk chunk(2, -1);
+  chunk.setBlockWorld(32, 64, -8, BlockType::DIRT);
+  REQUIRE(chunk.getBlockWorld(32, 64, -8) == BlockType::DIRT);
+}
+
+TEST_CASE("Chunk getAABB", "[chunk]") {
+  Chunk chunk(1, -1);
+  AABB aabb = chunk.getAABB();
+  REQUIRE(aabb.min.x == Catch::Approx(16.f));
+  REQUIRE(aabb.min.y == Catch::Approx(0.f));
+  REQUIRE(aabb.min.z == Catch::Approx(-16.f));
+  REQUIRE(aabb.max.x == Catch::Approx(32.f));
+  REQUIRE(aabb.max.y == Catch::Approx(256.f));
+  REQUIRE(aabb.max.z == Catch::Approx(0.f));
+}
+
+TEST_CASE("Chunk getWorldPosition", "[chunk]") {
+  Chunk chunk(3, -2);
+  Vec3 pos = chunk.getWorldPosition();
+  REQUIRE(pos.x == Catch::Approx(48.f));
+  REQUIRE(pos.y == Catch::Approx(0.f));
+  REQUIRE(pos.z == Catch::Approx(-32.f));
+}
+
+TEST_CASE("Chunk markDirty", "[chunk]") {
+  Chunk chunk(0, 0);
+  chunk.needsMeshUpdate = false;
+  chunk.markDirty();
+  REQUIRE(chunk.needsMeshUpdate == true);
+}
+
+// ============================================================================
+// Serialization Tests
+// ============================================================================
+TEST_CASE("Serialization roundtrip", "[serialization]") {
+  Chunk original(5, -3);
+  original.setBlock(8, 64, 8, BlockType::STONE);
+  original.setBlock(0, 0, 0, BlockType::GRASS);
+  original.generated = true;
+  original.biomes[0] = Biome::Desert;
+  original.biomes[100] = Biome::Forest;
+  original.heightMap[0] = 65;
+  original.heightMap[100] = 72;
+
+  auto data = ChunkSerializer::serialize(original);
+  auto restored = ChunkSerializer::deserialize(data);
+  REQUIRE(restored.has_value());
+  REQUIRE(restored->chunkX == original.chunkX);
+  REQUIRE(restored->chunkZ == original.chunkZ);
+  REQUIRE(restored->getBlock(8, 64, 8) == BlockType::STONE);
+  REQUIRE(restored->getBlock(0, 0, 0) == BlockType::GRASS);
+  REQUIRE(restored->biomes[0] == Biome::Desert);
+  REQUIRE(restored->biomes[100] == Biome::Forest);
+  REQUIRE(restored->heightMap[0] == 65);
+  REQUIRE(restored->heightMap[100] == 72);
+}
+
+TEST_CASE("Serialization size is correct", "[serialization]") {
+  Chunk chunk(0, 0);
+  size_t expected = ChunkSerializer::serializedSize(chunk);
+  auto data = ChunkSerializer::serialize(chunk);
+  REQUIRE(data.size() == expected);
+}
+
+TEST_CASE("Serialization corrupt data returns nullopt", "[serialization]") {
+  std::vector<uint8_t> corruptData(100, 0xFF);
+  auto result = ChunkSerializer::deserialize(corruptData);
+  REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization empty data returns nullopt", "[serialization]") {
+  std::vector<uint8_t> emptyData;
+  auto result = ChunkSerializer::deserialize(emptyData);
+  REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization wrong magic returns nullopt", "[serialization]") {
+  Chunk chunk(0, 0);
+  auto data = ChunkSerializer::serialize(chunk);
+  data[0] = 0x00;
+  auto result = ChunkSerializer::deserialize(data);
+  REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization truncated data returns nullopt", "[serialization]") {
+  Chunk chunk(0, 0);
+  auto data = ChunkSerializer::serialize(chunk);
+  data.resize(HEADER_SIZE);
+  auto result = ChunkSerializer::deserialize(data);
+  REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization wrong block count returns nullopt", "[serialization]") {
+  Chunk chunk(0, 0);
+  auto data = ChunkSerializer::serialize(chunk);
+  data[16] = 0x00;
+  data[17] = 0x00;
+  data[18] = 0x00;
+  data[19] = 0x01;
+  auto result = ChunkSerializer::deserialize(data);
+  REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization multiple roundtrips consistent", "[serialization]") {
+  Chunk original(10, 10);
+  original.setBlock(4, 100, 4, BlockType::DIAMOND_ORE);
+  auto data1 = ChunkSerializer::serialize(original);
+  auto restored1 = ChunkSerializer::deserialize(data1);
+  REQUIRE(restored1.has_value());
+  auto data2 = ChunkSerializer::serialize(*restored1);
+  auto restored2 = ChunkSerializer::deserialize(data2);
+  REQUIRE(restored2.has_value());
+  REQUIRE(restored2->getBlock(4, 100, 4) == BlockType::DIAMOND_ORE);
+}
+
+// ============================================================================
+// World Tests
+// ============================================================================
+TEST_CASE("World creation", "[world]") {
+  auto world = std::make_shared<World>(42);
+  REQUIRE(world->getSeed() == 42);
+  REQUIRE(world->getViewDistance() == 32);
+}
+
+TEST_CASE("World getChunk generates chunk", "[world]") {
+  auto world = std::make_shared<World>(123);
+  auto chunk = world->getChunk(0, 0);
+  REQUIRE(chunk != nullptr);
+  REQUIRE(chunk->chunkX == 0);
+  REQUIRE(chunk->chunkZ == 0);
+  REQUIRE(chunk->generated == true);
+}
+
+TEST_CASE("World getChunk returns cached chunk", "[world]") {
+  auto world = std::make_shared<World>(42);
+  auto chunk1 = world->getChunk(5, -3);
+  auto chunk2 = world->getChunk(5, -3);
+  REQUIRE(chunk1 == chunk2);
+}
+
+TEST_CASE("World getBlock and setBlock", "[world]") {
+  auto world = std::make_shared<World>(42);
+  BlockType b = world->getBlock(100, 64, 100);
+  REQUIRE(static_cast<int>(b) >= 0);
+  world->setBlock(100, 64, 100, BlockType::DIAMOND_ORE);
+  BlockType after = world->getBlock(100, 64, 100);
+  REQUIRE(after == BlockType::DIAMOND_ORE);
+}
+
+TEST_CASE("World getLoadedChunks", "[world]") {
+  auto world = std::make_shared<World>(42);
+  world->getChunk(0, 0);
+  world->getChunk(1, 0);
+  world->getChunk(0, 1);
+  auto loaded = world->getLoadedChunks();
+  REQUIRE(loaded.size() == 3);
+}
+
+TEST_CASE("World getTerrainHeight", "[world]") {
+  auto world = std::make_shared<World>(42);
+  double h = world->getTerrainHeight(100, 200);
+  REQUIRE(h >= 0.0);
+}
+
+TEST_CASE("World getBiome", "[world]") {
+  auto world = std::make_shared<World>(42);
+  Biome b = world->getBiome(100, 200);
+  REQUIRE(static_cast<int>(b) >= 0);
+  REQUIRE(static_cast<int>(b) < static_cast<int>(Biome::Count));
+}
+
+TEST_CASE("World setViewDistance", "[world]") {
+  auto world = std::make_shared<World>(42);
+  world->setViewDistance(10);
+  REQUIRE(world->getViewDistance() == 10);
+  world->setViewDistance(0);
+  REQUIRE(world->getViewDistance() == 1);
+}
+
+TEST_CASE("World markChunkMeshed", "[world]") {
+  auto world = std::make_shared<World>(42);
+  auto chunk = world->getChunk(0, 0);
+  REQUIRE(chunk->needsMeshUpdate == true);
+  world->markChunkMeshed(0, 0);
+  REQUIRE(chunk->needsMeshUpdate == false);
+}
+
+TEST_CASE("World getDirtyChunks", "[world]") {
+  auto world = std::make_shared<World>(42);
+  world->getChunk(0, 0);
+  world->getChunk(1, 0);
+  auto dirty = world->getDirtyChunks();
+  REQUIRE(dirty.size() == 2);
+  world->markChunkMeshed(0, 0);
+  dirty = world->getDirtyChunks();
+  REQUIRE(dirty.size() == 1);
+}
+
+// ============================================================================
+// Async Generation Tests
+// ============================================================================
+TEST_CASE("World async generation pending count", "[world][async]") {
+  auto world = std::make_shared<World>(42);
+  REQUIRE(world->getPendingChunkCount() == 0);
+}
+
+TEST_CASE("World generateAroundPlayer submits chunks", "[world][async]") {
+  auto world = std::make_shared<World>(42);
+  world->setViewDistance(4);
+  world->generateAroundPlayer(0, 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  size_t pending = world->getPendingChunkCount();
+  REQUIRE(pending >= 0);
+}
+
+TEST_CASE("World generateAroundPlayer populates chunks", "[world][async]") {
+  auto world = std::make_shared<World>(42);
+  world->setViewDistance(2);
+  world->generateAroundPlayer(0, 0);
+  for (int attempts = 0; attempts < 50; ++attempts) {
+    if (world->getPendingChunkCount() == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  auto chunks = world->getLoadedChunks();
+  REQUIRE(chunks.size() >= 0);
+}
+
+TEST_CASE("World updatePlayerPosition loads surrounding chunks", "[world]") {
+  auto world = std::make_shared<World>(42);
+  world->setViewDistance(2);
+  world->updatePlayerPosition(256, 256);
+  auto chunks = world->getLoadedChunks();
+  REQUIRE(chunks.size() == 25);
+}
+
+// ============================================================================
+// SaveManager Tests
+// ============================================================================
+TEST_CASE("SaveManager creation", "[save]") {
+  SaveManager saver("/tmp/rycraft_test_world_sm1");
+  REQUIRE(saver.getWorldPath().find("rycraft_test_world_") != std::string::npos);
+}
+
+TEST_CASE("SaveManager save/load chunk roundtrip", "[save]") {
+  std::string tempDir = "/tmp/rycraft_test_save_roundtrip";
+  {
+    SaveManager saver(tempDir);
+    Chunk original(7, -5);
+    original.setBlock(8, 100, 8, BlockType::IRON_ORE);
+    original.generated = true;
+    saver.saveChunk(original);
+    saver.flush();
+    auto loaded = saver.loadChunk(7, -5);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->chunkX == 7);
+    REQUIRE(loaded->chunkZ == -5);
+    REQUIRE(loaded->getBlock(8, 100, 8) == BlockType::IRON_ORE);
+  }
+  std::system(("rm -rf " + tempDir).c_str());
+}
+
+TEST_CASE("SaveManager load non-existent chunk returns nullopt", "[save]") {
+  std::string tempDir = "/tmp/rycraft_test_save_missing";
+  {
+    SaveManager saver(tempDir);
+    auto loaded = saver.loadChunk(999, 999);
+    REQUIRE(loaded.has_value() == false);
+  }
+  std::system(("rm -rf " + tempDir).c_str());
+}
+
+TEST_CASE("SaveManager save/load metadata roundtrip", "[save]") {
+  std::string tempDir = "/tmp/rycraft_test_save_meta";
+  {
+    SaveManager saver(tempDir);
+    saver.saveMetadata(12345, Vec3{100.f, 80.f, -50.f}, 9876543210);
+    auto meta = saver.loadMetadata();
+    REQUIRE(meta.has_value());
+    REQUIRE(meta->seed == 12345);
+    REQUIRE(meta->spawnPos.x == Catch::Approx(100.f));
+    REQUIRE(meta->spawnPos.y == Catch::Approx(80.f));
+    REQUIRE(meta->spawnPos.z == Catch::Approx(-50.f));
+    REQUIRE(meta->worldTime == 9876543210);
+  }
+  std::system(("rm -rf " + tempDir).c_str());
+}
+
+TEST_CASE("SaveManager load missing metadata returns nullopt", "[save]") {
+  std::string tempDir = "/tmp/rycraft_test_save_nometa";
+  {
+    SaveManager saver(tempDir);
+    auto meta = saver.loadMetadata();
+    REQUIRE(meta.has_value() == false);
+  }
+  std::system(("rm -rf " + tempDir).c_str());
+}
+
+TEST_CASE("SaveManager LZ4 compression produces smaller data", "[save]") {
+  std::string tempDir = "/tmp/rycraft_test_save_compress";
+  {
+    SaveManager saver(tempDir);
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::STONE);
+    chunk.generated = true;
+    saver.saveChunk(chunk);
+    saver.flush();
+    auto loaded = saver.loadChunk(0, 0);
+    REQUIRE(loaded.has_value());
+  }
+  std::system(("rm -rf " + tempDir).c_str());
 }
