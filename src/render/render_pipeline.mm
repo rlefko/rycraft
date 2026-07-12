@@ -241,46 +241,24 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         RY_LOG_FATAL("Failed to allocate highlight uniforms buffer");
     }
 
-    // ---- MSAA textures (at render resolution) ----
-    auto colorMSAADesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                             width:_renderWidth
-                                                                            height:_renderHeight
-                                                                        mipmapped:false];
-    colorMSAADesc.usage = MTLTextureUsageRenderTarget;
-    colorMSAADesc.sampleCount = 4;
-    _colorMSAA = [_device newTextureWithDescriptor:colorMSAADesc];
-    if (!_colorMSAA) {
-        RY_LOG_FATAL("Failed to allocate MSAA color texture");
-    }
-
-    // Depth32Float_Stencil8 is required for MSAA depth textures —
-    // plain Depth32Float does not support multi-sampling.
-    auto depthMSAADesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
-                                                                              width:_renderWidth
-                                                                             height:_renderHeight
-                                                                         mipmapped:false];
-    depthMSAADesc.usage = MTLTextureUsageRenderTarget;
-    depthMSAADesc.sampleCount = 4;
-    _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
-    if (!_depthMSAA) {
-        RY_LOG_FATAL("Failed to allocate MSAA depth texture");
-    }
-
-    // ---- Resolve textures (single-sample, at render resolution) ----
+    // ---- Render target textures (single-sample, at render resolution) ----
+    // MSAA disabled: sampleCount=4 crashes on M4 Max with assertion
+    // "MTLTextureDescriptor has sampleCount set but is using a type that
+    // does not allow sampleCount". Render directly to resolve textures.
     auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                  width:_renderWidth
-                                                                                 height:_renderHeight
-                                                                             mipmapped:false];
-    colorResolveDesc.usage = MTLTextureUsageRenderTarget;
+                                                                                   width:_renderWidth
+                                                                                  height:_renderHeight
+                                                                              mipmapped:false];
+    colorResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
     if (!_colorResolve) {
         RY_LOG_FATAL("Failed to allocate color resolve texture");
     }
 
     auto depthResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                 width:_renderWidth
-                                                                                height:_renderHeight
-                                                                            mipmapped:false];
+                                                                                  width:_renderWidth
+                                                                                 height:_renderHeight
+                                                                             mipmapped:false];
     _depthResolve = [_device newTextureWithDescriptor:depthResolveDesc];
     if (!_depthResolve) {
         RY_LOG_FATAL("Failed to allocate depth resolve texture");
@@ -396,18 +374,13 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     // ---- Main render pass descriptor (render at half-resolution for upscaling) ----
     auto renderPassDesc = [[MTLRenderPassDescriptor alloc] init];
 
-    // Color attachment: render to MSAA, resolve to _colorResolve.
-    //
-    // Deferred store optimization: MTLStoreActionMultisampleResolve resolves the
-    // 4x MSAA samples into _colorResolve and discards the MSAA texture contents.
-    // The MSAA texture is never read back, saving memory bandwidth. When bloom is
-    // active, _colorResolve feeds the bloom extract pass; when bloom is off,
-    // _colorResolve feeds the upscaler directly. Either way, the MSAA texture
-    // itself is a throwaway intermediate — exactly what MultisampleResolve provides.
-    renderPassDesc.colorAttachments[0].texture = _colorMSAA;
-    renderPassDesc.colorAttachments[0].resolveTexture = _colorResolve;
+    // Color attachment: render directly to _colorResolve (MSAA disabled).
+    // Deferred store: MTLStoreActionStore keeps _colorResolve for bloom/upscale.
+    // When bloom is active, _colorResolve feeds the bloom extract pass; when
+    // bloom is off, _colorResolve feeds the upscaler directly.
+    renderPassDesc.colorAttachments[0].texture = _colorResolve;
     renderPassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
-    renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+    renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
     renderPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(
         skyUniforms.horizonColor[0],
         skyUniforms.horizonColor[1],
@@ -415,11 +388,10 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
         1.0f
     );
 
-    // Depth attachment: render to MSAA depth, resolve to single-sample
-    renderPassDesc.depthAttachment.texture = _depthMSAA;
-    renderPassDesc.depthAttachment.resolveTexture = _depthResolve;
+    // Depth attachment: render directly to _depthResolve (MSAA disabled)
+    renderPassDesc.depthAttachment.texture = _depthResolve;
     renderPassDesc.depthAttachment.loadAction = MTLLoadActionClear;
-    renderPassDesc.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
+    renderPassDesc.depthAttachment.storeAction = MTLStoreActionStore;
     renderPassDesc.depthAttachment.clearDepth = 1.0;
 
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
@@ -948,50 +920,24 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
     _renderHeight = height / 2;
 
     // Release old textures
-    _colorMSAA = nil;
     _colorResolve = nil;
-    _depthMSAA = nil;
     _depthResolve = nil;
 
-    // Reallocate MSAA textures at render resolution
-    auto colorMSAADesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                             width:_renderWidth
-                                                                            height:_renderHeight
-                                                                        mipmapped:false];
-    colorMSAADesc.usage = MTLTextureUsageRenderTarget;
-    colorMSAADesc.sampleCount = 4;
-    _colorMSAA = [_device newTextureWithDescriptor:colorMSAADesc];
-    if (!_colorMSAA) {
-        RY_LOG_FATAL("Failed to reallocate MSAA color texture after resize");
-    }
-
-    // Depth32Float_Stencil8 is required for MSAA depth textures
-    auto depthMSAADesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
-                                                                              width:_renderWidth
-                                                                             height:_renderHeight
-                                                                         mipmapped:false];
-    depthMSAADesc.usage = MTLTextureUsageRenderTarget;
-    depthMSAADesc.sampleCount = 4;
-    _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
-    if (!_depthMSAA) {
-        RY_LOG_FATAL("Failed to reallocate MSAA depth texture after resize");
-    }
-
-    // Reallocate resolve textures at render resolution
+    // Reallocate render target textures at render resolution (MSAA disabled)
     auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                  width:_renderWidth
-                                                                                 height:_renderHeight
-                                                                             mipmapped:false];
-    colorResolveDesc.usage = MTLTextureUsageRenderTarget;
+                                                                                   width:_renderWidth
+                                                                                  height:_renderHeight
+                                                                              mipmapped:false];
+    colorResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
     if (!_colorResolve) {
         RY_LOG_FATAL("Failed to reallocate color resolve texture after resize");
     }
 
     auto depthResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                 width:_renderWidth
-                                                                                height:_renderHeight
-                                                                            mipmapped:false];
+                                                                                  width:_renderWidth
+                                                                                 height:_renderHeight
+                                                                             mipmapped:false];
     _depthResolve = [_device newTextureWithDescriptor:depthResolveDesc];
     if (!_depthResolve) {
         RY_LOG_FATAL("Failed to reallocate depth resolve texture after resize");

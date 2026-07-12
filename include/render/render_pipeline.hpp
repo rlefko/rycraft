@@ -134,11 +134,10 @@ private:
     id<MTLDepthStencilState> _cloudDepthState;
     id<MTLBuffer> _cloudUniformsBuffer;
 
-    // MSAA textures (4x) and single-sample resolve targets.
+    // Render target textures (single-sample, at render resolution).
+    // MSAA disabled due to Metal texture creation crash on M4 Max.
     // With upscaling: render at half-resolution, upscale to display.
-    id<MTLTexture> _colorMSAA;
     id<MTLTexture> _colorResolve;
-    id<MTLTexture> _depthMSAA;
     id<MTLTexture> _depthResolve;
 
     // Uniform buffer (512 bytes with fog + camera position).

@@ -169,12 +169,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Pixel formats
     _view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    _view.sampleCount = 4;  // 4x MSAA
-
-    // We manage our own MSAA depth textures in RenderPipeline.
-    // Setting depthStencilPixelFormat here would make MTKView create
-    // its own MSAA depth texture, which conflicts with ours.
-    // (MTLPixelFormatDepth32Float does not support MSAA.)
+    _view.sampleCount = 1;  // MSAA disabled (crashes on M4 Max)
+    _view.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
 
     // Disable automatic setNeedsDisplay — we drive rendering from the game loop
     _view.enableSetNeedsDisplay = false;

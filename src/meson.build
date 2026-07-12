@@ -6,9 +6,12 @@ subdir('entity')
 subdir('audio')
 
 # Copy compiled metallib next to the executable so it's discoverable at runtime
-copy_metallib = run_command(
-  'cp', metallib.full_path(), meson.current_build_dir() / 'pipeline.metallib',
-  check : true,
+copy_metallib = custom_target(
+  'copy_metallib',
+  input : metallib,
+  output : 'pipeline.metallib',
+  command : ['cp', '@INPUT@', '@OUTPUT@'],
+  build_by_default : true,
 )
 
 rycraft_exe = executable('rycraft',
@@ -23,4 +26,5 @@ rycraft_exe = executable('rycraft',
     libaudio,
   ],
   dependencies : [appleframeworks],
+  build_by_default : true,
 )
