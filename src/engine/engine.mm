@@ -169,12 +169,12 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Pixel formats
     _view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    _view.depthStencilPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     _view.sampleCount = 4;  // 4x MSAA
 
-    // Note: MetalFX upscaling will be configured in Phase 8.6.
-    // The depth stencil format is set to Depth32Float to support
-    // MetalFX's depth-based temporal upscaling requirements.
+    // We manage our own MSAA depth textures in RenderPipeline.
+    // Setting depthStencilPixelFormat here would make MTKView create
+    // its own MSAA depth texture, which conflicts with ours.
+    // (MTLPixelFormatDepth32Float does not support MSAA.)
 
     // Disable automatic setNeedsDisplay — we drive rendering from the game loop
     _view.enableSetNeedsDisplay = false;
