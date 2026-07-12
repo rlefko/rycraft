@@ -253,10 +253,12 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         RY_LOG_FATAL("Failed to allocate MSAA color texture");
     }
 
-    auto depthMSAADesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                             width:_renderWidth
-                                                                            height:_renderHeight
-                                                                        mipmapped:false];
+    // Depth32Float_Stencil8 is required for MSAA depth textures —
+    // plain Depth32Float does not support multi-sampling.
+    auto depthMSAADesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                                              width:_renderWidth
+                                                                             height:_renderHeight
+                                                                         mipmapped:false];
     depthMSAADesc.usage = MTLTextureUsageRenderTarget;
     depthMSAADesc.sampleCount = 4;
     _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
@@ -266,9 +268,9 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     // ---- Resolve textures (single-sample, at render resolution) ----
     auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                 width:_renderWidth
-                                                                                height:_renderHeight
-                                                                            mipmapped:false];
+                                                                                  width:_renderWidth
+                                                                                 height:_renderHeight
+                                                                             mipmapped:false];
     colorResolveDesc.usage = MTLTextureUsageRenderTarget;
     _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
     if (!_colorResolve) {
@@ -963,10 +965,11 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
         RY_LOG_FATAL("Failed to reallocate MSAA color texture after resize");
     }
 
-    auto depthMSAADesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                             width:_renderWidth
-                                                                            height:_renderHeight
-                                                                        mipmapped:false];
+    // Depth32Float_Stencil8 is required for MSAA depth textures
+    auto depthMSAADesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+                                                                              width:_renderWidth
+                                                                             height:_renderHeight
+                                                                         mipmapped:false];
     depthMSAADesc.usage = MTLTextureUsageRenderTarget;
     depthMSAADesc.sampleCount = 4;
     _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
@@ -976,9 +979,9 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
 
     // Reallocate resolve textures at render resolution
     auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                 width:_renderWidth
-                                                                                height:_renderHeight
-                                                                            mipmapped:false];
+                                                                                  width:_renderWidth
+                                                                                 height:_renderHeight
+                                                                             mipmapped:false];
     colorResolveDesc.usage = MTLTextureUsageRenderTarget;
     _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
     if (!_colorResolve) {

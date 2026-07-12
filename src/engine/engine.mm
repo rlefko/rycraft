@@ -169,7 +169,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Pixel formats
     _view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    _view.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
+    _view.depthStencilPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
     _view.sampleCount = 4;  // 4x MSAA
 
     // Note: MetalFX upscaling will be configured in Phase 8.6.
