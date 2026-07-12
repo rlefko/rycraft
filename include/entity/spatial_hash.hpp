@@ -22,7 +22,11 @@ public:
     void remove(uint64_t entityId);
 
     // Query entities within a radius of a position
-    std::vector<uint64_t> query(const Vec3& position, float radius) const;
+    std::vector<uint64_t> query(const Vec3& position, float radius,
+                                 const std::unordered_map<uint64_t, Vec3>& entityPositions) const;
+
+    // Query entities within a radius (no distance filter, cell-based only)
+    std::vector<uint64_t> queryCells(const Vec3& position, float radius) const;
 
     // Clear all entries
     void clear();

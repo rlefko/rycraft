@@ -99,9 +99,9 @@ void SpatialHash::remove(uint64_t entityId) {
 }
 
 // ---------------------------------------------------------------------------
-// query — Find all entities within radius of position
+// queryCells — Collect candidates from neighboring cells (no distance filter)
 // ---------------------------------------------------------------------------
-std::vector<uint64_t> SpatialHash::query(const Vec3& position, float radius) const {
+std::vector<uint64_t> SpatialHash::queryCells(const Vec3& position, float radius) const {
     std::vector<uint64_t> results;
 
     // Calculate cell range
@@ -112,24 +112,42 @@ std::vector<uint64_t> SpatialHash::query(const Vec3& position, float radius) con
     int radiusCells = static_cast<int>(std::ceil(radius / cellSize_));
 
     // Collect entity IDs from neighboring cells
-    std::vector<uint64_t> candidates;
-
     for (int cx = centerCX - radiusCells; cx <= centerCX + radiusCells; ++cx) {
         for (int cy = centerCY - radiusCells; cy <= centerCY + radiusCells; ++cy) {
             for (int cz = centerCZ - radiusCells; cz <= centerCZ + radiusCells; ++cz) {
                 int64_t key = cellKey(cx, cy, cz);
                 auto it = grid_.find(key);
                 if (it != grid_.end()) {
-                    candidates.insert(candidates.end(), it->second.begin(), it->second.end());
+                    results.insert(results.end(), it->second.begin(), it->second.end());
                 }
             }
         }
     }
 
-    // Return all candidates from neighboring cells.
-    // The caller should filter by actual entity position if needed.
+    return results;
+}
+
+// ---------------------------------------------------------------------------
+// query — Find all entities within radius with distance filtering
+// ---------------------------------------------------------------------------
+std::vector<uint64_t> SpatialHash::query(const Vec3& position, float radius,
+                                          const std::unordered_map<uint64_t, Vec3>& entityPositions) const {
+    std::vector<uint64_t> results;
+    float radiusSq = radius * radius;
+
+    // Get candidates from neighboring cells
+    auto candidates = queryCells(position, radius);
+
+    // Filter by actual Euclidean distance
     for (uint64_t id : candidates) {
-        results.push_back(id);
+        auto it = entityPositions.find(id);
+        if (it == entityPositions.end()) continue;
+
+        Vec3 diff = it->second - position;
+        float distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
+        if (distSq <= radiusSq) {
+            results.push_back(id);
+        }
     }
 
     return results;

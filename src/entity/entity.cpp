@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // nextId — Monotonically increasing entity UUID
@@ -26,9 +27,9 @@ EntityConfig Entity::getConfig(EntityType type) {
         return {0.7f, 0.9f, 0.025f, Vec3{0.9f, 0.65f, 0.75f}};
     case EntityType::CHICKEN:
         return {0.4f, 0.7f, 0.03f, Vec3{0.95f, 0.95f, 0.9f}};
+    default:
+        std::unreachable();
     }
-    // Fail loud: unreachable
-    return {0.5f, 0.5f, 0.02f, Vec3{1.f, 0.f, 1.f}};
 }
 
 // ---------------------------------------------------------------------------
@@ -146,8 +147,11 @@ void Entity::tick(World& world) {
         tryStepAssist(world, movement.y);
     }
 
-    // 5. Update onGround flag
-    onGround = (std::abs(movement.y) < 1e-6f && velocity.y < 0.f);
+    // 5. Update onGround flag: check if block below feet is solid
+    int footX = static_cast<int>(std::floor(position.x));
+    int footY = static_cast<int>(std::floor(position.y)) - 1;
+    int footZ = static_cast<int>(std::floor(position.z));
+    onGround = PhysicsEngine::isSolid(world, footX, footY, footZ);
 
     // 6. Update AABB
     aabb = computeAABB();

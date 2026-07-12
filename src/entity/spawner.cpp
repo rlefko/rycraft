@@ -3,17 +3,14 @@
 #include "entity/ai.hpp"
 #include "entity/physics.hpp"
 
-#include <cmath>
-#include <cstdlib>
-#include <ctime>
 #include <algorithm>
+#include <cmath>
 
 // ---------------------------------------------------------------------------
 // Spawner constructor
 // ---------------------------------------------------------------------------
 Spawner::Spawner(World& world)
-    : world_(world) {
-    std::srand(static_cast<unsigned>(world.getSeed()));
+    : world_(world), rng_(static_cast<uint64_t>(world.getSeed())) {
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +79,8 @@ bool Spawner::isSpawnValid(int x, int y, int z) {
 // ---------------------------------------------------------------------------
 int Spawner::randomInt(int min, int max) {
     if (min > max) std::swap(min, max);
-    return min + static_cast<int>(std::rand() % (max - min + 1));
+    std::uniform_int_distribution<int> dist(min, max);
+    return dist(rng_);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +165,27 @@ void Spawner::spawnInitialPopulation() {
 // ---------------------------------------------------------------------------
 std::vector<std::shared_ptr<Entity>>& Spawner::getEntities() {
     return entities_;
+}
+
+// ---------------------------------------------------------------------------
+// getEntity — Lookup entity by ID
+// ---------------------------------------------------------------------------
+Entity* Spawner::getEntity(uint64_t entityId) {
+    for (auto& e : entities_) {
+        if (e->id == entityId) return e.get();
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// getEntityPositions — Build position map for spatial hash queries
+// ---------------------------------------------------------------------------
+std::unordered_map<uint64_t, Vec3> Spawner::getEntityPositions() const {
+    std::unordered_map<uint64_t, Vec3> result;
+    for (const auto& e : entities_) {
+        result[e->id] = e->position;
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------

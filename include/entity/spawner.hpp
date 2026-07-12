@@ -7,6 +7,7 @@
 #include <world/biome.hpp>
 
 #include <memory>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +40,12 @@ public:
     // Get all managed entities
     std::vector<std::shared_ptr<Entity>>& getEntities();
 
+    // Get entity by ID (returns nullptr if not found)
+    Entity* getEntity(uint64_t entityId);
+
+    // Get entity positions map for spatial hash queries
+    std::unordered_map<uint64_t, Vec3> getEntityPositions() const;
+
     // Remove a dead entity by ID
     void removeEntity(uint64_t entityId);
 
@@ -65,7 +72,8 @@ private:
     World& world_;
     std::vector<std::shared_ptr<Entity>> entities_;
     SpatialHash spatialHash_;
+    std::mt19937 rng_;
 
     // Random number in [min, max]
-    static int randomInt(int min, int max);
+    int randomInt(int min, int max);
 };

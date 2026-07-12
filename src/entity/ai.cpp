@@ -2,27 +2,24 @@
 #include "entity/entity.hpp"
 #include "entity/physics.hpp"
 #include "entity/spatial_hash.hpp"
+#include "entity/spawner.hpp"
 #include "world/world.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
-#include <ctime>
 #include <random>
 
 // ---------------------------------------------------------------------------
 // Simple deterministic random for AI (seeded per entity ID)
 // ---------------------------------------------------------------------------
 static float entityRandom(uint64_t seed) {
-    // Simple LCG seeded by entity ID for deterministic behavior
+    // MurmurHash3-style finalizer for deterministic per-entity randomness
     static std::mt19937 rng(42);
     static std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    // Use a hash of seed to perturb the random
     uint64_t hash = seed ^ 0x5deece66d;
     hash = (hash ^ (hash >> 9)) * 0xcc9e2d51;
     hash = (hash ^ (hash >> 17)) * 0x1b873593;
     hash = hash ^ (hash >> 13);
-    // Advance rng by hash amount (modulo to keep reasonable)
     for (uint64_t i = 0; i < (hash % 100 + 1); ++i) {
         rng.discard(1);
     }
@@ -32,10 +29,7 @@ static float entityRandom(uint64_t seed) {
 // ---------------------------------------------------------------------------
 // StateMachine
 // ---------------------------------------------------------------------------
-StateMachine::StateMachine() {
-    // Seed random based on time for variety
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
-}
+StateMachine::StateMachine() {}
 
 void StateMachine::transitionTo(AnimalState newState) {
     // Exit current state
@@ -154,13 +148,15 @@ bool StateMachine::shouldStopFollowing(const Vec3& entityPos, const Vec3& player
 // StateMachine::update — Main state machine evaluation
 // ---------------------------------------------------------------------------
 Vec3 StateMachine::update(Entity& entity, World& world,
-                           const Vec3& playerPosition, bool playerMovingToward,
-                           bool playerHoldingFood,
-                           SpatialHash& spatialHash) {
+                            const Vec3& playerPosition, bool playerMovingToward,
+                            bool playerHoldingFood,
+                            Spawner& spawner) {
     stateTimer++;
     idleTimer++;
 
     Vec3 steering = Vec3::zero();
+
+    auto entityPositions = spawner.getEntityPositions();
 
     // Priority 1: FLEE (highest priority, preempts everything)
     if (currentState != AnimalState::FLEE &&
@@ -232,13 +228,13 @@ Vec3 StateMachine::update(Entity& entity, World& world,
     // Priority 4: BREED (when mate nearby and both fed)
     if (currentState != AnimalState::BREED &&
         currentState != AnimalState::EAT &&
-        BehaviorController::canBreed(entity, spatialHash)) {
+        BehaviorController::canBreed(entity, spawner)) {
         transitionTo(AnimalState::BREED);
     }
 
     if (currentState == AnimalState::BREED) {
         if (stateTimer >= 30) {
-            BehaviorController::doBreed(entity, world, spatialHash);
+            BehaviorController::doBreed(entity, spawner);
             transitionTo(AnimalState::IDLE);
             return Vec3::zero();
         }
@@ -278,7 +274,7 @@ Vec3 StateMachine::update(Entity& entity, World& world,
         steering = (toTarget / distToTarget) * entity.getConfig(entity.type).speed;
 
         // Add flocking behavior
-        Vec3 flockForce = FlockingController::computeSteering(entity, spatialHash);
+        Vec3 flockForce = FlockingController::computeSteering(entity, spawner);
         steering = steering + flockForce;
 
         return steering;
@@ -290,8 +286,11 @@ Vec3 StateMachine::update(Entity& entity, World& world,
 // ---------------------------------------------------------------------------
 // FlockingController
 // ---------------------------------------------------------------------------
-Vec3 FlockingController::computeSteering(Entity& entity, const SpatialHash& spatialHash) {
-    auto neighborIds = spatialHash.query(entity.position, COHESION_RADIUS);
+Vec3 FlockingController::computeSteering(Entity& entity, Spawner& spawner) {
+    SpatialHash& spatialHash = spawner.getSpatialHash();
+    auto entityPositions = spawner.getEntityPositions();
+
+    auto neighborIds = spatialHash.query(entity.position, COHESION_RADIUS, entityPositions);
 
     // Remove self from neighbors
     neighborIds.erase(
@@ -301,9 +300,9 @@ Vec3 FlockingController::computeSteering(Entity& entity, const SpatialHash& spat
 
     if (neighborIds.empty()) return Vec3::zero();
 
-    Vec3 separation = computeSeparation(entity, neighborIds, spatialHash);
-    Vec3 alignment = computeAlignment(entity, neighborIds, spatialHash);
-    Vec3 cohesion = computeCohesion(entity, neighborIds, spatialHash);
+    Vec3 separation = computeSeparation(entity, neighborIds, spawner);
+    Vec3 alignment = computeAlignment(entity, neighborIds, spawner);
+    Vec3 cohesion = computeCohesion(entity, neighborIds, spawner);
 
     Vec3 total = separation * SEPARATION_WEIGHT +
                  alignment * ALIGNMENT_WEIGHT +
@@ -312,28 +311,91 @@ Vec3 FlockingController::computeSteering(Entity& entity, const SpatialHash& spat
     return clampForce(total, MAX_FLOCKING_FORCE);
 }
 
-Vec3 FlockingController::computeSeparation(Entity& /*entity*/,
-                                            const std::vector<uint64_t>& /*neighborIds*/,
-                                            const SpatialHash& /*spatialHash*/) {
-    // Separation steering requires entity position data from a manager.
-    // Returns zero when called without entity registry context.
-    return Vec3::zero();
+Vec3 FlockingController::computeSeparation(Entity& entity,
+                                             const std::vector<uint64_t>& neighborIds,
+                                             Spawner& spawner) {
+    Vec3 steer = Vec3::zero();
+    int count = 0;
+
+    for (uint64_t nid : neighborIds) {
+        Entity* neighbor = spawner.getEntity(nid);
+        if (!neighbor) continue;
+
+        Vec3 diff = entity.position - neighbor->position;
+        diff.y = 0.f; // Horizontal only
+        float dist = std::sqrt(diff.x * diff.x + diff.z * diff.z);
+
+        if (dist > 0.01f && dist <= SEPARATION_RADIUS) {
+            steer = steer + diff / (dist * dist); // Weight by inverse distance squared
+            count++;
+        }
+    }
+
+    if (count == 0) return Vec3::zero();
+    steer = steer / count;
+    float len = std::sqrt(steer.x * steer.x + steer.z * steer.z);
+    if (len > 0.01f) {
+        steer = (steer / len) * 0.05f;
+    }
+    return steer;
 }
 
-Vec3 FlockingController::computeAlignment(Entity& /*entity*/,
-                                           const std::vector<uint64_t>& /*neighborIds*/,
-                                           const SpatialHash& /*spatialHash*/) {
-    // Alignment steering requires entity velocity data from a manager.
-    // Returns zero when called without entity registry context.
-    return Vec3::zero();
+Vec3 FlockingController::computeAlignment(Entity& entity,
+                                            const std::vector<uint64_t>& neighborIds,
+                                            Spawner& spawner) {
+    Vec3 avgVel = Vec3::zero();
+    int count = 0;
+
+    for (uint64_t nid : neighborIds) {
+        Entity* neighbor = spawner.getEntity(nid);
+        if (!neighbor) continue;
+
+        Vec3 diff = entity.position - neighbor->position;
+        float distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
+
+        if (distSq <= ALIGNMENT_RADIUS * ALIGNMENT_RADIUS) {
+            avgVel = avgVel + neighbor->velocity;
+            count++;
+        }
+    }
+
+    if (count == 0) return Vec3::zero();
+    avgVel = avgVel / count;
+    float len = avgVel.length();
+    if (len > 0.01f) {
+        avgVel = (avgVel / len) * 0.03f;
+    }
+    return avgVel - entity.velocity * 0.1f;
 }
 
-Vec3 FlockingController::computeCohesion(Entity& /*entity*/,
-                                          const std::vector<uint64_t>& /*neighborIds*/,
-                                          const SpatialHash& /*spatialHash*/) {
-    // Cohesion steering requires entity position data from a manager.
-    // Returns zero when called without entity registry context.
-    return Vec3::zero();
+Vec3 FlockingController::computeCohesion(Entity& entity,
+                                           const std::vector<uint64_t>& neighborIds,
+                                           Spawner& spawner) {
+    Vec3 center = Vec3::zero();
+    int count = 0;
+
+    for (uint64_t nid : neighborIds) {
+        Entity* neighbor = spawner.getEntity(nid);
+        if (!neighbor) continue;
+
+        Vec3 diff = entity.position - neighbor->position;
+        float distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
+
+        if (distSq <= COHESION_RADIUS * COHESION_RADIUS) {
+            center = center + neighbor->position;
+            count++;
+        }
+    }
+
+    if (count == 0) return Vec3::zero();
+    center = center / count;
+    Vec3 steer = center - entity.position;
+    steer.y = 0.f; // Horizontal only
+    float len = std::sqrt(steer.x * steer.x + steer.z * steer.z);
+    if (len > 0.01f) {
+        steer = (steer / len) * 0.02f;
+    }
+    return steer;
 }
 
 Vec3 FlockingController::clampForce(const Vec3& force, float maxForce) {
@@ -408,14 +470,30 @@ void BehaviorController::doEat(Entity& entity, World& world) {
     }
 }
 
-std::optional<uint64_t> BehaviorController::doBreed(Entity& entity, World& world,
-                                                     SpatialHash& spatialHash) {
-    // Find a mate: same type, within 4 blocks, also fed
-    auto neighbors = spatialHash.query(entity.position, 4.0f);
+std::optional<uint64_t> BehaviorController::doBreed(Entity& entity, Spawner& spawner) {
+    SpatialHash& spatialHash = spawner.getSpatialHash();
+    auto entityPositions = spawner.getEntityPositions();
 
-    // We can't access entity data through spatial hash alone
-    // The actual breed logic is handled by the Spawner which has entity references
-    (void)world;
+    // Find a mate: same type, within 4 blocks, also fed
+    auto neighbors = spatialHash.query(entity.position, 4.0f, entityPositions);
+
+    for (uint64_t nid : neighbors) {
+        if (nid == entity.id) continue;
+        Entity* mate = spawner.getEntity(nid);
+        if (!mate) continue;
+        if (mate->type != entity.type) continue;
+        if (!mate->isFed) continue;
+
+        // Found a valid mate, spawn baby
+        auto baby = spawner.spawnBaby(entity.type, entity.position, entity.id);
+        if (baby) {
+            // Reset fed status for both parents
+            entity.isFed = false;
+            mate->isFed = false;
+            return baby->id;
+        }
+    }
+
     return std::nullopt;
 }
 
@@ -450,15 +528,20 @@ bool BehaviorController::isOnGrass(Entity& entity, World& world) {
            world.getBlock(bx, by - 1, bz) == BlockType::GRASS;
 }
 
-bool BehaviorController::canBreed(Entity& entity, SpatialHash& spatialHash) {
+bool BehaviorController::canBreed(Entity& entity, Spawner& spawner) {
     if (!entity.isFed) return false;
 
-    auto neighbors = spatialHash.query(entity.position, 4.0f);
+    SpatialHash& spatialHash = spawner.getSpatialHash();
+    auto entityPositions = spawner.getEntityPositions();
+    auto neighbors = spatialHash.query(entity.position, 4.0f, entityPositions);
 
-    // Need at least one other entity nearby (the actual type/fed check
-    // is done by the Spawner which has full entity references)
     for (uint64_t nid : neighbors) {
-        if (nid != entity.id) return true;
+        if (nid == entity.id) continue;
+        Entity* mate = spawner.getEntity(nid);
+        if (!mate) continue;
+        if (mate->type != entity.type) continue;
+        if (!mate->isFed) continue;
+        return true;
     }
     return false;
 }

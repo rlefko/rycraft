@@ -2646,8 +2646,12 @@ TEST_CASE("Flocking: separation pushes entities apart", "[ai][flocking]") {
     hash.insert(e1->id, e1->position);
     hash.insert(e2->id, e2->position);
 
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[e1->id] = e1->position;
+    positions[e2->id] = e2->position;
+
     // Query near e1 should find e2
-    auto neighbors = hash.query(e1->position, FlockingController::SEPARATION_RADIUS);
+    auto neighbors = hash.query(e1->position, FlockingController::SEPARATION_RADIUS, positions);
     bool foundE2 = false;
     for (uint64_t id : neighbors) {
         if (id == e2->id) {
@@ -2669,8 +2673,12 @@ TEST_CASE("Flocking: alignment matches neighbor velocity", "[ai][flocking]") {
     hash.insert(e1->id, e1->position);
     hash.insert(e2->id, e2->position);
 
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[e1->id] = e1->position;
+    positions[e2->id] = e2->position;
+
     // Alignment should consider neighbor velocities
-    auto neighbors = hash.query(e1->position, FlockingController::ALIGNMENT_RADIUS);
+    auto neighbors = hash.query(e1->position, FlockingController::ALIGNMENT_RADIUS, positions);
     REQUIRE(neighbors.size() >= 2); // Both entities in range
 }
 
@@ -2685,8 +2693,13 @@ TEST_CASE("Flocking: cohesion centers on neighbors", "[ai][flocking]") {
     hash.insert(e2->id, e2->position);
     hash.insert(e3->id, e3->position);
 
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[e1->id] = e1->position;
+    positions[e2->id] = e2->position;
+    positions[e3->id] = e3->position;
+
     // Query from center should find all three
-    auto neighbors = hash.query(e1->position, FlockingController::COHESION_RADIUS);
+    auto neighbors = hash.query(e1->position, FlockingController::COHESION_RADIUS, positions);
     REQUIRE(neighbors.size() >= 3);
 }
 
@@ -2856,7 +2869,10 @@ TEST_CASE("Spatial hash: insert and query finds entity", "[spatial]") {
 
     hash.insert(1, Vec3{0.f, 64.f, 0.f});
 
-    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f);
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[1] = Vec3{0.f, 64.f, 0.f};
+
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f, positions);
     REQUIRE(results.size() == 1);
     REQUIRE(results[0] == 1);
 }
@@ -2868,7 +2884,12 @@ TEST_CASE("Spatial hash: multiple entities in same cell", "[spatial]") {
     hash.insert(2, Vec3{1.f, 64.f, 1.f});
     hash.insert(3, Vec3{2.f, 64.f, 2.f});
 
-    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f);
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[1] = Vec3{0.f, 64.f, 0.f};
+    positions[2] = Vec3{1.f, 64.f, 1.f};
+    positions[3] = Vec3{2.f, 64.f, 2.f};
+
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f, positions);
     REQUIRE(results.size() == 3);
 }
 
@@ -2878,10 +2899,14 @@ TEST_CASE("Spatial hash: entities in different cells", "[spatial]") {
     hash.insert(1, Vec3{0.f, 64.f, 0.f});
     hash.insert(2, Vec3{16.f, 64.f, 16.f}); // Different cell (8-block cells)
 
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[1] = Vec3{0.f, 64.f, 0.f};
+    positions[2] = Vec3{16.f, 64.f, 16.f};
+
     // Query at origin with small radius should only find entity 1
-    auto near = hash.query(Vec3{0.f, 64.f, 0.f}, 5.0f);
+    auto near = hash.query(Vec3{0.f, 64.f, 0.f}, 5.0f, positions);
     // Query at origin with large radius should find both
-    auto far = hash.query(Vec3{0.f, 64.f, 0.f}, 30.0f);
+    auto far = hash.query(Vec3{0.f, 64.f, 0.f}, 30.0f, positions);
 
     REQUIRE(far.size() >= near.size());
 }
@@ -2892,11 +2917,16 @@ TEST_CASE("Spatial hash: remove entity", "[spatial]") {
     hash.insert(1, Vec3{0.f, 64.f, 0.f});
     hash.insert(2, Vec3{1.f, 64.f, 1.f});
 
-    REQUIRE(hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f).size() == 2);
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[1] = Vec3{0.f, 64.f, 0.f};
+    positions[2] = Vec3{1.f, 64.f, 1.f};
+
+    REQUIRE(hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f, positions).size() == 2);
 
     hash.remove(1);
+    positions.erase(1);
 
-    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f);
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f, positions);
     REQUIRE(results.size() == 1);
     REQUIRE(results[0] == 2);
 }
@@ -2910,7 +2940,8 @@ TEST_CASE("Spatial hash: clear removes all", "[spatial]") {
 
     hash.clear();
 
-    auto results = hash.query(Vec3{10.f, 64.f, 10.f}, 50.0f);
+    std::unordered_map<uint64_t, Vec3> positions;
+    auto results = hash.query(Vec3{10.f, 64.f, 10.f}, 50.0f, positions);
     REQUIRE(results.empty());
 }
 
@@ -2928,8 +2959,11 @@ TEST_CASE("Spatial hash: re-insert moves entity to new cell", "[spatial]") {
     hash.insert(1, Vec3{0.f, 64.f, 0.f});
     hash.insert(1, Vec3{20.f, 64.f, 20.f}); // Re-insert far away
 
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[1] = Vec3{20.f, 64.f, 20.f};
+
     // Query at origin should not find entity
-    auto near = hash.query(Vec3{0.f, 64.f, 0.f}, 5.0f);
+    auto near = hash.query(Vec3{0.f, 64.f, 0.f}, 5.0f, positions);
     bool foundNear = false;
     for (uint64_t id : near) {
         if (id == 1) { foundNear = true; break; }
@@ -2937,7 +2971,7 @@ TEST_CASE("Spatial hash: re-insert moves entity to new cell", "[spatial]") {
     REQUIRE(foundNear == false);
 
     // Query far away should find entity
-    auto far = hash.query(Vec3{20.f, 64.f, 20.f}, 5.0f);
+    auto far = hash.query(Vec3{20.f, 64.f, 20.f}, 5.0f, positions);
     bool foundFar = false;
     for (uint64_t id : far) {
         if (id == 1) { foundFar = true; break; }
@@ -2951,8 +2985,29 @@ TEST_CASE("Spatial hash: remove non-existent entity is safe", "[spatial]") {
     // Should not crash
     hash.remove(999);
 
-    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f);
+    std::unordered_map<uint64_t, Vec3> positions;
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f, positions);
     REQUIRE(results.empty());
+}
+
+TEST_CASE("Spatial hash: query filters by distance", "[spatial]") {
+    SpatialHash hash(8.0f);
+
+    hash.insert(1, Vec3{0.f, 64.f, 0.f});
+    hash.insert(2, Vec3{15.f, 64.f, 15.f}); // In adjacent cell but far
+
+    std::unordered_map<uint64_t, Vec3> positions;
+    positions[1] = Vec3{0.f, 64.f, 0.f};
+    positions[2] = Vec3{15.f, 64.f, 15.f};
+
+    // Small radius should only find entity 1
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 5.0f, positions);
+    REQUIRE(results.size() == 1);
+    REQUIRE(results[0] == 1);
+
+    // Large radius should find both
+    auto allResults = hash.query(Vec3{0.f, 64.f, 0.f}, 25.0f, positions);
+    REQUIRE(allResults.size() == 2);
 }
 
 // ---- Spawner Tests ----
@@ -3052,8 +3107,8 @@ TEST_CASE("Spawner: spatial hash is populated on spawn", "[spawner]") {
 
     spawner.spawnEntity(EntityType::SHEEP, Vec3{8.f, 70.f, 8.f});
 
-    auto& hash = spawner.getSpatialHash();
-    auto results = hash.query(Vec3{8.f, 70.f, 8.f}, 10.0f);
+    auto positions = spawner.getEntityPositions();
+    auto results = spawner.getSpatialHash().query(Vec3{8.f, 70.f, 8.f}, 10.0f, positions);
     REQUIRE(results.size() >= 1);
 }
 

@@ -7,8 +7,9 @@
 #include <optional>
 #include <vector>
 
-// Forward declaration
+// Forward declarations
 class SpatialHash;
+class Spawner;
 
 // ---------------------------------------------------------------------------
 // AnimalState — AI behavior states for entity state machine
@@ -49,9 +50,9 @@ public:
     // Evaluate conditions and update state.
     // Returns the velocity offset to apply (AI-driven movement).
     Vec3 update(Entity& entity, World& world,
-                const Vec3& playerPosition, bool playerMovingToward,
-                bool playerHoldingFood,
-                SpatialHash& spatialHash);
+                 const Vec3& playerPosition, bool playerMovingToward,
+                 bool playerHoldingFood,
+                 Spawner& spawner);
 
     // Transition to a new state
     void transitionTo(AnimalState newState);
@@ -112,7 +113,7 @@ public:
     static constexpr float MAX_FLOCKING_FORCE = 0.05f;
 
     // Compute flocking steering force for an entity
-    static Vec3 computeSteering(Entity& entity, const SpatialHash& spatialHash);
+    static Vec3 computeSteering(Entity& entity, Spawner& spawner);
 
     // Clamp force to maximum (exposed for testing)
     static Vec3 clampForce(const Vec3& force, float maxForce);
@@ -120,14 +121,14 @@ public:
 private:
     // Pure functions for each flocking rule
     static Vec3 computeSeparation(Entity& entity,
-                                  const std::vector<uint64_t>& neighborIds,
-                                  const SpatialHash& spatialHash);
+                                   const std::vector<uint64_t>& neighborIds,
+                                   Spawner& spawner);
     static Vec3 computeAlignment(Entity& entity,
-                                 const std::vector<uint64_t>& neighborIds,
-                                 const SpatialHash& spatialHash);
+                                  const std::vector<uint64_t>& neighborIds,
+                                  Spawner& spawner);
     static Vec3 computeCohesion(Entity& entity,
-                                const std::vector<uint64_t>& neighborIds,
-                                const SpatialHash& spatialHash);
+                                 const std::vector<uint64_t>& neighborIds,
+                                 Spawner& spawner);
 };
 
 // ---------------------------------------------------------------------------
@@ -159,16 +160,15 @@ public:
     static void doEat(Entity& entity, World& world);
 
     // Execute breed behavior: find mate, spawn baby
-    static std::optional<uint64_t> doBreed(Entity& entity, World& world,
-                                           SpatialHash& spatialHash);
+    static std::optional<uint64_t> doBreed(Entity& entity, Spawner& spawner);
 
     // Execute follow-player behavior: steer toward player
     static Vec3 computeFollowSteering(const Vec3& entityPos, const Vec3& playerPos,
-                                      float minDistance = 3.0f, float maxDistance = 6.0f);
+                                       float minDistance = 3.0f, float maxDistance = 6.0f);
 
     // Check if entity is standing on grass
     static bool isOnGrass(Entity& entity, World& world);
 
     // Check if entity can breed: mate nearby and both fed
-    static bool canBreed(Entity& entity, SpatialHash& spatialHash);
+    static bool canBreed(Entity& entity, Spawner& spawner);
 };
