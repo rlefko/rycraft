@@ -11,7 +11,12 @@ struct Uniforms {
     float3 sunDirection;   // Normalized direction to the sun
     float3 sunColor;
     float3 ambientColor;
-    float _padding;        // Pad to 16-byte alignment
+    float _padding;
+    // Fog (Phase 8)
+    float3 fogColor;
+    float fogDensity;
+    float3 cameraPosition;
+    float _padding2;
 };
 
 // ---------------------------------------------------------------------------
@@ -37,6 +42,7 @@ struct VertexOutput {
     float3 vNormal;
     float2 vUV;
     float vLight;
+    float3 vWorldPosition; // World-space position for fog calculation
 };
 
 // ---------------------------------------------------------------------------
@@ -55,7 +61,7 @@ float3 getFaceNormal(uint index) {
 }
 
 // ---------------------------------------------------------------------------
-// Vertex shader
+// Vertex shader — passes world position for fog calculation
 // ---------------------------------------------------------------------------
 vertex VertexOutput vertexMain(
     VertexInput in [[stage_in]],
@@ -66,6 +72,7 @@ vertex VertexOutput vertexMain(
     // Transform position through MVP
     float4 worldPos = uniforms.modelMatrix * float4(in.position, 1.0);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
+    out.vWorldPosition = worldPos.xyz;
 
     // Pass through UV
     out.vUV = in.uv;
@@ -86,7 +93,7 @@ vertex VertexOutput vertexMain(
 }
 
 // ---------------------------------------------------------------------------
-// Fragment shader
+// Fragment shader — with distance fog (Phase 8)
 // ---------------------------------------------------------------------------
 fragment float4 fragmentMain(
     VertexOutput in [[stage_in]],
@@ -95,12 +102,23 @@ fragment float4 fragmentMain(
 ) {
     // Nearest-neighbor sampling for crisp voxel textures
     constexpr sampler atlasSampler(mag_filter::nearest,
-                                   min_filter::nearest);
+                                    min_filter::nearest);
 
     float4 texColor = atlas.sample(atlasSampler, in.vUV);
 
     // Combine directional sun light with ambient
     float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight + uniforms.ambientColor);
 
-    return float4(litColor, 1.0);
+    // ---- Distance fog (Phase 8) ----
+    // Use world position passed from vertex shader
+    float distanceToFrag = distance(in.vWorldPosition, uniforms.cameraPosition);
+
+    // Exponential fog: fogFactor = 1.0 - exp(-density * distance)
+    float fogFactor = 1.0f - exp(-uniforms.fogDensity * distanceToFrag);
+    fogFactor = clamp(fogFactor, 0.0f, 1.0f);
+
+    // Blend between fog color and lit color
+    float3 finalColor = mix(uniforms.fogColor, litColor, fogFactor);
+
+    return float4(finalColor, 1.0);
 }

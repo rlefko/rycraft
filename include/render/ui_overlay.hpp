@@ -1,7 +1,9 @@
 #pragma once
 
 #import <Metal/Metal.h>
+
 #include <cstdint>
+#include <array>
 
 // ---------------------------------------------------------------------------
 // UIOverlay — Screen-space orthographic render pass for HUD elements.
@@ -13,7 +15,17 @@
 //   • Pre-allocate fullscreen quad geometry
 //   • Provide drawQuad() for screen-space colored rectangles
 //   • Manage its own pipeline state (orthographic projection)
+//   • Render performance HUD (FPS, chunk count, entity count, frame time)
 // ---------------------------------------------------------------------------
+
+// Performance HUD state (Phase 8)
+struct PerformanceStats {
+    float fps = 0.f;           // Rolling average FPS (60 frames)
+    uint32_t chunkCount = 0;   // Loaded chunks
+    uint32_t entityCount = 0;  // Active entities
+    float frameTimeMs = 0.f;   // Frame time in milliseconds
+};
+
 class UIOverlay {
 public:
     UIOverlay(id<MTLDevice> device,
@@ -29,6 +41,10 @@ public:
                   float x, float y,
                   float w, float h,
                   float r, float g, float b, float a);
+
+    // Draw performance HUD (Phase 8)
+    void drawPerformanceHUD(id<MTLRenderCommandEncoder> encoder,
+                            const PerformanceStats& stats);
 
     // Regenerate quad buffers for new viewport size.
     void resize(uint32_t width, uint32_t height);
@@ -56,4 +72,27 @@ private:
 
     // Build orthographic projection for normalized screen coords.
     void buildProjectionMatrix();
+
+    // ---- Performance HUD helpers (Phase 8) ----
+
+    // 8×8 bitmap font atlas data (procedural characters)
+    static const uint8_t FONT_WIDTH = 8;
+    static const uint8_t FONT_HEIGHT = 8;
+
+    // Get bitmap data for a character (returns 8 bytes, one per row)
+    static std::array<uint8_t, 8> getCharBitmap(char c);
+
+    // Draw a single character at screen position
+    void drawChar(id<MTLRenderCommandEncoder> encoder,
+                  char c, float x, float y,
+                  float r, float g, float b);
+
+    // Draw a string at screen position (returns width in pixels)
+    float drawString(id<MTLRenderCommandEncoder> encoder,
+                     const char* str, float x, float y,
+                     float r, float g, float b);
+
+    // Convert number to string buffer
+    static void intToString(int value, char* buf, size_t bufSize);
+    static void floatToString(float value, char* buf, size_t bufSize);
 };

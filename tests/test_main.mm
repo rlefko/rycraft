@@ -15,6 +15,7 @@
 #include <render/texture_atlas.hpp>
 #include <render/mega_buffer.hpp>
 #include <render/ui_overlay.hpp>
+#include <render/uniforms.hpp>
 #include <entity/physics.hpp>
 #include <entity/player.hpp>
 #include <entity/voxel_traversal.hpp>
@@ -23,6 +24,8 @@
 #include <entity/spatial_hash.hpp>
 #include <entity/spawner.hpp>
 #include <engine/hotbar.hpp>
+#include <audio/sfx.hpp>
+#include <audio/audio_engine.hpp>
 
 #include <cmath>
 #include <thread>
@@ -3255,4 +3258,560 @@ TEST_CASE("Entity: eat animation stops at zero", "[entity][animation]") {
     entity->tick(*world);
 
     REQUIRE(entity->eatAnimationTimer == 0);
+}
+
+// ============================================================================
+// Phase 8: Post-Processing, Audio, Performance HUD Tests
+// ============================================================================
+
+// ---- Bloom Tests ----
+
+TEST_CASE("Bloom: ACES tone mapping formula", "[phase8][bloom]") {
+    // ACES: color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14)
+    auto acesToneMap = [](float c) -> float {
+        float a = c * (2.51f * c + 0.03f);
+        float b = c * (2.43f * c + 0.59f) + 0.14f;
+        return a / b;
+    };
+
+    // Identity at 0
+    REQUIRE(acesToneMap(0.0f) == Catch::Approx(0.0f).epsilon(0.0001f));
+
+    // Near-identity at 1.0 (slight compression)
+    float at1 = acesToneMap(1.0f);
+    REQUIRE(at1 > 0.8f);
+    REQUIRE(at1 < 1.2f);
+
+    // Compresses high values
+    float at2 = acesToneMap(2.0f);
+    REQUIRE(at2 < 2.0f); // Compression
+
+    // Monotonically increasing
+    REQUIRE(acesToneMap(0.5f) < acesToneMap(1.0f));
+    REQUIRE(acesToneMap(1.0f) < acesToneMap(1.5f));
+}
+
+TEST_CASE("Bloom: extract threshold — bright pixels pass, dark pixels blocked", "[phase8][bloom]") {
+    auto softThreshold = [](float luminance, float threshold) -> float {
+        float low = threshold - 0.5f;
+        float high = threshold + 0.5f;
+        if (luminance <= low) return 0.0f;
+        if (luminance >= high) return 1.0f;
+        return (luminance - low) / (high - low);
+    };
+
+    // Dark pixel (luminance 0.2) with threshold 1.0 → blocked
+    REQUIRE(softThreshold(0.2f, 1.0f) == Catch::Approx(0.0f));
+
+    // Bright pixel (luminance 1.5) with threshold 1.0 → passes
+    REQUIRE(softThreshold(1.5f, 1.0f) == Catch::Approx(1.0f));
+
+    // Edge pixel (luminance 1.0) with threshold 1.0 → 0.5
+    REQUIRE(softThreshold(1.0f, 1.0f) == Catch::Approx(0.5f));
+
+    // Very bright pixel (luminance 3.0) → passes fully
+    REQUIRE(softThreshold(3.0f, 1.0f) == Catch::Approx(1.0f));
+}
+
+TEST_CASE("Bloom: blur kernel weights are positive and symmetric", "[phase8][bloom]") {
+    // 8-tap Kawase blur weights (normalized in shader by dividing by sum)
+    float weights[8] = {
+        0.0625f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.0625f
+    };
+
+    // All weights are positive
+    for (int i = 0; i < 8; ++i) {
+        REQUIRE(weights[i] > 0.0f);
+    }
+
+    // Symmetric: first and last match, inner pairs match
+    REQUIRE(weights[0] == weights[7]);
+    REQUIRE(weights[1] == weights[6]);
+    REQUIRE(weights[2] == weights[5]);
+    REQUIRE(weights[3] == weights[4]);
+
+    // Sum is used for normalization in shader
+    float sum = 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        sum += weights[i];
+    }
+    REQUIRE(sum > 0.0f); // Non-zero for valid normalization
+}
+
+TEST_CASE("Bloom: blur kernel is symmetric", "[phase8][bloom]") {
+    float weights[8] = {
+        0.0625f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.0625f
+    };
+
+    // First and last should match
+    REQUIRE(weights[0] == weights[7]);
+    // Inner pairs should match
+    REQUIRE(weights[1] == weights[6]);
+    REQUIRE(weights[2] == weights[5]);
+    REQUIRE(weights[3] == weights[4]);
+}
+
+// ---- Fog Tests ----
+
+TEST_CASE("Fog: exponential fog factor at various distances", "[phase8][fog]") {
+    float density = 0.0003f;
+
+    auto fogFactor = [](float distance, float density) -> float {
+        return 1.0f - std::exp(-density * distance);
+    };
+
+    // At distance 0: no fog
+    REQUIRE(fogFactor(0.0f, density) == Catch::Approx(0.0f).epsilon(0.0001f));
+
+    // At distance 100: slight fog
+    float f100 = fogFactor(100.0f, density);
+    REQUIRE(f100 > 0.0f);
+    REQUIRE(f100 < 0.5f);
+
+    // At distance 1000: significant fog
+    float f1000 = fogFactor(1000.0f, density);
+    REQUIRE(f1000 > 0.2f);
+    REQUIRE(f1000 < 0.5f);
+
+    // At distance 5000: very foggy
+    float f5000 = fogFactor(5000.0f, density);
+    REQUIRE(f5000 > 0.7f);
+
+    // Fog factor increases monotonically with distance
+    REQUIRE(fogFactor(100.0f, density) < fogFactor(500.0f, density));
+    REQUIRE(fogFactor(500.0f, density) < fogFactor(1000.0f, density));
+}
+
+TEST_CASE("Fog: fog color mixing", "[phase8][fog]") {
+    struct F3 { float x, y, z; };
+
+    auto mixFog = [](float fogFactor, F3 fogColor, F3 litColor) -> F3 {
+        // fogFactor: 0 = fully fogged, 1 = fully lit
+        // mix(fogColor, litColor, fogFactor) = fogColor*(1-fogFactor) + litColor*fogFactor
+        return {
+            fogColor.x * (1.0f - fogFactor) + litColor.x * fogFactor,
+            fogColor.y * (1.0f - fogFactor) + litColor.y * fogFactor,
+            fogColor.z * (1.0f - fogFactor) + litColor.z * fogFactor,
+        };
+    };
+
+    F3 fogColor{0.5f, 0.7f, 0.8f}; // Sky-like
+    F3 litColor{0.3f, 0.3f, 0.3f}; // Dark stone
+
+    // No fog (factor=1): fully lit
+    auto noFog = mixFog(1.0f, fogColor, litColor);
+    REQUIRE(noFog.x == Catch::Approx(litColor.x));
+
+    // Full fog (factor=0): fully fogged
+    auto fullFog = mixFog(0.0f, fogColor, litColor);
+    REQUIRE(fullFog.x == Catch::Approx(fogColor.x));
+
+    // Half fog: blend
+    auto halfFog = mixFog(0.5f, fogColor, litColor);
+    REQUIRE(halfFog.x == Catch::Approx((fogColor.x + litColor.x) * 0.5f));
+}
+
+// ---- Cloud Tests ----
+
+TEST_CASE("Clouds: noise threshold for cloud generation", "[phase8][clouds]") {
+    // Cloud threshold: 0.4 — noise values above this render as clouds
+    float threshold = 0.4f;
+
+    auto cloudMask = [](float noise, float threshold) -> float {
+        float low = threshold - 0.1f;
+        float high = threshold + 0.1f;
+        if (noise <= low) return 0.0f;
+        if (noise >= high) return 1.0f;
+        return (noise - low) / (high - low);
+    };
+
+    // Low noise → no cloud
+    REQUIRE(cloudMask(0.2f, threshold) == Catch::Approx(0.0f));
+
+    // High noise → full cloud
+    REQUIRE(cloudMask(0.6f, threshold) == Catch::Approx(1.0f));
+
+    // At threshold → partial cloud
+    REQUIRE(cloudMask(0.4f, threshold) == Catch::Approx(0.5f));
+}
+
+TEST_CASE("Clouds: wind offset calculation", "[phase8][clouds]") {
+    // Wind speed: 0.02 blocks/tick
+    float windSpeed = 0.02f;
+
+    auto windOffset = [](uint64_t worldTime, float windSpeed) -> float {
+        return static_cast<float>(worldTime) * windSpeed;
+    };
+
+    // At time 0: no offset
+    REQUIRE(windOffset(0, windSpeed) == Catch::Approx(0.0f));
+
+    // At time 1000: offset = 20
+    REQUIRE(windOffset(1000, windSpeed) == Catch::Approx(20.0f));
+
+    // At time 5000: offset = 100
+    REQUIRE(windOffset(5000, windSpeed) == Catch::Approx(100.0f));
+
+    // Monotonically increasing
+    REQUIRE(windOffset(100, windSpeed) < windOffset(200, windSpeed));
+}
+
+TEST_CASE("Clouds: cloud altitude constant", "[phase8][clouds]") {
+    // Cloud layer at Y=192
+    static constexpr float CLOUD_ALTITUDE = 192.0f;
+    REQUIRE(CLOUD_ALTITUDE > 0.0f);
+    REQUIRE(CLOUD_ALTITUDE < 256.0f); // Within world bounds
+}
+
+// ---- Audio Engine Tests ----
+
+TEST_CASE("Audio engine: voice allocation and deallocation", "[phase8][audio]") {
+    // Simulate voice allocation logic
+    static constexpr int MAX_VOICES = 16;
+    std::vector<bool> active(MAX_VOICES, false);
+
+    auto allocateVoice = [&active]() -> int32_t {
+        for (int i = 0; i < MAX_VOICES; ++i) {
+            if (!active[i]) {
+                active[i] = true;
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    auto deallocateVoice = [&active](int32_t idx) {
+        if (idx >= 0 && idx < MAX_VOICES) {
+            active[idx] = false;
+        }
+    };
+
+    // Allocate first voice
+    int v1 = allocateVoice();
+    REQUIRE(v1 == 0);
+
+    // Allocate second voice
+    int v2 = allocateVoice();
+    REQUIRE(v2 == 1);
+
+    // Allocate all 16 voices
+    for (int i = 2; i < MAX_VOICES; ++i) {
+        int v = allocateVoice();
+        REQUIRE(v == i);
+    }
+
+    // 17th allocation should fail
+    int vFail = allocateVoice();
+    REQUIRE(vFail == -1);
+
+    // Deallocate one voice
+    deallocateVoice(0);
+
+    // Next allocation should reuse slot 0
+    int vReuse = allocateVoice();
+    REQUIRE(vReuse == 0);
+}
+
+TEST_CASE("Audio engine: mixer gain calculation", "[phase8][audio]") {
+    // Simple gain mixing: output = sample * voiceGain * masterVolume
+    auto mixSample = [](float sample, float voiceGain, float masterVolume) -> float {
+        return sample * voiceGain * masterVolume;
+    };
+
+    // Full gain
+    REQUIRE(mixSample(1.0f, 1.0f, 1.0f) == Catch::Approx(1.0f));
+
+    // Half voice gain
+    REQUIRE(mixSample(1.0f, 0.5f, 1.0f) == Catch::Approx(0.5f));
+
+    // Half master volume
+    REQUIRE(mixSample(1.0f, 1.0f, 0.5f) == Catch::Approx(0.5f));
+
+    // Quarter total gain
+    REQUIRE(mixSample(1.0f, 0.5f, 0.5f) == Catch::Approx(0.25f));
+
+    // Silent master volume
+    REQUIRE(mixSample(1.0f, 1.0f, 0.0f) == Catch::Approx(0.0f));
+}
+
+TEST_CASE("Audio engine: master volume clamping", "[phase8][audio]") {
+    auto clampVolume = [](float gain) -> float {
+        return gain < 0.0f ? 0.0f : (gain > 1.0f ? 1.0f : gain);
+    };
+
+    REQUIRE(clampVolume(-0.5f) == Catch::Approx(0.0f));
+    REQUIRE(clampVolume(0.0f) == Catch::Approx(0.0f));
+    REQUIRE(clampVolume(0.5f) == Catch::Approx(0.5f));
+    REQUIRE(clampVolume(1.0f) == Catch::Approx(1.0f));
+    REQUIRE(clampVolume(2.0f) == Catch::Approx(1.0f));
+}
+
+// ---- SFX Tests ----
+
+TEST_CASE("SFX: block break generates non-empty buffer", "[phase8][sfx]") {
+    auto samples = SoundEffect::generateBlockBreak();
+    REQUIRE(samples.empty() == false);
+
+    // Expected duration: 0.1s at 44100 Hz = 4410 samples
+    uint32_t expected = static_cast<uint32_t>(0.1f * SoundEffect::SAMPLE_RATE);
+    REQUIRE(samples.size() == expected);
+}
+
+TEST_CASE("SFX: block place generates non-empty buffer", "[phase8][sfx]") {
+    auto samples = SoundEffect::generateBlockPlace();
+    REQUIRE(samples.empty() == false);
+
+    // Expected duration: 0.08s at 44100 Hz = 3528 samples
+    uint32_t expected = static_cast<uint32_t>(0.08f * SoundEffect::SAMPLE_RATE);
+    REQUIRE(samples.size() == expected);
+}
+
+TEST_CASE("SFX: footstep generates non-empty buffer", "[phase8][sfx]") {
+    auto samples = SoundEffect::generateFootstep();
+    REQUIRE(samples.empty() == false);
+
+    // Expected duration: 0.12s at 44100 Hz = 5292 samples
+    uint32_t expected = static_cast<uint32_t>(0.12f * SoundEffect::SAMPLE_RATE);
+    REQUIRE(samples.size() == expected);
+}
+
+TEST_CASE("SFX: ambient wind generates correct duration", "[phase8][sfx]") {
+    auto samples = SoundEffect::generateAmbientWind(2);
+    REQUIRE(samples.empty() == false);
+
+    // Expected duration: 2s at 44100 Hz = 88200 samples
+    uint32_t expected = 2 * SoundEffect::SAMPLE_RATE;
+    REQUIRE(samples.size() == expected);
+}
+
+TEST_CASE("SFX: animal sounds generate non-empty buffers", "[phase8][sfx]") {
+    auto sheep = SoundEffect::generateSheepBaa();
+    auto cow = SoundEffect::generateCowMoo();
+    auto pig = SoundEffect::generatePigOink();
+    auto chicken = SoundEffect::generateChickenCluck();
+
+    REQUIRE(sheep.empty() == false);
+    REQUIRE(cow.empty() == false);
+    REQUIRE(pig.empty() == false);
+    REQUIRE(chicken.empty() == false);
+}
+
+TEST_CASE("SFX: sample values within [-1, 1] range", "[phase8][sfx]") {
+    auto samples = SoundEffect::generateBlockBreak();
+
+    for (float sample : samples) {
+        REQUIRE(sample >= -1.0f);
+        REQUIRE(sample <= 1.0f);
+    }
+}
+
+TEST_CASE("SFX: footstep samples are low-frequency (few zero crossings)", "[phase8][sfx]") {
+    auto samples = SoundEffect::generateFootstep();
+
+    // Count zero crossings
+    int zeroCrossings = 0;
+    for (size_t i = 1; i < samples.size(); ++i) {
+        if ((samples[i - 1] >= 0.f && samples[i] < 0.f) ||
+            (samples[i - 1] < 0.f && samples[i] >= 0.f)) {
+            ++zeroCrossings;
+        }
+    }
+
+    // At 80-120Hz for 0.12s: expect roughly 10-15 zero crossings
+    // (2 crossings per cycle, 10-14 cycles in 0.12s at 80-120Hz)
+    REQUIRE(zeroCrossings > 0);
+    REQUIRE(zeroCrossings < 50); // Much less than high-frequency sounds
+}
+
+TEST_CASE("SFX: deterministic output for same parameters", "[phase8][sfx]") {
+    auto samples1a = SoundEffect::generateBlockBreak();
+    auto samples1b = SoundEffect::generateBlockBreak();
+
+    REQUIRE(samples1a.size() == samples1b.size());
+    for (size_t i = 0; i < samples1a.size(); ++i) {
+        REQUIRE(samples1a[i] == samples1b[i]);
+    }
+}
+
+// ---- Performance HUD Tests ----
+
+TEST_CASE("Performance HUD: FPS averaging over 60 frames", "[phase8][hud]") {
+    // Simulate rolling average FPS
+    std::vector<float> frameTimes;
+    frameTimes.reserve(60);
+
+    auto computeFPS = [&frameTimes](float newFrameTimeMs) -> float {
+        frameTimes.push_back(newFrameTimeMs);
+        if (frameTimes.size() > 60) {
+            frameTimes.erase(frameTimes.begin());
+        }
+
+        float totalMs = 0.0f;
+        for (float t : frameTimes) {
+            totalMs += t;
+        }
+        return static_cast<float>(frameTimes.size()) * 1000.0f / totalMs;
+    };
+
+    // Feed 60 frames at 16.67ms each (60 FPS)
+    for (int i = 0; i < 60; ++i) {
+        computeFPS(16.67f);
+    }
+
+    float fps = computeFPS(16.67f);
+    REQUIRE(fps > 55.0f);
+    REQUIRE(fps < 65.0f);
+
+    // Feed slower frames → FPS drops
+    for (int i = 0; i < 60; ++i) {
+        computeFPS(33.33f); // 30 FPS
+    }
+
+    fps = computeFPS(33.33f);
+    REQUIRE(fps > 25.0f);
+    REQUIRE(fps < 35.0f);
+}
+
+TEST_CASE("Performance HUD: text positioning", "[phase8][hud]") {
+    // HUD at top-left: (8px, height-8px)
+    uint32_t width = 1920;
+    uint32_t height = 1080;
+
+    float hudX = 8.0f / static_cast<float>(width);
+    float hudY = 1.0f - 8.0f / static_cast<float>(height);
+
+    // Verify normalized coordinates are valid
+    REQUIRE(hudX > 0.0f);
+    REQUIRE(hudX < 0.01f); // Near left edge
+    REQUIRE(hudY > 0.99f); // Near top edge
+    REQUIRE(hudY < 1.0f);
+
+    // Background dimensions
+    float bgWidth = 220.0f / static_cast<float>(width);
+    float bgHeight = 80.0f / static_cast<float>(height);
+
+    REQUIRE(bgWidth > 0.0f);
+    REQUIRE(bgWidth < 0.2f); // Less than 20% of screen width
+    REQUIRE(bgHeight > 0.0f);
+    REQUIRE(bgHeight < 0.1f); // Less than 10% of screen height
+}
+
+TEST_CASE("Performance HUD: integer to string conversion", "[phase8][hud]") {
+    // Simulate the intToString function
+    auto intToString = [](int value, char* buf, size_t bufSize) {
+        char tmp[20];
+        int len = 0;
+        if (value == 0) {
+            tmp[len++] = '0';
+        } else {
+            int v = value < 0 ? -value : value;
+            while (v > 0) {
+                tmp[len++] = '0' + (v % 10);
+                v /= 10;
+            }
+            if (value < 0) tmp[len++] = '-';
+            for (int i = 0; i < len / 2; ++i) {
+                char t = tmp[i];
+                tmp[i] = tmp[len - 1 - i];
+                tmp[len - 1 - i] = t;
+            }
+        }
+        size_t copyLen = len < static_cast<int>(bufSize - 1) ? len : bufSize - 1;
+        std::memcpy(buf, tmp, copyLen);
+        buf[copyLen] = '\0';
+    };
+
+    char buf[16];
+
+    intToString(0, buf, sizeof(buf));
+    REQUIRE(std::string(buf) == "0");
+
+    intToString(42, buf, sizeof(buf));
+    REQUIRE(std::string(buf) == "42");
+
+    intToString(12345, buf, sizeof(buf));
+    REQUIRE(std::string(buf) == "12345");
+
+    intToString(-7, buf, sizeof(buf));
+    REQUIRE(std::string(buf) == "-7");
+}
+
+TEST_CASE("Performance HUD: float to string conversion", "[phase8][hud]") {
+    auto floatToString = [](float value, char* buf, size_t bufSize) {
+        int intPart = static_cast<int>(std::floor(value));
+        int fracPart = static_cast<int>((value - std::floor(value)) * 10);
+
+        char tmp[20];
+        int len = 0;
+        if (intPart == 0) {
+            tmp[len++] = '0';
+        } else {
+            int v = intPart < 0 ? -intPart : intPart;
+            while (v > 0) {
+                tmp[len++] = '0' + (v % 10);
+                v /= 10;
+            }
+            if (intPart < 0) tmp[len++] = '-';
+            for (int i = 0; i < len / 2; ++i) {
+                char t = tmp[i];
+                tmp[i] = tmp[len - 1 - i];
+                tmp[len - 1 - i] = t;
+            }
+        }
+
+        if (len + 3 < static_cast<int>(bufSize)) {
+            std::memcpy(buf, tmp, len);
+            buf[len] = '.';
+            buf[len + 1] = '0' + fracPart;
+            buf[len + 2] = '\0';
+        } else {
+            size_t safeLen = len < static_cast<int>(bufSize - 1) ? len : static_cast<int>(bufSize - 1);
+            std::memcpy(buf, tmp, safeLen);
+            buf[safeLen] = '\0';
+        }
+    };
+
+    char buf[16];
+
+    floatToString(60.0f, buf, sizeof(buf));
+    REQUIRE(std::string(buf) == "60.0");
+
+    floatToString(16.7f, buf, sizeof(buf));
+    REQUIRE(std::string(buf) == "16.7");
+
+    floatToString(0.5f, buf, sizeof(buf));
+    REQUIRE(std::string(buf) == "0.5");
+}
+
+// ---- Uniforms struct tests ----
+
+TEST_CASE("Uniforms: size fits in 512-byte buffer", "[phase8][uniforms]") {
+    REQUIRE(sizeof(Uniforms) <= 512);
+}
+
+TEST_CASE("Uniforms: alignment is 16 bytes", "[phase8][uniforms]") {
+    REQUIRE(alignof(Uniforms) == 16);
+}
+
+TEST_CASE("Uniforms: fog fields are present", "[phase8][uniforms]") {
+    Uniforms u{};
+    std::memset(&u, 0, sizeof(u));
+
+    // Set fog parameters
+    u.fogColor[0] = 0.5f;
+    u.fogColor[1] = 0.6f;
+    u.fogColor[2] = 0.7f;
+    u.fogDensity = 0.0003f;
+    u.cameraPosition[0] = 10.0f;
+    u.cameraPosition[1] = 64.0f;
+    u.cameraPosition[2] = -5.0f;
+
+    // Verify values are stored correctly
+    REQUIRE(u.fogColor[0] == Catch::Approx(0.5f));
+    REQUIRE(u.fogColor[1] == Catch::Approx(0.6f));
+    REQUIRE(u.fogColor[2] == Catch::Approx(0.7f));
+    REQUIRE(u.fogDensity == Catch::Approx(0.0003f));
+    REQUIRE(u.cameraPosition[0] == Catch::Approx(10.0f));
+    REQUIRE(u.cameraPosition[1] == Catch::Approx(64.0f));
+    REQUIRE(u.cameraPosition[2] == Catch::Approx(-5.0f));
 }

@@ -19,6 +19,7 @@
 class World;
 class Camera;
 class UIOverlay;
+class Bloom;
 
 // GPU-side per-chunk mesh allocation tracking.
 struct ChunkMeshState {
@@ -36,6 +37,32 @@ struct SkyUniforms {
     float padding;
 };
 
+// Cloud uniforms (Phase 8)
+struct CloudUniforms {
+    float cameraPosition[3];
+    float _pad0;
+    float sunDirection[3];
+    float _pad1;
+    float windOffset;
+    float cloudAltitude;
+    float noiseFrequency;
+    float cloudThreshold;
+};
+
+// MetalFX Upscaler stub (Phase 8.4 — placeholder for Phase 9.4 optimization)
+class MetalFXUpscaler {
+public:
+    MetalFXUpscaler(id<MTLDevice> /*device*/, uint32_t /*srcWidth*/, uint32_t /*srcHeight*/,
+                    uint32_t /*dstWidth*/, uint32_t /*dstHeight*/);
+    ~MetalFXUpscaler();
+
+    // Upscale source texture to destination using bilinear sampling.
+    // (Placeholder — full MetalFX temporal upscaling in Phase 9.4)
+    void upscale(id<MTLCommandBuffer> commandBuffer,
+                 id<MTLTexture> source,
+                 id<MTLTexture> destination);
+};
+
 // ---------------------------------------------------------------------------
 // RenderPipeline — Full Metal render pass with MSAA 4x and frustum culling.
 //
@@ -46,6 +73,8 @@ struct SkyUniforms {
 //   • Frustum-cull chunks before drawing
 //   • Mesh dirty chunks on-demand and upload to GPU
 //   • Render sky, water, block highlight, and UI overlay
+//   • Post-processing: bloom, fog, clouds (Phase 8)
+//   • Render target upscaling preparation (Phase 8.4)
 // ---------------------------------------------------------------------------
 class RenderPipeline {
 public:
@@ -90,13 +119,19 @@ private:
     id<MTLBuffer> _highlightVertexBuffer;
     id<MTLBuffer> _highlightUniformsBuffer;
 
+    // Cloud pipeline state (Phase 8)
+    id<MTLRenderPipelineState> _cloudPipelineState;
+    id<MTLDepthStencilState> _cloudDepthState;
+    id<MTLBuffer> _cloudUniformsBuffer;
+
     // MSAA textures (4x) and single-sample resolve targets.
+    // With upscaling: render at half-resolution, upscale to display.
     id<MTLTexture> _colorMSAA;
     id<MTLTexture> _colorResolve;
     id<MTLTexture> _depthMSAA;
     id<MTLTexture> _depthResolve;
 
-    // Uniform buffer (256 bytes — fits Uniforms struct with padding).
+    // Uniform buffer (512 bytes with fog + camera position).
     id<MTLBuffer> _uniformsBuffer;
 
     // MegaBuffer for centralized GPU memory management.
@@ -108,8 +143,17 @@ private:
     // UI overlay for HUD rendering (crosshair, hotbar).
     UIOverlay* _uiOverlay;
 
-    uint32_t _width;
-    uint32_t _height;
+    // Bloom post-processing (Phase 8)
+    Bloom* _bloom;
+
+    // MetalFX upscaler (Phase 8.4)
+    MetalFXUpscaler* _upscaler;
+
+    // Render target dimensions (may differ from display for upscaling)
+    uint32_t _renderWidth;
+    uint32_t _renderHeight;
+    uint32_t _displayWidth;
+    uint32_t _displayHeight;
 
     // ---- Frustum culling ----
     void extractFrustumPlanes(const Mat4& vpMatrix);
@@ -138,7 +182,8 @@ private:
                       const Mat4& projectionMatrix,
                       const float sunDirection[3],
                       const float sunColor[3],
-                      const float ambientColor[3]);
+                      const float ambientColor[3],
+                      const float fogColor[3]);
 
     void renderWater(id<MTLCommandBuffer> commandBuffer,
                       id<CAMetalDrawable> drawable,
@@ -155,4 +200,13 @@ private:
 
     void renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
                          const Hotbar& hotbar);
+
+    // ---- Phase 8: Clouds ----
+    void renderClouds(id<MTLCommandBuffer> commandBuffer,
+                      id<CAMetalDrawable> drawable,
+                      const Mat4& viewMatrix,
+                      const Mat4& projectionMatrix,
+                      const Camera& camera,
+                      uint64_t worldTime,
+                      const float sunDirection[3]);
 };

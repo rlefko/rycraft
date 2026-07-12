@@ -1,0 +1,58 @@
+#pragma once
+
+#include <vector>
+#include <cstdint>
+
+// ---------------------------------------------------------------------------
+// SoundEffect — Procedural sound effect generation.
+//
+// Generates PCM audio samples at 44100 Hz for various game events.
+// All generation functions are pure: same parameters → same output.
+//
+// Sound types:
+//   • Block break: noise burst with frequency sweep (200→800ms, 0.1s)
+//   • Block place: noise burst with frequency sweep (800→200ms, 0.08s)
+//   • Footstep: low-frequency thud (80-120Hz, 0.12s)
+//   • Ambient wind: filtered noise, continuous loop
+//   • Animal: simple tone sequences per entity type
+// ---------------------------------------------------------------------------
+class SoundEffect {
+public:
+    static constexpr uint32_t SAMPLE_RATE = 44100;
+
+    // Block interaction sounds
+    static std::vector<float> generateBlockBreak();
+    static std::vector<float> generateBlockPlace();
+
+    // Movement sounds
+    static std::vector<float> generateFootstep();
+
+    // Environmental sounds
+    static std::vector<float> generateAmbientWind(uint32_t durationSeconds = 4);
+
+    // Entity sounds (tone sequences)
+    static std::vector<float> generateSheepBaa();
+    static std::vector<float> generateCowMoo();
+    static std::vector<float> generatePigOink();
+    static std::vector<float> generateChickenCluck();
+
+    // Internal helpers
+private:
+    // Pure pseudo-random number generator (deterministic)
+    static float randomNoise(uint32_t seed, uint32_t index);
+
+    // Low-frequency oscillator
+    static float sinOscillator(uint32_t index, uint32_t sampleRate, float frequency);
+
+    // Frequency sweep (linear interpolation)
+    static float frequencySweep(uint32_t index, uint32_t sampleRate,
+                                float startFreq, float endFreq, uint32_t totalSamples);
+
+    // Envelope: attack-decay-sustain-release
+    static float adsrEnvelope(uint32_t index, uint32_t totalSamples,
+                              float attackTime, float decayTime,
+                              float sustainLevel, float releaseTime);
+
+    // Low-pass filter (simple one-pole)
+    static float lowPassFilter(float sample, float* state, float cutoff, uint32_t sampleRate);
+};

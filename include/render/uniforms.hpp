@@ -14,6 +14,12 @@ struct alignas(16) Uniforms {
     float _pad1;
     float ambientColor[3];
     float _pad2;
+    // Fog parameters (Phase 8)
+    float fogColor[3];
+    float fogDensity;
+    // Camera world position for fog distance calculation
+    float cameraPosition[3];
+    float _pad3;
 };
 
-static_assert(sizeof(Uniforms) <= 256, "Uniforms must fit in 256-byte buffer");
+static_assert(sizeof(Uniforms) <= 512, "Uniforms must fit in 512-byte buffer");

@@ -45,14 +45,44 @@ sky_air = custom_target(
   ],
 )
 
+# Compile bloom.metal to .air intermediate representation (Phase 8)
+bloom_air = custom_target(
+  'bloom.air',
+  input : 'bloom.metal',
+  output : 'bloom.air',
+  command : [
+    'xcrun', 'metal',
+    '-c',
+    '-mmacos-version-min=13.0',
+    '-std=metal3.0',
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+)
+
+# Compile clouds.metal to .air intermediate representation (Phase 8)
+clouds_air = custom_target(
+  'clouds.air',
+  input : 'clouds.metal',
+  output : 'clouds.air',
+  command : [
+    'xcrun', 'metal',
+    '-c',
+    '-mmacos-version-min=13.0',
+    '-std=metal3.0',
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+)
+
 # Combine all .air files into a single .metallib for runtime loading
 metallib = custom_target(
   'pipeline.metallib',
-  input : [pipeline_air, ui_overlay_air, sky_air],
+  input : [pipeline_air, ui_overlay_air, sky_air, bloom_air, clouds_air],
   output : 'pipeline.metallib',
   command : [
     'xcrun', 'metallib',
-    '@INPUT0@', '@INPUT1@', '@INPUT2@',
+    '@INPUT0@', '@INPUT1@', '@INPUT2@', '@INPUT3@', '@INPUT4@',
     '-o', '@OUTPUT@',
   ],
   build_by_default : true,
