@@ -8,3 +8,4 @@ build/
 # Catch2 extracted source (re-downloaded from wrap)
 subprojects/Catch2*/
 subprojects/packagecache/
+.cache/

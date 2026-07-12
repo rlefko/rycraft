@@ -59,6 +59,9 @@ private:
     std::atomic<bool> running_{true};
     std::thread saveThread_;
 
+    // Counter for in-flight writes (queued + being written)
+    std::atomic<int> pendingWrites_{0};
+
     // Queue for async saves
     struct SaveJob {
         std::string regionFile;

@@ -12,6 +12,7 @@
 #include "common/math.hpp"
 #include "engine/hotbar.hpp"
 #include "render/mega_buffer.hpp"
+#include "render/particles.hpp"
 #include "render/texture_atlas.hpp"
 #include "render/vertex.hpp"
 
@@ -20,6 +21,7 @@ class World;
 class Camera;
 class UIOverlay;
 class Bloom;
+class ParticleSystem;
 
 // GPU-side per-chunk mesh allocation tracking.
 struct ChunkMeshState {
@@ -100,6 +102,14 @@ public:
     // Reallocate MSAA and resolve textures for new viewport size.
     void resize(uint32_t width, uint32_t height);
 
+    // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
+    // When zero, the bloom pass is skipped entirely (saves 13 render passes).
+    void setBloomIntensity(float intensity);
+    float getBloomIntensity() const { return _bloomIntensity; }
+
+    // Update particle system physics (call each game tick).
+    void tickParticles(float dt, const World& world, const Vec3& playerPosition);
+
 private:
     // ---- Metal resources ----
     id<MTLDevice> _device;
@@ -149,6 +159,12 @@ private:
     // MetalFX upscaler (Phase 8.4)
     MetalFXUpscaler* _upscaler;
 
+    // Weather particle system (rain/snow)
+    ParticleSystem* _particles;
+
+    // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
+    float _bloomIntensity;
+
     // Render target dimensions (may differ from display for upscaling)
     uint32_t _renderWidth;
     uint32_t _renderHeight;
@@ -160,9 +176,10 @@ private:
     bool isChunkInFrustum(const AABB& chunkAABB) const;
     float _frustumPlanes[6][4];
 
-    // ---- Chunk mesh cache ----
-    // Key: packed int64 ((uint32_t)chunkX << 32 | (uint32_t)chunkZ)
-    std::unordered_map<uint64_t, ChunkMeshState> _chunkMeshes;
+    // ---- Chunk mesh cache (per-LOD) ----
+    // Outer key: packed int64 ((uint32_t)chunkX << 32 | (uint32_t)chunkZ)
+    // Inner key: LOD level (0-2), enables multiple mesh resolutions per chunk.
+    std::unordered_map<uint64_t, std::unordered_map<int, ChunkMeshState>> _chunkMeshes;
 
     // ---- Day/Night Cycle (Task 6.4-6.5) ----
     void computeDayNightUniforms(uint64_t worldTime,

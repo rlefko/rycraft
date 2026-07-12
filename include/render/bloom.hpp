@@ -38,6 +38,11 @@ public:
     // Get the intermediate bloom output texture (for chaining effects).
     id<MTLTexture> bloomOutputTexture() const { return _bloomOutput; }
 
+    // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
+    // When intensity is 0, renderBloom skips the entire pipeline as early exit.
+    void setIntensity(float intensity) { _intensity = intensity; }
+    float getIntensity() const { return _intensity; }
+
 private:
     id<MTLDevice> _device;
 
@@ -64,6 +69,9 @@ private:
 
     uint32_t _width;
     uint32_t _height;
+
+    // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
+    float _intensity;
 
     // ---- Texture allocation helpers ----
     void allocateExtractTexture();

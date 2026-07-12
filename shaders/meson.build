@@ -75,14 +75,29 @@ clouds_air = custom_target(
   ],
 )
 
+# Compile particles.metal to .air intermediate representation (weather effects)
+particles_air = custom_target(
+  'particles.air',
+  input : 'particles.metal',
+  output : 'particles.air',
+  command : [
+    'xcrun', 'metal',
+    '-c',
+    '-mmacos-version-min=13.0',
+    '-std=metal3.0',
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+)
+
 # Combine all .air files into a single .metallib for runtime loading
 metallib = custom_target(
   'pipeline.metallib',
-  input : [pipeline_air, ui_overlay_air, sky_air, bloom_air, clouds_air],
+  input : [pipeline_air, ui_overlay_air, sky_air, bloom_air, clouds_air, particles_air],
   output : 'pipeline.metallib',
   command : [
     'xcrun', 'metallib',
-    '@INPUT0@', '@INPUT1@', '@INPUT2@', '@INPUT3@', '@INPUT4@',
+    '@INPUT0@', '@INPUT1@', '@INPUT2@', '@INPUT3@', '@INPUT4@', '@INPUT5@',
     '-o', '@OUTPUT@',
   ],
   build_by_default : true,

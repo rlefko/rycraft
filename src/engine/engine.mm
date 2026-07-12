@@ -320,7 +320,12 @@ static EngineState* _engineGetState(Engine* engine) {
         state->player.jump();
     }
 
-    // 7. Single raycast for block interaction + highlight
+    // 7. Update weather particles
+    if (_renderPipeline) {
+        _renderPipeline->tickParticles(state->deltaTime, *state->world, state->player.position);
+    }
+
+    // 8. Single raycast for block interaction + highlight
     Vec3 cameraPos = state->camera.position();
     Vec3 forward = state->camera.forward();
     auto rayHit = VoxelTraversal::traceRayWithNormal(cameraPos, forward, *state->world, 6.0f);

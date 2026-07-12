@@ -2,7 +2,9 @@
 
 #include "common/error.hpp"
 #include "render/bloom.hpp"
+#include "render/lod_mesher.hpp"
 #include "render/mesher.hpp"
+#include "render/particles.hpp"
 #include "render/ui_overlay.hpp"
 #include "render/uniforms.hpp"
 #include "world/chunk.hpp"
@@ -27,6 +29,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     , _uiOverlay(nullptr)
     , _bloom(nullptr)
     , _upscaler(nullptr)
+    , _particles(nullptr)
+    , _bloomIntensity(1.0f)
     , _renderWidth(width / 2)
     , _renderHeight(height / 2)
     , _displayWidth(width)
@@ -330,10 +334,14 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     // ---- Bloom post-processing (Phase 8) ----
     _bloom = new Bloom(_device, shaderLibrary, _renderWidth, _renderHeight);
+    _bloom->setIntensity(_bloomIntensity);
 
     // ---- MetalFX Upscaler (Phase 8.4) ----
     _upscaler = new MetalFXUpscaler(_device, _renderWidth, _renderHeight,
-                                     _displayWidth, _displayHeight);
+                                      _displayWidth, _displayHeight);
+
+    // ---- Weather Particle System ----
+    _particles = new ParticleSystem(_device, shaderLibrary);
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +394,14 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     // ---- Main render pass descriptor (render at half-resolution for upscaling) ----
     auto renderPassDesc = [[MTLRenderPassDescriptor alloc] init];
 
-    // Color attachment: render to MSAA, resolve to _colorResolve
+    // Color attachment: render to MSAA, resolve to _colorResolve.
+    //
+    // Deferred store optimization: MTLStoreActionMultisampleResolve resolves the
+    // 4x MSAA samples into _colorResolve and discards the MSAA texture contents.
+    // The MSAA texture is never read back, saving memory bandwidth. When bloom is
+    // active, _colorResolve feeds the bloom extract pass; when bloom is off,
+    // _colorResolve feeds the upscaler directly. Either way, the MSAA texture
+    // itself is a throwaway intermediate — exactly what MultisampleResolve provides.
     renderPassDesc.colorAttachments[0].texture = _colorMSAA;
     renderPassDesc.colorAttachments[0].resolveTexture = _colorResolve;
     renderPassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -417,6 +432,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
         renderBlockHighlight(encoder, highlightedBlock.value(), viewMatrix, projectionMatrix);
     }
 
+    // ---- Weather particle pass (rain/snow billboards) ----
+    if (_particles) {
+        _particles->render(encoder, viewMatrix, projectionMatrix, camera.getPosition());
+    }
+
     [encoder endEncoding];
 
     // ---- Cloud Pass (Phase 8, at render resolution) ----
@@ -428,14 +448,21 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
                 sunDirection, sunColor, ambientColor);
 
     // ---- Bloom Post-Processing (Phase 8) ----
-    // Render bloom: scene → extract → blur pyramid → composite
+    // Deferred store path:
+    //   Bloom active  → _colorResolve → bloom extract → blur → composite → _bloomOutput
+    //   Bloom inactive → _colorResolve → upscaler → display (skip bloom entirely)
+    // When bloom intensity is 0, renderBloom returns immediately (early exit),
+    // skipping 13 internal render passes. The upscaler then reads _colorResolve.
     if (_bloom) {
         _bloom->renderBloom(commandBuffer, _colorResolve, _bloom->bloomOutputTexture());
     }
 
     // ---- Upscale to display resolution (Phase 8.4) ----
+    // Select upscale source based on bloom activity:
+    //   Bloom active  → upscale _bloomOutput (scene + bloom, tone-mapped)
+    //   Bloom inactive → upscale _colorResolve (raw resolved scene)
     id<MTLTexture> finalTexture = _colorResolve;
-    if (_bloom) {
+    if (_bloom && _bloomIntensity > 0.0f) {
         finalTexture = _bloom->bloomOutputTexture();
     }
     if (_upscaler && finalTexture) {
@@ -583,17 +610,24 @@ void RenderPipeline::renderSky(id<MTLCommandBuffer> commandBuffer,
 // renderChunks (opaque pass)
 // ---------------------------------------------------------------------------
 void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
-                                    const World& world,
-                                    const Mat4& viewMatrix,
-                                    const Mat4& projectionMatrix,
-                                    const float sunDirection[3],
-                                    const float sunColor[3],
-                                    const float ambientColor[3],
-                                    const float fogColor[3])
+                                     const World& world,
+                                     const Mat4& viewMatrix,
+                                     const Mat4& projectionMatrix,
+                                     const float sunDirection[3],
+                                     const float sunColor[3],
+                                     const float ambientColor[3],
+                                     const float fogColor[3])
 {
     // Bind pipeline state
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setDepthStencilState:_depthState];
+
+    // Extract camera position from view matrix.
+    // View = R^T * T(-eye), so eye = -R^T * T_col3 = -R * T_col3
+    const float* v = viewMatrix.data.data();
+    float camX = -(v[12] * v[0] + v[13] * v[4] + v[14] * v[8]);
+    float camY = -(v[12] * v[1] + v[13] * v[5] + v[14] * v[9]);
+    float camZ = -(v[12] * v[2] + v[13] * v[6] + v[14] * v[10]);
 
     // Pack and upload uniforms
     Uniforms uniforms{};
@@ -615,16 +649,15 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
     std::memcpy(uniforms.ambientColor, ambientColor, sizeof(uniforms.ambientColor));
 
     // Fog parameters (Phase 8)
-    // Fog color matches sky horizon color (passed from render())
     uniforms.fogColor[0] = fogColor[0];
     uniforms.fogColor[1] = fogColor[1];
     uniforms.fogColor[2] = fogColor[2];
     uniforms.fogDensity = 0.0003f; // Per block
 
     // Camera position for fog distance calculation
-    uniforms.cameraPosition[0] = 0.f;
-    uniforms.cameraPosition[1] = 0.f;
-    uniforms.cameraPosition[2] = 0.f;
+    uniforms.cameraPosition[0] = camX;
+    uniforms.cameraPosition[1] = camY;
+    uniforms.cameraPosition[2] = camZ;
 
     // Upload to GPU
     std::memcpy((void*)_uniformsBuffer.contents, &uniforms, sizeof(Uniforms));
@@ -633,7 +666,10 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
     [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
 
-    // Draw chunks (with frustum culling)
+    // LOD mesher instance (stateless — safe to reuse)
+    LODMesher lodMesher;
+
+    // Draw chunks (with frustum culling and distance-based LOD)
     auto loadedChunks = world.getLoadedChunks();
 
     for (auto& chunk : loadedChunks) {
@@ -643,19 +679,33 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
         AABB chunkAABB = chunk->getAABB();
         if (!isChunkInFrustum(chunkAABB)) continue;
 
+        // Compute distance from camera to chunk center (in blocks)
+        Vec3 chunkCenter = chunkAABB.center();
+        float dx = chunkCenter.x - camX;
+        float dy = chunkCenter.y - camY;
+        float dz = chunkCenter.z - camZ;
+        int distanceBlocks = static_cast<int>(std::sqrt(dx * dx + dy * dy + dz * dz));
+
+        // Select LOD level based on distance
+        int lodLevel = LODMesher::computeLODLevel(distanceBlocks);
+
         // Chunk key for mesh cache lookup (packed int64, no allocation)
         uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(chunk->chunkX)) << 32) |
                         static_cast<uint64_t>(static_cast<uint32_t>(chunk->chunkZ));
 
-        // Mesh dirty chunks on demand
+        // Mesh dirty chunks on demand (invalidate all LOD levels)
         if (chunk->needsMeshUpdate) {
-            auto it = _chunkMeshes.find(key);
-            if (it != _chunkMeshes.end() && it->second.uploaded) {
-                _megaBuffer->free(it->second.alloc);
+            auto cit = _chunkMeshes.find(key);
+            if (cit != _chunkMeshes.end()) {
+                for (auto& [_, state] : cit->second) {
+                    if (state.uploaded) {
+                        _megaBuffer->free(state.alloc);
+                    }
+                }
+                cit->second.clear();
             }
 
-            GreedyMesher mesher;
-            MeshOutput mesh = mesher.buildMesh(*chunk);
+            MeshOutput mesh = lodMesher.buildMesh(*chunk, lodLevel);
 
             if (!mesh.vertices.empty()) {
                 uint32_t vertCount = static_cast<uint32_t>(mesh.vertices.size());
@@ -678,25 +728,28 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
                 state.alloc = alloc;
                 state.uploaded = true;
 
-                _chunkMeshes[key] = state;
+                _chunkMeshes[key][lodLevel] = state;
             }
 
             chunk->setMeshed(true);
             chunk->needsMeshUpdate = false;
         }
 
-        // Look up cached mesh state
-        auto it = _chunkMeshes.find(key);
-        if (it == _chunkMeshes.end() || !it->second.uploaded) continue;
+        // Look up cached mesh state for this LOD level
+        auto cit = _chunkMeshes.find(key);
+        if (cit == _chunkMeshes.end()) continue;
 
-        const auto& meshState = it->second;
+        auto lodIt = cit->second.find(lodLevel);
+        if (lodIt == cit->second.end() || !lodIt->second.uploaded) continue;
+
+        const auto& meshState = lodIt->second;
 
         if (meshState.alloc.indexCount == 0) continue;
 
         // Bind vertex buffer from MegaBuffer allocation
         [encoder setVertexBuffer:meshState.alloc.vertexBuffer
-                           offset:meshState.alloc.vertexOffset
-                         atIndex:0];
+                            offset:meshState.alloc.vertexOffset
+                          atIndex:0];
         [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
         [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
         [encoder setFragmentTexture:_textureAtlas->texture() atIndex:0];
@@ -704,10 +757,10 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
 
         // Draw indexed primitives (triangles)
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                             indexCount:meshState.alloc.indexCount
-                              indexType:MTLIndexTypeUInt32
-                            indexBuffer:meshState.alloc.indexBuffer
-                        indexBufferOffset:meshState.alloc.indexOffset];
+                              indexCount:meshState.alloc.indexCount
+                               indexType:MTLIndexTypeUInt32
+                             indexBuffer:meshState.alloc.indexBuffer
+                         indexBufferOffset:meshState.alloc.indexOffset];
     }
 }
 
@@ -878,6 +931,7 @@ RenderPipeline::~RenderPipeline() {
     delete _uiOverlay;
     delete _bloom;
     delete _upscaler;
+    delete _particles;
 }
 
 // ---------------------------------------------------------------------------
@@ -952,8 +1006,26 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
     if (_upscaler) {
         delete _upscaler;
         _upscaler = new MetalFXUpscaler(_device, _renderWidth, _renderHeight,
-                                        _displayWidth, _displayHeight);
+                                         _displayWidth, _displayHeight);
     }
+}
+
+// ---------------------------------------------------------------------------
+// setBloomIntensity
+// ---------------------------------------------------------------------------
+void RenderPipeline::setBloomIntensity(float intensity) {
+    _bloomIntensity = intensity;
+    if (_bloom) {
+        _bloom->setIntensity(intensity);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tickParticles — Update weather particle physics each game tick
+// ---------------------------------------------------------------------------
+void RenderPipeline::tickParticles(float dt, const World& world, const Vec3& playerPosition) {
+    if (!_particles) return;
+    _particles->tick(dt, world, playerPosition);
 }
 
 // ---------------------------------------------------------------------------

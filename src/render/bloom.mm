@@ -25,6 +25,7 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
     , _blurPyramid{}
     , _width(width)
     , _height(height)
+    , _intensity(1.0f)
 {
     // ---- Load shader functions ----
     id<MTLFunction> extractVertexFunc = [shaderLibrary newFunctionWithName:@"bloomExtractVertex"];
@@ -295,10 +296,10 @@ void Bloom::renderCompositePass(id<MTLCommandBuffer> commandBuffer,
     [encoder setFragmentSamplerState:_linearSampler atIndex:0];
     [encoder setFragmentSamplerState:_linearSampler atIndex:1];
 
-    // Upload uniforms
+    // Upload uniforms — intensity controls bloom strength in composite shader.
     float resolution[2] = {static_cast<float>(outputTexture.width), static_cast<float>(outputTexture.height)};
     float texelSize[2] = {1.0f / static_cast<float>(outputTexture.width), 1.0f / static_cast<float>(outputTexture.height)};
-    uploadUniforms(resolution, texelSize, 1.0f, 1.0f, 1.0f);
+    uploadUniforms(resolution, texelSize, 1.0f, _intensity, 1.0f);
     [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:0];
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
@@ -313,6 +314,10 @@ void Bloom::renderBloom(id<MTLCommandBuffer> commandBuffer,
                         id<MTLTexture> outputTexture)
 {
     if (!commandBuffer || !sceneTexture || !outputTexture) return;
+
+    // Early exit: zero intensity means bloom is effectively disabled.
+    // Avoids 13 render passes (1 extract + 8 blur + 3 upsample + 1 composite).
+    if (_intensity <= 0.0f) return;
 
     // 1. Extract bright pixels
     renderExtractPass(commandBuffer, sceneTexture);

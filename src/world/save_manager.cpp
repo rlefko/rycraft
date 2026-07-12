@@ -51,6 +51,9 @@ void SaveManager::saveChunk(const Chunk& chunk) {
         saveQueue_.push(std::move(job));
     }
 
+    // Mark as pending write
+    pendingWrites_.fetch_add(1, std::memory_order_acq_rel);
+
     saveCondition_.notify_one();
 }
 
@@ -195,10 +198,12 @@ std::optional<SaveManager::WorldMetadata> SaveManager::loadMetadata() const {
 }
 
 void SaveManager::flush() {
-    // Wait until save queue is empty
+    // Wait until all queued saves are written to disk.
+    // Two conditions: queue is empty (no pending jobs) AND
+    // pendingWrites is 0 (all in-flight writes completed).
     std::unique_lock<std::mutex> lock(saveMutex_);
     saveCondition_.wait(lock, [this]() {
-        return saveQueue_.empty();
+        return saveQueue_.empty() && pendingWrites_.load(std::memory_order_acquire) == 0;
     });
 }
 
@@ -229,6 +234,9 @@ void SaveManager::saveLoop() {
 
         // Write to file
         writeFile(job.regionFile, job.compressedData);
+
+        // Mark write as complete
+        pendingWrites_.fetch_sub(1, std::memory_order_release);
 
         // Notify flush waiters
         saveCondition_.notify_all();
