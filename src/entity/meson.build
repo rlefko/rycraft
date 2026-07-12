@@ -3,6 +3,9 @@ entity_sources = files(
   'physics.cpp',
   'player.cpp',
   'voxel_traversal.cpp',
+  'ai.cpp',
+  'spatial_hash.cpp',
+  'spawner.cpp',
 )
 
 libentity = static_library('entity',

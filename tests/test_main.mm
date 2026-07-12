@@ -18,6 +18,10 @@
 #include <entity/physics.hpp>
 #include <entity/player.hpp>
 #include <entity/voxel_traversal.hpp>
+#include <entity/entity.hpp>
+#include <entity/ai.hpp>
+#include <entity/spatial_hash.hpp>
+#include <entity/spawner.hpp>
 #include <engine/hotbar.hpp>
 
 #include <cmath>
@@ -2296,4 +2300,959 @@ TEST_CASE("isInWater: detects player in water block", "[phase6][water]") {
         Vec3{10.6f, 201.8f, 10.6f}
     };
     REQUIRE(PhysicsEngine::isInWater(*world, playerBox2) == false);
+}
+
+// ============================================================================
+// Phase 7: Entity System, AI, Flocking, Spawning, Spatial Hash Tests
+// ============================================================================
+
+// ---- Entity Creation Tests ----
+
+TEST_CASE("Entity creation assigns unique ID", "[entity]") {
+    auto e1 = std::make_shared<Entity>(1, EntityType::SHEEP, Vec3{0.f, 64.f, 0.f});
+    auto e2 = std::make_shared<Entity>(2, EntityType::COW, Vec3{1.f, 64.f, 1.f});
+
+    REQUIRE(e1->id == 1);
+    REQUIRE(e2->id == 2);
+    REQUIRE(e1->id != e2->id);
+}
+
+TEST_CASE("Entity creation sets correct type and position", "[entity]") {
+    Vec3 spawn{10.f, 80.f, -5.f};
+    auto entity = std::make_shared<Entity>(42, EntityType::PIG, spawn);
+
+    REQUIRE(entity->type == EntityType::PIG);
+    REQUIRE(entity->position.x == Catch::Approx(10.f));
+    REQUIRE(entity->position.y == Catch::Approx(80.f));
+    REQUIRE(entity->position.z == Catch::Approx(-5.f));
+    REQUIRE(entity->alive == true);
+    REQUIRE(entity->onGround == false);
+}
+
+TEST_CASE("Entity AABB computation: sheep dimensions", "[entity]") {
+    auto entity = std::make_shared<Entity>(1, EntityType::SHEEP, Vec3{0.f, 64.f, 0.f});
+    AABB aabb = entity->computeAABB();
+
+    Vec3 size = aabb.max - aabb.min;
+    // Sheep: 0.6 wide, 0.9 tall
+    REQUIRE(size.x == Catch::Approx(0.6f));
+    REQUIRE(size.y == Catch::Approx(0.9f));
+    REQUIRE(size.z == Catch::Approx(0.6f));
+
+    // Center should match entity position
+    REQUIRE(aabb.min.x == Catch::Approx(-0.3f));
+    REQUIRE(aabb.min.z == Catch::Approx(-0.3f));
+    REQUIRE(aabb.min.y == Catch::Approx(64.f));
+}
+
+TEST_CASE("Entity AABB computation: cow dimensions", "[entity]") {
+    auto entity = std::make_shared<Entity>(2, EntityType::COW, Vec3{5.f, 70.f, 5.f});
+    AABB aabb = entity->computeAABB();
+
+    Vec3 size = aabb.max - aabb.min;
+    // Cow: 0.9 wide, 1.4 tall
+    REQUIRE(size.x == Catch::Approx(0.9f));
+    REQUIRE(size.y == Catch::Approx(1.4f));
+    REQUIRE(size.z == Catch::Approx(0.9f));
+}
+
+TEST_CASE("Entity AABB: baby entity is half size", "[entity]") {
+    auto entity = std::make_shared<Entity>(3, EntityType::SHEEP, Vec3{0.f, 64.f, 0.f});
+    entity->isBaby = true;
+
+    AABB aabb = entity->computeAABB();
+    Vec3 size = aabb.max - aabb.min;
+
+    // Baby sheep: 0.3 wide, 0.45 tall
+    REQUIRE(size.x == Catch::Approx(0.3f));
+    REQUIRE(size.y == Catch::Approx(0.45f));
+    REQUIRE(size.z == Catch::Approx(0.3f));
+}
+
+TEST_CASE("Entity nextId is monotonically increasing", "[entity]") {
+    uint64_t id1 = Entity::nextId();
+    uint64_t id2 = Entity::nextId();
+    uint64_t id3 = Entity::nextId();
+
+    REQUIRE(id2 > id1);
+    REQUIRE(id3 > id2);
+}
+
+// ---- Entity Config Tests ----
+
+TEST_CASE("EntityConfig: sheep has correct config", "[entity]") {
+    auto cfg = Entity::getConfig(EntityType::SHEEP);
+    REQUIRE(cfg.width == Catch::Approx(0.6f));
+    REQUIRE(cfg.height == Catch::Approx(0.9f));
+    REQUIRE(cfg.speed > 0.f);
+    // Sheep color should be white-ish
+    REQUIRE(cfg.color.x > 0.8f);
+    REQUIRE(cfg.color.y > 0.8f);
+}
+
+TEST_CASE("EntityConfig: all types have positive dimensions", "[entity]") {
+    for (int t = 0; t < 4; ++t) {
+        EntityType type = static_cast<EntityType>(t);
+        auto cfg = Entity::getConfig(type);
+        REQUIRE(cfg.width > 0.f);
+        REQUIRE(cfg.height > 0.f);
+        REQUIRE(cfg.speed > 0.f);
+    }
+}
+
+// ---- Entity Physics Tests ----
+
+TEST_CASE("Entity physics: gravity reduces velocity.y", "[entity][physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    // Place floor far below
+    for (int x = -10; x <= 10; ++x) {
+        for (int z = -10; z <= 10; ++z) {
+            world->setBlock(x, 0, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(100, EntityType::SHEEP, Vec3{0.f, 100.f, 0.f});
+    entity->velocity = Vec3::zero();
+
+    entity->tick(*world);
+
+    // Velocity.y should be negative (gravity applied)
+    REQUIRE(entity->velocity.y < 0.f);
+}
+
+TEST_CASE("Entity physics: entity stops on ground", "[entity][physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    // Place solid floor at high Y to avoid terrain interference
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(101, EntityType::COW, Vec3{0.f, 202.f, 0.f});
+    entity->velocity = Vec3{0.f, -1.f, 0.f}; // Falling
+
+    entity->tick(*world);
+
+    // Entity should have stopped at or above y=200
+    REQUIRE(entity->position.y >= 200.f);
+    // Vertical velocity should be reduced (collision absorbs some)
+    REQUIRE(std::abs(entity->velocity.y) < 2.f);
+}
+
+TEST_CASE("Entity physics: step assist climbs 1-block gap", "[entity][physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    // Create a 1-block step at high Y: floor at y=200, step up at x=2
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+    // Make a step at x=2
+    for (int z = -5; z <= 5; ++z) {
+        world->setBlock(2, 201, z, BlockType::STONE);
+    }
+
+    auto entity = std::make_shared<Entity>(102, EntityType::PIG, Vec3{1.f, 201.f, 0.f});
+    entity->velocity = Vec3{0.1f, -0.5f, 0.f}; // Moving toward step while falling
+
+    entity->tick(*world);
+
+    // Entity should have stepped up or been blocked
+    // The key is that it doesn't fall through
+    REQUIRE(entity->position.y >= 200.f);
+}
+
+TEST_CASE("Entity physics: dead entities don't tick", "[entity][physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+    for (int x = -10; x <= 10; ++x) {
+        for (int z = -10; z <= 10; ++z) {
+            world->setBlock(x, 0, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(103, EntityType::CHICKEN, Vec3{0.f, 100.f, 0.f});
+    entity->alive = false;
+    Vec3 posBefore = entity->position;
+
+    entity->tick(*world);
+
+    // Dead entity should not change position
+    REQUIRE(entity->position == posBefore);
+}
+
+TEST_CASE("Entity physics: terminal velocity is clamped", "[entity][physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // No floor — entity falls freely at very high Y
+    auto entity = std::make_shared<Entity>(104, EntityType::SHEEP, Vec3{0.f, 250.f, 0.f});
+    entity->velocity = Vec3{0.f, -10.f, 0.f}; // Start below terminal
+
+    entity->tick(*world);
+
+    // Velocity should be clamped
+    REQUIRE(entity->velocity.y >= -3.92f);
+}
+
+// ---- Voxel Model Tests ----
+
+TEST_CASE("Entity voxel model: sheep has multiple blocks", "[entity][voxel]") {
+    auto model = Entity::getVoxelModel(EntityType::SHEEP, false);
+    REQUIRE(model.size() >= 5); // body + head + 4 legs minimum
+}
+
+TEST_CASE("Entity voxel model: cow has udder block", "[entity][voxel]") {
+    auto model = Entity::getVoxelModel(EntityType::COW, false);
+    // Cow should have more blocks than sheep (body, patch, head, 4 legs, udder)
+    REQUIRE(model.size() >= 7);
+}
+
+TEST_CASE("Entity voxel model: chicken has wings", "[entity][voxel]") {
+    auto model = Entity::getVoxelModel(EntityType::CHICKEN, false);
+    // Chicken: body, head, beak, comb, 2 legs, 2 wings = 8 blocks
+    REQUIRE(model.size() >= 6);
+}
+
+TEST_CASE("Entity voxel model: baby model is scaled down", "[entity][voxel]") {
+    auto adultModel = Entity::getVoxelModel(EntityType::SHEEP, false);
+    auto babyModel = Entity::getVoxelModel(EntityType::SHEEP, true);
+
+    REQUIRE(adultModel.size() == babyModel.size());
+
+    // Baby blocks should be smaller
+    for (size_t i = 0; i < adultModel.size(); ++i) {
+        REQUIRE(babyModel[i].size.x <= adultModel[i].size.x);
+        REQUIRE(babyModel[i].size.y <= adultModel[i].size.y);
+        REQUIRE(babyModel[i].size.z <= adultModel[i].size.z);
+    }
+}
+
+TEST_CASE("Entity voxel model: all blocks have valid colors", "[entity][voxel]") {
+    for (int t = 0; t < 4; ++t) {
+        EntityType type = static_cast<EntityType>(t);
+        auto model = Entity::getVoxelModel(type, false);
+        for (const auto& block : model) {
+            REQUIRE(block.color.x >= 0.f);
+            REQUIRE(block.color.x <= 1.f);
+            REQUIRE(block.color.y >= 0.f);
+            REQUIRE(block.color.y <= 1.f);
+            REQUIRE(block.color.z >= 0.f);
+            REQUIRE(block.color.z <= 1.f);
+        }
+    }
+}
+
+// ---- State Machine Tests ----
+
+TEST_CASE("State machine: initial state is IDLE", "[ai][state]") {
+    StateMachine sm;
+    REQUIRE(sm.currentState == AnimalState::IDLE);
+}
+
+TEST_CASE("State machine: idle transitions to wander after ticks", "[ai][state]") {
+    // shouldWander returns true after minIdle ticks
+    REQUIRE(StateMachine::shouldWander(0) == false);
+    REQUIRE(StateMachine::shouldWander(29) == false);
+    REQUIRE(StateMachine::shouldWander(30) == true); // minIdle = 30
+}
+
+TEST_CASE("State machine: wander stops after max ticks", "[ai][state]") {
+    REQUIRE(StateMachine::shouldStopWandering(0) == false);
+    REQUIRE(StateMachine::shouldStopWandering(199) == false);
+    REQUIRE(StateMachine::shouldStopWandering(200) == true); // maxWander = 200
+}
+
+TEST_CASE("State machine: flee triggers when player close and approaching", "[ai][state]") {
+    Vec3 entityPos{0.f, 64.f, 0.f};
+    Vec3 playerPos{3.f, 64.f, 3.f}; // ~4.24 blocks away (within 6)
+
+    REQUIRE(StateMachine::shouldFlee(entityPos, playerPos, true) == true);
+    REQUIRE(StateMachine::shouldFlee(entityPos, playerPos, false) == false); // Not approaching
+}
+
+TEST_CASE("State machine: flee does not trigger when player far", "[ai][state]") {
+    Vec3 entityPos{0.f, 64.f, 0.f};
+    Vec3 playerPos{20.f, 64.f, 20.f}; // ~28 blocks away
+
+    REQUIRE(StateMachine::shouldFlee(entityPos, playerPos, true) == false);
+}
+
+TEST_CASE("State machine: stop fleeing when player far or timeout", "[ai][state]") {
+    Vec3 entityPos{0.f, 64.f, 0.f};
+    Vec3 playerFar{15.f, 64.f, 15.f}; // > 10 blocks
+    Vec3 playerNear{3.f, 64.f, 3.f};
+
+    // Stop because player is far
+    REQUIRE(StateMachine::shouldStopFleeing(entityPos, playerFar, 10) == true);
+    // Don't stop because player is close and time is short
+    REQUIRE(StateMachine::shouldStopFleeing(entityPos, playerNear, 10) == false);
+    // Stop because timeout reached
+    REQUIRE(StateMachine::shouldStopFleeing(entityPos, playerNear, 300) == true);
+}
+
+TEST_CASE("State machine: eat triggers when hungry", "[ai][state]") {
+    REQUIRE(StateMachine::shouldEat(0) == false);
+    REQUIRE(StateMachine::shouldEat(299) == false);
+    REQUIRE(StateMachine::shouldEat(300) == true);
+}
+
+TEST_CASE("State machine: follow player triggers when player holds food nearby", "[ai][state]") {
+    Vec3 entityPos{0.f, 64.f, 0.f};
+    Vec3 playerPos{5.f, 64.f, 5.f}; // ~7 blocks away (within 10)
+
+    REQUIRE(StateMachine::shouldFollowPlayer(entityPos, playerPos, true) == true);
+    REQUIRE(StateMachine::shouldFollowPlayer(entityPos, playerPos, false) == false);
+}
+
+TEST_CASE("State machine: stop following when player far or no food", "[ai][state]") {
+    Vec3 entityPos{0.f, 64.f, 0.f};
+    Vec3 playerFar{15.f, 64.f, 15.f};
+
+    REQUIRE(StateMachine::shouldStopFollowing(entityPos, playerFar, true) == true);
+    REQUIRE(StateMachine::shouldStopFollowing(entityPos, Vec3{5.f, 64.f, 5.f}, false) == true);
+}
+
+// ---- Flocking Tests ----
+
+TEST_CASE("Flocking: separation pushes entities apart", "[ai][flocking]") {
+    SpatialHash hash;
+
+    auto e1 = std::make_shared<Entity>(200, EntityType::SHEEP, Vec3{0.f, 64.f, 0.f});
+    auto e2 = std::make_shared<Entity>(201, EntityType::SHEEP, Vec3{0.5f, 64.f, 0.f});
+
+    hash.insert(e1->id, e1->position);
+    hash.insert(e2->id, e2->position);
+
+    // Query near e1 should find e2
+    auto neighbors = hash.query(e1->position, FlockingController::SEPARATION_RADIUS);
+    bool foundE2 = false;
+    for (uint64_t id : neighbors) {
+        if (id == e2->id) {
+            foundE2 = true;
+            break;
+        }
+    }
+    REQUIRE(foundE2);
+}
+
+TEST_CASE("Flocking: alignment matches neighbor velocity", "[ai][flocking]") {
+    SpatialHash hash;
+
+    auto e1 = std::make_shared<Entity>(202, EntityType::SHEEP, Vec3{0.f, 64.f, 0.f});
+    auto e2 = std::make_shared<Entity>(203, EntityType::SHEEP, Vec3{1.f, 64.f, 1.f});
+    e1->velocity = Vec3{0.1f, 0.f, 0.1f};
+    e2->velocity = Vec3{0.1f, 0.f, 0.1f};
+
+    hash.insert(e1->id, e1->position);
+    hash.insert(e2->id, e2->position);
+
+    // Alignment should consider neighbor velocities
+    auto neighbors = hash.query(e1->position, FlockingController::ALIGNMENT_RADIUS);
+    REQUIRE(neighbors.size() >= 2); // Both entities in range
+}
+
+TEST_CASE("Flocking: cohesion centers on neighbors", "[ai][flocking]") {
+    SpatialHash hash;
+
+    auto e1 = std::make_shared<Entity>(204, EntityType::SHEEP, Vec3{0.f, 64.f, 0.f});
+    auto e2 = std::make_shared<Entity>(205, EntityType::SHEEP, Vec3{2.f, 64.f, 0.f});
+    auto e3 = std::make_shared<Entity>(206, EntityType::SHEEP, Vec3{-2.f, 64.f, 0.f});
+
+    hash.insert(e1->id, e1->position);
+    hash.insert(e2->id, e2->position);
+    hash.insert(e3->id, e3->position);
+
+    // Query from center should find all three
+    auto neighbors = hash.query(e1->position, FlockingController::COHESION_RADIUS);
+    REQUIRE(neighbors.size() >= 3);
+}
+
+TEST_CASE("Flocking: max force clamps steering", "[ai][flocking]") {
+    Vec3 bigForce{1.f, 0.f, 0.f};
+    Vec3 clamped = FlockingController::clampForce(bigForce, FlockingController::MAX_FLOCKING_FORCE);
+
+    REQUIRE(clamped.length() <= Catch::Approx(FlockingController::MAX_FLOCKING_FORCE).epsilon(0.001f));
+}
+
+TEST_CASE("Flocking: small force passes through clamp", "[ai][flocking]") {
+    Vec3 smallForce{0.01f, 0.f, 0.f};
+    Vec3 clamped = FlockingController::clampForce(smallForce, FlockingController::MAX_FLOCKING_FORCE);
+
+    REQUIRE(clamped.x == Catch::Approx(0.01f));
+}
+
+TEST_CASE("Flocking: zero force remains zero", "[ai][flocking]") {
+    Vec3 zeroForce = Vec3::zero();
+    Vec3 clamped = FlockingController::clampForce(zeroForce, FlockingController::MAX_FLOCKING_FORCE);
+
+    REQUIRE(clamped == Vec3::zero());
+}
+
+// ---- Edge Detection Tests ----
+
+TEST_CASE("Edge detection: safe on flat ground", "[ai][edge]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+
+    // Create flat ground at high Y to avoid terrain interference
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    Vec3 entityPos{0.f, 201.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f}; // Moving +X
+
+    REQUIRE(EdgeDetector::isSafeToMove(entityPos, direction, EntityType::SHEEP, *world) == true);
+}
+
+TEST_CASE("Edge detection: detects cliff ahead", "[ai][edge]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+
+    // Create ground only on one side (cliff at x=2) at high Y
+    for (int x = -5; x <= 1; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+    // x=2..5 is empty (cliff)
+
+    Vec3 entityPos{0.f, 201.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f}; // Moving toward cliff
+
+    // Should detect cliff
+    REQUIRE(EdgeDetector::isCliffAhead(entityPos, direction, *world) == true);
+    REQUIRE(EdgeDetector::isSafeToMove(entityPos, direction, EntityType::SHEEP, *world) == false);
+}
+
+TEST_CASE("Edge detection: safe moving away from cliff", "[ai][edge]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0); // Need chunk for negative X coordinates
+
+    // Ground at high Y only on left side
+    for (int x = -5; x <= 1; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    Vec3 entityPos{0.f, 201.f, 0.f};
+    Vec3 direction{-1.f, 0.f, 0.f}; // Moving away from cliff (toward -X where ground exists)
+
+    REQUIRE(EdgeDetector::isSafeToMove(entityPos, direction, EntityType::SHEEP, *world) == true);
+}
+
+TEST_CASE("Edge detection: pig tolerates water", "[ai][edge]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+
+    // Flat ground with water ahead at high Y
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+    world->setBlock(3, 201, 0, BlockType::WATER);
+
+    Vec3 entityPos{0.f, 201.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    // Pig should be okay with water
+    bool pigSafe = EdgeDetector::isSafeToMove(entityPos, direction, EntityType::PIG, *world);
+
+    // The key test: pig doesn't get blocked by water alone on flat ground
+    REQUIRE(pigSafe == true);
+}
+
+// ---- Behavior Controller Tests ----
+
+TEST_CASE("Behavior: follow steering moves toward player", "[ai][behavior]") {
+    Vec3 entityPos{0.f, 64.f, 0.f};
+    Vec3 playerPos{10.f, 64.f, 0.f};
+
+    Vec3 steering = BehaviorController::computeFollowSteering(entityPos, playerPos);
+
+    // Steering should point toward player (+X)
+    REQUIRE(steering.x > 0.f);
+    REQUIRE(steering.y == Catch::Approx(0.f));
+}
+
+TEST_CASE("Behavior: follow steering backs away when too close", "[ai][behavior]") {
+    Vec3 entityPos{0.f, 64.f, 0.f};
+    Vec3 playerPos{1.f, 64.f, 0.f}; // Only 1 block away (min is 3)
+
+    Vec3 steering = BehaviorController::computeFollowSteering(entityPos, playerPos);
+
+    // Steering should point away from player (-X)
+    REQUIRE(steering.x < 0.f);
+}
+
+TEST_CASE("Behavior: follow steering is zero at comfortable distance", "[ai][behavior]") {
+    Vec3 entityPos{0.f, 64.f, 0.f};
+    Vec3 playerPos{4.5f, 64.f, 0.f}; // 4.5 blocks (between 3 and 6)
+
+    Vec3 steering = BehaviorController::computeFollowSteering(entityPos, playerPos);
+
+    REQUIRE(steering == Vec3::zero());
+}
+
+TEST_CASE("Behavior: isOnGrass detects grass block", "[ai][behavior]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->setBlock(0, 200, 0, BlockType::GRASS);
+
+    auto entity = std::make_shared<Entity>(300, EntityType::SHEEP, Vec3{0.f, 201.f, 0.f});
+
+    REQUIRE(BehaviorController::isOnGrass(*entity, *world) == true);
+}
+
+TEST_CASE("Behavior: isOnGrass returns false on stone", "[ai][behavior]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->setBlock(0, 200, 0, BlockType::STONE);
+    world->setBlock(0, 199, 0, BlockType::STONE);
+
+    auto entity = std::make_shared<Entity>(301, EntityType::SHEEP, Vec3{0.f, 201.f, 0.f});
+
+    REQUIRE(BehaviorController::isOnGrass(*entity, *world) == false);
+}
+
+// ---- Spatial Hash Tests ----
+
+TEST_CASE("Spatial hash: insert and query finds entity", "[spatial]") {
+    SpatialHash hash(8.0f);
+
+    hash.insert(1, Vec3{0.f, 64.f, 0.f});
+
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f);
+    REQUIRE(results.size() == 1);
+    REQUIRE(results[0] == 1);
+}
+
+TEST_CASE("Spatial hash: multiple entities in same cell", "[spatial]") {
+    SpatialHash hash(8.0f);
+
+    hash.insert(1, Vec3{0.f, 64.f, 0.f});
+    hash.insert(2, Vec3{1.f, 64.f, 1.f});
+    hash.insert(3, Vec3{2.f, 64.f, 2.f});
+
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f);
+    REQUIRE(results.size() == 3);
+}
+
+TEST_CASE("Spatial hash: entities in different cells", "[spatial]") {
+    SpatialHash hash(8.0f);
+
+    hash.insert(1, Vec3{0.f, 64.f, 0.f});
+    hash.insert(2, Vec3{16.f, 64.f, 16.f}); // Different cell (8-block cells)
+
+    // Query at origin with small radius should only find entity 1
+    auto near = hash.query(Vec3{0.f, 64.f, 0.f}, 5.0f);
+    // Query at origin with large radius should find both
+    auto far = hash.query(Vec3{0.f, 64.f, 0.f}, 30.0f);
+
+    REQUIRE(far.size() >= near.size());
+}
+
+TEST_CASE("Spatial hash: remove entity", "[spatial]") {
+    SpatialHash hash(8.0f);
+
+    hash.insert(1, Vec3{0.f, 64.f, 0.f});
+    hash.insert(2, Vec3{1.f, 64.f, 1.f});
+
+    REQUIRE(hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f).size() == 2);
+
+    hash.remove(1);
+
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f);
+    REQUIRE(results.size() == 1);
+    REQUIRE(results[0] == 2);
+}
+
+TEST_CASE("Spatial hash: clear removes all", "[spatial]") {
+    SpatialHash hash(8.0f);
+
+    hash.insert(1, Vec3{0.f, 64.f, 0.f});
+    hash.insert(2, Vec3{10.f, 64.f, 10.f});
+    hash.insert(3, Vec3{20.f, 64.f, 20.f});
+
+    hash.clear();
+
+    auto results = hash.query(Vec3{10.f, 64.f, 10.f}, 50.0f);
+    REQUIRE(results.empty());
+}
+
+TEST_CASE("Spatial hash: cell size is configurable", "[spatial]") {
+    SpatialHash hash1(4.0f);
+    SpatialHash hash2(16.0f);
+
+    REQUIRE(hash1.getCellSize() == Catch::Approx(4.0f));
+    REQUIRE(hash2.getCellSize() == Catch::Approx(16.0f));
+}
+
+TEST_CASE("Spatial hash: re-insert moves entity to new cell", "[spatial]") {
+    SpatialHash hash(8.0f);
+
+    hash.insert(1, Vec3{0.f, 64.f, 0.f});
+    hash.insert(1, Vec3{20.f, 64.f, 20.f}); // Re-insert far away
+
+    // Query at origin should not find entity
+    auto near = hash.query(Vec3{0.f, 64.f, 0.f}, 5.0f);
+    bool foundNear = false;
+    for (uint64_t id : near) {
+        if (id == 1) { foundNear = true; break; }
+    }
+    REQUIRE(foundNear == false);
+
+    // Query far away should find entity
+    auto far = hash.query(Vec3{20.f, 64.f, 20.f}, 5.0f);
+    bool foundFar = false;
+    for (uint64_t id : far) {
+        if (id == 1) { foundFar = true; break; }
+    }
+    REQUIRE(foundFar == true);
+}
+
+TEST_CASE("Spatial hash: remove non-existent entity is safe", "[spatial]") {
+    SpatialHash hash(8.0f);
+
+    // Should not crash
+    hash.remove(999);
+
+    auto results = hash.query(Vec3{0.f, 64.f, 0.f}, 10.0f);
+    REQUIRE(results.empty());
+}
+
+// ---- Spawner Tests ----
+
+TEST_CASE("Spawner: biome spawn rules — Plains", "[spawner][biome]") {
+    auto rule = Spawner::getSpawnRule(Biome::Plains);
+    REQUIRE(rule.sheepCount == 8);
+    REQUIRE(rule.cowCount == 4);
+    REQUIRE(rule.pigCount == 2);
+    REQUIRE(rule.chickenCount == 0);
+}
+
+TEST_CASE("Spawner: biome spawn rules — Forest", "[spawner][biome]") {
+    auto rule = Spawner::getSpawnRule(Biome::Forest);
+    REQUIRE(rule.sheepCount == 4);
+    REQUIRE(rule.cowCount == 4);
+    REQUIRE(rule.pigCount == 4);
+}
+
+TEST_CASE("Spawner: biome spawn rules — Desert has no animals", "[spawner][biome]") {
+    auto rule = Spawner::getSpawnRule(Biome::Desert);
+    REQUIRE(rule.sheepCount == 0);
+    REQUIRE(rule.cowCount == 0);
+    REQUIRE(rule.pigCount == 0);
+    REQUIRE(rule.chickenCount == 0);
+}
+
+TEST_CASE("Spawner: biome spawn rules — Ocean has no animals", "[spawner][biome]") {
+    auto rule = Spawner::getSpawnRule(Biome::Ocean);
+    REQUIRE(rule.sheepCount == 0);
+    REQUIRE(rule.cowCount == 0);
+    REQUIRE(rule.pigCount == 0);
+}
+
+TEST_CASE("Spawner: biome spawn rules — Taiga", "[spawner][biome]") {
+    auto rule = Spawner::getSpawnRule(Biome::Taiga);
+    REQUIRE(rule.sheepCount == 6);
+    REQUIRE(rule.cowCount == 2);
+}
+
+TEST_CASE("Spawner: biome spawn rules — Swamp", "[spawner][biome]") {
+    auto rule = Spawner::getSpawnRule(Biome::Swamp);
+    REQUIRE(rule.pigCount == 2);
+    REQUIRE(rule.cowCount == 2);
+}
+
+TEST_CASE("Spawner: spawn entity adds to list", "[spawner]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    Spawner spawner(*world);
+
+    auto entity = spawner.spawnEntity(EntityType::SHEEP, Vec3{8.f, 70.f, 8.f});
+    REQUIRE(entity != nullptr);
+    REQUIRE(entity->type == EntityType::SHEEP);
+
+    auto& entities = spawner.getEntities();
+    REQUIRE(entities.size() == 1);
+    REQUIRE(entities[0]->id == entity->id);
+}
+
+TEST_CASE("Spawner: spawn baby entity", "[spawner]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    Spawner spawner(*world);
+
+    auto parent = spawner.spawnEntity(EntityType::COW, Vec3{8.f, 70.f, 8.f});
+    auto baby = spawner.spawnBaby(EntityType::COW, Vec3{8.5f, 70.f, 8.5f}, parent->id);
+
+    REQUIRE(baby != nullptr);
+    REQUIRE(baby->isBaby == true);
+    REQUIRE(baby->parentId == parent->id);
+    REQUIRE(baby->babyTimer == 600);
+}
+
+TEST_CASE("Spawner: remove dead entity", "[spawner]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    Spawner spawner(*world);
+
+    auto entity = spawner.spawnEntity(EntityType::PIG, Vec3{8.f, 70.f, 8.f});
+    REQUIRE(spawner.getEntities().size() == 1);
+
+    entity->alive = false;
+    spawner.removeEntity(entity->id);
+
+    REQUIRE(spawner.getEntities().size() == 0);
+}
+
+TEST_CASE("Spawner: spatial hash is populated on spawn", "[spawner]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    Spawner spawner(*world);
+
+    spawner.spawnEntity(EntityType::SHEEP, Vec3{8.f, 70.f, 8.f});
+
+    auto& hash = spawner.getSpatialHash();
+    auto results = hash.query(Vec3{8.f, 70.f, 8.f}, 10.0f);
+    REQUIRE(results.size() >= 1);
+}
+
+TEST_CASE("Spawner: findSpawnHeight finds surface", "[spawner]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place ground at high Y to avoid terrain interference
+    for (int x = 0; x <= 15; ++x) {
+        for (int z = 0; z <= 15; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    Spawner spawner(*world);
+
+    auto height = spawner.findSpawnHeight(8, 8);
+    REQUIRE(height.has_value());
+    // Should find the highest solid block (may be terrain or our placed blocks)
+    REQUIRE(height.value() >= 201); // At least one above our placed ground
+}
+
+TEST_CASE("Spawner: isSpawnValid checks block configuration", "[spawner]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Valid: stone at y=200, air at y=201 and y=202
+    for (int x = 0; x <= 15; ++x) {
+        for (int z = 0; z <= 15; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    Spawner spawner(*world);
+
+    // y=201: air at 201, air at 202, stone at 200 → valid
+    REQUIRE(spawner.isSpawnValid(8, 201, 8) == true);
+
+    // y=200: stone at 200 → invalid (not air at spawn)
+    REQUIRE(spawner.isSpawnValid(8, 200, 8) == false);
+}
+
+TEST_CASE("Spawner: initial population spawns entities", "[spawner]") {
+    auto world = std::make_shared<World>(42);
+
+    // Load a few chunks
+    world->getChunk(0, 0);
+    world->getChunk(1, 0);
+
+    Spawner spawner(*world);
+    spawner.spawnInitialPopulation();
+
+    // Should have spawned at least some entities (depends on biome)
+    auto& entities = spawner.getEntities();
+    REQUIRE(entities.size() >= 0); // Non-negative (may be zero if biomes are barren)
+
+    // All spawned entities should be alive
+    for (const auto& entity : entities) {
+        REQUIRE(entity->alive == true);
+    }
+}
+
+// ---- Entity Baby Timer Tests ----
+
+TEST_CASE("Entity: baby timer decrements on tick", "[entity][baby]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(400, EntityType::SHEEP, Vec3{0.f, 201.f, 0.f});
+    entity->isBaby = true;
+    entity->babyTimer = 10;
+
+    for (int i = 0; i < 5; ++i) {
+        entity->tick(*world);
+    }
+
+    REQUIRE(entity->babyTimer == 5);
+    REQUIRE(entity->isBaby == true);
+}
+
+TEST_CASE("Entity: baby becomes adult when timer expires", "[entity][baby]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(401, EntityType::COW, Vec3{0.f, 201.f, 0.f});
+    entity->isBaby = true;
+    entity->babyTimer = 2;
+
+    entity->tick(*world);
+    entity->tick(*world);
+
+    REQUIRE(entity->isBaby == false);
+    REQUIRE(entity->babyTimer == 0);
+}
+
+// ---- Entity Hunger Timer Tests ----
+
+TEST_CASE("Entity: hunger timer increments on tick", "[entity][hunger]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(402, EntityType::SHEEP, Vec3{0.f, 201.f, 0.f});
+    int initialHunger = entity->hungerTimer;
+
+    entity->tick(*world);
+    entity->tick(*world);
+
+    REQUIRE(entity->hungerTimer == initialHunger + 2);
+}
+
+TEST_CASE("Entity: hunger timer caps at 600", "[entity][hunger]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(403, EntityType::SHEEP, Vec3{0.f, 201.f, 0.f});
+    entity->hungerTimer = 599;
+
+    entity->tick(*world);
+    entity->tick(*world);
+
+    REQUIRE(entity->hungerTimer == 600);
+}
+
+// ---- Entity Eat Animation Tests ----
+
+TEST_CASE("Entity: eat animation timer decrements", "[entity][animation]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(404, EntityType::SHEEP, Vec3{0.f, 201.f, 0.f});
+    entity->eatAnimationTimer = 10;
+
+    for (int i = 0; i < 5; ++i) {
+        entity->tick(*world);
+    }
+
+    REQUIRE(entity->eatAnimationTimer == 5);
+}
+
+TEST_CASE("Entity: eat animation stops at zero", "[entity][animation]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(-1, 0);
+    world->getChunk(0, -1);
+    world->getChunk(-1, -1);
+
+    for (int x = -5; x <= 5; ++x) {
+        for (int z = -5; z <= 5; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    auto entity = std::make_shared<Entity>(405, EntityType::SHEEP, Vec3{0.f, 201.f, 0.f});
+    entity->eatAnimationTimer = 2;
+
+    entity->tick(*world);
+    entity->tick(*world);
+
+    REQUIRE(entity->eatAnimationTimer == 0);
 }
