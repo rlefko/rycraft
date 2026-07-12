@@ -183,8 +183,7 @@ static constexpr NSInteger KEYCODE_NINE        = 25;
 // InputManager
 // ---------------------------------------------------------------------------
 InputManager::InputManager(NSWindow* window)
-    : NSResponder{}()
-    , state_{}
+    : state_{}
     , window_(window)
     , lastMousePosition_{0, 0}
     , cursorActive_(false)
@@ -200,42 +199,42 @@ InputManager::InputManager(NSWindow* window)
     auto self = this;
 
     keyDownMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSKeyDownEvent
+        NSEventMaskKeyDown
         handler: ^NSEvent*(NSEvent* event) {
             self->handleKeyDown(event);
             return nil;  // consume event
         }];
 
     keyUpMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSKeyUpEvent
+        NSEventMaskKeyUp
         handler: ^NSEvent*(NSEvent* event) {
             self->handleKeyUp(event);
             return nil;
         }];
 
     mouseMovedMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSMouseMovedEvent
+        NSEventMaskMouseMoved
         handler: ^NSEvent*(NSEvent* event) {
             self->handleMouseMoved(event);
             return event;  // pass through
         }];
 
     mouseDraggedMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSLeftMouseDraggedEvent | NSRightMouseDraggedEvent | NSOtherMouseDraggedEvent
+        NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged
         handler: ^NSEvent*(NSEvent* event) {
             self->handleMouseDragged(event);
             return event;
         }];
 
     mouseDownMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSLeftMouseDownEvent | NSRightMouseDownEvent | NSOtherMouseDownEvent
+        NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
         handler: ^NSEvent*(NSEvent* event) {
             self->handleMouseDown(event);
             return event;
         }];
 
     mouseUpMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
-        NSLeftMouseUpEvent | NSRightMouseUpEvent | NSOtherMouseUpEvent
+        NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp | NSEventMaskOtherMouseUp
         handler: ^NSEvent*(NSEvent* event) {
             self->handleMouseUp(event);
             return event;

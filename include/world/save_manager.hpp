@@ -11,7 +11,6 @@
 #include <sstream>
 #include <cstring>
 #include <filesystem>
-#include <lz4.h>
 #include "world/chunk.hpp"
 #include "world/serialization.hpp"
 

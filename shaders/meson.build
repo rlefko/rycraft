@@ -30,14 +30,29 @@ ui_overlay_air = custom_target(
   ],
 )
 
+# Compile sky.metal to .air intermediate representation
+sky_air = custom_target(
+  'sky.air',
+  input : 'sky.metal',
+  output : 'sky.air',
+  command : [
+    'xcrun', 'metal',
+    '-c',
+    '-mmacos-version-min=13.0',
+    '-std=metal3.0',
+    '-o', '@OUTPUT@',
+    '@INPUT@',
+  ],
+)
+
 # Combine all .air files into a single .metallib for runtime loading
 metallib = custom_target(
   'pipeline.metallib',
-  input : [pipeline_air, ui_overlay_air],
+  input : [pipeline_air, ui_overlay_air, sky_air],
   output : 'pipeline.metallib',
   command : [
     'xcrun', 'metallib',
-    '@INPUT0@', '@INPUT1@',
+    '@INPUT0@', '@INPUT1@', '@INPUT2@',
     '-o', '@OUTPUT@',
   ],
   build_by_default : true,

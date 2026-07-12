@@ -4,11 +4,13 @@
 #import <QuartzCore/QuartzCore.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "common/math.hpp"
+#include "engine/hotbar.hpp"
 #include "render/mega_buffer.hpp"
 #include "render/texture_atlas.hpp"
 #include "render/vertex.hpp"
@@ -24,6 +26,16 @@ struct ChunkMeshState {
     bool uploaded = false;
 };
 
+// Sky uniforms for day/night cycle
+struct SkyUniforms {
+    float zenithColor[3];
+    float horizonColor[3];
+    float sunDirection[3];
+    float sunColor[3];
+    float sunIntensity;
+    float padding;
+};
+
 // ---------------------------------------------------------------------------
 // RenderPipeline — Full Metal render pass with MSAA 4x and frustum culling.
 //
@@ -33,13 +45,14 @@ struct ChunkMeshState {
 //   • Upload uniforms (model/view/projection/lighting) each frame
 //   • Frustum-cull chunks before drawing
 //   • Mesh dirty chunks on-demand and upload to GPU
+//   • Render sky, water, block highlight, and UI overlay
 // ---------------------------------------------------------------------------
 class RenderPipeline {
 public:
     RenderPipeline(id<MTLDevice> device,
-                   id<MTLLibrary> shaderLibrary,
-                   uint32_t width,
-                   uint32_t height);
+                    id<MTLLibrary> shaderLibrary,
+                    uint32_t width,
+                    uint32_t height);
 
     ~RenderPipeline();
 
@@ -50,7 +63,10 @@ public:
                 const Mat4& viewMatrix,
                 const Mat4& projectionMatrix,
                 const World& world,
-                const Camera& camera);
+                const Camera& camera,
+                uint64_t worldTime = 0,
+                std::optional<Vec3> highlightedBlock = std::nullopt,
+                const Hotbar& hotbar = Hotbar());
 
     // Reallocate MSAA and resolve textures for new viewport size.
     void resize(uint32_t width, uint32_t height);
@@ -61,7 +77,20 @@ private:
     id<MTLRenderPipelineState> _pipelineState;
     id<MTLDepthStencilState> _depthState;
 
-    // MSAA textures (4×) and single-sample resolve targets.
+    // Sky pipeline state
+    id<MTLRenderPipelineState> _skyPipelineState;
+    id<MTLBuffer> _skyUniformsBuffer;
+
+    // Water pipeline state (transparent pass)
+    id<MTLRenderPipelineState> _waterPipelineState;
+    id<MTLDepthStencilState> _waterDepthState;
+
+    // Block highlight pipeline state (wireframe lines)
+    id<MTLRenderPipelineState> _highlightPipelineState;
+    id<MTLBuffer> _highlightVertexBuffer;
+    id<MTLBuffer> _highlightUniformsBuffer;
+
+    // MSAA textures (4x) and single-sample resolve targets.
     id<MTLTexture> _colorMSAA;
     id<MTLTexture> _colorResolve;
     id<MTLTexture> _depthMSAA;
@@ -88,6 +117,42 @@ private:
     float _frustumPlanes[6][4];
 
     // ---- Chunk mesh cache ----
-    // Key: "chunkX,chunkZ"  (matches World::chunkKey format)
-    std::unordered_map<std::string, ChunkMeshState> _chunkMeshes;
+    // Key: packed int64 ((uint32_t)chunkX << 32 | (uint32_t)chunkZ)
+    std::unordered_map<uint64_t, ChunkMeshState> _chunkMeshes;
+
+    // ---- Day/Night Cycle (Task 6.4-6.5) ----
+    void computeDayNightUniforms(uint64_t worldTime,
+                                  float sunDirection[3],
+                                  float sunColor[3],
+                                  float ambientColor[3],
+                                  SkyUniforms& skyUniforms);
+
+    // ---- Render passes ----
+    void renderSky(id<MTLCommandBuffer> commandBuffer,
+                   id<CAMetalDrawable> drawable,
+                   const SkyUniforms& skyUniforms);
+
+    void renderChunks(id<MTLRenderCommandEncoder> encoder,
+                      const World& world,
+                      const Mat4& viewMatrix,
+                      const Mat4& projectionMatrix,
+                      const float sunDirection[3],
+                      const float sunColor[3],
+                      const float ambientColor[3]);
+
+    void renderWater(id<MTLCommandBuffer> commandBuffer,
+                      id<CAMetalDrawable> drawable,
+                      const Mat4& viewMatrix,
+                     const Mat4& projectionMatrix,
+                     const float sunDirection[3],
+                     const float sunColor[3],
+                     const float ambientColor[3]);
+
+    void renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
+                              const Vec3& blockPos,
+                              const Mat4& viewMatrix,
+                              const Mat4& projectionMatrix);
+
+    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
+                         const Hotbar& hotbar);
 };

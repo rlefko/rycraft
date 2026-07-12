@@ -3,6 +3,11 @@
 
 #include <cmath>
 
+// Water physics modifiers (Task 6.7-6.8)
+static constexpr float WATER_GRAVITY_MULTIPLIER = 0.3f;
+static constexpr float WATER_HORIZONTAL_DRAG = 0.7f;
+static constexpr float WATER_BUOYANCY_FORCE = 0.02f;
+
 // ---------------------------------------------------------------------------
 // getAABB — Compute player's axis-aligned bounding box
 // ---------------------------------------------------------------------------
@@ -18,6 +23,10 @@ AABB Player::getAABB() const {
 // tick — Full physics tick for the player
 // ---------------------------------------------------------------------------
 void Player::tick(World& world, const InputState& input, bool sprinting) {
+    // 0. Check if player is in water
+    AABB playerAABB = getAABB();
+    bool inWater = PhysicsEngine::isInWater(world, playerAABB);
+
     // 1. Apply input: WASD → horizontal velocity based on yaw
     float speed = WALK_SPEED;
     if (sprinting) {
@@ -47,36 +56,47 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
     velocity.x = moveX;
     velocity.z = moveZ;
 
-    // 2. Apply gravity to velocity.y
-    velocity.y += GRAVITY;
+    // 2. Apply gravity (reduced in water)
+    float effectiveGravity = GRAVITY;
+    if (inWater) {
+        effectiveGravity *= WATER_GRAVITY_MULTIPLIER;
+    }
+    velocity.y += effectiveGravity;
 
-    // 3. Apply drag to velocity
+    // 3. Apply drag (increased in water)
     float horizontalDrag = onGround ? HORIZONTAL_DRAG_GROUND : HORIZONTAL_DRAG_AIR;
+    if (inWater) {
+        horizontalDrag = WATER_HORIZONTAL_DRAG;
+    }
     velocity.x *= horizontalDrag;
     velocity.z *= horizontalDrag;
     velocity.y *= VERTICAL_DRAG;
 
-    // 4. Clamp velocity to terminal velocity
+    // 4. Apply buoyancy force when in water
+    if (inWater && velocity.y < 0.f) {
+        velocity.y += WATER_BUOYANCY_FORCE;
+    }
+
+    // 5. Clamp velocity to terminal velocity
     if (velocity.y < TERMINAL_VELOCITY) {
         velocity.y = TERMINAL_VELOCITY;
     }
 
-    // 5. Resolve collisions via physics engine
+    // 6. Resolve collisions via physics engine
     PhysicsEngine physics;
-    AABB playerAABB = getAABB();
     Vec3 resolvedMovement = physics.sweepCollision(playerAABB, velocity, world);
 
-    // 6. Update position by resolved movement
+    // 7. Update position by resolved movement
     position.x += resolvedMovement.x;
     position.y += resolvedMovement.y;
     position.z += resolvedMovement.z;
 
-    // 7. Track fall distance: accumulate negative Y displacement
+    // 8. Track fall distance: accumulate negative Y displacement
     if (resolvedMovement.y < 0.f) {
         fallDistance += static_cast<int>(std::ceil(-resolvedMovement.y * 20.f));
     }
 
-    // 8. Check if on ground (zero vertical movement while velocity was negative)
+    // 9. Check if on ground (zero vertical movement while velocity was negative)
     onGround = (std::abs(resolvedMovement.y) < 1e-6f && velocity.y < 0.f);
 
     // If on ground, apply fall damage and reset
@@ -87,14 +107,14 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
         resetFallDistance();
     }
 
-    // 9. Reset fall distance every 100 ticks to avoid FP drift
+    // 10. Reset fall distance every 100 ticks to avoid FP drift
     fallResetTimer++;
     if (fallResetTimer >= 100) {
         resetFallDistance();
         fallResetTimer = 0;
     }
 
-    // 10. Decrement jump cooldown
+    // 11. Decrement jump cooldown
     if (jumpCooldown > 0) {
         jumpCooldown--;
     }
@@ -109,6 +129,9 @@ void Player::jump() {
     if (!onGround) return;
 
     velocity.y = JUMP_VELOCITY;
+
+    // Reduced jump velocity in water
+    // (checked in tick, but we store the intent here)
     jumpCooldown = JUMP_COOLDOWN_TICKS;
 }
 

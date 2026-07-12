@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <lz4.h>
 
 namespace fs = std::filesystem;
 

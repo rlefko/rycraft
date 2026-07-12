@@ -6,14 +6,25 @@
 #include <common/math.hpp>
 #include <render/render_pipeline.hpp>
 #include <engine/camera.hpp>
+#include <engine/hotbar.hpp>
+#include <engine/input_bindings.hpp>
+#include <entity/player.hpp>
+#include <entity/voxel_traversal.hpp>
 #include <world/world.hpp>
+#include <world/save_manager.hpp>
 
 #include <chrono>
 #include <memory>
+#include <cmath>
+#include <optional>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // Engine — Singleton (Objective-C class with C++ internals)
 // ---------------------------------------------------------------------------
+
+// Raycast hit result type for block interaction
+using BlockRayHit = std::optional<std::pair<Vec3, Vec3>>;
 
 // Internal C++ state
 struct EngineState {
@@ -30,6 +41,24 @@ struct EngineState {
     // ---- Projection ----
     Mat4 projectionMatrix = Mat4::identity();
     CGSize drawableSize = {0, 0};
+
+    // ---- Day/Night Cycle ----
+    static constexpr uint64_t TICKS_PER_DAY = 24000; // 20 min at 20Hz
+    uint64_t worldTime = 0;
+
+    // ---- Block Interaction ----
+    Hotbar hotbar;
+    Vec3 highlightedBlock; // Block currently targeted by crosshair
+    bool hasHighlightedBlock = false;
+
+    // ---- Player & World ----
+    Player player;
+    std::shared_ptr<World> world;
+    std::unique_ptr<SaveManager> saveManager;
+    Camera camera;
+
+    // ---- Input manager (set after window creation) ----
+    InputManager* inputManager = nullptr;
 };
 
 @implementation Engine {
@@ -44,6 +73,9 @@ struct EngineState {
 
     // C++ game state
     std::unique_ptr<EngineState> _state;
+
+    // Scroll wheel tracking
+    float _scrollAccumulator;
 }
 
 // ---- C++ bridge helper — must be inside @implementation to access _state ----
@@ -68,7 +100,12 @@ static EngineState* _engineGetState(Engine* engine) {
         _view = nil;
         _device = nil;
         _queue = nil;
+        _scrollAccumulator = 0;
         _state = std::make_unique<EngineState>();
+        _state->world = std::make_shared<World>(42);
+        _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
+        // Spawn player above terrain
+        _state->player.position = Vec3{0.f, 100.f, 0.f};
     }
     return self;
 }
@@ -149,6 +186,10 @@ static EngineState* _engineGetState(Engine* engine) {
     // Set as window content
     [_window setContentView: _view];
 
+    // 7. Create InputManager
+    _state->inputManager = new InputManager(_window);
+    _state->inputManager->hideAndConfineCursor();
+
     // 6. Load shader library and create render pipeline
     NSString* exePath = [[NSBundle mainBundle] executablePath];
     NSString* dirPath = [exePath stringByDeletingLastPathComponent];
@@ -205,9 +246,9 @@ static EngineState* _engineGetState(Engine* engine) {
     // 2. Add to accumulator
     state->accumulator += frameTime;
 
-    // 3. Fixed timestep physics
+    // 3. Fixed timestep game tick
     while (state->accumulator >= EngineState::TICK_DT) {
-        // physicsTick() — will be filled in Phase 5
+        [self gameTick:state];
         state->accumulator -= EngineState::TICK_DT;
     }
 
@@ -216,6 +257,11 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // 5. Increment frame count
     state->frameCount++;
+
+    // 6. Consume input state for next frame
+    if (state->inputManager) {
+        state->inputManager->state().update();
+    }
 
     (void)view;
 }
@@ -230,6 +276,158 @@ static EngineState* _engineGetState(Engine* engine) {
     (void)view;
 }
 
+// ---- Game Tick (fixed timestep at 20Hz) ----
+
+- (void)gameTick:(EngineState*)state {
+    if (!state->inputManager || !state->world) return;
+
+    InputState& input = state->inputManager->state();
+
+    // 1. Advance world time (1 tick per game tick)
+    state->worldTime++;
+
+    // 2. Hotbar input: keys 1-9 select slots
+    for (int i = 0; i < Hotbar::SLOTS; ++i) {
+        Key key = static_cast<Key>(static_cast<int>(Key::One) + i);
+        if (input.isJustPressed(key)) {
+            state->hotbar.selectSlot(i);
+            break;
+        }
+    }
+
+    // 3. Hotbar input: scroll wheel cycles slots
+    _scrollAccumulator += input.mouseDelta.y;
+    while (_scrollAccumulator >= 30.0f) {
+        state->hotbar.selectNext();
+        _scrollAccumulator -= 30.0f;
+    }
+    while (_scrollAccumulator <= -30.0f) {
+        state->hotbar.selectPrev();
+        _scrollAccumulator += 30.0f;
+    }
+
+    // 4. Update camera from player state
+    state->camera.setPosition(state->player.position);
+    InputBindings bindings;
+    state->camera.update(state->deltaTime, input, bindings, state->player.position);
+
+    // 5. Player physics tick
+    bool sprinting = input.isDown(Key::LeftControl);
+    state->player.tick(*state->world, input, sprinting);
+
+    // 6. Player jump on space
+    if (input.isJustPressed(Key::Space)) {
+        state->player.jump();
+    }
+
+    // 7. Single raycast for block interaction + highlight
+    Vec3 cameraPos = state->camera.position();
+    Vec3 forward = state->camera.forward();
+    auto rayHit = VoxelTraversal::traceRayWithNormal(cameraPos, forward, *state->world, 6.0f);
+
+    // Update block highlight
+    if (rayHit.has_value()) {
+        state->highlightedBlock = rayHit->first;
+        state->hasHighlightedBlock = true;
+    } else {
+        state->hasHighlightedBlock = false;
+    }
+
+    // Block breaking (left mouse click)
+    if (input.isJustPressed(Key::MouseLeft)) {
+        [self breakBlock:state hit:rayHit];
+    }
+
+    // Block placing (right mouse click)
+    if (input.isJustPressed(Key::MouseRight)) {
+        [self placeBlock:state hit:rayHit];
+    }
+}
+
+// ---- Block Breaking (Task 6.1) ----
+
+- (void)breakBlock:(EngineState*)state hit:(BlockRayHit)hit {
+    if (!hit.has_value()) return;
+
+    int hitX = static_cast<int>(std::floor(hit->first.x));
+    int hitY = static_cast<int>(std::floor(hit->first.y));
+    int hitZ = static_cast<int>(std::floor(hit->first.z));
+
+    // Cannot break bedrock
+    BlockType current = state->world->getBlock(hitX, hitY, hitZ);
+    if (current == BlockType::BEDROCK) return;
+
+    // Set block to air
+    state->world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
+
+    // Mark chunk dirty
+    int chunkX = Chunk::worldToChunk(hitX);
+    int chunkZ = Chunk::worldToChunk(hitZ);
+    auto chunk = state->world->getChunk(chunkX, chunkZ);
+    if (chunk) {
+        chunk->markDirty();
+    }
+
+    // Trigger save of dirty chunk
+    if (state->saveManager && chunk) {
+        state->saveManager->saveChunk(*chunk);
+    }
+
+    // Clear highlight since block is now air
+    state->hasHighlightedBlock = false;
+}
+
+// ---- Block Placing (Task 6.2) ----
+
+- (void)placeBlock:(EngineState*)state hit:(BlockRayHit)hit {
+    if (!hit.has_value()) return;
+
+    // Calculate placement position: hit block + face normal
+    int placeX = static_cast<int>(std::floor(hit->first.x)) + static_cast<int>(hit->second.x);
+    int placeY = static_cast<int>(std::floor(hit->first.y)) + static_cast<int>(hit->second.y);
+    int placeZ = static_cast<int>(std::floor(hit->first.z)) + static_cast<int>(hit->second.z);
+
+    // Validate: placement AABB must not overlap player AABB
+    AABB placeBox{
+        Vec3{static_cast<float>(placeX), static_cast<float>(placeY), static_cast<float>(placeZ)},
+        Vec3{static_cast<float>(placeX + 1), static_cast<float>(placeY + 1), static_cast<float>(placeZ + 1)}
+    };
+
+    if (placeBox.intersects(state->player.getAABB())) return;
+
+    // Place block
+    BlockType selectedType = state->hotbar.getSelectedBlockType();
+    state->world->setBlock(placeX, placeY, placeZ, selectedType);
+
+    // Mark both adjacent chunks dirty (boundary case)
+    int chunkX = Chunk::worldToChunk(placeX);
+    int chunkZ = Chunk::worldToChunk(placeZ);
+
+    auto markChunkDirty = [&](int cx, int cz) {
+        auto c = state->world->getChunk(cx, cz);
+        if (c) c->markDirty();
+    };
+
+    markChunkDirty(chunkX, chunkZ);
+
+    // Check if block is on chunk boundary and mark neighbor
+    int localX = placeX - chunkX * CHUNK_WIDTH;
+    int localZ = placeZ - chunkZ * CHUNK_DEPTH;
+    if (localX == 0) markChunkDirty(chunkX - 1, chunkZ);
+    if (localX == CHUNK_WIDTH - 1) markChunkDirty(chunkX + 1, chunkZ);
+    if (localZ == 0) markChunkDirty(chunkX, chunkZ - 1);
+    if (localZ == CHUNK_DEPTH - 1) markChunkDirty(chunkX, chunkZ + 1);
+
+    // Save affected chunk
+    if (state->saveManager) {
+        auto chunk = state->world->getChunk(chunkX, chunkZ);
+        if (chunk) state->saveManager->saveChunk(*chunk);
+    }
+}
+
+// ---- Block Highlight Update (Task 6.9) ----
+// Merged into gameTick: via single raycast (Major #4 fix)
+
 // ---- Render ----
 
 - (void)render {
@@ -240,7 +438,7 @@ static EngineState* _engineGetState(Engine* engine) {
     if (currentSize.width > 0 && currentSize.height > 0) {
         state->drawableSize = currentSize;
         float aspect = static_cast<float>(currentSize.width) /
-                       static_cast<float>(currentSize.height);
+                        static_cast<float>(currentSize.height);
         state->projectionMatrix = Mat4::perspective(
             70.0f * (static_cast<float>(M_PI) / 180.0f),  // 70° FOV in radians
             aspect,
@@ -252,23 +450,21 @@ static EngineState* _engineGetState(Engine* engine) {
     id<CAMetalDrawable> drawable = _view.currentDrawable;
     if (!drawable) return;
 
-    if (!_renderPipeline) return;
+    if (!_renderPipeline || !state->world) return;
 
-    // Camera view matrix (default identity until camera is wired)
-    Mat4 viewMatrix = Mat4::identity();
-
-    // TODO: Wire up real World from Phase 3
-    // For now, render pipeline handles empty world gracefully (sky only)
-    static World dummyWorld(42);
-    static Camera dummyCamera;
+    // Camera view matrix
+    Mat4 viewMatrix = state->camera.viewMatrix();
 
     _renderPipeline->render(
         _queue,
         drawable,
         viewMatrix,
         state->projectionMatrix,
-        dummyWorld,
-        dummyCamera
+        *state->world,
+        state->camera,
+        state->worldTime,
+        state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
+        state->hotbar
     );
 }
 
