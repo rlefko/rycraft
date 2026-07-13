@@ -67,8 +67,8 @@ void StructureGenerator::generateHouse(Chunk& chunk, int localX, int localY, int
 
 bool biomeAllowsStructure(Biome biome) {
     switch (biome) {
-        case Biome::Plains:
-        case Biome::Forest:
+        case Biome::PLAINS:
+        case Biome::FOREST:
             return true;
         default:
             return false;

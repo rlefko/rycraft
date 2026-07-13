@@ -185,7 +185,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         float16_t px, py, pz;
         float16_t u, v;
     };
-    const uint32_t highlightAttr = packFaceAttr(FaceNormal::PlusY, TEXTURE_LAYER_WHITE);
+    const uint32_t highlightAttr = packFaceAttr(FaceNormal::PLUS_Y, TEXTURE_LAYER_WHITE);
     HighlightVertex highlightVerts[24];
     std::memset(highlightVerts, 0, sizeof(highlightVerts));
 
@@ -755,7 +755,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
                 _chunkMeshes.erase(cached);
             }
 
-            MeshOutput mesh = lodMesher.buildMesh(*chunk, static_cast<int>(ChunkLOD::Full));
+            MeshOutput mesh = lodMesher.buildMesh(*chunk, static_cast<int>(ChunkLOD::FULL));
             chunk->setMeshed(true);
             chunk->needsMeshUpdate = false;
 
@@ -878,7 +878,7 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
 {
     _uiOverlay->beginFrame();
     drawGameHud(*_uiOverlay, hotbar, uiFrame, _displayWidth, _displayHeight);
-    if (uiFrame.screen != GameScreen::Playing) {
+    if (uiFrame.screen != GameScreen::PLAYING) {
         drawMenu(*_uiOverlay, uiFrame.menu, uiFrame.hoveredButton, _displayWidth, _displayHeight);
     }
     _uiOverlay->flush(encoder);

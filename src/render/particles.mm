@@ -240,7 +240,7 @@ void ParticleSystem::spawnSnowParticle(Particle& p, const Vec3& playerPos, float
 // ---------------------------------------------------------------------------
 bool ParticleSystem::isSnowBiome(const World& world, int x, int z) const {
     Biome biome = world.getBiome(x, z);
-    return biome == Biome::IceSpikes || biome == Biome::Taiga;
+    return biome == Biome::ICE_SPIKES || biome == Biome::TAIGA;
 }
 
 // ---------------------------------------------------------------------------

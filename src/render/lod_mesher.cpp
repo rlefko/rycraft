@@ -208,7 +208,7 @@ static MeshOutput buildGenericMesh(
         };
 
         meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged,
-                        FaceNormal::PlusY,
+                        FaceNormal::PLUS_Y,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -252,7 +252,7 @@ static MeshOutput buildGenericMesh(
         };
 
         meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged,
-                        FaceNormal::MinusY,
+                        FaceNormal::MINUS_Y,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -293,7 +293,7 @@ static MeshOutput buildGenericMesh(
         };
 
         meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged,
-                        FaceNormal::PlusX,
+                        FaceNormal::PLUS_X,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -335,7 +335,7 @@ static MeshOutput buildGenericMesh(
         };
 
         meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged,
-                        FaceNormal::MinusX,
+                        FaceNormal::MINUS_X,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -377,7 +377,7 @@ static MeshOutput buildGenericMesh(
         };
 
         meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged,
-                        FaceNormal::PlusZ,
+                        FaceNormal::PLUS_Z,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -419,7 +419,7 @@ static MeshOutput buildGenericMesh(
         };
 
         meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged,
-                        FaceNormal::MinusZ,
+                        FaceNormal::MINUS_Z,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -432,12 +432,12 @@ static MeshOutput buildGenericMesh(
 
 MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
     // Beyond render distance — return empty mesh (distance culling)
-    if (lodLevel >= static_cast<int>(ChunkLOD::Count)) {
+    if (lodLevel >= static_cast<int>(ChunkLOD::COUNT)) {
         return MeshOutput{};
     }
 
     switch (static_cast<ChunkLOD>(lodLevel)) {
-        case ChunkLOD::Full: {
+        case ChunkLOD::FULL: {
             // LOD 0: Full resolution greedy meshing (16×16×256)
             auto blockFn = [&chunk](int x, int y, int z) -> BlockType {
                 return chunk.getBlock(x, y, z);
@@ -445,7 +445,7 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
             return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn);
         }
 
-        case ChunkLOD::Medium: {
+        case ChunkLOD::MEDIUM: {
             // LOD 1: 2× downsampling (8×8×128)
             // Each coarse block represents a 2×2×2 group of original blocks.
             // Coarse block is solid if majority of group is solid.
@@ -479,7 +479,7 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
             return buildGenericMesh(8, 128, 8, blockFn);
         }
 
-        case ChunkLOD::Coarse: {
+        case ChunkLOD::COARSE: {
             // LOD 2: 4× downsampling (4×4×64)
             // Each coarse block represents a 4×4×4 group of original blocks.
             auto blockFn = [&chunk](int cx, int cy, int cz) -> BlockType {
@@ -518,8 +518,8 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
 }
 
 int LODMesher::computeLODLevel(int distanceBlocks) {
-    if (distanceBlocks < LOD0_MAX_DISTANCE) return static_cast<int>(ChunkLOD::Full);
-    if (distanceBlocks < LOD1_MAX_DISTANCE) return static_cast<int>(ChunkLOD::Medium);
-    if (distanceBlocks < LOD2_MAX_DISTANCE) return static_cast<int>(ChunkLOD::Coarse);
-    return static_cast<int>(ChunkLOD::Count); // Beyond render distance
+    if (distanceBlocks < LOD0_MAX_DISTANCE) return static_cast<int>(ChunkLOD::FULL);
+    if (distanceBlocks < LOD1_MAX_DISTANCE) return static_cast<int>(ChunkLOD::MEDIUM);
+    if (distanceBlocks < LOD2_MAX_DISTANCE) return static_cast<int>(ChunkLOD::COARSE);
+    return static_cast<int>(ChunkLOD::COUNT); // Beyond render distance
 }

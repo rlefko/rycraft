@@ -5,7 +5,7 @@
 
 void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
                  uint32_t displayWidth, uint32_t displayHeight) {
-    if (frame.screen == GameScreen::Title) return;
+    if (frame.screen == GameScreen::TITLE) return;
 
     const float w = static_cast<float>(displayWidth);
     const float h = static_cast<float>(displayHeight);
@@ -16,7 +16,7 @@ void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
     }
 
     // ---- Crosshair (gameplay only — menus have a real cursor) ----
-    if (frame.screen == GameScreen::Playing) {
+    if (frame.screen == GameScreen::PLAYING) {
         float crossH = 2.0f / h;
         float crossW = 24.0f / w;
         float crossV = 24.0f / h;

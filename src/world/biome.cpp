@@ -36,40 +36,40 @@ Biome BiomeGenerator::lookupBiome(double temperature, double moisture, double el
 
     // Below sea level: ocean biomes
     if (elevation < seaLevel - 8.0) {
-        return Biome::DeepOcean;
+        return Biome::DEEP_OCEAN;
     }
     if (elevation < seaLevel) {
-        return Biome::Ocean;
+        return Biome::OCEAN;
     }
 
     // Swamp: low elevation, very wet
     if (elevation < seaLevel + 4.0 && moisture > 0.6) {
-        return Biome::Swamp;
+        return Biome::SWAMP;
     }
 
     // Cold biomes
     if (temperature < 0.3) {
         if (moisture < 0.3) {
-            return Biome::ExtremeHills;
+            return Biome::EXTREME_HILLS;
         }
         if (moisture < 0.5) {
-            return Biome::IceSpikes;
+            return Biome::ICE_SPIKES;
         }
-        return Biome::Taiga;
+        return Biome::TAIGA;
     }
 
     // Hot + dry = Desert
     if (temperature > 0.7 && moisture < 0.3) {
-        return Biome::Desert;
+        return Biome::DESERT;
     }
 
     // Warm + wet = Forest
     if (moisture > 0.5) {
-        return Biome::Forest;
+        return Biome::FOREST;
     }
 
     // Default: Plains
-    return Biome::Plains;
+    return Biome::PLAINS;
 }
 
 Biome BiomeGenerator::getBiome(double x, double z, double elevation, const BiomeConfig& config) const {
@@ -96,36 +96,36 @@ Biome BiomeGenerator::getBiome(double x, double z, double elevation, const Biome
 
 double BiomeGenerator::getBiomeHeightModifier(Biome biome) const {
     switch (biome) {
-        case Biome::ExtremeHills: return 30.0;
-        case Biome::Desert:       return 5.0;
-        case Biome::Forest:       return 10.0;
-        case Biome::Taiga:        return 15.0;
-        case Biome::IceSpikes:    return 20.0;
-        case Biome::Swamp:        return -5.0;
-        case Biome::Plains:
-        case Biome::Ocean:
-        case Biome::DeepOcean:
-        case Biome::MushroomIsland:
+        case Biome::EXTREME_HILLS: return 30.0;
+        case Biome::DESERT:       return 5.0;
+        case Biome::FOREST:       return 10.0;
+        case Biome::TAIGA:        return 15.0;
+        case Biome::ICE_SPIKES:    return 20.0;
+        case Biome::SWAMP:        return -5.0;
+        case Biome::PLAINS:
+        case Biome::OCEAN:
+        case Biome::DEEP_OCEAN:
+        case Biome::MUSHROOM_ISLAND:
         default:                  return 0.0;
     }
 }
 
 BlockType BiomeGenerator::getSurfaceBlock(Biome biome) const {
     switch (biome) {
-        case Biome::Desert:
-        case Biome::DeepOcean:
-        case Biome::Ocean:
+        case Biome::DESERT:
+        case Biome::DEEP_OCEAN:
+        case Biome::OCEAN:
             return BlockType::AIR; // Water fills ocean, sand below
 
-        case Biome::Plains:
-        case Biome::Forest:
-        case Biome::Taiga:
-        case Biome::Swamp:
-        case Biome::MushroomIsland:
+        case Biome::PLAINS:
+        case Biome::FOREST:
+        case Biome::TAIGA:
+        case Biome::SWAMP:
+        case Biome::MUSHROOM_ISLAND:
             return BlockType::GRASS;
 
-        case Biome::ExtremeHills:
-        case Biome::IceSpikes:
+        case Biome::EXTREME_HILLS:
+        case Biome::ICE_SPIKES:
             return BlockType::STONE;
 
         default:

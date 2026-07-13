@@ -15,17 +15,17 @@ constexpr int CHUNK_HEIGHT = 256;
 constexpr int CHUNK_VOLUME = CHUNK_WIDTH * CHUNK_DEPTH * CHUNK_HEIGHT;
 
 enum class Biome : uint8_t {
-    DeepOcean = 0,
-    Ocean = 1,
-    Plains = 2,
-    Forest = 3,
-    Taiga = 4,
-    Desert = 5,
-    ExtremeHills = 6,
-    Swamp = 7,
-    MushroomIsland = 8,
-    IceSpikes = 9,
-    Count = 10
+    DEEP_OCEAN = 0,
+    OCEAN = 1,
+    PLAINS = 2,
+    FOREST = 3,
+    TAIGA = 4,
+    DESERT = 5,
+    EXTREME_HILLS = 6,
+    SWAMP = 7,
+    MUSHROOM_ISLAND = 8,
+    ICE_SPIKES = 9,
+    COUNT = 10
 };
 
 struct Chunk {

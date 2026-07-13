@@ -1155,7 +1155,7 @@ TEST_CASE("Spatial hash: query filters by distance", "[spatial]") {
 
 
 TEST_CASE("Spawner: biome spawn rules — Plains", "[spawner][biome]") {
-    auto rule = Spawner::getSpawnRule(Biome::Plains);
+    auto rule = Spawner::getSpawnRule(Biome::PLAINS);
     REQUIRE(rule.sheepCount == 8);
     REQUIRE(rule.cowCount == 4);
     REQUIRE(rule.pigCount == 2);
@@ -1163,14 +1163,14 @@ TEST_CASE("Spawner: biome spawn rules — Plains", "[spawner][biome]") {
 }
 
 TEST_CASE("Spawner: biome spawn rules — Forest", "[spawner][biome]") {
-    auto rule = Spawner::getSpawnRule(Biome::Forest);
+    auto rule = Spawner::getSpawnRule(Biome::FOREST);
     REQUIRE(rule.sheepCount == 4);
     REQUIRE(rule.cowCount == 4);
     REQUIRE(rule.pigCount == 4);
 }
 
 TEST_CASE("Spawner: biome spawn rules — Desert has no animals", "[spawner][biome]") {
-    auto rule = Spawner::getSpawnRule(Biome::Desert);
+    auto rule = Spawner::getSpawnRule(Biome::DESERT);
     REQUIRE(rule.sheepCount == 0);
     REQUIRE(rule.cowCount == 0);
     REQUIRE(rule.pigCount == 0);
@@ -1178,20 +1178,20 @@ TEST_CASE("Spawner: biome spawn rules — Desert has no animals", "[spawner][bio
 }
 
 TEST_CASE("Spawner: biome spawn rules — Ocean has no animals", "[spawner][biome]") {
-    auto rule = Spawner::getSpawnRule(Biome::Ocean);
+    auto rule = Spawner::getSpawnRule(Biome::OCEAN);
     REQUIRE(rule.sheepCount == 0);
     REQUIRE(rule.cowCount == 0);
     REQUIRE(rule.pigCount == 0);
 }
 
 TEST_CASE("Spawner: biome spawn rules — Taiga", "[spawner][biome]") {
-    auto rule = Spawner::getSpawnRule(Biome::Taiga);
+    auto rule = Spawner::getSpawnRule(Biome::TAIGA);
     REQUIRE(rule.sheepCount == 6);
     REQUIRE(rule.cowCount == 2);
 }
 
 TEST_CASE("Spawner: biome spawn rules — Swamp", "[spawner][biome]") {
-    auto rule = Spawner::getSpawnRule(Biome::Swamp);
+    auto rule = Spawner::getSpawnRule(Biome::SWAMP);
     REQUIRE(rule.pigCount == 2);
     REQUIRE(rule.cowCount == 2);
 }

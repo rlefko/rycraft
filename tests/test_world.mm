@@ -224,55 +224,55 @@ TEST_CASE("TerrainGenerator getNoise is deterministic", "[terrain]") {
 TEST_CASE("BiomeGenerator lookup: DeepOcean for very low elevation", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.5, 0.5, 50.0);
-  REQUIRE(b == Biome::DeepOcean);
+  REQUIRE(b == Biome::DEEP_OCEAN);
 }
 
 TEST_CASE("BiomeGenerator lookup: Ocean for below sea level", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.5, 0.5, 62.0);
-  REQUIRE(b == Biome::Ocean);
+  REQUIRE(b == Biome::OCEAN);
 }
 
 TEST_CASE("BiomeGenerator lookup: Swamp for low elevation + wet", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.6, 0.7, 66.0);
-  REQUIRE(b == Biome::Swamp);
+  REQUIRE(b == Biome::SWAMP);
 }
 
 TEST_CASE("BiomeGenerator lookup: ExtremeHills for cold + dry", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.2, 0.2, 80.0);
-  REQUIRE(b == Biome::ExtremeHills);
+  REQUIRE(b == Biome::EXTREME_HILLS);
 }
 
 TEST_CASE("BiomeGenerator lookup: IceSpikes for cold + medium moisture", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.2, 0.4, 80.0);
-  REQUIRE(b == Biome::IceSpikes);
+  REQUIRE(b == Biome::ICE_SPIKES);
 }
 
 TEST_CASE("BiomeGenerator lookup: Taiga for cold + wet", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.2, 0.7, 80.0);
-  REQUIRE(b == Biome::Taiga);
+  REQUIRE(b == Biome::TAIGA);
 }
 
 TEST_CASE("BiomeGenerator lookup: Desert for hot + dry", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.8, 0.2, 80.0);
-  REQUIRE(b == Biome::Desert);
+  REQUIRE(b == Biome::DESERT);
 }
 
 TEST_CASE("BiomeGenerator lookup: Forest for warm + wet", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.5, 0.6, 80.0);
-  REQUIRE(b == Biome::Forest);
+  REQUIRE(b == Biome::FOREST);
 }
 
 TEST_CASE("BiomeGenerator lookup: Plains for warm + dry", "[biome]") {
   BiomeGenerator bg(42);
   Biome b = bg.lookupBiome(0.5, 0.4, 80.0);
-  REQUIRE(b == Biome::Plains);
+  REQUIRE(b == Biome::PLAINS);
 }
 
 TEST_CASE("BiomeGenerator temperature in [0, 1]", "[biome]") {
@@ -295,22 +295,22 @@ TEST_CASE("BiomeGenerator moisture in [0, 1]", "[biome]") {
 
 TEST_CASE("BiomeGenerator height modifier values", "[biome]") {
   BiomeGenerator bg(42);
-  REQUIRE(bg.getBiomeHeightModifier(Biome::ExtremeHills) == 30.0);
-  REQUIRE(bg.getBiomeHeightModifier(Biome::Desert) == 5.0);
-  REQUIRE(bg.getBiomeHeightModifier(Biome::Plains) == 0.0);
-  REQUIRE(bg.getBiomeHeightModifier(Biome::Forest) == 10.0);
-  REQUIRE(bg.getBiomeHeightModifier(Biome::Taiga) == 15.0);
-  REQUIRE(bg.getBiomeHeightModifier(Biome::Swamp) == -5.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::EXTREME_HILLS) == 30.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::DESERT) == 5.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::PLAINS) == 0.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::FOREST) == 10.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::TAIGA) == 15.0);
+  REQUIRE(bg.getBiomeHeightModifier(Biome::SWAMP) == -5.0);
 }
 
 TEST_CASE("BiomeGenerator surface block values", "[biome]") {
   BiomeGenerator bg(42);
-  REQUIRE(bg.getSurfaceBlock(Biome::Plains) == BlockType::GRASS);
-  REQUIRE(bg.getSurfaceBlock(Biome::Forest) == BlockType::GRASS);
-  REQUIRE(bg.getSurfaceBlock(Biome::Taiga) == BlockType::GRASS);
-  REQUIRE(bg.getSurfaceBlock(Biome::Desert) == BlockType::AIR);
-  REQUIRE(bg.getSurfaceBlock(Biome::ExtremeHills) == BlockType::STONE);
-  REQUIRE(bg.getSurfaceBlock(Biome::IceSpikes) == BlockType::STONE);
+  REQUIRE(bg.getSurfaceBlock(Biome::PLAINS) == BlockType::GRASS);
+  REQUIRE(bg.getSurfaceBlock(Biome::FOREST) == BlockType::GRASS);
+  REQUIRE(bg.getSurfaceBlock(Biome::TAIGA) == BlockType::GRASS);
+  REQUIRE(bg.getSurfaceBlock(Biome::DESERT) == BlockType::AIR);
+  REQUIRE(bg.getSurfaceBlock(Biome::EXTREME_HILLS) == BlockType::STONE);
+  REQUIRE(bg.getSurfaceBlock(Biome::ICE_SPIKES) == BlockType::STONE);
 }
 
 TEST_CASE("BiomeGenerator getBiome is deterministic", "[biome]") {
@@ -422,8 +422,8 @@ TEST_CASE("Serialization roundtrip", "[serialization]") {
   original.setBlock(8, 64, 8, BlockType::STONE);
   original.setBlock(0, 0, 0, BlockType::GRASS);
   original.generated = true;
-  original.biomes[0] = Biome::Desert;
-  original.biomes[100] = Biome::Forest;
+  original.biomes[0] = Biome::DESERT;
+  original.biomes[100] = Biome::FOREST;
   original.heightMap[0] = 65;
   original.heightMap[100] = 72;
 
@@ -434,8 +434,8 @@ TEST_CASE("Serialization roundtrip", "[serialization]") {
   REQUIRE(restored->chunkZ == original.chunkZ);
   REQUIRE(restored->getBlock(8, 64, 8) == BlockType::STONE);
   REQUIRE(restored->getBlock(0, 0, 0) == BlockType::GRASS);
-  REQUIRE(restored->biomes[0] == Biome::Desert);
-  REQUIRE(restored->biomes[100] == Biome::Forest);
+  REQUIRE(restored->biomes[0] == Biome::DESERT);
+  REQUIRE(restored->biomes[100] == Biome::FOREST);
   REQUIRE(restored->heightMap[0] == 65);
   REQUIRE(restored->heightMap[100] == 72);
 }
@@ -620,7 +620,7 @@ TEST_CASE("World getBiome", "[world]") {
   auto world = std::make_shared<World>(42);
   Biome b = world->getBiome(100, 200);
   REQUIRE(static_cast<int>(b) >= 0);
-  REQUIRE(static_cast<int>(b) < static_cast<int>(Biome::Count));
+  REQUIRE(static_cast<int>(b) < static_cast<int>(Biome::COUNT));
 }
 
 TEST_CASE("World setViewDistance", "[world]") {

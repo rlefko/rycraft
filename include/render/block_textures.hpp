@@ -24,8 +24,8 @@ inline constexpr uint8_t TEXTURE_LAYER_COUNT = TEXTURE_LAYER_WHITE + 1;
 // Which array layer a given face of a block samples.
 constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
     if (type == BlockType::GRASS) {
-        if (face == FaceNormal::PlusY) return static_cast<uint8_t>(BlockType::GRASS);
-        if (face == FaceNormal::MinusY) return static_cast<uint8_t>(BlockType::DIRT);
+        if (face == FaceNormal::PLUS_Y) return static_cast<uint8_t>(BlockType::GRASS);
+        if (face == FaceNormal::MINUS_Y) return static_cast<uint8_t>(BlockType::DIRT);
         return TEXTURE_LAYER_GRASS_SIDE;
     }
     return static_cast<uint8_t>(type);

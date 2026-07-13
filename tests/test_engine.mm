@@ -75,65 +75,65 @@ TEST_CASE("InputBindings load returns defaults for a missing file", "[engine][bi
 
 TEST_CASE("GameFlow: ESC toggles pause and backs out of settings", "[ui][flow]") {
     GameFlow flow;
-    REQUIRE(flow.screen == GameScreen::Title);
+    REQUIRE(flow.screen == GameScreen::TITLE);
 
     // ESC is inert on the title screen
     auto fx = flow.onEscape();
-    REQUIRE(flow.screen == GameScreen::Title);
+    REQUIRE(flow.screen == GameScreen::TITLE);
     REQUIRE(!fx.captureCursor);
 
     // PLAY enters gameplay and captures the mouse
-    fx = flow.onMenuAction(MenuAction::Play);
-    REQUIRE(flow.screen == GameScreen::Playing);
+    fx = flow.onMenuAction(MenuAction::PLAY);
+    REQUIRE(flow.screen == GameScreen::PLAYING);
     REQUIRE(fx.captureCursor);
     REQUIRE(fx.resetTiming);
 
     // ESC pauses (release + timing reset), ESC again resumes (capture)
     fx = flow.onEscape();
-    REQUIRE(flow.screen == GameScreen::Paused);
+    REQUIRE(flow.screen == GameScreen::PAUSED);
     REQUIRE(fx.releaseCursor);
     REQUIRE(fx.resetTiming);
 
     fx = flow.onEscape();
-    REQUIRE(flow.screen == GameScreen::Playing);
+    REQUIRE(flow.screen == GameScreen::PLAYING);
     REQUIRE(fx.captureCursor);
 
     // Settings sits under pause; ESC backs out one level
     flow.onEscape();
-    flow.onMenuAction(MenuAction::OpenSettings);
-    REQUIRE(flow.screen == GameScreen::Settings);
+    flow.onMenuAction(MenuAction::OPEN_SETTINGS);
+    REQUIRE(flow.screen == GameScreen::SETTINGS);
     flow.onEscape();
-    REQUIRE(flow.screen == GameScreen::Paused);
+    REQUIRE(flow.screen == GameScreen::PAUSED);
 }
 
 TEST_CASE("GameFlow: resume and quit actions", "[ui][flow]") {
     GameFlow flow;
-    flow.onMenuAction(MenuAction::Play);
+    flow.onMenuAction(MenuAction::PLAY);
     flow.onEscape();  // pause
 
-    auto fx = flow.onMenuAction(MenuAction::Resume);
-    REQUIRE(flow.screen == GameScreen::Playing);
+    auto fx = flow.onMenuAction(MenuAction::RESUME);
+    REQUIRE(flow.screen == GameScreen::PLAYING);
     REQUIRE(fx.captureCursor);
 
     // Quit only works from title/pause
-    fx = flow.onMenuAction(MenuAction::Quit);
+    fx = flow.onMenuAction(MenuAction::QUIT);
     REQUIRE(!fx.requestQuit);
     flow.onEscape();
-    fx = flow.onMenuAction(MenuAction::Quit);
+    fx = flow.onMenuAction(MenuAction::QUIT);
     REQUIRE(fx.requestQuit);
 }
 
 TEST_CASE("GameFlow: focus loss force-pauses gameplay only", "[ui][flow]") {
     GameFlow flow;
-    flow.onMenuAction(MenuAction::Play);
+    flow.onMenuAction(MenuAction::PLAY);
 
     auto fx = flow.onFocusLost();
-    REQUIRE(flow.screen == GameScreen::Paused);
+    REQUIRE(flow.screen == GameScreen::PAUSED);
     REQUIRE(fx.releaseCursor);
 
     // Idempotent while already paused
     fx = flow.onFocusLost();
-    REQUIRE(flow.screen == GameScreen::Paused);
+    REQUIRE(flow.screen == GameScreen::PAUSED);
     REQUIRE(!fx.releaseCursor);
 }
 
@@ -141,7 +141,7 @@ TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][me
     SettingsValues values;
     for (auto [w, h] : {std::pair{1024.f, 768.f}, {2048.f, 1536.f}, {3456.f, 2234.f}}) {
         for (GameScreen screen :
-             {GameScreen::Title, GameScreen::Paused, GameScreen::Settings}) {
+             {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS}) {
             MenuLayout layout = buildMenuLayout(screen, w, h, values);
             REQUIRE(!layout.buttons.empty());
 
@@ -150,7 +150,7 @@ TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][me
                 REQUIRE(button.rect.y >= 0.f);
                 REQUIRE(button.rect.x + button.rect.w <= 1.f);
                 REQUIRE(button.rect.y + button.rect.h <= 1.f);
-                REQUIRE(button.action != MenuAction::None);
+                REQUIRE(button.action != MenuAction::NONE);
                 if (layout.panel.w > 0.f) {
                     REQUIRE(button.rect.x >= layout.panel.x);
                     REQUIRE(button.rect.x + button.rect.w <= layout.panel.x + layout.panel.w);
@@ -170,12 +170,12 @@ TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][me
         }
     }
 
-    REQUIRE(buildMenuLayout(GameScreen::Playing, 1024.f, 768.f, values).buttons.empty());
+    REQUIRE(buildMenuLayout(GameScreen::PLAYING, 1024.f, 768.f, values).buttons.empty());
 }
 
 TEST_CASE("Menu hit test: button centers hit, gaps miss", "[ui][menu]") {
     SettingsValues values;
-    MenuLayout layout = buildMenuLayout(GameScreen::Paused, 1024.f, 768.f, values);
+    MenuLayout layout = buildMenuLayout(GameScreen::PAUSED, 1024.f, 768.f, values);
 
     for (size_t i = 0; i < layout.buttons.size(); ++i) {
         const UIRect& rect = layout.buttons[i].rect;
@@ -190,7 +190,7 @@ TEST_CASE("Font covers every character the menus draw", "[ui][font]") {
     SettingsValues values;
     std::string needed = "0123456789.:/-+ ";
     for (GameScreen screen :
-         {GameScreen::Title, GameScreen::Paused, GameScreen::Settings}) {
+         {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS}) {
         MenuLayout layout = buildMenuLayout(screen, 1024.f, 768.f, values);
         for (const auto& text : layout.texts) needed += text.text;
         for (const auto& button : layout.buttons) needed += button.label;

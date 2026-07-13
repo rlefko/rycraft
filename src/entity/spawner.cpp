@@ -18,24 +18,24 @@ Spawner::Spawner(World& world)
 // ---------------------------------------------------------------------------
 BiomeSpawnRule Spawner::getSpawnRule(Biome biome) {
     switch (biome) {
-    case Biome::Plains:
+    case Biome::PLAINS:
         return {8, 4, 2, 0};
-    case Biome::Forest:
+    case Biome::FOREST:
         return {4, 4, 4, 0};
-    case Biome::Desert:
+    case Biome::DESERT:
         return {0, 0, 0, 0};
-    case Biome::Ocean:
-    case Biome::DeepOcean:
+    case Biome::OCEAN:
+    case Biome::DEEP_OCEAN:
         return {0, 0, 0, 0};
-    case Biome::Taiga:
+    case Biome::TAIGA:
         return {6, 2, 0, 0};
-    case Biome::Swamp:
+    case Biome::SWAMP:
         return {0, 2, 2, 0};
-    case Biome::ExtremeHills:
+    case Biome::EXTREME_HILLS:
         return {2, 2, 1, 0};
-    case Biome::MushroomIsland:
+    case Biome::MUSHROOM_ISLAND:
         return {4, 0, 0, 0};
-    case Biome::IceSpikes:
+    case Biome::ICE_SPIKES:
         return {2, 1, 0, 0};
     default:
         return {0, 0, 0, 0};

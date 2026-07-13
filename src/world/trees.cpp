@@ -132,10 +132,10 @@ void TreeGenerator::generate(Chunk& chunk, const std::array<Biome, CHUNK_WIDTH *
             // Determine tree density based on biome
             double density;
             switch (biome) {
-                case Biome::Forest:       density = 0.15; break;
-                case Biome::Plains:       density = 0.03; break;
-                case Biome::Taiga:        density = 0.12; break;
-                case Biome::Swamp:        density = 0.05; break;
+                case Biome::FOREST:       density = 0.15; break;
+                case Biome::PLAINS:       density = 0.03; break;
+                case Biome::TAIGA:        density = 0.12; break;
+                case Biome::SWAMP:        density = 0.05; break;
                 default:                  density = 0.0;  break;  // Desert, Ocean, etc.
             }
 
@@ -158,7 +158,7 @@ void TreeGenerator::generate(Chunk& chunk, const std::array<Biome, CHUNK_WIDTH *
             if (!canPlaceTree(chunk, x, surfaceY, z)) continue;
 
             // Choose tree type based on biome
-            bool isPine = (biome == Biome::Taiga);
+            bool isPine = (biome == Biome::TAIGA);
 
             if (isPine) {
                 generatePine(chunk, x, surfaceY, z);

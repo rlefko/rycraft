@@ -10,7 +10,7 @@ Chunk::Chunk(int cx, int cz)
     , biomes{}
     , heightMap{}
 {
-    biomes.fill(Biome::Plains);
+    biomes.fill(Biome::PLAINS);
     heightMap.fill(0);
 }
 

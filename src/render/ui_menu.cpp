@@ -60,8 +60,8 @@ MenuLayout buildTitleLayout(const LayoutContext& ctx) {
     addCenteredText(layout, ctx, "rycraft", 0.68f, 8.0f);
     addCenteredText(layout, ctx, "A voxel world built on Metal", 0.58f, 1.5f, 0.85f, 0.85f, 0.9f);
 
-    addButton(layout, ctx, "PLAY", MenuAction::Play, 0.5f, 0.42f, 320.f, 48.f);
-    addButton(layout, ctx, "QUIT", MenuAction::Quit, 0.5f, 0.42f - ctx.py(68.f), 320.f, 48.f);
+    addButton(layout, ctx, "PLAY", MenuAction::PLAY, 0.5f, 0.42f, 320.f, 48.f);
+    addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, 0.42f - ctx.py(68.f), 320.f, 48.f);
     return layout;
 }
 
@@ -72,9 +72,9 @@ MenuLayout buildPauseLayout(const LayoutContext& ctx) {
 
     addCenteredText(layout, ctx, "PAUSED", 0.5f + ctx.py(120.f), 3.0f);
 
-    addButton(layout, ctx, "RESUME", MenuAction::Resume, 0.5f, 0.5f + ctx.py(40.f), 320.f, 44.f);
-    addButton(layout, ctx, "SETTINGS", MenuAction::OpenSettings, 0.5f, 0.5f - ctx.py(24.f), 320.f, 44.f);
-    addButton(layout, ctx, "QUIT", MenuAction::Quit, 0.5f, 0.5f - ctx.py(88.f), 320.f, 44.f);
+    addButton(layout, ctx, "RESUME", MenuAction::RESUME, 0.5f, 0.5f + ctx.py(40.f), 320.f, 44.f);
+    addButton(layout, ctx, "SETTINGS", MenuAction::OPEN_SETTINGS, 0.5f, 0.5f - ctx.py(24.f), 320.f, 44.f);
+    addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, 0.5f - ctx.py(88.f), 320.f, 44.f);
     return layout;
 }
 
@@ -86,17 +86,17 @@ MenuLayout buildSettingsLayout(const LayoutContext& ctx, const SettingsValues& v
     addCenteredText(layout, ctx, "SETTINGS", 0.5f + ctx.py(160.f), 3.0f);
 
     addSettingsRow(layout, ctx, "RENDER DIST", std::to_string(values.viewDistance),
-                   MenuAction::ViewDistanceDown, MenuAction::ViewDistanceUp,
+                   MenuAction::VIEW_DISTANCE_DOWN, MenuAction::VIEW_DISTANCE_UP,
                    0.5f + ctx.py(84.f));
     addSettingsRow(layout, ctx, "FOG", std::to_string(values.fogLevel),
-                   MenuAction::FogDown, MenuAction::FogUp, 0.5f + ctx.py(28.f));
+                   MenuAction::FOG_DOWN, MenuAction::FOG_UP, 0.5f + ctx.py(28.f));
     addSettingsRow(layout, ctx, "SENSITIVITY", std::to_string(values.sensitivityLevel),
-                   MenuAction::SensitivityDown, MenuAction::SensitivityUp,
+                   MenuAction::SENSITIVITY_DOWN, MenuAction::SENSITIVITY_UP,
                    0.5f - ctx.py(28.f));
     addSettingsRow(layout, ctx, "VOLUME", std::to_string(values.volumeLevel),
-                   MenuAction::VolumeDown, MenuAction::VolumeUp, 0.5f - ctx.py(84.f));
+                   MenuAction::VOLUME_DOWN, MenuAction::VOLUME_UP, 0.5f - ctx.py(84.f));
 
-    addButton(layout, ctx, "BACK", MenuAction::CloseSettings, 0.5f, 0.5f - ctx.py(160.f), 320.f, 44.f);
+    addButton(layout, ctx, "BACK", MenuAction::CLOSE_SETTINGS, 0.5f, 0.5f - ctx.py(160.f), 320.f, 44.f);
     return layout;
 }
 
@@ -108,13 +108,13 @@ MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeigh
     LayoutContext ctx{pixelWidth, pixelHeight, pixelHeight / 768.0f};
 
     switch (screen) {
-        case GameScreen::Title:
+        case GameScreen::TITLE:
             return buildTitleLayout(ctx);
-        case GameScreen::Paused:
+        case GameScreen::PAUSED:
             return buildPauseLayout(ctx);
-        case GameScreen::Settings:
+        case GameScreen::SETTINGS:
             return buildSettingsLayout(ctx, values);
-        case GameScreen::Playing:
+        case GameScreen::PLAYING:
             return {};
     }
     return {};

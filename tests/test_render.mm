@@ -73,7 +73,7 @@ TEST_CASE("Mesher: empty chunk produces no geometry", "[render][mesher]") {
     // All AIR — no solid blocks
 
     LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
     REQUIRE(output.vertices.empty());
     REQUIRE(output.indices.empty());
@@ -84,7 +84,7 @@ TEST_CASE("Mesher: single block produces 6 faces", "[render][mesher]") {
     chunk.setBlock(8, 64, 8, BlockType::STONE);
 
     LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
     // 6 faces × 4 vertices = 24 vertices
     REQUIRE(output.vertices.size() == 24);
@@ -101,7 +101,7 @@ TEST_CASE("Mesher: 2x2 flat merges top face", "[render][mesher]") {
     chunk.setBlock(1, 64, 1, BlockType::STONE);
 
     LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
     // Without greedy merge: 4 top faces = 16 vertices
     // With greedy merge: 1 top face = 4 vertices
@@ -125,13 +125,13 @@ TEST_CASE("Mesher: 2x2 flat merges top face", "[render][mesher]") {
     REQUIRE(output.indices.size() == 36);
 
     // Verify the top face is a single quad (first 4 vertices)
-    // All 4 top-face vertices should decode to FaceNormal::PlusY
+    // All 4 top-face vertices should decode to FaceNormal::PLUS_Y
     bool foundTopQuad = false;
     for (size_t i = 0; i + 3 < output.vertices.size(); ++i) {
-        if (unpackFace(output.vertices[i].faceAttr) == FaceNormal::PlusY &&
-            unpackFace(output.vertices[i + 1].faceAttr) == FaceNormal::PlusY &&
-            unpackFace(output.vertices[i + 2].faceAttr) == FaceNormal::PlusY &&
-            unpackFace(output.vertices[i + 3].faceAttr) == FaceNormal::PlusY) {
+        if (unpackFace(output.vertices[i].faceAttr) == FaceNormal::PLUS_Y &&
+            unpackFace(output.vertices[i + 1].faceAttr) == FaceNormal::PLUS_Y &&
+            unpackFace(output.vertices[i + 2].faceAttr) == FaceNormal::PLUS_Y &&
+            unpackFace(output.vertices[i + 3].faceAttr) == FaceNormal::PLUS_Y) {
             foundTopQuad = true;
             break;
         }
@@ -148,7 +148,7 @@ TEST_CASE("Mesher: vertical column merges side faces", "[render][mesher]") {
     chunk.setBlock(8, 67, 8, BlockType::STONE);
 
     LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
     // Top (+Y): 1 quad at y=67 top = 4 vertices, 6 indices
     // Bottom (-Y): 1 quad at y=64 bottom = 4 vertices, 6 indices
@@ -197,7 +197,7 @@ TEST_CASE("Mesher: produces mesh without side effects", "[render][mesher]") {
     REQUIRE(chunk.needsMeshUpdate == true);
 
     LODMesher mesher;
-    MeshOutput mesh = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
+    MeshOutput mesh = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
     // buildMesh is pure — it does not modify the chunk
     REQUIRE(chunk.needsMeshUpdate == true);
@@ -226,12 +226,12 @@ TEST_CASE("Block textures: every block type maps to a valid layer", "[render][te
 }
 
 TEST_CASE("Block textures: grass uses per-face layers", "[render][textures]") {
-    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::PlusY) ==
+    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::PLUS_Y) ==
             static_cast<uint8_t>(BlockType::GRASS));
-    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::MinusY) ==
+    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::MINUS_Y) ==
             static_cast<uint8_t>(BlockType::DIRT));
-    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::PlusX) == TEXTURE_LAYER_GRASS_SIDE);
-    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::MinusZ) == TEXTURE_LAYER_GRASS_SIDE);
+    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::PLUS_X) == TEXTURE_LAYER_GRASS_SIDE);
+    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::MINUS_Z) == TEXTURE_LAYER_GRASS_SIDE);
 }
 
 TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][textures]") {
@@ -255,12 +255,12 @@ TEST_CASE("Mesher: faces under cover carry reduced skylight", "[render][mesher]"
     chunk.setBlock(8, 68, 8, BlockType::LEAVES);
 
     LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
     bool foundShadedTop = false;
     bool foundLitCanopyTop = false;
     for (const Vertex& v : output.vertices) {
-        if (unpackFace(v.faceAttr) != FaceNormal::PlusY) continue;
+        if (unpackFace(v.faceAttr) != FaceNormal::PLUS_Y) continue;
         float y = static_cast<float>(v.py);
         if (y > 64.5f && y < 65.5f) {
             // The ground's top face sits under the canopy → shaded

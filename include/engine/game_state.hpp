@@ -10,28 +10,28 @@
 // ---------------------------------------------------------------------------
 
 enum class GameScreen {
-    Title,     // launch screen: PLAY / QUIT, world visible behind
-    Playing,   // normal gameplay, cursor captured
-    Paused,    // ESC menu: RESUME / SETTINGS / QUIT
-    Settings,  // settings panel, reached from Paused
+    TITLE,     // launch screen: PLAY / QUIT, world visible behind
+    PLAYING,   // normal gameplay, cursor captured
+    PAUSED,    // ESC menu: RESUME / SETTINGS / QUIT
+    SETTINGS,  // settings panel, reached from PAUSED
 };
 
 enum class MenuAction {
-    None,
-    Play,
-    Resume,
-    OpenSettings,
-    CloseSettings,
-    Quit,
+    NONE,
+    PLAY,
+    RESUME,
+    OPEN_SETTINGS,
+    CLOSE_SETTINGS,
+    QUIT,
     // Settings value steppers (handled by the engine; no screen change)
-    ViewDistanceDown,
-    ViewDistanceUp,
-    FogDown,
-    FogUp,
-    SensitivityDown,
-    SensitivityUp,
-    VolumeDown,
-    VolumeUp,
+    VIEW_DISTANCE_DOWN,
+    VIEW_DISTANCE_UP,
+    FOG_DOWN,
+    FOG_UP,
+    SENSITIVITY_DOWN,
+    SENSITIVITY_UP,
+    VOLUME_DOWN,
+    VOLUME_UP,
 };
 
 // What the engine must do after a transition.
@@ -43,24 +43,24 @@ struct GameFlowEffects {
 };
 
 struct GameFlow {
-    GameScreen screen = GameScreen::Title;
+    GameScreen screen = GameScreen::TITLE;
 
     // Menus freeze the world: ticks run only while Playing.
-    constexpr bool inMenu() const { return screen != GameScreen::Playing; }
+    constexpr bool inMenu() const { return screen != GameScreen::PLAYING; }
 
     // ESC: pause from gameplay, resume from pause, back out of settings.
     constexpr GameFlowEffects onEscape() {
         switch (screen) {
-            case GameScreen::Playing:
-                screen = GameScreen::Paused;
+            case GameScreen::PLAYING:
+                screen = GameScreen::PAUSED;
                 return {.releaseCursor = true, .resetTiming = true};
-            case GameScreen::Paused:
-                screen = GameScreen::Playing;
+            case GameScreen::PAUSED:
+                screen = GameScreen::PLAYING;
                 return {.captureCursor = true, .resetTiming = true};
-            case GameScreen::Settings:
-                screen = GameScreen::Paused;
+            case GameScreen::SETTINGS:
+                screen = GameScreen::PAUSED;
                 return {};
-            case GameScreen::Title:
+            case GameScreen::TITLE:
                 return {};
         }
         return {};
@@ -68,26 +68,26 @@ struct GameFlow {
 
     constexpr GameFlowEffects onMenuAction(MenuAction action) {
         switch (action) {
-            case MenuAction::Play:
-                if (screen == GameScreen::Title) {
-                    screen = GameScreen::Playing;
+            case MenuAction::PLAY:
+                if (screen == GameScreen::TITLE) {
+                    screen = GameScreen::PLAYING;
                     return {.captureCursor = true, .resetTiming = true};
                 }
                 return {};
-            case MenuAction::Resume:
-                if (screen == GameScreen::Paused) {
-                    screen = GameScreen::Playing;
+            case MenuAction::RESUME:
+                if (screen == GameScreen::PAUSED) {
+                    screen = GameScreen::PLAYING;
                     return {.captureCursor = true, .resetTiming = true};
                 }
                 return {};
-            case MenuAction::OpenSettings:
-                if (screen == GameScreen::Paused) screen = GameScreen::Settings;
+            case MenuAction::OPEN_SETTINGS:
+                if (screen == GameScreen::PAUSED) screen = GameScreen::SETTINGS;
                 return {};
-            case MenuAction::CloseSettings:
-                if (screen == GameScreen::Settings) screen = GameScreen::Paused;
+            case MenuAction::CLOSE_SETTINGS:
+                if (screen == GameScreen::SETTINGS) screen = GameScreen::PAUSED;
                 return {};
-            case MenuAction::Quit:
-                if (screen == GameScreen::Title || screen == GameScreen::Paused) {
+            case MenuAction::QUIT:
+                if (screen == GameScreen::TITLE || screen == GameScreen::PAUSED) {
                     return {.requestQuit = true};
                 }
                 return {};
@@ -100,8 +100,8 @@ struct GameFlow {
     // Losing focus while playing auto-pauses: the pointer lock is global
     // system state and must never survive a Cmd-Tab.
     constexpr GameFlowEffects onFocusLost() {
-        if (screen == GameScreen::Playing) {
-            screen = GameScreen::Paused;
+        if (screen == GameScreen::PLAYING) {
+            screen = GameScreen::PAUSED;
             return {.releaseCursor = true, .resetTiming = true};
         }
         return {};

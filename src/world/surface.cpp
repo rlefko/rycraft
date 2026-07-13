@@ -10,12 +10,12 @@ int SurfaceGenerator::getSurfaceHeight(Biome biome, double baseHeight) {
 
     // Apply biome-specific height adjustments
     switch (biome) {
-        case Biome::ExtremeHills: height += 15; break;
-        case Biome::IceSpikes:    height += 10; break;
-        case Biome::Taiga:        height += 8;  break;
-        case Biome::Forest:       height += 5;  break;
-        case Biome::Desert:       height += 3;  break;
-        case Biome::Swamp:        height -= 3;  break;
+        case Biome::EXTREME_HILLS: height += 15; break;
+        case Biome::ICE_SPIKES:    height += 10; break;
+        case Biome::TAIGA:        height += 8;  break;
+        case Biome::FOREST:       height += 5;  break;
+        case Biome::DESERT:       height += 3;  break;
+        case Biome::SWAMP:        height -= 3;  break;
         default:                  break;
     }
 
@@ -25,14 +25,14 @@ int SurfaceGenerator::getSurfaceHeight(Biome biome, double baseHeight) {
 
 BlockType SurfaceGenerator::getSurfaceBlockType(Biome biome) {
     switch (biome) {
-        case Biome::Desert:       return BlockType::SAND;
-        case Biome::IceSpikes:    return BlockType::SNOW;
-        case Biome::ExtremeHills: return BlockType::STONE;
-        case Biome::Plains:
-        case Biome::Forest:
-        case Biome::Taiga:
-        case Biome::Swamp:
-        case Biome::MushroomIsland:
+        case Biome::DESERT:       return BlockType::SAND;
+        case Biome::ICE_SPIKES:    return BlockType::SNOW;
+        case Biome::EXTREME_HILLS: return BlockType::STONE;
+        case Biome::PLAINS:
+        case Biome::FOREST:
+        case Biome::TAIGA:
+        case Biome::SWAMP:
+        case Biome::MUSHROOM_ISLAND:
             return BlockType::GRASS;
         default:
             return BlockType::DIRT;
@@ -41,15 +41,15 @@ BlockType SurfaceGenerator::getSurfaceBlockType(Biome biome) {
 
 BlockType SurfaceGenerator::getSubsurfaceBlockType(Biome biome) {
     switch (biome) {
-        case Biome::Desert:       return BlockType::SAND;
-        case Biome::Taiga:        return BlockType::GRAVEL;
+        case Biome::DESERT:       return BlockType::SAND;
+        case Biome::TAIGA:        return BlockType::GRAVEL;
         default:
             return BlockType::DIRT;
     }
 }
 
 bool SurfaceGenerator::isDesert(Biome biome) {
-    return biome == Biome::Desert;
+    return biome == Biome::DESERT;
 }
 
 void SurfaceGenerator::generateSurface(Chunk& chunk,

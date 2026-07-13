@@ -270,12 +270,12 @@ static EngineState* _engineGetState(Engine* engine) {
     if (const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN")) {
         std::string name = screenEnv;
         if (name == "playing") {
-            _state->flow.screen = GameScreen::Playing;
+            _state->flow.screen = GameScreen::PLAYING;
             _state->inputManager->captureMouse();
         } else if (name == "paused") {
-            _state->flow.screen = GameScreen::Paused;
+            _state->flow.screen = GameScreen::PAUSED;
         } else if (name == "settings") {
-            _state->flow.screen = GameScreen::Settings;
+            _state->flow.screen = GameScreen::SETTINGS;
         }
     }
 
@@ -341,7 +341,7 @@ static EngineState* _engineGetState(Engine* engine) {
     [self handleGlobalInput];
 
     // 4. Fixed timestep game tick — menus freeze the world
-    if (state->flow.screen == GameScreen::Playing) {
+    if (state->flow.screen == GameScreen::PLAYING) {
         while (state->accumulator >= EngineState::TICK_DT) {
             [self gameTick:state];
             state->accumulator -= EngineState::TICK_DT;
@@ -383,7 +383,7 @@ static EngineState* _engineGetState(Engine* engine) {
     EngineState* state = _state.get();
     if (!state->audio) return;
 
-    const bool playing = state->flow.screen == GameScreen::Playing;
+    const bool playing = state->flow.screen == GameScreen::PLAYING;
     float volume = static_cast<float>(state->settings.volumeLevel) / 10.0f;
     state->audio->setMasterVolume(playing ? volume : 0.0f);
 
@@ -395,7 +395,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
 - (void)playSfx:(const std::vector<float>&)buffer gain:(float)gain {
     EngineState* state = _state.get();
-    if (!state->audio || state->flow.screen != GameScreen::Playing) return;
+    if (!state->audio || state->flow.screen != GameScreen::PLAYING) return;
     state->audio->playSound(buffer, SoundEffect::SAMPLE_RATE, gain);
 }
 
@@ -430,35 +430,35 @@ static EngineState* _engineGetState(Engine* engine) {
     SettingsValues& settings = state->settings;
 
     switch (action) {
-        case MenuAction::ViewDistanceDown:
-        case MenuAction::ViewDistanceUp: {
-            int step = (action == MenuAction::ViewDistanceUp) ? 2 : -2;
+        case MenuAction::VIEW_DISTANCE_DOWN:
+        case MenuAction::VIEW_DISTANCE_UP: {
+            int step = (action == MenuAction::VIEW_DISTANCE_UP) ? 2 : -2;
             settings.viewDistance = std::clamp(settings.viewDistance + step, 4, 32);
             if (state->world) {
                 state->world->setViewDistance(settings.viewDistance);
             }
             break;
         }
-        case MenuAction::FogDown:
-        case MenuAction::FogUp: {
-            int step = (action == MenuAction::FogUp) ? 1 : -1;
+        case MenuAction::FOG_DOWN:
+        case MenuAction::FOG_UP: {
+            int step = (action == MenuAction::FOG_UP) ? 1 : -1;
             settings.fogLevel = std::clamp(settings.fogLevel + step, 0, 10);
             if (_renderPipeline) {
                 _renderPipeline->setFogDensity(static_cast<float>(settings.fogLevel) * 0.0001f);
             }
             break;
         }
-        case MenuAction::SensitivityDown:
-        case MenuAction::SensitivityUp: {
-            int step = (action == MenuAction::SensitivityUp) ? 1 : -1;
+        case MenuAction::SENSITIVITY_DOWN:
+        case MenuAction::SENSITIVITY_UP: {
+            int step = (action == MenuAction::SENSITIVITY_UP) ? 1 : -1;
             settings.sensitivityLevel = std::clamp(settings.sensitivityLevel + step, 1, 10);
             state->camera.setMouseSensitivity(
                 static_cast<float>(settings.sensitivityLevel) * 0.0005f);
             break;
         }
-        case MenuAction::VolumeDown:
-        case MenuAction::VolumeUp: {
-            int step = (action == MenuAction::VolumeUp) ? 1 : -1;
+        case MenuAction::VOLUME_DOWN:
+        case MenuAction::VOLUME_UP: {
+            int step = (action == MenuAction::VOLUME_UP) ? 1 : -1;
             settings.volumeLevel = std::clamp(settings.volumeLevel + step, 0, 10);
             [self syncAudioVolume];
             break;

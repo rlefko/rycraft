@@ -35,7 +35,7 @@ struct MenuText {
 struct MenuButton {
     UIRect rect;
     std::string label;
-    MenuAction action = MenuAction::None;
+    MenuAction action = MenuAction::NONE;
 };
 
 struct MenuLayout {
@@ -63,7 +63,7 @@ struct PerformanceStats {
 
 // Everything the UI pass needs to draw one frame.
 struct UIFrameState {
-    GameScreen screen = GameScreen::Title;
+    GameScreen screen = GameScreen::TITLE;
     int hoveredButton = -1;  // index into menu.buttons, -1 = none
     bool showDebugHud = false;
     PerformanceStats stats{};

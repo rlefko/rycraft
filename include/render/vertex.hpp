@@ -53,10 +53,10 @@ static_assert(alignof(Vertex) == 16, "Vertex must be 16-byte aligned");
 
 // Face normal index constants
 enum class FaceNormal : uint8_t {
-    PlusX = 0,
-    MinusX = 1,
-    PlusZ = 2,
-    MinusZ = 3,
-    PlusY = 4,
-    MinusY = 5,
+    PLUS_X = 0,
+    MINUS_X = 1,
+    PLUS_Z = 2,
+    MINUS_Z = 3,
+    PLUS_Y = 4,
+    MINUS_Y = 5,
 };
