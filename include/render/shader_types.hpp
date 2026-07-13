@@ -35,10 +35,17 @@ struct SkyUniforms {
     float sunIntensity;  // 0 at night, 1 at noon
 };
 
-// Procedural cloud layer, bound at buffer(0) in clouds.metal.
+// Procedural cloud layer, bound at buffer(0) in clouds.metal. The fragment
+// shader ray-casts from the camera through each pixel onto the horizontal
+// cloud plane, so the camera basis and projection shape ride along.
 struct CloudUniforms {
     simd_float3 cameraPosition;
+    simd_float3 cameraForward;
+    simd_float3 cameraRight;
+    simd_float3 cameraUp;
     simd_float3 sunDirection;
+    float tanHalfFov;
+    float aspect;
     float windOffset;
     float cloudAltitude;
     float noiseFrequency;
@@ -81,8 +88,10 @@ static_assert(offsetof(Uniforms, cameraPosition) == 272);
 static_assert(sizeof(SkyUniforms) == 80);
 static_assert(offsetof(SkyUniforms, sunIntensity) == 64);
 
-static_assert(sizeof(CloudUniforms) == 48);
-static_assert(offsetof(CloudUniforms, windOffset) == 32);
+static_assert(sizeof(CloudUniforms) == 112);
+static_assert(offsetof(CloudUniforms, sunDirection) == 64);
+static_assert(offsetof(CloudUniforms, tanHalfFov) == 80);
+static_assert(offsetof(CloudUniforms, cloudThreshold) == 100);
 
 static_assert(sizeof(GPUParticle) == 48);
 static_assert(offsetof(GPUParticle, velocity) == 16);

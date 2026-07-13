@@ -2,16 +2,8 @@
 
 #include "common/error.hpp"
 
-#include <array>
-#include <cstring>
 #include <cmath>
-
-// ---------------------------------------------------------------------------
-// UIOverlay vertex layout (matches Metal shader):
-//   attribute(0) float2 position  — offset 0
-//   attribute(1) float4 color     — offset 8
-//   stride = 16 bytes per vertex
-// ---------------------------------------------------------------------------
+#include <cstring>
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -35,21 +27,18 @@ UIOverlay::UIOverlay(id<MTLDevice> device,
         RY_LOG_FATAL("Failed to load UI fragment shader function 'uiFragmentMain'");
     }
 
-    // ---- Vertex descriptor ----
+    // ---- Vertex descriptor (matches UIVertex: float2 pos, float4 color) ----
     auto vertexDesc = [MTLVertexDescriptor vertexDescriptor];
 
-    // Attribute 0: position (float2)
     vertexDesc.attributes[0].format = MTLVertexFormatFloat2;
     vertexDesc.attributes[0].offset = 0;
     vertexDesc.attributes[0].bufferIndex = 0;
 
-    // Attribute 1: color (float4)
     vertexDesc.attributes[1].format = MTLVertexFormatFloat4;
     vertexDesc.attributes[1].offset = 8;
     vertexDesc.attributes[1].bufferIndex = 0;
 
-    // Buffer layout: 16 bytes per vertex
-    vertexDesc.layouts[0].stride = 16;
+    vertexDesc.layouts[0].stride = sizeof(UIVertex);
     vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
     vertexDesc.layouts[0].stepRate = 1;
 
@@ -78,58 +67,77 @@ UIOverlay::UIOverlay(id<MTLDevice> device,
         RY_LOG_FATAL(msg.UTF8String);
     }
 
-    // ---- Allocate buffers ----
-    // Dynamic buffer: 4 vertices × 16 bytes = 64 bytes
-    _dynamicBuffer = [_device newBufferWithLength:64
-                                           options:MTLResourceStorageModeShared];
-    if (!_dynamicBuffer) {
-        RY_LOG_FATAL("Failed to allocate UI overlay dynamic buffer");
-    }
-
-    // Index buffer: 6 indices × 2 bytes = 12 bytes
-    _quadIndexBuffer = [_device newBufferWithLength:12
-                                             options:MTLResourceStorageModeShared];
-    if (!_quadIndexBuffer) {
-        RY_LOG_FATAL("Failed to allocate UI overlay index buffer");
-    }
-
-    // Indices for a triangle strip quad (0,1,2, 0,2,3)
-    uint16_t indices[] = {0, 1, 2, 0, 2, 3};
-    std::memcpy((void*)_quadIndexBuffer.contents, indices, sizeof(indices));
-
-    // Projection matrix buffer (16 floats = 64 bytes)
+    // ---- Projection matrix buffer (16 floats = 64 bytes) ----
     _projectionBuffer = [_device newBufferWithLength:64
                                               options:MTLResourceStorageModeShared];
     if (!_projectionBuffer) {
         RY_LOG_FATAL("Failed to allocate UI overlay projection buffer");
     }
     buildProjectionMatrix();
+
+    // Vertex ring slots are allocated lazily in flush() (grow on demand).
+    for (int i = 0; i < RING_SLOTS; ++i) {
+        _vertexRing[i] = nil;
+    }
+    _vertices.reserve(4096);
+}
+
+// ---------------------------------------------------------------------------
+// Frame batching
+// ---------------------------------------------------------------------------
+void UIOverlay::beginFrame() {
+    _vertices.clear();
+}
+
+void UIOverlay::flush(id<MTLRenderCommandEncoder> encoder) {
+    if (!encoder || _vertices.empty()) return;
+
+    const size_t byteCount = _vertices.size() * sizeof(UIVertex);
+    id<MTLBuffer>& slot = _vertexRing[_frameIndex % RING_SLOTS];
+    ++_frameIndex;
+
+    if (!slot || slot.length < byteCount) {
+        // Grow to the next power of two so steady-state frames never realloc
+        size_t capacity = 16384;
+        while (capacity < byteCount) capacity *= 2;
+        slot = [_device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
+        if (!slot) {
+            RY_LOG_ERROR("Failed to allocate UI overlay vertex buffer");
+            _vertices.clear();
+            return;
+        }
+    }
+
+    std::memcpy((void*)slot.contents, _vertices.data(), byteCount);
+
+    [encoder setRenderPipelineState:_pipelineState];
+    [encoder setVertexBuffer:slot offset:0 atIndex:0];
+    [encoder setVertexBuffer:_projectionBuffer offset:0 atIndex:1];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                vertexStart:0
+                vertexCount:_vertices.size()];
+
+    _vertices.clear();
 }
 
 // ---------------------------------------------------------------------------
 // drawQuad()
 // ---------------------------------------------------------------------------
-void UIOverlay::drawQuad(id<MTLRenderCommandEncoder> encoder,
-                         float x, float y,
+void UIOverlay::drawQuad(float x, float y,
                          float w, float h,
                          float r, float g, float b, float a)
 {
-    if (!encoder) return;
+    const UIVertex bl{x, y, r, g, b, a};
+    const UIVertex tl{x, y + h, r, g, b, a};
+    const UIVertex br{x + w, y, r, g, b, a};
+    const UIVertex tr{x + w, y + h, r, g, b, a};
 
-    // Build quad vertices and upload to dynamic buffer
-    buildQuadVertices(x, y, w, h, r, g, b, a);
-
-    // Bind pipeline and buffers
-    [encoder setRenderPipelineState:_pipelineState];
-    [encoder setVertexBuffer:_dynamicBuffer offset:0 atIndex:0];
-    [encoder setVertexBuffer:_projectionBuffer offset:0 atIndex:1];
-
-    // Draw indexed quad (2 triangles)
-    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                         indexCount:6
-                          indexType:MTLIndexTypeUInt16
-                        indexBuffer:_quadIndexBuffer
-                    indexBufferOffset:0];
+    _vertices.push_back(bl);
+    _vertices.push_back(tl);
+    _vertices.push_back(br);
+    _vertices.push_back(tl);
+    _vertices.push_back(tr);
+    _vertices.push_back(br);
 }
 
 // ---------------------------------------------------------------------------
@@ -145,39 +153,10 @@ void UIOverlay::resize(uint32_t width, uint32_t height) {
 }
 
 // ---------------------------------------------------------------------------
-// buildQuadVertices()
-// ---------------------------------------------------------------------------
-void UIOverlay::buildQuadVertices(float x, float y, float w, float h,
-                                  float r, float g, float b, float a) {
-    // Screen-space quad vertices (bottom-left origin, normalized coords).
-    // Layout: [x, y, r, g, b, a, 0, 0] — 16 bytes per vertex.
-    struct alignas(16) QuadVertex {
-        float px, py;
-        float cr, cg, cb, ca;
-    };
-
-    QuadVertex vertices[4];
-
-    // Bottom-left
-    vertices[0] = {x, y, r, g, b, a};
-    // Top-left
-    vertices[1] = {x, y + h, r, g, b, a};
-    // Bottom-right
-    vertices[2] = {x + w, y, r, g, b, a};
-    // Top-right
-    vertices[3] = {x + w, y + h, r, g, b, a};
-
-    std::memcpy((void*)_dynamicBuffer.contents, vertices, sizeof(vertices));
-}
-
-// ---------------------------------------------------------------------------
 // buildProjectionMatrix()
 // ---------------------------------------------------------------------------
 void UIOverlay::buildProjectionMatrix() {
     // Orthographic projection that maps normalized screen coords [0,1] to NDC.
-    // This creates a 2×2 identity-like matrix so that screen coords pass through
-    // directly to clip space (Metal's NDC is [-1,1] in x,y).
-    //
     // We map: screen(0,0) → NDC(-1,-1), screen(1,1) → NDC(1,1)
     //   x_ndc = 2*x_screen - 1
     //   y_ndc = 2*y_screen - 1
@@ -194,12 +173,11 @@ void UIOverlay::buildProjectionMatrix() {
 }
 
 // ============================================================================
-// Performance HUD (Phase 8)
+// Bitmap font text
 // ============================================================================
 
 // ---- 8×8 bitmap font data ----
 // Each character is 8 bytes (one byte per row), bits 7-0 = left-to-right pixels
-// Using std::array to avoid C99 compound literal issues
 static uint8_t getCharRow(char c, int row) {
     if (row < 0 || row >= 8) return 0x00;
     switch (c) {
@@ -251,17 +229,14 @@ std::array<uint8_t, 8> UIOverlay::getCharBitmap(char c) {
     return bitmap;
 }
 
-void UIOverlay::drawChar(id<MTLRenderCommandEncoder> encoder,
-                          char c, float x, float y,
+void UIOverlay::drawChar(char c, float x, float y, float scale,
                           float r, float g, float b)
 {
-    if (!encoder) return;
-
     auto bitmap = getCharBitmap(c);
 
-    // Draw each lit pixel as a small quad
-    float pixelW = 1.0f / static_cast<float>(_width);
-    float pixelH = 1.0f / static_cast<float>(_height);
+    // Each lit font pixel becomes one small quad
+    float pixelW = scale / static_cast<float>(_width);
+    float pixelH = scale / static_cast<float>(_height);
 
     for (int row = 0; row < FONT_HEIGHT; ++row) {
         uint8_t rowBits = bitmap[row];
@@ -269,27 +244,32 @@ void UIOverlay::drawChar(id<MTLRenderCommandEncoder> encoder,
             if (rowBits & (0x80 >> col)) {
                 float px = x + col * pixelW;
                 float py = y + (FONT_HEIGHT - 1 - row) * pixelH;
-                drawQuad(encoder, px, py, pixelW, pixelH, r, g, b, 1.0f);
+                drawQuad(px, py, pixelW, pixelH, r, g, b, 1.0f);
             }
         }
     }
 }
 
-float UIOverlay::drawString(id<MTLRenderCommandEncoder> encoder,
-                             const char* str, float x, float y,
+float UIOverlay::drawString(const char* str, float x, float y, float scale,
                              float r, float g, float b)
 {
-    if (!encoder || !str) return 0.f;
+    if (!str) return 0.f;
 
     float cursorX = x;
 
     while (*str) {
-        drawChar(encoder, *str, cursorX, y, r, g, b);
-        cursorX += (FONT_WIDTH + 1) / static_cast<float>(_width);
+        drawChar(*str, cursorX, y, scale, r, g, b);
+        cursorX += (FONT_WIDTH + 1) * scale / static_cast<float>(_width);
         ++str;
     }
 
     return cursorX - x;
+}
+
+float UIOverlay::measureString(const char* str, float scale) const {
+    if (!str) return 0.f;
+    const float advance = (FONT_WIDTH + 1) * scale / static_cast<float>(_width);
+    return advance * static_cast<float>(std::strlen(str));
 }
 
 void UIOverlay::intToString(int value, char* buf, size_t bufSize) {
@@ -337,11 +317,8 @@ void UIOverlay::floatToString(float value, char* buf, size_t bufSize) {
     }
 }
 
-void UIOverlay::drawPerformanceHUD(id<MTLRenderCommandEncoder> encoder,
-                                    const PerformanceStats& stats)
+void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats)
 {
-    if (!encoder) return;
-
     // HUD position: top-left corner
     float hudX = 8.0f / static_cast<float>(_width);
     float hudY = 1.0f - 8.0f / static_cast<float>(_height); // Top of screen
@@ -349,7 +326,7 @@ void UIOverlay::drawPerformanceHUD(id<MTLRenderCommandEncoder> encoder,
     // Background: semi-transparent dark rectangle
     float bgWidth = 220.0f / static_cast<float>(_width);
     float bgHeight = 80.0f / static_cast<float>(_height);
-    drawQuad(encoder, hudX - 4.0f / _width, hudY - bgHeight,
+    drawQuad(hudX - 4.0f / _width, hudY - bgHeight,
              bgWidth, bgHeight,
              0.0f, 0.0f, 0.0f, 0.6f);
 
@@ -361,28 +338,28 @@ void UIOverlay::drawPerformanceHUD(id<MTLRenderCommandEncoder> encoder,
     // FPS
     char fpsBuf[16];
     floatToString(stats.fps, fpsBuf, sizeof(fpsBuf));
-    drawString(encoder, "FPS: ", textX, textY, 1.0f, 1.0f, 0.2f);
-    drawString(encoder, fpsBuf, textX + 40.0f / _width, textY, 1.0f, 1.0f, 0.2f);
+    drawString("FPS: ", textX, textY, 1.0f, 1.0f, 1.0f, 0.2f);
+    drawString(fpsBuf, textX + 40.0f / _width, textY, 1.0f, 1.0f, 1.0f, 0.2f);
     textY -= lineHeight;
 
     // Chunks
     char chunkBuf[16];
     intToString(static_cast<int>(stats.chunkCount), chunkBuf, sizeof(chunkBuf));
-    drawString(encoder, "Chunks: ", textX, textY, 0.2f, 1.0f, 0.8f);
-    drawString(encoder, chunkBuf, textX + 72.0f / _width, textY, 0.2f, 1.0f, 0.8f);
+    drawString("Chunks: ", textX, textY, 1.0f, 0.2f, 1.0f, 0.8f);
+    drawString(chunkBuf, textX + 72.0f / _width, textY, 1.0f, 0.2f, 1.0f, 0.8f);
     textY -= lineHeight;
 
     // Entities
     char entityBuf[16];
     intToString(static_cast<int>(stats.entityCount), entityBuf, sizeof(entityBuf));
-    drawString(encoder, "Entities: ", textX, textY, 0.8f, 0.4f, 1.0f);
-    drawString(encoder, entityBuf, textX + 88.0f / _width, textY, 0.8f, 0.4f, 1.0f);
+    drawString("Entities: ", textX, textY, 1.0f, 0.8f, 0.4f, 1.0f);
+    drawString(entityBuf, textX + 88.0f / _width, textY, 1.0f, 0.8f, 0.4f, 1.0f);
     textY -= lineHeight;
 
     // Frame time
     char ftBuf[16];
     floatToString(stats.frameTimeMs, ftBuf, sizeof(ftBuf));
-    drawString(encoder, "Frame: ", textX, textY, 1.0f, 0.8f, 0.4f);
-    drawString(encoder, ftBuf, textX + 60.0f / _width, textY, 1.0f, 0.8f, 0.4f);
+    drawString("Frame: ", textX, textY, 1.0f, 1.0f, 0.8f, 0.4f);
+    drawString(ftBuf, textX + 60.0f / _width, textY, 1.0f, 1.0f, 0.8f, 0.4f);
     (void)textY; // Suppress unused variable warning
 }

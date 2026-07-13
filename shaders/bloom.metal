@@ -33,7 +33,10 @@ vertex BloomVertexOut bloomExtractVertex(uint vertexID [[vertex_id]]) {
     };
     BloomVertexOut out;
     out.clipPosition = float4(positions[vertexID], 0.0, 1.0);
-    out.vUV = positions[vertexID] * 0.5f + 0.5f;
+    // Texture v runs downward in Metal while NDC y runs up; flip v so
+    // every sampling pass preserves the image orientation.
+    out.vUV = float2(positions[vertexID].x * 0.5f + 0.5f,
+                     0.5f - positions[vertexID].y * 0.5f);
     return out;
 }
 
@@ -75,7 +78,10 @@ vertex BloomVertexOut bloomBlurVertex(uint vertexID [[vertex_id]]) {
     };
     BloomVertexOut out;
     out.clipPosition = float4(positions[vertexID], 0.0, 1.0);
-    out.vUV = positions[vertexID] * 0.5f + 0.5f;
+    // Texture v runs downward in Metal while NDC y runs up; flip v so
+    // every sampling pass preserves the image orientation.
+    out.vUV = float2(positions[vertexID].x * 0.5f + 0.5f,
+                     0.5f - positions[vertexID].y * 0.5f);
     return out;
 }
 
@@ -133,7 +139,10 @@ vertex BloomVertexOut bloomCompositeVertex(uint vertexID [[vertex_id]]) {
     };
     BloomVertexOut out;
     out.clipPosition = float4(positions[vertexID], 0.0, 1.0);
-    out.vUV = positions[vertexID] * 0.5f + 0.5f;
+    // Texture v runs downward in Metal while NDC y runs up; flip v so
+    // every sampling pass preserves the image orientation.
+    out.vUV = float2(positions[vertexID].x * 0.5f + 0.5f,
+                     0.5f - positions[vertexID].y * 0.5f);
     return out;
 }
 

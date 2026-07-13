@@ -11,9 +11,13 @@
 #include "engine/camera.hpp"
 #include "engine/hotbar.hpp"
 
+#import <ImageIO/ImageIO.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -27,11 +31,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     , _textureAtlas(nullptr)
     , _uiOverlay(nullptr)
     , _bloom(nullptr)
-    , _upscaler(nullptr)
     , _particles(nullptr)
     , _bloomIntensity(1.0f)
-    , _renderWidth(width / 2)
-    , _renderHeight(height / 2)
     , _displayWidth(width)
     , _displayHeight(height)
     , _frustumPlanes{}
@@ -89,31 +90,6 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         RY_LOG_FATAL(msg.UTF8String);
     }
 
-    // ---- Water pipeline state (transparent) ----
-    auto waterPipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
-    waterPipelineDesc.vertexFunction = vertexFunc;
-    waterPipelineDesc.fragmentFunction = fragmentFunc;
-    waterPipelineDesc.vertexDescriptor = vertexDesc;
-
-    waterPipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    waterPipelineDesc.colorAttachments[0].blendingEnabled = true;
-    waterPipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    waterPipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-    waterPipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-    waterPipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    waterPipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    waterPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    waterPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-    waterPipelineDesc.rasterSampleCount = 4;
-
-    _waterPipelineState = [_device newRenderPipelineStateWithDescriptor:waterPipelineDesc
-                                                                 error:&error];
-    if (!_waterPipelineState) {
-        NSString* msg = [NSString stringWithFormat:@"Failed to create water pipeline state: %@",
-                         error.localizedDescription];
-        RY_LOG_FATAL(msg.UTF8String);
-    }
-
     // ---- Depth stencil state (opaque) ----
     auto depthDesc = [[MTLDepthStencilDescriptor alloc] init];
     depthDesc.depthCompareFunction = MTLCompareFunctionLess;
@@ -123,13 +99,13 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         RY_LOG_FATAL("Failed to create depth stencil state");
     }
 
-    // ---- Water depth state (no depth write) ----
-    auto waterDepthDesc = [[MTLDepthStencilDescriptor alloc] init];
-    waterDepthDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
-    waterDepthDesc.depthWriteEnabled = false;
-    _waterDepthState = [_device newDepthStencilStateWithDescriptor:waterDepthDesc];
-    if (!_waterDepthState) {
-        RY_LOG_FATAL("Failed to create water depth stencil state");
+    // ---- Depth-tested, non-writing state (block highlight) ----
+    auto noWriteDepthDesc = [[MTLDepthStencilDescriptor alloc] init];
+    noWriteDepthDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
+    noWriteDepthDesc.depthWriteEnabled = false;
+    _noDepthWriteState = [_device newDepthStencilStateWithDescriptor:noWriteDepthDesc];
+    if (!_noDepthWriteState) {
+        RY_LOG_FATAL("Failed to create no-write depth stencil state");
     }
 
     // ---- Sky pipeline state ----
@@ -147,6 +123,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     skyPipelineDesc.vertexFunction = skyVertexFunc;
     skyPipelineDesc.fragmentFunction = skyFragmentFunc;
     skyPipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    skyPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     skyPipelineDesc.rasterSampleCount = 4;
 
     _skyPipelineState = [_device newRenderPipelineStateWithDescriptor:skyPipelineDesc
@@ -155,6 +132,15 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         NSString* msg = [NSString stringWithFormat:@"Failed to create sky pipeline state: %@",
                          error.localizedDescription];
         RY_LOG_FATAL(msg.UTF8String);
+    }
+
+    // Sky depth state: always pass, never write — the sky sits behind everything
+    auto skyDepthDesc = [[MTLDepthStencilDescriptor alloc] init];
+    skyDepthDesc.depthCompareFunction = MTLCompareFunctionAlways;
+    skyDepthDesc.depthWriteEnabled = false;
+    _skyDepthState = [_device newDepthStencilStateWithDescriptor:skyDepthDesc];
+    if (!_skyDepthState) {
+        RY_LOG_FATAL("Failed to create sky depth stencil state");
     }
 
     // Sky uniforms buffer
@@ -244,52 +230,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         RY_LOG_FATAL("Failed to allocate highlight uniforms buffer");
     }
 
-    // ---- MSAA textures (multisample, at render resolution) ----
-    auto colorMSAADesc = [[MTLTextureDescriptor alloc] init];
-    colorMSAADesc.textureType = MTLTextureType2DMultisample;
-    colorMSAADesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    colorMSAADesc.width = _renderWidth;
-    colorMSAADesc.height = _renderHeight;
-    colorMSAADesc.sampleCount = 4;
-    colorMSAADesc.usage = MTLTextureUsageRenderTarget;
-    colorMSAADesc.storageMode = MTLStorageModeMemoryless;
-    _colorMSAA = [_device newTextureWithDescriptor:colorMSAADesc];
-    if (!_colorMSAA) {
-        RY_LOG_FATAL("Failed to allocate MSAA color texture");
-    }
-
-    auto depthMSAADesc = [[MTLTextureDescriptor alloc] init];
-    depthMSAADesc.textureType = MTLTextureType2DMultisample;
-    depthMSAADesc.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-    depthMSAADesc.width = _renderWidth;
-    depthMSAADesc.height = _renderHeight;
-    depthMSAADesc.sampleCount = 4;
-    depthMSAADesc.usage = MTLTextureUsageRenderTarget;
-    depthMSAADesc.storageMode = MTLStorageModePrivate;
-    _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
-    if (!_depthMSAA) {
-        RY_LOG_FATAL("Failed to allocate MSAA depth texture");
-    }
-
-    // ---- Resolve textures (single-sample, at render resolution) ----
-    auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                   width:_renderWidth
-                                                                                  height:_renderHeight
-                                                                              mipmapped:false];
-    colorResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
-    if (!_colorResolve) {
-        RY_LOG_FATAL("Failed to allocate color resolve texture");
-    }
-
-    auto depthResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                   width:_renderWidth
-                                                                                  height:_renderHeight
-                                                                              mipmapped:false];
-    _depthResolve = [_device newTextureWithDescriptor:depthResolveDesc];
-    if (!_depthResolve) {
-        RY_LOG_FATAL("Failed to allocate depth resolve texture");
-    }
+    // ---- Scene render targets (native resolution) ----
+    allocateSceneTargets();
 
     // ---- Uniforms buffer ----
     _uniformsBuffer = [_device newBufferWithLength:sizeof(Uniforms)
@@ -341,15 +283,54 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
                                                   options:MTLResourceStorageModeShared];
 
     // ---- Bloom post-processing (Phase 8) ----
-    _bloom = new Bloom(_device, shaderLibrary, _renderWidth, _renderHeight);
+    _bloom = new Bloom(_device, shaderLibrary, _displayWidth, _displayHeight);
     _bloom->setIntensity(_bloomIntensity);
-
-    // ---- MetalFX Upscaler (Phase 8.4) ----
-    _upscaler = new MetalFXUpscaler(_device, _renderWidth, _renderHeight,
-                                      _displayWidth, _displayHeight);
 
     // ---- Weather Particle System ----
     _particles = new ParticleSystem(_device, shaderLibrary);
+}
+
+// ---------------------------------------------------------------------------
+// allocateSceneTargets — (re)create the MSAA + resolve textures at the
+// current drawable size. MSAA targets are memoryless: their contents never
+// leave tile memory (color is resolved, depth is discarded at pass end).
+// ---------------------------------------------------------------------------
+void RenderPipeline::allocateSceneTargets() {
+    auto colorMSAADesc = [[MTLTextureDescriptor alloc] init];
+    colorMSAADesc.textureType = MTLTextureType2DMultisample;
+    colorMSAADesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    colorMSAADesc.width = _displayWidth;
+    colorMSAADesc.height = _displayHeight;
+    colorMSAADesc.sampleCount = 4;
+    colorMSAADesc.usage = MTLTextureUsageRenderTarget;
+    colorMSAADesc.storageMode = MTLStorageModeMemoryless;
+    _colorMSAA = [_device newTextureWithDescriptor:colorMSAADesc];
+    if (!_colorMSAA) {
+        RY_LOG_FATAL("Failed to allocate MSAA color texture");
+    }
+
+    auto depthMSAADesc = [[MTLTextureDescriptor alloc] init];
+    depthMSAADesc.textureType = MTLTextureType2DMultisample;
+    depthMSAADesc.pixelFormat = MTLPixelFormatDepth32Float;
+    depthMSAADesc.width = _displayWidth;
+    depthMSAADesc.height = _displayHeight;
+    depthMSAADesc.sampleCount = 4;
+    depthMSAADesc.usage = MTLTextureUsageRenderTarget;
+    depthMSAADesc.storageMode = MTLStorageModeMemoryless;
+    _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
+    if (!_depthMSAA) {
+        RY_LOG_FATAL("Failed to allocate MSAA depth texture");
+    }
+
+    auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                   width:_displayWidth
+                                                                                  height:_displayHeight
+                                                                              mipmapped:false];
+    colorResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
+    if (!_colorResolve) {
+        RY_LOG_FATAL("Failed to allocate color resolve texture");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +347,13 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
                             const Hotbar& hotbar)
 {
     if (!drawable || !queue) return;
+
+    // Track the true drawable size (pixels, not view points — 2x on Retina)
+    // so the scene targets always match the surface we resolve into.
+    if (drawable.texture.width != _displayWidth || drawable.texture.height != _displayHeight) {
+        resize(static_cast<uint32_t>(drawable.texture.width),
+               static_cast<uint32_t>(drawable.texture.height));
+    }
 
     // Compute VP matrix and extract frustum planes
     Mat4 vpMatrix = projectionMatrix * viewMatrix;
@@ -396,16 +384,10 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     // Upload sky uniforms
     std::memcpy((void*)_skyUniformsBuffer.contents, &skyUniforms, sizeof(SkyUniforms));
 
-    // ---- Sky Pass (before everything else, at display resolution) ----
-    renderSky(commandBuffer, drawable, skyUniforms);
-
-    // ---- Main render pass descriptor (render at half-resolution for upscaling) ----
+    // ---- Scene pass: sky → chunks → highlight → particles → clouds ----
+    // Everything renders into the 4x MSAA target and resolves once into
+    // _colorResolve. The memoryless depth buffer is discarded at pass end.
     auto renderPassDesc = [[MTLRenderPassDescriptor alloc] init];
-
-    // Color attachment: render to MSAA, resolve to _colorResolve.
-    // MTLStoreActionMultisampleResolve resolves 4x MSAA into _colorResolve
-    // and discards the MSAA texture contents. _colorResolve then feeds
-    // bloom and the upscaler.
     renderPassDesc.colorAttachments[0].texture = _colorMSAA;
     renderPassDesc.colorAttachments[0].resolveTexture = _colorResolve;
     renderPassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -417,63 +399,53 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
         1.0f
     );
 
-    // Depth attachment: render to MSAA depth, resolve to single-sample
     renderPassDesc.depthAttachment.texture = _depthMSAA;
-    renderPassDesc.depthAttachment.resolveTexture = _depthResolve;
     renderPassDesc.depthAttachment.loadAction = MTLLoadActionClear;
-    renderPassDesc.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
+    renderPassDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
     renderPassDesc.depthAttachment.clearDepth = 1.0;
 
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
     if (!encoder) return;
 
-    // ---- Opaque chunk pass ----
+    renderSky(encoder);
+
     const float fogColor[3] = {skyUniforms.horizonColor.x,
                                skyUniforms.horizonColor.y,
                                skyUniforms.horizonColor.z};
     renderChunks(encoder, world, viewMatrix, projectionMatrix, camera.getPosition(),
                  sunDirection, sunColor, ambientColor, fogColor);
 
-    // ---- Block highlight pass (after opaque chunks, before UI) ----
     if (highlightedBlock.has_value()) {
         renderBlockHighlight(encoder, highlightedBlock.value(), viewMatrix, projectionMatrix);
     }
 
-    // ---- Weather particle pass (rain/snow billboards) ----
     if (_particles) {
         _particles->render(encoder, viewMatrix, projectionMatrix, camera.getPosition());
     }
 
+    renderClouds(encoder, camera, worldTime, sunDirection);
+
     [encoder endEncoding];
 
-    // ---- Cloud Pass (Phase 8, at render resolution) ----
-    renderClouds(commandBuffer, drawable, viewMatrix, projectionMatrix,
-                 camera, worldTime, sunDirection);
-
-    // ---- Water pass (transparent, separate render pass) ----
-    renderWater(commandBuffer, drawable, viewMatrix, projectionMatrix,
-                sunDirection, sunColor, ambientColor);
-
-    // ---- Bloom Post-Processing (Phase 8) ----
-    // Deferred store path:
-    //   Bloom active  → _colorResolve → bloom extract → blur → composite → _bloomOutput
-    //   Bloom inactive → _colorResolve → upscaler → display (skip bloom entirely)
-    // When bloom intensity is 0, renderBloom returns immediately (early exit),
-    // skipping 13 internal render passes. The upscaler then reads _colorResolve.
-    if (_bloom) {
-        _bloom->renderBloom(commandBuffer, _colorResolve, _bloom->bloomOutputTexture());
-    }
-
-    // ---- Upscale to display resolution (Phase 8.4) ----
-    // Select upscale source based on bloom activity:
-    //   Bloom active  → upscale _bloomOutput (scene + bloom, tone-mapped)
-    //   Bloom inactive → upscale _colorResolve (raw resolved scene)
-    id<MTLTexture> finalTexture = _colorResolve;
+    // ---- Bloom (extract/blur, then composite into the drawable) ----
+    // With zero intensity the bloom pipeline is skipped and the resolved
+    // scene is blitted to the drawable unchanged (same dimensions).
     if (_bloom && _bloomIntensity > 0.0f) {
-        finalTexture = _bloom->bloomOutputTexture();
-    }
-    if (_upscaler && finalTexture) {
-        _upscaler->upscale(commandBuffer, finalTexture, drawable.texture);
+        _bloom->renderBloom(commandBuffer, _colorResolve, drawable.texture);
+    } else {
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        if (blit) {
+            [blit copyFromTexture:_colorResolve
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(_colorResolve.width, _colorResolve.height, 1)
+                        toTexture:drawable.texture
+                 destinationSlice:0
+                 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+        }
     }
 
     // ---- UI Overlay Pass (screen-space HUD at display resolution) ----
@@ -488,9 +460,94 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
         [uiEncoder endEncoding];
     }
 
+    // ---- Optional frame capture (playtest verification) ----
+    if (!_capturePath.empty()) {
+        encodeFrameCapture(commandBuffer, drawable.texture);
+    }
+
     // Present and commit
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
+}
+
+// ---------------------------------------------------------------------------
+// Frame capture — copy the finished drawable into a shared texture and write
+// it out as a PNG once the GPU finishes. Lets automated playtests inspect
+// real frames without macOS screen-recording permissions.
+// ---------------------------------------------------------------------------
+void RenderPipeline::requestFrameCapture(const std::string& path) {
+    _capturePath = path;
+}
+
+void RenderPipeline::encodeFrameCapture(id<MTLCommandBuffer> commandBuffer,
+                                        id<MTLTexture> frameTexture) {
+    NSString* path = [NSString stringWithUTF8String:_capturePath.c_str()];
+    _capturePath.clear();
+
+    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:frameTexture.pixelFormat
+                                                                   width:frameTexture.width
+                                                                  height:frameTexture.height
+                                                               mipmapped:false];
+    desc.storageMode = MTLStorageModeShared;
+    id<MTLTexture> capture = [_device newTextureWithDescriptor:desc];
+    if (!capture) {
+        RY_LOG_ERROR("Frame capture: failed to allocate readback texture");
+        return;
+    }
+
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    if (!blit) return;
+    [blit copyFromTexture:frameTexture
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(frameTexture.width, frameTexture.height, 1)
+                toTexture:capture
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+        const size_t width = capture.width;
+        const size_t height = capture.height;
+        const size_t bytesPerRow = width * 4;
+        std::vector<uint8_t> pixels(bytesPerRow * height);
+        [capture getBytes:pixels.data()
+              bytesPerRow:bytesPerRow
+               fromRegion:MTLRegionMake2D(0, 0, width, height)
+              mipmapLevel:0];
+
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        const uint32_t bitmapInfo =  // BGRA8
+            static_cast<uint32_t>(kCGBitmapByteOrder32Little) |
+            static_cast<uint32_t>(kCGImageAlphaNoneSkipFirst);
+        CGContextRef context = CGBitmapContextCreate(
+            pixels.data(), width, height, 8, bytesPerRow, colorSpace, bitmapInfo);
+        CGImageRef image = context ? CGBitmapContextCreateImage(context) : nullptr;
+
+        bool ok = false;
+        if (image) {
+            NSURL* url = [NSURL fileURLWithPath:path];
+            CGImageDestinationRef dest = CGImageDestinationCreateWithURL(
+                (__bridge CFURLRef)url, (__bridge CFStringRef)UTTypePNG.identifier, 1, nullptr);
+            if (dest) {
+                CGImageDestinationAddImage(dest, image, nullptr);
+                ok = CGImageDestinationFinalize(dest);
+                CFRelease(dest);
+            }
+            CGImageRelease(image);
+        }
+        if (context) CGContextRelease(context);
+        CGColorSpaceRelease(colorSpace);
+
+        const std::string pathUtf8 = [path UTF8String];
+        if (ok) {
+            RY_LOG_INFO(("Frame captured to " + pathUtf8).c_str());
+        } else {
+            RY_LOG_ERROR(("Frame capture FAILED for " + pathUtf8).c_str());
+        }
+    }];
 }
 
 // ---------------------------------------------------------------------------
@@ -584,33 +641,16 @@ void RenderPipeline::computeDayNightUniforms(uint64_t worldTime,
 }
 
 // ---------------------------------------------------------------------------
-// renderSky (Task 6.6)
+// renderSky — fullscreen gradient drawn first in the scene pass
 // ---------------------------------------------------------------------------
-void RenderPipeline::renderSky(id<MTLCommandBuffer> commandBuffer,
-                                id<CAMetalDrawable> drawable,
-                                const SkyUniforms& skyUniforms)
-{
-    auto skyPassDesc = [[MTLRenderPassDescriptor alloc] init];
-    skyPassDesc.colorAttachments[0].texture = drawable.texture;
-    skyPassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
-    skyPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    skyPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(
-        skyUniforms.horizonColor.x,
-        skyUniforms.horizonColor.y,
-        skyUniforms.horizonColor.z,
-        1.0f
-    );
-
-    id<MTLRenderCommandEncoder> skyEncoder = [commandBuffer renderCommandEncoderWithDescriptor:skyPassDesc];
-    if (!skyEncoder) return;
-
-    [skyEncoder setRenderPipelineState:_skyPipelineState];
-    [skyEncoder setVertexBuffer:_skyUniformsBuffer offset:0 atIndex:1];
+void RenderPipeline::renderSky(id<MTLRenderCommandEncoder> encoder) {
+    [encoder setRenderPipelineState:_skyPipelineState];
+    [encoder setDepthStencilState:_skyDepthState];
+    [encoder setVertexBuffer:_skyUniformsBuffer offset:0 atIndex:1];
+    [encoder setFragmentBuffer:_skyUniformsBuffer offset:0 atIndex:1];
 
     // Draw fullscreen quad (6 vertices, no index buffer)
-    [skyEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
-
-    [skyEncoder endEncoding];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 }
 
 // ---------------------------------------------------------------------------
@@ -760,25 +800,6 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
 }
 
 // ---------------------------------------------------------------------------
-// renderWater (Task 6.7-6.8)
-// ---------------------------------------------------------------------------
-void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer,
-                                    id<CAMetalDrawable> drawable,
-                                    const Mat4& viewMatrix,
-                                   const Mat4& projectionMatrix,
-                                   const float sunDirection[3],
-                                   const float sunColor[3],
-                                   const float ambientColor[3])
-{
-    // Water transparency pass not yet implemented (Phase 9 optimization).
-    // Water blocks are rendered as part of the main opaque mesh.
-    // Stub preserved for future depth-sorted back-to-front rendering.
-    (void)commandBuffer; (void)drawable; (void)viewMatrix;
-    (void)projectionMatrix; (void)sunDirection; (void)sunColor;
-    (void)ambientColor;
-}
-
-// ---------------------------------------------------------------------------
 // renderBlockHighlight (Task 6.9)
 // ---------------------------------------------------------------------------
 void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
@@ -807,11 +828,15 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
     std::memcpy((void*)_highlightUniformsBuffer.contents, &uniforms, sizeof(Uniforms));
 
     [encoder setRenderPipelineState:_highlightPipelineState];
-    [encoder setDepthStencilState:_waterDepthState]; // No depth write
+    [encoder setDepthStencilState:_noDepthWriteState];
 
     [encoder setVertexBuffer:_highlightVertexBuffer offset:0 atIndex:0];
     [encoder setVertexBuffer:_highlightUniformsBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:_highlightUniformsBuffer offset:0 atIndex:1];
+    // fragmentMain samples the atlas; bind it so the highlight never relies
+    // on a texture left over from the chunk loop (e.g. when no chunks drew).
+    [encoder setFragmentTexture:_textureAtlas->texture() atIndex:0];
+    [encoder setFragmentSamplerState:_textureAtlas->sampler() atIndex:0];
 
     // Draw 12 lines (24 vertices) for wireframe box
     [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:24];
@@ -823,6 +848,8 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
 void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
                                       const Hotbar& hotbar)
 {
+    _uiOverlay->beginFrame();
+
     // ---- Performance HUD (Phase 8) ----
     // Note: Performance stats are tracked in the engine layer.
     // For now, render with default stats (will be populated by engine).
@@ -831,7 +858,7 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
     stats.chunkCount = 0;
     stats.entityCount = 0;
     stats.frameTimeMs = 16.67f;
-    _uiOverlay->drawPerformanceHUD(encoder, stats);
+    _uiOverlay->drawPerformanceHUD(stats);
 
     // ---- Crosshair ----
     float centerX = 0.5f;
@@ -842,14 +869,12 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
     float crossLineW = 1.0f / static_cast<float>(_displayWidth);
 
     // Horizontal line
-    _uiOverlay->drawQuad(encoder,
-                         centerX - crossW * 0.5f, centerY - crossH * 0.5f,
+    _uiOverlay->drawQuad(centerX - crossW * 0.5f, centerY - crossH * 0.5f,
                          crossW, crossH,
                          1.0f, 1.0f, 1.0f, 1.0f);
 
     // Vertical line
-    _uiOverlay->drawQuad(encoder,
-                         centerX - crossLineW * 0.5f, centerY - crossV * 0.5f,
+    _uiOverlay->drawQuad(centerX - crossLineW * 0.5f, centerY - crossV * 0.5f,
                          crossLineW, crossV,
                          1.0f, 1.0f, 1.0f, 1.0f);
 
@@ -869,16 +894,14 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
         // Slot background
         if (i == selectedIndex) {
             // Selected slot: bright border
-            _uiOverlay->drawQuad(encoder,
-                                 slotX - 2.0f / _displayWidth,
+            _uiOverlay->drawQuad(slotX - 2.0f / _displayWidth,
                                  hotbarY - 2.0f / _displayHeight,
                                  hotbarSlotSize + 4.0f / _displayWidth,
                                  hotbarSlotSize + 4.0f / _displayHeight,
                                  1.0f, 1.0f, 1.0f, 0.8f);
         }
 
-        _uiOverlay->drawQuad(encoder,
-                             slotX, hotbarY,
+        _uiOverlay->drawQuad(slotX, hotbarY,
                              hotbarSlotSize, hotbarSlotSize,
                              0.3f, 0.3f, 0.3f, 0.6f);
 
@@ -900,11 +923,12 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
 
         float innerSize = hotbarSlotSize * 0.7f;
         float innerOffset = (hotbarSlotSize - innerSize) * 0.5f;
-        _uiOverlay->drawQuad(encoder,
-                             slotX + innerOffset, hotbarY + innerOffset,
+        _uiOverlay->drawQuad(slotX + innerOffset, hotbarY + innerOffset,
                              innerSize, innerSize,
                              r, g, b, 0.9f);
     }
+
+    _uiOverlay->flush(encoder);
 }
 
 // ---------------------------------------------------------------------------
@@ -915,7 +939,6 @@ RenderPipeline::~RenderPipeline() {
     delete _textureAtlas;
     delete _uiOverlay;
     delete _bloom;
-    delete _upscaler;
     delete _particles;
 }
 
@@ -927,75 +950,13 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
 
     _displayWidth = width;
     _displayHeight = height;
-    _renderWidth = width / 2;
-    _renderHeight = height / 2;
 
-    // Release old textures
-    _colorMSAA = nil;
-    _colorResolve = nil;
-    _depthMSAA = nil;
-    _depthResolve = nil;
+    allocateSceneTargets();
 
-    // Reallocate MSAA textures at render resolution
-    auto colorMSAADesc = [[MTLTextureDescriptor alloc] init];
-    colorMSAADesc.textureType = MTLTextureType2DMultisample;
-    colorMSAADesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    colorMSAADesc.width = _renderWidth;
-    colorMSAADesc.height = _renderHeight;
-    colorMSAADesc.sampleCount = 4;
-    colorMSAADesc.usage = MTLTextureUsageRenderTarget;
-    colorMSAADesc.storageMode = MTLStorageModeMemoryless;
-    _colorMSAA = [_device newTextureWithDescriptor:colorMSAADesc];
-    if (!_colorMSAA) {
-        RY_LOG_FATAL("Failed to reallocate MSAA color texture after resize");
-    }
-
-    auto depthMSAADesc = [[MTLTextureDescriptor alloc] init];
-    depthMSAADesc.textureType = MTLTextureType2DMultisample;
-    depthMSAADesc.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-    depthMSAADesc.width = _renderWidth;
-    depthMSAADesc.height = _renderHeight;
-    depthMSAADesc.sampleCount = 4;
-    depthMSAADesc.usage = MTLTextureUsageRenderTarget;
-    depthMSAADesc.storageMode = MTLStorageModePrivate;
-    _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
-    if (!_depthMSAA) {
-        RY_LOG_FATAL("Failed to reallocate MSAA depth texture after resize");
-    }
-
-    // Reallocate resolve textures at render resolution
-    auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                   width:_renderWidth
-                                                                                  height:_renderHeight
-                                                                              mipmapped:false];
-    colorResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
-    if (!_colorResolve) {
-        RY_LOG_FATAL("Failed to reallocate color resolve texture after resize");
-    }
-
-    auto depthResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                  width:_renderWidth
-                                                                                 height:_renderHeight
-                                                                             mipmapped:false];
-    _depthResolve = [_device newTextureWithDescriptor:depthResolveDesc];
-    if (!_depthResolve) {
-        RY_LOG_FATAL("Failed to reallocate depth resolve texture after resize");
-    }
-
-    // Resize UI overlay for display resolution
     _uiOverlay->resize(_displayWidth, _displayHeight);
 
-    // Resize bloom for render resolution
     if (_bloom) {
-        _bloom->resize(_renderWidth, _renderHeight);
-    }
-
-    // Reallocate upscaler
-    if (_upscaler) {
-        delete _upscaler;
-        _upscaler = new MetalFXUpscaler(_device, _renderWidth, _renderHeight,
-                                         _displayWidth, _displayHeight);
+        _bloom->resize(_displayWidth, _displayHeight);
     }
 }
 
@@ -1076,12 +1037,9 @@ bool RenderPipeline::isChunkInFrustum(const AABB& chunkAABB) const {
 }
 
 // ============================================================================
-// renderClouds (Phase 8)
+// renderClouds — alpha-blended cloud layer, drawn last in the scene pass
 // ============================================================================
-void RenderPipeline::renderClouds(id<MTLCommandBuffer> commandBuffer,
-                                   id<CAMetalDrawable> drawable,
-                                   const Mat4& /*viewMatrix*/,
-                                   const Mat4& /*projectionMatrix*/,
+void RenderPipeline::renderClouds(id<MTLRenderCommandEncoder> encoder,
                                    const Camera& camera,
                                    uint64_t worldTime,
                                    const float sunDirection[3])
@@ -1092,9 +1050,21 @@ void RenderPipeline::renderClouds(id<MTLCommandBuffer> commandBuffer,
     CloudUniforms cloudUniforms{};
 
     Vec3 camPos = camera.getPosition();
+    Vec3 camFwd = camera.forward();
+    Vec3 camRight = camera.right();
+    Vec3 camUp = camera.up();
     cloudUniforms.cameraPosition = simd_make_float3(camPos.x, camPos.y, camPos.z);
+    cloudUniforms.cameraForward = simd_make_float3(camFwd.x, camFwd.y, camFwd.z);
+    cloudUniforms.cameraRight = simd_make_float3(camRight.x, camRight.y, camRight.z);
+    cloudUniforms.cameraUp = simd_make_float3(camUp.x, camUp.y, camUp.z);
     cloudUniforms.sunDirection =
         simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
+
+    // Projection shape for per-pixel ray reconstruction
+    cloudUniforms.tanHalfFov =
+        std::tan(camera.FOV() * 0.5f * static_cast<float>(M_PI) / 180.0f);
+    cloudUniforms.aspect =
+        static_cast<float>(_displayWidth) / static_cast<float>(std::max(_displayHeight, 1u));
 
     // Wind offset: worldTime * windSpeed (0.02 blocks/tick)
     cloudUniforms.windOffset = static_cast<float>(worldTime) * 0.02f;
@@ -1102,62 +1072,15 @@ void RenderPipeline::renderClouds(id<MTLCommandBuffer> commandBuffer,
     // Cloud parameters
     cloudUniforms.cloudAltitude = 192.0f;
     cloudUniforms.noiseFrequency = 0.005f;
-    cloudUniforms.cloudThreshold = 0.4f;
+    cloudUniforms.cloudThreshold = 0.55f;
 
     std::memcpy((void*)_cloudUniformsBuffer.contents, &cloudUniforms, sizeof(cloudUniforms));
 
-    // Cloud render pass (over the scene, with alpha blending)
-    auto cloudPassDesc = [[MTLRenderPassDescriptor alloc] init];
-    cloudPassDesc.colorAttachments[0].texture = drawable.texture;
-    cloudPassDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    cloudPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    cloudPassDesc.depthAttachment.texture = _depthResolve;
-    cloudPassDesc.depthAttachment.loadAction = MTLLoadActionLoad;
-    cloudPassDesc.depthAttachment.storeAction = MTLStoreActionStore;
-
-    id<MTLRenderCommandEncoder> cloudEncoder = [commandBuffer renderCommandEncoderWithDescriptor:cloudPassDesc];
-    if (!cloudEncoder) return;
-
-    [cloudEncoder setRenderPipelineState:_cloudPipelineState];
-    [cloudEncoder setDepthStencilState:_cloudDepthState];
-    [cloudEncoder setVertexBuffer:_cloudUniformsBuffer offset:0 atIndex:0];
-    [cloudEncoder setFragmentBuffer:_cloudUniformsBuffer offset:0 atIndex:0];
+    [encoder setRenderPipelineState:_cloudPipelineState];
+    [encoder setDepthStencilState:_cloudDepthState];
+    [encoder setVertexBuffer:_cloudUniformsBuffer offset:0 atIndex:0];
+    [encoder setFragmentBuffer:_cloudUniformsBuffer offset:0 atIndex:0];
 
     // Draw fullscreen quad (6 vertices)
-    [cloudEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
-    [cloudEncoder endEncoding];
-}
-
-// ============================================================================
-// MetalFXUpscaler implementation (Phase 8.4)
-// ============================================================================
-MetalFXUpscaler::MetalFXUpscaler(id<MTLDevice> /*device*/, uint32_t /*srcWidth*/, uint32_t /*srcHeight*/,
-                                 uint32_t /*dstWidth*/, uint32_t /*dstHeight*/)
-{
-}
-
-MetalFXUpscaler::~MetalFXUpscaler() {
-}
-
-void MetalFXUpscaler::upscale(id<MTLCommandBuffer> commandBuffer,
-                               id<MTLTexture> source,
-                               id<MTLTexture> destination)
-{
-    if (!commandBuffer || !source || !destination) return;
-
-    // Use Metal's built-in copy for upscale (nearest-neighbor).
-    // A bilinear upscale shader would be needed for higher quality.
-    id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
-    if (blitEncoder) {
-        [blitEncoder copyFromTexture:source
-                        sourceSlice:0
-                        sourceLevel:0
-                       sourceOrigin:MTLOriginMake(0, 0, 0)
-                         sourceSize:MTLSizeMake(source.width, source.height, 1)
-                              toTexture:destination
-                     destinationSlice:0
-                     destinationLevel:0
-                destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blitEncoder endEncoding];
-    }
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 }

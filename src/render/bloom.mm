@@ -84,7 +84,6 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
     // ---- Allocate textures ----
     allocateExtractTexture();
     allocateBlurPyramid();
-    allocateCompositeOutput();
 }
 
 // ---------------------------------------------------------------------------
@@ -93,7 +92,6 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
 Bloom::~Bloom() {
     // Metal objects are reference-counted; nil assignment releases them
     _extractTexture = nil;
-    _bloomOutput = nil;
     for (int i = 0; i < PYRAMID_LEVELS; ++i) {
         _blurPyramid[i][0] = nil;
         _blurPyramid[i][1] = nil;
@@ -142,21 +140,6 @@ void Bloom::allocateBlurPyramid() {
 }
 
 // ---------------------------------------------------------------------------
-// allocateCompositeOutput
-// ---------------------------------------------------------------------------
-void Bloom::allocateCompositeOutput() {
-    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                   width:_width
-                                                                  height:_height
-                                                              mipmapped:false];
-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    _bloomOutput = [_device newTextureWithDescriptor:desc];
-    if (!_bloomOutput) {
-        RY_LOG_FATAL("Failed to allocate bloom composite output texture");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // resize
 // ---------------------------------------------------------------------------
 void Bloom::resize(uint32_t width, uint32_t height) {
@@ -167,7 +150,6 @@ void Bloom::resize(uint32_t width, uint32_t height) {
 
     // Release and reallocate all textures
     _extractTexture = nil;
-    _bloomOutput = nil;
     for (int i = 0; i < PYRAMID_LEVELS; ++i) {
         _blurPyramid[i][0] = nil;
         _blurPyramid[i][1] = nil;
@@ -175,7 +157,6 @@ void Bloom::resize(uint32_t width, uint32_t height) {
 
     allocateExtractTexture();
     allocateBlurPyramid();
-    allocateCompositeOutput();
 }
 
 // ---------------------------------------------------------------------------

@@ -167,10 +167,9 @@ static EngineState* _engineGetState(Engine* engine) {
         return NO;
     }
 
-    // Pixel formats
+    // Drawable pixel format. The render pipeline builds its own MSAA render
+    // passes, so the view carries no sample count or depth buffer of its own.
     _view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    _view.sampleCount = 4;  // 4x MSAA
-    _view.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
 
     // Disable automatic setNeedsDisplay — we drive rendering from the game loop
     _view.enableSetNeedsDisplay = false;
@@ -206,6 +205,11 @@ static EngineState* _engineGetState(Engine* engine) {
         static_cast<uint32_t>(_view.bounds.size.width),
         static_cast<uint32_t>(_view.bounds.size.height)
     );
+
+    // Playtest/diagnostic override: RYCRAFT_BLOOM=<0..1> scales or disables bloom
+    if (const char* bloomEnv = std::getenv("RYCRAFT_BLOOM")) {
+        _renderPipeline->setBloomIntensity(static_cast<float>(std::atof(bloomEnv)));
+    }
 
     RY_LOG_INFO(std::string("Engine initialized — window: ") +
         std::to_string(static_cast<int>(_view.bounds.size.width)) + "x" +
@@ -476,6 +480,19 @@ static EngineState* _engineGetState(Engine* engine) {
         auto chunks = state->world->getLoadedChunks();
         RY_LOG_INFO(std::string("Render: ") + std::to_string(chunks.size()) +
             " loaded chunks, frame " + std::to_string(state->frameCount));
+    }
+
+    // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
+    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered.
+    static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
+    if (capturePath && *capturePath) {
+        static const uint64_t captureFrame = [] {
+            const char* frameEnv = std::getenv("RYCRAFT_CAPTURE_FRAME");
+            return frameEnv ? static_cast<uint64_t>(std::atoll(frameEnv)) : uint64_t{240};
+        }();
+        if (state->frameCount == captureFrame) {
+            _renderPipeline->requestFrameCapture(capturePath);
+        }
     }
 
     // Camera view matrix

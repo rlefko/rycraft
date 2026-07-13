@@ -22,6 +22,8 @@ appleframeworks = dependency('appleframeworks',
     'AudioToolbox',
     'QuartzCore',
     'CoreVideo',
+    'ImageIO',
+    'UniformTypeIdentifiers',
   ],
 )
 

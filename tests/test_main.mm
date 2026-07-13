@@ -3917,10 +3917,10 @@ TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types
 }
 
 TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(CloudUniforms) == 48);
-    REQUIRE(offsetof(CloudUniforms, sunDirection) == 16);
-    REQUIRE(offsetof(CloudUniforms, windOffset) == 32);
-    REQUIRE(offsetof(CloudUniforms, cloudThreshold) == 44);
+    REQUIRE(sizeof(CloudUniforms) == 112);
+    REQUIRE(offsetof(CloudUniforms, sunDirection) == 64);
+    REQUIRE(offsetof(CloudUniforms, tanHalfFov) == 80);
+    REQUIRE(offsetof(CloudUniforms, cloudThreshold) == 100);
 }
 
 TEST_CASE("Shader types: GPUParticle layout matches MSL", "[render][shader-types]") {

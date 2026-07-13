@@ -47,6 +47,8 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    // Particles draw inside the 4x MSAA scene pass
+    pipelineDesc.rasterSampleCount = 4;
 
     NSError* error = nil;
     _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc
