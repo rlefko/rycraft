@@ -93,6 +93,12 @@ fragment float4 fragmentMain(
     // the quad extent in blocks, so each block gets one full texture tile.
     float4 texColor = blockTextures.sample(blockSampler, in.vUV, in.vTextureLayer);
 
+    // Alpha cutout for foliage/glass: transparent texels simply don't exist.
+    // Runs in the opaque pass with depth writes, so no sorting is needed.
+    if (texColor.a < 0.5f) {
+        discard_fragment();
+    }
+
     // Combine directional sun light with ambient
     float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight + uniforms.ambientColor);
 

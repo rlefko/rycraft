@@ -23,6 +23,14 @@
 using BlockAccessor = std::function<BlockType(int, int, int)>;
 inline static int idx(int row, int col, int width) { return row * width + col; }
 
+// A face of `cur` toward `neighbor` renders when cur has geometry (isSolid),
+// the neighbor doesn't fully hide it (isOpaque), and the two blocks differ —
+// interior faces between identical cutout blocks (leaf-leaf, glass-glass)
+// stay culled so foliage doesn't render its own inner walls.
+inline static bool faceVisible(BlockType cur, BlockType neighbor) {
+    return isSolid(cur) && !isOpaque(neighbor) && neighbor != cur;
+}
+
 // One vertex of a quad corner: position + UV (UVs span the quad extent in
 // blocks so the repeat sampler tiles the texture per block).
 struct QuadCorner {
@@ -125,53 +133,30 @@ static MeshOutput buildGenericMesh(
     output.vertices.reserve(6 * gridW * gridD * gridH / 4);
     output.indices.reserve(6 * gridW * gridD * gridH / 2);
 
-    // ======================================================================
-    // Pass 1: Build Y-occupancy masks (flat bool[gridH][gridD][gridW])
-    // ======================================================================
-    std::vector<bool> solidY(gridH * gridD * gridW, false);
-
-    for (int y = 0; y < gridH; ++y) {
-        for (int z = 0; z < gridD; ++z) {
-            for (int x = 0; x < gridW; ++x) {
-                if (isOpaque(getBlock(x, y, z))) {
-                    solidY[idx(y, idx(z, x, gridW), gridD * gridW)] = true;
-                }
-            }
-        }
-    }
-
     // Reusable flat buffers for face processing (avoid reallocation per face)
     std::vector<bool> faceMask;
     std::vector<BlockType> blockTypes;
     std::vector<bool> merged;
 
     // ======================================================================
-    // Face: +Y (top) — exposed when solid AND block above is AIR
+    // Face: +Y (top) — visible when the block above doesn't hide it
     // ======================================================================
     for (int ly = 0; ly < gridH - 1; ++ly) {
+        faceMask.assign(gridD * gridW, false);
+        blockTypes.assign(gridD * gridW, BlockType::AIR);
+
         bool anyExposed = false;
-        for (int z = 0; z < gridD && !anyExposed; ++z) {
-            for (int x = 0; x < gridW && !anyExposed; ++x) {
-                if (solidY[idx(ly, idx(z, x, gridW), gridD * gridW)] &&
-                    !solidY[idx(ly + 1, idx(z, x, gridW), gridD * gridW)]) {
+        for (int z = 0; z < gridD; ++z) {
+            for (int x = 0; x < gridW; ++x) {
+                BlockType cur = getBlock(x, ly, z);
+                if (faceVisible(cur, getBlock(x, ly + 1, z))) {
+                    faceMask[idx(z, x, gridW)] = true;
+                    blockTypes[idx(z, x, gridW)] = cur;
                     anyExposed = true;
                 }
             }
         }
         if (!anyExposed) continue;
-
-        faceMask.assign(gridD * gridW, false);
-        blockTypes.assign(gridD * gridW, BlockType::AIR);
-
-        for (int z = 0; z < gridD; ++z) {
-            for (int x = 0; x < gridW; ++x) {
-                if (solidY[idx(ly, idx(z, x, gridW), gridD * gridW)] &&
-                    !solidY[idx(ly + 1, idx(z, x, gridW), gridD * gridW)]) {
-                    faceMask[idx(z, x, gridW)] = true;
-                    blockTypes[idx(z, x, gridW)] = getBlock(x, ly, z);
-                }
-            }
-        }
 
         auto emitQuad = [ly](
             int col, int row, int width, int height,
@@ -196,32 +181,24 @@ static MeshOutput buildGenericMesh(
     }
 
     // ======================================================================
-    // Face: -Y (bottom) — exposed when solid AND block below is AIR
+    // Face: -Y (bottom) — visible when the block below doesn't hide it
     // ======================================================================
     for (int ly = 1; ly < gridH; ++ly) {
+        faceMask.assign(gridD * gridW, false);
+        blockTypes.assign(gridD * gridW, BlockType::AIR);
+
         bool anyExposed = false;
-        for (int z = 0; z < gridD && !anyExposed; ++z) {
-            for (int x = 0; x < gridW && !anyExposed; ++x) {
-                if (solidY[idx(ly, idx(z, x, gridW), gridD * gridW)] &&
-                    !solidY[idx(ly - 1, idx(z, x, gridW), gridD * gridW)]) {
+        for (int z = 0; z < gridD; ++z) {
+            for (int x = 0; x < gridW; ++x) {
+                BlockType cur = getBlock(x, ly, z);
+                if (faceVisible(cur, getBlock(x, ly - 1, z))) {
+                    faceMask[idx(z, x, gridW)] = true;
+                    blockTypes[idx(z, x, gridW)] = cur;
                     anyExposed = true;
                 }
             }
         }
         if (!anyExposed) continue;
-
-        faceMask.assign(gridD * gridW, false);
-        blockTypes.assign(gridD * gridW, BlockType::AIR);
-
-        for (int z = 0; z < gridD; ++z) {
-            for (int x = 0; x < gridW; ++x) {
-                if (solidY[idx(ly, idx(z, x, gridW), gridD * gridW)] &&
-                    !solidY[idx(ly - 1, idx(z, x, gridW), gridD * gridW)]) {
-                    faceMask[idx(z, x, gridW)] = true;
-                    blockTypes[idx(z, x, gridW)] = getBlock(x, ly, z);
-                }
-            }
-        }
 
         auto emitQuad = [ly](
             int col, int row, int width, int height,
@@ -254,10 +231,10 @@ static MeshOutput buildGenericMesh(
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
-                if (isOpaque(getBlock(lx, y, z)) &&
-                    !isOpaque(getBlock(lx + 1, y, z))) {
+                BlockType cur = getBlock(lx, y, z);
+                if (faceVisible(cur, getBlock(lx + 1, y, z))) {
                     faceMask[idx(y, z, gridD)] = true;
-                    blockTypes[idx(y, z, gridD)] = getBlock(lx, y, z);
+                    blockTypes[idx(y, z, gridD)] = cur;
                 }
             }
         }
@@ -293,10 +270,10 @@ static MeshOutput buildGenericMesh(
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
-                if (isOpaque(getBlock(lx, y, z)) &&
-                    !isOpaque(getBlock(lx - 1, y, z))) {
+                BlockType cur = getBlock(lx, y, z);
+                if (faceVisible(cur, getBlock(lx - 1, y, z))) {
                     faceMask[idx(y, z, gridD)] = true;
-                    blockTypes[idx(y, z, gridD)] = getBlock(lx, y, z);
+                    blockTypes[idx(y, z, gridD)] = cur;
                 }
             }
         }
@@ -333,10 +310,10 @@ static MeshOutput buildGenericMesh(
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
-                if (isOpaque(getBlock(x, y, lz)) &&
-                    !isOpaque(getBlock(x, y, lz + 1))) {
+                BlockType cur = getBlock(x, y, lz);
+                if (faceVisible(cur, getBlock(x, y, lz + 1))) {
                     faceMask[idx(y, x, gridW)] = true;
-                    blockTypes[idx(y, x, gridW)] = getBlock(x, y, lz);
+                    blockTypes[idx(y, x, gridW)] = cur;
                 }
             }
         }
@@ -373,10 +350,10 @@ static MeshOutput buildGenericMesh(
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
-                if (isOpaque(getBlock(x, y, lz)) &&
-                    !isOpaque(getBlock(x, y, lz - 1))) {
+                BlockType cur = getBlock(x, y, lz);
+                if (faceVisible(cur, getBlock(x, y, lz - 1))) {
                     faceMask[idx(y, x, gridW)] = true;
-                    blockTypes[idx(y, x, gridW)] = getBlock(x, y, lz);
+                    blockTypes[idx(y, x, gridW)] = cur;
                 }
             }
         }

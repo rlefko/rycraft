@@ -38,11 +38,12 @@ constexpr bool isSolid(BlockType type) {
     return type != BlockType::AIR && type != BlockType::WATER;
 }
 
-// Meshing/occlusion: blocks that produce visible faces and hide the faces of
-// their neighbors. Matches the mesher's historical behavior (leaves and
-// glass occlude; only air and water do not).
+// Meshing/occlusion: blocks that fully hide their neighbors' faces. Leaves
+// and glass are alpha-cutout textures (their transparent texels are
+// discarded in the fragment shader), so the faces behind them must render.
 constexpr bool isOpaque(BlockType type) {
-    return type != BlockType::AIR && type != BlockType::WATER;
+    return type != BlockType::AIR && type != BlockType::WATER &&
+           type != BlockType::LEAVES && type != BlockType::GLASS;
 }
 
 // Light/visibility: blocks you can (partially) see through.

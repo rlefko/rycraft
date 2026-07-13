@@ -153,7 +153,15 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                 for (uint32_t y = 0; y < TILE_SIZE; ++y) {
                     for (uint32_t x = 0; x < TILE_SIZE; ++x) {
                         double n = noise.noise2D(x * 0.25, y * 0.25);
-                        fillTilePixel(&getTilePixel(x, y), 0.2, 0.5, 0.15, n, 0.25);
+                        // Alpha-cutout foliage: sparse holes let the sky and
+                        // the branches behind show through (the fragment
+                        // shader discards texels below 0.5 alpha)
+                        double holes = noise.noise2D(x * 0.7 + 31.0, y * 0.7 + 47.0);
+                        if (holes > 0.45) {
+                            getTilePixel(x, y).a = 0;
+                        } else {
+                            fillTilePixel(&getTilePixel(x, y), 0.2, 0.5, 0.15, n, 0.25);
+                        }
                     }
                 }
                 break;
