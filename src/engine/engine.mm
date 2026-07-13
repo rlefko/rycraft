@@ -169,7 +169,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Pixel formats
     _view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    _view.sampleCount = 1;  // MSAA disabled (crashes on M4 Max)
+    _view.sampleCount = 4;  // 4x MSAA
     _view.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
 
     // Disable automatic setNeedsDisplay — we drive rendering from the game loop
@@ -206,6 +206,11 @@ static EngineState* _engineGetState(Engine* engine) {
         static_cast<uint32_t>(_view.bounds.size.width),
         static_cast<uint32_t>(_view.bounds.size.height)
     );
+
+    RY_LOG_INFO(std::string("Engine initialized — window: ") +
+        std::to_string(static_cast<int>(_view.bounds.size.width)) + "x" +
+        std::to_string(static_cast<int>(_view.bounds.size.height)) +
+        ", device: " + std::string([[_device name] UTF8String]));
 
     return YES;
 }
@@ -307,21 +312,34 @@ static EngineState* _engineGetState(Engine* engine) {
     InputBindings bindings;
     state->camera.update(state->deltaTime, input, bindings, state->player.position);
 
-    // 5. Player physics tick
+    // 5. Sync player yaw from camera so WASD uses the correct direction
+    state->player.yaw = state->camera.yaw();
+
+    // 6. Player physics tick
     bool sprinting = input.isDown(Key::LeftControl);
     state->player.tick(*state->world, input, sprinting);
 
-    // 6. Player jump on space
+    // 7. Update loaded chunks around player
+    state->world->updatePlayerPosition(
+        Chunk::worldToChunk(state->player.position.x),
+        Chunk::worldToChunk(state->player.position.z));
+
+    // 8. Player jump on space
     if (input.isJustPressed(Key::Space)) {
         state->player.jump();
     }
 
-    // 7. Update weather particles
+    // 9. ESC to quit (only when cursor is active)
+    if (input.isJustPressed(Key::Escape)) {
+        exit(0);
+    }
+
+    // 10. Update weather particles
     if (_renderPipeline) {
         _renderPipeline->tickParticles(state->deltaTime, *state->world, state->player.position);
     }
 
-    // 8. Single raycast for block interaction + highlight
+    // 11. Single raycast for block interaction + highlight
     Vec3 cameraPos = state->camera.position();
     Vec3 forward = state->camera.forward();
     auto rayHit = VoxelTraversal::traceRayWithNormal(cameraPos, forward, *state->world, 6.0f);
@@ -452,6 +470,13 @@ static EngineState* _engineGetState(Engine* engine) {
     if (!drawable) return;
 
     if (!_renderPipeline || !state->world) return;
+
+    // Log render diagnostics every 60 frames
+    if (state->frameCount % 60 == 1) {
+        auto chunks = state->world->getLoadedChunks();
+        RY_LOG_INFO(std::string("Render: ") + std::to_string(chunks.size()) +
+            " loaded chunks, frame " + std::to_string(state->frameCount));
+    }
 
     // Camera view matrix
     Mat4 viewMatrix = state->camera.viewMatrix();

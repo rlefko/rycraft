@@ -54,3 +54,9 @@ inline std::string timestamp() {
   do {                                                                       \
     std::cerr << "[" << timestamp() << "] [ERROR] " << msg << std::endl;     \
   } while (0)
+
+#define RY_LOG_INFO(msg)                                                     \
+  do {                                                                       \
+    std::cerr << "[" << timestamp() << "] [INFO] " << __FILE__ << ":"        \
+              << __LINE__ << " " << msg << std::endl;                        \
+  } while (0)

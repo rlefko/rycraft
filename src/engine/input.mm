@@ -265,6 +265,8 @@ void InputManager::handleKeyDown(NSEvent* event) {
     if (!cursorActive_) {
         cursorActive_ = true;
         hideAndConfineCursor();
+        RY_LOG_INFO("Input activated — cursor captured");
+        return;  // Don't process this keypress — it was used to activate
     }
 
     // Track just-pressed
