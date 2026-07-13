@@ -18,6 +18,7 @@
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -720,6 +721,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     constexpr int MAX_MESH_BUILDS_PER_FRAME = 16;
     int meshBuilds = 0;
     bool allocFailureLogged = false;
+    float meshMsThisFrame = 0.f;
 
     for (auto& chunk : loadedChunks) {
         if (!chunk || !chunk->generated)
@@ -746,7 +748,11 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                 _chunkMeshes.erase(cached);
             }
 
+            auto buildStart = std::chrono::steady_clock::now();
             MeshOutput mesh = lodMesher.buildMesh(*chunk, static_cast<int>(ChunkLOD::FULL));
+            meshMsThisFrame += std::chrono::duration<float, std::milli>(
+                                   std::chrono::steady_clock::now() - buildStart)
+                                   .count();
             chunk->setMeshed(true);
             chunk->needsMeshUpdate = false;
 
@@ -806,6 +812,18 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                            indexBuffer:meshState.alloc.indexBuffer
                      indexBufferOffset:meshState.alloc.indexOffset];
     }
+
+    // F3 HUD counters (per-build EMA so the number is comparable across
+    // frames with different build counts)
+    _chunkStats.meshBuildsLastFrame = static_cast<uint32_t>(meshBuilds);
+    if (meshBuilds > 0) {
+        float perBuild = meshMsThisFrame / static_cast<float>(meshBuilds);
+        _chunkStats.meshMsAvg = _chunkStats.meshMsAvg == 0.f
+                                    ? perBuild
+                                    : _chunkStats.meshMsAvg * 0.9f + perBuild * 0.1f;
+    }
+    _chunkStats.megaUsedMB = static_cast<float>(_megaBuffer->vertexUsed()) / (1024.f * 1024.f);
+    _chunkStats.megaCapMB = static_cast<float>(_megaBuffer->vertexCapacity()) / (1024.f * 1024.f);
 }
 
 // ---------------------------------------------------------------------------

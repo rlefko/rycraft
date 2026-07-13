@@ -4,6 +4,8 @@
 #include "world/save_manager.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cmath>
 
 World::World(uint32_t seed, int viewDistance)
@@ -114,7 +116,11 @@ std::shared_ptr<Chunk> World::loadOrGenerateChunk(int chunkX, int chunkZ) {
 
     try {
         auto chunk = std::make_shared<Chunk>(chunkX, chunkZ);
+        auto start = std::chrono::steady_clock::now();
         generateChunk(chunk);
+        recordGenMs(
+            std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
         return chunk;
     } catch (const std::exception& e) {
         RY_LOG_ERROR(
@@ -316,6 +322,23 @@ void World::generateAroundPlayer(int playerX, int playerZ) {
     for (const auto& [chunkX, chunkZ] : chunksToGenerate) {
         generateChunkAsync(chunkX, chunkZ);
     }
+}
+
+void World::recordGenMs(float ms) {
+    // CAS loop: several gen workers may finish simultaneously
+    uint32_t oldBits = genMsEmaBits_.load(std::memory_order_relaxed);
+    for (;;) {
+        float oldEma = std::bit_cast<float>(oldBits);
+        float newEma = oldEma == 0.f ? ms : oldEma * 0.9f + ms * 0.1f;
+        if (genMsEmaBits_.compare_exchange_weak(oldBits, std::bit_cast<uint32_t>(newEma),
+                                                std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+float World::averageGenMs() const {
+    return std::bit_cast<float>(genMsEmaBits_.load(std::memory_order_relaxed));
 }
 
 size_t World::getPendingChunkCount() const {

@@ -11,6 +11,7 @@
 #include "world/terrain.hpp"
 #include "world/trees.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -75,6 +76,10 @@ public:
     // Get generation queue status
     size_t getPendingChunkCount() const;
 
+    // EMA of per-chunk generation time in ms (updated by the gen workers,
+    // read lock-free by the HUD)
+    float averageGenMs() const;
+
     // Attach the save manager (non-owning). Once set, getChunk and the async
     // generation path try loading a chunk from disk before generating it —
     // without this, saved block edits were written but never read back.
@@ -110,6 +115,10 @@ private:
     std::shared_ptr<ThreadPool> genPool_; // lazily initialized
     std::unordered_map<ChunkPos, std::future<void>> pendingGenerations_;
     mutable std::mutex pendingMutex_;
+
+    // Generation-time EMA as float bits: workers CAS-update, HUD reads
+    std::atomic<uint32_t> genMsEmaBits_{0};
+    void recordGenMs(float ms);
 
     // Generate a single chunk (synchronous)
     void generateChunk(std::shared_ptr<Chunk> chunk);

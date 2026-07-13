@@ -71,6 +71,7 @@ struct EngineState {
     // ---- Performance stats (exponential moving averages) ----
     float smoothedFrameMs = 16.7f;
     uint32_t cachedChunkCount = 0;
+    uint32_t cachedPendingChunks = 0;
 
     // ---- Player & World ----
     Player player;
@@ -906,6 +907,7 @@ static EngineState* _engineGetState(Engine* engine) {
         state->smoothedFrameMs * 0.95f + static_cast<float>(state->deltaTime) * 1000.0f * 0.05f;
     if (state->frameCount % 30 == 0) {
         state->cachedChunkCount = static_cast<uint32_t>(state->world->getLoadedChunks().size());
+        state->cachedPendingChunks = static_cast<uint32_t>(state->world->getPendingChunkCount());
     }
 
     UIFrameState uiFrame;
@@ -917,6 +919,13 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.stats.chunkCount = state->cachedChunkCount;
     uiFrame.stats.entityCount =
         state->spawner ? static_cast<uint32_t>(state->spawner->getEntities().size()) : 0;
+    uiFrame.stats.pendingChunks = state->cachedPendingChunks;
+    uiFrame.stats.genMsAvg = state->world->averageGenMs();
+    auto chunkStats = _renderPipeline->chunkRenderStats();
+    uiFrame.stats.meshMsAvg = chunkStats.meshMsAvg;
+    uiFrame.stats.meshBuildsFrame = chunkStats.meshBuildsLastFrame;
+    uiFrame.stats.megaUsedMB = chunkStats.megaUsedMB;
+    uiFrame.stats.megaCapMB = chunkStats.megaCapMB;
     uiFrame.menu = state->menuLayout;
 
     _renderPipeline->render(

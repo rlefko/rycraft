@@ -31,6 +31,8 @@ public:
 
     uint64_t vertexUsed() const;
     uint64_t indexUsed() const;
+    uint64_t vertexCapacity() const { return _vertexSize; }
+    uint64_t indexCapacity() const { return _indexSize; }
 
 private:
     static uint64_t alignUp(uint64_t value);

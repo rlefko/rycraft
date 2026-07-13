@@ -80,6 +80,15 @@ public:
     // verification — macOS screen-recording permissions don't apply.
     void requestFrameCapture(const std::string& path);
 
+    // Chunk streaming counters for the F3 HUD (render thread only).
+    struct ChunkRenderStats {
+        float meshMsAvg = 0.f;
+        uint32_t meshBuildsLastFrame = 0;
+        float megaUsedMB = 0.f;
+        float megaCapMB = 0.f;
+    };
+    ChunkRenderStats chunkRenderStats() const { return _chunkStats; }
+
 private:
     // ---- Metal resources ----
     id<MTLDevice> _device;
@@ -165,6 +174,9 @@ private:
     // Scratch set reused each frame to sweep meshes of unloaded chunks
     // without per-frame allocation.
     std::unordered_set<uint64_t> _liveChunkKeys;
+
+    // HUD counters, written only by the render thread during renderChunks.
+    ChunkRenderStats _chunkStats;
 
     // ---- Day/Night Cycle (Task 6.4-6.5) ----
     void computeDayNightUniforms(uint64_t worldTime, float sunDirection[3], float sunColor[3],
