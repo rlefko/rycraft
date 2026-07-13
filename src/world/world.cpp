@@ -14,9 +14,7 @@ World::World(uint32_t seed, int viewDistance)
     , caveGen_(seed)
     , oreGen_(seed)
     , treeGen_(seed)
-    , structureGen_(seed)
-{
-}
+    , structureGen_(seed) {}
 
 World::~World() {
     // Wait for in-flight generation tasks: they capture `this` and insert
@@ -45,19 +43,12 @@ void World::generateChunk(std::shared_ptr<Chunk> chunk) {
             int worldZ = worldBaseZ + z;
             int xzIndex = x + z * CHUNK_WIDTH;
 
-            double height = terrainGen_.getHeight(
-                static_cast<double>(worldX),
-                static_cast<double>(worldZ),
-                terrainConfig
-            );
+            double height = terrainGen_.getHeight(static_cast<double>(worldX),
+                                                  static_cast<double>(worldZ), terrainConfig);
             heights[xzIndex] = height;
 
-            Biome biome = biomeGen_.getBiome(
-                static_cast<double>(worldX),
-                static_cast<double>(worldZ),
-                height,
-                biomeConfig
-            );
+            Biome biome = biomeGen_.getBiome(static_cast<double>(worldX),
+                                             static_cast<double>(worldZ), height, biomeConfig);
             biomes[xzIndex] = biome;
         }
     }
@@ -126,8 +117,8 @@ std::shared_ptr<Chunk> World::loadOrGenerateChunk(int chunkX, int chunkZ) {
         generateChunk(chunk);
         return chunk;
     } catch (const std::exception& e) {
-        RY_LOG_ERROR((std::string("Chunk generation failed, using blank fallback: ") + e.what())
-                         .c_str());
+        RY_LOG_ERROR(
+            (std::string("Chunk generation failed, using blank fallback: ") + e.what()).c_str());
         auto chunk = std::make_shared<Chunk>(chunkX, chunkZ);
         chunk->generated = true;
         chunk->needsMeshUpdate = true;

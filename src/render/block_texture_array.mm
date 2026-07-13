@@ -17,18 +17,15 @@ struct alignas(4) BgraPixel {
 };
 
 static uint8_t clampToByte(double value) {
-    if (value <= 0.0) return 0;
-    if (value >= 1.0) return 255;
+    if (value <= 0.0)
+        return 0;
+    if (value >= 1.0)
+        return 255;
     return static_cast<uint8_t>(std::lround(value * 255.0));
 }
 
-static void fillTilePixel(
-    BgraPixel* pixel,
-    double baseR, double baseG, double baseB,
-    double noiseValue,
-    double noiseAmp = 0.1,
-    uint8_t alpha = 255
-) {
+static void fillTilePixel(BgraPixel* pixel, double baseR, double baseG, double baseB,
+                          double noiseValue, double noiseAmp = 0.1, uint8_t alpha = 255) {
     double factor = 1.0 + noiseValue * noiseAmp;
     pixel->r = clampToByte(baseR * factor);
     pixel->g = clampToByte(baseG * factor);
@@ -219,13 +216,19 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                         oreR = oreG = oreB = 0.1;
                         break;
                     case BlockType::IRON_ORE:
-                        oreR = 0.8; oreG = 0.6; oreB = 0.45;
+                        oreR = 0.8;
+                        oreG = 0.6;
+                        oreB = 0.45;
                         break;
                     case BlockType::GOLD_ORE:
-                        oreR = 1.0; oreG = 0.85; oreB = 0.1;
+                        oreR = 1.0;
+                        oreG = 0.85;
+                        oreB = 0.1;
                         break;
                     case BlockType::DIAMOND_ORE:
-                        oreR = 0.4; oreG = 0.9; oreB = 0.9;
+                        oreR = 0.4;
+                        oreG = 0.9;
+                        oreB = 0.9;
                         break;
                     default:
                         break;
@@ -261,9 +264,15 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                         // Subtle glass: light blue with high alpha, slight border
                         bool isEdge = (x == 0 || x == 15 || y == 0 || y == 15);
                         if (isEdge) {
-                            p.r = 180; p.g = 200; p.b = 220; p.a = 200;
+                            p.r = 180;
+                            p.g = 200;
+                            p.b = 220;
+                            p.a = 200;
                         } else {
-                            p.r = 220; p.g = 230; p.b = 240; p.a = 100;
+                            p.r = 220;
+                            p.g = 230;
+                            p.b = 240;
+                            p.a = 100;
                         }
                     }
                 }

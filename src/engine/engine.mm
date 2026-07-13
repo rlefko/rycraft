@@ -2,30 +2,30 @@
 
 #import <QuartzCore/QuartzCore.h>
 
+#include <audio/audio_engine.hpp>
+#include <audio/sfx.hpp>
 #include <common/error.hpp>
 #include <common/math.hpp>
 #include <common/random.hpp>
-#include <render/render_pipeline.hpp>
 #include <engine/camera.hpp>
 #include <engine/game_state.hpp>
 #include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
-#include <render/ui_menu.hpp>
 #include <entity/ai.hpp>
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
-#include <world/world.hpp>
+#include <render/render_pipeline.hpp>
+#include <render/ui_menu.hpp>
 #include <world/save_manager.hpp>
-#include <audio/audio_engine.hpp>
-#include <audio/sfx.hpp>
+#include <world/world.hpp>
 
 #include <algorithm>
 #include <chrono>
-#include <memory>
-#include <unordered_map>
 #include <cmath>
+#include <memory>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 
 // ---------------------------------------------------------------------------
@@ -61,10 +61,10 @@ struct EngineState {
     bool hasHighlightedBlock = false;
 
     // ---- Game flow & UI ----
-    GameFlow flow;                 // Title → Playing ⇄ Paused ⇄ Settings
-    bool spawnValidated = false;   // player unstuck from stale-save terrain
-    SettingsValues settings;       // live values shown in the settings menu
-    MenuLayout menuLayout;         // rebuilt each frame while a menu is open
+    GameFlow flow;               // Title → Playing ⇄ Paused ⇄ Settings
+    bool spawnValidated = false; // player unstuck from stale-save terrain
+    SettingsValues settings;     // live values shown in the settings menu
+    MenuLayout menuLayout;       // rebuilt each frame while a menu is open
     int hoveredButton = -1;
     bool showDebugHud = false;
 
@@ -90,9 +90,9 @@ struct EngineState {
     std::vector<float> sfxBlockPlace;
     std::vector<float> sfxFootstep;
     std::vector<float> sfxWind;
-    std::vector<float> sfxAnimal[4];  // indexed by EntityType
+    std::vector<float> sfxAnimal[4]; // indexed by EntityType
     int32_t windVoice = -1;
-    float footstepDistance = 0.f;   // ground distance walked since last step
+    float footstepDistance = 0.f; // ground distance walked since last step
     Vec3 lastFootstepPos{0.f, 0.f, 0.f};
 
     // ---- Input manager (set after window creation) ----
@@ -172,9 +172,9 @@ static EngineState* _engineGetState(Engine* engine) {
         RY_LOG_FATAL("Failed to create NSApplication");
         return NO;
     }
-    [_app setActivationPolicy: NSApplicationActivationPolicyRegular];
-    [_app activateIgnoringOtherApps: true];
-    [_app setDelegate: self];
+    [_app setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [_app activateIgnoringOtherApps:true];
+    [_app setDelegate:self];
 
     // 2. Create Metal device
     _device = MTLCreateSystemDefaultDevice();
@@ -192,31 +192,24 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // 4. Create NSWindow
     NSRect screenFrame = [[NSScreen mainScreen] visibleFrame];
-    NSRect windowRect = NSMakeRect(
-        (screenFrame.size.width - 1024) * 0.5,
-        (screenFrame.size.height - 768) * 0.5,
-        1024, 768
-    );
+    NSRect windowRect = NSMakeRect((screenFrame.size.width - 1024) * 0.5,
+                                   (screenFrame.size.height - 768) * 0.5, 1024, 768);
     _window = [[NSWindow alloc]
-        initWithContentRect: windowRect
-        styleMask: NSWindowStyleMaskTitled
-             | NSWindowStyleMaskClosable
-             | NSWindowStyleMaskMiniaturizable
-             | NSWindowStyleMaskResizable
-        backing: NSBackingStoreBuffered
-        defer: false];
+        initWithContentRect:windowRect
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                    backing:NSBackingStoreBuffered
+                      defer:false];
     if (!_window) {
         RY_LOG_FATAL("Failed to create NSWindow");
         return NO;
     }
-    [_window setTitle: @"rycraft"];
-    [_window setDelegate: self];
-    [_window makeKeyAndOrderFront: nil];
+    [_window setTitle:@"rycraft"];
+    [_window setDelegate:self];
+    [_window makeKeyAndOrderFront:nil];
 
     // 5. Create and configure MTKView
-    _view = [[MTKView alloc]
-        initWithFrame: windowRect
-        device: _device];
+    _view = [[MTKView alloc] initWithFrame:windowRect device:_device];
     if (!_view) {
         RY_LOG_FATAL("Failed to create MTKView");
         return NO;
@@ -234,7 +227,7 @@ static EngineState* _engineGetState(Engine* engine) {
     _view.delegate = self;
 
     // Set as window content
-    [_window setContentView: _view];
+    [_window setContentView:_view];
 
     // 7. Create InputManager (the game opens on the title screen with a
     // free cursor; clicking PLAY captures the mouse)
@@ -246,20 +239,16 @@ static EngineState* _engineGetState(Engine* engine) {
     NSString* libPath = [dirPath stringByAppendingPathComponent:@"pipeline.metallib"];
     NSURL* libURL = [NSURL fileURLWithPath:libPath];
     NSError* libError = nil;
-    id<MTLLibrary> library = [_device newLibraryWithURL:libURL
-                                                    error:&libError];
+    id<MTLLibrary> library = [_device newLibraryWithURL:libURL error:&libError];
     if (libError) {
-        NSString* msg = [NSString stringWithFormat:@"Failed to load shader library: %@",
-                         libError.localizedDescription];
+        NSString* msg = [NSString
+            stringWithFormat:@"Failed to load shader library: %@", libError.localizedDescription];
         RY_LOG_FATAL([msg UTF8String]);
     }
 
     _renderPipeline = std::make_unique<RenderPipeline>(
-        _device,
-        library,
-        static_cast<uint32_t>(_view.bounds.size.width),
-        static_cast<uint32_t>(_view.bounds.size.height)
-    );
+        _device, library, static_cast<uint32_t>(_view.bounds.size.width),
+        static_cast<uint32_t>(_view.bounds.size.height));
 
     // Playtest/diagnostic override: RYCRAFT_BLOOM=<0..1> scales or disables bloom
     if (const char* bloomEnv = std::getenv("RYCRAFT_BLOOM")) {
@@ -297,9 +286,9 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     RY_LOG_INFO(std::string("Engine initialized — window: ") +
-        std::to_string(static_cast<int>(_view.bounds.size.width)) + "x" +
-        std::to_string(static_cast<int>(_view.bounds.size.height)) +
-        ", device: " + std::string([[_device name] UTF8String]));
+                std::to_string(static_cast<int>(_view.bounds.size.width)) + "x" +
+                std::to_string(static_cast<int>(_view.bounds.size.height)) +
+                ", device: " + std::string([[_device name] UTF8String]));
 
     return YES;
 }
@@ -310,20 +299,22 @@ static EngineState* _engineGetState(Engine* engine) {
 
 - (void)terminate {
     if (_app) {
-        [_app terminate: nil];
+        [_app terminate:nil];
     }
 }
 
 // ---- MTKViewDelegate: game loop with fixed timestep ----
 
 - (void)drawInMTKView:(MTKView*)view {
-    if (!_device || !_queue) return;
+    if (!_device || !_queue)
+        return;
 
     EngineState* state = _state.get();
 
     // 1. Calculate elapsed time
     double currentTime = CACurrentMediaTime();
-    double frameTime = (state->lastTime > 0) ? (currentTime - state->lastTime) : EngineState::TICK_DT;
+    double frameTime =
+        (state->lastTime > 0) ? (currentTime - state->lastTime) : EngineState::TICK_DT;
     state->lastTime = currentTime;
 
     // Clamp frame time to prevent spiral of death after long pause
@@ -366,10 +357,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)newSize {
     if (_renderPipeline && newSize.width > 0 && newSize.height > 0) {
-        _renderPipeline->resize(
-            static_cast<uint32_t>(newSize.width),
-            static_cast<uint32_t>(newSize.height)
-        );
+        _renderPipeline->resize(static_cast<uint32_t>(newSize.width),
+                                static_cast<uint32_t>(newSize.height));
     }
     (void)view;
 }
@@ -381,21 +370,23 @@ static EngineState* _engineGetState(Engine* engine) {
 // the first transition into gameplay.
 - (void)syncAudioVolume {
     EngineState* state = _state.get();
-    if (!state->audio) return;
+    if (!state->audio)
+        return;
 
     const bool playing = state->flow.screen == GameScreen::PLAYING;
     float volume = static_cast<float>(state->settings.volumeLevel) / 10.0f;
     state->audio->setMasterVolume(playing ? volume : 0.0f);
 
     if (playing && state->windVoice < 0 && !state->sfxWind.empty()) {
-        state->windVoice = state->audio->playSound(state->sfxWind, SoundEffect::SAMPLE_RATE,
-                                                   0.18f, /*looping=*/true);
+        state->windVoice = state->audio->playSound(state->sfxWind, SoundEffect::SAMPLE_RATE, 0.18f,
+                                                   /*looping=*/true);
     }
 }
 
 - (void)playSfx:(const std::vector<float>&)buffer gain:(float)gain {
     EngineState* state = _state.get();
-    if (!state->audio || state->flow.screen != GameScreen::PLAYING) return;
+    if (!state->audio || state->flow.screen != GameScreen::PLAYING)
+        return;
     state->audio->playSound(buffer, SoundEffect::SAMPLE_RATE, gain);
 }
 
@@ -452,8 +443,8 @@ static EngineState* _engineGetState(Engine* engine) {
         case MenuAction::SENSITIVITY_UP: {
             int step = (action == MenuAction::SENSITIVITY_UP) ? 1 : -1;
             settings.sensitivityLevel = std::clamp(settings.sensitivityLevel + step, 1, 10);
-            state->camera.setMouseSensitivity(
-                static_cast<float>(settings.sensitivityLevel) * 0.0005f);
+            state->camera.setMouseSensitivity(static_cast<float>(settings.sensitivityLevel) *
+                                              0.0005f);
             break;
         }
         case MenuAction::VOLUME_DOWN:
@@ -470,7 +461,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
 - (void)handleGlobalInput {
     EngineState* state = _state.get();
-    if (!state->inputManager) return;
+    if (!state->inputManager)
+        return;
     InputState& input = state->inputManager->state();
 
     if (input.isJustPressed(Key::Escape)) {
@@ -485,12 +477,10 @@ static EngineState* _engineGetState(Engine* engine) {
         // hit-test in window points — the same normalized space it's drawn in
         float boundsW = static_cast<float>(_view.bounds.size.width);
         float boundsH = static_cast<float>(_view.bounds.size.height);
-        state->menuLayout =
-            buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings);
+        state->menuLayout = buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings);
 
         Vec2 mouse = input.mousePosition;
-        state->hoveredButton =
-            menuHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
+        state->hoveredButton = menuHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
 
         if (input.isJustPressed(Key::MouseLeft) && state->hoveredButton >= 0) {
             MenuAction action =
@@ -517,7 +507,8 @@ static EngineState* _engineGetState(Engine* engine) {
 // ---- Clean quit: save the world, then terminate through AppKit ----
 
 - (void)saveWorldState {
-    if (_savedWorld) return;
+    if (_savedWorld)
+        return;
     _savedWorld = true;
 
     EngineState* state = _state.get();
@@ -565,7 +556,8 @@ static EngineState* _engineGetState(Engine* engine) {
 // ---- Game Tick (fixed timestep at 20Hz) ----
 
 - (void)gameTick:(EngineState*)state {
-    if (!state->inputManager || !state->world) return;
+    if (!state->inputManager || !state->world)
+        return;
 
     InputState& input = state->inputManager->state();
 
@@ -638,9 +630,8 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 7. Update loaded chunks around player
-    state->world->updatePlayerPosition(
-        Chunk::worldToChunk(state->player.position.x),
-        Chunk::worldToChunk(state->player.position.z));
+    state->world->updatePlayerPosition(Chunk::worldToChunk(state->player.position.x),
+                                       Chunk::worldToChunk(state->player.position.z));
 
     // 7b. Animals: initial population once the spawn area streamed in, then
     // per-tick AI steering + physics for every living entity
@@ -655,7 +646,8 @@ static EngineState* _engineGetState(Engine* engine) {
             int playerChunkZ = Chunk::worldToChunk(static_cast<int>(state->player.position.z));
             for (int dz = -SPAWN_CHUNK_RADIUS; dz <= SPAWN_CHUNK_RADIUS; ++dz) {
                 for (int dx = -SPAWN_CHUNK_RADIUS; dx <= SPAWN_CHUNK_RADIUS; ++dx) {
-                    if (state->spawner->getEntities().size() >= MAX_ANIMALS) break;
+                    if (state->spawner->getEntities().size() >= MAX_ANIMALS)
+                        break;
                     state->spawner->spawnForChunk(playerChunkX + dx, playerChunkZ + dz);
                 }
             }
@@ -667,12 +659,14 @@ static EngineState* _engineGetState(Engine* engine) {
         auto& entities = state->spawner->getEntities();
         auto& spatialHash = state->spawner->getSpatialHash();
         for (auto& entity : entities) {
-            if (!entity || !entity->alive) continue;
+            if (!entity || !entity->alive)
+                continue;
 
             // Simulation distance: distant animals stand still (cheap and
             // invisible — they are beyond the fog anyway)
             Vec3 offset = entity->position - state->player.position;
-            if (offset.length() > 96.f) continue;
+            if (offset.length() > 96.f)
+                continue;
 
             StateMachine& brain = state->entityBrains[entity->id];
             Vec3 steering = brain.update(*entity, *state->world, state->player.position,
@@ -692,8 +686,8 @@ static EngineState* _engineGetState(Engine* engine) {
             --state->animalCallCooldown;
         } else if (state->audio && !entities.empty()) {
             static SeededRng callRng(0xA111CA11u);
-            const auto& candidate = entities[callRng.nextInt(
-                0, static_cast<int>(entities.size()) - 1)];
+            const auto& candidate =
+                entities[callRng.nextInt(0, static_cast<int>(entities.size()) - 1)];
             if (candidate && candidate->alive) {
                 Vec3 toPlayer = candidate->position - state->player.position;
                 if (toPlayer.length() < 24.f && callRng.nextFloat() < 0.3f) {
@@ -701,7 +695,7 @@ static EngineState* _engineGetState(Engine* engine) {
                     [self playSfx:state->sfxAnimal[type] gain:0.35f];
                 }
             }
-            state->animalCallCooldown = 120 + callRng.nextInt(0, 120);  // 6-12s
+            state->animalCallCooldown = 120 + callRng.nextInt(0, 120); // 6-12s
         }
     }
 
@@ -745,7 +739,8 @@ static EngineState* _engineGetState(Engine* engine) {
 // ---- Block Breaking (Task 6.1) ----
 
 - (void)breakBlock:(EngineState*)state hit:(BlockRayHit)hit {
-    if (!hit.has_value()) return;
+    if (!hit.has_value())
+        return;
 
     int hitX = static_cast<int>(std::floor(hit->first.x));
     int hitY = static_cast<int>(std::floor(hit->first.y));
@@ -753,7 +748,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Cannot break bedrock
     BlockType current = state->world->getBlock(hitX, hitY, hitZ);
-    if (current == BlockType::BEDROCK) return;
+    if (current == BlockType::BEDROCK)
+        return;
 
     // Set block to air
     state->world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
@@ -780,7 +776,8 @@ static EngineState* _engineGetState(Engine* engine) {
 // ---- Block Placing (Task 6.2) ----
 
 - (void)placeBlock:(EngineState*)state hit:(BlockRayHit)hit {
-    if (!hit.has_value()) return;
+    if (!hit.has_value())
+        return;
 
     // Calculate placement position: hit block + face normal
     int placeX = static_cast<int>(std::floor(hit->first.x)) + static_cast<int>(hit->second.x);
@@ -790,10 +787,11 @@ static EngineState* _engineGetState(Engine* engine) {
     // Validate: placement AABB must not overlap player AABB
     AABB placeBox{
         Vec3{static_cast<float>(placeX), static_cast<float>(placeY), static_cast<float>(placeZ)},
-        Vec3{static_cast<float>(placeX + 1), static_cast<float>(placeY + 1), static_cast<float>(placeZ + 1)}
-    };
+        Vec3{static_cast<float>(placeX + 1), static_cast<float>(placeY + 1),
+             static_cast<float>(placeZ + 1)}};
 
-    if (placeBox.intersects(state->player.getAABB())) return;
+    if (placeBox.intersects(state->player.getAABB()))
+        return;
 
     // Place block
     BlockType selectedType = state->hotbar.getSelectedBlockType();
@@ -805,7 +803,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
     auto markChunkDirty = [&](int cx, int cz) {
         auto c = state->world->getChunk(cx, cz);
-        if (c) c->markDirty();
+        if (c)
+            c->markDirty();
     };
 
     markChunkDirty(chunkX, chunkZ);
@@ -813,15 +812,20 @@ static EngineState* _engineGetState(Engine* engine) {
     // Check if block is on chunk boundary and mark neighbor
     int localX = placeX - chunkX * CHUNK_WIDTH;
     int localZ = placeZ - chunkZ * CHUNK_DEPTH;
-    if (localX == 0) markChunkDirty(chunkX - 1, chunkZ);
-    if (localX == CHUNK_WIDTH - 1) markChunkDirty(chunkX + 1, chunkZ);
-    if (localZ == 0) markChunkDirty(chunkX, chunkZ - 1);
-    if (localZ == CHUNK_DEPTH - 1) markChunkDirty(chunkX, chunkZ + 1);
+    if (localX == 0)
+        markChunkDirty(chunkX - 1, chunkZ);
+    if (localX == CHUNK_WIDTH - 1)
+        markChunkDirty(chunkX + 1, chunkZ);
+    if (localZ == 0)
+        markChunkDirty(chunkX, chunkZ - 1);
+    if (localZ == CHUNK_DEPTH - 1)
+        markChunkDirty(chunkX, chunkZ + 1);
 
     // Save affected chunk
     if (state->saveManager) {
         auto chunk = state->world->getChunk(chunkX, chunkZ);
-        if (chunk) state->saveManager->saveChunk(*chunk);
+        if (chunk)
+            state->saveManager->saveChunk(*chunk);
     }
 
     [self playSfx:state->sfxBlockPlace gain:0.8f];
@@ -839,26 +843,25 @@ static EngineState* _engineGetState(Engine* engine) {
     CGSize currentSize = _view.drawableSize;
     if (currentSize.width > 0 && currentSize.height > 0) {
         state->drawableSize = currentSize;
-        float aspect = static_cast<float>(currentSize.width) /
-                        static_cast<float>(currentSize.height);
-        state->projectionMatrix = Mat4::perspective(
-            70.0f * (static_cast<float>(M_PI) / 180.0f),  // 70° FOV in radians
-            aspect,
-            0.1f,
-            1000.0f
-        );
+        float aspect =
+            static_cast<float>(currentSize.width) / static_cast<float>(currentSize.height);
+        state->projectionMatrix =
+            Mat4::perspective(70.0f * (static_cast<float>(M_PI) / 180.0f), // 70° FOV in radians
+                              aspect, 0.1f, 1000.0f);
     }
 
     id<CAMetalDrawable> drawable = _view.currentDrawable;
-    if (!drawable) return;
+    if (!drawable)
+        return;
 
-    if (!_renderPipeline || !state->world) return;
+    if (!_renderPipeline || !state->world)
+        return;
 
     // Log render diagnostics every 60 frames
     if (state->frameCount % 60 == 1) {
         auto chunks = state->world->getLoadedChunks();
         RY_LOG_INFO(std::string("Render: ") + std::to_string(chunks.size()) +
-            " loaded chunks, frame " + std::to_string(state->frameCount));
+                    " loaded chunks, frame " + std::to_string(state->frameCount));
     }
 
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
@@ -897,18 +900,10 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.menu = state->menuLayout;
 
     _renderPipeline->render(
-        _queue,
-        drawable,
-        viewMatrix,
-        state->projectionMatrix,
-        *state->world,
-        state->camera,
+        _queue, drawable, viewMatrix, state->projectionMatrix, *state->world, state->camera,
         state->worldTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
-        state->hotbar,
-        uiFrame,
-        state->spawner ? &state->spawner->getEntities() : nullptr
-    );
+        state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
 }
 
 - (double)deltaTime {
@@ -933,6 +928,7 @@ Mat4 engineProjectionMatrix(Engine* engine) {
 CGSize engineDrawableSize(Engine* engine) {
     extern EngineState* _engineGetState(Engine*);
     EngineState* state = _engineGetState(engine);
-    if (!state) return {0, 0};
+    if (!state)
+        return {0, 0};
     return state->drawableSize;
 }

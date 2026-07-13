@@ -8,12 +8,8 @@ uint64_t MegaBuffer::alignUp(uint64_t value) {
     return (value + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 }
 
-bool MegaBuffer::tryBumpAllocate(
-    uint64_t& outOffset,
-    uint64_t alignedSize,
-    uint64_t bufferSize,
-    uint64_t& bumpPtr
-) const {
+bool MegaBuffer::tryBumpAllocate(uint64_t& outOffset, uint64_t alignedSize, uint64_t bufferSize,
+                                 uint64_t& bumpPtr) const {
     uint64_t end = bumpPtr + alignedSize;
     if (end > bufferSize) {
         return false;
@@ -23,12 +19,9 @@ bool MegaBuffer::tryBumpAllocate(
     return true;
 }
 
-bool MegaBuffer::tryFreeListAllocate(
-    uint64_t& outOffset,
-    uint64_t alignedSize,
-    uint64_t /*bufferSize*/,
-    std::vector<std::pair<uint64_t, uint64_t>>& freeList
-) {
+bool MegaBuffer::tryFreeListAllocate(uint64_t& outOffset, uint64_t alignedSize,
+                                     uint64_t /*bufferSize*/,
+                                     std::vector<std::pair<uint64_t, uint64_t>>& freeList) {
     // Sort free list by offset for deterministic first-fit
     std::sort(freeList.begin(), freeList.end());
 
@@ -66,24 +59,16 @@ bool MegaBuffer::tryFreeListAllocate(
     return false;
 }
 
-MegaBuffer::MegaBuffer(
-    id<MTLDevice> device,
-    uint64_t vertexSize,
-    uint64_t indexSize
-)
-    : _vertexSize(vertexSize)
-    , _indexSize(indexSize)
-    , _vertexPtr(0)
-    , _indexPtr(0)
-{
+MegaBuffer::MegaBuffer(id<MTLDevice> device, uint64_t vertexSize, uint64_t indexSize)
+    : _vertexSize(vertexSize), _indexSize(indexSize), _vertexPtr(0), _indexPtr(0) {
     _vertexBuffer = [device newBufferWithLength:static_cast<NSUInteger>(vertexSize)
-                                         options:MTLResourceStorageModeShared];
+                                        options:MTLResourceStorageModeShared];
     if (!_vertexBuffer) {
         std::terminate();
     }
 
     _indexBuffer = [device newBufferWithLength:static_cast<NSUInteger>(indexSize)
-                                        options:MTLResourceStorageModeShared];
+                                       options:MTLResourceStorageModeShared];
     if (!_indexBuffer) {
         std::terminate();
     }
@@ -105,23 +90,28 @@ MegaBuffer::ChunkAllocation MegaBuffer::allocate(uint32_t vertexCount, uint32_t 
     // Vertex allocation: try bump pointer first, then free list
     bool vertexAllocated = false;
     if (vertexBytes > 0) {
-        vertexAllocated = tryBumpAllocate(vertexOffset, vertexBytes, _vertexSize, const_cast<uint64_t&>(_vertexPtr));
+        vertexAllocated = tryBumpAllocate(vertexOffset, vertexBytes, _vertexSize,
+                                          const_cast<uint64_t&>(_vertexPtr));
         if (!vertexAllocated) {
-            vertexAllocated = tryFreeListAllocate(vertexOffset, vertexBytes, _vertexSize, _vertexFreeList);
+            vertexAllocated =
+                tryFreeListAllocate(vertexOffset, vertexBytes, _vertexSize, _vertexFreeList);
         }
     }
 
     // Index allocation: try bump pointer first, then free list
     bool indexAllocated = false;
     if (indexBytes > 0) {
-        indexAllocated = tryBumpAllocate(indexOffset, indexBytes, _indexSize, const_cast<uint64_t&>(_indexPtr));
+        indexAllocated =
+            tryBumpAllocate(indexOffset, indexBytes, _indexSize, const_cast<uint64_t&>(_indexPtr));
         if (!indexAllocated) {
-            indexAllocated = tryFreeListAllocate(indexOffset, indexBytes, _indexSize, _indexFreeList);
+            indexAllocated =
+                tryFreeListAllocate(indexOffset, indexBytes, _indexSize, _indexFreeList);
         }
     }
 
     if ((vertexBytes > 0 && !vertexAllocated) || (indexBytes > 0 && !indexAllocated)) {
-        throw std::runtime_error("mega buffer allocation failed — insufficient space in vertex or index buffer");
+        throw std::runtime_error(
+            "mega buffer allocation failed — insufficient space in vertex or index buffer");
     }
 
     return ChunkAllocation{
@@ -141,11 +131,7 @@ void MegaBuffer::uploadVertices(const void* data, size_t size, uint64_t offset) 
     if (offset + size > _vertexSize) {
         throw std::out_of_range("vertex upload exceeds buffer bounds");
     }
-    std::memcpy(
-        static_cast<uint8_t*>([_vertexBuffer contents]) + offset,
-        data,
-        size
-    );
+    std::memcpy(static_cast<uint8_t*>([_vertexBuffer contents]) + offset, data, size);
 }
 
 void MegaBuffer::uploadIndices(const void* data, size_t size, uint64_t offset) {
@@ -155,11 +141,7 @@ void MegaBuffer::uploadIndices(const void* data, size_t size, uint64_t offset) {
     if (offset + size > _indexSize) {
         throw std::out_of_range("index upload exceeds buffer bounds");
     }
-    std::memcpy(
-        static_cast<uint8_t*>([_indexBuffer contents]) + offset,
-        data,
-        size
-    );
+    std::memcpy(static_cast<uint8_t*>([_indexBuffer contents]) + offset, data, size);
 }
 
 void MegaBuffer::free(ChunkAllocation& alloc) {
@@ -172,8 +154,7 @@ void MegaBuffer::free(ChunkAllocation& alloc) {
         std::sort(_vertexFreeList.begin(), _vertexFreeList.end());
         auto writeIt = _vertexFreeList.begin();
         for (auto readIt = _vertexFreeList.begin(); readIt != _vertexFreeList.end(); ++readIt) {
-            if (readIt != writeIt &&
-                (*writeIt).first + (*writeIt).second == readIt->first) {
+            if (readIt != writeIt && (*writeIt).first + (*writeIt).second == readIt->first) {
                 (*writeIt).second += readIt->second;
             } else {
                 *(++writeIt) = *readIt;
@@ -189,8 +170,7 @@ void MegaBuffer::free(ChunkAllocation& alloc) {
         std::sort(_indexFreeList.begin(), _indexFreeList.end());
         auto writeIt = _indexFreeList.begin();
         for (auto readIt = _indexFreeList.begin(); readIt != _indexFreeList.end(); ++readIt) {
-            if (readIt != writeIt &&
-                (*writeIt).first + (*writeIt).second == readIt->first) {
+            if (readIt != writeIt && (*writeIt).first + (*writeIt).second == readIt->first) {
                 (*writeIt).second += readIt->second;
             } else {
                 *(++writeIt) = *readIt;

@@ -13,10 +13,8 @@ static constexpr float WATER_BUOYANCY_FORCE = 0.02f;
 // ---------------------------------------------------------------------------
 AABB Player::getAABB() const {
     float halfWidth = WIDTH * 0.5f;
-    return AABB{
-        Vec3{position.x - halfWidth, position.y, position.z - halfWidth},
-        Vec3{position.x + halfWidth, position.y + HEIGHT, position.z + halfWidth}
-    };
+    return AABB{Vec3{position.x - halfWidth, position.y, position.z - halfWidth},
+                Vec3{position.x + halfWidth, position.y + HEIGHT, position.z + halfWidth}};
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ bool VoxelTraversal::isBlockSolid(World& world, int x, int y, int z) {
 // traceRay — DDA ray marching, returns first solid block position
 // ---------------------------------------------------------------------------
 std::optional<Vec3> VoxelTraversal::traceRay(const Vec3& origin, const Vec3& direction,
-                                              World& world, float maxDistance) {
+                                             World& world, float maxDistance) {
     // Current voxel (floor of origin)
     int x = static_cast<int>(std::floor(origin.x));
     int y = static_cast<int>(std::floor(origin.y));
@@ -27,12 +27,15 @@ std::optional<Vec3> VoxelTraversal::traceRay(const Vec3& origin, const Vec3& dir
     int stepZ = (direction.z >= 0.f) ? 1 : -1;
 
     // Distance to next voxel boundary along each axis
-    float tMaxX = (direction.x != 0.f) ?
-        ((stepX > 0) ? (x + 1 - origin.x) : (x - origin.x)) / direction.x : INFINITY;
-    float tMaxY = (direction.y != 0.f) ?
-        ((stepY > 0) ? (y + 1 - origin.y) : (y - origin.y)) / direction.y : INFINITY;
-    float tMaxZ = (direction.z != 0.f) ?
-        ((stepZ > 0) ? (z + 1 - origin.z) : (z - origin.z)) / direction.z : INFINITY;
+    float tMaxX = (direction.x != 0.f)
+                      ? ((stepX > 0) ? (x + 1 - origin.x) : (x - origin.x)) / direction.x
+                      : INFINITY;
+    float tMaxY = (direction.y != 0.f)
+                      ? ((stepY > 0) ? (y + 1 - origin.y) : (y - origin.y)) / direction.y
+                      : INFINITY;
+    float tMaxZ = (direction.z != 0.f)
+                      ? ((stepZ > 0) ? (z + 1 - origin.z) : (z - origin.z)) / direction.z
+                      : INFINITY;
 
     // Distance between voxel boundaries along each axis
     float tDeltaX = (direction.x != 0.f) ? stepX / direction.x : INFINITY;
@@ -78,9 +81,10 @@ std::optional<Vec3> VoxelTraversal::traceRay(const Vec3& origin, const Vec3& dir
 // ---------------------------------------------------------------------------
 // traceRayWithNormal — DDA ray marching with face normal computation
 // ---------------------------------------------------------------------------
-std::optional<std::pair<Vec3, Vec3>> VoxelTraversal::traceRayWithNormal(
-    const Vec3& origin, const Vec3& direction, World& world, float maxDistance) {
-
+std::optional<std::pair<Vec3, Vec3>> VoxelTraversal::traceRayWithNormal(const Vec3& origin,
+                                                                        const Vec3& direction,
+                                                                        World& world,
+                                                                        float maxDistance) {
     // Current voxel (floor of origin)
     int x = static_cast<int>(std::floor(origin.x));
     int y = static_cast<int>(std::floor(origin.y));
@@ -97,12 +101,15 @@ std::optional<std::pair<Vec3, Vec3>> VoxelTraversal::traceRayWithNormal(
     int stepZ = (direction.z >= 0.f) ? 1 : -1;
 
     // Distance to next voxel boundary along each axis
-    float tMaxX = (direction.x != 0.f) ?
-        ((stepX > 0) ? (x + 1 - origin.x) : (x - origin.x)) / direction.x : INFINITY;
-    float tMaxY = (direction.y != 0.f) ?
-        ((stepY > 0) ? (y + 1 - origin.y) : (y - origin.y)) / direction.y : INFINITY;
-    float tMaxZ = (direction.z != 0.f) ?
-        ((stepZ > 0) ? (z + 1 - origin.z) : (z - origin.z)) / direction.z : INFINITY;
+    float tMaxX = (direction.x != 0.f)
+                      ? ((stepX > 0) ? (x + 1 - origin.x) : (x - origin.x)) / direction.x
+                      : INFINITY;
+    float tMaxY = (direction.y != 0.f)
+                      ? ((stepY > 0) ? (y + 1 - origin.y) : (y - origin.y)) / direction.y
+                      : INFINITY;
+    float tMaxZ = (direction.z != 0.f)
+                      ? ((stepZ > 0) ? (z + 1 - origin.z) : (z - origin.z)) / direction.z
+                      : INFINITY;
 
     // Distance between voxel boundaries along each axis
     float tDeltaX = (direction.x != 0.f) ? stepX / direction.x : INFINITY;
@@ -126,9 +133,7 @@ std::optional<std::pair<Vec3, Vec3>> VoxelTraversal::traceRayWithNormal(
             }
 
             return std::make_pair(
-                Vec3{static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)},
-                normal
-            );
+                Vec3{static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)}, normal);
         }
 
         // Store previous position before advancing

@@ -1,10 +1,10 @@
 #pragma once
-#include <array>
-#include <vector>
-#include <cstdint>
-#include <optional>
 #include "common/math.hpp"
 #include "world/block_properties.hpp"
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <vector>
 
 // Backwards compatibility alias
 constexpr int CHUNK_SIZE = 16;

@@ -63,10 +63,8 @@ std::vector<AABB> PhysicsEngine::collectObstacles(const AABB& expandedAABB, Worl
                 if (PhysicsEngine::isSolid(world, x, y, z)) {
                     obstacles.emplace_back(
                         Vec3{static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)},
-                        Vec3{static_cast<float>(x) + 1.f,
-                             static_cast<float>(y) + 1.f,
-                             static_cast<float>(z) + 1.f}
-                    );
+                        Vec3{static_cast<float>(x) + 1.f, static_cast<float>(y) + 1.f,
+                             static_cast<float>(z) + 1.f});
                 }
             }
         }
@@ -78,18 +76,20 @@ std::vector<AABB> PhysicsEngine::collectObstacles(const AABB& expandedAABB, Worl
 // ---------------------------------------------------------------------------
 // resolveAxis — Resolve collision along a single axis
 // ---------------------------------------------------------------------------
-static Vec3 resolveAxis(const Vec3& position, const Vec3& entitySize,
-                        const Vec3& remainingMovement, int axis,
-                        World& world, bool& wasPushed) {
+static Vec3 resolveAxis(const Vec3& position, const Vec3& entitySize, const Vec3& remainingMovement,
+                        int axis, World& world, bool& wasPushed) {
     Vec3 newRemaining = remainingMovement;
 
     auto getAxis = [](const Vec3& v, int a) -> float {
         return (a == 0) ? v.x : (a == 1) ? v.y : v.z;
     };
     auto setAxis = [](Vec3& v, int a, float val) {
-        if (a == 0) v.x = val;
-        else if (a == 1) v.y = val;
-        else v.z = val;
+        if (a == 0)
+            v.x = val;
+        else if (a == 1)
+            v.y = val;
+        else
+            v.z = val;
     };
 
     float moveAmount = getAxis(newRemaining, axis);
@@ -107,14 +107,20 @@ static Vec3 resolveAxis(const Vec3& position, const Vec3& entitySize,
     AABB sweptAABB = currentAABB;
     if (moveAmount > 0.f) {
         // Extend max in movement direction
-        if (axis == 0) sweptAABB.max.x += moveAmount;
-        else if (axis == 1) sweptAABB.max.y += moveAmount;
-        else sweptAABB.max.z += moveAmount;
+        if (axis == 0)
+            sweptAABB.max.x += moveAmount;
+        else if (axis == 1)
+            sweptAABB.max.y += moveAmount;
+        else
+            sweptAABB.max.z += moveAmount;
     } else if (moveAmount < 0.f) {
         // Extend min in movement direction
-        if (axis == 0) sweptAABB.min.x += moveAmount;
-        else if (axis == 1) sweptAABB.min.y += moveAmount;
-        else sweptAABB.min.z += moveAmount;
+        if (axis == 0)
+            sweptAABB.min.x += moveAmount;
+        else if (axis == 1)
+            sweptAABB.min.y += moveAmount;
+        else
+            sweptAABB.min.z += moveAmount;
     }
 
     // Collect obstacles intersecting the swept AABB
@@ -153,13 +159,19 @@ static Vec3 resolveAxis(const Vec3& position, const Vec3& entitySize,
             // Rebuild swept AABB with reduced movement for next obstacle
             sweptAABB = currentAABB;
             if (moveAmount > 0.f) {
-                if (axis == 0) sweptAABB.max.x += moveAmount;
-                else if (axis == 1) sweptAABB.max.y += moveAmount;
-                else sweptAABB.max.z += moveAmount;
+                if (axis == 0)
+                    sweptAABB.max.x += moveAmount;
+                else if (axis == 1)
+                    sweptAABB.max.y += moveAmount;
+                else
+                    sweptAABB.max.z += moveAmount;
             } else if (moveAmount < 0.f) {
-                if (axis == 0) sweptAABB.min.x += moveAmount;
-                else if (axis == 1) sweptAABB.min.y += moveAmount;
-                else sweptAABB.min.z += moveAmount;
+                if (axis == 0)
+                    sweptAABB.min.x += moveAmount;
+                else if (axis == 1)
+                    sweptAABB.min.y += moveAmount;
+                else
+                    sweptAABB.min.z += moveAmount;
             }
         }
     }
@@ -187,8 +199,10 @@ Vec3 PhysicsEngine::sweepCollision(const AABB& entityAABB, const Vec3& movement,
 
     // Resolve second horizontal axis
     remaining = resolveAxis(position, entitySize, remaining, secondAxis, world, wasPushed);
-    if (secondAxis == 0) position.x += remaining.x;
-    else position.z += remaining.z;
+    if (secondAxis == 0)
+        position.x += remaining.x;
+    else
+        position.z += remaining.z;
 
     // Resolve third horizontal axis
     remaining = resolveAxis(position, entitySize, remaining, thirdAxis, world, wasPushed);

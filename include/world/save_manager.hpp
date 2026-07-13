@@ -1,18 +1,18 @@
 #pragma once
-#include <string>
-#include <optional>
-#include <unordered_map>
-#include <mutex>
-#include <thread>
-#include <atomic>
-#include <condition_variable>
-#include <queue>
-#include <fstream>
-#include <sstream>
-#include <cstring>
-#include <filesystem>
 #include "world/chunk.hpp"
 #include "world/serialization.hpp"
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
 
 class SaveManager {
 public:
@@ -75,7 +75,8 @@ private:
 
     // Compress data with LZ4
     std::vector<uint8_t> compress(const std::vector<uint8_t>& data) const;
-    std::vector<uint8_t> decompress(const std::vector<uint8_t>& data, size_t maxDecompressedSize) const;
+    std::vector<uint8_t> decompress(const std::vector<uint8_t>& data,
+                                    size_t maxDecompressedSize) const;
 
     // Get region file path for chunk coordinates
     std::string getRegionPath(int chunkX, int chunkZ) const;

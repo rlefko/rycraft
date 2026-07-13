@@ -1,7 +1,7 @@
 #pragma once
 
-#include <common/math.hpp>
 #include <common/error.hpp>
+#include <common/math.hpp>
 
 #include <string>
 #include <unordered_map>
@@ -78,9 +78,9 @@ struct InputState {
     // jumps, hotbar keys, and block clicks were silently dropped whenever
     // the press landed on a tickless frame.
     std::unordered_map<Key, bool> keysPressedForTick;
-    Vec2 mouseDelta;      // accumulated raw look deltas while captured
-    Vec2 mousePosition;   // window points, bottom-left origin
-    float scrollDelta = 0.f;  // accumulated scroll-wheel Y this frame
+    Vec2 mouseDelta;         // accumulated raw look deltas while captured
+    Vec2 mousePosition;      // window points, bottom-left origin
+    float scrollDelta = 0.f; // accumulated scroll-wheel Y this frame
     bool mouseLeftDown = false;
     bool mouseRightDown = false;
 
@@ -138,7 +138,7 @@ private:
     // Cursor state
     Vec2 lastMousePosition_;
     bool captured_ = false;
-    bool cursorHidden_ = false;  // NSCursor hide/unhide must stay balanced
+    bool cursorHidden_ = false; // NSCursor hide/unhide must stay balanced
 
     // Move the hardware cursor to the window center (CG coordinates).
     void warpCursorToWindowCenter();
@@ -154,4 +154,4 @@ private:
 
     static Key keyCodeToKey(NSInteger keyCode);
 };
-#endif  // __OBJC__
+#endif // __OBJC__

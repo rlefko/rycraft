@@ -31,14 +31,14 @@ struct EngineState;
 - (void)terminate;
 
 // ---- Accessors ----
-@property (nonatomic, readonly) id<MTLDevice> metalDevice;
-@property (nonatomic, readonly) id<MTLCommandQueue> commandQueue;
-@property (nonatomic, readonly) NSWindow* window;
-@property (nonatomic, readonly) MTKView* view;
+@property(nonatomic, readonly) id<MTLDevice> metalDevice;
+@property(nonatomic, readonly) id<MTLCommandQueue> commandQueue;
+@property(nonatomic, readonly) NSWindow* window;
+@property(nonatomic, readonly) MTKView* view;
 
 // ---- Timing ----
-@property (nonatomic, readonly) double deltaTime;
-@property (nonatomic, readonly) uint64_t frameCount;
+@property(nonatomic, readonly) double deltaTime;
+@property(nonatomic, readonly) uint64_t frameCount;
 
 @end
 
@@ -46,4 +46,4 @@ struct EngineState;
 Mat4 engineProjectionMatrix(Engine* engine);
 CGSize engineDrawableSize(Engine* engine);
 
-#endif  // __OBJC__
+#endif // __OBJC__

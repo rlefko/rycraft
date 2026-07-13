@@ -26,8 +26,8 @@ struct UIRect {
 };
 
 struct MenuText {
-    float x, y;   // bottom-left of the text run
-    float scale;  // glyph scale (1.0 = 8 px tall)
+    float x, y;  // bottom-left of the text run
+    float scale; // glyph scale (1.0 = 8 px tall)
     std::string text;
     float r = 1.f, g = 1.f, b = 1.f;
 };
@@ -39,18 +39,18 @@ struct MenuButton {
 };
 
 struct MenuLayout {
-    float dimAlpha = 0.f;  // full-screen darkening behind the menu
-    UIRect panel{};        // w == 0 → no panel
+    float dimAlpha = 0.f; // full-screen darkening behind the menu
+    UIRect panel{};       // w == 0 → no panel
     std::vector<MenuText> texts;
     std::vector<MenuButton> buttons;
 };
 
 // Live values the settings screen displays.
 struct SettingsValues {
-    int viewDistance = 12;   // chunks
-    int fogLevel = 3;        // 0-10 (density = level * 0.0001 per block)
-    int sensitivityLevel = 4;  // 1-10 (sensitivity = level * 0.0005)
-    int volumeLevel = 8;     // 0-10
+    int viewDistance = 12;    // chunks
+    int fogLevel = 3;         // 0-10 (density = level * 0.0001 per block)
+    int sensitivityLevel = 4; // 1-10 (sensitivity = level * 0.0005)
+    int volumeLevel = 8;      // 0-10
 };
 
 // Performance HUD data (F3), filled by the engine with real measurements.
@@ -64,7 +64,7 @@ struct PerformanceStats {
 // Everything the UI pass needs to draw one frame.
 struct UIFrameState {
     GameScreen screen = GameScreen::TITLE;
-    int hoveredButton = -1;  // index into menu.buttons, -1 = none
+    int hoveredButton = -1; // index into menu.buttons, -1 = none
     bool showDebugHud = false;
     PerformanceStats stats{};
     MenuLayout menu;

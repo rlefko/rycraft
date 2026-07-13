@@ -59,10 +59,8 @@ public:
     void tick(float dt, const World& world, const Vec3& playerPosition);
 
     // Render active particles as billboards (call during main render pass).
-    void render(id<MTLRenderCommandEncoder> encoder,
-                const Mat4& viewMatrix,
-                const Mat4& projectionMatrix,
-                const Vec3& cameraPosition);
+    void render(id<MTLRenderCommandEncoder> encoder, const Mat4& viewMatrix,
+                const Mat4& projectionMatrix, const Vec3& cameraPosition);
 
 private:
     // ---- CPU particle pool ----

@@ -12,11 +12,11 @@
 
 #include "common/math.hpp"
 #include "engine/hotbar.hpp"
-#include "render/ui_menu.hpp"
+#include "render/block_texture_array.hpp"
 #include "render/mega_buffer.hpp"
 #include "render/particles.hpp"
 #include "render/shader_types.hpp"
-#include "render/block_texture_array.hpp"
+#include "render/ui_menu.hpp"
 #include "render/vertex.hpp"
 
 // Forward declarations
@@ -48,25 +48,17 @@ struct ChunkMeshState {
 // ---------------------------------------------------------------------------
 class RenderPipeline {
 public:
-    RenderPipeline(id<MTLDevice> device,
-                    id<MTLLibrary> shaderLibrary,
-                    uint32_t width,
-                    uint32_t height);
+    RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
+                   uint32_t height);
 
     ~RenderPipeline();
 
     // Render a single frame.
     // Handles empty world gracefully (sky-only output).
-    void render(id<MTLCommandQueue> queue,
-                id<CAMetalDrawable> drawable,
-                const Mat4& viewMatrix,
-                const Mat4& projectionMatrix,
-                const World& world,
-                const Camera& camera,
-                uint64_t worldTime = 0,
-                std::optional<Vec3> highlightedBlock = std::nullopt,
-                const Hotbar& hotbar = Hotbar(),
-                const UIFrameState& uiFrame = UIFrameState{},
+    void render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable, const Mat4& viewMatrix,
+                const Mat4& projectionMatrix, const World& world, const Camera& camera,
+                uint64_t worldTime = 0, std::optional<Vec3> highlightedBlock = std::nullopt,
+                const Hotbar& hotbar = Hotbar(), const UIFrameState& uiFrame = UIFrameState{},
                 const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
 
     // Reallocate MSAA and resolve textures for new viewport size.
@@ -175,36 +167,24 @@ private:
     std::unordered_set<uint64_t> _liveChunkKeys;
 
     // ---- Day/Night Cycle (Task 6.4-6.5) ----
-    void computeDayNightUniforms(uint64_t worldTime,
-                                  float sunDirection[3],
-                                  float sunColor[3],
-                                  float ambientColor[3],
-                                  SkyUniforms& skyUniforms);
+    void computeDayNightUniforms(uint64_t worldTime, float sunDirection[3], float sunColor[3],
+                                 float ambientColor[3], SkyUniforms& skyUniforms);
 
     // ---- Scene pass stages (all encode into the single MSAA scene encoder) ----
     void renderSky(id<MTLRenderCommandEncoder> encoder);
 
-    void renderChunks(id<MTLRenderCommandEncoder> encoder,
-                      const World& world,
-                      const Mat4& viewMatrix,
-                      const Mat4& projectionMatrix,
-                      const Vec3& cameraPosition,
-                      const float sunDirection[3],
-                      const float sunColor[3],
-                      const float ambientColor[3],
+    void renderChunks(id<MTLRenderCommandEncoder> encoder, const World& world,
+                      const Mat4& viewMatrix, const Mat4& projectionMatrix,
+                      const Vec3& cameraPosition, const float sunDirection[3],
+                      const float sunColor[3], const float ambientColor[3],
                       const float fogColor[3]);
 
-    void renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
-                              const Vec3& blockPos,
-                              const Mat4& viewMatrix,
-                              const Mat4& projectionMatrix);
+    void renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, const Vec3& blockPos,
+                              const Mat4& viewMatrix, const Mat4& projectionMatrix);
 
-    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
-                         const Hotbar& hotbar,
+    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
                          const UIFrameState& uiFrame);
 
-    void renderClouds(id<MTLRenderCommandEncoder> encoder,
-                      const Camera& camera,
-                      uint64_t worldTime,
+    void renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera, uint64_t worldTime,
                       const float sunDirection[3]);
 };

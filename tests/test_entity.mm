@@ -1,42 +1,42 @@
 #include "test_helpers.hpp"
 
-#include <catch2/catch_test_macros.hpp>
+#include <audio/audio_engine.hpp>
+#include <audio/sfx.hpp>
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
 #include <common/math.hpp>
-#include <common/thread_pool.hpp>
 #include <common/random.hpp>
+#include <common/thread_pool.hpp>
+#include <engine/game_state.hpp>
+#include <engine/hotbar.hpp>
+#include <engine/input_bindings.hpp>
+#include <entity/ai.hpp>
+#include <entity/entity.hpp>
+#include <entity/physics.hpp>
+#include <entity/player.hpp>
+#include <entity/spatial_hash.hpp>
+#include <entity/spawner.hpp>
+#include <entity/voxel_traversal.hpp>
+#include <render/block_texture_array.hpp>
+#include <render/block_textures.hpp>
+#include <render/lod_mesher.hpp>
+#include <render/mega_buffer.hpp>
+#include <render/shader_types.hpp>
+#include <render/ui_menu.hpp>
+#include <render/ui_overlay.hpp>
+#include <render/vertex.hpp>
+#include <world/biome.hpp>
 #include <world/chunk.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/noise.hpp>
-#include <world/terrain.hpp>
-#include <world/biome.hpp>
-#include <world/world.hpp>
-#include <world/serialization.hpp>
 #include <world/save_manager.hpp>
-#include <render/vertex.hpp>
-#include <render/lod_mesher.hpp>
-#include <render/block_textures.hpp>
-#include <render/block_texture_array.hpp>
-#include <render/mega_buffer.hpp>
-#include <render/ui_overlay.hpp>
-#include <render/shader_types.hpp>
-#include <entity/physics.hpp>
-#include <entity/player.hpp>
-#include <entity/voxel_traversal.hpp>
-#include <entity/entity.hpp>
-#include <entity/ai.hpp>
-#include <entity/spatial_hash.hpp>
-#include <entity/spawner.hpp>
-#include <engine/hotbar.hpp>
-#include <engine/input_bindings.hpp>
-#include <engine/game_state.hpp>
-#include <render/ui_menu.hpp>
-#include <audio/sfx.hpp>
-#include <audio/audio_engine.hpp>
+#include <world/serialization.hpp>
+#include <world/terrain.hpp>
+#include <world/world.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <thread>
-#include <chrono>
 
 // ============================================================================
 // Vec3 Tests
@@ -44,7 +44,6 @@
 // ===========================================================================
 // Entities: physics, AI, spawning, the player
 // ===========================================================================
-
 
 // ============================================================================
 // Physics Engine Tests (Phase 5)
@@ -163,8 +162,8 @@ TEST_CASE("isSolid: solid for STONE and GLASS, passable for AIR/WATER", "[physic
     // GLASS collides: it renders as a full block, so physics must agree
     // (it used to be passable — the fall-through-glass bug).
     REQUIRE(PhysicsEngine::isSolid(*world, 4, 200, 4) == true);
-    REQUIRE(PhysicsEngine::isSolid(*world, 5, 200, 5) == true);  // DIRT
-    REQUIRE(PhysicsEngine::isSolid(*world, 6, 200, 6) == true);  // BEDROCK
+    REQUIRE(PhysicsEngine::isSolid(*world, 5, 200, 5) == true); // DIRT
+    REQUIRE(PhysicsEngine::isSolid(*world, 6, 200, 6) == true); // BEDROCK
 }
 
 TEST_CASE("Block properties: the three predicates agree on every type", "[physics][world]") {
@@ -200,32 +199,32 @@ TEST_CASE("isInWater: returns true when entity AABB overlaps water block", "[phy
 // ============================================================================
 
 TEST_CASE("Player movement follows the camera basis", "[player]") {
-  auto world = std::make_shared<World>(42);
-  world->getChunk(0, 0);
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
 
-  // At yaw = 0 the camera looks down +Z (Camera::updateFront), so W must
-  // accelerate toward +Z and D toward the camera's right (-X at yaw 0).
-  // These were inverted once: W walked backwards, D strafed left.
-  {
-    Player player;
-    player.position = Vec3{8.f, 250.f, 8.f};  // high in the air, no collisions
-    player.yaw = 0.f;
-    InputState input;
-    input.keysDown[Key::W] = true;
-    player.tick(*world, input, false);
-    REQUIRE(player.velocity.z > 0.f);
-    REQUIRE(std::abs(player.velocity.x) < 1e-4f);
-  }
-  {
-    Player player;
-    player.position = Vec3{8.f, 250.f, 8.f};
-    player.yaw = 0.f;
-    InputState input;
-    input.keysDown[Key::D] = true;
-    player.tick(*world, input, false);
-    REQUIRE(player.velocity.x < 0.f);
-    REQUIRE(std::abs(player.velocity.z) < 1e-4f);
-  }
+    // At yaw = 0 the camera looks down +Z (Camera::updateFront), so W must
+    // accelerate toward +Z and D toward the camera's right (-X at yaw 0).
+    // These were inverted once: W walked backwards, D strafed left.
+    {
+        Player player;
+        player.position = Vec3{8.f, 250.f, 8.f}; // high in the air, no collisions
+        player.yaw = 0.f;
+        InputState input;
+        input.keysDown[Key::W] = true;
+        player.tick(*world, input, false);
+        REQUIRE(player.velocity.z > 0.f);
+        REQUIRE(std::abs(player.velocity.x) < 1e-4f);
+    }
+    {
+        Player player;
+        player.position = Vec3{8.f, 250.f, 8.f};
+        player.yaw = 0.f;
+        InputState input;
+        input.keysDown[Key::D] = true;
+        player.tick(*world, input, false);
+        REQUIRE(player.velocity.x < 0.f);
+        REQUIRE(std::abs(player.velocity.z) < 1e-4f);
+    }
 }
 
 TEST_CASE("Player AABB: correct dimensions (0.6x1.8x0.6)", "[player]") {
@@ -443,7 +442,6 @@ TEST_CASE("DDA traversal: maxDistance limits traversal range", "[voxel]") {
 
 // ---- Entity Creation Tests ----
 
-
 TEST_CASE("Entity creation assigns unique ID", "[entity]") {
     auto e1 = std::make_shared<Entity>(1, EntityType::SHEEP, Vec3{0.f, 64.f, 0.f});
     auto e2 = std::make_shared<Entity>(2, EntityType::COW, Vec3{1.f, 64.f, 1.f});
@@ -516,7 +514,6 @@ TEST_CASE("Entity nextId is monotonically increasing", "[entity]") {
 
 // ---- Entity Config Tests ----
 
-
 TEST_CASE("EntityConfig: sheep has correct config", "[entity]") {
     auto cfg = Entity::getConfig(EntityType::SHEEP);
     REQUIRE(cfg.width == Catch::Approx(0.6f));
@@ -538,7 +535,6 @@ TEST_CASE("EntityConfig: all types have positive dimensions", "[entity]") {
 }
 
 // ---- Entity Physics Tests ----
-
 
 TEST_CASE("Entity physics: gravity reduces velocity.y", "[entity][physics]") {
     auto world = std::make_shared<World>(42);
@@ -654,7 +650,6 @@ TEST_CASE("Entity physics: terminal velocity is clamped", "[entity][physics]") {
 
 // ---- Voxel Model Tests ----
 
-
 TEST_CASE("Entity voxel model: sheep has multiple blocks", "[entity][voxel]") {
     auto model = Entity::getVoxelModel(EntityType::SHEEP, false);
     REQUIRE(model.size() >= 5); // body + head + 4 legs minimum
@@ -702,7 +697,6 @@ TEST_CASE("Entity voxel model: all blocks have valid colors", "[entity][voxel]")
 }
 
 // ---- State Machine Tests ----
-
 
 TEST_CASE("State machine: initial state is IDLE", "[ai][state]") {
     StateMachine sm;
@@ -774,7 +768,6 @@ TEST_CASE("State machine: stop following when player far or no food", "[ai][stat
 
 // ---- Flocking Tests ----
 
-
 TEST_CASE("Flocking: separation pushes entities apart", "[ai][flocking]") {
     SpatialHash hash;
 
@@ -845,25 +838,27 @@ TEST_CASE("Flocking: max force clamps steering", "[ai][flocking]") {
     Vec3 bigForce{1.f, 0.f, 0.f};
     Vec3 clamped = FlockingController::clampForce(bigForce, FlockingController::MAX_FLOCKING_FORCE);
 
-    REQUIRE(clamped.length() <= Catch::Approx(FlockingController::MAX_FLOCKING_FORCE).epsilon(0.001f));
+    REQUIRE(clamped.length() <=
+            Catch::Approx(FlockingController::MAX_FLOCKING_FORCE).epsilon(0.001f));
 }
 
 TEST_CASE("Flocking: small force passes through clamp", "[ai][flocking]") {
     Vec3 smallForce{0.01f, 0.f, 0.f};
-    Vec3 clamped = FlockingController::clampForce(smallForce, FlockingController::MAX_FLOCKING_FORCE);
+    Vec3 clamped =
+        FlockingController::clampForce(smallForce, FlockingController::MAX_FLOCKING_FORCE);
 
     REQUIRE(clamped.x == Catch::Approx(0.01f));
 }
 
 TEST_CASE("Flocking: zero force remains zero", "[ai][flocking]") {
     Vec3 zeroForce = Vec3::zero();
-    Vec3 clamped = FlockingController::clampForce(zeroForce, FlockingController::MAX_FLOCKING_FORCE);
+    Vec3 clamped =
+        FlockingController::clampForce(zeroForce, FlockingController::MAX_FLOCKING_FORCE);
 
     REQUIRE(clamped == Vec3::zero());
 }
 
 // ---- Edge Detection Tests ----
-
 
 TEST_CASE("Edge detection: safe on flat ground", "[ai][edge]") {
     auto world = std::make_shared<World>(42);
@@ -950,7 +945,6 @@ TEST_CASE("Edge detection: pig tolerates water", "[ai][edge]") {
 
 // ---- Behavior Controller Tests ----
 
-
 TEST_CASE("Behavior: follow steering moves toward player", "[ai][behavior]") {
     Vec3 entityPos{0.f, 64.f, 0.f};
     Vec3 playerPos{10.f, 64.f, 0.f};
@@ -1003,7 +997,6 @@ TEST_CASE("Behavior: isOnGrass returns false on stone", "[ai][behavior]") {
 }
 
 // ---- Spatial Hash Tests ----
-
 
 TEST_CASE("Spatial hash: insert and query finds entity", "[spatial]") {
     SpatialHash hash(8.0f);
@@ -1107,7 +1100,10 @@ TEST_CASE("Spatial hash: re-insert moves entity to new cell", "[spatial]") {
     auto near = hash.query(Vec3{0.f, 64.f, 0.f}, 5.0f, positions);
     bool foundNear = false;
     for (uint64_t id : near) {
-        if (id == 1) { foundNear = true; break; }
+        if (id == 1) {
+            foundNear = true;
+            break;
+        }
     }
     REQUIRE(foundNear == false);
 
@@ -1115,7 +1111,10 @@ TEST_CASE("Spatial hash: re-insert moves entity to new cell", "[spatial]") {
     auto far = hash.query(Vec3{20.f, 64.f, 20.f}, 5.0f, positions);
     bool foundFar = false;
     for (uint64_t id : far) {
-        if (id == 1) { foundFar = true; break; }
+        if (id == 1) {
+            foundFar = true;
+            break;
+        }
     }
     REQUIRE(foundFar == true);
 }
@@ -1152,7 +1151,6 @@ TEST_CASE("Spatial hash: query filters by distance", "[spatial]") {
 }
 
 // ---- Spawner Tests ----
-
 
 TEST_CASE("Spawner: biome spawn rules — Plains", "[spawner][biome]") {
     auto rule = Spawner::getSpawnRule(Biome::PLAINS);
@@ -1315,7 +1313,6 @@ TEST_CASE("Spawner: initial population spawns entities", "[spawner]") {
 
 // ---- Entity Baby Timer Tests ----
 
-
 TEST_CASE("Entity: baby timer decrements on tick", "[entity][baby]") {
     auto world = std::make_shared<World>(42);
     world->getChunk(0, 0);
@@ -1367,7 +1364,6 @@ TEST_CASE("Entity: baby becomes adult when timer expires", "[entity][baby]") {
 
 // ---- Entity Hunger Timer Tests ----
 
-
 TEST_CASE("Entity: hunger timer increments on tick", "[entity][hunger]") {
     auto world = std::make_shared<World>(42);
     world->getChunk(0, 0);
@@ -1413,7 +1409,6 @@ TEST_CASE("Entity: hunger timer caps at 600", "[entity][hunger]") {
 }
 
 // ---- Entity Eat Animation Tests ----
-
 
 TEST_CASE("Entity: eat animation timer decrements", "[entity][animation]") {
     auto world = std::make_shared<World>(42);

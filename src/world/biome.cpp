@@ -2,32 +2,16 @@
 
 #include <cmath>
 
-BiomeGenerator::BiomeGenerator(uint32_t seed)
-    : temperatureNoise_(seed)
-    , moistureNoise_(seed + 1)
-{
-}
+BiomeGenerator::BiomeGenerator(uint32_t seed) : temperatureNoise_(seed), moistureNoise_(seed + 1) {}
 
 double BiomeGenerator::getTemperature(double x, double z) const {
-    double val = temperatureNoise_.octave2D(
-        x * 0.025,
-        z * 0.025,
-        4,
-        0.5,
-        2.0
-    );
+    double val = temperatureNoise_.octave2D(x * 0.025, z * 0.025, 4, 0.5, 2.0);
     // Map from [-1, 1] to [0, 1]
     return (val + 1.0) * 0.5;
 }
 
 double BiomeGenerator::getMoisture(double x, double z) const {
-    double val = moistureNoise_.octave2D(
-        x * 0.05,
-        z * 0.05,
-        4,
-        0.5,
-        2.0
-    );
+    double val = moistureNoise_.octave2D(x * 0.05, z * 0.05, 4, 0.5, 2.0);
     return (val + 1.0) * 0.5;
 }
 
@@ -72,23 +56,16 @@ Biome BiomeGenerator::lookupBiome(double temperature, double moisture, double el
     return Biome::PLAINS;
 }
 
-Biome BiomeGenerator::getBiome(double x, double z, double elevation, const BiomeConfig& config) const {
-    double temp = temperatureNoise_.octave2D(
-        x * config.temperatureFrequency,
-        z * config.temperatureFrequency,
-        config.temperatureOctaves,
-        0.5,
-        2.0
-    );
+Biome BiomeGenerator::getBiome(double x, double z, double elevation,
+                               const BiomeConfig& config) const {
+    double temp =
+        temperatureNoise_.octave2D(x * config.temperatureFrequency, z * config.temperatureFrequency,
+                                   config.temperatureOctaves, 0.5, 2.0);
     temp = (temp + 1.0) * 0.5;
 
-    double moist = moistureNoise_.octave2D(
-        x * config.moistureFrequency,
-        z * config.moistureFrequency,
-        config.moistureOctaves,
-        0.5,
-        2.0
-    );
+    double moist =
+        moistureNoise_.octave2D(x * config.moistureFrequency, z * config.moistureFrequency,
+                                config.moistureOctaves, 0.5, 2.0);
     moist = (moist + 1.0) * 0.5;
 
     return lookupBiome(temp, moist, elevation);
@@ -96,17 +73,24 @@ Biome BiomeGenerator::getBiome(double x, double z, double elevation, const Biome
 
 double BiomeGenerator::getBiomeHeightModifier(Biome biome) const {
     switch (biome) {
-        case Biome::EXTREME_HILLS: return 30.0;
-        case Biome::DESERT:       return 5.0;
-        case Biome::FOREST:       return 10.0;
-        case Biome::TAIGA:        return 15.0;
-        case Biome::ICE_SPIKES:    return 20.0;
-        case Biome::SWAMP:        return -5.0;
+        case Biome::EXTREME_HILLS:
+            return 30.0;
+        case Biome::DESERT:
+            return 5.0;
+        case Biome::FOREST:
+            return 10.0;
+        case Biome::TAIGA:
+            return 15.0;
+        case Biome::ICE_SPIKES:
+            return 20.0;
+        case Biome::SWAMP:
+            return -5.0;
         case Biome::PLAINS:
         case Biome::OCEAN:
         case Biome::DEEP_OCEAN:
         case Biome::MUSHROOM_ISLAND:
-        default:                  return 0.0;
+        default:
+            return 0.0;
     }
 }
 

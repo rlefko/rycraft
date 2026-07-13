@@ -22,10 +22,7 @@
 
 class UIOverlay {
 public:
-    UIOverlay(id<MTLDevice> device,
-              id<MTLLibrary> shaderLibrary,
-              uint32_t width,
-              uint32_t height);
+    UIOverlay(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width, uint32_t height);
 
     // Start a new frame's batch (drops any unflushed quads).
     void beginFrame();
@@ -36,18 +33,14 @@ public:
     // Queue a screen-space quad with a solid color.
     // x, y: bottom-left corner in normalized [0, 1] coordinates
     // w, h: width and height in normalized [0, 1] coordinates
-    void drawQuad(float x, float y,
-                  float w, float h,
-                  float r, float g, float b, float a);
+    void drawQuad(float x, float y, float w, float h, float r, float g, float b, float a);
 
     // Queue a single 8×8 bitmap-font character. `scale` multiplies the glyph
     // pixel size (1.0 = 8px tall on screen).
-    void drawChar(char c, float x, float y, float scale,
-                  float r, float g, float b);
+    void drawChar(char c, float x, float y, float scale, float r, float g, float b);
 
     // Queue a string; returns its normalized advance width.
-    float drawString(const char* str, float x, float y, float scale,
-                     float r, float g, float b);
+    float drawString(const char* str, float x, float y, float scale, float r, float g, float b);
 
     // Normalized width a string will occupy at the given scale.
     float measureString(const char* str, float scale) const;

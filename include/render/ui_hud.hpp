@@ -22,5 +22,5 @@ void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
                  uint32_t displayWidth, uint32_t displayHeight);
 
 // The current menu (title/pause/settings), with hover highlighting.
-void drawMenu(UIOverlay& ui, const MenuLayout& layout, int hoveredButton,
-              uint32_t displayWidth, uint32_t displayHeight);
+void drawMenu(UIOverlay& ui, const MenuLayout& layout, int hoveredButton, uint32_t displayWidth,
+              uint32_t displayHeight);

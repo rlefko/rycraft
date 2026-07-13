@@ -24,53 +24,51 @@
 // ---------------------------------------------------------------------------
 class ThreadPool {
 public:
-  explicit ThreadPool(size_t numWorkers);
-  ~ThreadPool();
+    explicit ThreadPool(size_t numWorkers);
+    ~ThreadPool();
 
-  // Delete copy/move
-  ThreadPool(const ThreadPool&) = delete;
-  ThreadPool& operator=(const ThreadPool&) = delete;
-  ThreadPool(ThreadPool&&) = delete;
-  ThreadPool& operator=(ThreadPool&&) = delete;
+    // Delete copy/move
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
+    ThreadPool(ThreadPool&&) = delete;
+    ThreadPool& operator=(ThreadPool&&) = delete;
 
-  // Submit a callable, returns future for result retrieval
-  template <typename F, typename... Args>
-  auto submit(F&& f, Args&&... args)
-      -> std::future<std::invoke_result_t<F, Args...>> {
-    using ReturnType = std::invoke_result_t<F, Args...>;
+    // Submit a callable, returns future for result retrieval
+    template <typename F, typename... Args>
+    auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
+        using ReturnType = std::invoke_result_t<F, Args...>;
 
-    auto task = std::make_shared<std::packaged_task<ReturnType()>>(
-        [f = std::forward<F>(f),
-         t = std::make_tuple(std::forward<Args>(args)...)]() mutable {
-         try {
-           return std::apply(std::move(f), std::move(t));
-         } catch (...) {
-           std::cerr << "[ThreadPool] Task threw an exception" << std::endl;
-           throw;
-         }
-       });
+        auto task = std::make_shared<std::packaged_task<ReturnType()>>(
+            [f = std::forward<F>(f), t = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+                try {
+                    return std::apply(std::move(f), std::move(t));
+                } catch (...) {
+                    std::cerr << "[ThreadPool] Task threw an exception" << std::endl;
+                    throw;
+                }
+            });
 
-    std::future<ReturnType> result = task->get_future();
+        std::future<ReturnType> result = task->get_future();
 
-    {
-      std::lock_guard<std::mutex> lock(queueMutex_);
-      if (stop_.load()) {
-        throw std::runtime_error("ThreadPool is shutting down");
-      }
-      tasks_.emplace([task]() { (*task)(); });
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (stop_.load()) {
+                throw std::runtime_error("ThreadPool is shutting down");
+            }
+            tasks_.emplace([task]() { (*task)(); });
+        }
+
+        condition_.notify_one();
+        return result;
     }
 
-    condition_.notify_one();
-    return result;
-  }
-
-  // Worker count
-  [[nodiscard]] size_t size() const { return workers_.size(); }
+    // Worker count
+    [[nodiscard]] size_t size() const { return workers_.size(); }
 
 private:
-  std::vector<std::thread> workers_;
-  std::queue<std::function<void()>> tasks_;
-  std::mutex queueMutex_;
-  std::condition_variable condition_;
-  std::atomic<bool> stop_{false};
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex queueMutex_;
+    std::condition_variable condition_;
+    std::atomic<bool> stop_{false};
 };

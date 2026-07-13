@@ -1,9 +1,9 @@
 #pragma once
+#include "world/chunk.hpp"
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
-#include <optional>
-#include "world/chunk.hpp"
 
 // Binary chunk format:
 // Header (20 bytes):

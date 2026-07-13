@@ -1,19 +1,19 @@
 #import "render/render_pipeline.hpp"
 
 #include "common/error.hpp"
+#include "render/block_textures.hpp"
 #include "render/bloom.hpp"
 #include "render/entity_renderer.hpp"
-#include "render/block_textures.hpp"
 #include "render/lod_mesher.hpp"
 
+#include "engine/camera.hpp"
+#include "engine/hotbar.hpp"
 #include "render/particles.hpp"
 #include "render/ui_hud.hpp"
 #include "render/ui_overlay.hpp"
 #include "world/chunk.hpp"
 #include "world/chunk_pos.hpp"
 #include "world/world.hpp"
-#include "engine/camera.hpp"
-#include "engine/hotbar.hpp"
 
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -26,16 +26,10 @@
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
-RenderPipeline::RenderPipeline(id<MTLDevice> device,
-                                id<MTLLibrary> shaderLibrary,
-                                uint32_t width,
-                                uint32_t height)
-    : _device(device)
-    , _bloomIntensity(1.0f)
-    , _displayWidth(width)
-    , _displayHeight(height)
-    , _frustumPlanes{}
-{
+RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
+                               uint32_t height)
+    : _device(device), _bloomIntensity(1.0f), _displayWidth(width), _displayHeight(height),
+      _frustumPlanes{} {
     // ---- Load main chunk shader functions ----
     id<MTLFunction> vertexFunc = [shaderLibrary newFunctionWithName:@"vertexMain"];
     if (!vertexFunc) {
@@ -81,11 +75,10 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     pipelineDesc.rasterSampleCount = 4;
 
     NSError* error = nil;
-    _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc
-                                                            error:&error];
+    _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
     if (!_pipelineState) {
         NSString* msg = [NSString stringWithFormat:@"Failed to create render pipeline state: %@",
-                         error.localizedDescription];
+                                                   error.localizedDescription];
         RY_LOG_FATAL(msg.UTF8String);
     }
 
@@ -125,11 +118,10 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     skyPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     skyPipelineDesc.rasterSampleCount = 4;
 
-    _skyPipelineState = [_device newRenderPipelineStateWithDescriptor:skyPipelineDesc
-                                                               error:&error];
+    _skyPipelineState = [_device newRenderPipelineStateWithDescriptor:skyPipelineDesc error:&error];
     if (!_skyPipelineState) {
         NSString* msg = [NSString stringWithFormat:@"Failed to create sky pipeline state: %@",
-                         error.localizedDescription];
+                                                   error.localizedDescription];
         RY_LOG_FATAL(msg.UTF8String);
     }
 
@@ -144,7 +136,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     // Sky uniforms buffer
     _skyUniformsBuffer = [_device newBufferWithLength:sizeof(SkyUniforms)
-                                                options:MTLResourceStorageModeShared];
+                                              options:MTLResourceStorageModeShared];
     if (!_skyUniformsBuffer) {
         RY_LOG_FATAL("Failed to allocate sky uniforms buffer");
     }
@@ -163,16 +155,18 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     highlightPipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
     highlightPipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
     highlightPipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    highlightPipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    highlightPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    highlightPipelineDesc.colorAttachments[0].destinationRGBBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+    highlightPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
     highlightPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     highlightPipelineDesc.rasterSampleCount = 4;
 
     _highlightPipelineState = [_device newRenderPipelineStateWithDescriptor:highlightPipelineDesc
-                                                                     error:&error];
+                                                                      error:&error];
     if (!_highlightPipelineState) {
         NSString* msg = [NSString stringWithFormat:@"Failed to create highlight pipeline state: %@",
-                         error.localizedDescription];
+                                                   error.localizedDescription];
         RY_LOG_FATAL(msg.UTF8String);
     }
 
@@ -208,12 +202,14 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
                                  static_cast<float16_t>(corners[a][0] - 0.002f),
                                  static_cast<float16_t>(corners[a][1] - 0.002f),
                                  static_cast<float16_t>(corners[a][2] - 0.002f),
-                                 0, 0};
+                                 0,
+                                 0};
         highlightVerts[i * 2 + 1] = {highlightAttr,
                                      static_cast<float16_t>(corners[b][0] - 0.002f),
                                      static_cast<float16_t>(corners[b][1] - 0.002f),
                                      static_cast<float16_t>(corners[b][2] - 0.002f),
-                                     0, 0};
+                                     0,
+                                     0};
     }
 
     _highlightVertexBuffer = [_device newBufferWithBytes:highlightVerts
@@ -225,7 +221,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     // Highlight uniforms buffer (same layout as Uniforms)
     _highlightUniformsBuffer = [_device newBufferWithLength:sizeof(Uniforms)
-                                                      options:MTLResourceStorageModeShared];
+                                                    options:MTLResourceStorageModeShared];
     if (!_highlightUniformsBuffer) {
         RY_LOG_FATAL("Failed to allocate highlight uniforms buffer");
     }
@@ -235,7 +231,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     // ---- Uniforms buffer ----
     _uniformsBuffer = [_device newBufferWithLength:sizeof(Uniforms)
-                                              options:MTLResourceStorageModeShared];
+                                           options:MTLResourceStorageModeShared];
     if (!_uniformsBuffer) {
         RY_LOG_FATAL("Failed to allocate uniforms buffer");
     }
@@ -263,13 +259,15 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         cloudPipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
         cloudPipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
         cloudPipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-        cloudPipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-        cloudPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        cloudPipelineDesc.colorAttachments[0].destinationRGBBlendFactor =
+            MTLBlendFactorOneMinusSourceAlpha;
+        cloudPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
+            MTLBlendFactorOneMinusSourceAlpha;
         cloudPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         cloudPipelineDesc.rasterSampleCount = 4;
 
         _cloudPipelineState = [_device newRenderPipelineStateWithDescriptor:cloudPipelineDesc
-                                                                     error:&error];
+                                                                      error:&error];
     }
 
     // Cloud depth state (depth test, no write)
@@ -280,7 +278,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     // Cloud uniforms buffer
     _cloudUniformsBuffer = [_device newBufferWithLength:sizeof(CloudUniforms)
-                                                  options:MTLResourceStorageModeShared];
+                                                options:MTLResourceStorageModeShared];
 
     // ---- Bloom post-processing (Phase 8) ----
     _bloom = std::make_unique<Bloom>(_device, shaderLibrary, _displayWidth, _displayHeight);
@@ -325,10 +323,11 @@ void RenderPipeline::allocateSceneTargets() {
         RY_LOG_FATAL("Failed to allocate MSAA depth texture");
     }
 
-    auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                   width:_displayWidth
-                                                                                  height:_displayHeight
-                                                                              mipmapped:false];
+    auto colorResolveDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:_displayWidth
+                                                          height:_displayHeight
+                                                       mipmapped:false];
     colorResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
     if (!_colorResolve) {
@@ -339,19 +338,14 @@ void RenderPipeline::allocateSceneTargets() {
 // ---------------------------------------------------------------------------
 // render()
 // ---------------------------------------------------------------------------
-void RenderPipeline::render(id<MTLCommandQueue> queue,
-                            id<CAMetalDrawable> drawable,
-                            const Mat4& viewMatrix,
-                            const Mat4& projectionMatrix,
-                            const World& world,
-                            const Camera& camera,
-                            uint64_t worldTime,
-                            std::optional<Vec3> highlightedBlock,
-                            const Hotbar& hotbar,
+void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
+                            const Mat4& viewMatrix, const Mat4& projectionMatrix,
+                            const World& world, const Camera& camera, uint64_t worldTime,
+                            std::optional<Vec3> highlightedBlock, const Hotbar& hotbar,
                             const UIFrameState& uiFrame,
-                            const std::vector<std::shared_ptr<Entity>>* entities)
-{
-    if (!drawable || !queue) return;
+                            const std::vector<std::shared_ptr<Entity>>* entities) {
+    if (!drawable || !queue)
+        return;
 
     // Track the true drawable size (pixels, not view points — 2x on Retina)
     // so the scene targets always match the surface we resolve into.
@@ -372,10 +366,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     computeDayNightUniforms(worldTime, sunDirection, sunColor, ambientColor, skyUniforms);
 
     // Normalize sun direction
-    float sunLen = std::sqrt(
-        sunDirection[0] * sunDirection[0] +
-        sunDirection[1] * sunDirection[1] +
-        sunDirection[2] * sunDirection[2]);
+    float sunLen = std::sqrt(sunDirection[0] * sunDirection[0] + sunDirection[1] * sunDirection[1] +
+                             sunDirection[2] * sunDirection[2]);
     if (sunLen > 0.001f) {
         sunDirection[0] /= sunLen;
         sunDirection[1] /= sunLen;
@@ -384,7 +376,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
 
     // Create command buffer
     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
-    if (!commandBuffer) return;
+    if (!commandBuffer)
+        return;
 
     // Upload sky uniforms
     std::memcpy((void*)_skyUniformsBuffer.contents, &skyUniforms, sizeof(SkyUniforms));
@@ -398,27 +391,24 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     renderPassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
     renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(
-        skyUniforms.horizonColor.x,
-        skyUniforms.horizonColor.y,
-        skyUniforms.horizonColor.z,
-        1.0f
-    );
+        skyUniforms.horizonColor.x, skyUniforms.horizonColor.y, skyUniforms.horizonColor.z, 1.0f);
 
     renderPassDesc.depthAttachment.texture = _depthMSAA;
     renderPassDesc.depthAttachment.loadAction = MTLLoadActionClear;
     renderPassDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
     renderPassDesc.depthAttachment.clearDepth = 1.0;
 
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
-    if (!encoder) return;
+    id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
+    if (!encoder)
+        return;
 
     renderSky(encoder);
 
-    const float fogColor[3] = {skyUniforms.horizonColor.x,
-                               skyUniforms.horizonColor.y,
+    const float fogColor[3] = {skyUniforms.horizonColor.x, skyUniforms.horizonColor.y,
                                skyUniforms.horizonColor.z};
-    renderChunks(encoder, world, viewMatrix, projectionMatrix, camera.getPosition(),
-                 sunDirection, sunColor, ambientColor, fogColor);
+    renderChunks(encoder, world, viewMatrix, projectionMatrix, camera.getPosition(), sunDirection,
+                 sunColor, ambientColor, fogColor);
 
     if (entities && _entityRenderer) {
         _entityRenderer->render(encoder, _uniformsBuffer, *entities,
@@ -464,7 +454,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     uiPassDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
     uiPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-    id<MTLRenderCommandEncoder> uiEncoder = [commandBuffer renderCommandEncoderWithDescriptor:uiPassDesc];
+    id<MTLRenderCommandEncoder> uiEncoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:uiPassDesc];
     if (uiEncoder) {
         renderUIOverlay(uiEncoder, hotbar, uiFrame);
         [uiEncoder endEncoding];
@@ -506,7 +497,8 @@ void RenderPipeline::encodeFrameCapture(id<MTLCommandBuffer> commandBuffer,
     }
 
     id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
-    if (!blit) return;
+    if (!blit)
+        return;
     [blit copyFromTexture:frameTexture
               sourceSlice:0
               sourceLevel:0
@@ -529,11 +521,11 @@ void RenderPipeline::encodeFrameCapture(id<MTLCommandBuffer> commandBuffer,
               mipmapLevel:0];
 
         CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-        const uint32_t bitmapInfo =  // BGRA8
+        const uint32_t bitmapInfo = // BGRA8
             static_cast<uint32_t>(kCGBitmapByteOrder32Little) |
             static_cast<uint32_t>(kCGImageAlphaNoneSkipFirst);
-        CGContextRef context = CGBitmapContextCreate(
-            pixels.data(), width, height, 8, bytesPerRow, colorSpace, bitmapInfo);
+        CGContextRef context = CGBitmapContextCreate(pixels.data(), width, height, 8, bytesPerRow,
+                                                     colorSpace, bitmapInfo);
         CGImageRef image = context ? CGBitmapContextCreateImage(context) : nullptr;
 
         bool ok = false;
@@ -548,7 +540,8 @@ void RenderPipeline::encodeFrameCapture(id<MTLCommandBuffer> commandBuffer,
             }
             CGImageRelease(image);
         }
-        if (context) CGContextRelease(context);
+        if (context)
+            CGContextRelease(context);
         CGColorSpaceRelease(colorSpace);
 
         const std::string pathUtf8 = [path UTF8String];
@@ -563,17 +556,15 @@ void RenderPipeline::encodeFrameCapture(id<MTLCommandBuffer> commandBuffer,
 // ---------------------------------------------------------------------------
 // computeDayNightUniforms (Task 6.4-6.5)
 // ---------------------------------------------------------------------------
-void RenderPipeline::computeDayNightUniforms(uint64_t worldTime,
-                                              float sunDirection[3],
-                                              float sunColor[3],
-                                              float ambientColor[3],
-                                              SkyUniforms& skyUniforms)
-{
+void RenderPipeline::computeDayNightUniforms(uint64_t worldTime, float sunDirection[3],
+                                             float sunColor[3], float ambientColor[3],
+                                             SkyUniforms& skyUniforms) {
     // Full day = 24000 ticks (20 minutes real time at 20Hz)
     static constexpr uint64_t TICKS_PER_DAY = 24000;
 
     // Orbital angle: 0 = dawn, PI/2 = noon, PI = dusk, 3PI/2 = midnight
-    float dayFraction = static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
+    float dayFraction =
+        static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
     float orbitalAngle = dayFraction * 2.0f * static_cast<float>(M_PI);
 
     // Sun direction: rotates in XZ plane with slight Z offset for visual depth
@@ -666,16 +657,11 @@ void RenderPipeline::renderSky(id<MTLRenderCommandEncoder> encoder) {
 // ---------------------------------------------------------------------------
 // renderChunks (opaque pass)
 // ---------------------------------------------------------------------------
-void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
-                                     const World& world,
-                                     const Mat4& viewMatrix,
-                                     const Mat4& projectionMatrix,
-                                     const Vec3& cameraPosition,
-                                     const float sunDirection[3],
-                                     const float sunColor[3],
-                                     const float ambientColor[3],
-                                     const float fogColor[3])
-{
+void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const World& world,
+                                  const Mat4& viewMatrix, const Mat4& projectionMatrix,
+                                  const Vec3& cameraPosition, const float sunDirection[3],
+                                  const float sunColor[3], const float ambientColor[3],
+                                  const float fogColor[3]) {
     // Bind pipeline state
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setDepthStencilState:_depthState];
@@ -732,7 +718,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
     _liveChunkKeys.clear();
 
     for (auto& chunk : loadedChunks) {
-        if (!chunk || !chunk->generated) continue;
+        if (!chunk || !chunk->generated)
+            continue;
 
         // Chunk key for mesh cache lookup (packed, no allocation)
         uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
@@ -740,7 +727,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
 
         // Frustum culling
         AABB chunkAABB = chunk->getAABB();
-        if (!isChunkInFrustum(chunkAABB)) continue;
+        if (!isChunkInFrustum(chunkAABB))
+            continue;
 
         // (Re)build the mesh when the chunk is dirty or was never meshed
         auto cached = _chunkMeshes.find(key);
@@ -759,12 +747,11 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
             chunk->setMeshed(true);
             chunk->needsMeshUpdate = false;
 
-            ChunkMeshState state;  // uploaded == false marks an empty mesh
+            ChunkMeshState state; // uploaded == false marks an empty mesh
             if (!mesh.vertices.empty()) {
                 try {
-                    auto alloc = _megaBuffer->allocate(
-                        static_cast<uint32_t>(mesh.vertices.size()),
-                        static_cast<uint32_t>(mesh.indices.size()));
+                    auto alloc = _megaBuffer->allocate(static_cast<uint32_t>(mesh.vertices.size()),
+                                                       static_cast<uint32_t>(mesh.indices.size()));
                     _megaBuffer->uploadVertices(mesh.vertices.data(),
                                                 mesh.vertices.size() * sizeof(Vertex),
                                                 alloc.vertexOffset);
@@ -775,7 +762,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
                     state.uploaded = true;
                 } catch (const std::exception& e) {
                     if (!allocFailureLogged) {
-                        RY_LOG_ERROR((std::string("Chunk mesh upload failed: ") + e.what()).c_str());
+                        RY_LOG_ERROR(
+                            (std::string("Chunk mesh upload failed: ") + e.what()).c_str());
                         allocFailureLogged = true;
                     }
                 }
@@ -784,10 +772,12 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
         }
 
         cached = _chunkMeshes.find(key);
-        if (cached == _chunkMeshes.end() || !cached->second.uploaded) continue;
+        if (cached == _chunkMeshes.end() || !cached->second.uploaded)
+            continue;
 
         const auto& meshState = cached->second;
-        if (meshState.alloc.indexCount == 0) continue;
+        if (meshState.alloc.indexCount == 0)
+            continue;
 
         // Mesh vertices are chunk-local; this restores world space (and keeps
         // fp16 positions exact regardless of how far the chunk is from origin)
@@ -798,15 +788,15 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
 
         // Bind vertex buffer from MegaBuffer allocation
         [encoder setVertexBuffer:meshState.alloc.vertexBuffer
-                            offset:meshState.alloc.vertexOffset
-                          atIndex:0];
+                          offset:meshState.alloc.vertexOffset
+                         atIndex:0];
 
         // Draw indexed primitives (triangles)
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                              indexCount:meshState.alloc.indexCount
-                               indexType:MTLIndexTypeUInt32
-                             indexBuffer:meshState.alloc.indexBuffer
-                         indexBufferOffset:meshState.alloc.indexOffset];
+                            indexCount:meshState.alloc.indexCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:meshState.alloc.indexBuffer
+                     indexBufferOffset:meshState.alloc.indexOffset];
     }
 
     // Sweep mesh allocations of chunks the world has since unloaded
@@ -825,11 +815,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
 // ---------------------------------------------------------------------------
 // renderBlockHighlight (Task 6.9)
 // ---------------------------------------------------------------------------
-void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
-                                           const Vec3& blockPos,
-                                           const Mat4& viewMatrix,
-                                           const Mat4& projectionMatrix)
-{
+void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, const Vec3& blockPos,
+                                          const Mat4& viewMatrix, const Mat4& projectionMatrix) {
     // Upload highlight-specific uniforms with translation to block position
     Uniforms uniforms{};
 
@@ -872,10 +859,8 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
 // ---------------------------------------------------------------------------
 // renderUIOverlay (Task 6.10 + hotbar)
 // ---------------------------------------------------------------------------
-void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
-                                      const Hotbar& hotbar,
-                                      const UIFrameState& uiFrame)
-{
+void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
+                                     const UIFrameState& uiFrame) {
     _uiOverlay->beginFrame();
     drawGameHud(*_uiOverlay, hotbar, uiFrame, _displayWidth, _displayHeight);
     if (uiFrame.screen != GameScreen::PLAYING) {
@@ -893,7 +878,8 @@ RenderPipeline::~RenderPipeline() = default;
 // resize()
 // ---------------------------------------------------------------------------
 void RenderPipeline::resize(uint32_t width, uint32_t height) {
-    if (width == _displayWidth && height == _displayHeight) return;
+    if (width == _displayWidth && height == _displayHeight)
+        return;
 
     _displayWidth = width;
     _displayHeight = height;
@@ -921,7 +907,8 @@ void RenderPipeline::setBloomIntensity(float intensity) {
 // tickParticles — Update weather particle physics each game tick
 // ---------------------------------------------------------------------------
 void RenderPipeline::tickParticles(float dt, const World& world, const Vec3& playerPosition) {
-    if (!_particles) return;
+    if (!_particles)
+        return;
     _particles->tick(dt, world, playerPosition);
 }
 
@@ -937,20 +924,18 @@ void RenderPipeline::extractFrustumPlanes(const Mat4& vpMatrix) {
     };
 
     for (int c = 0; c < 4; ++c) {
-        _frustumPlanes[0][c] = row(3, c) + row(0, c);  // left
-        _frustumPlanes[1][c] = row(3, c) - row(0, c);  // right
-        _frustumPlanes[2][c] = row(3, c) + row(1, c);  // bottom
-        _frustumPlanes[3][c] = row(3, c) - row(1, c);  // top
-        _frustumPlanes[4][c] = row(2, c);              // near (Metal: z' >= 0)
-        _frustumPlanes[5][c] = row(3, c) - row(2, c);  // far
+        _frustumPlanes[0][c] = row(3, c) + row(0, c); // left
+        _frustumPlanes[1][c] = row(3, c) - row(0, c); // right
+        _frustumPlanes[2][c] = row(3, c) + row(1, c); // bottom
+        _frustumPlanes[3][c] = row(3, c) - row(1, c); // top
+        _frustumPlanes[4][c] = row(2, c);             // near (Metal: z' >= 0)
+        _frustumPlanes[5][c] = row(3, c) - row(2, c); // far
     }
 
     for (int i = 0; i < 6; ++i) {
-        float len = std::sqrt(
-            _frustumPlanes[i][0] * _frustumPlanes[i][0] +
-            _frustumPlanes[i][1] * _frustumPlanes[i][1] +
-            _frustumPlanes[i][2] * _frustumPlanes[i][2]
-        );
+        float len = std::sqrt(_frustumPlanes[i][0] * _frustumPlanes[i][0] +
+                              _frustumPlanes[i][1] * _frustumPlanes[i][1] +
+                              _frustumPlanes[i][2] * _frustumPlanes[i][2]);
         if (len > 0.0f) {
             _frustumPlanes[i][0] /= len;
             _frustumPlanes[i][1] /= len;
@@ -971,9 +956,7 @@ bool RenderPipeline::isChunkInFrustum(const AABB& chunkAABB) const {
         float D = _frustumPlanes[i][3];
 
         float dist = A * center.x + B * center.y + C * center.z + D;
-        float extent = std::abs(A) * extents.x +
-                       std::abs(B) * extents.y +
-                       std::abs(C) * extents.z;
+        float extent = std::abs(A) * extents.x + std::abs(B) * extents.y + std::abs(C) * extents.z;
 
         if (dist + extent < 0.f) {
             return false;
@@ -986,12 +969,10 @@ bool RenderPipeline::isChunkInFrustum(const AABB& chunkAABB) const {
 // ============================================================================
 // renderClouds — alpha-blended cloud layer, drawn last in the scene pass
 // ============================================================================
-void RenderPipeline::renderClouds(id<MTLRenderCommandEncoder> encoder,
-                                   const Camera& camera,
-                                   uint64_t worldTime,
-                                   const float sunDirection[3])
-{
-    if (!_cloudPipelineState) return;
+void RenderPipeline::renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera,
+                                  uint64_t worldTime, const float sunDirection[3]) {
+    if (!_cloudPipelineState)
+        return;
 
     // Cloud uniforms
     CloudUniforms cloudUniforms{};
@@ -1008,8 +989,7 @@ void RenderPipeline::renderClouds(id<MTLRenderCommandEncoder> encoder,
         simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
 
     // Projection shape for per-pixel ray reconstruction
-    cloudUniforms.tanHalfFov =
-        std::tan(camera.FOV() * 0.5f * static_cast<float>(M_PI) / 180.0f);
+    cloudUniforms.tanHalfFov = std::tan(camera.FOV() * 0.5f * static_cast<float>(M_PI) / 180.0f);
     cloudUniforms.aspect =
         static_cast<float>(_displayWidth) / static_cast<float>(std::max(_displayHeight, 1u));
 

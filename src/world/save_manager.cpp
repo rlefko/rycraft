@@ -1,9 +1,9 @@
 #include "world/save_manager.hpp"
 
-#include <iostream>
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <iostream>
 #include <lz4.h>
 
 namespace fs = std::filesystem;
@@ -11,8 +11,7 @@ namespace fs = std::filesystem;
 SaveManager::SaveManager(const std::string& worldPath)
     : worldPath_(worldPath)
     , regionsPath_(worldPath + "/regions")
-    , metadataPath_(worldPath + "/metadata.json")
-{
+    , metadataPath_(worldPath + "/metadata.json") {
     // Ensure directories exist
     ensureDirectory(worldPath_);
     ensureDirectory(regionsPath_);
@@ -112,8 +111,7 @@ std::optional<SaveManager::WorldMetadata> SaveManager::loadMetadata() const {
         return std::nullopt;
     }
 
-    std::string content((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
 
     // Simple JSON parsing (no external dependency)
@@ -140,7 +138,8 @@ std::optional<SaveManager::WorldMetadata> SaveManager::loadMetadata() const {
         return std::nullopt;
     }
     spawnXPos += 4;
-    while (spawnXPos < content.size() && (content[spawnXPos] == ' ' || content[spawnXPos] == '\n')) {
+    while (spawnXPos < content.size() &&
+           (content[spawnXPos] == ' ' || content[spawnXPos] == '\n')) {
         ++spawnXPos;
     }
     try {
@@ -155,7 +154,8 @@ std::optional<SaveManager::WorldMetadata> SaveManager::loadMetadata() const {
         return std::nullopt;
     }
     spawnYPos += 4;
-    while (spawnYPos < content.size() && (content[spawnYPos] == ' ' || content[spawnYPos] == '\n')) {
+    while (spawnYPos < content.size() &&
+           (content[spawnYPos] == ' ' || content[spawnYPos] == '\n')) {
         ++spawnYPos;
     }
     try {
@@ -170,7 +170,8 @@ std::optional<SaveManager::WorldMetadata> SaveManager::loadMetadata() const {
         return std::nullopt;
     }
     spawnZPos += 4;
-    while (spawnZPos < content.size() && (content[spawnZPos] == ' ' || content[spawnZPos] == '\n')) {
+    while (spawnZPos < content.size() &&
+           (content[spawnZPos] == ' ' || content[spawnZPos] == '\n')) {
         ++spawnZPos;
     }
     try {
@@ -216,9 +217,7 @@ void SaveManager::saveLoop() {
         SaveJob job;
         {
             std::unique_lock<std::mutex> lock(saveMutex_);
-            saveCondition_.wait(lock, [this]() {
-                return !saveQueue_.empty() || !running_.load();
-            });
+            saveCondition_.wait(lock, [this]() { return !saveQueue_.empty() || !running_.load(); });
 
             if (!running_.load() && saveQueue_.empty()) {
                 break;
@@ -248,12 +247,9 @@ std::vector<uint8_t> SaveManager::compress(const std::vector<uint8_t>& data) con
     int maxCompressedSize = LZ4_COMPRESSBOUND(static_cast<int>(data.size()));
     std::vector<uint8_t> compressed(maxCompressedSize);
 
-    int compressedSize = LZ4_compress_default(
-        reinterpret_cast<const char*>(data.data()),
-        reinterpret_cast<char*>(compressed.data()),
-        static_cast<int>(data.size()),
-        maxCompressedSize
-    );
+    int compressedSize = LZ4_compress_default(reinterpret_cast<const char*>(data.data()),
+                                              reinterpret_cast<char*>(compressed.data()),
+                                              static_cast<int>(data.size()), maxCompressedSize);
 
     if (compressedSize <= 0) {
         // Compression failed, return uncompressed with size prefix
@@ -268,7 +264,8 @@ std::vector<uint8_t> SaveManager::compress(const std::vector<uint8_t>& data) con
     return compressed;
 }
 
-std::vector<uint8_t> SaveManager::decompress(const std::vector<uint8_t>& data, size_t maxDecompressedSize) const {
+std::vector<uint8_t> SaveManager::decompress(const std::vector<uint8_t>& data,
+                                             size_t maxDecompressedSize) const {
     if (data.empty()) {
         return {};
     }
@@ -276,11 +273,8 @@ std::vector<uint8_t> SaveManager::decompress(const std::vector<uint8_t>& data, s
     std::vector<uint8_t> decompressed(maxDecompressedSize);
 
     int decompressedSize = LZ4_decompress_safe(
-        reinterpret_cast<const char*>(data.data()),
-        reinterpret_cast<char*>(decompressed.data()),
-        static_cast<int>(data.size()),
-        static_cast<int>(maxDecompressedSize)
-    );
+        reinterpret_cast<const char*>(data.data()), reinterpret_cast<char*>(decompressed.data()),
+        static_cast<int>(data.size()), static_cast<int>(maxDecompressedSize));
 
     if (decompressedSize <= 0) {
         // Decompression failed, return empty
@@ -327,7 +321,8 @@ bool SaveManager::writeFile(const std::string& path, const std::vector<uint8_t>&
         return false;
     }
 
-    file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    file.write(reinterpret_cast<const char*>(data.data()),
+               static_cast<std::streamsize>(data.size()));
     file.close();
     return true;
 }

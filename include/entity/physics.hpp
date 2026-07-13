@@ -3,8 +3,8 @@
 #include <common/math.hpp>
 #include <world/chunk.hpp>
 
-#include <vector>
 #include <optional>
+#include <vector>
 
 // Forward declaration
 class World;

@@ -17,22 +17,23 @@ float SoundEffect::randomNoise(uint32_t seed, uint32_t index) {
     value *= 0xc2b2ae35u;
     value ^= value >> 16;
     // Convert to [-1, 1]
-    return (static_cast<float>(value & 0x7FFFFFFFu) / static_cast<float>(0x7FFFFFFFu)) * 2.0f - 1.0f;
+    return (static_cast<float>(value & 0x7FFFFFFFu) / static_cast<float>(0x7FFFFFFFu)) * 2.0f -
+           1.0f;
 }
 
 // ---------------------------------------------------------------------------
 // Low-frequency oscillator (pure sine)
 // ---------------------------------------------------------------------------
 float SoundEffect::sinOscillator(uint32_t index, uint32_t sampleRate, float frequency) {
-    return std::sin(2.0f * static_cast<float>(M_PI) * frequency * static_cast<float>(index) / static_cast<float>(sampleRate));
+    return std::sin(2.0f * static_cast<float>(M_PI) * frequency * static_cast<float>(index) /
+                    static_cast<float>(sampleRate));
 }
 
 // ---------------------------------------------------------------------------
 // Frequency sweep (linear interpolation between start and end frequency)
 // ---------------------------------------------------------------------------
-float SoundEffect::frequencySweep(uint32_t index, uint32_t sampleRate,
-                                   float startFreq, float endFreq, uint32_t totalSamples)
-{
+float SoundEffect::frequencySweep(uint32_t index, uint32_t sampleRate, float startFreq,
+                                  float endFreq, uint32_t totalSamples) {
     float t = static_cast<float>(index) / static_cast<float>(totalSamples);
     float frequency = startFreq + (endFreq - startFreq) * t;
     return sinOscillator(index, sampleRate, frequency);
@@ -41,10 +42,8 @@ float SoundEffect::frequencySweep(uint32_t index, uint32_t sampleRate,
 // ---------------------------------------------------------------------------
 // ADSR envelope
 // ---------------------------------------------------------------------------
-float SoundEffect::adsrEnvelope(uint32_t index, uint32_t totalSamples,
-                                 float attackTime, float decayTime,
-                                 float sustainLevel, float releaseTime)
-{
+float SoundEffect::adsrEnvelope(uint32_t index, uint32_t totalSamples, float attackTime,
+                                float decayTime, float sustainLevel, float releaseTime) {
     float t = static_cast<float>(index) / static_cast<float>(totalSamples);
     float attackSamples = attackTime * SAMPLE_RATE / static_cast<float>(totalSamples);
     float decaySamples = decayTime * SAMPLE_RATE / static_cast<float>(totalSamples);
@@ -151,7 +150,8 @@ std::vector<float> SoundEffect::generateFootstep() {
 
     for (uint32_t i = 0; i < duration; ++i) {
         // Low-frequency thud with slight frequency modulation
-        float baseFreq = 80.0f + 40.0f * std::exp(-static_cast<float>(i) / static_cast<float>(duration * 0.3f));
+        float baseFreq =
+            80.0f + 40.0f * std::exp(-static_cast<float>(i) / static_cast<float>(duration * 0.3f));
         float tone = sinOscillator(i, SAMPLE_RATE, baseFreq);
 
         // Add noise component for texture
@@ -183,11 +183,15 @@ std::vector<float> SoundEffect::generateAmbientWind(uint32_t durationSeconds) {
         float noise = randomNoise(512, i / 4); // Lower effective rate for wind texture
 
         // Low-pass filter for wind character
-        float cutoff = 200.0f + 100.0f * std::sin(2.0f * static_cast<float>(M_PI) * 0.1f * static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
+        float cutoff =
+            200.0f + 100.0f * std::sin(2.0f * static_cast<float>(M_PI) * 0.1f *
+                                       static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
         noise = lowPassFilter(noise, &filterState, cutoff, SAMPLE_RATE);
 
         // Gentle volume modulation
-        float modulation = 0.3f + 0.1f * std::sin(2.0f * static_cast<float>(M_PI) * 0.05f * static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
+        float modulation =
+            0.3f + 0.1f * std::sin(2.0f * static_cast<float>(M_PI) * 0.05f * static_cast<float>(i) /
+                                   static_cast<float>(SAMPLE_RATE));
 
         samples[i] = noise * modulation * 0.15f; // Low volume for ambient
     }
@@ -209,7 +213,8 @@ std::vector<float> SoundEffect::generateSheepBaa() {
         float tone = sinOscillator(i, SAMPLE_RATE, freq);
 
         // Slight vibrato
-        tone *= 1.0f + 0.05f * std::sin(2.0f * static_cast<float>(M_PI) * 5.0f * static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
+        tone *= 1.0f + 0.05f * std::sin(2.0f * static_cast<float>(M_PI) * 5.0f *
+                                        static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
 
         float envelope = adsrEnvelope(i, duration, 0.02f, 0.05f, 0.6f, 0.1f);
 
@@ -281,11 +286,14 @@ std::vector<float> SoundEffect::generateChickenCluck() {
 
     for (uint32_t i = 0; i < duration; ++i) {
         // High frequency chirp
-        float freq = 800.0f + 200.0f * std::sin(2.0f * static_cast<float>(M_PI) * 15.0f * static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
+        float freq =
+            800.0f + 200.0f * std::sin(2.0f * static_cast<float>(M_PI) * 15.0f *
+                                       static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
         float tone = sinOscillator(i, SAMPLE_RATE, freq);
 
         // Rapid amplitude modulation for "cluck" character
-        float am = 0.5f + 0.5f * std::sin(2.0f * static_cast<float>(M_PI) * 30.0f * static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
+        float am = 0.5f + 0.5f * std::sin(2.0f * static_cast<float>(M_PI) * 30.0f *
+                                          static_cast<float>(i) / static_cast<float>(SAMPLE_RATE));
 
         float envelope = adsrEnvelope(i, duration, 0.005f, 0.02f, 0.0f, 0.05f);
 

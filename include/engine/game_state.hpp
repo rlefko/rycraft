@@ -10,10 +10,10 @@
 // ---------------------------------------------------------------------------
 
 enum class GameScreen {
-    TITLE,     // launch screen: PLAY / QUIT, world visible behind
-    PLAYING,   // normal gameplay, cursor captured
-    PAUSED,    // ESC menu: RESUME / SETTINGS / QUIT
-    SETTINGS,  // settings panel, reached from PAUSED
+    TITLE,    // launch screen: PLAY / QUIT, world visible behind
+    PLAYING,  // normal gameplay, cursor captured
+    PAUSED,   // ESC menu: RESUME / SETTINGS / QUIT
+    SETTINGS, // settings panel, reached from PAUSED
 };
 
 enum class MenuAction {
@@ -36,10 +36,10 @@ enum class MenuAction {
 
 // What the engine must do after a transition.
 struct GameFlowEffects {
-    bool captureCursor = false;  // hide + pointer-lock the mouse
-    bool releaseCursor = false;  // unhide + free the mouse
-    bool resetTiming = false;    // zero the tick accumulator + mouse delta
-    bool requestQuit = false;    // save and terminate
+    bool captureCursor = false; // hide + pointer-lock the mouse
+    bool releaseCursor = false; // unhide + free the mouse
+    bool resetTiming = false;   // zero the tick accumulator + mouse delta
+    bool requestQuit = false;   // save and terminate
 };
 
 struct GameFlow {

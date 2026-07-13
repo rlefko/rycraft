@@ -20,16 +20,14 @@
 // ---------------------------------------------------------------------------
 class Bloom {
 public:
-    Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
-          uint32_t width, uint32_t height);
+    Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width, uint32_t height);
 
     ~Bloom();
 
     // Execute the bloom post-processing pipeline.
     // sceneTexture: the resolved MSAA scene color
     // outputTexture: the final display texture (BGRA8, e.g. the drawable)
-    void renderBloom(id<MTLCommandBuffer> commandBuffer,
-                     id<MTLTexture> sceneTexture,
+    void renderBloom(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture,
                      id<MTLTexture> outputTexture);
 
     // Reallocate textures for new resolution.
@@ -72,20 +70,15 @@ private:
     void allocateBlurPyramid();
 
     // ---- Render pass helpers ----
-    void renderExtractPass(id<MTLCommandBuffer> commandBuffer,
-                           id<MTLTexture> sceneTexture);
+    void renderExtractPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture);
 
-    void renderBlurPass(id<MTLCommandBuffer> commandBuffer,
-                        id<MTLTexture> source,
-                        id<MTLTexture> destination,
-                        float blurRadius);
+    void renderBlurPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> source,
+                        id<MTLTexture> destination, float blurRadius);
 
-    void renderCompositePass(id<MTLCommandBuffer> commandBuffer,
-                             id<MTLTexture> sceneTexture,
-                             id<MTLTexture> bloomTexture,
-                             id<MTLTexture> outputTexture);
+    void renderCompositePass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture,
+                             id<MTLTexture> bloomTexture, id<MTLTexture> outputTexture);
 
     // Upload bloom uniforms
-    void uploadUniforms(float resolution[2], float texelSize[2],
-                        float threshold, float intensity, float blurRadius);
+    void uploadUniforms(float resolution[2], float texelSize[2], float threshold, float intensity,
+                        float blurRadius);
 };

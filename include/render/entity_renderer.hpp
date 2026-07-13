@@ -22,8 +22,7 @@ public:
     EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrary);
 
     // Draw every visible entity. `isVisible` is the caller's frustum test.
-    void render(id<MTLRenderCommandEncoder> encoder,
-                id<MTLBuffer> uniformsBuffer,
+    void render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
                 const std::vector<std::shared_ptr<Entity>>& entities,
                 const std::function<bool(const AABB&)>& isVisible);
 
@@ -34,8 +33,8 @@ private:
         uint32_t indexCount = 0;
     };
 
-    static constexpr int TYPE_COUNT = 4;  // SHEEP, COW, PIG, CHICKEN
-    Mesh _meshes[TYPE_COUNT][2];          // [type][adult=0 / baby=1]
+    static constexpr int TYPE_COUNT = 4; // SHEEP, COW, PIG, CHICKEN
+    Mesh _meshes[TYPE_COUNT][2];         // [type][adult=0 / baby=1]
 
     id<MTLRenderPipelineState> _pipelineState;
 

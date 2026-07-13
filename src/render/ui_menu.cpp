@@ -14,25 +14,25 @@ namespace {
 
 // Shared building blocks, all sized against a 768-pt-tall reference window.
 struct LayoutContext {
-    float w, h;      // window size in points
-    float s;         // reference scale: 1.0 at 768-pt-tall
+    float w, h; // window size in points
+    float s;    // reference scale: 1.0 at 768-pt-tall
 
-    float px(float v) const { return v * s / w; }  // ref-pixels → normalized X
-    float py(float v) const { return v * s / h; }  // ref-pixels → normalized Y
+    float px(float v) const { return v * s / w; } // ref-pixels → normalized X
+    float py(float v) const { return v * s / h; } // ref-pixels → normalized Y
 };
 
 void addCenteredText(MenuLayout& layout, const LayoutContext& ctx, const std::string& text,
                      float centerY, float scale, float r = 1.f, float g = 1.f, float b = 1.f) {
     float width = menuTextWidth(text, scale * ctx.s, ctx.w);
     layout.texts.push_back(MenuText{0.5f - width * 0.5f,
-                                    centerY - ctx.py(FONT_HEIGHT * scale) * 0.5f,
-                                    scale * ctx.s, text, r, g, b});
+                                    centerY - ctx.py(FONT_HEIGHT * scale) * 0.5f, scale * ctx.s,
+                                    text, r, g, b});
 }
 
 void addButton(MenuLayout& layout, const LayoutContext& ctx, const std::string& label,
                MenuAction action, float centerX, float centerY, float refW, float refH) {
-    UIRect rect{centerX - ctx.px(refW) * 0.5f, centerY - ctx.py(refH) * 0.5f,
-                ctx.px(refW), ctx.py(refH)};
+    UIRect rect{centerX - ctx.px(refW) * 0.5f, centerY - ctx.py(refH) * 0.5f, ctx.px(refW),
+                ctx.py(refH)};
     layout.buttons.push_back(MenuButton{rect, label, action});
 }
 
@@ -73,7 +73,8 @@ MenuLayout buildPauseLayout(const LayoutContext& ctx) {
     addCenteredText(layout, ctx, "PAUSED", 0.5f + ctx.py(120.f), 3.0f);
 
     addButton(layout, ctx, "RESUME", MenuAction::RESUME, 0.5f, 0.5f + ctx.py(40.f), 320.f, 44.f);
-    addButton(layout, ctx, "SETTINGS", MenuAction::OPEN_SETTINGS, 0.5f, 0.5f - ctx.py(24.f), 320.f, 44.f);
+    addButton(layout, ctx, "SETTINGS", MenuAction::OPEN_SETTINGS, 0.5f, 0.5f - ctx.py(24.f), 320.f,
+              44.f);
     addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, 0.5f - ctx.py(88.f), 320.f, 44.f);
     return layout;
 }
@@ -88,15 +89,15 @@ MenuLayout buildSettingsLayout(const LayoutContext& ctx, const SettingsValues& v
     addSettingsRow(layout, ctx, "RENDER DIST", std::to_string(values.viewDistance),
                    MenuAction::VIEW_DISTANCE_DOWN, MenuAction::VIEW_DISTANCE_UP,
                    0.5f + ctx.py(84.f));
-    addSettingsRow(layout, ctx, "FOG", std::to_string(values.fogLevel),
-                   MenuAction::FOG_DOWN, MenuAction::FOG_UP, 0.5f + ctx.py(28.f));
+    addSettingsRow(layout, ctx, "FOG", std::to_string(values.fogLevel), MenuAction::FOG_DOWN,
+                   MenuAction::FOG_UP, 0.5f + ctx.py(28.f));
     addSettingsRow(layout, ctx, "SENSITIVITY", std::to_string(values.sensitivityLevel),
-                   MenuAction::SENSITIVITY_DOWN, MenuAction::SENSITIVITY_UP,
-                   0.5f - ctx.py(28.f));
+                   MenuAction::SENSITIVITY_DOWN, MenuAction::SENSITIVITY_UP, 0.5f - ctx.py(28.f));
     addSettingsRow(layout, ctx, "VOLUME", std::to_string(values.volumeLevel),
                    MenuAction::VOLUME_DOWN, MenuAction::VOLUME_UP, 0.5f - ctx.py(84.f));
 
-    addButton(layout, ctx, "BACK", MenuAction::CLOSE_SETTINGS, 0.5f, 0.5f - ctx.py(160.f), 320.f, 44.f);
+    addButton(layout, ctx, "BACK", MenuAction::CLOSE_SETTINGS, 0.5f, 0.5f - ctx.py(160.f), 320.f,
+              44.f);
     return layout;
 }
 

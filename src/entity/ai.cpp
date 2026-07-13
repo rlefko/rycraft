@@ -28,12 +28,24 @@ StateMachine::StateMachine() {}
 void StateMachine::transitionTo(AnimalState newState) {
     // Exit current state
     switch (currentState) {
-    case AnimalState::IDLE: onExitIdle(); break;
-    case AnimalState::WANDER: onExitWander(); break;
-    case AnimalState::FLEE: onExitFlee(); break;
-    case AnimalState::EAT: onExitEat(); break;
-    case AnimalState::BREED: onExitBreed(); break;
-    case AnimalState::FOLLOW_PLAYER: onExitFollowPlayer(); break;
+        case AnimalState::IDLE:
+            onExitIdle();
+            break;
+        case AnimalState::WANDER:
+            onExitWander();
+            break;
+        case AnimalState::FLEE:
+            onExitFlee();
+            break;
+        case AnimalState::EAT:
+            onExitEat();
+            break;
+        case AnimalState::BREED:
+            onExitBreed();
+            break;
+        case AnimalState::FOLLOW_PLAYER:
+            onExitFollowPlayer();
+            break;
     }
 
     currentState = newState;
@@ -41,12 +53,24 @@ void StateMachine::transitionTo(AnimalState newState) {
 
     // Enter new state
     switch (currentState) {
-    case AnimalState::IDLE: onEnterIdle(); break;
-    case AnimalState::WANDER: onEnterWander(); break;
-    case AnimalState::FLEE: onEnterFlee(); break;
-    case AnimalState::EAT: onEnterEat(); break;
-    case AnimalState::BREED: onEnterBreed(); break;
-    case AnimalState::FOLLOW_PLAYER: onEnterFollowPlayer(); break;
+        case AnimalState::IDLE:
+            onEnterIdle();
+            break;
+        case AnimalState::WANDER:
+            onEnterWander();
+            break;
+        case AnimalState::FLEE:
+            onEnterFlee();
+            break;
+        case AnimalState::EAT:
+            onEnterEat();
+            break;
+        case AnimalState::BREED:
+            onEnterBreed();
+            break;
+        case AnimalState::FOLLOW_PLAYER:
+            onEnterFollowPlayer();
+            break;
     }
 }
 
@@ -89,16 +113,16 @@ void StateMachine::onExitFollowPlayer() {}
 // ---------------------------------------------------------------------------
 // Condition checks (pure functions)
 // ---------------------------------------------------------------------------
-bool StateMachine::shouldFlee(const Vec3& entityPos, const Vec3& playerPos,
-                               bool playerMovingToward, float fleeDistance) {
+bool StateMachine::shouldFlee(const Vec3& entityPos, const Vec3& playerPos, bool playerMovingToward,
+                              float fleeDistance) {
     if (!playerMovingToward) return false;
     Vec3 diff = playerPos - entityPos;
     float distSq = diff.x * diff.x + diff.z * diff.z; // horizontal only
     return distSq <= fleeDistance * fleeDistance;
 }
 
-bool StateMachine::shouldStopFleeing(const Vec3& entityPos, const Vec3& playerPos,
-                                      int fleeTicks, float safeDistance, int maxFleeTicks) {
+bool StateMachine::shouldStopFleeing(const Vec3& entityPos, const Vec3& playerPos, int fleeTicks,
+                                     float safeDistance, int maxFleeTicks) {
     Vec3 diff = playerPos - entityPos;
     float distSq = diff.x * diff.x + diff.z * diff.z;
     return distSq > safeDistance * safeDistance || fleeTicks >= maxFleeTicks;
@@ -123,7 +147,7 @@ bool StateMachine::shouldStopWandering(int wanderTicks, int maxWander) {
 }
 
 bool StateMachine::shouldFollowPlayer(const Vec3& entityPos, const Vec3& playerPos,
-                                       bool playerHoldingFood, float followDistance) {
+                                      bool playerHoldingFood, float followDistance) {
     if (!playerHoldingFood) return false;
     Vec3 diff = playerPos - entityPos;
     float distSq = diff.x * diff.x + diff.z * diff.z;
@@ -131,7 +155,7 @@ bool StateMachine::shouldFollowPlayer(const Vec3& entityPos, const Vec3& playerP
 }
 
 bool StateMachine::shouldStopFollowing(const Vec3& entityPos, const Vec3& playerPos,
-                                        bool playerHoldingFood, float stopDistance) {
+                                       bool playerHoldingFood, float stopDistance) {
     if (!playerHoldingFood) return true;
     Vec3 diff = playerPos - entityPos;
     float distSq = diff.x * diff.x + diff.z * diff.z;
@@ -141,10 +165,8 @@ bool StateMachine::shouldStopFollowing(const Vec3& entityPos, const Vec3& player
 // ---------------------------------------------------------------------------
 // StateMachine::update — Main state machine evaluation
 // ---------------------------------------------------------------------------
-Vec3 StateMachine::update(Entity& entity, World& world,
-                            const Vec3& playerPosition, bool playerMovingToward,
-                            bool playerHoldingFood,
-                            Spawner& spawner) {
+Vec3 StateMachine::update(Entity& entity, World& world, const Vec3& playerPosition,
+                          bool playerMovingToward, bool playerHoldingFood, Spawner& spawner) {
     stateTimer++;
     idleTimer++;
 
@@ -185,8 +207,7 @@ Vec3 StateMachine::update(Entity& entity, World& world,
     }
 
     // Priority 2: FOLLOW_PLAYER (when player holds food)
-    if (currentState != AnimalState::FOLLOW_PLAYER &&
-        currentState != AnimalState::EAT &&
+    if (currentState != AnimalState::FOLLOW_PLAYER && currentState != AnimalState::EAT &&
         shouldFollowPlayer(entity.position, playerPosition, playerHoldingFood)) {
         transitionTo(AnimalState::FOLLOW_PLAYER);
     }
@@ -202,8 +223,7 @@ Vec3 StateMachine::update(Entity& entity, World& world,
     }
 
     // Priority 3: EAT (when hungry and on grass)
-    if (currentState != AnimalState::EAT &&
-        shouldEat(entity.hungerTimer) &&
+    if (currentState != AnimalState::EAT && shouldEat(entity.hungerTimer) &&
         BehaviorController::isOnGrass(entity, world)) {
         transitionTo(AnimalState::EAT);
     }
@@ -220,8 +240,7 @@ Vec3 StateMachine::update(Entity& entity, World& world,
     }
 
     // Priority 4: BREED (when mate nearby and both fed)
-    if (currentState != AnimalState::BREED &&
-        currentState != AnimalState::EAT &&
+    if (currentState != AnimalState::BREED && currentState != AnimalState::EAT &&
         BehaviorController::canBreed(entity, spawner)) {
         transitionTo(AnimalState::BREED);
     }
@@ -241,11 +260,8 @@ Vec3 StateMachine::update(Entity& entity, World& world,
         // Set wander target
         float angle = entityRandom(entity.id + stateTimer) * 2.f * 3.14159f;
         float distance = 8.f + entityRandom(entity.id + stateTimer + 1) * 4.f;
-        targetPosition = {
-            entity.position.x + std::cos(angle) * distance,
-            entity.position.y,
-            entity.position.z + std::sin(angle) * distance
-        };
+        targetPosition = {entity.position.x + std::cos(angle) * distance, entity.position.y,
+                          entity.position.z + std::sin(angle) * distance};
     }
 
     if (currentState == AnimalState::IDLE) {
@@ -287,10 +303,8 @@ Vec3 FlockingController::computeSteering(Entity& entity, Spawner& spawner) {
     auto neighborIds = spatialHash.query(entity.position, COHESION_RADIUS, entityPositions);
 
     // Remove self from neighbors
-    neighborIds.erase(
-        std::remove(neighborIds.begin(), neighborIds.end(), entity.id),
-        neighborIds.end()
-    );
+    neighborIds.erase(std::remove(neighborIds.begin(), neighborIds.end(), entity.id),
+                      neighborIds.end());
 
     if (neighborIds.empty()) return Vec3::zero();
 
@@ -298,16 +312,14 @@ Vec3 FlockingController::computeSteering(Entity& entity, Spawner& spawner) {
     Vec3 alignment = computeAlignment(entity, neighborIds, spawner);
     Vec3 cohesion = computeCohesion(entity, neighborIds, spawner);
 
-    Vec3 total = separation * SEPARATION_WEIGHT +
-                 alignment * ALIGNMENT_WEIGHT +
-                 cohesion * COHESION_WEIGHT;
+    Vec3 total =
+        separation * SEPARATION_WEIGHT + alignment * ALIGNMENT_WEIGHT + cohesion * COHESION_WEIGHT;
 
     return clampForce(total, MAX_FLOCKING_FORCE);
 }
 
-Vec3 FlockingController::computeSeparation(Entity& entity,
-                                             const std::vector<uint64_t>& neighborIds,
-                                             Spawner& spawner) {
+Vec3 FlockingController::computeSeparation(Entity& entity, const std::vector<uint64_t>& neighborIds,
+                                           Spawner& spawner) {
     Vec3 steer = Vec3::zero();
     int count = 0;
 
@@ -334,9 +346,8 @@ Vec3 FlockingController::computeSeparation(Entity& entity,
     return steer;
 }
 
-Vec3 FlockingController::computeAlignment(Entity& entity,
-                                            const std::vector<uint64_t>& neighborIds,
-                                            Spawner& spawner) {
+Vec3 FlockingController::computeAlignment(Entity& entity, const std::vector<uint64_t>& neighborIds,
+                                          Spawner& spawner) {
     Vec3 avgVel = Vec3::zero();
     int count = 0;
 
@@ -362,9 +373,8 @@ Vec3 FlockingController::computeAlignment(Entity& entity,
     return avgVel - entity.velocity * 0.1f;
 }
 
-Vec3 FlockingController::computeCohesion(Entity& entity,
-                                           const std::vector<uint64_t>& neighborIds,
-                                           Spawner& spawner) {
+Vec3 FlockingController::computeCohesion(Entity& entity, const std::vector<uint64_t>& neighborIds,
+                                         Spawner& spawner) {
     Vec3 center = Vec3::zero();
     int count = 0;
 
@@ -403,8 +413,8 @@ Vec3 FlockingController::clampForce(const Vec3& force, float maxForce) {
 // ---------------------------------------------------------------------------
 // EdgeDetector
 // ---------------------------------------------------------------------------
-bool EdgeDetector::isSafeToMove(const Vec3& entityPos, const Vec3& direction,
-                                 EntityType entityType, World& world) {
+bool EdgeDetector::isSafeToMove(const Vec3& entityPos, const Vec3& direction, EntityType entityType,
+                                World& world) {
     // Pigs are okay with water
     if (entityType != EntityType::PIG && isWaterAhead(entityPos, direction, world)) {
         return false;
@@ -492,7 +502,7 @@ std::optional<uint64_t> BehaviorController::doBreed(Entity& entity, Spawner& spa
 }
 
 Vec3 BehaviorController::computeFollowSteering(const Vec3& entityPos, const Vec3& playerPos,
-                                                float minDistance, float maxDistance) {
+                                               float minDistance, float maxDistance) {
     Vec3 toPlayer = playerPos - entityPos;
     toPlayer.y = 0.f;
     float dist = std::sqrt(toPlayer.x * toPlayer.x + toPlayer.z * toPlayer.z);

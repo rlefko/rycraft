@@ -1,42 +1,42 @@
 #include "test_helpers.hpp"
 
-#include <catch2/catch_test_macros.hpp>
+#include <audio/audio_engine.hpp>
+#include <audio/sfx.hpp>
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
 #include <common/math.hpp>
-#include <common/thread_pool.hpp>
 #include <common/random.hpp>
+#include <common/thread_pool.hpp>
+#include <engine/game_state.hpp>
+#include <engine/hotbar.hpp>
+#include <engine/input_bindings.hpp>
+#include <entity/ai.hpp>
+#include <entity/entity.hpp>
+#include <entity/physics.hpp>
+#include <entity/player.hpp>
+#include <entity/spatial_hash.hpp>
+#include <entity/spawner.hpp>
+#include <entity/voxel_traversal.hpp>
+#include <render/block_texture_array.hpp>
+#include <render/block_textures.hpp>
+#include <render/lod_mesher.hpp>
+#include <render/mega_buffer.hpp>
+#include <render/shader_types.hpp>
+#include <render/ui_menu.hpp>
+#include <render/ui_overlay.hpp>
+#include <render/vertex.hpp>
+#include <world/biome.hpp>
 #include <world/chunk.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/noise.hpp>
-#include <world/terrain.hpp>
-#include <world/biome.hpp>
-#include <world/world.hpp>
-#include <world/serialization.hpp>
 #include <world/save_manager.hpp>
-#include <render/vertex.hpp>
-#include <render/lod_mesher.hpp>
-#include <render/block_textures.hpp>
-#include <render/block_texture_array.hpp>
-#include <render/mega_buffer.hpp>
-#include <render/ui_overlay.hpp>
-#include <render/shader_types.hpp>
-#include <entity/physics.hpp>
-#include <entity/player.hpp>
-#include <entity/voxel_traversal.hpp>
-#include <entity/entity.hpp>
-#include <entity/ai.hpp>
-#include <entity/spatial_hash.hpp>
-#include <entity/spawner.hpp>
-#include <engine/hotbar.hpp>
-#include <engine/input_bindings.hpp>
-#include <engine/game_state.hpp>
-#include <render/ui_menu.hpp>
-#include <audio/sfx.hpp>
-#include <audio/audio_engine.hpp>
+#include <world/serialization.hpp>
+#include <world/terrain.hpp>
+#include <world/world.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <thread>
-#include <chrono>
 
 // ============================================================================
 // Vec3 Tests
@@ -44,7 +44,6 @@
 // ===========================================================================
 // Rendering: meshing, textures, shared GPU layouts
 // ===========================================================================
-
 
 // ============================================================================
 // Vertex Format Tests
@@ -165,23 +164,18 @@ TEST_CASE("Mesher: vertical column merges side faces", "[render][mesher]") {
     for (size_t i = 0; i + 3 < output.vertices.size(); ++i) {
         uint8_t ni = static_cast<uint8_t>(unpackFace(output.vertices[i].faceAttr));
         // Check side faces (face indices 0-3)
-        if (ni <= 3 &&
-            static_cast<uint8_t>(unpackFace(output.vertices[i + 1].faceAttr)) == ni &&
+        if (ni <= 3 && static_cast<uint8_t>(unpackFace(output.vertices[i + 1].faceAttr)) == ni &&
             static_cast<uint8_t>(unpackFace(output.vertices[i + 2].faceAttr)) == ni &&
             static_cast<uint8_t>(unpackFace(output.vertices[i + 3].faceAttr)) == ni) {
             // Check that the quad spans 4 units in Y
-            float minY = std::min({
-                static_cast<float>(output.vertices[i].py),
-                static_cast<float>(output.vertices[i + 1].py),
-                static_cast<float>(output.vertices[i + 2].py),
-                static_cast<float>(output.vertices[i + 3].py)
-            });
-            float maxY = std::max({
-                static_cast<float>(output.vertices[i].py),
-                static_cast<float>(output.vertices[i + 1].py),
-                static_cast<float>(output.vertices[i + 2].py),
-                static_cast<float>(output.vertices[i + 3].py)
-            });
+            float minY = std::min({static_cast<float>(output.vertices[i].py),
+                                   static_cast<float>(output.vertices[i + 1].py),
+                                   static_cast<float>(output.vertices[i + 2].py),
+                                   static_cast<float>(output.vertices[i + 3].py)});
+            float maxY = std::max({static_cast<float>(output.vertices[i].py),
+                                   static_cast<float>(output.vertices[i + 1].py),
+                                   static_cast<float>(output.vertices[i + 2].py),
+                                   static_cast<float>(output.vertices[i + 3].py)});
             if (maxY - minY >= 3.5f) { // height=4, account for float16 precision
                 foundSideQuad = true;
                 break;
@@ -218,8 +212,7 @@ TEST_CASE("Mesher: produces mesh without side effects", "[render][mesher]") {
 TEST_CASE("Block textures: every block type maps to a valid layer", "[render][textures]") {
     for (int t = 0; t < static_cast<int>(BlockType::COUNT); ++t) {
         for (int f = 0; f < 6; ++f) {
-            uint8_t layer = textureLayerFor(static_cast<BlockType>(t),
-                                            static_cast<FaceNormal>(f));
+            uint8_t layer = textureLayerFor(static_cast<BlockType>(t), static_cast<FaceNormal>(f));
             REQUIRE(layer < TEXTURE_LAYER_COUNT);
         }
     }
@@ -236,8 +229,8 @@ TEST_CASE("Block textures: grass uses per-face layers", "[render][textures]") {
 
 TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][textures]") {
     for (int f = 0; f < 6; ++f) {
-        for (uint8_t layer : {uint8_t{0}, uint8_t{7}, TEXTURE_LAYER_GRASS_SIDE,
-                              TEXTURE_LAYER_WHITE}) {
+        for (uint8_t layer :
+             {uint8_t{0}, uint8_t{7}, TEXTURE_LAYER_GRASS_SIDE, TEXTURE_LAYER_WHITE}) {
             for (uint8_t light : {uint8_t{0}, uint8_t{4}, uint8_t{15}}) {
                 uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer, light);
                 REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
@@ -260,7 +253,8 @@ TEST_CASE("Mesher: faces under cover carry reduced skylight", "[render][mesher]"
     bool foundShadedTop = false;
     bool foundLitCanopyTop = false;
     for (const Vertex& v : output.vertices) {
-        if (unpackFace(v.faceAttr) != FaceNormal::PLUS_Y) continue;
+        if (unpackFace(v.faceAttr) != FaceNormal::PLUS_Y)
+            continue;
         float y = static_cast<float>(v.py);
         if (y > 64.5f && y < 65.5f) {
             // The ground's top face sits under the canopy → shaded
@@ -329,7 +323,6 @@ TEST_CASE("MegaBuffer vertex allocation size calculation", "[render][megabuffer]
 
 // ---- Day/Night Cycle Tests (Task 6.4-6.5) ----
 
-
 TEST_CASE("Day/night cycle: sun position at noon", "[phase6][daynight]") {
     // At noon: worldTime = 6000 (25% of 24000)
     // orbitalAngle = 0.25 * 2*PI = PI/2
@@ -337,7 +330,8 @@ TEST_CASE("Day/night cycle: sun position at noon", "[phase6][daynight]") {
     uint64_t worldTime = 6000;
     static constexpr uint64_t TICKS_PER_DAY = 24000;
 
-    float dayFraction = static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
+    float dayFraction =
+        static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
     float orbitalAngle = dayFraction * 2.0f * static_cast<float>(M_PI);
 
     float sunX = std::cos(orbitalAngle);
@@ -355,7 +349,8 @@ TEST_CASE("Day/night cycle: sun position at sunset", "[phase6][daynight]") {
     uint64_t worldTime = 12000;
     static constexpr uint64_t TICKS_PER_DAY = 24000;
 
-    float dayFraction = static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
+    float dayFraction =
+        static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
     float orbitalAngle = dayFraction * 2.0f * static_cast<float>(M_PI);
 
     float sunX = std::cos(orbitalAngle);
@@ -372,7 +367,8 @@ TEST_CASE("Day/night cycle: sun position at midnight", "[phase6][daynight]") {
     uint64_t worldTime = 18000;
     static constexpr uint64_t TICKS_PER_DAY = 24000;
 
-    float dayFraction = static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
+    float dayFraction =
+        static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
     float orbitalAngle = dayFraction * 2.0f * static_cast<float>(M_PI);
 
     float sunX = std::cos(orbitalAngle);
@@ -389,7 +385,8 @@ TEST_CASE("Day/night cycle: sun position at dawn", "[phase6][daynight]") {
     uint64_t worldTime = 0;
     static constexpr uint64_t TICKS_PER_DAY = 24000;
 
-    float dayFraction = static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
+    float dayFraction =
+        static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
     float orbitalAngle = dayFraction * 2.0f * static_cast<float>(M_PI);
 
     float sunX = std::cos(orbitalAngle);
@@ -404,7 +401,8 @@ TEST_CASE("Day/night cycle: world time wraps at day boundary", "[phase6][daynigh
 
     // worldTime = 48000 (2 days) should wrap to same position as 0
     uint64_t worldTime = 48000;
-    float dayFraction = static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
+    float dayFraction =
+        static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
     REQUIRE(dayFraction == Catch::Approx(0.f).margin(0.001f));
 }
 
@@ -412,7 +410,8 @@ TEST_CASE("Day/night cycle: sun elevation drives ambient brightness", "[phase6][
     // Test that sun elevation at noon produces higher ambient than at midnight
     auto computeAmbient = [](uint64_t worldTime) -> float {
         static constexpr uint64_t TICKS_PER_DAY = 24000;
-        float dayFraction = static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
+        float dayFraction =
+            static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
         float orbitalAngle = dayFraction * 2.0f * static_cast<float>(M_PI);
         float sunElevation = std::sin(orbitalAngle);
 
@@ -436,7 +435,6 @@ TEST_CASE("Day/night cycle: sun elevation drives ambient brightness", "[phase6][
 // ============================================================================
 
 // ---- Bloom Tests ----
-
 
 TEST_CASE("Bloom: ACES tone mapping formula", "[phase8][bloom]") {
     // ACES: color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14)
@@ -467,8 +465,10 @@ TEST_CASE("Bloom: extract threshold — bright pixels pass, dark pixels blocked"
     auto softThreshold = [](float luminance, float threshold) -> float {
         float low = threshold - 0.5f;
         float high = threshold + 0.5f;
-        if (luminance <= low) return 0.0f;
-        if (luminance >= high) return 1.0f;
+        if (luminance <= low)
+            return 0.0f;
+        if (luminance >= high)
+            return 1.0f;
         return (luminance - low) / (high - low);
     };
 
@@ -487,9 +487,7 @@ TEST_CASE("Bloom: extract threshold — bright pixels pass, dark pixels blocked"
 
 TEST_CASE("Bloom: blur kernel weights are positive and symmetric", "[phase8][bloom]") {
     // 8-tap Kawase blur weights (normalized in shader by dividing by sum)
-    float weights[8] = {
-        0.0625f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.0625f
-    };
+    float weights[8] = {0.0625f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.0625f};
 
     // All weights are positive
     for (int i = 0; i < 8; ++i) {
@@ -511,9 +509,7 @@ TEST_CASE("Bloom: blur kernel weights are positive and symmetric", "[phase8][blo
 }
 
 TEST_CASE("Bloom: blur kernel is symmetric", "[phase8][bloom]") {
-    float weights[8] = {
-        0.0625f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.0625f
-    };
+    float weights[8] = {0.0625f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.125f, 0.0625f};
 
     // First and last should match
     REQUIRE(weights[0] == weights[7]);
@@ -524,7 +520,6 @@ TEST_CASE("Bloom: blur kernel is symmetric", "[phase8][bloom]") {
 }
 
 // ---- Fog Tests ----
-
 
 TEST_CASE("Fog: exponential fog factor at various distances", "[phase8][fog]") {
     float density = 0.0003f;
@@ -556,7 +551,9 @@ TEST_CASE("Fog: exponential fog factor at various distances", "[phase8][fog]") {
 }
 
 TEST_CASE("Fog: fog color mixing", "[phase8][fog]") {
-    struct F3 { float x, y, z; };
+    struct F3 {
+        float x, y, z;
+    };
 
     auto mixFog = [](float fogFactor, F3 fogColor, F3 litColor) -> F3 {
         // fogFactor: 0 = fully fogged, 1 = fully lit
@@ -586,7 +583,6 @@ TEST_CASE("Fog: fog color mixing", "[phase8][fog]") {
 
 // ---- Cloud Tests ----
 
-
 TEST_CASE("Clouds: noise threshold for cloud generation", "[phase8][clouds]") {
     // Cloud threshold: 0.4 — noise values above this render as clouds
     float threshold = 0.4f;
@@ -594,8 +590,10 @@ TEST_CASE("Clouds: noise threshold for cloud generation", "[phase8][clouds]") {
     auto cloudMask = [](float noise, float threshold) -> float {
         float low = threshold - 0.1f;
         float high = threshold + 0.1f;
-        if (noise <= low) return 0.0f;
-        if (noise >= high) return 1.0f;
+        if (noise <= low)
+            return 0.0f;
+        if (noise >= high)
+            return 1.0f;
         return (noise - low) / (high - low);
     };
 
@@ -642,7 +640,6 @@ TEST_CASE("Clouds: cloud altitude constant", "[phase8][clouds]") {
 // types have the same layout in each. These pins catch accidental drift
 // (reordered fields, ad-hoc padding) that previously corrupted fog, camera
 // position, sky colors, and particle data.
-
 
 TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]") {
     REQUIRE(sizeof(Uniforms) == 288);

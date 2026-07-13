@@ -1,7 +1,7 @@
 #pragma once
 
-#include <vector>
 #include <cstdint>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // SoundEffect — Procedural sound effect generation.
@@ -45,13 +45,12 @@ private:
     static float sinOscillator(uint32_t index, uint32_t sampleRate, float frequency);
 
     // Frequency sweep (linear interpolation)
-    static float frequencySweep(uint32_t index, uint32_t sampleRate,
-                                float startFreq, float endFreq, uint32_t totalSamples);
+    static float frequencySweep(uint32_t index, uint32_t sampleRate, float startFreq, float endFreq,
+                                uint32_t totalSamples);
 
     // Envelope: attack-decay-sustain-release
-    static float adsrEnvelope(uint32_t index, uint32_t totalSamples,
-                              float attackTime, float decayTime,
-                              float sustainLevel, float releaseTime);
+    static float adsrEnvelope(uint32_t index, uint32_t totalSamples, float attackTime,
+                              float decayTime, float sustainLevel, float releaseTime);
 
     // Low-pass filter (simple one-pole)
     static float lowPassFilter(float sample, float* state, float cutoff, uint32_t sampleRate);

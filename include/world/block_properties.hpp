@@ -42,12 +42,12 @@ constexpr bool isSolid(BlockType type) {
 // and glass are alpha-cutout textures (their transparent texels are
 // discarded in the fragment shader), so the faces behind them must render.
 constexpr bool isOpaque(BlockType type) {
-    return type != BlockType::AIR && type != BlockType::WATER &&
-           type != BlockType::LEAVES && type != BlockType::GLASS;
+    return type != BlockType::AIR && type != BlockType::WATER && type != BlockType::LEAVES &&
+           type != BlockType::GLASS;
 }
 
 // Light/visibility: blocks you can (partially) see through.
 constexpr bool isTransparent(BlockType type) {
-    return type == BlockType::AIR || type == BlockType::WATER ||
-           type == BlockType::LEAVES || type == BlockType::GLASS;
+    return type == BlockType::AIR || type == BlockType::WATER || type == BlockType::LEAVES ||
+           type == BlockType::GLASS;
 }

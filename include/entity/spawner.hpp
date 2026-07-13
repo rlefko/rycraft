@@ -1,13 +1,13 @@
 #pragma once
 
-#include <entity/entity.hpp>
 #include <entity/ai.hpp>
+#include <entity/entity.hpp>
 #include <entity/spatial_hash.hpp>
-#include <world/world.hpp>
 #include <world/biome.hpp>
+#include <world/world.hpp>
 
-#include <memory>
 #include "common/random.hpp"
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -50,8 +50,7 @@ public:
     void removeEntity(uint64_t entityId);
 
     // Spawn a baby entity (called from breed behavior)
-    std::shared_ptr<Entity> spawnBaby(EntityType type, const Vec3& position,
-                                      uint64_t parentId);
+    std::shared_ptr<Entity> spawnBaby(EntityType type, const Vec3& position, uint64_t parentId);
 
     // Get spatial hash for neighbor queries
     SpatialHash& getSpatialHash();

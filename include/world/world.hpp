@@ -1,23 +1,23 @@
 #pragma once
+#include "common/thread_pool.hpp"
+#include "world/biome.hpp"
+#include "world/caves.hpp"
 #include "world/chunk.hpp"
 #include "world/chunk_pos.hpp"
-#include "world/terrain.hpp"
-#include "world/biome.hpp"
-#include "world/surface.hpp"
-#include "world/caves.hpp"
-#include "world/ores.hpp"
-#include "world/trees.hpp"
-#include "world/structures.hpp"
 #include "world/noise.hpp"
-#include "common/thread_pool.hpp"
+#include "world/ores.hpp"
+#include "world/structures.hpp"
+#include "world/surface.hpp"
+#include "world/terrain.hpp"
+#include "world/trees.hpp"
 
-#include <unordered_map>
-#include <mutex>
-#include <memory>
-#include <optional>
-#include <vector>
 #include <cstdint>
 #include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
 
 class SaveManager;
 
@@ -107,7 +107,7 @@ private:
     bool hasPlayerChunk_ = false;
 
     // Async generation state
-    std::shared_ptr<ThreadPool> genPool_;  // lazily initialized
+    std::shared_ptr<ThreadPool> genPool_; // lazily initialized
     std::unordered_map<ChunkPos, std::future<void>> pendingGenerations_;
     mutable std::mutex pendingMutex_;
 

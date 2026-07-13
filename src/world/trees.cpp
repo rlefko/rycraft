@@ -9,10 +9,7 @@ uint32_t TreeGenerator::treeRand(uint32_t& state) {
     return (state >> 16) & 0x7fff;
 }
 
-TreeGenerator::TreeGenerator(uint32_t seed)
-    : treeDensity_(seed)
-{
-}
+TreeGenerator::TreeGenerator(uint32_t seed) : treeDensity_(seed) {}
 
 bool TreeGenerator::canPlaceTree(Chunk& chunk, int localX, int localY, int localZ) const {
     // Must be on GRASS block
@@ -49,7 +46,7 @@ void TreeGenerator::generateOak(Chunk& chunk, int localX, int localY, int localZ
 
     // Place leaves in sphere around top of trunk
     int leafCenterY = localY + trunkHeight + 1;
-    int leafRadius = 2 + (treeRand(state) % 2);  // Radius 2-3
+    int leafRadius = 2 + (treeRand(state) % 2); // Radius 2-3
 
     for (int dx = -leafRadius; dx <= leafRadius; ++dx) {
         for (int dy = -leafRadius; dy <= leafRadius; ++dy) {
@@ -120,7 +117,8 @@ void TreeGenerator::generatePine(Chunk& chunk, int localX, int localY, int local
     }
 }
 
-void TreeGenerator::generate(Chunk& chunk, const std::array<Biome, CHUNK_WIDTH * CHUNK_DEPTH>& biomes) const {
+void TreeGenerator::generate(Chunk& chunk,
+                             const std::array<Biome, CHUNK_WIDTH * CHUNK_DEPTH>& biomes) const {
     int worldBaseX = chunk.chunkX * CHUNK_WIDTH;
     int worldBaseZ = chunk.chunkZ * CHUNK_DEPTH;
 
@@ -132,20 +130,28 @@ void TreeGenerator::generate(Chunk& chunk, const std::array<Biome, CHUNK_WIDTH *
             // Determine tree density based on biome
             double density;
             switch (biome) {
-                case Biome::FOREST:       density = 0.15; break;
-                case Biome::PLAINS:       density = 0.03; break;
-                case Biome::TAIGA:        density = 0.12; break;
-                case Biome::SWAMP:        density = 0.05; break;
-                default:                  density = 0.0;  break;  // Desert, Ocean, etc.
+                case Biome::FOREST:
+                    density = 0.15;
+                    break;
+                case Biome::PLAINS:
+                    density = 0.03;
+                    break;
+                case Biome::TAIGA:
+                    density = 0.12;
+                    break;
+                case Biome::SWAMP:
+                    density = 0.05;
+                    break;
+                default:
+                    density = 0.0;
+                    break; // Desert, Ocean, etc.
             }
 
             if (density <= 0.0) continue;
 
             // Use noise to determine if a tree spawns at this position
-            double noiseVal = treeDensity_.noise2D(
-                static_cast<double>(worldBaseX + x) * 0.5,
-                static_cast<double>(worldBaseZ + z) * 0.5
-            );
+            double noiseVal = treeDensity_.noise2D(static_cast<double>(worldBaseX + x) * 0.5,
+                                                   static_cast<double>(worldBaseZ + z) * 0.5);
             // Map from [-1, 1] to [0, 1]
             double spawnChance = (noiseVal + 1.0) * 0.5;
 

@@ -1,8 +1,8 @@
 #pragma once
 
-#include <vector>
-#include <cstdint>
 #include "render/vertex.hpp"
+#include <cstdint>
+#include <vector>
 
 // Forward declaration
 struct Chunk;

@@ -1,42 +1,42 @@
 #include "test_helpers.hpp"
 
-#include <catch2/catch_test_macros.hpp>
+#include <audio/audio_engine.hpp>
+#include <audio/sfx.hpp>
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
 #include <common/math.hpp>
-#include <common/thread_pool.hpp>
 #include <common/random.hpp>
+#include <common/thread_pool.hpp>
+#include <engine/game_state.hpp>
+#include <engine/hotbar.hpp>
+#include <engine/input_bindings.hpp>
+#include <entity/ai.hpp>
+#include <entity/entity.hpp>
+#include <entity/physics.hpp>
+#include <entity/player.hpp>
+#include <entity/spatial_hash.hpp>
+#include <entity/spawner.hpp>
+#include <entity/voxel_traversal.hpp>
+#include <render/block_texture_array.hpp>
+#include <render/block_textures.hpp>
+#include <render/lod_mesher.hpp>
+#include <render/mega_buffer.hpp>
+#include <render/shader_types.hpp>
+#include <render/ui_menu.hpp>
+#include <render/ui_overlay.hpp>
+#include <render/vertex.hpp>
+#include <world/biome.hpp>
 #include <world/chunk.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/noise.hpp>
-#include <world/terrain.hpp>
-#include <world/biome.hpp>
-#include <world/world.hpp>
-#include <world/serialization.hpp>
 #include <world/save_manager.hpp>
-#include <render/vertex.hpp>
-#include <render/lod_mesher.hpp>
-#include <render/block_textures.hpp>
-#include <render/block_texture_array.hpp>
-#include <render/mega_buffer.hpp>
-#include <render/ui_overlay.hpp>
-#include <render/shader_types.hpp>
-#include <entity/physics.hpp>
-#include <entity/player.hpp>
-#include <entity/voxel_traversal.hpp>
-#include <entity/entity.hpp>
-#include <entity/ai.hpp>
-#include <entity/spatial_hash.hpp>
-#include <entity/spawner.hpp>
-#include <engine/hotbar.hpp>
-#include <engine/input_bindings.hpp>
-#include <engine/game_state.hpp>
-#include <render/ui_menu.hpp>
-#include <audio/sfx.hpp>
-#include <audio/audio_engine.hpp>
+#include <world/serialization.hpp>
+#include <world/terrain.hpp>
+#include <world/world.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <thread>
-#include <chrono>
 
 // ============================================================================
 // Vec3 Tests
@@ -45,9 +45,7 @@
 // Audio: procedural sound effects and the mixer
 // ===========================================================================
 
-
 // ---- Audio Engine Tests ----
-
 
 TEST_CASE("Audio engine: voice allocation and deallocation", "[phase8][audio]") {
     // Simulate voice allocation logic
@@ -131,7 +129,6 @@ TEST_CASE("Audio engine: master volume clamping", "[phase8][audio]") {
 }
 
 // ---- SFX Tests ----
-
 
 TEST_CASE("SFX: block break generates non-empty buffer", "[phase8][sfx]") {
     auto samples = SoundEffect::generateBlockBreak();

@@ -12,12 +12,12 @@ struct Uniforms {
     simd_float4x4 modelMatrix;
     simd_float4x4 viewMatrix;
     simd_float4x4 projectionMatrix;
-    simd_float3 sunDirection;  // normalized direction to the sun
+    simd_float3 sunDirection; // normalized direction to the sun
     simd_float3 sunColor;
     simd_float3 ambientColor;
     simd_float3 fogColor;
     float fogDensity;
-    simd_float3 cameraPosition;  // for fog distance
+    simd_float3 cameraPosition; // for fog distance
 };
 
 // Per-chunk world offset, bound at buffer(2) via setVertexBytes. Vertices are
@@ -32,7 +32,7 @@ struct SkyUniforms {
     simd_float3 horizonColor;
     simd_float3 sunDirection;
     simd_float3 sunColor;
-    float sunIntensity;  // 0 at night, 1 at noon
+    float sunIntensity; // 0 at night, 1 at noon
 };
 
 // Procedural cloud layer, bound at buffer(0) in clouds.metal. The fragment
@@ -57,13 +57,13 @@ struct GPUParticle {
     simd_float3 position;
     simd_float3 velocity;
     float lifetime;
-    float type;  // 0 = rain, 1 = snow
+    float type; // 0 = rain, 1 = snow
 };
 
 // One vertex of an entity voxel-box mesh, indexed directly by vertex_id in
 // entities' draw calls (buffer(0) in the entity shaders).
 struct EntityVertex {
-    simd_float3 position;  // model-local (feet-centered)
+    simd_float3 position; // model-local (feet-centered)
     simd_float3 normal;
     simd_float3 color;
 };
@@ -82,11 +82,11 @@ struct ParticleUniforms {
 
 // Bound at buffer(0) in all three bloom passes.
 struct BloomUniforms {
-    simd_float2 resolution;  // output texture width, height
-    simd_float2 texelSize;   // 1/width, 1/height
-    float threshold;         // extract luminance threshold
-    float intensity;         // bloom strength multiplier
-    float blurRadius;        // Kawase blur radius in texels
+    simd_float2 resolution; // output texture width, height
+    simd_float2 texelSize;  // 1/width, 1/height
+    float threshold;        // extract luminance threshold
+    float intensity;        // bloom strength multiplier
+    float blurRadius;       // Kawase blur radius in texels
 };
 
 #ifndef __METAL_VERSION__

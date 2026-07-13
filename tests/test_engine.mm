@@ -1,42 +1,42 @@
 #include "test_helpers.hpp"
 
-#include <catch2/catch_test_macros.hpp>
+#include <audio/audio_engine.hpp>
+#include <audio/sfx.hpp>
 #include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
 #include <common/math.hpp>
-#include <common/thread_pool.hpp>
 #include <common/random.hpp>
+#include <common/thread_pool.hpp>
+#include <engine/game_state.hpp>
+#include <engine/hotbar.hpp>
+#include <engine/input_bindings.hpp>
+#include <entity/ai.hpp>
+#include <entity/entity.hpp>
+#include <entity/physics.hpp>
+#include <entity/player.hpp>
+#include <entity/spatial_hash.hpp>
+#include <entity/spawner.hpp>
+#include <entity/voxel_traversal.hpp>
+#include <render/block_texture_array.hpp>
+#include <render/block_textures.hpp>
+#include <render/lod_mesher.hpp>
+#include <render/mega_buffer.hpp>
+#include <render/shader_types.hpp>
+#include <render/ui_menu.hpp>
+#include <render/ui_overlay.hpp>
+#include <render/vertex.hpp>
+#include <world/biome.hpp>
 #include <world/chunk.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/noise.hpp>
-#include <world/terrain.hpp>
-#include <world/biome.hpp>
-#include <world/world.hpp>
-#include <world/serialization.hpp>
 #include <world/save_manager.hpp>
-#include <render/vertex.hpp>
-#include <render/lod_mesher.hpp>
-#include <render/block_textures.hpp>
-#include <render/block_texture_array.hpp>
-#include <render/mega_buffer.hpp>
-#include <render/ui_overlay.hpp>
-#include <render/shader_types.hpp>
-#include <entity/physics.hpp>
-#include <entity/player.hpp>
-#include <entity/voxel_traversal.hpp>
-#include <entity/entity.hpp>
-#include <entity/ai.hpp>
-#include <entity/spatial_hash.hpp>
-#include <entity/spawner.hpp>
-#include <engine/hotbar.hpp>
-#include <engine/input_bindings.hpp>
-#include <engine/game_state.hpp>
-#include <render/ui_menu.hpp>
-#include <audio/sfx.hpp>
-#include <audio/audio_engine.hpp>
+#include <world/serialization.hpp>
+#include <world/terrain.hpp>
+#include <world/world.hpp>
 
+#include <chrono>
 #include <cmath>
 #include <thread>
-#include <chrono>
 
 // ============================================================================
 // Vec3 Tests
@@ -45,28 +45,27 @@
 // Engine: game flow, menus, input, hotbar
 // ===========================================================================
 
-
 TEST_CASE("InputBindings save/load round-trips a custom binding", "[engine][bindings]") {
-  TempDir dir("bindings");
-  std::string path = dir.path() + "/bindings.json";
+    TempDir dir("bindings");
+    std::string path = dir.path() + "/bindings.json";
 
-  InputBindings custom;
-  custom.forward.key = Key::Up;
-  custom.jump.key = Key::F;
-  REQUIRE(custom.save(path));
+    InputBindings custom;
+    custom.forward.key = Key::Up;
+    custom.jump.key = Key::F;
+    REQUIRE(custom.save(path));
 
-  auto loaded = InputBindings::load(path);
-  REQUIRE(loaded.has_value());
-  REQUIRE(loaded->forward.key == Key::Up);
-  REQUIRE(loaded->jump.key == Key::F);
-  REQUIRE(loaded->backward.key == Key::S);  // untouched bindings keep defaults
+    auto loaded = InputBindings::load(path);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->forward.key == Key::Up);
+    REQUIRE(loaded->jump.key == Key::F);
+    REQUIRE(loaded->backward.key == Key::S); // untouched bindings keep defaults
 }
 
 TEST_CASE("InputBindings load returns defaults for a missing file", "[engine][bindings]") {
-  TempDir dir("bindings_missing");
-  auto loaded = InputBindings::load(dir.path() + "/nope.json");
-  REQUIRE(loaded.has_value());
-  REQUIRE(loaded->forward.key == Key::W);
+    TempDir dir("bindings_missing");
+    auto loaded = InputBindings::load(dir.path() + "/nope.json");
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->forward.key == Key::W);
 }
 
 // ============================================================================
@@ -109,7 +108,7 @@ TEST_CASE("GameFlow: ESC toggles pause and backs out of settings", "[ui][flow]")
 TEST_CASE("GameFlow: resume and quit actions", "[ui][flow]") {
     GameFlow flow;
     flow.onMenuAction(MenuAction::PLAY);
-    flow.onEscape();  // pause
+    flow.onEscape(); // pause
 
     auto fx = flow.onMenuAction(MenuAction::RESUME);
     REQUIRE(flow.screen == GameScreen::PLAYING);
@@ -140,8 +139,7 @@ TEST_CASE("GameFlow: focus loss force-pauses gameplay only", "[ui][flow]") {
 TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][menu]") {
     SettingsValues values;
     for (auto [w, h] : {std::pair{1024.f, 768.f}, {2048.f, 1536.f}, {3456.f, 2234.f}}) {
-        for (GameScreen screen :
-             {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS}) {
+        for (GameScreen screen : {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS}) {
             MenuLayout layout = buildMenuLayout(screen, w, h, values);
             REQUIRE(!layout.buttons.empty());
 
@@ -162,8 +160,8 @@ TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][me
                 for (size_t j = i + 1; j < layout.buttons.size(); ++j) {
                     const UIRect& a = layout.buttons[i].rect;
                     const UIRect& b = layout.buttons[j].rect;
-                    bool separated = a.x + a.w <= b.x || b.x + b.w <= a.x ||
-                                     a.y + a.h <= b.y || b.y + b.h <= a.y;
+                    bool separated = a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y ||
+                                     b.y + b.h <= a.y;
                     REQUIRE(separated);
                 }
             }
@@ -189,20 +187,23 @@ TEST_CASE("Menu hit test: button centers hit, gaps miss", "[ui][menu]") {
 TEST_CASE("Font covers every character the menus draw", "[ui][font]") {
     SettingsValues values;
     std::string needed = "0123456789.:/-+ ";
-    for (GameScreen screen :
-         {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS}) {
+    for (GameScreen screen : {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS}) {
         MenuLayout layout = buildMenuLayout(screen, 1024.f, 768.f, values);
-        for (const auto& text : layout.texts) needed += text.text;
-        for (const auto& button : layout.buttons) needed += button.label;
+        for (const auto& text : layout.texts)
+            needed += text.text;
+        for (const auto& button : layout.buttons)
+            needed += button.label;
     }
     // Plus everything the debug HUD prints
     needed += "FPS: Chunks: Entities: Frame: ";
 
     for (char c : needed) {
-        if (c == ' ') continue;  // spaces render as gaps by design
+        if (c == ' ')
+            continue; // spaces render as gaps by design
         auto bitmap = UIOverlay::getCharBitmap(c);
         bool anyPixel = false;
-        for (uint8_t row : bitmap) anyPixel |= row != 0;
+        for (uint8_t row : bitmap)
+            anyPixel |= row != 0;
         INFO("Missing glyph: '" << c << "'");
         REQUIRE(anyPixel);
     }
@@ -249,8 +250,8 @@ TEST_CASE("UIOverlay quad vertex generation: crosshair horizontal line", "[rende
 
     float centerX = 0.5f;
     float centerY = 0.5f;
-    float crossH = 1.0f / screenHeight;    // 1 pixel height
-    float crossW = 20.0f / screenWidth;    // 20 pixel width
+    float crossH = 1.0f / screenHeight; // 1 pixel height
+    float crossW = 20.0f / screenWidth; // 20 pixel width
 
     float left = centerX - crossW * 0.5f;
     float bottom = centerY - crossH * 0.5f;
@@ -356,7 +357,6 @@ TEST_CASE("UIOverlay quad index order forms two triangles", "[render][ui]") {
 
 // ---- Hotbar Tests (Task 6.3) ----
 
-
 TEST_CASE("Hotbar: initial slot selection is 0", "[phase6][hotbar]") {
     Hotbar hotbar;
     REQUIRE(hotbar.getSelectedIndex() == 0);
@@ -453,7 +453,6 @@ TEST_CASE("Hotbar: default slot contents", "[phase6][hotbar]") {
 
 // ---- Performance HUD Tests ----
 
-
 TEST_CASE("Performance HUD: FPS averaging over 60 frames", "[phase8][hud]") {
     // Simulate rolling average FPS
     std::vector<float> frameTimes;
@@ -528,7 +527,8 @@ TEST_CASE("Performance HUD: integer to string conversion", "[phase8][hud]") {
                 tmp[len++] = '0' + (v % 10);
                 v /= 10;
             }
-            if (value < 0) tmp[len++] = '-';
+            if (value < 0)
+                tmp[len++] = '-';
             for (int i = 0; i < len / 2; ++i) {
                 char t = tmp[i];
                 tmp[i] = tmp[len - 1 - i];
@@ -570,7 +570,8 @@ TEST_CASE("Performance HUD: float to string conversion", "[phase8][hud]") {
                 tmp[len++] = '0' + (v % 10);
                 v /= 10;
             }
-            if (intPart < 0) tmp[len++] = '-';
+            if (intPart < 0)
+                tmp[len++] = '-';
             for (int i = 0; i < len / 2; ++i) {
                 char t = tmp[i];
                 tmp[i] = tmp[len - 1 - i];
@@ -584,7 +585,8 @@ TEST_CASE("Performance HUD: float to string conversion", "[phase8][hud]") {
             buf[len + 1] = '0' + fracPart;
             buf[len + 2] = '\0';
         } else {
-            size_t safeLen = len < static_cast<int>(bufSize - 1) ? len : static_cast<int>(bufSize - 1);
+            size_t safeLen =
+                len < static_cast<int>(bufSize - 1) ? len : static_cast<int>(bufSize - 1);
             std::memcpy(buf, tmp, safeLen);
             buf[safeLen] = '\0';
         }

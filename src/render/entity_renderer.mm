@@ -43,8 +43,7 @@ static void appendBox(std::vector<EntityVertex>& vertices, std::vector<uint16_t>
     }
 }
 
-EntityRenderer::Mesh EntityRenderer::buildMesh(id<MTLDevice> device, EntityType type,
-                                               bool isBaby) {
+EntityRenderer::Mesh EntityRenderer::buildMesh(id<MTLDevice> device, EntityType type, bool isBaby) {
     std::vector<EntityVertex> vertices;
     std::vector<uint16_t> indices;
     for (const VoxelBlock& block : Entity::getVoxelModel(type, isBaby)) {
@@ -92,28 +91,31 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     }
 }
 
-void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder,
-                            id<MTLBuffer> uniformsBuffer,
+void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
                             const std::vector<std::shared_ptr<Entity>>& entities,
                             const std::function<bool(const AABB&)>& isVisible) {
-    if (entities.empty()) return;
+    if (entities.empty())
+        return;
 
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setVertexBuffer:uniformsBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:uniformsBuffer offset:0 atIndex:1];
 
     for (const auto& entity : entities) {
-        if (!entity || !entity->alive) continue;
-        if (!isVisible(entity->aabb)) continue;
+        if (!entity || !entity->alive)
+            continue;
+        if (!isVisible(entity->aabb))
+            continue;
 
         const int type = static_cast<int>(entity->type);
-        if (type < 0 || type >= TYPE_COUNT) continue;
+        if (type < 0 || type >= TYPE_COUNT)
+            continue;
         const Mesh& mesh = _meshes[type][entity->isBaby ? 1 : 0];
 
         EntityModel model;
         model.model = matrix_identity_float4x4;
-        model.model.columns[3] = simd_make_float4(entity->position.x, entity->position.y,
-                                                  entity->position.z, 1.0f);
+        model.model.columns[3] =
+            simd_make_float4(entity->position.x, entity->position.y, entity->position.z, 1.0f);
         [encoder setVertexBytes:&model length:sizeof(model) atIndex:2];
 
         [encoder setVertexBuffer:mesh.vertexBuffer offset:0 atIndex:0];

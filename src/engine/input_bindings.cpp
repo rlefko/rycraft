@@ -2,10 +2,10 @@
 
 #include <common/error.hpp>
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <filesystem>
 
 namespace fs = std::filesystem;
 
@@ -110,8 +110,7 @@ std::optional<InputBindings> InputBindings::load(const std::string& path) {
     // Minimal JSON parsing: find "key": "value" pairs
     InputBindings bindings;
 
-    auto parseBinding = [&](ActionBinding& field,
-                            const std::string& jsonKey) -> bool {
+    auto parseBinding = [&](ActionBinding& field, const std::string& jsonKey) -> bool {
         std::string searchKey = "\"" + jsonKey + "\"";
         size_t pos = content.find(searchKey);
         if (pos == std::string::npos) return false;
@@ -127,12 +126,11 @@ std::optional<InputBindings> InputBindings::load(const std::string& path) {
         size_t quoteEnd = content.find('"', quoteStart + 1);
         if (quoteEnd == std::string::npos) return false;
 
-        std::string value = content.substr(quoteStart + 1,
-                                            quoteEnd - quoteStart - 1);
+        std::string value = content.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
         auto parsedKey = keyFromString(value);
         if (parsedKey == Key::None && !value.empty()) {
-            RY_LOG_ERROR(std::string("Invalid binding value '") + value +
-                         "' for '" + jsonKey + "', using default");
+            RY_LOG_ERROR(std::string("Invalid binding value '") + value + "' for '" + jsonKey +
+                         "', using default");
         }
         field.key = parsedKey;
         return true;

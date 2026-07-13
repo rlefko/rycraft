@@ -10,19 +10,16 @@
 // ---------------------------------------------------------------------------
 // Audio callback C function → C++ method bridge
 // ---------------------------------------------------------------------------
-OSStatus audioRenderCallback(void* inRefCon,
-                             AudioUnitRenderActionFlags* ioActionFlags,
-                             const AudioTimeStamp* inTimeStamp,
-                             UInt32 inBusNumber,
-                             UInt32 /*inNumberFrames*/,
-                             AudioBufferList* ioData)
-{
+OSStatus audioRenderCallback(void* inRefCon, AudioUnitRenderActionFlags* ioActionFlags,
+                             const AudioTimeStamp* inTimeStamp, UInt32 inBusNumber,
+                             UInt32 /*inNumberFrames*/, AudioBufferList* ioData) {
     (void)ioActionFlags;
     (void)inTimeStamp;
     (void)inBusNumber;
 
     AudioEngine* engine = static_cast<AudioEngine*>(inRefCon);
-    if (!engine) return -1;
+    if (!engine)
+        return -1;
 
     engine->audioCallback(ioData);
     return noErr;
@@ -31,10 +28,7 @@ OSStatus audioRenderCallback(void* inRefCon,
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
-AudioEngine::AudioEngine()
-    : _audioUnit(nullptr)
-    , _outputFormat{}
-{
+AudioEngine::AudioEngine() : _audioUnit(nullptr), _outputFormat{} {
     std::memset(_voices, 0, sizeof(_voices));
 }
 
@@ -49,7 +43,8 @@ AudioEngine::~AudioEngine() {
 // initialize
 // ---------------------------------------------------------------------------
 bool AudioEngine::initialize() {
-    if (_isRunning) return true;
+    if (_isRunning)
+        return true;
 
     // Describe the RemoteIO AudioUnit
     AudioComponentDescription desc{};
@@ -86,11 +81,8 @@ bool AudioEngine::initialize() {
     _outputFormat.mBitsPerChannel = 32;
 
     // The format the render callback SUPPLIES: input scope of output bus 0
-    status = AudioUnitSetProperty(_audioUnit,
-                                   kAudioUnitProperty_StreamFormat,
-                                   kAudioUnitScope_Input,
-                                   0,
-                                   &_outputFormat, sizeof(_outputFormat));
+    status = AudioUnitSetProperty(_audioUnit, kAudioUnitProperty_StreamFormat,
+                                  kAudioUnitScope_Input, 0, &_outputFormat, sizeof(_outputFormat));
     if (status != noErr) {
         RY_LOG_ERROR("Failed to set audio output format");
         return false;
@@ -101,11 +93,8 @@ bool AudioEngine::initialize() {
     callback.inputProc = audioRenderCallback;
     callback.inputProcRefCon = this;
 
-    status = AudioUnitSetProperty(_audioUnit,
-                                   kAudioUnitProperty_SetRenderCallback,
-                                   kAudioUnitScope_Global,
-                                   0,
-                                   &callback, sizeof(callback));
+    status = AudioUnitSetProperty(_audioUnit, kAudioUnitProperty_SetRenderCallback,
+                                  kAudioUnitScope_Global, 0, &callback, sizeof(callback));
     if (status != noErr) {
         RY_LOG_ERROR("Failed to set audio render callback");
         return false;
@@ -132,7 +121,8 @@ bool AudioEngine::initialize() {
 // stop
 // ---------------------------------------------------------------------------
 void AudioEngine::stop() {
-    if (!_isRunning || !_audioUnit) return;
+    if (!_isRunning || !_audioUnit)
+        return;
 
     OSStatus status = AudioOutputUnitStop(_audioUnit);
     if (status != noErr) {
@@ -163,7 +153,8 @@ int32_t AudioEngine::allocateVoice() {
 // deallocateVoice
 // ---------------------------------------------------------------------------
 void AudioEngine::deallocateVoice(int32_t voiceIndex) {
-    if (voiceIndex < 0 || voiceIndex >= MAX_VOICES) return;
+    if (voiceIndex < 0 || voiceIndex >= MAX_VOICES)
+        return;
 
     _voices[voiceIndex].active = false;
     _voices[voiceIndex].samples.clear();
@@ -175,17 +166,16 @@ void AudioEngine::deallocateVoice(int32_t voiceIndex) {
 // ---------------------------------------------------------------------------
 // playSound
 // ---------------------------------------------------------------------------
-int32_t AudioEngine::playSound(const std::vector<float>& buffer,
-                               uint32_t sampleRate,
-                               float gain,
-                               bool looping)
-{
-    if (buffer.empty()) return -1;
+int32_t AudioEngine::playSound(const std::vector<float>& buffer, uint32_t sampleRate, float gain,
+                               bool looping) {
+    if (buffer.empty())
+        return -1;
 
     std::lock_guard<std::mutex> lock(_voiceMutex);
 
     int32_t voiceIndex = allocateVoice();
-    if (voiceIndex < 0) return -1;
+    if (voiceIndex < 0)
+        return -1;
 
     _voices[voiceIndex].samples = buffer;
     _voices[voiceIndex].sampleRate = sampleRate;
@@ -201,7 +191,8 @@ int32_t AudioEngine::playSound(const std::vector<float>& buffer,
 // stopVoice
 // ---------------------------------------------------------------------------
 void AudioEngine::stopVoice(int32_t voiceIndex) {
-    if (voiceIndex < 0 || voiceIndex >= MAX_VOICES) return;
+    if (voiceIndex < 0 || voiceIndex >= MAX_VOICES)
+        return;
 
     std::lock_guard<std::mutex> lock(_voiceMutex);
     deallocateVoice(voiceIndex);
@@ -219,7 +210,8 @@ void AudioEngine::setMasterVolume(float gain) {
 // audioCallback — called from audio thread
 // ---------------------------------------------------------------------------
 void AudioEngine::audioCallback(AudioBufferList* outputData) {
-    if (!outputData) return;
+    if (!outputData)
+        return;
 
     // Get output buffer
     float* outputBuffer = static_cast<float*>(outputData->mBuffers[0].mData);
@@ -230,10 +222,12 @@ void AudioEngine::audioCallback(AudioBufferList* outputData) {
 
     // Mix all active voices
     for (int i = 0; i < MAX_VOICES; ++i) {
-        if (!_voices[i].active) continue;
+        if (!_voices[i].active)
+            continue;
 
         const auto& voice = _voices[i];
-        if (voice.samples.empty()) continue;
+        if (voice.samples.empty())
+            continue;
 
         uint32_t samplesAvailable = voice.samples.size();
         uint32_t framesToMix = std::min(frameCount, samplesAvailable - voice.readPosition);
