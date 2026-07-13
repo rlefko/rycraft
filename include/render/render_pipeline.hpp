@@ -28,10 +28,25 @@ class UIOverlay;
 class Bloom;
 class ParticleSystem;
 
-// GPU-side per-chunk mesh allocation tracking.
+// GPU-side per-chunk mesh allocation tracking. opaqueIndexCount splits the
+// one allocation into the opaque section and the water section (see
+// MeshOutput).
 struct ChunkMeshState {
     MegaBuffer::ChunkAllocation alloc;
+    uint32_t opaqueIndexCount = 0;
     bool uploaded = false;
+};
+
+// One chunk's water draw, recorded during the opaque pass and encoded by
+// the water pass after the scene resolves.
+struct WaterDraw {
+    simd_float4 origin;
+    id<MTLBuffer> vertexBuffer;
+    id<MTLBuffer> indexBuffer;
+    uint64_t vertexOffset;
+    uint64_t indexOffset;
+    uint32_t indexCount;
+    float distSq; // camera distance², for back-to-front ordering
 };
 
 // ---------------------------------------------------------------------------
@@ -113,12 +128,25 @@ private:
     id<MTLDepthStencilState> _cloudDepthState;
     id<MTLBuffer> _cloudUniformsBuffer;
 
+    // Water pass (refraction/reflection/caustics) — no depth attachment;
+    // the fragment shader depth-tests against the resolved scene depth
+    id<MTLRenderPipelineState> _waterPipelineState;
+    id<MTLRenderPipelineState> _underwaterOverlayState;
+    id<MTLBuffer> _waterUniformsBuffer;
+    std::vector<WaterDraw> _waterDraws; // reused each frame
+
     // MSAA render targets (memoryless — resolved or discarded at pass end)
     id<MTLTexture> _colorMSAA;
     id<MTLTexture> _depthMSAA;
 
     // Single-sample resolve target feeding bloom / the drawable blit
     id<MTLTexture> _colorResolve;
+
+    // Water pass inputs: the opaque scene's resolved depth, and a copy of
+    // the resolved color the refraction samples (a render target cannot
+    // sample itself)
+    id<MTLTexture> _depthResolve;
+    id<MTLTexture> _sceneColorCopy;
 
     // Uniform buffer (512 bytes with fog + camera position).
     id<MTLBuffer> _uniformsBuffer;
@@ -193,6 +221,13 @@ private:
 
     void renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, const Vec3& blockPos,
                               const Mat4& viewMatrix, const Mat4& projectionMatrix);
+
+    // Water pass: own encoder after the scene pass resolves. Encodes the
+    // recorded _waterDraws plus the underwater overlay when submerged.
+    void renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4& viewMatrix,
+                     const Mat4& projectionMatrix, const Vec3& cameraPosition,
+                     bool cameraUnderwater, const SkyUniforms& skyUniforms, const float fogColor[3],
+                     uint64_t worldTime);
 
     void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
                          const UIFrameState& uiFrame);

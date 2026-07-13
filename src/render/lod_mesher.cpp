@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <functional>
+#include <unordered_map>
 
 // ==========================================================================
 // Generic greedy mesher — works with any grid dimensions.
@@ -16,8 +17,10 @@
 // the same meshing pipeline to run on full-resolution and coarse-resolution
 // grids without code duplication.
 //
-// Flat 1D arrays used throughout to avoid vector<vector<T>> allocation
-// overhead. Indexing: idx(row, col, width) = row * width + col.
+// The six directional passes run twice per build with different visibility
+// predicates: once for the opaque cube section, once for water surfaces
+// (drawn by the dedicated water pass). Flat 1D arrays used throughout to
+// avoid vector<vector<T>> allocation overhead.
 // ==========================================================================
 
 using BlockAccessor = std::function<BlockType(int, int, int)>;
@@ -25,12 +28,19 @@ inline static int idx(int row, int col, int width) {
     return row * width + col;
 }
 
-// A face of `cur` toward `neighbor` renders when cur has geometry (isSolid),
+// A face of `cur` toward `neighbor` renders when cur has cube geometry,
 // the neighbor doesn't fully hide it (isOpaque), and the two blocks differ —
 // interior faces between identical cutout blocks (leaf-leaf, glass-glass)
 // stay culled so foliage doesn't render its own inner walls.
-inline static bool faceVisible(BlockType cur, BlockType neighbor) {
-    return isSolid(cur) && !isOpaque(neighbor) && neighbor != cur;
+inline static bool cubeFaceVisible(BlockType cur, BlockType neighbor) {
+    return rendersAsCube(cur) && !isOpaque(neighbor) && neighbor != cur;
+}
+
+// Water surfaces: every boundary between water and a non-water, non-hiding
+// cell (the sea top under air, sides at waterfall lips, ceilings of flooded
+// caves). Interior water-water faces stay culled.
+inline static bool waterFaceVisible(BlockType cur, BlockType neighbor) {
+    return cur == BlockType::WATER && neighbor != BlockType::WATER && !isOpaque(neighbor);
 }
 
 // One vertex of a quad corner: position + UV (UVs span the quad extent in
@@ -123,6 +133,279 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
     }
 }
 
+// The six directional passes for one visibility predicate. topDrop lowers
+// the +Y face plane (the water surface sits 0.125 below the cell top —
+// fp16-exact at every chunk-local magnitude, so no cracks).
+template <typename Visible>
+static void runGreedyPasses(int gridW, int gridH, int gridD, const BlockAccessor& getBlock,
+                            const Visible& visible, const auto& lightAt, float topDrop,
+                            std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices) {
+    // Reusable flat buffers for face processing (avoid reallocation per face)
+    std::vector<bool> faceMask;
+    std::vector<BlockType> blockTypes;
+    std::vector<uint8_t> cellLight;
+    std::vector<bool> merged;
+
+    // ======================================================================
+    // Face: +Y (top) — visible when the block above doesn't hide it
+    // ======================================================================
+    for (int ly = 0; ly < gridH - 1; ++ly) {
+        faceMask.assign(gridD * gridW, false);
+        blockTypes.assign(gridD * gridW, BlockType::AIR);
+        cellLight.assign(gridD * gridW, 15);
+
+        bool anyExposed = false;
+        for (int z = 0; z < gridD; ++z) {
+            for (int x = 0; x < gridW; ++x) {
+                BlockType cur = getBlock(x, ly, z);
+                if (visible(cur, getBlock(x, ly + 1, z))) {
+                    faceMask[idx(z, x, gridW)] = true;
+                    blockTypes[idx(z, x, gridW)] = cur;
+                    cellLight[idx(z, x, gridW)] = lightAt(x, ly + 1, z);
+                    anyExposed = true;
+                }
+            }
+        }
+        if (!anyExposed) continue;
+
+        auto emitQuad = [ly, topDrop](int col, int row, int width, int height, FaceNormal face,
+                                      BlockType bt, uint8_t skyLight, std::vector<Vertex>& verts,
+                                      std::vector<uint32_t>& idxs) {
+            // +Y face: y = ly+1 (minus the water-surface drop), CCW from above
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const float y = static_cast<float>(ly + 1) - topDrop;
+            const QuadCorner corners[4] = {
+                {static_cast<float>(col), y, static_cast<float>(row), 0.f, 0.f},
+                {static_cast<float>(col + width), y, static_cast<float>(row), fw, 0.f},
+                {static_cast<float>(col + width), y, static_cast<float>(row + height), fw, fh},
+                {static_cast<float>(col), y, static_cast<float>(row + height), 0.f, fh},
+            };
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
+        };
+
+        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_Y,
+                        outVertices, outIndices, emitQuad);
+    }
+
+    // ======================================================================
+    // Face: -Y (bottom) — visible when the block below doesn't hide it
+    // ======================================================================
+    for (int ly = 1; ly < gridH; ++ly) {
+        faceMask.assign(gridD * gridW, false);
+        blockTypes.assign(gridD * gridW, BlockType::AIR);
+        cellLight.assign(gridD * gridW, 15);
+
+        bool anyExposed = false;
+        for (int z = 0; z < gridD; ++z) {
+            for (int x = 0; x < gridW; ++x) {
+                BlockType cur = getBlock(x, ly, z);
+                if (visible(cur, getBlock(x, ly - 1, z))) {
+                    faceMask[idx(z, x, gridW)] = true;
+                    blockTypes[idx(z, x, gridW)] = cur;
+                    cellLight[idx(z, x, gridW)] = lightAt(x, ly - 1, z);
+                    anyExposed = true;
+                }
+            }
+        }
+        if (!anyExposed) continue;
+
+        auto emitQuad = [ly](int col, int row, int width, int height, FaceNormal face, BlockType bt,
+                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             std::vector<uint32_t>& idxs) {
+            // -Y face: y = ly, CCW from below
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(col), static_cast<float>(ly), static_cast<float>(row), 0.f,
+                 0.f},
+                {static_cast<float>(col + width), static_cast<float>(ly), static_cast<float>(row),
+                 fw, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(ly),
+                 static_cast<float>(row + height), fw, fh},
+                {static_cast<float>(col), static_cast<float>(ly), static_cast<float>(row + height),
+                 0.f, fh},
+            };
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
+        };
+
+        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_Y,
+                        outVertices, outIndices, emitQuad);
+    }
+
+    // ======================================================================
+    // Face: +X (right) — exposed when visible toward the +X neighbor
+    // ======================================================================
+    for (int lx = 0; lx < gridW - 1; ++lx) {
+        faceMask.assign(gridH * gridD, false);
+        blockTypes.assign(gridH * gridD, BlockType::AIR);
+        cellLight.assign(gridH * gridD, 15);
+
+        for (int y = 0; y < gridH; ++y) {
+            for (int z = 0; z < gridD; ++z) {
+                BlockType cur = getBlock(lx, y, z);
+                if (visible(cur, getBlock(lx + 1, y, z))) {
+                    faceMask[idx(y, z, gridD)] = true;
+                    blockTypes[idx(y, z, gridD)] = cur;
+                    cellLight[idx(y, z, gridD)] = lightAt(lx + 1, y, z);
+                }
+            }
+        }
+
+        auto emitQuad = [lx](int col, int row, int width, int height, FaceNormal face, BlockType bt,
+                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             std::vector<uint32_t>& idxs) {
+            // +X face: x = lx+1, CCW from +X (rows are Y, cols are Z).
+            // Texture v runs downward in Metal, so the TOP of the face
+            // carries v=0 — otherwise side textures (the grass strip)
+            // render upside down. Same for the other three side faces.
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(lx + 1), static_cast<float>(row), static_cast<float>(col), 0.f,
+                 fh},
+                {static_cast<float>(lx + 1), static_cast<float>(row + height),
+                 static_cast<float>(col), 0.f, 0.f},
+                {static_cast<float>(lx + 1), static_cast<float>(row + height),
+                 static_cast<float>(col + width), fw, 0.f},
+                {static_cast<float>(lx + 1), static_cast<float>(row),
+                 static_cast<float>(col + width), fw, fh},
+            };
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
+        };
+
+        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_X,
+                        outVertices, outIndices, emitQuad);
+    }
+
+    // ======================================================================
+    // Face: -X (left) — exposed when visible toward the -X neighbor
+    // ======================================================================
+    for (int lx = 0; lx < gridW; ++lx) {
+        faceMask.assign(gridH * gridD, false);
+        blockTypes.assign(gridH * gridD, BlockType::AIR);
+        cellLight.assign(gridH * gridD, 15);
+
+        for (int y = 0; y < gridH; ++y) {
+            for (int z = 0; z < gridD; ++z) {
+                BlockType cur = getBlock(lx, y, z);
+                if (visible(cur, getBlock(lx - 1, y, z))) {
+                    faceMask[idx(y, z, gridD)] = true;
+                    blockTypes[idx(y, z, gridD)] = cur;
+                    cellLight[idx(y, z, gridD)] = lightAt(lx - 1, y, z);
+                }
+            }
+        }
+
+        auto emitQuad = [lx](int col, int row, int width, int height, FaceNormal face, BlockType bt,
+                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             std::vector<uint32_t>& idxs) {
+            // -X face: the face plane of block lx is x = lx (the old code
+            // emitted at lx-1, one unit inside the neighbor)
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col), 0.f, fh},
+                {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col + width),
+                 fw, fh},
+                {static_cast<float>(lx), static_cast<float>(row + height),
+                 static_cast<float>(col + width), fw, 0.f},
+                {static_cast<float>(lx), static_cast<float>(row + height), static_cast<float>(col),
+                 0.f, 0.f},
+            };
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
+        };
+
+        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_X,
+                        outVertices, outIndices, emitQuad);
+    }
+
+    // ======================================================================
+    // Face: +Z (front) — exposed when visible toward the +Z neighbor
+    // ======================================================================
+    for (int lz = 0; lz < gridD - 1; ++lz) {
+        faceMask.assign(gridH * gridW, false);
+        blockTypes.assign(gridH * gridW, BlockType::AIR);
+        cellLight.assign(gridH * gridW, 15);
+
+        for (int x = 0; x < gridW; ++x) {
+            for (int y = 0; y < gridH; ++y) {
+                BlockType cur = getBlock(x, y, lz);
+                if (visible(cur, getBlock(x, y, lz + 1))) {
+                    faceMask[idx(y, x, gridW)] = true;
+                    blockTypes[idx(y, x, gridW)] = cur;
+                    cellLight[idx(y, x, gridW)] = lightAt(x, y, lz + 1);
+                }
+            }
+        }
+
+        auto emitQuad = [lz](int col, int row, int width, int height, FaceNormal face, BlockType bt,
+                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             std::vector<uint32_t>& idxs) {
+            // +Z face: z = lz+1 (the old code emitted at lz, coplanar with
+            // the block interior)
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz + 1), 0.f,
+                 fh},
+                {static_cast<float>(col), static_cast<float>(row + height),
+                 static_cast<float>(lz + 1), 0.f, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(row + height),
+                 static_cast<float>(lz + 1), fw, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(row),
+                 static_cast<float>(lz + 1), fw, fh},
+            };
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
+        };
+
+        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_Z,
+                        outVertices, outIndices, emitQuad);
+    }
+
+    // ======================================================================
+    // Face: -Z (back) — exposed when visible toward the -Z neighbor
+    // ======================================================================
+    for (int lz = 0; lz < gridD; ++lz) {
+        faceMask.assign(gridH * gridW, false);
+        blockTypes.assign(gridH * gridW, BlockType::AIR);
+        cellLight.assign(gridH * gridW, 15);
+
+        for (int x = 0; x < gridW; ++x) {
+            for (int y = 0; y < gridH; ++y) {
+                BlockType cur = getBlock(x, y, lz);
+                if (visible(cur, getBlock(x, y, lz - 1))) {
+                    faceMask[idx(y, x, gridW)] = true;
+                    blockTypes[idx(y, x, gridW)] = cur;
+                    cellLight[idx(y, x, gridW)] = lightAt(x, y, lz - 1);
+                }
+            }
+        }
+
+        auto emitQuad = [lz](int col, int row, int width, int height, FaceNormal face, BlockType bt,
+                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             std::vector<uint32_t>& idxs) {
+            // -Z face: the face plane of block lz is z = lz (the old code
+            // emitted at lz-1, one unit inside the neighbor)
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz), 0.f, fh},
+                {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz),
+                 fw, fh},
+                {static_cast<float>(col + width), static_cast<float>(row + height),
+                 static_cast<float>(lz), fw, 0.f},
+                {static_cast<float>(col), static_cast<float>(row + height), static_cast<float>(lz),
+                 0.f, 0.f},
+            };
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
+        };
+
+        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_Z,
+                        outVertices, outIndices, emitQuad);
+    }
+}
+
 // Flora cross-quads: two diagonal quads spanning the cell, inset 0.125 from
 // the walls (0.125 is exactly representable in fp16 at every chunk-local
 // magnitude, so the X stays crack-free). Single winding per quad — the
@@ -184,278 +467,10 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
         return static_cast<uint8_t>(std::max(12 - depth, 4));
     };
 
-    // Reusable flat buffers for face processing (avoid reallocation per face)
-    std::vector<bool> faceMask;
-    std::vector<BlockType> blockTypes;
-    std::vector<uint8_t> cellLight;
-    std::vector<bool> merged;
+    // ---- Opaque section: cubes, then flora crosses (full LOD only) ----
+    runGreedyPasses(gridW, gridH, gridD, getBlock, cubeFaceVisible, lightAt, 0.f, output.vertices,
+                    output.indices);
 
-    // ======================================================================
-    // Face: +Y (top) — visible when the block above doesn't hide it
-    // ======================================================================
-    for (int ly = 0; ly < gridH - 1; ++ly) {
-        faceMask.assign(gridD * gridW, false);
-        blockTypes.assign(gridD * gridW, BlockType::AIR);
-        cellLight.assign(gridD * gridW, 15);
-
-        bool anyExposed = false;
-        for (int z = 0; z < gridD; ++z) {
-            for (int x = 0; x < gridW; ++x) {
-                BlockType cur = getBlock(x, ly, z);
-                if (faceVisible(cur, getBlock(x, ly + 1, z))) {
-                    faceMask[idx(z, x, gridW)] = true;
-                    blockTypes[idx(z, x, gridW)] = cur;
-                    cellLight[idx(z, x, gridW)] = lightAt(x, ly + 1, z);
-                    anyExposed = true;
-                }
-            }
-        }
-        if (!anyExposed) continue;
-
-        auto emitQuad = [ly](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
-                             std::vector<uint32_t>& idxs) {
-            // +Y face: y = ly+1, CCW from above
-            const float fw = static_cast<float>(width);
-            const float fh = static_cast<float>(height);
-            const QuadCorner corners[4] = {
-                {static_cast<float>(col), static_cast<float>(ly + 1), static_cast<float>(row), 0.f,
-                 0.f},
-                {static_cast<float>(col + width), static_cast<float>(ly + 1),
-                 static_cast<float>(row), fw, 0.f},
-                {static_cast<float>(col + width), static_cast<float>(ly + 1),
-                 static_cast<float>(row + height), fw, fh},
-                {static_cast<float>(col), static_cast<float>(ly + 1),
-                 static_cast<float>(row + height), 0.f, fh},
-            };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
-        };
-
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_Y,
-                        output.vertices, output.indices, emitQuad);
-    }
-
-    // ======================================================================
-    // Face: -Y (bottom) — visible when the block below doesn't hide it
-    // ======================================================================
-    for (int ly = 1; ly < gridH; ++ly) {
-        faceMask.assign(gridD * gridW, false);
-        blockTypes.assign(gridD * gridW, BlockType::AIR);
-        cellLight.assign(gridD * gridW, 15);
-
-        bool anyExposed = false;
-        for (int z = 0; z < gridD; ++z) {
-            for (int x = 0; x < gridW; ++x) {
-                BlockType cur = getBlock(x, ly, z);
-                if (faceVisible(cur, getBlock(x, ly - 1, z))) {
-                    faceMask[idx(z, x, gridW)] = true;
-                    blockTypes[idx(z, x, gridW)] = cur;
-                    cellLight[idx(z, x, gridW)] = lightAt(x, ly - 1, z);
-                    anyExposed = true;
-                }
-            }
-        }
-        if (!anyExposed) continue;
-
-        auto emitQuad = [ly](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
-                             std::vector<uint32_t>& idxs) {
-            // -Y face: y = ly, CCW from below
-            const float fw = static_cast<float>(width);
-            const float fh = static_cast<float>(height);
-            const QuadCorner corners[4] = {
-                {static_cast<float>(col), static_cast<float>(ly), static_cast<float>(row), 0.f,
-                 0.f},
-                {static_cast<float>(col + width), static_cast<float>(ly), static_cast<float>(row),
-                 fw, 0.f},
-                {static_cast<float>(col + width), static_cast<float>(ly),
-                 static_cast<float>(row + height), fw, fh},
-                {static_cast<float>(col), static_cast<float>(ly), static_cast<float>(row + height),
-                 0.f, fh},
-            };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
-        };
-
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_Y,
-                        output.vertices, output.indices, emitQuad);
-    }
-
-    // ======================================================================
-    // Face: +X (right) — exposed when solid AND block to +X is AIR
-    // ======================================================================
-    for (int lx = 0; lx < gridW - 1; ++lx) {
-        faceMask.assign(gridH * gridD, false);
-        blockTypes.assign(gridH * gridD, BlockType::AIR);
-        cellLight.assign(gridH * gridD, 15);
-
-        for (int y = 0; y < gridH; ++y) {
-            for (int z = 0; z < gridD; ++z) {
-                BlockType cur = getBlock(lx, y, z);
-                if (faceVisible(cur, getBlock(lx + 1, y, z))) {
-                    faceMask[idx(y, z, gridD)] = true;
-                    blockTypes[idx(y, z, gridD)] = cur;
-                    cellLight[idx(y, z, gridD)] = lightAt(lx + 1, y, z);
-                }
-            }
-        }
-
-        auto emitQuad = [lx](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
-                             std::vector<uint32_t>& idxs) {
-            // +X face: x = lx+1, CCW from +X (rows are Y, cols are Z).
-            // Texture v runs downward in Metal, so the TOP of the face
-            // carries v=0 — otherwise side textures (the grass strip)
-            // render upside down. Same for the other three side faces.
-            const float fw = static_cast<float>(width);
-            const float fh = static_cast<float>(height);
-            const QuadCorner corners[4] = {
-                {static_cast<float>(lx + 1), static_cast<float>(row), static_cast<float>(col), 0.f,
-                 fh},
-                {static_cast<float>(lx + 1), static_cast<float>(row + height),
-                 static_cast<float>(col), 0.f, 0.f},
-                {static_cast<float>(lx + 1), static_cast<float>(row + height),
-                 static_cast<float>(col + width), fw, 0.f},
-                {static_cast<float>(lx + 1), static_cast<float>(row),
-                 static_cast<float>(col + width), fw, fh},
-            };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
-        };
-
-        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_X,
-                        output.vertices, output.indices, emitQuad);
-    }
-
-    // ======================================================================
-    // Face: -X (left) — exposed when solid AND block to -X is AIR
-    // ======================================================================
-    for (int lx = 0; lx < gridW; ++lx) {
-        faceMask.assign(gridH * gridD, false);
-        blockTypes.assign(gridH * gridD, BlockType::AIR);
-        cellLight.assign(gridH * gridD, 15);
-
-        for (int y = 0; y < gridH; ++y) {
-            for (int z = 0; z < gridD; ++z) {
-                BlockType cur = getBlock(lx, y, z);
-                if (faceVisible(cur, getBlock(lx - 1, y, z))) {
-                    faceMask[idx(y, z, gridD)] = true;
-                    blockTypes[idx(y, z, gridD)] = cur;
-                    cellLight[idx(y, z, gridD)] = lightAt(lx - 1, y, z);
-                }
-            }
-        }
-
-        auto emitQuad = [lx](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
-                             std::vector<uint32_t>& idxs) {
-            // -X face: the face plane of block lx is x = lx (the old code
-            // emitted at lx-1, one unit inside the neighbor)
-            const float fw = static_cast<float>(width);
-            const float fh = static_cast<float>(height);
-            const QuadCorner corners[4] = {
-                {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col), 0.f, fh},
-                {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col + width),
-                 fw, fh},
-                {static_cast<float>(lx), static_cast<float>(row + height),
-                 static_cast<float>(col + width), fw, 0.f},
-                {static_cast<float>(lx), static_cast<float>(row + height), static_cast<float>(col),
-                 0.f, 0.f},
-            };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
-        };
-
-        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_X,
-                        output.vertices, output.indices, emitQuad);
-    }
-
-    // ======================================================================
-    // Face: +Z (front) — exposed when solid AND block to +Z is AIR
-    // ======================================================================
-    for (int lz = 0; lz < gridD - 1; ++lz) {
-        faceMask.assign(gridH * gridW, false);
-        blockTypes.assign(gridH * gridW, BlockType::AIR);
-        cellLight.assign(gridH * gridW, 15);
-
-        for (int x = 0; x < gridW; ++x) {
-            for (int y = 0; y < gridH; ++y) {
-                BlockType cur = getBlock(x, y, lz);
-                if (faceVisible(cur, getBlock(x, y, lz + 1))) {
-                    faceMask[idx(y, x, gridW)] = true;
-                    blockTypes[idx(y, x, gridW)] = cur;
-                    cellLight[idx(y, x, gridW)] = lightAt(x, y, lz + 1);
-                }
-            }
-        }
-
-        auto emitQuad = [lz](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
-                             std::vector<uint32_t>& idxs) {
-            // +Z face: z = lz+1 (the old code emitted at lz, coplanar with
-            // the block interior)
-            const float fw = static_cast<float>(width);
-            const float fh = static_cast<float>(height);
-            const QuadCorner corners[4] = {
-                {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz + 1), 0.f,
-                 fh},
-                {static_cast<float>(col), static_cast<float>(row + height),
-                 static_cast<float>(lz + 1), 0.f, 0.f},
-                {static_cast<float>(col + width), static_cast<float>(row + height),
-                 static_cast<float>(lz + 1), fw, 0.f},
-                {static_cast<float>(col + width), static_cast<float>(row),
-                 static_cast<float>(lz + 1), fw, fh},
-            };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
-        };
-
-        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_Z,
-                        output.vertices, output.indices, emitQuad);
-    }
-
-    // ======================================================================
-    // Face: -Z (back) — exposed when solid AND block to -Z is AIR
-    // ======================================================================
-    for (int lz = 0; lz < gridD; ++lz) {
-        faceMask.assign(gridH * gridW, false);
-        blockTypes.assign(gridH * gridW, BlockType::AIR);
-        cellLight.assign(gridH * gridW, 15);
-
-        for (int x = 0; x < gridW; ++x) {
-            for (int y = 0; y < gridH; ++y) {
-                BlockType cur = getBlock(x, y, lz);
-                if (faceVisible(cur, getBlock(x, y, lz - 1))) {
-                    faceMask[idx(y, x, gridW)] = true;
-                    blockTypes[idx(y, x, gridW)] = cur;
-                    cellLight[idx(y, x, gridW)] = lightAt(x, y, lz - 1);
-                }
-            }
-        }
-
-        auto emitQuad = [lz](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
-                             std::vector<uint32_t>& idxs) {
-            // -Z face: the face plane of block lz is z = lz (the old code
-            // emitted at lz-1, one unit inside the neighbor)
-            const float fw = static_cast<float>(width);
-            const float fh = static_cast<float>(height);
-            const QuadCorner corners[4] = {
-                {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz), 0.f, fh},
-                {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz),
-                 fw, fh},
-                {static_cast<float>(col + width), static_cast<float>(row + height),
-                 static_cast<float>(lz), fw, 0.f},
-                {static_cast<float>(col), static_cast<float>(row + height), static_cast<float>(lz),
-                 0.f, 0.f},
-            };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
-        };
-
-        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_Z,
-                        output.vertices, output.indices, emitQuad);
-    }
-
-    // ======================================================================
-    // Flora cross-quads (full LOD only) — non-solid plants never enter the
-    // greedy passes above, so this is their only geometry
-    // ======================================================================
     if (emitFlora) {
         for (int z = 0; z < gridD; ++z) {
             for (int x = 0; x < gridW; ++x) {
@@ -469,6 +484,11 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
             }
         }
     }
+
+    // ---- Water section: everything after this index draws in the water pass
+    output.opaqueIndexCount = static_cast<uint32_t>(output.indices.size());
+    runGreedyPasses(gridW, gridH, gridD, getBlock, waterFaceVisible, lightAt, 0.125f,
+                    output.vertices, output.indices);
 
     return output;
 }

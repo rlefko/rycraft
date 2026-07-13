@@ -26,6 +26,24 @@ struct ChunkOrigin {
     simd_float4 origin;
 };
 
+// Bound at buffer(3) in the water shaders (vertex: wave time; fragment:
+// refraction/reflection/caustics). The water pass composites its own pixels
+// from the resolved opaque scene, so it needs the full camera inverse and
+// the sky palette that the fresnel reflection samples procedurally.
+struct WaterUniforms {
+    simd_float4x4 invViewProjection; // clip → world, for depth reconstruction
+    simd_float3 zenithColor;
+    simd_float3 horizonColor;
+    simd_float3 sunDirection;
+    simd_float3 sunColor;
+    simd_float3 cameraPosition;
+    simd_float3 fogColor;
+    simd_float2 resolution; // scene color/depth texture size in pixels
+    float fogDensity;
+    float time;             // seconds; drives waves + caustics
+    float cameraUnderwater; // 1.0 when the camera is inside water
+};
+
 // Sky gradient + sun disc, bound at buffer(1) in sky.metal.
 struct SkyUniforms {
     simd_float3 zenithColor;
@@ -97,6 +115,13 @@ static_assert(offsetof(Uniforms, sunDirection) == 192);
 static_assert(offsetof(Uniforms, fogColor) == 240);
 static_assert(offsetof(Uniforms, fogDensity) == 256);
 static_assert(offsetof(Uniforms, cameraPosition) == 272);
+
+static_assert(sizeof(WaterUniforms) == 192);
+static_assert(offsetof(WaterUniforms, zenithColor) == 64);
+static_assert(offsetof(WaterUniforms, resolution) == 160);
+static_assert(offsetof(WaterUniforms, fogDensity) == 168);
+static_assert(offsetof(WaterUniforms, time) == 172);
+static_assert(offsetof(WaterUniforms, cameraUnderwater) == 176);
 
 static_assert(sizeof(SkyUniforms) == 80);
 static_assert(offsetof(SkyUniforms, sunIntensity) == 64);

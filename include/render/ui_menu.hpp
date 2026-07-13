@@ -72,6 +72,7 @@ struct UIFrameState {
     GameScreen screen = GameScreen::TITLE;
     int hoveredButton = -1; // index into menu.buttons, -1 = none
     bool showDebugHud = false;
+    bool cameraUnderwater = false; // drives the underwater veil + god rays
     PerformanceStats stats{};
     MenuLayout menu;
 };

@@ -7,10 +7,14 @@
 // Forward declaration
 struct Chunk;
 
-// Output of a single chunk mesh build.
+// Output of a single chunk mesh build. One vertex/index stream holds two
+// sections: indices [0, opaqueIndexCount) draw in the opaque chunk pass,
+// [opaqueIndexCount, indices.size()) are the chunk's water surfaces, drawn
+// by the dedicated water pass. One MegaBuffer allocation serves both.
 struct MeshOutput {
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
+    uint32_t opaqueIndexCount = 0;
 
     MeshOutput() = default;
     MeshOutput(MeshOutput&&) = default;

@@ -18,6 +18,7 @@
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -237,6 +238,66 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         RY_LOG_FATAL("Failed to allocate uniforms buffer");
     }
 
+    _waterUniformsBuffer = [_device newBufferWithLength:sizeof(WaterUniforms)
+                                                options:MTLResourceStorageModeShared];
+    if (!_waterUniformsBuffer) {
+        RY_LOG_FATAL("Failed to allocate water uniforms buffer");
+    }
+
+    // ---- Water pipeline states ----
+    // Water composites its own pixels from the resolved scene: single
+    // sample, color-only (manual depth test in the shader), no blending.
+    {
+        id<MTLFunction> waterVertexFunc = [shaderLibrary newFunctionWithName:@"waterVertexMain"];
+        id<MTLFunction> waterFragmentFunc =
+            [shaderLibrary newFunctionWithName:@"waterFragmentMain"];
+        if (!waterVertexFunc || !waterFragmentFunc) {
+            RY_LOG_FATAL("Failed to load water shader functions");
+        }
+        auto waterDesc = [[MTLRenderPipelineDescriptor alloc] init];
+        waterDesc.vertexFunction = waterVertexFunc;
+        waterDesc.fragmentFunction = waterFragmentFunc;
+        waterDesc.vertexDescriptor = vertexDesc;
+        waterDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        waterDesc.rasterSampleCount = 1;
+        _waterPipelineState = [_device newRenderPipelineStateWithDescriptor:waterDesc error:&error];
+        if (!_waterPipelineState) {
+            NSString* msg = [NSString stringWithFormat:@"Failed to create water pipeline: %@",
+                                                       error.localizedDescription];
+            RY_LOG_FATAL(msg.UTF8String);
+        }
+
+        id<MTLFunction> overlayVertexFunc =
+            [shaderLibrary newFunctionWithName:@"underwaterOverlayVertex"];
+        id<MTLFunction> overlayFragmentFunc =
+            [shaderLibrary newFunctionWithName:@"underwaterOverlayFragment"];
+        if (!overlayVertexFunc || !overlayFragmentFunc) {
+            RY_LOG_FATAL("Failed to load underwater overlay shader functions");
+        }
+        auto overlayDesc = [[MTLRenderPipelineDescriptor alloc] init];
+        overlayDesc.vertexFunction = overlayVertexFunc;
+        overlayDesc.fragmentFunction = overlayFragmentFunc;
+        overlayDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        overlayDesc.colorAttachments[0].blendingEnabled = true;
+        overlayDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        overlayDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        overlayDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        overlayDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        overlayDesc.colorAttachments[0].destinationRGBBlendFactor =
+            MTLBlendFactorOneMinusSourceAlpha;
+        overlayDesc.colorAttachments[0].destinationAlphaBlendFactor =
+            MTLBlendFactorOneMinusSourceAlpha;
+        overlayDesc.rasterSampleCount = 1;
+        _underwaterOverlayState = [_device newRenderPipelineStateWithDescriptor:overlayDesc
+                                                                          error:&error];
+        if (!_underwaterOverlayState) {
+            NSString* msg =
+                [NSString stringWithFormat:@"Failed to create underwater overlay pipeline: %@",
+                                           error.localizedDescription];
+            RY_LOG_FATAL(msg.UTF8String);
+        }
+    }
+
     // ---- MegaBuffer (centralized GPU memory for chunk meshes) ----
     _megaBuffer = std::make_unique<MegaBuffer>(_device);
 
@@ -334,6 +395,35 @@ void RenderPipeline::allocateSceneTargets() {
     if (!_colorResolve) {
         RY_LOG_FATAL("Failed to allocate color resolve texture");
     }
+
+    // ---- Water pass inputs ----
+    // The scene depth resolves here (min filter: nearest sample wins) so the
+    // water shader can depth-test and reconstruct the world behind pixels.
+    auto depthResolveDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                           width:_displayWidth
+                                                          height:_displayHeight
+                                                       mipmapped:false];
+    depthResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    depthResolveDesc.storageMode = MTLStorageModePrivate;
+    _depthResolve = [_device newTextureWithDescriptor:depthResolveDesc];
+    if (!_depthResolve) {
+        RY_LOG_FATAL("Failed to allocate depth resolve texture");
+    }
+
+    // Refraction samples a copy of the resolved color (a render target
+    // cannot sample itself)
+    auto sceneCopyDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:_displayWidth
+                                                          height:_displayHeight
+                                                       mipmapped:false];
+    sceneCopyDesc.usage = MTLTextureUsageShaderRead;
+    sceneCopyDesc.storageMode = MTLStorageModePrivate;
+    _sceneColorCopy = [_device newTextureWithDescriptor:sceneCopyDesc];
+    if (!_sceneColorCopy) {
+        RY_LOG_FATAL("Failed to allocate scene copy texture");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,9 +484,13 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(
         skyUniforms.horizonColor.x, skyUniforms.horizonColor.y, skyUniforms.horizonColor.z, 1.0f);
 
+    // Depth resolves out of tile memory (min filter: nearest sample) so the
+    // water pass can depth-test and reconstruct world positions.
     renderPassDesc.depthAttachment.texture = _depthMSAA;
+    renderPassDesc.depthAttachment.resolveTexture = _depthResolve;
     renderPassDesc.depthAttachment.loadAction = MTLLoadActionClear;
-    renderPassDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
+    renderPassDesc.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
+    renderPassDesc.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterMin;
     renderPassDesc.depthAttachment.clearDepth = 1.0;
 
     id<MTLRenderCommandEncoder> encoder =
@@ -406,8 +500,16 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
 
     renderSky(encoder);
 
-    const float fogColor[3] = {skyUniforms.horizonColor.x, skyUniforms.horizonColor.y,
-                               skyUniforms.horizonColor.z};
+    // Underwater the whole scene sinks into a dense blue veil (light
+    // attenuation); the water pass adds the god-ray overlay on top.
+    const bool cameraUnderwater = uiFrame.cameraUnderwater;
+    const float fogColor[3] = {cameraUnderwater ? 0.05f : skyUniforms.horizonColor.x,
+                               cameraUnderwater ? 0.15f : skyUniforms.horizonColor.y,
+                               cameraUnderwater ? 0.32f : skyUniforms.horizonColor.z};
+    const float savedFogDensity = _fogDensity;
+    if (cameraUnderwater) {
+        _fogDensity = std::max(_fogDensity, 0.035f);
+    }
     renderChunks(encoder, world, viewMatrix, projectionMatrix, camera.getPosition(), sunDirection,
                  sunColor, ambientColor, fogColor);
 
@@ -427,6 +529,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderClouds(encoder, camera, worldTime, sunDirection);
 
     [encoder endEncoding];
+
+    // ---- Water pass (refraction/reflection/caustics over the resolved scene) ----
+    renderWater(commandBuffer, viewMatrix, projectionMatrix, camera.getPosition(), cameraUnderwater,
+                skyUniforms, fogColor, worldTime);
+    _fogDensity = savedFogDensity;
 
     // ---- Bloom (extract/blur, then composite into the drawable) ----
     // With zero intensity the bloom pipeline is skipped and the resolved
@@ -698,6 +805,9 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // full detail; see the LOD note in lod_mesher.hpp.
     LODMesher lodMesher;
 
+    // Water draws recorded here render later, in the dedicated water pass
+    _waterDraws.clear();
+
     auto loadedChunks = world.getLoadedChunks();
 
     // Sweep mesh allocations of chunks the world has since unloaded BEFORE
@@ -771,6 +881,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                                                mesh.indices.size() * sizeof(uint32_t),
                                                alloc.indexOffset);
                     state.alloc = alloc;
+                    state.opaqueIndexCount = mesh.opaqueIndexCount;
                     state.uploaded = true;
                 } catch (const std::exception& e) {
                     if (!allocFailureLogged) {
@@ -801,6 +912,22 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         ChunkOrigin origin{};
         origin.origin = simd_make_float4(static_cast<float>(chunk->chunkX * CHUNK_WIDTH), 0.0f,
                                          static_cast<float>(chunk->chunkZ * CHUNK_DEPTH), 0.0f);
+
+        // The chunk's water section renders after the scene resolves
+        uint32_t waterIndexCount = meshState.alloc.indexCount - meshState.opaqueIndexCount;
+        if (waterIndexCount > 0) {
+            float dx = static_cast<float>(chunk->chunkX * CHUNK_WIDTH + CHUNK_WIDTH / 2) - camX;
+            float dz = static_cast<float>(chunk->chunkZ * CHUNK_DEPTH + CHUNK_DEPTH / 2) - camZ;
+            _waterDraws.push_back(WaterDraw{
+                origin.origin, meshState.alloc.vertexBuffer, meshState.alloc.indexBuffer,
+                meshState.alloc.vertexOffset,
+                meshState.alloc.indexOffset + meshState.opaqueIndexCount * sizeof(uint32_t),
+                waterIndexCount, dx * dx + dz * dz});
+        }
+
+        if (meshState.opaqueIndexCount == 0)
+            continue;
+
         [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
 
         // Bind vertex buffer from MegaBuffer allocation
@@ -810,7 +937,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
 
         // Draw indexed primitives (triangles)
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                            indexCount:meshState.alloc.indexCount
+                            indexCount:meshState.opaqueIndexCount
                              indexType:MTLIndexTypeUInt32
                            indexBuffer:meshState.alloc.indexBuffer
                      indexBufferOffset:meshState.alloc.indexOffset];
@@ -827,6 +954,101 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     }
     _chunkStats.megaUsedMB = static_cast<float>(_megaBuffer->vertexUsed()) / (1024.f * 1024.f);
     _chunkStats.megaCapMB = static_cast<float>(_megaBuffer->vertexCapacity()) / (1024.f * 1024.f);
+}
+
+// ---------------------------------------------------------------------------
+// renderWater — the water surfaces recorded by renderChunks, drawn into the
+// resolved scene color with their own compositing (refraction from a copy
+// of the scene, manual depth test against the resolved depth). Nearest
+// chunks draw last so the closest surface owns the pixel. Ends with the
+// underwater veil + god rays when the camera is submerged.
+// ---------------------------------------------------------------------------
+void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4& viewMatrix,
+                                 const Mat4& projectionMatrix, const Vec3& cameraPosition,
+                                 bool cameraUnderwater, const SkyUniforms& skyUniforms,
+                                 const float fogColor[3], uint64_t worldTime) {
+    if (_waterDraws.empty() && !cameraUnderwater)
+        return;
+
+    // Refraction input: copy the resolved scene (a render target cannot
+    // sample itself)
+    if (!_waterDraws.empty()) {
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        if (blit) {
+            [blit copyFromTexture:_colorResolve
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(_colorResolve.width, _colorResolve.height, 1)
+                        toTexture:_sceneColorCopy
+                 destinationSlice:0
+                 destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [blit endEncoding];
+        }
+    }
+
+    WaterUniforms wu{};
+    simd_float4x4 view, proj;
+    std::memcpy(&view, viewMatrix.data.data(), sizeof(view));
+    std::memcpy(&proj, projectionMatrix.data.data(), sizeof(proj));
+    wu.invViewProjection = simd_inverse(simd_mul(proj, view));
+    wu.zenithColor = skyUniforms.zenithColor;
+    wu.horizonColor = skyUniforms.horizonColor;
+    wu.sunDirection = skyUniforms.sunDirection;
+    wu.sunColor = skyUniforms.sunColor;
+    wu.cameraPosition = simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+    wu.fogColor = simd_make_float3(fogColor[0], fogColor[1], fogColor[2]);
+    wu.resolution =
+        simd_make_float2(static_cast<float>(_displayWidth), static_cast<float>(_displayHeight));
+    wu.fogDensity = _fogDensity;
+    // 20 Hz world time → seconds (the same stepping the clouds animate with)
+    wu.time = static_cast<float>(worldTime % 24000) * 0.05f;
+    wu.cameraUnderwater = cameraUnderwater ? 1.f : 0.f;
+    std::memcpy((void*)_waterUniformsBuffer.contents, &wu, sizeof(WaterUniforms));
+
+    auto passDesc = [[MTLRenderPassDescriptor alloc] init];
+    passDesc.colorAttachments[0].texture = _colorResolve;
+    passDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
+    if (!encoder)
+        return;
+
+    if (!_waterDraws.empty()) {
+        // Back-to-front: the nearest surface draws last and wins the pixel
+        std::sort(_waterDraws.begin(), _waterDraws.end(),
+                  [](const WaterDraw& a, const WaterDraw& b) { return a.distSq > b.distSq; });
+
+        [encoder setRenderPipelineState:_waterPipelineState];
+        [encoder setCullMode:MTLCullModeNone]; // surface visible from below
+        [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
+        [encoder setVertexBuffer:_waterUniformsBuffer offset:0 atIndex:3];
+        [encoder setFragmentBuffer:_waterUniformsBuffer offset:0 atIndex:3];
+        [encoder setFragmentTexture:_sceneColorCopy atIndex:0];
+        [encoder setFragmentTexture:_depthResolve atIndex:1];
+
+        for (const WaterDraw& draw : _waterDraws) {
+            ChunkOrigin origin{draw.origin};
+            [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
+            [encoder setVertexBuffer:draw.vertexBuffer offset:draw.vertexOffset atIndex:0];
+            [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:draw.indexCount
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:draw.indexBuffer
+                         indexBufferOffset:draw.indexOffset];
+        }
+    }
+
+    if (cameraUnderwater) {
+        [encoder setRenderPipelineState:_underwaterOverlayState];
+        [encoder setFragmentBuffer:_waterUniformsBuffer offset:0 atIndex:3];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+
+    [encoder endEncoding];
 }
 
 // ---------------------------------------------------------------------------

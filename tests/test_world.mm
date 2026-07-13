@@ -86,13 +86,17 @@ TEST_CASE("Block properties: flora, liquid, and targetable sets", "[block]") {
     }
     REQUIRE(!isFlora(BlockType::CACTUS)); // cactus is a full cube
 
-    // Liquids: swimmable, non-solid, click-through
+    // Liquids: swimmable, non-solid, click-through. Water renders in the
+    // water pass (non-opaque); lava draws as an emissive opaque cube.
     for (BlockType bt : {BlockType::WATER, BlockType::LAVA}) {
         REQUIRE(isLiquid(bt));
         REQUIRE(!isSolid(bt));
-        REQUIRE(!isOpaque(bt));
         REQUIRE(!isTargetable(bt));
     }
+    REQUIRE(!isOpaque(BlockType::WATER));
+    REQUIRE(isOpaque(BlockType::LAVA));
+    REQUIRE(rendersAsCube(BlockType::LAVA));
+    REQUIRE(!rendersAsCube(BlockType::WATER));
 
     // Cube blocks added by the worldgen overhaul stay solid + opaque
     for (BlockType bt :

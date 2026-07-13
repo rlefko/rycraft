@@ -184,6 +184,62 @@ TEST_CASE("Mesher: flora does not break greedy merging of the ground", "[render]
     REQUIRE(output.vertices.size() == 32);
 }
 
+TEST_CASE("Mesher: water surfaces land in the water section", "[render][mesher][water]") {
+    Chunk chunk(0, 0);
+    // Stone floor with one water block on top: the water's top face (under
+    // air) and four sides are water-section; the floor's faces are opaque.
+    chunk.setBlock(8, 60, 8, BlockType::STONE);
+    chunk.setBlock(8, 61, 8, BlockType::WATER);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // Opaque: stone cube 6 faces (water doesn't hide the +Y face) = 36 idx.
+    // Water: top + 4 sides = 5 quads = 30 indices (bottom hidden by stone).
+    REQUIRE(output.opaqueIndexCount == 36);
+    REQUIRE(output.indices.size() == 66);
+
+    // The water top surface sits 0.125 below the cell top (fp16-exact)
+    bool foundDroppedTop = false;
+    for (const Vertex& v : output.vertices) {
+        if (static_cast<float>(v.py) == 61.875f)
+            foundDroppedTop = true;
+    }
+    REQUIRE(foundDroppedTop);
+}
+
+TEST_CASE("Mesher: interior water-water faces are culled", "[render][mesher][water]") {
+    Chunk chunk(0, 0);
+    // 2x2x2 water cube on a stone slab
+    for (int z = 4; z < 6; ++z)
+        for (int x = 4; x < 6; ++x) {
+            chunk.setBlock(x, 59, z, BlockType::STONE);
+            chunk.setBlock(x, 60, z, BlockType::WATER);
+            chunk.setBlock(x, 61, z, BlockType::WATER);
+        }
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // Water section: greedy-merged top (1 quad) + 4 merged side walls
+    // (2 wide × 2 tall each → 1 quad per direction) = 5 quads = 30 indices
+    uint32_t waterIndexCount =
+        static_cast<uint32_t>(output.indices.size()) - output.opaqueIndexCount;
+    REQUIRE(waterIndexCount == 30);
+}
+
+TEST_CASE("Mesher: lava renders as an opaque cube section", "[render][mesher][water]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 8, 8, BlockType::LAVA);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // 6 faces, all in the opaque section; nothing in the water section
+    REQUIRE(output.opaqueIndexCount == 36);
+    REQUIRE(output.indices.size() == 36);
+}
+
 TEST_CASE("Mesher: flora is skipped at coarse LODs", "[render][mesher][flora]") {
     Chunk chunk(0, 0);
     for (int z = 0; z < CHUNK_DEPTH; ++z)
@@ -716,6 +772,15 @@ TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types
     REQUIRE(sizeof(SkyUniforms) == 80);
     REQUIRE(offsetof(SkyUniforms, horizonColor) == 16);
     REQUIRE(offsetof(SkyUniforms, sunIntensity) == 64);
+}
+
+TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(WaterUniforms) == 192);
+    REQUIRE(offsetof(WaterUniforms, zenithColor) == 64);
+    REQUIRE(offsetof(WaterUniforms, resolution) == 160);
+    REQUIRE(offsetof(WaterUniforms, fogDensity) == 168);
+    REQUIRE(offsetof(WaterUniforms, time) == 172);
+    REQUIRE(offsetof(WaterUniforms, cameraUnderwater) == 176);
 }
 
 TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-types]") {

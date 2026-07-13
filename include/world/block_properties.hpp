@@ -82,12 +82,12 @@ constexpr bool isSolid(BlockType type) {
 // Meshing/occlusion: blocks that fully hide their neighbors' faces. Leaf
 // variants and glass are alpha-cutout textures (their transparent texels
 // are discarded in the fragment shader), so the faces behind them must
-// render; the same goes for non-cube flora and for liquids.
+// render; the same goes for non-cube flora and for water. Lava is opaque:
+// it renders as a full emissive cube even though entities swim through it.
 constexpr bool isOpaque(BlockType type) {
     switch (type) {
         case BlockType::AIR:
         case BlockType::WATER:
-        case BlockType::LAVA:
         case BlockType::LEAVES:
         case BlockType::BIRCH_LEAVES:
         case BlockType::SPRUCE_LEAVES:
@@ -96,6 +96,13 @@ constexpr bool isOpaque(BlockType type) {
         default:
             return !isFlora(type);
     }
+}
+
+// Meshing: blocks the opaque chunk pass emits cube faces for. Wider than
+// isSolid by exactly lava (swim-through but drawn as a cube); water renders
+// in the dedicated water pass instead.
+constexpr bool rendersAsCube(BlockType type) {
+    return isSolid(type) || type == BlockType::LAVA;
 }
 
 // Light/visibility: blocks you can (at least partially) see through.

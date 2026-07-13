@@ -929,6 +929,15 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.screen = state->flow.screen;
     uiFrame.hoveredButton = state->hoveredButton;
     uiFrame.showDebugHud = state->showDebugHud;
+    // Underwater view (veil, god rays, dense fog): the camera cell is water.
+    // The camera chunk is always loaded, so this getBlock never generates.
+    {
+        Vec3 camPos = state->camera.getPosition();
+        uiFrame.cameraUnderwater =
+            state->world->getBlock(static_cast<int>(std::floor(camPos.x)),
+                                   static_cast<int>(std::floor(camPos.y)),
+                                   static_cast<int>(std::floor(camPos.z))) == BlockType::WATER;
+    }
     uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
     uiFrame.stats.fps = state->smoothedFrameMs > 0.f ? 1000.0f / state->smoothedFrameMs : 0.f;
     uiFrame.stats.chunkCount = state->cachedChunkCount;
