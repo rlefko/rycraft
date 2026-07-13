@@ -131,6 +131,7 @@ void World::setBlock(int x, int y, int z, BlockType type) {
     auto it = chunks_.find(ChunkPos{cx, cz});
     if (it != chunks_.end()) {
         it->second->setBlockWorld(x, y, z, type);
+        it->second->modifiedSinceSave = true;
     }
 }
 
@@ -212,20 +213,54 @@ void World::updatePlayerPosition(int playerX, int playerZ) {
 }
 
 void World::unloadDistantChunks() {
-    std::lock_guard<std::mutex> lock(chunksMutex_);
-    auto it = chunks_.begin();
-    while (it != chunks_.end()) {
-        int cx = it->second->chunkX;
-        int cz = it->second->chunkZ;
+    // Collect under the lock, save after releasing it (never do I/O under
+    // chunksMutex_ — the render thread takes it every frame)
+    std::vector<std::shared_ptr<Chunk>> toSave;
+    {
+        std::lock_guard<std::mutex> lock(chunksMutex_);
+        auto it = chunks_.begin();
+        while (it != chunks_.end()) {
+            int cx = it->second->chunkX;
+            int cz = it->second->chunkZ;
 
-        int distX = std::abs(cx - playerChunkX_);
-        int distZ = std::abs(cz - playerChunkZ_);
+            int distX = std::abs(cx - playerChunkX_);
+            int distZ = std::abs(cz - playerChunkZ_);
 
-        if (distX > viewDistance_ || distZ > viewDistance_) {
-            it = chunks_.erase(it);
-        } else {
-            ++it;
+            if (distX > viewDistance_ || distZ > viewDistance_) {
+                if (it->second->modifiedSinceSave && saveManager_) {
+                    it->second->modifiedSinceSave = false;
+                    toSave.push_back(it->second);
+                }
+                it = chunks_.erase(it);
+            } else {
+                ++it;
+            }
         }
+    }
+
+    for (auto& chunk : toSave) {
+        // The chunk left the map: no game thread mutates it anymore, so the
+        // save thread may serialize it lock-free
+        saveManager_->saveChunkAsync(std::move(chunk));
+    }
+}
+
+void World::saveModifiedChunks() {
+    if (!saveManager_) {
+        return;
+    }
+    std::vector<std::shared_ptr<Chunk>> toSave;
+    {
+        std::lock_guard<std::mutex> lock(chunksMutex_);
+        for (auto& [key, chunk] : chunks_) {
+            if (chunk->modifiedSinceSave) {
+                chunk->modifiedSinceSave = false;
+                toSave.push_back(chunk);
+            }
+        }
+    }
+    for (auto& chunk : toSave) {
+        saveManager_->saveChunkAsync(std::move(chunk));
     }
 }
 

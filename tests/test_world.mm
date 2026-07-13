@@ -1053,6 +1053,71 @@ TEST_CASE("SaveManager save/load chunk roundtrip", "[save]") {
     }
 }
 
+TEST_CASE("SaveManager: chunks in one region never clobber each other", "[save]") {
+    // Regression: the old packed-region format wrote ONE chunk per region
+    // file, so every chunk save silently destroyed its 1023 region-mates.
+    TempDir tempDirGuard("save_multi");
+    SaveManager saver(tempDirGuard.path());
+
+    // Same region (0,0), region border, and the next region over
+    const std::pair<int, int> coords[] = {{0, 0}, {1, 0}, {31, 31}, {32, 0}, {-1, -1}};
+    int marker = 1;
+    for (auto [cx, cz] : coords) {
+        Chunk chunk(cx, cz);
+        chunk.setBlock(1, 100 + marker, 1, BlockType::GOLD_ORE);
+        chunk.generated = true;
+        saver.saveChunk(chunk);
+        ++marker;
+    }
+    saver.flush();
+
+    marker = 1;
+    for (auto [cx, cz] : coords) {
+        auto loaded = saver.loadChunk(cx, cz);
+        REQUIRE(loaded.has_value());
+        REQUIRE(loaded->chunkX == cx);
+        REQUIRE(loaded->chunkZ == cz);
+        REQUIRE(loaded->getBlock(1, 100 + marker, 1) == BlockType::GOLD_ORE);
+        ++marker;
+    }
+}
+
+TEST_CASE("SaveManager: queued chunks are readable before the write lands", "[save]") {
+    // The load shield: unloading a chunk queues it; walking straight back
+    // must return the queued edits even if the file hasn't been written yet.
+    TempDir tempDirGuard("save_shield");
+    SaveManager saver(tempDirGuard.path());
+
+    auto chunk = std::make_shared<Chunk>(3, 4);
+    chunk->setBlock(2, 90, 2, BlockType::DIAMOND_ORE);
+    chunk->generated = true;
+    saver.saveChunkAsync(chunk);
+
+    // No flush: the job may or may not have been written yet — either way
+    // the loaded chunk must carry the edit.
+    auto loaded = saver.loadChunk(3, 4);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->getBlock(2, 90, 2) == BlockType::DIAMOND_ORE);
+    saver.flush();
+}
+
+TEST_CASE("World: edited chunks persist through unload-and-return", "[world][save]") {
+    TempDir tempDirGuard("save_unload");
+    SaveManager saver(tempDirGuard.path());
+    World world(4321, 1);
+    world.setSaveManager(&saver);
+
+    world.getChunk(0, 0);
+    world.setBlock(5, 150, 5, BlockType::PLANKS);
+
+    // Walk far away: (0,0) leaves the radius and queues for saving…
+    world.updatePlayerPosition(10 * CHUNK_WIDTH, 10 * CHUNK_DEPTH);
+    // …then come back: the reloaded chunk must carry the edit
+    auto chunk = world.getChunk(0, 0);
+    REQUIRE(chunk->getBlock(5, 150, 5) == BlockType::PLANKS);
+    saver.flush();
+}
+
 TEST_CASE("SaveManager load non-existent chunk returns nullopt", "[save]") {
     TempDir tempDirGuard("save_missing");
     const std::string& tempDir = tempDirGuard.path();

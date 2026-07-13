@@ -60,8 +60,13 @@ public:
     // Update chunks around player position (synchronous)
     void updatePlayerPosition(int playerX, int playerZ);
 
-    // Unload chunks outside the view distance (called by updatePlayerPosition)
+    // Unload chunks outside the view distance (called by updatePlayerPosition).
+    // Edited chunks queue for saving as they leave the map.
     void unloadDistantChunks();
+
+    // Queue every still-loaded edited chunk for saving (quit path — callers
+    // must not mutate blocks afterward until SaveManager::flush returns)
+    void saveModifiedChunks();
 
     // Start async generation of chunks around player
     void generateAroundPlayer(int playerX, int playerZ);

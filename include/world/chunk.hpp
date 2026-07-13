@@ -52,6 +52,10 @@ struct Chunk {
     bool meshed = false;
     bool generated = false;
 
+    // Player edits since the last save — only these chunks persist on
+    // unload/quit (regenerated chunks are pure functions of the seed)
+    bool modifiedSinceSave = false;
+
     Chunk(int cx, int cz);
 
     // Block access

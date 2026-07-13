@@ -521,6 +521,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
     EngineState* state = _state.get();
     if (state->saveManager && state->world) {
+        // Edited chunks persist on unload; the quit path sweeps the rest
+        state->world->saveModifiedChunks();
         state->saveManager->saveMetadata(state->world->getSeed(), state->player.position,
                                          state->worldTime);
         state->saveManager->flush();
@@ -787,17 +789,12 @@ static EngineState* _engineGetState(Engine* engine) {
         state->world->setBlock(hitX, hitY + 1, hitZ, BlockType::AIR);
     }
 
-    // Mark chunk dirty
+    // Mark chunk dirty (edits persist via save-on-unload + the quit sweep)
     int chunkX = Chunk::worldToChunk(hitX);
     int chunkZ = Chunk::worldToChunk(hitZ);
     auto chunk = state->world->getChunk(chunkX, chunkZ);
     if (chunk) {
         chunk->markDirty();
-    }
-
-    // Trigger save of dirty chunk
-    if (state->saveManager && chunk) {
-        state->saveManager->saveChunk(*chunk);
     }
 
     // Clear highlight since block is now air
@@ -853,13 +850,6 @@ static EngineState* _engineGetState(Engine* engine) {
         markChunkDirty(chunkX, chunkZ - 1);
     if (localZ == CHUNK_DEPTH - 1)
         markChunkDirty(chunkX, chunkZ + 1);
-
-    // Save affected chunk
-    if (state->saveManager) {
-        auto chunk = state->world->getChunk(chunkX, chunkZ);
-        if (chunk)
-            state->saveManager->saveChunk(*chunk);
-    }
 
     [self playSfx:state->sfxBlockPlace gain:0.8f];
 }
