@@ -701,94 +701,89 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
     [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
 
-    // LOD mesher instance (stateless — safe to reuse)
+    // Bind the shared atlas + uniforms once; every chunk draw reuses them
+    [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
+    [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
+    [encoder setFragmentTexture:_textureAtlas->texture() atIndex:0];
+    [encoder setFragmentSamplerState:_textureAtlas->sampler() atIndex:0];
+
+    // LOD mesher instance (stateless — safe to reuse). Everything renders at
+    // full detail; see the LOD note in lod_mesher.hpp.
     LODMesher lodMesher;
 
-    // Draw chunks (with frustum culling and distance-based LOD)
     auto loadedChunks = world.getLoadedChunks();
 
+    // Cap mesh builds per frame so a burst of freshly generated chunks
+    // amortizes over a few frames instead of stalling one.
+    constexpr int MAX_MESH_BUILDS_PER_FRAME = 16;
+    int meshBuilds = 0;
+    bool allocFailureLogged = false;
+
+    _liveChunkKeys.clear();
+
     for (auto& chunk : loadedChunks) {
-        if (!chunk || !chunk->meshed) continue;
+        if (!chunk || !chunk->generated) continue;
+
+        // Chunk key for mesh cache lookup (packed int64, no allocation)
+        uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(chunk->chunkX)) << 32) |
+                        static_cast<uint64_t>(static_cast<uint32_t>(chunk->chunkZ));
+        _liveChunkKeys.insert(key);
 
         // Frustum culling
         AABB chunkAABB = chunk->getAABB();
         if (!isChunkInFrustum(chunkAABB)) continue;
 
-        // Compute distance from camera to chunk center (in blocks)
-        Vec3 chunkCenter = chunkAABB.center();
-        float dx = chunkCenter.x - camX;
-        float dy = chunkCenter.y - camY;
-        float dz = chunkCenter.z - camZ;
-        int distanceBlocks = static_cast<int>(std::sqrt(dx * dx + dy * dy + dz * dz));
+        // (Re)build the mesh when the chunk is dirty or was never meshed
+        auto cached = _chunkMeshes.find(key);
+        const bool needsBuild = chunk->needsMeshUpdate || cached == _chunkMeshes.end();
+        if (needsBuild && meshBuilds < MAX_MESH_BUILDS_PER_FRAME) {
+            ++meshBuilds;
 
-        // Select LOD level based on distance
-        int lodLevel = LODMesher::computeLODLevel(distanceBlocks);
-
-        // Chunk key for mesh cache lookup (packed int64, no allocation)
-        uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(chunk->chunkX)) << 32) |
-                        static_cast<uint64_t>(static_cast<uint32_t>(chunk->chunkZ));
-
-        // Mesh dirty chunks on demand (invalidate all LOD levels)
-        if (chunk->needsMeshUpdate) {
-            auto cit = _chunkMeshes.find(key);
-            if (cit != _chunkMeshes.end()) {
-                for (auto& [_, state] : cit->second) {
-                    if (state.uploaded) {
-                        _megaBuffer->free(state.alloc);
-                    }
+            if (cached != _chunkMeshes.end()) {
+                if (cached->second.uploaded) {
+                    _megaBuffer->free(cached->second.alloc);
                 }
-                cit->second.clear();
+                _chunkMeshes.erase(cached);
             }
 
-            MeshOutput mesh = lodMesher.buildMesh(*chunk, lodLevel);
-
-            if (!mesh.vertices.empty()) {
-                uint32_t vertCount = static_cast<uint32_t>(mesh.vertices.size());
-                uint32_t idxCount = static_cast<uint32_t>(mesh.indices.size());
-
-                auto alloc = _megaBuffer->allocate(vertCount, idxCount);
-
-                _megaBuffer->uploadVertices(
-                    mesh.vertices.data(),
-                    vertCount * sizeof(Vertex),
-                    alloc.vertexOffset
-                );
-                _megaBuffer->uploadIndices(
-                    mesh.indices.data(),
-                    idxCount * sizeof(uint32_t),
-                    alloc.indexOffset
-                );
-
-                ChunkMeshState state;
-                state.alloc = alloc;
-                state.uploaded = true;
-
-                _chunkMeshes[key][lodLevel] = state;
-            }
-
+            MeshOutput mesh = lodMesher.buildMesh(*chunk, static_cast<int>(ChunkLOD::Full));
             chunk->setMeshed(true);
             chunk->needsMeshUpdate = false;
+
+            ChunkMeshState state;  // uploaded == false marks an empty mesh
+            if (!mesh.vertices.empty()) {
+                try {
+                    auto alloc = _megaBuffer->allocate(
+                        static_cast<uint32_t>(mesh.vertices.size()),
+                        static_cast<uint32_t>(mesh.indices.size()));
+                    _megaBuffer->uploadVertices(mesh.vertices.data(),
+                                                mesh.vertices.size() * sizeof(Vertex),
+                                                alloc.vertexOffset);
+                    _megaBuffer->uploadIndices(mesh.indices.data(),
+                                               mesh.indices.size() * sizeof(uint32_t),
+                                               alloc.indexOffset);
+                    state.alloc = alloc;
+                    state.uploaded = true;
+                } catch (const std::exception& e) {
+                    if (!allocFailureLogged) {
+                        RY_LOG_ERROR((std::string("Chunk mesh upload failed: ") + e.what()).c_str());
+                        allocFailureLogged = true;
+                    }
+                }
+            }
+            _chunkMeshes[key] = state;
         }
 
-        // Look up cached mesh state for this LOD level
-        auto cit = _chunkMeshes.find(key);
-        if (cit == _chunkMeshes.end()) continue;
+        cached = _chunkMeshes.find(key);
+        if (cached == _chunkMeshes.end() || !cached->second.uploaded) continue;
 
-        auto lodIt = cit->second.find(lodLevel);
-        if (lodIt == cit->second.end() || !lodIt->second.uploaded) continue;
-
-        const auto& meshState = lodIt->second;
-
+        const auto& meshState = cached->second;
         if (meshState.alloc.indexCount == 0) continue;
 
         // Bind vertex buffer from MegaBuffer allocation
         [encoder setVertexBuffer:meshState.alloc.vertexBuffer
                             offset:meshState.alloc.vertexOffset
                           atIndex:0];
-        [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
-        [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
-        [encoder setFragmentTexture:_textureAtlas->texture() atIndex:0];
-        [encoder setFragmentSamplerState:_textureAtlas->sampler() atIndex:0];
 
         // Draw indexed primitives (triangles)
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
@@ -796,6 +791,18 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
                                indexType:MTLIndexTypeUInt32
                              indexBuffer:meshState.alloc.indexBuffer
                          indexBufferOffset:meshState.alloc.indexOffset];
+    }
+
+    // Sweep mesh allocations of chunks the world has since unloaded
+    for (auto it = _chunkMeshes.begin(); it != _chunkMeshes.end();) {
+        if (_liveChunkKeys.count(it->first) == 0) {
+            if (it->second.uploaded) {
+                _megaBuffer->free(it->second.alloc);
+            }
+            it = _chunkMeshes.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 

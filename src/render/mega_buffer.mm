@@ -77,13 +77,13 @@ MegaBuffer::MegaBuffer(
     , _indexPtr(0)
 {
     _vertexBuffer = [device newBufferWithLength:static_cast<NSUInteger>(vertexSize)
-                                         options:MTLResourceStorageModePrivate];
+                                         options:MTLResourceStorageModeShared];
     if (!_vertexBuffer) {
         std::terminate();
     }
 
     _indexBuffer = [device newBufferWithLength:static_cast<NSUInteger>(indexSize)
-                                        options:MTLResourceStorageModePrivate];
+                                        options:MTLResourceStorageModeShared];
     if (!_indexBuffer) {
         std::terminate();
     }

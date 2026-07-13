@@ -1035,8 +1035,28 @@ TEST_CASE("World updatePlayerPosition loads surrounding chunks", "[world]") {
   auto world = std::make_shared<World>(42);
   world->setViewDistance(2);
   world->updatePlayerPosition(256, 256);
+
+  // Generation streams in on the worker pool; wait for it to settle.
+  for (int i = 0; i < 500 && world->getPendingChunkCount() > 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
   auto chunks = world->getLoadedChunks();
   REQUIRE(chunks.size() == 25);
+}
+
+TEST_CASE("World updatePlayerPosition streams the spawn area on first call", "[world]") {
+  auto world = std::make_shared<World>(42);
+  world->setViewDistance(1);
+
+  // The player spawns in chunk (0,0) — the very position the tracker starts
+  // at. The first call must still trigger streaming.
+  world->updatePlayerPosition(0, 0);
+  for (int i = 0; i < 500 && world->getPendingChunkCount() > 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  REQUIRE(world->getLoadedChunks().size() == 9);
 }
 
 // ============================================================================

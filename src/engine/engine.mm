@@ -102,7 +102,9 @@ static EngineState* _engineGetState(Engine* engine) {
         _queue = nil;
         _scrollAccumulator = 0;
         _state = std::make_unique<EngineState>();
-        _state->world = std::make_shared<World>(42);
+        // View distance 12 keeps the full-detail mesh set comfortably inside
+        // the 128 MB mega-buffer (25×25 chunks ≈ 60 MB of vertex data).
+        _state->world = std::make_shared<World>(42, 12);
         _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
         // Spawn player above terrain
         _state->player.position = Vec3{0.f, 100.f, 0.f};

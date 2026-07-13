@@ -16,7 +16,16 @@ World::World(uint32_t seed, int viewDistance)
 {
 }
 
-World::~World() = default;
+World::~World() {
+    // Wait for in-flight generation tasks: they capture `this` and insert
+    // into chunks_, so destroying the World underneath them is a use-after-free.
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    for (auto& [key, future] : pendingGenerations_) {
+        if (future.valid()) {
+            future.wait();
+        }
+    }
+}
 
 std::string World::chunkKey(int cx, int cz) {
     std::ostringstream oss;
@@ -212,21 +221,18 @@ void World::updatePlayerPosition(int playerX, int playerZ) {
     int newPlayerChunkX = Chunk::worldToChunk(playerX);
     int newPlayerChunkZ = Chunk::worldToChunk(playerZ);
 
-    if (newPlayerChunkX == playerChunkX_ && newPlayerChunkZ == playerChunkZ_) {
+    if (hasPlayerChunk_ && newPlayerChunkX == playerChunkX_ && newPlayerChunkZ == playerChunkZ_) {
         return;
     }
 
+    hasPlayerChunk_ = true;
     playerChunkX_ = newPlayerChunkX;
     playerChunkZ_ = newPlayerChunkZ;
 
-    // Load chunks around player (getChunk locks chunksMutex_ internally)
-    for (int dz = -viewDistance_; dz <= viewDistance_; ++dz) {
-        for (int dx = -viewDistance_; dx <= viewDistance_; ++dx) {
-            getChunk(playerChunkX_ + dx, playerChunkZ_ + dz);
-        }
-    }
+    // Stream the surrounding chunks in on the generation pool; the workers
+    // insert finished chunks into chunks_ themselves.
+    generateAroundPlayer(playerX, playerZ);
 
-    // Unload distant chunks — lock separately to avoid deadlock with getChunk
     unloadDistantChunks();
 }
 
@@ -257,12 +263,14 @@ void World::generateAroundPlayer(int playerX, int playerZ) {
     int playerChunkX = Chunk::worldToChunk(playerX);
     int playerChunkZ = Chunk::worldToChunk(playerZ);
 
-    // Clean up completed futures
+    // Clean up completed futures. valid() stays true until get() is called,
+    // so poll readiness instead — otherwise this map only ever grows.
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         auto it = pendingGenerations_.begin();
         while (it != pendingGenerations_.end()) {
-            if (!it->second.valid()) {
+            if (!it->second.valid() ||
+                it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                 it = pendingGenerations_.erase(it);
             } else {
                 ++it;
@@ -301,7 +309,9 @@ size_t World::getPendingChunkCount() const {
     std::lock_guard<std::mutex> lock(pendingMutex_);
     size_t pending = 0;
     for (const auto& [key, future] : pendingGenerations_) {
-        if (future.valid()) {
+        // A future stays valid() until get(); only count genuinely unfinished work
+        if (future.valid() &&
+            future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
             ++pending;
         }
     }

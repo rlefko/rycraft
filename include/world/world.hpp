@@ -89,9 +89,12 @@ private:
     TreeGenerator treeGen_;
     StructureGenerator structureGen_;
 
-    // Player position for chunk loading
+    // Player position for chunk loading. hasPlayerChunk_ stays false until
+    // the first updatePlayerPosition call, so the spawn area streams in even
+    // when the player starts in chunk (0, 0).
     int playerChunkX_ = 0;
     int playerChunkZ_ = 0;
+    bool hasPlayerChunk_ = false;
 
     // Async generation state
     std::shared_ptr<ThreadPool> genPool_;  // lazily initialized

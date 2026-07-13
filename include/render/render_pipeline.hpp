@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/math.hpp"
@@ -149,10 +150,15 @@ private:
     bool isChunkInFrustum(const AABB& chunkAABB) const;
     float _frustumPlanes[6][4];
 
-    // ---- Chunk mesh cache (per-LOD) ----
-    // Outer key: packed int64 ((uint32_t)chunkX << 32 | (uint32_t)chunkZ)
-    // Inner key: LOD level (0-2), enables multiple mesh resolutions per chunk.
-    std::unordered_map<uint64_t, std::unordered_map<int, ChunkMeshState>> _chunkMeshes;
+    // ---- Chunk mesh cache ----
+    // Key: packed int64 ((uint32_t)chunkX << 32 | (uint32_t)chunkZ).
+    // An entry with uploaded == false marks a chunk whose mesh is empty
+    // (all air) so it is not rebuilt every frame.
+    std::unordered_map<uint64_t, ChunkMeshState> _chunkMeshes;
+
+    // Scratch set reused each frame to sweep meshes of unloaded chunks
+    // without per-frame allocation.
+    std::unordered_set<uint64_t> _liveChunkKeys;
 
     // ---- Day/Night Cycle (Task 6.4-6.5) ----
     void computeDayNightUniforms(uint64_t worldTime,
