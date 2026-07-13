@@ -20,11 +20,19 @@ appleframeworks = dependency('appleframeworks',
     'Cocoa',
     'CoreAudio',
     'AudioToolbox',
-    'GameController',
     'QuartzCore',
     'CoreVideo',
   ],
 )
+
+# LZ4 (world save compression): system copy if present, wrap subproject otherwise
+lz4_dep = dependency('liblz4',
+  fallback : ['lz4', 'liblz4_dep'],
+  default_options : ['default_library=static', 'ossfuzz=false'],
+)
+
+# Xcode 15+ ld warns about the duplicate -lc++ that mixed cpp/objcpp linking produces
+add_project_link_arguments('-Wl,-no_warn_duplicate_libraries', language : ['cpp', 'objcpp'])
 
 # Shader compilation pipeline
 subdir('shaders')

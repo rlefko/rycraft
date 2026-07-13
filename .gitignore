@@ -10,3 +10,4 @@ subprojects/Catch2*/
 subprojects/lz4-*/
 subprojects/packagecache/
 .cache/
+subprojects/.wraplock
