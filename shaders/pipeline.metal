@@ -118,7 +118,7 @@ fragment float4 fragmentMain(
     fogFactor = clamp(fogFactor, 0.0f, 1.0f);
 
     // Blend between fog color and lit color
-    float3 finalColor = mix(uniforms.fogColor, litColor, fogFactor);
+    float3 finalColor = mix(litColor, uniforms.fogColor, fogFactor);
 
     return float4(finalColor, 1.0);
 }
