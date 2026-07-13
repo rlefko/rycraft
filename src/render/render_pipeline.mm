@@ -2,6 +2,7 @@
 
 #include "common/error.hpp"
 #include "render/bloom.hpp"
+#include "render/entity_renderer.hpp"
 #include "render/block_textures.hpp"
 #include "render/lod_mesher.hpp"
 
@@ -35,6 +36,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     , _uiOverlay(nullptr)
     , _bloom(nullptr)
     , _particles(nullptr)
+    , _entityRenderer(nullptr)
     , _bloomIntensity(1.0f)
     , _displayWidth(width)
     , _displayHeight(height)
@@ -292,6 +294,9 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     // ---- Weather Particle System ----
     _particles = new ParticleSystem(_device, shaderLibrary);
+
+    // ---- Animal renderer ----
+    _entityRenderer = new EntityRenderer(_device, shaderLibrary);
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +354,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
                             uint64_t worldTime,
                             std::optional<Vec3> highlightedBlock,
                             const Hotbar& hotbar,
-                            const UIFrameState& uiFrame)
+                            const UIFrameState& uiFrame,
+                            const std::vector<std::shared_ptr<Entity>>* entities)
 {
     if (!drawable || !queue) return;
 
@@ -419,6 +425,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
                                skyUniforms.horizonColor.z};
     renderChunks(encoder, world, viewMatrix, projectionMatrix, camera.getPosition(),
                  sunDirection, sunColor, ambientColor, fogColor);
+
+    if (entities && _entityRenderer) {
+        _entityRenderer->render(encoder, _uniformsBuffer, *entities,
+                                [this](const AABB& aabb) { return isChunkInFrustum(aabb); });
+    }
 
     if (highlightedBlock.has_value()) {
         renderBlockHighlight(encoder, highlightedBlock.value(), viewMatrix, projectionMatrix);
@@ -888,6 +899,7 @@ RenderPipeline::~RenderPipeline() {
     delete _uiOverlay;
     delete _bloom;
     delete _particles;
+    delete _entityRenderer;
 }
 
 // ---------------------------------------------------------------------------

@@ -60,6 +60,19 @@ struct GPUParticle {
     float type;  // 0 = rain, 1 = snow
 };
 
+// One vertex of an entity voxel-box mesh, indexed directly by vertex_id in
+// entities' draw calls (buffer(0) in the entity shaders).
+struct EntityVertex {
+    simd_float3 position;  // model-local (feet-centered)
+    simd_float3 normal;
+    simd_float3 color;
+};
+
+// Per-entity transform, bound at buffer(2) via setVertexBytes.
+struct EntityModel {
+    simd_float4x4 model;
+};
+
 // Bound at buffer(1) in particles.metal.
 struct ParticleUniforms {
     simd_float4x4 viewMatrix;
@@ -96,6 +109,11 @@ static_assert(offsetof(CloudUniforms, cloudThreshold) == 100);
 static_assert(sizeof(GPUParticle) == 48);
 static_assert(offsetof(GPUParticle, velocity) == 16);
 static_assert(offsetof(GPUParticle, lifetime) == 32);
+
+static_assert(sizeof(EntityVertex) == 48);
+static_assert(offsetof(EntityVertex, normal) == 16);
+static_assert(offsetof(EntityVertex, color) == 32);
+static_assert(sizeof(EntityModel) == 64);
 
 static_assert(sizeof(ParticleUniforms) == 144);
 static_assert(offsetof(ParticleUniforms, cameraPosition) == 128);

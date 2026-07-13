@@ -121,3 +121,42 @@ fragment float4 fragmentMain(
 
     return float4(finalColor, 1.0);
 }
+
+// ---------------------------------------------------------------------------
+// Entity shaders — voxel-box animal models, lit like terrain
+// ---------------------------------------------------------------------------
+struct EntityVertexOutput {
+    float4 clipPosition [[position]];
+    float3 vNormal;
+    float3 vColor;
+    float3 vWorldPosition;
+};
+
+vertex EntityVertexOutput entityVertexMain(
+    device const EntityVertex* vertices [[buffer(0)]],
+    constant Uniforms &uniforms [[buffer(1)]],
+    constant EntityModel &entityModel [[buffer(2)]],
+    uint vertexID [[vertex_id]]
+) {
+    device const EntityVertex& v = vertices[vertexID];
+
+    EntityVertexOutput out;
+    float4 worldPos = entityModel.model * float4(v.position, 1.0);
+    out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
+    out.vWorldPosition = worldPos.xyz;
+    out.vNormal = normalize((entityModel.model * float4(v.normal, 0.0)).xyz);
+    out.vColor = v.color;
+    return out;
+}
+
+fragment float4 entityFragmentMain(
+    EntityVertexOutput in [[stage_in]],
+    constant Uniforms &uniforms [[buffer(1)]]
+) {
+    float light = max(dot(in.vNormal, uniforms.sunDirection), 0.0f);
+    float3 litColor = in.vColor * (uniforms.sunColor * light + uniforms.ambientColor);
+
+    float distanceToFrag = distance(in.vWorldPosition, uniforms.cameraPosition);
+    float fogFactor = clamp(1.0f - exp(-uniforms.fogDensity * distanceToFrag), 0.0f, 1.0f);
+    return float4(mix(litColor, uniforms.fogColor, fogFactor), 1.0);
+}

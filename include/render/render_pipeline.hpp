@@ -20,6 +20,8 @@
 #include "render/vertex.hpp"
 
 // Forward declarations
+class Entity;
+class EntityRenderer;
 class World;
 class Camera;
 class UIOverlay;
@@ -64,7 +66,8 @@ public:
                 uint64_t worldTime = 0,
                 std::optional<Vec3> highlightedBlock = std::nullopt,
                 const Hotbar& hotbar = Hotbar(),
-                const UIFrameState& uiFrame = UIFrameState{});
+                const UIFrameState& uiFrame = UIFrameState{},
+                const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
 
     // Reallocate MSAA and resolve textures for new viewport size.
     void resize(uint32_t width, uint32_t height);
@@ -133,6 +136,9 @@ private:
 
     // Weather particle system (rain/snow)
     ParticleSystem* _particles;
+
+    // Animal voxel-model renderer
+    EntityRenderer* _entityRenderer;
 
     // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
     float _bloomIntensity;

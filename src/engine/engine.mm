@@ -4,13 +4,16 @@
 
 #include <common/error.hpp>
 #include <common/math.hpp>
+#include <common/random.hpp>
 #include <render/render_pipeline.hpp>
 #include <engine/camera.hpp>
 #include <engine/game_state.hpp>
 #include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
 #include <render/ui_menu.hpp>
+#include <entity/ai.hpp>
 #include <entity/player.hpp>
+#include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
 #include <world/world.hpp>
 #include <world/save_manager.hpp>
@@ -20,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <memory>
+#include <unordered_map>
 #include <cmath>
 #include <optional>
 #include <utility>
@@ -73,12 +77,19 @@ struct EngineState {
     std::unique_ptr<SaveManager> saveManager;
     Camera camera;
 
+    // ---- Animals ----
+    std::unique_ptr<Spawner> spawner;
+    std::unordered_map<uint64_t, StateMachine> entityBrains;
+    bool populationSpawned = false;
+    int animalCallCooldown = 0;
+
     // ---- Audio ----
     std::unique_ptr<AudioEngine> audio;
     std::vector<float> sfxBlockBreak;
     std::vector<float> sfxBlockPlace;
     std::vector<float> sfxFootstep;
     std::vector<float> sfxWind;
+    std::vector<float> sfxAnimal[4];  // indexed by EntityType
     int32_t windVoice = -1;
     float footstepDistance = 0.f;   // ground distance walked since last step
     Vec3 lastFootstepPos{0.f, 0.f, 0.f};
@@ -147,6 +158,7 @@ static EngineState* _engineGetState(Engine* engine) {
         _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
         // Chunks load from disk before regenerating, so block edits persist
         _state->world->setSaveManager(_state->saveManager.get());
+        _state->spawner = std::make_unique<Spawner>(*_state->world);
         _state->player.position = spawnPos;
     }
     return self;
@@ -273,6 +285,10 @@ static EngineState* _engineGetState(Engine* engine) {
         _state->sfxBlockPlace = SoundEffect::generateBlockPlace();
         _state->sfxFootstep = SoundEffect::generateFootstep();
         _state->sfxWind = SoundEffect::generateAmbientWind();
+        _state->sfxAnimal[0] = SoundEffect::generateSheepBaa();
+        _state->sfxAnimal[1] = SoundEffect::generateCowMoo();
+        _state->sfxAnimal[2] = SoundEffect::generatePigOink();
+        _state->sfxAnimal[3] = SoundEffect::generateChickenCluck();
         [self syncAudioVolume];
     } else {
         RY_LOG_ERROR("Audio engine failed to initialize — continuing without sound");
@@ -596,6 +612,69 @@ static EngineState* _engineGetState(Engine* engine) {
         Chunk::worldToChunk(state->player.position.x),
         Chunk::worldToChunk(state->player.position.z));
 
+    // 7b. Animals: initial population once the spawn area streamed in, then
+    // per-tick AI steering + physics for every living entity
+    if (state->spawner) {
+        if (!state->populationSpawned && state->world->getPendingChunkCount() == 0) {
+            // Populate only the chunks near spawn, with a hard cap — biome
+            // densities over the full view distance produce thousands of
+            // animals, which neither the AI tick nor the player needs.
+            constexpr int SPAWN_CHUNK_RADIUS = 3;
+            constexpr size_t MAX_ANIMALS = 64;
+            int playerChunkX = Chunk::worldToChunk(static_cast<int>(state->player.position.x));
+            int playerChunkZ = Chunk::worldToChunk(static_cast<int>(state->player.position.z));
+            for (int dz = -SPAWN_CHUNK_RADIUS; dz <= SPAWN_CHUNK_RADIUS; ++dz) {
+                for (int dx = -SPAWN_CHUNK_RADIUS; dx <= SPAWN_CHUNK_RADIUS; ++dx) {
+                    if (state->spawner->getEntities().size() >= MAX_ANIMALS) break;
+                    state->spawner->spawnForChunk(playerChunkX + dx, playerChunkZ + dz);
+                }
+            }
+            state->populationSpawned = true;
+            RY_LOG_INFO(std::string("Spawned ") +
+                        std::to_string(state->spawner->getEntities().size()) + " animals");
+        }
+
+        auto& entities = state->spawner->getEntities();
+        auto& spatialHash = state->spawner->getSpatialHash();
+        for (auto& entity : entities) {
+            if (!entity || !entity->alive) continue;
+
+            // Simulation distance: distant animals stand still (cheap and
+            // invisible — they are beyond the fog anyway)
+            Vec3 offset = entity->position - state->player.position;
+            if (offset.length() > 96.f) continue;
+
+            StateMachine& brain = state->entityBrains[entity->id];
+            Vec3 steering = brain.update(*entity, *state->world, state->player.position,
+                                         /*playerMovingToward=*/false,
+                                         /*playerHoldingFood=*/false, *state->spawner);
+            entity->velocity.x += steering.x;
+            entity->velocity.z += steering.z;
+            entity->tick(*state->world);
+
+            // Keep the spatial hash in sync for flocking neighbor queries
+            spatialHash.remove(entity->id);
+            spatialHash.insert(entity->id, entity->position);
+        }
+
+        // Occasional ambient animal call from something nearby
+        if (state->animalCallCooldown > 0) {
+            --state->animalCallCooldown;
+        } else if (state->audio && !entities.empty()) {
+            static SeededRng callRng(0xA111CA11u);
+            const auto& candidate = entities[callRng.nextInt(
+                0, static_cast<int>(entities.size()) - 1)];
+            if (candidate && candidate->alive) {
+                Vec3 toPlayer = candidate->position - state->player.position;
+                if (toPlayer.length() < 24.f && callRng.nextFloat() < 0.3f) {
+                    int type = static_cast<int>(candidate->type);
+                    [self playSfx:state->sfxAnimal[type] gain:0.35f];
+                }
+            }
+            state->animalCallCooldown = 120 + callRng.nextInt(0, 120);  // 6-12s
+        }
+    }
+
     // 8. Player jump on space
     if (input.isJustPressed(Key::Space)) {
         state->player.jump();
@@ -780,7 +859,8 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
     uiFrame.stats.fps = state->smoothedFrameMs > 0.f ? 1000.0f / state->smoothedFrameMs : 0.f;
     uiFrame.stats.chunkCount = state->cachedChunkCount;
-    uiFrame.stats.entityCount = 0;
+    uiFrame.stats.entityCount =
+        state->spawner ? static_cast<uint32_t>(state->spawner->getEntities().size()) : 0;
     uiFrame.menu = state->menuLayout;
 
     _renderPipeline->render(
@@ -793,7 +873,8 @@ static EngineState* _engineGetState(Engine* engine) {
         state->worldTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
         state->hotbar,
-        uiFrame
+        uiFrame,
+        state->spawner ? &state->spawner->getEntities() : nullptr
     );
 }
 
