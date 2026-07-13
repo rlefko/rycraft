@@ -7,6 +7,56 @@ on:
     branches: [main]
 
 jobs:
+  format:
+    name: Format (clang-format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: |
+          clang-format --version
+          git ls-files '*.cpp' '*.hpp' '*.mm' ':!subprojects' \
+            | xargs clang-format --dry-run --Werror
+
+  build-test:
+    name: Build & Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install meson ninja ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('meson.build', 'src/**/meson.build') }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Cache wrap downloads
+        uses: actions/cache@v4
+        with:
+          path: subprojects/packagecache
+          key: wraps-${{ hashFiles('subprojects/*.wrap') }}
+
+      - name: Setup build
+        run: CC="ccache cc" CXX="ccache c++" OBJCXX="ccache c++" meson setup build
+
+      - name: Compile
+        run: ninja -C build
+
+      - name: Run tests
+        run: ninja -C build test
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-test-log
+          path: build/meson-logs/testlog.txt
+
   lint:
     name: Lint (clang-tidy)
     runs-on: macos-latest
@@ -14,46 +64,30 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: brew install meson ninja
+        run: brew install meson ninja llvm
 
-      - name: Setup build
+      - name: Cache wrap downloads
+        uses: actions/cache@v4
+        with:
+          path: subprojects/packagecache
+          key: wraps-${{ hashFiles('subprojects/*.wrap') }}
+
+      - name: Setup build (generates compile_commands.json)
         run: meson setup build
 
+      # clang-tidy runs against the compile database, so flags and the SDK
+      # sysroot come from the real build. Only C++ translation units are
+      # linted: Homebrew clang-tidy trips over Apple's Objective-C headers
+      # in the .mm files, and headers are covered via HeaderFilterRegex.
+      # Homebrew clang-tidy needs the SDK sysroot passed explicitly
+      # (Apple clang finds it implicitly; LLVM's does not).
       - name: Run clang-tidy
         run: |
-          find src include -name '*.cpp' -o -name '*.hpp' | \
-            xargs -I {} clang-tidy --config-file=.clang-tidy --build-dir=build {}
-
-  build:
-    name: Build
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: brew install meson ninja
-
-      - name: Setup build
-        run: meson setup build
-
-      - name: Compile
-        run: ninja -C build
-
-  test:
-    name: Test
-    runs-on: macos-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: brew install meson ninja
-
-      - name: Setup build
-        run: meson setup build
-
-      - name: Run tests
-        run: ninja -C build test
+          SDK="$(xcrun --show-sdk-path)"
+          git ls-files 'src/**/*.cpp' \
+            | xargs -P "$(sysctl -n hw.ncpu)" -n 4 \
+              "$(brew --prefix llvm)/bin/clang-tidy" -p build --quiet \
+              --extra-arg=-isysroot --extra-arg="$SDK"
 
   codeql:
     name: CodeQL Analysis
@@ -67,6 +101,12 @@ jobs:
 
       - name: Install dependencies
         run: brew install meson ninja
+
+      - name: Cache wrap downloads
+        uses: actions/cache@v4
+        with:
+          path: subprojects/packagecache
+          key: wraps-${{ hashFiles('subprojects/*.wrap') }}
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
