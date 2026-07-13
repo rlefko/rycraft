@@ -1,11 +1,12 @@
-build/
+/build/
 *.a
 *.air
 *.metallib
 *.o
 *.dSYM/
 
-# Catch2 extracted source (re-downloaded from wrap)
+# Meson wrap subprojects (re-downloaded from the .wrap files at setup)
 subprojects/Catch2*/
+subprojects/lz4-*/
 subprojects/packagecache/
 .cache/
