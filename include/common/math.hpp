@@ -308,35 +308,40 @@ struct alignas(16) Mat4 {
     return m;
   }
 
+  // Right-handed perspective projection with Metal's [0, 1] NDC depth range
+  // (view space looks down -Z: z = -near maps to 0, z = -far maps to 1).
   static Mat4 perspective(float fovY, float aspect, float near, float far) {
     Mat4 m;
     float tanHalfFov = std::tan(fovY * 0.5f);
     m(0, 0) = 1.f / (aspect * tanHalfFov);
     m(1, 1) = 1.f / tanHalfFov;
-    m(2, 2) = -(far + near) / (far - near);
-    m(2, 3) = -2.f * far * near / (far - near);
+    m(2, 2) = -far / (far - near);
+    m(2, 3) = -(far * near) / (far - near);
     m(3, 2) = -1.f;
     m(3, 3) = 0.f;
     return m;
   }
 
+  // Right-handed view matrix for column vectors (v' = M * v): camera basis
+  // vectors form the ROWS of the rotation block and the translation sits in
+  // column 3, matching transformVec4 and the MSL float4x4 convention.
   static Mat4 lookAt(const Vec3& eye, const Vec3& target, const Vec3& up) {
     Vec3 z = (eye - target).normalize();
     Vec3 x = up.cross(z).normalize();
     Vec3 y = z.cross(x);
     Mat4 m = Mat4::identity();
     m(0, 0) = x.x;
-    m(1, 0) = x.y;
-    m(2, 0) = x.z;
-    m(0, 1) = y.x;
+    m(0, 1) = x.y;
+    m(0, 2) = x.z;
+    m(1, 0) = y.x;
     m(1, 1) = y.y;
-    m(2, 1) = y.z;
-    m(0, 2) = z.x;
-    m(1, 2) = z.y;
+    m(1, 2) = y.z;
+    m(2, 0) = z.x;
+    m(2, 1) = z.y;
     m(2, 2) = z.z;
-    m(3, 0) = -x.dot(eye);
-    m(3, 1) = -y.dot(eye);
-    m(3, 2) = -z.dot(eye);
+    m(0, 3) = -x.dot(eye);
+    m(1, 3) = -y.dot(eye);
+    m(2, 3) = -z.dot(eye);
     return m;
   }
 

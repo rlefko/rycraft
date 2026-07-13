@@ -178,6 +178,7 @@ private:
                       const World& world,
                       const Mat4& viewMatrix,
                       const Mat4& projectionMatrix,
+                      const Vec3& cameraPosition,
                       const float sunDirection[3],
                       const float sunColor[3],
                       const float ambientColor[3],

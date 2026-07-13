@@ -431,7 +431,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     const float fogColor[3] = {skyUniforms.horizonColor.x,
                                skyUniforms.horizonColor.y,
                                skyUniforms.horizonColor.z};
-    renderChunks(encoder, world, viewMatrix, projectionMatrix,
+    renderChunks(encoder, world, viewMatrix, projectionMatrix, camera.getPosition(),
                  sunDirection, sunColor, ambientColor, fogColor);
 
     // ---- Block highlight pass (after opaque chunks, before UI) ----
@@ -620,6 +620,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
                                      const World& world,
                                      const Mat4& viewMatrix,
                                      const Mat4& projectionMatrix,
+                                     const Vec3& cameraPosition,
                                      const float sunDirection[3],
                                      const float sunColor[3],
                                      const float ambientColor[3],
@@ -629,12 +630,9 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setDepthStencilState:_depthState];
 
-    // Extract camera position from view matrix.
-    // View = R^T * T(-eye), so eye = -R^T * T_col3 = -R * T_col3
-    const float* v = viewMatrix.data.data();
-    float camX = -(v[12] * v[0] + v[13] * v[4] + v[14] * v[8]);
-    float camY = -(v[12] * v[1] + v[13] * v[5] + v[14] * v[9]);
-    float camZ = -(v[12] * v[2] + v[13] * v[6] + v[14] * v[10]);
+    const float camX = cameraPosition.x;
+    const float camY = cameraPosition.y;
+    const float camZ = cameraPosition.z;
 
     // Pack and upload uniforms
     Uniforms uniforms{};
@@ -1023,37 +1021,21 @@ void RenderPipeline::tickParticles(float dt, const World& world, const Vec3& pla
 // Frustum culling
 // ---------------------------------------------------------------------------
 void RenderPipeline::extractFrustumPlanes(const Mat4& vpMatrix) {
-    const float* m = vpMatrix.data.data();
+    // Gribb-Hartmann plane extraction for a column-major, column-vector VP
+    // matrix. Row i of the matrix is (data[i], data[4+i], data[8+i], data[12+i]).
+    // A point is inside a plane when dot(plane, (p, 1)) >= 0.
+    auto row = [&vpMatrix](int i, int component) {
+        return vpMatrix.data[static_cast<size_t>(component * 4 + i)];
+    };
 
-    _frustumPlanes[0][0] = m[12] + m[0];
-    _frustumPlanes[0][1] = m[13] + m[1];
-    _frustumPlanes[0][2] = m[14] + m[2];
-    _frustumPlanes[0][3] = m[15] + m[3];
-
-    _frustumPlanes[1][0] = m[12] - m[0];
-    _frustumPlanes[1][1] = m[13] - m[1];
-    _frustumPlanes[1][2] = m[14] - m[2];
-    _frustumPlanes[1][3] = m[15] - m[3];
-
-    _frustumPlanes[2][0] = m[12] + m[4];
-    _frustumPlanes[2][1] = m[13] + m[5];
-    _frustumPlanes[2][2] = m[14] + m[6];
-    _frustumPlanes[2][3] = m[15] + m[7];
-
-    _frustumPlanes[3][0] = m[12] - m[4];
-    _frustumPlanes[3][1] = m[13] - m[5];
-    _frustumPlanes[3][2] = m[14] - m[6];
-    _frustumPlanes[3][3] = m[15] - m[7];
-
-    _frustumPlanes[4][0] = m[12] + m[8];
-    _frustumPlanes[4][1] = m[13] + m[9];
-    _frustumPlanes[4][2] = m[14] + m[10];
-    _frustumPlanes[4][3] = m[15] + m[11];
-
-    _frustumPlanes[5][0] = m[12] - m[8];
-    _frustumPlanes[5][1] = m[13] - m[9];
-    _frustumPlanes[5][2] = m[14] - m[10];
-    _frustumPlanes[5][3] = m[15] - m[11];
+    for (int c = 0; c < 4; ++c) {
+        _frustumPlanes[0][c] = row(3, c) + row(0, c);  // left
+        _frustumPlanes[1][c] = row(3, c) - row(0, c);  // right
+        _frustumPlanes[2][c] = row(3, c) + row(1, c);  // bottom
+        _frustumPlanes[3][c] = row(3, c) - row(1, c);  // top
+        _frustumPlanes[4][c] = row(2, c);              // near (Metal: z' >= 0)
+        _frustumPlanes[5][c] = row(3, c) - row(2, c);  // far
+    }
 
     for (int i = 0; i < 6; ++i) {
         float len = std::sqrt(

@@ -183,10 +183,26 @@ TEST_CASE("Mat4 perspective", "[math]") {
   REQUIRE(p(0, 0) == Catch::Approx(1.f).epsilon(0.01f));
   REQUIRE(p(1, 1) == Catch::Approx(1.f).epsilon(0.01f));
   REQUIRE(p(3, 3) == Catch::Approx(0.f));
-  // Bottom-right 2x2 should have the far/near terms
-  REQUIRE(p(2, 2) != 0.f);
-  REQUIRE(p(2, 3) != 0.f);
   REQUIRE(p(3, 2) == Catch::Approx(-1.f));
+}
+
+TEST_CASE("Mat4 perspective maps depth to Metal [0,1] clip range", "[math]") {
+  const float nearZ = 1.f;
+  const float farZ = 100.f;
+  Mat4 p = Mat4::perspective(static_cast<float>(std::atan(1.f) * 2.f), 1.f, nearZ, farZ);
+
+  // View space looks down -Z: the near plane must land on NDC z=0 and the
+  // far plane on NDC z=1 (Metal), NOT the OpenGL [-1,1] range.
+  Vec4 nearPoint = p.transformVec4({0.f, 0.f, -nearZ, 1.f});
+  REQUIRE(nearPoint.z / nearPoint.w == Catch::Approx(0.f).margin(1e-5f));
+
+  Vec4 farPoint = p.transformVec4({0.f, 0.f, -farZ, 1.f});
+  REQUIRE(farPoint.z / farPoint.w == Catch::Approx(1.f).epsilon(1e-4f));
+
+  Vec4 midPoint = p.transformVec4({0.f, 0.f, -10.f, 1.f});
+  float midNdc = midPoint.z / midPoint.w;
+  REQUIRE(midNdc > 0.f);
+  REQUIRE(midNdc < 1.f);
 }
 
 TEST_CASE("Mat4 lookAt", "[math]") {
@@ -195,9 +211,50 @@ TEST_CASE("Mat4 lookAt", "[math]") {
   Vec3 up{0.f, 1.f, 0.f};
   Mat4 v = Mat4::lookAt(eye, target, up);
 
-  // Camera looking down -Z from (0,0,5)
-  // The translation component should place origin 5 units back
-  REQUIRE(v(3, 2) == Catch::Approx(-5.f).epsilon(0.01f));
+  // Column-vector convention: translation lives in column 3, so the target
+  // (5 units ahead of the camera looking down -Z) maps to (0, 0, -5).
+  Vec3 targetView = v.transformVec3(target);
+  REQUIRE(targetView.x == Catch::Approx(0.f).margin(1e-5f));
+  REQUIRE(targetView.y == Catch::Approx(0.f).margin(1e-5f));
+  REQUIRE(targetView.z == Catch::Approx(-5.f).epsilon(0.01f));
+
+  // The eye itself maps to the view-space origin
+  Vec3 eyeView = v.transformVec3(eye);
+  REQUIRE(eyeView.x == Catch::Approx(0.f).margin(1e-5f));
+  REQUIRE(eyeView.y == Catch::Approx(0.f).margin(1e-5f));
+  REQUIRE(eyeView.z == Catch::Approx(0.f).margin(1e-5f));
+
+  // World +X is the camera's right; world +Y stays up
+  Vec3 right = v.transformVec3({1.f, 0.f, 5.f});
+  REQUIRE(right.x == Catch::Approx(1.f).epsilon(0.01f));
+  Vec3 above = v.transformVec3({0.f, 1.f, 5.f});
+  REQUIRE(above.y == Catch::Approx(1.f).epsilon(0.01f));
+
+  // Basis vectors in rows, translation in column 3 (not the bottom row)
+  REQUIRE(v(3, 2) == Catch::Approx(0.f));
+  REQUIRE(v(2, 3) == Catch::Approx(-5.f).epsilon(0.01f));
+}
+
+TEST_CASE("Mat4 memcpy to simd_float4x4 preserves transform semantics", "[math]") {
+  // The engine memcpys Mat4 straight into the GPU uniform buffer, where MSL
+  // treats it as a column-major float4x4 multiplying column vectors. This
+  // pins that the two conventions agree, without needing a GPU.
+  Vec3 eye{3.f, 70.f, -2.f};
+  Mat4 view = Mat4::lookAt(eye, {10.f, 64.f, 10.f}, {0.f, 1.f, 0.f});
+  Mat4 proj = Mat4::perspective(1.2f, 16.f / 9.f, 0.1f, 1000.f);
+  Mat4 vp = proj * view;
+
+  simd_float4x4 gpuMatrix;
+  std::memcpy(&gpuMatrix, vp.data.data(), sizeof(gpuMatrix));
+
+  Vec4 point{25.f, 60.f, 40.f, 1.f};
+  Vec4 cpuResult = vp.transformVec4(point);
+  simd_float4 gpuResult = simd_mul(gpuMatrix, simd_make_float4(point.x, point.y, point.z, point.w));
+
+  REQUIRE(gpuResult.x == Catch::Approx(cpuResult.x).epsilon(1e-4f));
+  REQUIRE(gpuResult.y == Catch::Approx(cpuResult.y).epsilon(1e-4f));
+  REQUIRE(gpuResult.z == Catch::Approx(cpuResult.z).epsilon(1e-4f));
+  REQUIRE(gpuResult.w == Catch::Approx(cpuResult.w).epsilon(1e-4f));
 }
 
 TEST_CASE("Mat4 translation", "[math]") {
