@@ -658,7 +658,12 @@ static EngineState* _engineGetState(Engine* engine) {
 
         auto& entities = state->spawner->getEntities();
         auto& spatialHash = state->spawner->getSpatialHash();
-        for (auto& entity : entities) {
+        // Index-based over a size snapshot with a shared_ptr copy: breeding
+        // inside StateMachine::update can push_back into this very vector,
+        // which would invalidate range-for iterators mid-loop.
+        const size_t entityCount = entities.size();
+        for (size_t i = 0; i < entityCount; ++i) {
+            std::shared_ptr<Entity> entity = entities[i];
             if (!entity || !entity->alive)
                 continue;
 

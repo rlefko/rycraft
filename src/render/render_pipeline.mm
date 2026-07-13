@@ -575,64 +575,51 @@ void RenderPipeline::computeDayNightUniforms(uint64_t worldTime, float sunDirect
     // Sun elevation factor: 1 at noon (angle=PI/2), -1 at midnight (angle=3PI/2)
     float sunElevation = std::sin(orbitalAngle);
 
-    // ---- Sun color: white at noon, orange at sunrise/sunset, dark at night ----
-    if (sunElevation > 0.1f) {
-        // Daytime: white to slightly warm
-        float intensity = std::min(sunElevation, 1.0f);
-        sunColor[0] = 1.0f;
-        sunColor[1] = 0.95f + 0.05f * intensity;
-        sunColor[2] = 0.9f + 0.1f * intensity;
-    } else if (sunElevation > -0.1f) {
-        // Sunrise/sunset: orange
-        float t = (sunElevation + 0.1f) / 0.2f; // 0..1 across twilight
-        sunColor[0] = 1.0f;
-        sunColor[1] = 0.5f + 0.45f * t;
-        sunColor[2] = 0.2f + 0.7f * t;
-    } else {
-        // Night: very dim
-        sunColor[0] = 0.1f;
-        sunColor[1] = 0.1f;
-        sunColor[2] = 0.15f;
-    }
+    // ---- Sun color: white at noon, orange at sunrise/sunset, dim at night ----
+    // Piecewise formulas blended continuously — visible color snapping at the
+    // branch thresholds made dawn and dusk read as abrupt jumps.
+    float sunColorDay[3] = {1.0f, 0.95f + 0.05f * std::min(std::max(sunElevation, 0.0f), 1.0f),
+                            0.9f + 0.1f * std::min(std::max(sunElevation, 0.0f), 1.0f)};
+    float sunColorSunset[3] = {1.0f, 0.5f, 0.2f};
+    float sunColorNight[3] = {0.1f, 0.1f, 0.15f};
 
-    // ---- Ambient color: 0.35/0.35/0.4 at noon, 0.1/0.1/0.15 at night ----
+    // 0 → deep sunset colors, 1 → full day colors, over elevation 0..0.35
+    float dayBlend = std::clamp(sunElevation / 0.35f, 0.0f, 1.0f);
+    // 0 → sunset colors, 1 → night colors, over elevation -0.05..-0.35
+    float nightBlend = std::clamp((-sunElevation - 0.05f) / 0.30f, 0.0f, 1.0f);
+
+    auto blend3 = [](const float a[3], const float b[3], float t, float out[3]) {
+        for (int i = 0; i < 3; ++i) {
+            out[i] = a[i] + (b[i] - a[i]) * t;
+        }
+    };
+
+    blend3(sunColorSunset, sunColorDay, dayBlend, sunColor);
+    blend3(sunColor, sunColorNight, nightBlend, sunColor);
+
+    // ---- Ambient: bright at noon, dim at night ----
     float ambientDay[3] = {0.35f, 0.35f, 0.4f};
     float ambientNight[3] = {0.1f, 0.1f, 0.15f};
-    float ambientT = std::max(0.0f, std::min(1.0f, (sunElevation + 0.2f) / 0.6f));
-    for (int i = 0; i < 3; ++i) {
-        ambientColor[i] = ambientNight[i] + (ambientDay[i] - ambientNight[i]) * ambientT;
-    }
+    float ambientT = std::clamp((sunElevation + 0.2f) / 0.6f, 0.0f, 1.0f);
+    blend3(ambientNight, ambientDay, ambientT, ambientColor);
 
-    // ---- Sky colors ----
-    // Daytime sky: blue zenith, lighter horizon
+    // ---- Sky palette: blend twilight → day above the horizon and
+    // twilight → night below it, so dawn and dusk sweep smoothly ----
     float dayZenith[3] = {0.2f, 0.4f, 0.8f};
     float dayHorizon[3] = {0.53f, 0.81f, 0.92f};
-
-    // Night sky: very dark blue
     float nightZenith[3] = {0.02f, 0.02f, 0.05f};
     float nightHorizon[3] = {0.05f, 0.05f, 0.1f};
-
-    // Twilight: purple/orange
     float twilightZenith[3] = {0.15f, 0.1f, 0.3f};
     float twilightHorizon[3] = {0.6f, 0.3f, 0.2f};
 
-    // Interpolate based on sun elevation
-    float* zenithColor = dayZenith;
-    float* horizonColor = dayHorizon;
-
-    if (sunElevation > 0.05f) {
-        // Full day
-        zenithColor = dayZenith;
-        horizonColor = dayHorizon;
-    } else if (sunElevation > -0.15f) {
-        // Twilight
-        zenithColor = twilightZenith;
-        horizonColor = twilightHorizon;
-    } else {
-        // Night
-        zenithColor = nightZenith;
-        horizonColor = nightHorizon;
-    }
+    float zenith[3];
+    float horizon[3];
+    blend3(twilightZenith, dayZenith, dayBlend, zenith);
+    blend3(zenith, nightZenith, nightBlend, zenith);
+    blend3(twilightHorizon, dayHorizon, dayBlend, horizon);
+    blend3(horizon, nightHorizon, nightBlend, horizon);
+    const float* zenithColor = zenith;
+    const float* horizonColor = horizon;
 
     skyUniforms.zenithColor = simd_make_float3(zenithColor[0], zenithColor[1], zenithColor[2]);
     skyUniforms.horizonColor = simd_make_float3(horizonColor[0], horizonColor[1], horizonColor[2]);

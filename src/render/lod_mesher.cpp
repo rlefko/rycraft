@@ -271,18 +271,21 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
         auto emitQuad = [lx](int col, int row, int width, int height, FaceNormal face, BlockType bt,
                              uint8_t skyLight, std::vector<Vertex>& verts,
                              std::vector<uint32_t>& idxs) {
-            // +X face: x = lx+1, CCW from +X (rows are Y, cols are Z)
+            // +X face: x = lx+1, CCW from +X (rows are Y, cols are Z).
+            // Texture v runs downward in Metal, so the TOP of the face
+            // carries v=0 — otherwise side textures (the grass strip)
+            // render upside down. Same for the other three side faces.
             const float fw = static_cast<float>(width);
             const float fh = static_cast<float>(height);
             const QuadCorner corners[4] = {
                 {static_cast<float>(lx + 1), static_cast<float>(row), static_cast<float>(col), 0.f,
-                 0.f},
+                 fh},
                 {static_cast<float>(lx + 1), static_cast<float>(row + height),
-                 static_cast<float>(col), 0.f, fh},
+                 static_cast<float>(col), 0.f, 0.f},
                 {static_cast<float>(lx + 1), static_cast<float>(row + height),
-                 static_cast<float>(col + width), fw, fh},
-                {static_cast<float>(lx + 1), static_cast<float>(row),
                  static_cast<float>(col + width), fw, 0.f},
+                {static_cast<float>(lx + 1), static_cast<float>(row),
+                 static_cast<float>(col + width), fw, fh},
             };
             pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
@@ -319,13 +322,13 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
             const float fh = static_cast<float>(height);
             const QuadCorner corners[4] = {
                 {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col), 0.f,
-                 0.f},
+                 fh},
                 {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col + width),
-                 fw, 0.f},
+                 fw, fh},
                 {static_cast<float>(lx), static_cast<float>(row + height),
-                 static_cast<float>(col + width), fw, fh},
+                 static_cast<float>(col + width), fw, 0.f},
                 {static_cast<float>(lx), static_cast<float>(row + height), static_cast<float>(col),
-                 0.f, fh},
+                 0.f, 0.f},
             };
             pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
@@ -362,13 +365,13 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
             const float fh = static_cast<float>(height);
             const QuadCorner corners[4] = {
                 {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz + 1), 0.f,
-                 0.f},
+                 fh},
                 {static_cast<float>(col), static_cast<float>(row + height),
-                 static_cast<float>(lz + 1), 0.f, fh},
+                 static_cast<float>(lz + 1), 0.f, 0.f},
                 {static_cast<float>(col + width), static_cast<float>(row + height),
-                 static_cast<float>(lz + 1), fw, fh},
-                {static_cast<float>(col + width), static_cast<float>(row),
                  static_cast<float>(lz + 1), fw, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(row),
+                 static_cast<float>(lz + 1), fw, fh},
             };
             pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
@@ -405,13 +408,13 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
             const float fh = static_cast<float>(height);
             const QuadCorner corners[4] = {
                 {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz), 0.f,
-                 0.f},
+                 fh},
                 {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz),
-                 fw, 0.f},
+                 fw, fh},
                 {static_cast<float>(col + width), static_cast<float>(row + height),
-                 static_cast<float>(lz), fw, fh},
+                 static_cast<float>(lz), fw, 0.f},
                 {static_cast<float>(col), static_cast<float>(row + height), static_cast<float>(lz),
-                 0.f, fh},
+                 0.f, 0.f},
             };
             pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
