@@ -5,10 +5,11 @@
 
 // ---------------------------------------------------------------------------
 // isBlockSolid — ray targeting, delegating to the shared block property
-// table so raycasts agree with collision (glass is targetable).
+// table. Targetable is wider than solid: flora is walk-through for physics
+// but still stops the crosshair ray so plants can be broken in place.
 // ---------------------------------------------------------------------------
 bool VoxelTraversal::isBlockSolid(World& world, int x, int y, int z) {
-    return isSolid(world.getBlock(x, y, z));
+    return isTargetable(world.getBlock(x, y, z));
 }
 
 // ---------------------------------------------------------------------------

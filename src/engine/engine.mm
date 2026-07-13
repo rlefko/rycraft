@@ -781,6 +781,12 @@ static EngineState* _engineGetState(Engine* engine) {
     // Set block to air
     state->world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
 
+    // Flora standing on the broken block loses its support and pops with it
+    // (same column → same chunk → the dirty/save below covers it)
+    if (isFlora(state->world->getBlock(hitX, hitY + 1, hitZ))) {
+        state->world->setBlock(hitX, hitY + 1, hitZ, BlockType::AIR);
+    }
+
     // Mark chunk dirty
     int chunkX = Chunk::worldToChunk(hitX);
     int chunkZ = Chunk::worldToChunk(hitZ);

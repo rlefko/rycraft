@@ -71,7 +71,15 @@ vertex VertexOutput vertexMain(
     // column skylight (bits 11-14)
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
-    float3 normal = getFaceNormal(in.faceAttr & 7u);
+    uint normalIdx = in.faceAttr & 7u;
+    if (normalIdx == 6u) {
+        // Flora cross-quads: orientation-free lighting tracking the sun's
+        // elevation, so the two diagonal quads never shade differently
+        out.vNormal = float3(0.0, 1.0, 0.0);
+        out.vLight = max(uniforms.sunDirection.y, 0.0f) * 0.9f;
+        return out;
+    }
+    float3 normal = getFaceNormal(normalIdx);
     out.vNormal = normalize(
         (uniforms.modelMatrix * float4(normal, 0.0)).xyz
     );

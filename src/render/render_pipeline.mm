@@ -653,6 +653,9 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Bind pipeline state
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setDepthStencilState:_depthState];
+    // Flora cross-quads are single-winding and depend on cull mode None
+    // (Metal's default — pinned here so it survives future changes)
+    [encoder setCullMode:MTLCullModeNone];
 
     const float camX = cameraPosition.x;
     const float camY = cameraPosition.y;

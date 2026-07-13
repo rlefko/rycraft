@@ -123,7 +123,38 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
     }
 }
 
-static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockAccessor& getBlock) {
+// Flora cross-quads: two diagonal quads spanning the cell, inset 0.125 from
+// the walls (0.125 is exactly representable in fp16 at every chunk-local
+// magnitude, so the X stays crack-free). Single winding per quad — the
+// scene pass renders with cull mode None, which makes them double-sided.
+static void emitFloraCross(int x, int y, int z, BlockType bt, uint8_t skyLight,
+                           std::vector<Vertex>& verts, std::vector<uint32_t>& idxs) {
+    const float x0 = static_cast<float>(x) + 0.125f;
+    const float x1 = static_cast<float>(x) + 0.875f;
+    const float z0 = static_cast<float>(z) + 0.125f;
+    const float z1 = static_cast<float>(z) + 0.875f;
+    const float y0 = static_cast<float>(y);
+    const float y1 = static_cast<float>(y + 1);
+
+    // v = 0 at the TOP (Metal v runs downward — see the +X face comment)
+    const QuadCorner diagonalA[4] = {
+        {x0, y0, z0, 0.f, 1.f},
+        {x1, y0, z1, 1.f, 1.f},
+        {x1, y1, z1, 1.f, 0.f},
+        {x0, y1, z0, 0.f, 0.f},
+    };
+    const QuadCorner diagonalB[4] = {
+        {x0, y0, z1, 0.f, 1.f},
+        {x1, y0, z0, 1.f, 1.f},
+        {x1, y1, z0, 1.f, 0.f},
+        {x0, y1, z1, 0.f, 0.f},
+    };
+    pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalA);
+    pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalB);
+}
+
+static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockAccessor& getBlock,
+                                   bool emitFlora = false) {
     MeshOutput output;
 
     // Pre-allocate reasonable capacity (6 faces × grid area × 4 verts)
@@ -421,6 +452,24 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
                         output.vertices, output.indices, emitQuad);
     }
 
+    // ======================================================================
+    // Flora cross-quads (full LOD only) — non-solid plants never enter the
+    // greedy passes above, so this is their only geometry
+    // ======================================================================
+    if (emitFlora) {
+        for (int z = 0; z < gridD; ++z) {
+            for (int x = 0; x < gridW; ++x) {
+                for (int y = 0; y < gridH; ++y) {
+                    BlockType bt = getBlock(x, y, z);
+                    if (isFlora(bt)) {
+                        emitFloraCross(x, y, z, bt, lightAt(x, y, z), output.vertices,
+                                       output.indices);
+                    }
+                }
+            }
+        }
+    }
+
     return output;
 }
 
@@ -440,7 +489,8 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
             auto blockFn = [&chunk](int x, int y, int z) -> BlockType {
                 return chunk.getBlock(x, y, z);
             };
-            return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn);
+            return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn,
+                                    /*emitFlora=*/true);
         }
 
         case ChunkLOD::MEDIUM: {
@@ -457,6 +507,9 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
                     for (int dy = 0; dy < 2; ++dy) {
                         for (int dx = 0; dx < 2; ++dx) {
                             BlockType bt = chunk.getBlock(gx + dx, gy + dy, gz + dz);
+                            // Flora is skipped at coarse LODs — a meadow must
+                            // not majority-pick into phantom solid cells
+                            if (isFlora(bt)) bt = BlockType::AIR;
                             typeCounts[bt]++;
                         }
                     }
@@ -489,6 +542,7 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
                     for (int dy = 0; dy < 4; ++dy) {
                         for (int dx = 0; dx < 4; ++dx) {
                             BlockType bt = chunk.getBlock(gx + dx, gy + dy, gz + dz);
+                            if (isFlora(bt)) bt = BlockType::AIR;
                             typeCounts[bt]++;
                         }
                     }

@@ -138,6 +138,68 @@ TEST_CASE("Mesher: 2x2 flat merges top face", "[render][mesher]") {
     REQUIRE(foundTopQuad);
 }
 
+TEST_CASE("Mesher: flora emits an inset cross of two quads", "[render][mesher][flora]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::GRASS);
+    chunk.setBlock(8, 65, 8, BlockType::TALL_GRASS);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // Grass cube: 6 quads = 24 vertices. Flora: 2 quads = 8 vertices.
+    // (Flora is non-opaque, so all six grass faces still render.)
+    REQUIRE(output.vertices.size() == 32);
+    REQUIRE(output.indices.size() == 48);
+
+    int crossVerts = 0;
+    for (const Vertex& v : output.vertices) {
+        if (unpackFace(v.faceAttr) != FaceNormal::CROSS)
+            continue;
+        ++crossVerts;
+        REQUIRE(unpackTextureLayer(v.faceAttr) == static_cast<uint8_t>(BlockType::TALL_GRASS));
+        // Inset 0.125 from the cell walls, spanning the full cell height
+        float px = static_cast<float>(v.px);
+        float py = static_cast<float>(v.py);
+        float pz = static_cast<float>(v.pz);
+        REQUIRE((px == 8.125f || px == 8.875f));
+        REQUIRE((pz == 8.125f || pz == 8.875f));
+        REQUIRE((py == 65.f || py == 66.f));
+    }
+    REQUIRE(crossVerts == 8);
+}
+
+TEST_CASE("Mesher: flora does not break greedy merging of the ground", "[render][mesher][flora]") {
+    Chunk chunk(0, 0);
+    // 2x2 grass floor with one flower on top: the floor's +Y face must still
+    // merge into a single quad (flora neither occludes nor casts shade)
+    for (int z = 0; z < 2; ++z)
+        for (int x = 0; x < 2; ++x)
+            chunk.setBlock(x, 64, z, BlockType::GRASS);
+    chunk.setBlock(0, 65, 0, BlockType::FLOWER_RED);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // 2x2 slab = 24 vertices (all faces merged) + 8 flora vertices
+    REQUIRE(output.vertices.size() == 32);
+}
+
+TEST_CASE("Mesher: flora is skipped at coarse LODs", "[render][mesher][flora]") {
+    Chunk chunk(0, 0);
+    for (int z = 0; z < CHUNK_DEPTH; ++z)
+        for (int x = 0; x < CHUNK_WIDTH; ++x) {
+            chunk.setBlock(x, 64, z, BlockType::GRASS);
+            chunk.setBlock(x, 65, z, BlockType::TALL_GRASS);
+        }
+
+    LODMesher mesher;
+    MeshOutput medium = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::MEDIUM));
+    for (const Vertex& v : medium.vertices) {
+        REQUIRE(unpackFace(v.faceAttr) != FaceNormal::CROSS);
+        REQUIRE(unpackTextureLayer(v.faceAttr) != static_cast<uint8_t>(BlockType::TALL_GRASS));
+    }
+}
+
 TEST_CASE("Mesher: vertical column merges side faces", "[render][mesher]") {
     Chunk chunk(0, 0);
     // 4-block tall column of STONE at (8, 64..67, 8)
