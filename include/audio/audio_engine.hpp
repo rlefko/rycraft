@@ -65,7 +65,9 @@ private:
     static constexpr uint32_t SAMPLE_RATE = 44100;
 
     AudioVoice _voices[MAX_VOICES];
-    float _masterVolume = 1.0f;
+    // Read on the Core Audio render thread, written from the main thread —
+    // atomic so the concurrent access is well-defined without the voice lock.
+    std::atomic<float> _masterVolume{1.0f};
     std::atomic<bool> _isRunning{false};
 
     // AudioUnit

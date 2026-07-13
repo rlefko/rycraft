@@ -29,11 +29,13 @@ Dependency direction: `engine → render/world/entity/audio → common`. The ren
 - **Main thread:** the entire frame — input, ticks, meshing, encoding. `drawInMTKView:` drives everything.
 - **Generation pool:** four workers (`World::genPool_`) build chunks and insert them into `chunks_` under `chunksMutex_`.
 - **Save thread:** `SaveManager` drains an async write queue; `flush()` blocks until it empties.
-- **Audio render thread:** Core Audio calls `AudioEngine::audioCallback`; the voice table is mutex-guarded.
+- **Audio render thread:** Core Audio calls `AudioEngine::audioCallback`; it holds `_voiceMutex` for the whole mix, so every read of the voice table is serialized against `playSound`/`stopVoice`. **Why:** the callback used to read each voice's `samples`/`active`/`readPosition` without the lock while `playSound` reassigned them under it — a torn `std::vector` read / use-after-free on the real-time thread that corrupted the heap and made libmalloc trap.
 
 Lock discipline (see also performance-conventions):
 - Never generate, load, or do I/O while holding `chunksMutex_` — `getChunk` releases it around `loadOrGenerateChunk` and re-inserts with `try_emplace`, accepting rare duplicate generation over a render-thread stall. **Why:** the original `getChunk` generated a whole chunk (milliseconds) inside the lock the render thread takes every frame.
 - Worker insertions use `try_emplace`, never `operator[]`. **Why:** an async worker overwriting an existing chunk discards player edits that landed while it generated.
+
+Rendering vs. simulation: the sim runs at a fixed 20 Hz and `drawInMTKView:` renders the camera at the **latest** tick position — no inter-tick interpolation. **Why:** interpolation (rendering `lerp(prevTick, curTick, alpha)`) trails the simulation by up to one tick (50 ms) and read as floaty/laggy; the 20 Hz camera step is preferred over that added latency. Falls no longer look instantaneous because vertical velocity is reset on the ground instead of saturating (see `Player::tick`), not because of render smoothing.
 
 ## Error handling policy
 

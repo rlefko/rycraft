@@ -337,6 +337,13 @@ static EngineState* _engineGetState(Engine* engine) {
             [self gameTick:state];
             state->accumulator -= EngineState::TICK_DT;
         }
+
+        // Render the latest simulated position directly — no inter-tick
+        // interpolation. Interpolation trails the sim by up to a tick (50 ms)
+        // and read as floaty/light; the 20 Hz camera step is preferred over
+        // that added latency. Falls stay gradual because velocity no longer
+        // saturates (see Player::tick), so this no longer looks instantaneous.
+        state->camera.setPosition(state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f});
     } else {
         state->accumulator = 0;
     }
@@ -618,8 +625,10 @@ static EngineState* _engineGetState(Engine* engine) {
     // 5. Sync player yaw from camera so WASD uses the correct direction
     state->player.yaw = state->camera.yaw();
 
-    // 6. Player physics tick
-    bool sprinting = input.isDown(Key::LeftControl);
+    // 6. Player physics tick. Sprint reads the bound key (LeftShift) rather
+    // than a hardcoded LeftControl, which is actually the sneak binding — so
+    // sprint used to fire on the sneak key.
+    bool sprinting = input.isDown(bindings.sprint.key);
     state->player.tick(*state->world, input, sprinting);
 
     // 6b. Footsteps: one thud roughly every two blocks walked on the ground
