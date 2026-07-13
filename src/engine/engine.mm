@@ -14,6 +14,8 @@
 #include <entity/voxel_traversal.hpp>
 #include <world/world.hpp>
 #include <world/save_manager.hpp>
+#include <audio/audio_engine.hpp>
+#include <audio/sfx.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -70,6 +72,16 @@ struct EngineState {
     std::shared_ptr<World> world;
     std::unique_ptr<SaveManager> saveManager;
     Camera camera;
+
+    // ---- Audio ----
+    std::unique_ptr<AudioEngine> audio;
+    std::vector<float> sfxBlockBreak;
+    std::vector<float> sfxBlockPlace;
+    std::vector<float> sfxFootstep;
+    std::vector<float> sfxWind;
+    int32_t windVoice = -1;
+    float footstepDistance = 0.f;   // ground distance walked since last step
+    Vec3 lastFootstepPos{0.f, 0.f, 0.f};
 
     // ---- Input manager (set after window creation) ----
     InputManager* inputManager = nullptr;
@@ -254,6 +266,19 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
+    // 8. Audio: non-fatal on failure — the game is fully playable silent
+    _state->audio = std::make_unique<AudioEngine>();
+    if (_state->audio->initialize()) {
+        _state->sfxBlockBreak = SoundEffect::generateBlockBreak();
+        _state->sfxBlockPlace = SoundEffect::generateBlockPlace();
+        _state->sfxFootstep = SoundEffect::generateFootstep();
+        _state->sfxWind = SoundEffect::generateAmbientWind();
+        [self syncAudioVolume];
+    } else {
+        RY_LOG_ERROR("Audio engine failed to initialize — continuing without sound");
+        _state->audio.reset();
+    }
+
     RY_LOG_INFO(std::string("Engine initialized — window: ") +
         std::to_string(static_cast<int>(_view.bounds.size.width)) + "x" +
         std::to_string(static_cast<int>(_view.bounds.size.height)) +
@@ -332,6 +357,31 @@ static EngineState* _engineGetState(Engine* engine) {
     (void)view;
 }
 
+// ---- Audio ----
+
+// Master volume follows the settings slider while playing and mutes in
+// menus (paused world = paused soundscape). The ambient wind bed starts on
+// the first transition into gameplay.
+- (void)syncAudioVolume {
+    EngineState* state = _state.get();
+    if (!state->audio) return;
+
+    const bool playing = state->flow.screen == GameScreen::Playing;
+    float volume = static_cast<float>(state->settings.volumeLevel) / 10.0f;
+    state->audio->setMasterVolume(playing ? volume : 0.0f);
+
+    if (playing && state->windVoice < 0 && !state->sfxWind.empty()) {
+        state->windVoice = state->audio->playSound(state->sfxWind, SoundEffect::SAMPLE_RATE,
+                                                   0.18f, /*looping=*/true);
+    }
+}
+
+- (void)playSfx:(const std::vector<float>&)buffer gain:(float)gain {
+    EngineState* state = _state.get();
+    if (!state->audio || state->flow.screen != GameScreen::Playing) return;
+    state->audio->playSound(buffer, SoundEffect::SAMPLE_RATE, gain);
+}
+
 // ---- Screen-level input: ESC, menu interaction, debug HUD toggle ----
 
 - (void)applyFlowEffects:(GameFlowEffects)effects {
@@ -351,6 +401,7 @@ static EngineState* _engineGetState(Engine* engine) {
     if (effects.requestQuit) {
         [self requestQuit];
     }
+    [self syncAudioVolume];
 }
 
 // Settings steppers mutate live engine state; the screen doesn't change.
@@ -389,6 +440,7 @@ static EngineState* _engineGetState(Engine* engine) {
         case MenuAction::VolumeUp: {
             int step = (action == MenuAction::VolumeUp) ? 1 : -1;
             settings.volumeLevel = std::clamp(settings.volumeLevel + step, 0, 10);
+            [self syncAudioVolume];
             break;
         }
         default:
@@ -523,6 +575,22 @@ static EngineState* _engineGetState(Engine* engine) {
     bool sprinting = input.isDown(Key::LeftControl);
     state->player.tick(*state->world, input, sprinting);
 
+    // 6b. Footsteps: one thud roughly every two blocks walked on the ground
+    if (state->audio) {
+        Vec3 moved = state->player.position - state->lastFootstepPos;
+        moved.y = 0.f;
+        state->lastFootstepPos = state->player.position;
+        if (state->player.onGround) {
+            state->footstepDistance += moved.length();
+            if (state->footstepDistance >= 2.2f) {
+                state->footstepDistance = 0.f;
+                [self playSfx:state->sfxFootstep gain:0.5f];
+            }
+        } else {
+            state->footstepDistance = 0.f;
+        }
+    }
+
     // 7. Update loaded chunks around player
     state->world->updatePlayerPosition(
         Chunk::worldToChunk(state->player.position.x),
@@ -593,6 +661,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Clear highlight since block is now air
     state->hasHighlightedBlock = false;
+
+    [self playSfx:state->sfxBlockBreak gain:0.8f];
 }
 
 // ---- Block Placing (Task 6.2) ----
@@ -641,6 +711,8 @@ static EngineState* _engineGetState(Engine* engine) {
         auto chunk = state->world->getChunk(chunkX, chunkZ);
         if (chunk) state->saveManager->saveChunk(*chunk);
     }
+
+    [self playSfx:state->sfxBlockPlace gain:0.8f];
 }
 
 // ---- Block Highlight Update (Task 6.9) ----

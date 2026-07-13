@@ -71,28 +71,8 @@ bool AudioEngine::initialize() {
         return false;
     }
 
-    // Enable input/output
-    UInt32 flag = 1;
-    status = AudioUnitSetProperty(_audioUnit,
-                                   kAudioOutputUnitProperty_EnableIO,
-                                   kAudioUnitScope_Output,
-                                   0, // input
-                                   &flag, sizeof(flag));
-    if (status != noErr) {
-        RY_LOG_ERROR("Failed to enable audio input");
-        return false;
-    }
-
-    flag = 1;
-    status = AudioUnitSetProperty(_audioUnit,
-                                   kAudioOutputUnitProperty_EnableIO,
-                                   kAudioUnitScope_Input,
-                                   1, // output
-                                   &flag, sizeof(flag));
-    if (status != noErr) {
-        RY_LOG_ERROR("Failed to enable audio output");
-        return false;
-    }
+    // No EnableIO needed: kAudioUnitSubType_DefaultOutput has output-only
+    // IO fixed on (EnableIO applies to AUHAL, and setting it here fails).
 
     // Set output format: 44.1kHz, stereo, 32-bit float
     std::memset(&_outputFormat, 0, sizeof(_outputFormat));
@@ -105,10 +85,11 @@ bool AudioEngine::initialize() {
     _outputFormat.mBytesPerPacket = 8;
     _outputFormat.mBitsPerChannel = 32;
 
+    // The format the render callback SUPPLIES: input scope of output bus 0
     status = AudioUnitSetProperty(_audioUnit,
                                    kAudioUnitProperty_StreamFormat,
-                                   kAudioUnitScope_Output,
-                                   1,
+                                   kAudioUnitScope_Input,
+                                   0,
                                    &_outputFormat, sizeof(_outputFormat));
     if (status != noErr) {
         RY_LOG_ERROR("Failed to set audio output format");
@@ -196,7 +177,8 @@ void AudioEngine::deallocateVoice(int32_t voiceIndex) {
 // ---------------------------------------------------------------------------
 int32_t AudioEngine::playSound(const std::vector<float>& buffer,
                                uint32_t sampleRate,
-                               float gain)
+                               float gain,
+                               bool looping)
 {
     if (buffer.empty()) return -1;
 
@@ -210,7 +192,7 @@ int32_t AudioEngine::playSound(const std::vector<float>& buffer,
     _voices[voiceIndex].gain = gain;
     _voices[voiceIndex].readPosition = 0;
     _voices[voiceIndex].active = true;
-    _voices[voiceIndex].looping = false;
+    _voices[voiceIndex].looping = looping;
 
     return voiceIndex;
 }

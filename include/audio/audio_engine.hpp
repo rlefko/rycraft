@@ -40,9 +40,11 @@ public:
     void stop();
 
     // Play a sound buffer. Returns voice index (0-15) or -1 if no slots available.
+    // Looping voices repeat until stopVoice() is called (ambient beds).
     int32_t playSound(const std::vector<float>& buffer,
                       uint32_t sampleRate,
-                      float gain);
+                      float gain,
+                      bool looping = false);
 
     // Stop a specific voice by index.
     void stopVoice(int32_t voiceIndex);
