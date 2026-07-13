@@ -25,13 +25,13 @@
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
 #include <render/vertex.hpp>
-#include <world/biome.hpp>
 #include <world/chunk.hpp>
+#include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
+#include <world/climate.hpp>
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
-#include <world/terrain.hpp>
 #include <world/world.hpp>
 
 #include <chrono>
@@ -221,143 +221,206 @@ TEST_CASE("SimplexNoise operator() equals noise2D", "[noise]") {
 }
 
 // ============================================================================
-// Terrain Generator Tests
+// Climate / terrain shaping tests
 // ============================================================================
 
-TEST_CASE("TerrainGenerator height within [minHeight, maxHeight]", "[terrain]") {
-    TerrainGenerator terrain(42);
-    TerrainConfig config;
-    config.minHeight = 20.0;
-    config.maxHeight = 128.0;
+TEST_CASE("ClimateSampler shapeColumn is deterministic and sane", "[climate]") {
+    ClimateSampler c1(123);
+    ClimateSampler c2(123);
+    for (int i = -50; i <= 50; i += 7) {
+        ColumnShape a = c1.shapeColumn(i * 31.0, i * 17.0);
+        ColumnShape b = c2.shapeColumn(i * 31.0, i * 17.0);
+        REQUIRE(a.height == b.height);
+        REQUIRE(a.climate.temperature == b.climate.temperature);
+        REQUIRE(a.height >= 20.0);
+        REQUIRE(a.height <= 240.0);
+        REQUIRE(a.detailAmp >= 0.0);
+        REQUIRE(a.ravineEdge >= 0.0);
+        REQUIRE(a.ravineEdge <= 1.0);
+    }
+}
 
-    for (int ix = -100; ix <= 100; ix += 10) {
-        for (int iz = -100; iz <= 100; iz += 10) {
-            double h = terrain.getHeight(static_cast<double>(ix), static_cast<double>(iz), config);
-            REQUIRE(h >= config.minHeight);
-            REQUIRE(h <= config.maxHeight);
+TEST_CASE("selectBiome: ordered rules on the climate fields", "[climate]") {
+    ColumnShape shape;
+    shape.height = 40.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::DEEP_OCEAN);
+    shape.height = 58.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::OCEAN);
+
+    shape.height = 80.0;
+    shape.climate.temperature = -0.6;
+    shape.climate.humidity = 0.3;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::TAIGA);
+    shape.climate.humidity = -0.3;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::ICE_SPIKES);
+
+    shape.climate.temperature = 0.7;
+    shape.climate.humidity = -0.5;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::DESERT);
+
+    shape.climate.temperature = 0.3;
+    shape.climate.humidity = 0.4;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::FOREST);
+    shape.climate.temperature = 0.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::BIRCH_FOREST);
+
+    shape.climate.humidity = 0.6;
+    shape.height = 66.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::SWAMP);
+
+    shape.climate.humidity = 0.1;
+    shape.climate.temperature = 0.4;
+    shape.height = 80.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::FLOWER_FIELD);
+
+    shape.climate.humidity = -0.1;
+    shape.climate.temperature = 0.1;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::PLAINS);
+
+    shape.riverCut = 4.0;
+    shape.height = 60.0;
+    shape.climate.continentalness = 0.3;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::RIVER);
+}
+
+TEST_CASE("Terrain height is continuous — no biome cliffs", "[climate][worldgen]") {
+    // The old design added per-biome height offsets after a discrete biome
+    // pick, which produced 15-block-in-one-step walls at biome borders.
+    // Height now reads continuous splines only. The steepest legitimate
+    // slope is a river gorge bank through a high plateau (~7 blocks per
+    // column); a discrete-biome cliff would blow well past this bound.
+    ChunkGenerator gen(4242);
+    GenScratch scratch;
+    scratch.reset(&gen);
+    double prev = gen.baseHeightAt(-256, 100, scratch);
+    for (int x = -255; x <= 256; ++x) {
+        double h = gen.baseHeightAt(x, 100, scratch);
+        REQUIRE(std::abs(h - prev) <= 8.0);
+        prev = h;
+    }
+}
+
+// ============================================================================
+// ChunkGenerator tests
+// ============================================================================
+
+namespace {
+// Column-level invariants every generated chunk must satisfy.
+void checkChunkInvariants(const Chunk& chunk) {
+    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+            // Bedrock floor
+            REQUIRE(chunk.getBlock(lx, 0, lz) == BlockType::BEDROCK);
+            REQUIRE(chunk.getBlock(lx, 1, lz) == BlockType::BEDROCK);
+
+            int top = chunk.heightMap[lx + lz * CHUNK_WIDTH];
+            REQUIRE(top >= 2);
+            REQUIRE(isSolid(chunk.getBlock(lx, top, lz)));
+
+            for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                BlockType b = chunk.getBlock(lx, y, lz);
+                // Nothing solid above the height map
+                if (y > top) {
+                    REQUIRE(!isSolid(b));
+                }
+                // Water never rests directly on air, and stays below sea
+                // level; lava only pools at the very bottom
+                if (b == BlockType::WATER) {
+                    REQUIRE(y < 64);
+                    REQUIRE(chunk.getBlock(lx, y - 1, lz) != BlockType::AIR);
+                }
+                if (b == BlockType::LAVA) {
+                    REQUIRE(y <= 10);
+                }
+                if (b == BlockType::ICE) {
+                    REQUIRE(y == 63);
+                }
+            }
+        }
+    }
+}
+} // namespace
+
+TEST_CASE("ChunkGenerator: same seed → bit-identical chunk, different seed differs", "[worldgen]") {
+    ChunkGenerator g1(777);
+    ChunkGenerator g2(777);
+    ChunkGenerator g3(778);
+    Chunk a(5, -3), b(5, -3), c(5, -3);
+    g1.generate(a);
+    g2.generate(b);
+    g3.generate(c);
+    REQUIRE(a.blocks == b.blocks);
+    REQUIRE(a.biomes == b.biomes);
+    REQUIRE(a.heightMap == b.heightMap);
+    REQUIRE(a.blocks != c.blocks);
+}
+
+TEST_CASE("ChunkGenerator: column invariants hold across varied chunks", "[worldgen]") {
+    ChunkGenerator gen(1234);
+    for (auto [cx, cz] : {std::pair{0, 0}, {5, 7}, {-3, 2}, {40, -25}}) {
+        Chunk chunk(cx, cz);
+        gen.generate(chunk);
+        checkChunkInvariants(chunk);
+    }
+}
+
+TEST_CASE("ChunkGenerator: underground carve fraction is sane", "[worldgen][caves]") {
+    // The old carver's inverted threshold hollowed out ~99% of the
+    // underground (the bug this overhaul fixes). Keep the carved fraction
+    // in a believable band across several chunks.
+    ChunkGenerator gen(31337);
+    int air = 0, total = 0;
+    for (auto [cx, cz] : {std::pair{0, 0}, {3, 1}, {-2, -4}, {10, 6}}) {
+        Chunk chunk(cx, cz);
+        gen.generate(chunk);
+        for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+            for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+                int top = chunk.heightMap[lx + lz * CHUNK_WIDTH];
+                for (int y = 8; y < top - 10; ++y) {
+                    ++total;
+                    BlockType b = chunk.getBlock(lx, y, lz);
+                    if (b == BlockType::AIR || b == BlockType::LAVA)
+                        ++air;
+                }
+            }
+        }
+    }
+    REQUIRE(total > 0);
+    double fraction = static_cast<double>(air) / static_cast<double>(total);
+    REQUIRE(fraction >= 0.01);
+    REQUIRE(fraction <= 0.30);
+}
+
+TEST_CASE("ChunkGenerator: surfaceYAt matches the generated height map", "[worldgen]") {
+    ChunkGenerator gen(9999);
+    GenScratch scratch;
+    scratch.reset(&gen);
+    Chunk chunk(2, -7);
+    gen.generate(chunk);
+    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+            int wx = chunk.chunkX * CHUNK_WIDTH + lx;
+            int wz = chunk.chunkZ * CHUNK_DEPTH + lz;
+            REQUIRE(gen.surfaceYAt(wx, wz, scratch) == chunk.heightMap[lx + lz * CHUNK_WIDTH]);
         }
     }
 }
 
-TEST_CASE("TerrainGenerator deterministic output", "[terrain]") {
-    TerrainGenerator t1(123);
-    TerrainGenerator t2(123);
-
-    double a = t1.getHeight(100.0, 200.0);
-    double b = t2.getHeight(100.0, 200.0);
-    REQUIRE(a == b);
-}
-
-TEST_CASE("TerrainGenerator getNoise is deterministic", "[terrain]") {
-    TerrainGenerator terrain(42);
-    double a = terrain.getNoise(10.0, 20.0);
-    double b = terrain.getNoise(10.0, 20.0);
-    REQUIRE(a == b);
-}
-
-// ============================================================================
-// Biome Generator Tests
-// ============================================================================
-
-TEST_CASE("BiomeGenerator lookup: DeepOcean for very low elevation", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.5, 0.5, 50.0);
-    REQUIRE(b == Biome::DEEP_OCEAN);
-}
-
-TEST_CASE("BiomeGenerator lookup: Ocean for below sea level", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.5, 0.5, 62.0);
-    REQUIRE(b == Biome::OCEAN);
-}
-
-TEST_CASE("BiomeGenerator lookup: Swamp for low elevation + wet", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.6, 0.7, 66.0);
-    REQUIRE(b == Biome::SWAMP);
-}
-
-TEST_CASE("BiomeGenerator lookup: ExtremeHills for cold + dry", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.2, 0.2, 80.0);
-    REQUIRE(b == Biome::EXTREME_HILLS);
-}
-
-TEST_CASE("BiomeGenerator lookup: IceSpikes for cold + medium moisture", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.2, 0.4, 80.0);
-    REQUIRE(b == Biome::ICE_SPIKES);
-}
-
-TEST_CASE("BiomeGenerator lookup: Taiga for cold + wet", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.2, 0.7, 80.0);
-    REQUIRE(b == Biome::TAIGA);
-}
-
-TEST_CASE("BiomeGenerator lookup: Desert for hot + dry", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.8, 0.2, 80.0);
-    REQUIRE(b == Biome::DESERT);
-}
-
-TEST_CASE("BiomeGenerator lookup: Forest for warm + wet", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.5, 0.6, 80.0);
-    REQUIRE(b == Biome::FOREST);
-}
-
-TEST_CASE("BiomeGenerator lookup: Plains for warm + dry", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.5, 0.4, 80.0);
-    REQUIRE(b == Biome::PLAINS);
-}
-
-TEST_CASE("BiomeGenerator temperature in [0, 1]", "[biome]") {
-    BiomeGenerator bg(42);
-    for (int i = 0; i < 20; ++i) {
-        double t = bg.getTemperature(static_cast<double>(i) * 10.0, static_cast<double>(i) * 10.0);
-        REQUIRE(t >= 0.0);
-        REQUIRE(t <= 1.0);
-    }
-}
-
-TEST_CASE("BiomeGenerator moisture in [0, 1]", "[biome]") {
-    BiomeGenerator bg(42);
-    for (int i = 0; i < 20; ++i) {
-        double m = bg.getMoisture(static_cast<double>(i) * 10.0, static_cast<double>(i) * 10.0);
-        REQUIRE(m >= 0.0);
-        REQUIRE(m <= 1.0);
-    }
-}
-
-TEST_CASE("BiomeGenerator height modifier values", "[biome]") {
-    BiomeGenerator bg(42);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::EXTREME_HILLS) == 30.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::DESERT) == 5.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::PLAINS) == 0.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::FOREST) == 10.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::TAIGA) == 15.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::SWAMP) == -5.0);
-}
-
-TEST_CASE("BiomeGenerator surface block values", "[biome]") {
-    BiomeGenerator bg(42);
-    REQUIRE(bg.getSurfaceBlock(Biome::PLAINS) == BlockType::GRASS);
-    REQUIRE(bg.getSurfaceBlock(Biome::FOREST) == BlockType::GRASS);
-    REQUIRE(bg.getSurfaceBlock(Biome::TAIGA) == BlockType::GRASS);
-    REQUIRE(bg.getSurfaceBlock(Biome::DESERT) == BlockType::AIR);
-    REQUIRE(bg.getSurfaceBlock(Biome::EXTREME_HILLS) == BlockType::STONE);
-    REQUIRE(bg.getSurfaceBlock(Biome::ICE_SPIKES) == BlockType::STONE);
-}
-
-TEST_CASE("BiomeGenerator getBiome is deterministic", "[biome]") {
-    BiomeGenerator bg1(42);
-    BiomeGenerator bg2(42);
-
-    Biome b1 = bg1.getBiome(100.0, 200.0, 80.0);
-    Biome b2 = bg2.getBiome(100.0, 200.0, 80.0);
-    REQUIRE(b1 == b2);
+TEST_CASE("ChunkGenerator: chunks are generation-order independent", "[worldgen]") {
+    // Generate the same 2x1 area in both orders across separate generators;
+    // every block must agree (the purity contract for infinite worlds).
+    ChunkGenerator g1(5150);
+    ChunkGenerator g2(5150);
+    Chunk a0(0, 0), a1(1, 0);
+    g1.generate(a0);
+    g1.generate(a1);
+    Chunk b1(1, 0), b0(0, 0);
+    g2.generate(b1);
+    g2.generate(b0);
+    REQUIRE(a0.blocks == b0.blocks);
+    REQUIRE(a1.blocks == b1.blocks);
+    REQUIRE(a0.biomes == b0.biomes);
+    REQUIRE(a1.biomes == b1.biomes);
 }
 
 // ============================================================================

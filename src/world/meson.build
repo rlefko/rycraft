@@ -1,14 +1,10 @@
 world_sources = files(
   'world.cpp',
   'noise.cpp',
-  'terrain.cpp',
-  'biome.cpp',
+  'climate.cpp',
+  'density_field.cpp',
+  'chunk_generator.cpp',
   'chunk.cpp',
-  'surface.cpp',
-  'caves.cpp',
-  'ores.cpp',
-  'trees.cpp',
-  'structures.cpp',
   'serialization.cpp',
   'save_manager.cpp',
 )

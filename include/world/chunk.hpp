@@ -25,7 +25,12 @@ enum class Biome : uint8_t {
     SWAMP = 7,
     MUSHROOM_ISLAND = 8,
     ICE_SPIKES = 9,
-    COUNT = 10
+    // Values are persisted in saves: only append, never renumber.
+    BEACH = 10,
+    RIVER = 11,
+    BIRCH_FOREST = 12,
+    FLOWER_FIELD = 13,
+    COUNT = 14
 };
 
 struct Chunk {

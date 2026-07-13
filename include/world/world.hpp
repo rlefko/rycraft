@@ -1,15 +1,8 @@
 #pragma once
 #include "common/thread_pool.hpp"
-#include "world/biome.hpp"
-#include "world/caves.hpp"
 #include "world/chunk.hpp"
+#include "world/chunk_generator.hpp"
 #include "world/chunk_pos.hpp"
-#include "world/noise.hpp"
-#include "world/ores.hpp"
-#include "world/structures.hpp"
-#include "world/surface.hpp"
-#include "world/terrain.hpp"
-#include "world/trees.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -96,13 +89,8 @@ private:
     // Persistence (non-owning; the engine owns the SaveManager)
     SaveManager* saveManager_ = nullptr;
 
-    // Generation components
-    TerrainGenerator terrainGen_;
-    BiomeGenerator biomeGen_;
-    CaveGenerator caveGen_;
-    OreGenerator oreGen_;
-    TreeGenerator treeGen_;
-    StructureGenerator structureGen_;
+    // World generation (climate + density + surface + features)
+    ChunkGenerator generator_;
 
     // Player position for chunk loading. hasPlayerChunk_ stays false until
     // the first updatePlayerPosition call, so the spawn area streams in even

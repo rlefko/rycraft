@@ -11,12 +11,7 @@
 World::World(uint32_t seed, int viewDistance)
     : seed_(seed)
     , viewDistance_(viewDistance)
-    , terrainGen_(seed)
-    , biomeGen_(seed)
-    , caveGen_(seed)
-    , oreGen_(seed)
-    , treeGen_(seed)
-    , structureGen_(seed) {}
+    , generator_(seed) {}
 
 World::~World() {
     // Wait for in-flight generation tasks: they capture `this` and insert
@@ -30,45 +25,7 @@ World::~World() {
 }
 
 void World::generateChunk(std::shared_ptr<Chunk> chunk) {
-    int worldBaseX = chunk->chunkX * CHUNK_WIDTH;
-    int worldBaseZ = chunk->chunkZ * CHUNK_DEPTH;
-
-    TerrainConfig terrainConfig;
-    BiomeConfig biomeConfig;
-
-    std::vector<double> heights(CHUNK_WIDTH * CHUNK_DEPTH);
-    std::array<Biome, CHUNK_WIDTH * CHUNK_DEPTH> biomes;
-
-    for (int z = 0; z < CHUNK_DEPTH; ++z) {
-        for (int x = 0; x < CHUNK_WIDTH; ++x) {
-            int worldX = worldBaseX + x;
-            int worldZ = worldBaseZ + z;
-            int xzIndex = x + z * CHUNK_WIDTH;
-
-            double height = terrainGen_.getHeight(static_cast<double>(worldX),
-                                                  static_cast<double>(worldZ), terrainConfig);
-            heights[xzIndex] = height;
-
-            Biome biome = biomeGen_.getBiome(static_cast<double>(worldX),
-                                             static_cast<double>(worldZ), height, biomeConfig);
-            biomes[xzIndex] = biome;
-        }
-    }
-
-    SurfaceGenerator::generateSurface(*chunk, heights, biomes);
-
-    CaveConfig caveConfig;
-    caveGen_.carve(*chunk, caveConfig);
-
-    OreConfig oreConfig;
-    oreGen_.generate(*chunk, oreConfig);
-
-    treeGen_.generate(*chunk, biomes);
-    structureGen_.generate(*chunk, biomes);
-
-    chunk->biomes = biomes;
-    chunk->generated = true;
-    chunk->needsMeshUpdate = true;
+    generator_.generate(*chunk);
 }
 
 void World::generateChunkAsync(int chunkX, int chunkZ) {
@@ -178,12 +135,11 @@ void World::setBlock(int x, int y, int z, BlockType type) {
 }
 
 double World::getTerrainHeight(int x, int z) const {
-    return terrainGen_.getHeight(static_cast<double>(x), static_cast<double>(z));
+    return generator_.baseHeightAt(x, z);
 }
 
 Biome World::getBiome(int x, int z) const {
-    double height = getTerrainHeight(x, z);
-    return biomeGen_.getBiome(static_cast<double>(x), static_cast<double>(z), height);
+    return generator_.biomeAt(x, z);
 }
 
 std::vector<std::shared_ptr<Chunk>> World::getLoadedChunks() const {

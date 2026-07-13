@@ -35,7 +35,11 @@ BiomeSpawnRule Spawner::getSpawnRule(Biome biome) {
             return {4, 0, 0, 0};
         case Biome::ICE_SPIKES:
             return {2, 1, 0, 0};
-        default:
+        case Biome::BIRCH_FOREST:
+            return {4, 4, 4, 0};
+        case Biome::FLOWER_FIELD:
+            return {8, 4, 2, 0};
+        default: // BEACH, RIVER, and future biomes spawn nothing
             return {0, 0, 0, 0};
     }
 }

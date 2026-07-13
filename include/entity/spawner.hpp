@@ -3,7 +3,7 @@
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/spatial_hash.hpp>
-#include <world/biome.hpp>
+#include <world/chunk.hpp>
 #include <world/world.hpp>
 
 #include "common/random.hpp"
