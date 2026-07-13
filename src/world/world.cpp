@@ -219,12 +219,18 @@ void World::updatePlayerPosition(int playerX, int playerZ) {
     playerChunkX_ = newPlayerChunkX;
     playerChunkZ_ = newPlayerChunkZ;
 
+    // Load chunks around player (getChunk locks chunksMutex_ internally)
     for (int dz = -viewDistance_; dz <= viewDistance_; ++dz) {
         for (int dx = -viewDistance_; dx <= viewDistance_; ++dx) {
             getChunk(playerChunkX_ + dx, playerChunkZ_ + dz);
         }
     }
 
+    // Unload distant chunks — lock separately to avoid deadlock with getChunk
+    unloadDistantChunks();
+}
+
+void World::unloadDistantChunks() {
     std::lock_guard<std::mutex> lock(chunksMutex_);
     auto it = chunks_.begin();
     while (it != chunks_.end()) {

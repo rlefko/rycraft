@@ -64,6 +64,9 @@ public:
     // Update chunks around player position (synchronous)
     void updatePlayerPosition(int playerX, int playerZ);
 
+    // Unload chunks outside the view distance (called by updatePlayerPosition)
+    void unloadDistantChunks();
+
     // Start async generation of chunks around player
     void generateAroundPlayer(int playerX, int playerZ);
 
