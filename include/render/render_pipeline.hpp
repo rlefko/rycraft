@@ -12,6 +12,7 @@
 
 #include "common/math.hpp"
 #include "engine/hotbar.hpp"
+#include "render/ui_menu.hpp"
 #include "render/mega_buffer.hpp"
 #include "render/particles.hpp"
 #include "render/shader_types.hpp"
@@ -62,7 +63,8 @@ public:
                 const Camera& camera,
                 uint64_t worldTime = 0,
                 std::optional<Vec3> highlightedBlock = std::nullopt,
-                const Hotbar& hotbar = Hotbar());
+                const Hotbar& hotbar = Hotbar(),
+                const UIFrameState& uiFrame = UIFrameState{});
 
     // Reallocate MSAA and resolve textures for new viewport size.
     void resize(uint32_t width, uint32_t height);
@@ -74,6 +76,9 @@ public:
 
     // Update particle system physics (call each game tick).
     void tickParticles(float dt, const World& world, const Vec3& playerPosition);
+
+    // Exponential fog density per block (settings menu).
+    void setFogDensity(float density) { _fogDensity = density; }
 
     // Write the next presented frame to `path` as a PNG (async, off the
     // render thread). Used by the playtest workflow for headless visual
@@ -132,6 +137,9 @@ private:
     // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
     float _bloomIntensity;
 
+    // Exponential fog density per block
+    float _fogDensity = 0.0003f;
+
     // Drawable dimensions (the scene renders at native resolution)
     uint32_t _displayWidth;
     uint32_t _displayHeight;
@@ -186,7 +194,8 @@ private:
                               const Mat4& projectionMatrix);
 
     void renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
-                         const Hotbar& hotbar);
+                         const Hotbar& hotbar,
+                         const UIFrameState& uiFrame);
 
     void renderClouds(id<MTLRenderCommandEncoder> encoder,
                       const Camera& camera,

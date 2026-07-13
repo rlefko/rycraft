@@ -129,6 +129,8 @@ void InputState::update() {
     // Clear one-frame events
     keysJustPressed.clear();
     keysJustReleased.clear();
+    mouseDelta = Vec2{0, 0};
+    scrollDelta = 0.f;
 }
 
 void InputState::clearMouseDelta() {
@@ -186,14 +188,24 @@ InputManager::InputManager(NSWindow* window)
     : state_{}
     , window_(window)
     , lastMousePosition_{0, 0}
-    , cursorActive_(false)
+    , captured_(false)
+    , cursorHidden_(false)
     , keyDownMonitor_(nil)
     , keyUpMonitor_(nil)
     , mouseMovedMonitor_(nil)
     , mouseDraggedMonitor_(nil)
     , mouseDownMonitor_(nil)
-    , mouseUpMonitor_(nil) {
+    , mouseUpMonitor_(nil)
+    , scrollWheelMonitor_(nil) {
     assert(window_ != nil && "InputManager requires a non-nil window");
+
+    // Cursor warps (capture/release) briefly suppress local mouse events by
+    // default; zero the interval so menu hover works immediately.
+    CGEventSourceRef eventSource = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+    if (eventSource) {
+        CGEventSourceSetLocalEventsSuppressionInterval(eventSource, 0.0);
+        CFRelease(eventSource);
+    }
 
     // Register local event monitors
     auto self = this;
@@ -240,6 +252,13 @@ InputManager::InputManager(NSWindow* window)
             return event;
         }];
 
+    scrollWheelMonitor_ = [NSEvent addLocalMonitorForEventsMatchingMask:
+        NSEventMaskScrollWheel
+        handler: ^NSEvent*(NSEvent* event) {
+            self->handleScrollWheel(event);
+            return event;
+        }];
+
     // Enable tracking for mouse events
     [window_ setAcceptsMouseMovedEvents: true];
 }
@@ -252,6 +271,15 @@ InputManager::~InputManager() {
     if (mouseDraggedMonitor_) [NSEvent removeMonitor: mouseDraggedMonitor_];
     if (mouseDownMonitor_)  [NSEvent removeMonitor: mouseDownMonitor_];
     if (mouseUpMonitor_)    [NSEvent removeMonitor: mouseUpMonitor_];
+    if (scrollWheelMonitor_) [NSEvent removeMonitor: scrollWheelMonitor_];
+
+    // Never leave the (global) mouse association broken behind us
+    if (captured_) {
+        CGAssociateMouseAndMouseCursorPosition(true);
+    }
+    if (cursorHidden_) {
+        [NSCursor unhide];
+    }
 }
 
 InputState& InputManager::state() {
@@ -261,15 +289,6 @@ InputState& InputManager::state() {
 void InputManager::handleKeyDown(NSEvent* event) {
     Key key = keyCodeToKey([event keyCode]);
 
-    // Click-to-wait: first keypress activates cursor capture
-    if (!cursorActive_) {
-        cursorActive_ = true;
-        hideAndConfineCursor();
-        RY_LOG_INFO("Input activated — cursor captured");
-        return;  // Don't process this keypress — it was used to activate
-    }
-
-    // Track just-pressed
     state_.keysJustPressed[key] = true;
     state_.keysDown[key] = true;
 }
@@ -282,19 +301,23 @@ void InputManager::handleKeyUp(NSEvent* event) {
 }
 
 void InputManager::handleMouseMoved(NSEvent* event) {
+    if (captured_) {
+        // Raw hardware deltas, ACCUMULATED — multiple events can arrive per
+        // frame and overwriting dropped motion. deltaY is positive downward;
+        // the negation preserves the bottom-left-origin convention the
+        // camera consumes (mouse up = +y = pitch up).
+        state_.mouseDelta.x += static_cast<float>([event deltaX]);
+        state_.mouseDelta.y -= static_cast<float>([event deltaY]);
+        return;
+    }
     NSPoint loc = [event locationInWindow];
     Vec2 current{static_cast<float>(loc.x), static_cast<float>(loc.y)};
-    state_.mouseDelta = current - lastMousePosition_;
     state_.mousePosition = current;
     lastMousePosition_ = current;
 }
 
 void InputManager::handleMouseDragged(NSEvent* event) {
-    NSPoint loc = [event locationInWindow];
-    Vec2 current{static_cast<float>(loc.x), static_cast<float>(loc.y)};
-    state_.mouseDelta = current - lastMousePosition_;
-    state_.mousePosition = current;
-    lastMousePosition_ = current;
+    handleMouseMoved(event);
 }
 
 void InputManager::handleMouseDown(NSEvent* event) {
@@ -329,17 +352,52 @@ void InputManager::handleMouseUp(NSEvent* event) {
     }
 }
 
-void InputManager::hideAndConfineCursor() {
-    [NSCursor hide];
-    if (window_) {
-        [window_ performSelector: @selector(setIgnoresMouseEvents:)
-                       withObject: @NO
-                       afterDelay: 0];
-    }
+void InputManager::handleScrollWheel(NSEvent* event) {
+    state_.scrollDelta += static_cast<float>([event scrollingDeltaY]);
 }
 
-void InputManager::showCursor() {
-    [NSCursor unhide];
+void InputManager::warpCursorToWindowCenter() {
+    if (!window_) return;
+    NSRect contentRect = [window_ contentRectForFrameRect:[window_ frame]];
+    NSPoint centerCocoa{NSMidX(contentRect), NSMidY(contentRect)};
+    // Cocoa screen coords are bottom-left origin; CG display coords are
+    // top-left of the main display.
+    CGFloat screenHeight = [[[NSScreen screens] firstObject] frame].size.height;
+    CGWarpMouseCursorPosition(
+        CGPointMake(centerCocoa.x, screenHeight - centerCocoa.y));
+
+    // Keep the software position in sync with the warp
+    NSRect windowContent = [window_ contentRectForFrameRect:[window_ frame]];
+    lastMousePosition_ = Vec2{static_cast<float>(windowContent.size.width * 0.5),
+                              static_cast<float>(windowContent.size.height * 0.5)};
+    state_.mousePosition = lastMousePosition_;
+}
+
+void InputManager::captureMouse() {
+    if (captured_) return;
+    captured_ = true;
+
+    warpCursorToWindowCenter();
+    CGAssociateMouseAndMouseCursorPosition(false);
+    if (!cursorHidden_) {
+        [NSCursor hide];
+        cursorHidden_ = true;
+    }
+    state_.clearMouseDelta();
+}
+
+void InputManager::releaseMouse() {
+    if (!captured_) return;
+    captured_ = false;
+
+    // Warp BEFORE re-associating so the first hover events aren't suppressed
+    warpCursorToWindowCenter();
+    CGAssociateMouseAndMouseCursorPosition(true);
+    if (cursorHidden_) {
+        [NSCursor unhide];
+        cursorHidden_ = false;
+    }
+    state_.clearMouseDelta();
 }
 
 Key InputManager::keyCodeToKey(NSInteger keyCode) {

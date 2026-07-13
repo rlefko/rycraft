@@ -27,6 +27,8 @@
 #include <entity/spatial_hash.hpp>
 #include <entity/spawner.hpp>
 #include <engine/hotbar.hpp>
+#include <engine/game_state.hpp>
+#include <render/ui_menu.hpp>
 #include <audio/sfx.hpp>
 #include <audio/audio_engine.hpp>
 
@@ -1426,6 +1428,144 @@ TEST_CASE("Block textures: extra layers extend past the block types", "[render][
     REQUIRE(TEXTURE_LAYER_GRASS_SIDE == static_cast<uint8_t>(BlockType::COUNT));
     REQUIRE(TEXTURE_LAYER_COUNT > TEXTURE_LAYER_GRASS_SIDE);
     REQUIRE(BlockTextureArray::TILE_SIZE == 16);
+}
+
+// ============================================================================
+// Game flow + menu layout tests (pure C++, no Metal)
+// ============================================================================
+TEST_CASE("GameFlow: ESC toggles pause and backs out of settings", "[ui][flow]") {
+    GameFlow flow;
+    REQUIRE(flow.screen == GameScreen::Title);
+
+    // ESC is inert on the title screen
+    auto fx = flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::Title);
+    REQUIRE(!fx.captureCursor);
+
+    // PLAY enters gameplay and captures the mouse
+    fx = flow.onMenuAction(MenuAction::Play);
+    REQUIRE(flow.screen == GameScreen::Playing);
+    REQUIRE(fx.captureCursor);
+    REQUIRE(fx.resetTiming);
+
+    // ESC pauses (release + timing reset), ESC again resumes (capture)
+    fx = flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::Paused);
+    REQUIRE(fx.releaseCursor);
+    REQUIRE(fx.resetTiming);
+
+    fx = flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::Playing);
+    REQUIRE(fx.captureCursor);
+
+    // Settings sits under pause; ESC backs out one level
+    flow.onEscape();
+    flow.onMenuAction(MenuAction::OpenSettings);
+    REQUIRE(flow.screen == GameScreen::Settings);
+    flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::Paused);
+}
+
+TEST_CASE("GameFlow: resume and quit actions", "[ui][flow]") {
+    GameFlow flow;
+    flow.onMenuAction(MenuAction::Play);
+    flow.onEscape();  // pause
+
+    auto fx = flow.onMenuAction(MenuAction::Resume);
+    REQUIRE(flow.screen == GameScreen::Playing);
+    REQUIRE(fx.captureCursor);
+
+    // Quit only works from title/pause
+    fx = flow.onMenuAction(MenuAction::Quit);
+    REQUIRE(!fx.requestQuit);
+    flow.onEscape();
+    fx = flow.onMenuAction(MenuAction::Quit);
+    REQUIRE(fx.requestQuit);
+}
+
+TEST_CASE("GameFlow: focus loss force-pauses gameplay only", "[ui][flow]") {
+    GameFlow flow;
+    flow.onMenuAction(MenuAction::Play);
+
+    auto fx = flow.onFocusLost();
+    REQUIRE(flow.screen == GameScreen::Paused);
+    REQUIRE(fx.releaseCursor);
+
+    // Idempotent while already paused
+    fx = flow.onFocusLost();
+    REQUIRE(flow.screen == GameScreen::Paused);
+    REQUIRE(!fx.releaseCursor);
+}
+
+TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][menu]") {
+    SettingsValues values;
+    for (auto [w, h] : {std::pair{1024.f, 768.f}, {2048.f, 1536.f}, {3456.f, 2234.f}}) {
+        for (GameScreen screen :
+             {GameScreen::Title, GameScreen::Paused, GameScreen::Settings}) {
+            MenuLayout layout = buildMenuLayout(screen, w, h, values);
+            REQUIRE(!layout.buttons.empty());
+
+            for (const auto& button : layout.buttons) {
+                REQUIRE(button.rect.x >= 0.f);
+                REQUIRE(button.rect.y >= 0.f);
+                REQUIRE(button.rect.x + button.rect.w <= 1.f);
+                REQUIRE(button.rect.y + button.rect.h <= 1.f);
+                REQUIRE(button.action != MenuAction::None);
+                if (layout.panel.w > 0.f) {
+                    REQUIRE(button.rect.x >= layout.panel.x);
+                    REQUIRE(button.rect.x + button.rect.w <= layout.panel.x + layout.panel.w);
+                }
+            }
+
+            // No two buttons overlap
+            for (size_t i = 0; i < layout.buttons.size(); ++i) {
+                for (size_t j = i + 1; j < layout.buttons.size(); ++j) {
+                    const UIRect& a = layout.buttons[i].rect;
+                    const UIRect& b = layout.buttons[j].rect;
+                    bool separated = a.x + a.w <= b.x || b.x + b.w <= a.x ||
+                                     a.y + a.h <= b.y || b.y + b.h <= a.y;
+                    REQUIRE(separated);
+                }
+            }
+        }
+    }
+
+    REQUIRE(buildMenuLayout(GameScreen::Playing, 1024.f, 768.f, values).buttons.empty());
+}
+
+TEST_CASE("Menu hit test: button centers hit, gaps miss", "[ui][menu]") {
+    SettingsValues values;
+    MenuLayout layout = buildMenuLayout(GameScreen::Paused, 1024.f, 768.f, values);
+
+    for (size_t i = 0; i < layout.buttons.size(); ++i) {
+        const UIRect& rect = layout.buttons[i].rect;
+        REQUIRE(menuHitTest(layout, rect.x + rect.w * 0.5f, rect.y + rect.h * 0.5f) ==
+                static_cast<int>(i));
+    }
+
+    REQUIRE(menuHitTest(layout, 0.02f, 0.02f) == -1);
+}
+
+TEST_CASE("Font covers every character the menus draw", "[ui][font]") {
+    SettingsValues values;
+    std::string needed = "0123456789.:/-+ ";
+    for (GameScreen screen :
+         {GameScreen::Title, GameScreen::Paused, GameScreen::Settings}) {
+        MenuLayout layout = buildMenuLayout(screen, 1024.f, 768.f, values);
+        for (const auto& text : layout.texts) needed += text.text;
+        for (const auto& button : layout.buttons) needed += button.label;
+    }
+    // Plus everything the debug HUD prints
+    needed += "FPS: Chunks: Entities: Frame: ";
+
+    for (char c : needed) {
+        if (c == ' ') continue;  // spaces render as gaps by design
+        auto bitmap = UIOverlay::getCharBitmap(c);
+        bool anyPixel = false;
+        for (uint8_t row : bitmap) anyPixel |= row != 0;
+        INFO("Missing glyph: '" << c << "'");
+        REQUIRE(anyPixel);
+    }
 }
 
 // ============================================================================

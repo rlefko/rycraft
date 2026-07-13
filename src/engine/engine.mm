@@ -6,13 +6,16 @@
 #include <common/math.hpp>
 #include <render/render_pipeline.hpp>
 #include <engine/camera.hpp>
+#include <engine/game_state.hpp>
 #include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
+#include <render/ui_menu.hpp>
 #include <entity/player.hpp>
 #include <entity/voxel_traversal.hpp>
 #include <world/world.hpp>
 #include <world/save_manager.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <cmath>
@@ -51,6 +54,17 @@ struct EngineState {
     Vec3 highlightedBlock; // Block currently targeted by crosshair
     bool hasHighlightedBlock = false;
 
+    // ---- Game flow & UI ----
+    GameFlow flow;                 // Title → Playing ⇄ Paused ⇄ Settings
+    SettingsValues settings;       // live values shown in the settings menu
+    MenuLayout menuLayout;         // rebuilt each frame while a menu is open
+    int hoveredButton = -1;
+    bool showDebugHud = false;
+
+    // ---- Performance stats (exponential moving averages) ----
+    float smoothedFrameMs = 16.7f;
+    uint32_t cachedChunkCount = 0;
+
     // ---- Player & World ----
     Player player;
     std::shared_ptr<World> world;
@@ -76,6 +90,9 @@ struct EngineState {
 
     // Scroll wheel tracking
     float _scrollAccumulator;
+
+    // Save-on-quit guard (terminate can be reached from several paths)
+    bool _savedWorld;
 }
 
 // ---- C++ bridge helper — must be inside @implementation to access _state ----
@@ -102,14 +119,23 @@ static EngineState* _engineGetState(Engine* engine) {
         _queue = nil;
         _scrollAccumulator = 0;
         _state = std::make_unique<EngineState>();
+        _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
+
+        // Resume the saved world when one exists; otherwise start fresh
+        uint32_t seed = 42;
+        Vec3 spawnPos{0.f, 100.f, 0.f};
+        if (auto meta = _state->saveManager->loadMetadata()) {
+            seed = meta->seed;
+            spawnPos = meta->spawnPos;
+            _state->worldTime = meta->worldTime;
+        }
+
         // View distance 12 keeps the full-detail mesh set comfortably inside
         // the 128 MB mega-buffer (25×25 chunks ≈ 60 MB of vertex data).
-        _state->world = std::make_shared<World>(42, 12);
-        _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
+        _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
         // Chunks load from disk before regenerating, so block edits persist
         _state->world->setSaveManager(_state->saveManager.get());
-        // Spawn player above terrain
-        _state->player.position = Vec3{0.f, 100.f, 0.f};
+        _state->player.position = spawnPos;
     }
     return self;
 }
@@ -185,9 +211,9 @@ static EngineState* _engineGetState(Engine* engine) {
     // Set as window content
     [_window setContentView: _view];
 
-    // 7. Create InputManager
+    // 7. Create InputManager (the game opens on the title screen with a
+    // free cursor; clicking PLAY captures the mouse)
     _state->inputManager = new InputManager(_window);
-    _state->inputManager->hideAndConfineCursor();
 
     // 6. Load shader library and create render pipeline
     NSString* exePath = [[NSBundle mainBundle] executablePath];
@@ -213,6 +239,19 @@ static EngineState* _engineGetState(Engine* engine) {
     // Playtest/diagnostic override: RYCRAFT_BLOOM=<0..1> scales or disables bloom
     if (const char* bloomEnv = std::getenv("RYCRAFT_BLOOM")) {
         _renderPipeline->setBloomIntensity(static_cast<float>(std::atof(bloomEnv)));
+    }
+
+    // Playtest override: start on a specific screen (title|playing|paused|settings)
+    if (const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN")) {
+        std::string name = screenEnv;
+        if (name == "playing") {
+            _state->flow.screen = GameScreen::Playing;
+            _state->inputManager->captureMouse();
+        } else if (name == "paused") {
+            _state->flow.screen = GameScreen::Paused;
+        } else if (name == "settings") {
+            _state->flow.screen = GameScreen::Settings;
+        }
     }
 
     RY_LOG_INFO(std::string("Engine initialized — window: ") +
@@ -255,13 +294,21 @@ static EngineState* _engineGetState(Engine* engine) {
     // 2. Add to accumulator
     state->accumulator += frameTime;
 
-    // 3. Fixed timestep game tick
-    while (state->accumulator >= EngineState::TICK_DT) {
-        [self gameTick:state];
-        state->accumulator -= EngineState::TICK_DT;
+    // 3. Screen-level input (ESC, menu clicks, F3) — runs every frame so
+    // menus stay responsive while the simulation is frozen
+    [self handleGlobalInput];
+
+    // 4. Fixed timestep game tick — menus freeze the world
+    if (state->flow.screen == GameScreen::Playing) {
+        while (state->accumulator >= EngineState::TICK_DT) {
+            [self gameTick:state];
+            state->accumulator -= EngineState::TICK_DT;
+        }
+    } else {
+        state->accumulator = 0;
     }
 
-    // 4. Render
+    // 5. Render
     [self render];
 
     // 5. Increment frame count
@@ -285,6 +332,164 @@ static EngineState* _engineGetState(Engine* engine) {
     (void)view;
 }
 
+// ---- Screen-level input: ESC, menu interaction, debug HUD toggle ----
+
+- (void)applyFlowEffects:(GameFlowEffects)effects {
+    EngineState* state = _state.get();
+    if (effects.captureCursor && state->inputManager) {
+        state->inputManager->captureMouse();
+    }
+    if (effects.releaseCursor && state->inputManager) {
+        state->inputManager->releaseMouse();
+    }
+    if (effects.resetTiming) {
+        state->accumulator = 0;
+        if (state->inputManager) {
+            state->inputManager->state().clearMouseDelta();
+        }
+    }
+    if (effects.requestQuit) {
+        [self requestQuit];
+    }
+}
+
+// Settings steppers mutate live engine state; the screen doesn't change.
+- (void)applySettingAction:(MenuAction)action {
+    EngineState* state = _state.get();
+    SettingsValues& settings = state->settings;
+
+    switch (action) {
+        case MenuAction::ViewDistanceDown:
+        case MenuAction::ViewDistanceUp: {
+            int step = (action == MenuAction::ViewDistanceUp) ? 2 : -2;
+            settings.viewDistance = std::clamp(settings.viewDistance + step, 4, 32);
+            if (state->world) {
+                state->world->setViewDistance(settings.viewDistance);
+            }
+            break;
+        }
+        case MenuAction::FogDown:
+        case MenuAction::FogUp: {
+            int step = (action == MenuAction::FogUp) ? 1 : -1;
+            settings.fogLevel = std::clamp(settings.fogLevel + step, 0, 10);
+            if (_renderPipeline) {
+                _renderPipeline->setFogDensity(static_cast<float>(settings.fogLevel) * 0.0001f);
+            }
+            break;
+        }
+        case MenuAction::SensitivityDown:
+        case MenuAction::SensitivityUp: {
+            int step = (action == MenuAction::SensitivityUp) ? 1 : -1;
+            settings.sensitivityLevel = std::clamp(settings.sensitivityLevel + step, 1, 10);
+            state->camera.setMouseSensitivity(
+                static_cast<float>(settings.sensitivityLevel) * 0.0005f);
+            break;
+        }
+        case MenuAction::VolumeDown:
+        case MenuAction::VolumeUp: {
+            int step = (action == MenuAction::VolumeUp) ? 1 : -1;
+            settings.volumeLevel = std::clamp(settings.volumeLevel + step, 0, 10);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+- (void)handleGlobalInput {
+    EngineState* state = _state.get();
+    if (!state->inputManager) return;
+    InputState& input = state->inputManager->state();
+
+    if (input.isJustPressed(Key::Escape)) {
+        [self applyFlowEffects:state->flow.onEscape()];
+    }
+    if (input.isJustPressed(Key::F3)) {
+        state->showDebugHud = !state->showDebugHud;
+    }
+
+    if (state->flow.inMenu()) {
+        // Rebuild the layout each frame (settings values can change) and
+        // hit-test in window points — the same normalized space it's drawn in
+        float boundsW = static_cast<float>(_view.bounds.size.width);
+        float boundsH = static_cast<float>(_view.bounds.size.height);
+        state->menuLayout =
+            buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings);
+
+        Vec2 mouse = input.mousePosition;
+        state->hoveredButton =
+            menuHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
+
+        if (input.isJustPressed(Key::MouseLeft) && state->hoveredButton >= 0) {
+            MenuAction action =
+                state->menuLayout.buttons[static_cast<size_t>(state->hoveredButton)].action;
+            [self applySettingAction:action];
+            [self applyFlowEffects:state->flow.onMenuAction(action)];
+        }
+    } else {
+        state->hoveredButton = -1;
+
+        // Hotbar: scroll wheel cycles slots (frame-level, gameplay only)
+        _scrollAccumulator += input.scrollDelta;
+        while (_scrollAccumulator >= 10.0f) {
+            state->hotbar.selectNext();
+            _scrollAccumulator -= 10.0f;
+        }
+        while (_scrollAccumulator <= -10.0f) {
+            state->hotbar.selectPrev();
+            _scrollAccumulator += 10.0f;
+        }
+    }
+}
+
+// ---- Clean quit: save the world, then terminate through AppKit ----
+
+- (void)saveWorldState {
+    if (_savedWorld) return;
+    _savedWorld = true;
+
+    EngineState* state = _state.get();
+    if (state->saveManager && state->world) {
+        state->saveManager->saveMetadata(state->world->getSeed(), state->player.position,
+                                         state->worldTime);
+        state->saveManager->flush();
+        RY_LOG_INFO("World state saved");
+    }
+}
+
+- (void)requestQuit {
+    if (_state->inputManager) {
+        _state->inputManager->releaseMouse();
+    }
+    [NSApp terminate:self];
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+    (void)sender;
+    [self saveWorldState];
+    return NSTerminateNow;
+}
+
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
+    (void)sender;
+    // The red close button routes through applicationShouldTerminate: above,
+    // so the save-on-quit path has no duplicate
+    return YES;
+}
+
+- (void)applicationWillTerminate:(NSNotification*)notification {
+    (void)notification;
+    // Belt and braces: the mouse association is global system state
+    CGAssociateMouseAndMouseCursorPosition(true);
+    [self saveWorldState];
+}
+
+- (void)windowDidResignKey:(NSNotification*)notification {
+    (void)notification;
+    // Cmd-Tab (or any focus loss) must never leave the pointer locked
+    [self applyFlowEffects:_state->flow.onFocusLost()];
+}
+
 // ---- Game Tick (fixed timestep at 20Hz) ----
 
 - (void)gameTick:(EngineState*)state {
@@ -304,21 +509,12 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 3. Hotbar input: scroll wheel cycles slots
-    _scrollAccumulator += input.mouseDelta.y;
-    while (_scrollAccumulator >= 30.0f) {
-        state->hotbar.selectNext();
-        _scrollAccumulator -= 30.0f;
-    }
-    while (_scrollAccumulator <= -30.0f) {
-        state->hotbar.selectPrev();
-        _scrollAccumulator += 30.0f;
-    }
-
-    // 4. Update camera from player state
+    // 3. Update camera from player state, then consume the look delta so a
+    // second tick in the same frame doesn't re-apply it
     state->camera.setPosition(state->player.position);
     InputBindings bindings;
     state->camera.update(state->deltaTime, input, bindings, state->player.position);
+    input.clearMouseDelta();
 
     // 5. Sync player yaw from camera so WASD uses the correct direction
     state->player.yaw = state->camera.yaw();
@@ -337,12 +533,7 @@ static EngineState* _engineGetState(Engine* engine) {
         state->player.jump();
     }
 
-    // 9. ESC to quit (only when cursor is active)
-    if (input.isJustPressed(Key::Escape)) {
-        exit(0);
-    }
-
-    // 10. Update weather particles
+    // 9. Update weather particles
     if (_renderPipeline) {
         _renderPipeline->tickParticles(state->deltaTime, *state->world, state->player.position);
     }
@@ -502,6 +693,24 @@ static EngineState* _engineGetState(Engine* engine) {
     // Camera view matrix
     Mat4 viewMatrix = state->camera.viewMatrix();
 
+    // Real performance stats for the F3 HUD (EMA-smoothed frame time; chunk
+    // count sampled every 30 frames — getLoadedChunks copies under a lock)
+    state->smoothedFrameMs =
+        state->smoothedFrameMs * 0.95f + static_cast<float>(state->deltaTime) * 1000.0f * 0.05f;
+    if (state->frameCount % 30 == 0) {
+        state->cachedChunkCount = static_cast<uint32_t>(state->world->getLoadedChunks().size());
+    }
+
+    UIFrameState uiFrame;
+    uiFrame.screen = state->flow.screen;
+    uiFrame.hoveredButton = state->hoveredButton;
+    uiFrame.showDebugHud = state->showDebugHud;
+    uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
+    uiFrame.stats.fps = state->smoothedFrameMs > 0.f ? 1000.0f / state->smoothedFrameMs : 0.f;
+    uiFrame.stats.chunkCount = state->cachedChunkCount;
+    uiFrame.stats.entityCount = 0;
+    uiFrame.menu = state->menuLayout;
+
     _renderPipeline->render(
         _queue,
         drawable,
@@ -511,7 +720,8 @@ static EngineState* _engineGetState(Engine* engine) {
         state->camera,
         state->worldTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
-        state->hotbar
+        state->hotbar,
+        uiFrame
     );
 }
 

@@ -231,6 +231,12 @@ int World::getViewDistance() const {
 
 void World::setViewDistance(int distance) {
     viewDistance_ = std::max(1, distance);
+    // Re-stream immediately so a settings change is visible without waiting
+    // for the player to cross a chunk boundary
+    if (hasPlayerChunk_) {
+        generateAroundPlayer(playerChunkX_ * CHUNK_WIDTH, playerChunkZ_ * CHUNK_DEPTH);
+        unloadDistantChunks();
+    }
 }
 
 void World::updatePlayerPosition(int playerX, int playerZ) {

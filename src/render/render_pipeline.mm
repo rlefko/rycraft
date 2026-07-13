@@ -6,6 +6,7 @@
 #include "render/lod_mesher.hpp"
 
 #include "render/particles.hpp"
+#include "render/ui_hud.hpp"
 #include "render/ui_overlay.hpp"
 #include "world/chunk.hpp"
 #include "world/chunk_pos.hpp"
@@ -347,7 +348,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
                             const Camera& camera,
                             uint64_t worldTime,
                             std::optional<Vec3> highlightedBlock,
-                            const Hotbar& hotbar)
+                            const Hotbar& hotbar,
+                            const UIFrameState& uiFrame)
 {
     if (!drawable || !queue) return;
 
@@ -459,7 +461,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
 
     id<MTLRenderCommandEncoder> uiEncoder = [commandBuffer renderCommandEncoderWithDescriptor:uiPassDesc];
     if (uiEncoder) {
-        renderUIOverlay(uiEncoder, hotbar);
+        renderUIOverlay(uiEncoder, hotbar, uiFrame);
         [uiEncoder endEncoding];
     }
 
@@ -692,7 +694,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
 
     // Fog parameters
     uniforms.fogColor = simd_make_float3(fogColor[0], fogColor[1], fogColor[2]);
-    uniforms.fogDensity = 0.0003f; // Per block
+    uniforms.fogDensity = _fogDensity;
 
     // Camera position for fog distance calculation
     uniforms.cameraPosition = simd_make_float3(camX, camY, camZ);
@@ -866,88 +868,14 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
 // renderUIOverlay (Task 6.10 + hotbar)
 // ---------------------------------------------------------------------------
 void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
-                                      const Hotbar& hotbar)
+                                      const Hotbar& hotbar,
+                                      const UIFrameState& uiFrame)
 {
     _uiOverlay->beginFrame();
-
-    // ---- Performance HUD (Phase 8) ----
-    // Note: Performance stats are tracked in the engine layer.
-    // For now, render with default stats (will be populated by engine).
-    PerformanceStats stats{};
-    stats.fps = 60.0f;
-    stats.chunkCount = 0;
-    stats.entityCount = 0;
-    stats.frameTimeMs = 16.67f;
-    _uiOverlay->drawPerformanceHUD(stats);
-
-    // ---- Crosshair ----
-    float centerX = 0.5f;
-    float centerY = 0.5f;
-    float crossH = 1.0f / static_cast<float>(_displayHeight);
-    float crossW = 20.0f / static_cast<float>(_displayWidth);
-    float crossV = 20.0f / static_cast<float>(_displayHeight);
-    float crossLineW = 1.0f / static_cast<float>(_displayWidth);
-
-    // Horizontal line
-    _uiOverlay->drawQuad(centerX - crossW * 0.5f, centerY - crossH * 0.5f,
-                         crossW, crossH,
-                         1.0f, 1.0f, 1.0f, 1.0f);
-
-    // Vertical line
-    _uiOverlay->drawQuad(centerX - crossLineW * 0.5f, centerY - crossV * 0.5f,
-                         crossLineW, crossV,
-                         1.0f, 1.0f, 1.0f, 1.0f);
-
-    // ---- Hotbar (9 slots at bottom of screen) ----
-    float hotbarSlotSize = 48.0f / static_cast<float>(_displayHeight);
-    float hotbarGap = 2.0f / static_cast<float>(_displayHeight);
-    float hotbarY = 4.0f / static_cast<float>(_displayHeight);
-    float totalHotbarWidth = Hotbar::SLOTS * hotbarSlotSize +
-                             (Hotbar::SLOTS - 1) * hotbarGap;
-    float hotbarX = (1.0f - totalHotbarWidth) * 0.5f;
-
-    int selectedIndex = hotbar.getSelectedIndex();
-
-    for (int i = 0; i < Hotbar::SLOTS; ++i) {
-        float slotX = hotbarX + i * (hotbarSlotSize + hotbarGap);
-
-        // Slot background
-        if (i == selectedIndex) {
-            // Selected slot: bright border
-            _uiOverlay->drawQuad(slotX - 2.0f / _displayWidth,
-                                 hotbarY - 2.0f / _displayHeight,
-                                 hotbarSlotSize + 4.0f / _displayWidth,
-                                 hotbarSlotSize + 4.0f / _displayHeight,
-                                 1.0f, 1.0f, 1.0f, 0.8f);
-        }
-
-        _uiOverlay->drawQuad(slotX, hotbarY,
-                             hotbarSlotSize, hotbarSlotSize,
-                             0.3f, 0.3f, 0.3f, 0.6f);
-
-        // Block type indicator (simplified: color per block type)
-        BlockType type = hotbar.getSlot(i);
-        float r = 0.5f, g = 0.5f, b = 0.5f;
-        switch (type) {
-            case BlockType::STONE:    r = 0.5f; g = 0.5f; b = 0.5f; break;
-            case BlockType::DIRT:     r = 0.55f; g = 0.35f; b = 0.2f; break;
-            case BlockType::GRASS:    r = 0.2f; g = 0.6f; b = 0.2f; break;
-            case BlockType::LOG:      r = 0.4f; g = 0.25f; b = 0.15f; break;
-            case BlockType::SAND:     r = 0.85f; g = 0.78f; b = 0.55f; break;
-            case BlockType::PLANKS:   r = 0.65f; g = 0.45f; b = 0.25f; break;
-            case BlockType::BEDROCK:  r = 0.2f; g = 0.2f; b = 0.2f; break;
-            case BlockType::COAL_ORE: r = 0.15f; g = 0.15f; b = 0.15f; break;
-            case BlockType::IRON_ORE: r = 0.6f; g = 0.5f; b = 0.45f; break;
-            default:                  r = 0.5f; g = 0.5f; b = 0.5f; break;
-        }
-
-        float innerSize = hotbarSlotSize * 0.7f;
-        float innerOffset = (hotbarSlotSize - innerSize) * 0.5f;
-        _uiOverlay->drawQuad(slotX + innerOffset, hotbarY + innerOffset,
-                             innerSize, innerSize,
-                             r, g, b, 0.9f);
+    drawGameHud(*_uiOverlay, hotbar, uiFrame, _displayWidth, _displayHeight);
+    if (uiFrame.screen != GameScreen::Playing) {
+        drawMenu(*_uiOverlay, uiFrame.menu, uiFrame.hoveredButton, _displayWidth, _displayHeight);
     }
-
     _uiOverlay->flush(encoder);
 }
 

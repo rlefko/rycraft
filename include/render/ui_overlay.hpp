@@ -2,6 +2,8 @@
 
 #import <Metal/Metal.h>
 
+#include "render/ui_menu.hpp"
+
 #include <array>
 #include <cstdint>
 #include <vector>
@@ -17,14 +19,6 @@
 //
 // Coordinates are normalized [0, 1] with a bottom-left origin.
 // ---------------------------------------------------------------------------
-
-// Performance HUD state (Phase 8)
-struct PerformanceStats {
-    float fps = 0.f;           // Rolling average FPS (60 frames)
-    uint32_t chunkCount = 0;   // Loaded chunks
-    uint32_t entityCount = 0;  // Active entities
-    float frameTimeMs = 0.f;   // Frame time in milliseconds
-};
 
 class UIOverlay {
 public:
@@ -71,6 +65,10 @@ public:
     static constexpr int FONT_WIDTH = 8;
     static constexpr int FONT_HEIGHT = 8;
 
+    // Bitmap for one 8×8 glyph (a zero row for unknown characters).
+    // Public so tests can verify the font covers every menu string.
+    static std::array<uint8_t, 8> getCharBitmap(char c);
+
 private:
     // One batched vertex: position (normalized) + color. Matches the vertex
     // descriptor in ui_overlay.mm (float2 @0, float4 @8, stride 24).
@@ -100,7 +98,4 @@ private:
 
     // Build orthographic projection for normalized screen coords.
     void buildProjectionMatrix();
-
-    // Get bitmap data for a character (returns 8 bytes, one per row)
-    static std::array<uint8_t, 8> getCharBitmap(char c);
 };
