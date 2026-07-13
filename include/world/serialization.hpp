@@ -1,21 +1,25 @@
 #pragma once
+#include "world/chunk.hpp"
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
-#include <optional>
-#include "world/chunk.hpp"
 
 // Binary chunk format:
 // Header (20 bytes):
 //   uint32_t magic = 0x52594348 ("RYCH")
-//   uint32_t version = 1
+//   uint32_t version = 2
 //   int32_t chunkX
 //   int32_t chunkZ
 //   uint32_t blockCount (should be CHUNK_VOLUME)
 // Data:
 //   blockCount bytes of BlockType
 //   256 bytes of Biome (16x16)
-//   256 bytes of int8_t height map (16x16)
+//   512 bytes of int16_t height map (16x16, little-endian)
+//
+// v1 stored heights as int8_t, which overflowed at height 128 (terrain
+// reaches it) and corrupted tree/structure placement on load. Old versions
+// deserialize to nullopt, so pre-v2 chunks simply regenerate.
 
 struct ChunkSaveHeader {
     uint32_t magic;
@@ -26,11 +30,11 @@ struct ChunkSaveHeader {
 };
 
 constexpr uint32_t CHUNK_MAGIC = 0x52594348;
-constexpr uint32_t CHUNK_VERSION = 1;
+constexpr uint32_t CHUNK_VERSION = 2;
 
 constexpr size_t HEADER_SIZE = sizeof(ChunkSaveHeader);
 constexpr size_t BIOME_DATA_SIZE = CHUNK_WIDTH * CHUNK_DEPTH * sizeof(Biome);
-constexpr size_t HEIGHT_MAP_SIZE = CHUNK_WIDTH * CHUNK_DEPTH * sizeof(int8_t);
+constexpr size_t HEIGHT_MAP_SIZE = CHUNK_WIDTH * CHUNK_DEPTH * sizeof(int16_t);
 
 class ChunkSerializer {
 public:

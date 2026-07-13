@@ -5,7 +5,6 @@
 
 // Water physics modifiers (Task 6.7-6.8)
 static constexpr float WATER_GRAVITY_MULTIPLIER = 0.3f;
-static constexpr float WATER_HORIZONTAL_DRAG = 0.7f;
 static constexpr float WATER_BUOYANCY_FORCE = 0.02f;
 
 // ---------------------------------------------------------------------------
@@ -13,10 +12,8 @@ static constexpr float WATER_BUOYANCY_FORCE = 0.02f;
 // ---------------------------------------------------------------------------
 AABB Player::getAABB() const {
     float halfWidth = WIDTH * 0.5f;
-    return AABB{
-        Vec3{position.x - halfWidth, position.y, position.z - halfWidth},
-        Vec3{position.x + halfWidth, position.y + HEIGHT, position.z + halfWidth}
-    };
+    return AABB{Vec3{position.x - halfWidth, position.y, position.z - halfWidth},
+                Vec3{position.x + halfWidth, position.y + HEIGHT, position.z + halfWidth}};
 }
 
 // ---------------------------------------------------------------------------
@@ -27,8 +24,9 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
     AABB playerAABB = getAABB();
     bool inWater = PhysicsEngine::isInWater(world, playerAABB);
 
-    // 1. Apply input: WASD → horizontal velocity based on yaw
-    float speed = WALK_SPEED;
+    // 1. Apply input: WASD → horizontal velocity based on yaw.
+    // Water halves the pace (horizontal drag used to approximate this).
+    float speed = inWater ? WALK_SPEED * 0.5f : WALK_SPEED;
     if (sprinting) {
         speed *= SPRINT_MULTIPLIER;
     }
@@ -36,21 +34,24 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
     float moveX = 0.f;
     float moveZ = 0.f;
 
+    // Camera basis (see Camera::updateFront/right): forward is
+    // (+sin yaw, +cos yaw) and right is (-cos yaw, +sin yaw). These signs
+    // were all inverted before, so W walked backwards and D strafed left.
     if (input.isDown(Key::W)) {
-        moveX -= std::sin(yaw) * speed;
-        moveZ -= std::cos(yaw) * speed;
-    }
-    if (input.isDown(Key::S)) {
         moveX += std::sin(yaw) * speed;
         moveZ += std::cos(yaw) * speed;
     }
-    if (input.isDown(Key::A)) {
-        moveX -= std::cos(yaw) * speed;
-        moveZ += std::sin(yaw) * speed;
+    if (input.isDown(Key::S)) {
+        moveX -= std::sin(yaw) * speed;
+        moveZ -= std::cos(yaw) * speed;
     }
-    if (input.isDown(Key::D)) {
+    if (input.isDown(Key::A)) {
         moveX += std::cos(yaw) * speed;
         moveZ -= std::sin(yaw) * speed;
+    }
+    if (input.isDown(Key::D)) {
+        moveX -= std::cos(yaw) * speed;
+        moveZ += std::sin(yaw) * speed;
     }
 
     velocity.x = moveX;
@@ -63,13 +64,8 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
     }
     velocity.y += effectiveGravity;
 
-    // 3. Apply drag (increased in water)
-    float horizontalDrag = onGround ? HORIZONTAL_DRAG_GROUND : HORIZONTAL_DRAG_AIR;
-    if (inWater) {
-        horizontalDrag = WATER_HORIZONTAL_DRAG;
-    }
-    velocity.x *= horizontalDrag;
-    velocity.z *= horizontalDrag;
+    // 3. Vertical drag only: horizontal velocity is overwritten from input
+    // every tick, so horizontal drag merely rescaled the walk speed.
     velocity.y *= VERTICAL_DRAG;
 
     // 4. Apply buoyancy force when in water

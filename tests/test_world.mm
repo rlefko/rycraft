@@ -1,0 +1,1047 @@
+#include "test_helpers.hpp"
+
+#include <audio/audio_engine.hpp>
+#include <audio/sfx.hpp>
+#include <catch2/catch_approx.hpp>
+#include <catch2/catch_test_macros.hpp>
+#include <common/math.hpp>
+#include <common/random.hpp>
+#include <common/thread_pool.hpp>
+#include <engine/game_state.hpp>
+#include <engine/hotbar.hpp>
+#include <engine/input_bindings.hpp>
+#include <entity/ai.hpp>
+#include <entity/entity.hpp>
+#include <entity/physics.hpp>
+#include <entity/player.hpp>
+#include <entity/spatial_hash.hpp>
+#include <entity/spawner.hpp>
+#include <entity/voxel_traversal.hpp>
+#include <render/block_texture_array.hpp>
+#include <render/block_textures.hpp>
+#include <render/lod_mesher.hpp>
+#include <render/mega_buffer.hpp>
+#include <render/shader_types.hpp>
+#include <render/ui_menu.hpp>
+#include <render/ui_overlay.hpp>
+#include <render/vertex.hpp>
+#include <world/biome.hpp>
+#include <world/chunk.hpp>
+#include <world/chunk_pos.hpp>
+#include <world/noise.hpp>
+#include <world/save_manager.hpp>
+#include <world/serialization.hpp>
+#include <world/terrain.hpp>
+#include <world/world.hpp>
+
+#include <chrono>
+#include <cmath>
+#include <thread>
+
+// ============================================================================
+// Vec3 Tests
+// ============================================================================
+// ===========================================================================
+// World: chunks, generation, biomes, persistence
+// ===========================================================================
+
+// ============================================================================
+// Existing Tests
+// ============================================================================
+
+TEST_CASE("Chunk coordinates are multiples of CHUNK_SIZE", "[chunk]") {
+    REQUIRE(0 % CHUNK_SIZE == 0);
+    REQUIRE(16 % CHUNK_SIZE == 0);
+    REQUIRE(32 % CHUNK_SIZE == 0);
+    REQUIRE((-16) % CHUNK_SIZE == 0);
+}
+
+TEST_CASE("BlockType enum values are as expected", "[block]") {
+    REQUIRE(static_cast<int>(BlockType::AIR) == 0);
+    REQUIRE(static_cast<int>(BlockType::STONE) == 1);
+    REQUIRE(static_cast<int>(BlockType::GRASS) == 2);
+    REQUIRE(static_cast<int>(BlockType::DIRT) == 3);
+    REQUIRE(static_cast<int>(BlockType::SAND) == 4);
+    REQUIRE(static_cast<int>(BlockType::BEDROCK) == 7);
+    REQUIRE(static_cast<int>(BlockType::LOG) == 8);
+    REQUIRE(static_cast<int>(BlockType::LEAVES) == 9);
+    REQUIRE(static_cast<int>(BlockType::COUNT) == 17);
+}
+
+// ============================================================================
+// Simplex Noise Tests
+// ============================================================================
+
+TEST_CASE("SimplexNoise deterministic output for same seed", "[noise]") {
+    SimplexNoise noise1(42);
+    SimplexNoise noise2(42);
+
+    double v1 = noise1.noise2D(1.0, 2.0);
+    double v2 = noise2.noise2D(1.0, 2.0);
+    REQUIRE(v1 == v2);
+
+    double v3 = noise1.noise3D(1.0, 2.0, 3.0);
+    double v4 = noise2.noise3D(1.0, 2.0, 3.0);
+    REQUIRE(v3 == v4);
+}
+
+TEST_CASE("SimplexNoise same input gives same output", "[noise]") {
+    SimplexNoise noise(123);
+
+    double a = noise(10.0, 20.0);
+    double b = noise(10.0, 20.0);
+    REQUIRE(a == b);
+
+    double c = noise.noise3D(5.0, 5.0, 5.0);
+    double d = noise.noise3D(5.0, 5.0, 5.0);
+    REQUIRE(c == d);
+}
+
+TEST_CASE("SimplexNoise output range within [-1, 1]", "[noise]") {
+    SimplexNoise noise(99);
+
+    // Sample a grid of points
+    for (int ix = -10; ix <= 10; ++ix) {
+        for (int iy = -10; iy <= 10; ++iy) {
+            double v2d = noise.noise2D(static_cast<double>(ix), static_cast<double>(iy));
+            REQUIRE(v2d >= -1.0);
+            REQUIRE(v2d <= 1.0);
+        }
+    }
+
+    for (int ix = -5; ix <= 5; ++ix) {
+        for (int iy = -5; iy <= 5; ++iy) {
+            for (int iz = -5; iz <= 5; ++iz) {
+                double v3d = noise.noise3D(static_cast<double>(ix), static_cast<double>(iy),
+                                           static_cast<double>(iz));
+                REQUIRE(v3d >= -1.0);
+                REQUIRE(v3d <= 1.0);
+            }
+        }
+    }
+}
+
+TEST_CASE("SimplexNoise different seeds give different outputs", "[noise]") {
+    SimplexNoise noiseA(1);
+    SimplexNoise noiseB(2);
+
+    // Different seeds should produce different noise fields
+    bool different = false;
+    for (int i = 0; i < 20; ++i) {
+        double a = noiseA.noise2D(static_cast<double>(i), static_cast<double>(i));
+        double b = noiseB.noise2D(static_cast<double>(i), static_cast<double>(i));
+        if (a != b) {
+            different = true;
+            break;
+        }
+    }
+    REQUIRE(different == true);
+}
+
+TEST_CASE("SimplexNoise octave2D is deterministic", "[noise]") {
+    SimplexNoise noise(77);
+    double a = noise.octave2D(10.0, 20.0, 4, 0.5, 2.0);
+    double b = noise.octave2D(10.0, 20.0, 4, 0.5, 2.0);
+    REQUIRE(a == b);
+}
+
+TEST_CASE("SimplexNoise octave output range within [-1, 1]", "[noise]") {
+    SimplexNoise noise(42);
+
+    for (int i = 0; i < 20; ++i) {
+        double v =
+            noise.octave2D(static_cast<double>(i) * 0.1, static_cast<double>(i) * 0.1, 6, 0.5, 2.0);
+        REQUIRE(v >= -1.0);
+        REQUIRE(v <= 1.0);
+    }
+}
+
+TEST_CASE("SimplexNoise ridged noise is deterministic", "[noise]") {
+    SimplexNoise noise(55);
+    double a = noise.ridged2D(10.0, 20.0, 4, 0.5, 2.0);
+    double b = noise.ridged2D(10.0, 20.0, 4, 0.5, 2.0);
+    REQUIRE(a == b);
+}
+
+TEST_CASE("SimplexNoise ridged output range within [0, 1]", "[noise]") {
+    SimplexNoise noise(42);
+
+    for (int i = 0; i < 20; ++i) {
+        double v =
+            noise.ridged2D(static_cast<double>(i) * 0.1, static_cast<double>(i) * 0.1, 4, 0.5, 2.0);
+        REQUIRE(v >= 0.0);
+        REQUIRE(v <= 1.0);
+    }
+}
+
+TEST_CASE("SimplexNoise operator() equals noise2D", "[noise]") {
+    SimplexNoise noise(42);
+    REQUIRE(noise(1.0, 2.0) == noise.noise2D(1.0, 2.0));
+    REQUIRE(noise(10.5, -3.7) == noise.noise2D(10.5, -3.7));
+}
+
+// ============================================================================
+// Terrain Generator Tests
+// ============================================================================
+
+TEST_CASE("TerrainGenerator height within [minHeight, maxHeight]", "[terrain]") {
+    TerrainGenerator terrain(42);
+    TerrainConfig config;
+    config.minHeight = 20.0;
+    config.maxHeight = 128.0;
+
+    for (int ix = -100; ix <= 100; ix += 10) {
+        for (int iz = -100; iz <= 100; iz += 10) {
+            double h = terrain.getHeight(static_cast<double>(ix), static_cast<double>(iz), config);
+            REQUIRE(h >= config.minHeight);
+            REQUIRE(h <= config.maxHeight);
+        }
+    }
+}
+
+TEST_CASE("TerrainGenerator deterministic output", "[terrain]") {
+    TerrainGenerator t1(123);
+    TerrainGenerator t2(123);
+
+    double a = t1.getHeight(100.0, 200.0);
+    double b = t2.getHeight(100.0, 200.0);
+    REQUIRE(a == b);
+}
+
+TEST_CASE("TerrainGenerator getNoise is deterministic", "[terrain]") {
+    TerrainGenerator terrain(42);
+    double a = terrain.getNoise(10.0, 20.0);
+    double b = terrain.getNoise(10.0, 20.0);
+    REQUIRE(a == b);
+}
+
+// ============================================================================
+// Biome Generator Tests
+// ============================================================================
+
+TEST_CASE("BiomeGenerator lookup: DeepOcean for very low elevation", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.5, 0.5, 50.0);
+    REQUIRE(b == Biome::DEEP_OCEAN);
+}
+
+TEST_CASE("BiomeGenerator lookup: Ocean for below sea level", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.5, 0.5, 62.0);
+    REQUIRE(b == Biome::OCEAN);
+}
+
+TEST_CASE("BiomeGenerator lookup: Swamp for low elevation + wet", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.6, 0.7, 66.0);
+    REQUIRE(b == Biome::SWAMP);
+}
+
+TEST_CASE("BiomeGenerator lookup: ExtremeHills for cold + dry", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.2, 0.2, 80.0);
+    REQUIRE(b == Biome::EXTREME_HILLS);
+}
+
+TEST_CASE("BiomeGenerator lookup: IceSpikes for cold + medium moisture", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.2, 0.4, 80.0);
+    REQUIRE(b == Biome::ICE_SPIKES);
+}
+
+TEST_CASE("BiomeGenerator lookup: Taiga for cold + wet", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.2, 0.7, 80.0);
+    REQUIRE(b == Biome::TAIGA);
+}
+
+TEST_CASE("BiomeGenerator lookup: Desert for hot + dry", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.8, 0.2, 80.0);
+    REQUIRE(b == Biome::DESERT);
+}
+
+TEST_CASE("BiomeGenerator lookup: Forest for warm + wet", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.5, 0.6, 80.0);
+    REQUIRE(b == Biome::FOREST);
+}
+
+TEST_CASE("BiomeGenerator lookup: Plains for warm + dry", "[biome]") {
+    BiomeGenerator bg(42);
+    Biome b = bg.lookupBiome(0.5, 0.4, 80.0);
+    REQUIRE(b == Biome::PLAINS);
+}
+
+TEST_CASE("BiomeGenerator temperature in [0, 1]", "[biome]") {
+    BiomeGenerator bg(42);
+    for (int i = 0; i < 20; ++i) {
+        double t = bg.getTemperature(static_cast<double>(i) * 10.0, static_cast<double>(i) * 10.0);
+        REQUIRE(t >= 0.0);
+        REQUIRE(t <= 1.0);
+    }
+}
+
+TEST_CASE("BiomeGenerator moisture in [0, 1]", "[biome]") {
+    BiomeGenerator bg(42);
+    for (int i = 0; i < 20; ++i) {
+        double m = bg.getMoisture(static_cast<double>(i) * 10.0, static_cast<double>(i) * 10.0);
+        REQUIRE(m >= 0.0);
+        REQUIRE(m <= 1.0);
+    }
+}
+
+TEST_CASE("BiomeGenerator height modifier values", "[biome]") {
+    BiomeGenerator bg(42);
+    REQUIRE(bg.getBiomeHeightModifier(Biome::EXTREME_HILLS) == 30.0);
+    REQUIRE(bg.getBiomeHeightModifier(Biome::DESERT) == 5.0);
+    REQUIRE(bg.getBiomeHeightModifier(Biome::PLAINS) == 0.0);
+    REQUIRE(bg.getBiomeHeightModifier(Biome::FOREST) == 10.0);
+    REQUIRE(bg.getBiomeHeightModifier(Biome::TAIGA) == 15.0);
+    REQUIRE(bg.getBiomeHeightModifier(Biome::SWAMP) == -5.0);
+}
+
+TEST_CASE("BiomeGenerator surface block values", "[biome]") {
+    BiomeGenerator bg(42);
+    REQUIRE(bg.getSurfaceBlock(Biome::PLAINS) == BlockType::GRASS);
+    REQUIRE(bg.getSurfaceBlock(Biome::FOREST) == BlockType::GRASS);
+    REQUIRE(bg.getSurfaceBlock(Biome::TAIGA) == BlockType::GRASS);
+    REQUIRE(bg.getSurfaceBlock(Biome::DESERT) == BlockType::AIR);
+    REQUIRE(bg.getSurfaceBlock(Biome::EXTREME_HILLS) == BlockType::STONE);
+    REQUIRE(bg.getSurfaceBlock(Biome::ICE_SPIKES) == BlockType::STONE);
+}
+
+TEST_CASE("BiomeGenerator getBiome is deterministic", "[biome]") {
+    BiomeGenerator bg1(42);
+    BiomeGenerator bg2(42);
+
+    Biome b1 = bg1.getBiome(100.0, 200.0, 80.0);
+    Biome b2 = bg2.getBiome(100.0, 200.0, 80.0);
+    REQUIRE(b1 == b2);
+}
+
+// ============================================================================
+// Chunk Tests
+// ============================================================================
+
+TEST_CASE("Chunk creation initializes to air", "[chunk]") {
+    Chunk chunk(0, 0);
+    REQUIRE(chunk.chunkX == 0);
+    REQUIRE(chunk.chunkZ == 0);
+    REQUIRE(chunk.blocks.size() == static_cast<size_t>(CHUNK_VOLUME));
+    REQUIRE(chunk.getBlock(0, 0, 0) == BlockType::AIR);
+    REQUIRE(chunk.getBlock(7, 127, 7) == BlockType::AIR);
+}
+
+TEST_CASE("Chunk setBlock and getBlock", "[chunk]") {
+    Chunk chunk(5, -3);
+    chunk.setBlock(8, 64, 8, BlockType::STONE);
+    REQUIRE(chunk.getBlock(8, 64, 8) == BlockType::STONE);
+
+    chunk.setBlock(0, 0, 0, BlockType::GRASS);
+    REQUIRE(chunk.getBlock(0, 0, 0) == BlockType::GRASS);
+}
+
+TEST_CASE("Chunk setBlock marks chunk dirty", "[chunk]") {
+    Chunk chunk(0, 0);
+    REQUIRE(chunk.needsMeshUpdate == false);
+    chunk.setBlock(8, 64, 8, BlockType::STONE);
+    REQUIRE(chunk.needsMeshUpdate == true);
+}
+
+TEST_CASE("Chunk out-of-bounds returns air", "[chunk]") {
+    Chunk chunk(0, 0);
+    REQUIRE(chunk.getBlock(-1, 64, 8) == BlockType::AIR);
+    REQUIRE(chunk.getBlock(16, 64, 8) == BlockType::AIR);
+    REQUIRE(chunk.getBlock(8, -1, 8) == BlockType::AIR);
+    REQUIRE(chunk.getBlock(8, 256, 8) == BlockType::AIR);
+    REQUIRE(chunk.getBlock(8, 64, -1) == BlockType::AIR);
+    REQUIRE(chunk.getBlock(8, 64, 16) == BlockType::AIR);
+}
+
+TEST_CASE("Chunk world coordinate conversion", "[chunk]") {
+    REQUIRE(Chunk::worldToChunk(0) == 0);
+    REQUIRE(Chunk::worldToChunk(15) == 0);
+    REQUIRE(Chunk::worldToChunk(16) == 1);
+    REQUIRE(Chunk::worldToChunk(31) == 1);
+    REQUIRE(Chunk::worldToChunk(32) == 2);
+    REQUIRE(Chunk::worldToChunk(-1) == -1);
+    REQUIRE(Chunk::worldToChunk(-16) == -1);
+    REQUIRE(Chunk::worldToChunk(-17) == -2);
+    REQUIRE(Chunk::worldToChunk(-32) == -2);
+}
+
+TEST_CASE("Chunk chunkToWorld conversion", "[chunk]") {
+    REQUIRE(Chunk::chunkToWorld(0, 0) == 0);
+    REQUIRE(Chunk::chunkToWorld(1, 0) == 16);
+    REQUIRE(Chunk::chunkToWorld(1, 15) == 31);
+    REQUIRE(Chunk::chunkToWorld(-1, 0) == -16);
+    REQUIRE(Chunk::chunkToWorld(-1, 15) == -1);
+}
+
+TEST_CASE("Chunk world block access", "[chunk]") {
+    Chunk chunk(2, -1);
+    chunk.setBlockWorld(32, 64, -8, BlockType::DIRT);
+    REQUIRE(chunk.getBlockWorld(32, 64, -8) == BlockType::DIRT);
+}
+
+TEST_CASE("Chunk getAABB", "[chunk]") {
+    Chunk chunk(1, -1);
+    AABB aabb = chunk.getAABB();
+    REQUIRE(aabb.min.x == Catch::Approx(16.f));
+    REQUIRE(aabb.min.y == Catch::Approx(0.f));
+    REQUIRE(aabb.min.z == Catch::Approx(-16.f));
+    REQUIRE(aabb.max.x == Catch::Approx(32.f));
+    REQUIRE(aabb.max.y == Catch::Approx(256.f));
+    REQUIRE(aabb.max.z == Catch::Approx(0.f));
+}
+
+TEST_CASE("Chunk getWorldPosition", "[chunk]") {
+    Chunk chunk(3, -2);
+    Vec3 pos = chunk.getWorldPosition();
+    REQUIRE(pos.x == Catch::Approx(48.f));
+    REQUIRE(pos.y == Catch::Approx(0.f));
+    REQUIRE(pos.z == Catch::Approx(-32.f));
+}
+
+TEST_CASE("Chunk markDirty", "[chunk]") {
+    Chunk chunk(0, 0);
+    chunk.needsMeshUpdate = false;
+    chunk.markDirty();
+    REQUIRE(chunk.needsMeshUpdate == true);
+}
+
+// ============================================================================
+// Serialization Tests
+// ============================================================================
+
+TEST_CASE("Serialization roundtrip", "[serialization]") {
+    Chunk original(5, -3);
+    original.setBlock(8, 64, 8, BlockType::STONE);
+    original.setBlock(0, 0, 0, BlockType::GRASS);
+    original.generated = true;
+    original.biomes[0] = Biome::DESERT;
+    original.biomes[100] = Biome::FOREST;
+    original.heightMap[0] = 65;
+    original.heightMap[100] = 72;
+
+    auto data = ChunkSerializer::serialize(original);
+    auto restored = ChunkSerializer::deserialize(data);
+    REQUIRE(restored.has_value());
+    REQUIRE(restored->chunkX == original.chunkX);
+    REQUIRE(restored->chunkZ == original.chunkZ);
+    REQUIRE(restored->getBlock(8, 64, 8) == BlockType::STONE);
+    REQUIRE(restored->getBlock(0, 0, 0) == BlockType::GRASS);
+    REQUIRE(restored->biomes[0] == Biome::DESERT);
+    REQUIRE(restored->biomes[100] == Biome::FOREST);
+    REQUIRE(restored->heightMap[0] == 65);
+    REQUIRE(restored->heightMap[100] == 72);
+}
+
+TEST_CASE("Serialization: heights at 128 and above survive the roundtrip", "[serialization]") {
+    // Terrain reaches height 128, which overflowed the old int8 height field
+    // to -128 on load and corrupted tree/structure placement.
+    Chunk chunk(3, 4);
+    chunk.generated = true;
+    chunk.heightMap[0] = 127;
+    chunk.heightMap[1] = 128;
+    chunk.heightMap[2] = 255;
+
+    auto data = ChunkSerializer::serialize(chunk);
+    auto restored = ChunkSerializer::deserialize(data);
+    REQUIRE(restored.has_value());
+    REQUIRE(restored->heightMap[0] == 127);
+    REQUIRE(restored->heightMap[1] == 128);
+    REQUIRE(restored->heightMap[2] == 255);
+}
+
+TEST_CASE("Serialization: pre-v2 chunks are rejected so they regenerate", "[serialization]") {
+    Chunk chunk(0, 0);
+    chunk.generated = true;
+    auto data = ChunkSerializer::serialize(chunk);
+
+    // Rewrite the version field (offset 4) to the old v1
+    uint32_t oldVersion = 1;
+    std::memcpy(data.data() + 4, &oldVersion, sizeof(oldVersion));
+    REQUIRE(!ChunkSerializer::deserialize(data).has_value());
+}
+
+TEST_CASE("World loads saved chunks before generating", "[world][save]") {
+    TempDir tempDirGuard("load_before_generate");
+    const std::string& tempDir = tempDirGuard.path();
+
+    uint32_t seed = 777;
+    int editX = 8, editY = 200, editZ = 8;
+
+    {
+        // First session: edit a block and persist the chunk
+        SaveManager saver(tempDir);
+        auto world = std::make_shared<World>(seed);
+        world->setSaveManager(&saver);
+        auto chunk = world->getChunk(0, 0);
+        world->setBlock(editX, editY, editZ, BlockType::DIAMOND_ORE);
+        saver.saveChunk(*chunk);
+        saver.flush();
+    }
+
+    {
+        // Second session: the edit must come back from disk, not the generator
+        SaveManager saver(tempDir);
+        auto world = std::make_shared<World>(seed);
+        world->setSaveManager(&saver);
+        REQUIRE(world->getBlock(editX, editY, editZ) == BlockType::DIAMOND_ORE);
+    }
+}
+
+TEST_CASE("ChunkPos packs and hashes distinctly", "[world]") {
+    REQUIRE(ChunkPos{0, 0} == ChunkPos{0, 0});
+    REQUIRE(!(ChunkPos{1, 0} == ChunkPos{0, 1}));
+    REQUIRE(ChunkPos{1, 0}.packed() != ChunkPos{0, 1}.packed());
+    REQUIRE(ChunkPos{-1, -1}.packed() != ChunkPos{1, 1}.packed());
+
+    std::unordered_map<ChunkPos, int> map;
+    map[ChunkPos{5, -3}] = 42;
+    REQUIRE(map.at(ChunkPos{5, -3}) == 42);
+    REQUIRE(map.find(ChunkPos{-3, 5}) == map.end());
+}
+
+TEST_CASE("Serialization size is correct", "[serialization]") {
+    Chunk chunk(0, 0);
+    size_t expected = ChunkSerializer::serializedSize(chunk);
+    auto data = ChunkSerializer::serialize(chunk);
+    REQUIRE(data.size() == expected);
+}
+
+TEST_CASE("Serialization corrupt data returns nullopt", "[serialization]") {
+    std::vector<uint8_t> corruptData(100, 0xFF);
+    auto result = ChunkSerializer::deserialize(corruptData);
+    REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization empty data returns nullopt", "[serialization]") {
+    std::vector<uint8_t> emptyData;
+    auto result = ChunkSerializer::deserialize(emptyData);
+    REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization wrong magic returns nullopt", "[serialization]") {
+    Chunk chunk(0, 0);
+    auto data = ChunkSerializer::serialize(chunk);
+    data[0] = 0x00;
+    auto result = ChunkSerializer::deserialize(data);
+    REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization truncated data returns nullopt", "[serialization]") {
+    Chunk chunk(0, 0);
+    auto data = ChunkSerializer::serialize(chunk);
+    data.resize(HEADER_SIZE);
+    auto result = ChunkSerializer::deserialize(data);
+    REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization wrong block count returns nullopt", "[serialization]") {
+    Chunk chunk(0, 0);
+    auto data = ChunkSerializer::serialize(chunk);
+    data[16] = 0x00;
+    data[17] = 0x00;
+    data[18] = 0x00;
+    data[19] = 0x01;
+    auto result = ChunkSerializer::deserialize(data);
+    REQUIRE(result.has_value() == false);
+}
+
+TEST_CASE("Serialization multiple roundtrips consistent", "[serialization]") {
+    Chunk original(10, 10);
+    original.setBlock(4, 100, 4, BlockType::DIAMOND_ORE);
+    auto data1 = ChunkSerializer::serialize(original);
+    auto restored1 = ChunkSerializer::deserialize(data1);
+    REQUIRE(restored1.has_value());
+    auto data2 = ChunkSerializer::serialize(*restored1);
+    auto restored2 = ChunkSerializer::deserialize(data2);
+    REQUIRE(restored2.has_value());
+    REQUIRE(restored2->getBlock(4, 100, 4) == BlockType::DIAMOND_ORE);
+}
+
+// ============================================================================
+// World Tests
+// ============================================================================
+
+TEST_CASE("World creation", "[world]") {
+    auto world = std::make_shared<World>(42);
+    REQUIRE(world->getSeed() == 42);
+    REQUIRE(world->getViewDistance() == 32);
+}
+
+TEST_CASE("World getChunk generates chunk", "[world]") {
+    auto world = std::make_shared<World>(123);
+    auto chunk = world->getChunk(0, 0);
+    REQUIRE(chunk != nullptr);
+    REQUIRE(chunk->chunkX == 0);
+    REQUIRE(chunk->chunkZ == 0);
+    REQUIRE(chunk->generated == true);
+}
+
+TEST_CASE("World getChunk returns cached chunk", "[world]") {
+    auto world = std::make_shared<World>(42);
+    auto chunk1 = world->getChunk(5, -3);
+    auto chunk2 = world->getChunk(5, -3);
+    REQUIRE(chunk1 == chunk2);
+}
+
+TEST_CASE("World getBlock and setBlock", "[world]") {
+    auto world = std::make_shared<World>(42);
+    BlockType b = world->getBlock(100, 64, 100);
+    REQUIRE(static_cast<int>(b) >= 0);
+    world->setBlock(100, 64, 100, BlockType::DIAMOND_ORE);
+    BlockType after = world->getBlock(100, 64, 100);
+    REQUIRE(after == BlockType::DIAMOND_ORE);
+}
+
+TEST_CASE("World getLoadedChunks", "[world]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(1, 0);
+    world->getChunk(0, 1);
+    auto loaded = world->getLoadedChunks();
+    REQUIRE(loaded.size() == 3);
+}
+
+TEST_CASE("World getTerrainHeight", "[world]") {
+    auto world = std::make_shared<World>(42);
+    double h = world->getTerrainHeight(100, 200);
+    REQUIRE(h >= 0.0);
+}
+
+TEST_CASE("World getBiome", "[world]") {
+    auto world = std::make_shared<World>(42);
+    Biome b = world->getBiome(100, 200);
+    REQUIRE(static_cast<int>(b) >= 0);
+    REQUIRE(static_cast<int>(b) < static_cast<int>(Biome::COUNT));
+}
+
+TEST_CASE("World setViewDistance", "[world]") {
+    auto world = std::make_shared<World>(42);
+    world->setViewDistance(10);
+    REQUIRE(world->getViewDistance() == 10);
+    world->setViewDistance(0);
+    REQUIRE(world->getViewDistance() == 1);
+}
+
+TEST_CASE("World markChunkMeshed", "[world]") {
+    auto world = std::make_shared<World>(42);
+    auto chunk = world->getChunk(0, 0);
+    REQUIRE(chunk->needsMeshUpdate == true);
+    world->markChunkMeshed(0, 0);
+    REQUIRE(chunk->needsMeshUpdate == false);
+}
+
+TEST_CASE("World getDirtyChunks", "[world]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->getChunk(1, 0);
+    auto dirty = world->getDirtyChunks();
+    REQUIRE(dirty.size() == 2);
+    world->markChunkMeshed(0, 0);
+    dirty = world->getDirtyChunks();
+    REQUIRE(dirty.size() == 1);
+}
+
+// ============================================================================
+// Async Generation Tests
+// ============================================================================
+
+TEST_CASE("World async generation pending count", "[world][async]") {
+    auto world = std::make_shared<World>(42);
+    REQUIRE(world->getPendingChunkCount() == 0);
+}
+
+TEST_CASE("World generateAroundPlayer submits chunks", "[world][async]") {
+    auto world = std::make_shared<World>(42);
+    world->setViewDistance(4);
+    world->generateAroundPlayer(0, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    size_t pending = world->getPendingChunkCount();
+    REQUIRE(pending >= 0);
+}
+
+TEST_CASE("World generateAroundPlayer populates chunks", "[world][async]") {
+    auto world = std::make_shared<World>(42);
+    world->setViewDistance(2);
+    world->generateAroundPlayer(0, 0);
+    for (int attempts = 0; attempts < 50; ++attempts) {
+        if (world->getPendingChunkCount() == 0)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    auto chunks = world->getLoadedChunks();
+    REQUIRE(chunks.size() >= 0);
+}
+
+TEST_CASE("World updatePlayerPosition loads surrounding chunks", "[world]") {
+    auto world = std::make_shared<World>(42);
+    world->setViewDistance(2);
+    world->updatePlayerPosition(256, 256);
+
+    // Generation streams in on the worker pool; wait for it to settle.
+    for (int i = 0; i < 500 && world->getPendingChunkCount() > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto chunks = world->getLoadedChunks();
+    REQUIRE(chunks.size() == 25);
+}
+
+TEST_CASE("World updatePlayerPosition streams the spawn area on first call", "[world]") {
+    auto world = std::make_shared<World>(42);
+    world->setViewDistance(1);
+
+    // The player spawns in chunk (0,0) — the very position the tracker starts
+    // at. The first call must still trigger streaming.
+    world->updatePlayerPosition(0, 0);
+    for (int i = 0; i < 500 && world->getPendingChunkCount() > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    REQUIRE(world->getLoadedChunks().size() == 9);
+}
+
+// ============================================================================
+// SaveManager Tests
+// ============================================================================
+
+TEST_CASE("SaveManager creation", "[save]") {
+    TempDir dir("world_sm1");
+    SaveManager saver(dir.path());
+    REQUIRE(saver.getWorldPath().find("rycraft_test_") != std::string::npos);
+}
+
+TEST_CASE("SaveManager save/load chunk roundtrip", "[save]") {
+    TempDir tempDirGuard("save_roundtrip");
+    const std::string& tempDir = tempDirGuard.path();
+    {
+        SaveManager saver(tempDir);
+        Chunk original(7, -5);
+        original.setBlock(8, 100, 8, BlockType::IRON_ORE);
+        original.generated = true;
+        saver.saveChunk(original);
+        saver.flush();
+        auto loaded = saver.loadChunk(7, -5);
+        REQUIRE(loaded.has_value());
+        REQUIRE(loaded->chunkX == 7);
+        REQUIRE(loaded->chunkZ == -5);
+        REQUIRE(loaded->getBlock(8, 100, 8) == BlockType::IRON_ORE);
+    }
+}
+
+TEST_CASE("SaveManager load non-existent chunk returns nullopt", "[save]") {
+    TempDir tempDirGuard("save_missing");
+    const std::string& tempDir = tempDirGuard.path();
+    {
+        SaveManager saver(tempDir);
+        auto loaded = saver.loadChunk(999, 999);
+        REQUIRE(loaded.has_value() == false);
+    }
+}
+
+TEST_CASE("SaveManager save/load metadata roundtrip", "[save]") {
+    TempDir tempDirGuard("save_meta");
+    const std::string& tempDir = tempDirGuard.path();
+    {
+        SaveManager saver(tempDir);
+        saver.saveMetadata(12345, Vec3{100.f, 80.f, -50.f}, 9876543210);
+        auto meta = saver.loadMetadata();
+        REQUIRE(meta.has_value());
+        REQUIRE(meta->seed == 12345);
+        REQUIRE(meta->spawnPos.x == Catch::Approx(100.f));
+        REQUIRE(meta->spawnPos.y == Catch::Approx(80.f));
+        REQUIRE(meta->spawnPos.z == Catch::Approx(-50.f));
+        REQUIRE(meta->worldTime == 9876543210);
+    }
+}
+
+TEST_CASE("SaveManager load missing metadata returns nullopt", "[save]") {
+    TempDir tempDirGuard("save_nometa");
+    const std::string& tempDir = tempDirGuard.path();
+    {
+        SaveManager saver(tempDir);
+        auto meta = saver.loadMetadata();
+        REQUIRE(meta.has_value() == false);
+    }
+}
+
+TEST_CASE("SaveManager LZ4 compression produces smaller data", "[save]") {
+    TempDir tempDirGuard("save_compress");
+    const std::string& tempDir = tempDirGuard.path();
+    {
+        SaveManager saver(tempDir);
+        Chunk chunk(0, 0);
+        chunk.setBlock(8, 64, 8, BlockType::STONE);
+        chunk.generated = true;
+        saver.saveChunk(chunk);
+        saver.flush();
+        auto loaded = saver.loadChunk(0, 0);
+        REQUIRE(loaded.has_value());
+    }
+}
+
+// ============================================================================
+// Phase 6: Block Interaction & Environment Tests
+// ============================================================================
+
+// ---- Block Breaking Tests (Task 6.1) ----
+
+TEST_CASE("Block breaking: raycast hits block and block becomes AIR", "[phase6][block]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place a stone block at (5, 200, 0) — high Y to avoid terrain
+    world->setBlock(5, 200, 0, BlockType::STONE);
+    REQUIRE(world->getBlock(5, 200, 0) == BlockType::STONE);
+
+    // Ray from (0, 200, 0) going +X toward the block
+    Vec3 origin{0.f, 200.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->first.x == Catch::Approx(5.f));
+    REQUIRE(hit->first.y == Catch::Approx(200.f));
+    REQUIRE(hit->first.z == Catch::Approx(0.f));
+
+    // "Break" the block: set to AIR
+    int hitX = static_cast<int>(std::floor(hit->first.x));
+    int hitY = static_cast<int>(std::floor(hit->first.y));
+    int hitZ = static_cast<int>(std::floor(hit->first.z));
+    world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
+
+    // Verify block is now AIR
+    REQUIRE(world->getBlock(5, 200, 0) == BlockType::AIR);
+}
+
+TEST_CASE("Block breaking: chunk marked dirty after block change", "[phase6][block]") {
+    auto world = std::make_shared<World>(42);
+    auto chunk = world->getChunk(0, 0);
+
+    // Reset dirty state
+    chunk->needsMeshUpdate = false;
+
+    // Place and break a block
+    world->setBlock(5, 200, 0, BlockType::STONE);
+    REQUIRE(chunk->needsMeshUpdate == true);
+
+    // Reset and break
+    chunk->needsMeshUpdate = false;
+    world->setBlock(5, 200, 0, BlockType::AIR);
+    REQUIRE(chunk->needsMeshUpdate == true);
+}
+
+TEST_CASE("Block breaking: bedrock cannot be broken", "[phase6][block]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    world->setBlock(5, 200, 0, BlockType::BEDROCK);
+
+    Vec3 origin{0.f, 200.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
+
+    // Ray should NOT hit bedrock (it's not solid for ray tracing purposes in some games)
+    // But in our implementation, bedrock IS solid for ray tracing
+    // The "cannot break" logic is in the engine, not the traversal
+    if (hit.has_value()) {
+        // Verify it's bedrock
+        REQUIRE(world->getBlock(5, 200, 0) == BlockType::BEDROCK);
+    }
+}
+
+// ---- Block Placing Tests (Task 6.2) ----
+
+TEST_CASE("Block placing: raycast finds face and block placed on face normal", "[phase6][block]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place a stone block at (5, 200, 0)
+    world->setBlock(5, 200, 0, BlockType::STONE);
+
+    // Ray from (2, 200, 0) going +X — hits the -X face of the block
+    Vec3 origin{2.f, 200.f, 0.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
+    REQUIRE(hit.has_value());
+
+    // Calculate placement position: hit block + face normal
+    int placeX = static_cast<int>(std::floor(hit->first.x)) + static_cast<int>(hit->second.x);
+    int placeY = static_cast<int>(std::floor(hit->first.y)) + static_cast<int>(hit->second.y);
+    int placeZ = static_cast<int>(std::floor(hit->first.z)) + static_cast<int>(hit->second.z);
+
+    // Normal should be -X, so placement should be at (4, 200, 0)
+    REQUIRE(placeX == 4);
+    REQUIRE(placeY == 200);
+    REQUIRE(placeZ == 0);
+
+    // Place block
+    world->setBlock(placeX, placeY, placeZ, BlockType::DIRT);
+    REQUIRE(world->getBlock(4, 200, 0) == BlockType::DIRT);
+}
+
+TEST_CASE("Block placing: no placement when overlapping player AABB", "[phase6][block]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Place block at (10, 200, 10)
+    world->setBlock(10, 200, 10, BlockType::STONE);
+
+    // Player standing at (10, 200, 10) — inside the block we'd place on
+    Player player;
+    player.position = Vec3{10.f, 200.f, 10.f};
+
+    // Ray from (7, 200, 10) going +X
+    Vec3 origin{7.f, 200.f, 10.f};
+    Vec3 direction{1.f, 0.f, 0.f};
+
+    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
+    REQUIRE(hit.has_value());
+
+    // Calculate placement position
+    int placeX = static_cast<int>(std::floor(hit->first.x)) + static_cast<int>(hit->second.x);
+    int placeY = static_cast<int>(std::floor(hit->first.y)) + static_cast<int>(hit->second.y);
+    int placeZ = static_cast<int>(std::floor(hit->first.z)) + static_cast<int>(hit->second.z);
+
+    // Check overlap
+    AABB placeBox{
+        Vec3{static_cast<float>(placeX), static_cast<float>(placeY), static_cast<float>(placeZ)},
+        Vec3{static_cast<float>(placeX + 1), static_cast<float>(placeY + 1),
+             static_cast<float>(placeZ + 1)}};
+
+    bool overlaps = placeBox.intersects(player.getAABB());
+    // If it overlaps, we should NOT place the block
+    if (overlaps) {
+        // This is the expected behavior — block should not be placed
+        REQUIRE(overlaps == true);
+    }
+}
+
+TEST_CASE("Block placing: adjacent chunks marked dirty at boundary", "[phase6][block]") {
+    auto world = std::make_shared<World>(42);
+
+    // Place block at chunk boundary: x=15 is last block in chunk 0, x=16 is first in chunk 1
+    world->getChunk(0, 0);
+    world->getChunk(1, 0);
+
+    auto chunk0 = world->getChunk(0, 0);
+    auto chunk1 = world->getChunk(1, 0);
+
+    chunk0->needsMeshUpdate = false;
+    chunk1->needsMeshUpdate = false;
+
+    // Place block at x=16 (first block of chunk 1)
+    world->setBlock(16, 200, 8, BlockType::STONE);
+
+    // Chunk 1 should be dirty
+    REQUIRE(chunk1->needsMeshUpdate == true);
+}
+
+// ---- Water Physics Tests (Task 6.7-6.8) ----
+
+TEST_CASE("Water physics: reduced gravity when submerged", "[phase6][water]") {
+    auto world = std::make_shared<World>(42);
+    // Ensure chunk exists before setting blocks (setBlock only modifies existing chunks)
+    world->getChunk(0, 0);
+
+    // Place floor far below so player falls freely
+    for (int x = -10; x <= 10; ++x) {
+        for (int z = -10; z <= 10; ++z) {
+            world->setBlock(x, 0, z, BlockType::STONE);
+        }
+    }
+
+    // Place water block at player position
+    world->setBlock(0, 100, 0, BlockType::WATER);
+
+    Player player;
+    player.position = Vec3{0.f, 100.f, 0.f};
+    player.velocity = Vec3::zero();
+
+    InputState input;
+    player.tick(*world, input, false);
+
+    // In water: gravity *= 0.3, so effective gravity = -0.08 * 0.3 = -0.024
+    // After drag: -0.024 * 0.98 = -0.02352
+    // Plus buoyancy: -0.02352 + 0.02 = -0.00352
+    // Velocity should be much smaller than in air (-0.0784)
+    REQUIRE(std::abs(player.velocity.y) < std::abs(-0.08f * 0.98f));
+}
+
+TEST_CASE("Water physics: increased horizontal drag in water", "[phase6][water]") {
+    auto world = std::make_shared<World>(42);
+    // Ensure chunk exists before setting blocks (setBlock only modifies existing chunks)
+    world->getChunk(0, 0);
+
+    for (int x = -10; x <= 10; ++x) {
+        for (int z = -10; z <= 10; ++z) {
+            world->setBlock(x, 0, z, BlockType::STONE);
+        }
+    }
+
+    // Place water at player position
+    world->setBlock(0, 100, 0, BlockType::WATER);
+
+    Player player;
+    player.position = Vec3{0.f, 100.f, 0.f};
+    player.velocity = Vec3::zero();
+    player.yaw = 0.f;
+
+    // Press W to move forward
+    InputState input;
+    input.keysDown[Key::W] = true;
+    player.tick(*world, input, false);
+
+    // Water halves the walking pace (0.216 → 0.108 blocks/tick)
+    float totalHorizontalSpeed =
+        std::sqrt(player.velocity.x * player.velocity.x + player.velocity.z * player.velocity.z);
+    REQUIRE(totalHorizontalSpeed == Catch::Approx(0.108f).epsilon(0.01f));
+}
+
+TEST_CASE("Water physics: buoyancy pushes player upward", "[phase6][water]") {
+    auto world = std::make_shared<World>(42);
+    // Ensure chunk exists before setting blocks (setBlock only modifies existing chunks)
+    world->getChunk(0, 0);
+
+    for (int x = -10; x <= 10; ++x) {
+        for (int z = -10; z <= 10; ++z) {
+            world->setBlock(x, 0, z, BlockType::STONE);
+        }
+    }
+
+    world->setBlock(0, 100, 0, BlockType::WATER);
+
+    Player player;
+    player.position = Vec3{0.f, 100.f, 0.f};
+    player.velocity = Vec3{0.f, -0.1f, 0.f}; // Moving downward
+
+    InputState input;
+    player.tick(*world, input, false);
+
+    // Buoyancy should reduce downward velocity
+    // Without buoyancy: velocity.y ≈ -0.1 * 0.98 + (-0.024) = -0.122
+    // With buoyancy: velocity.y ≈ -0.122 + 0.02 = -0.102
+    // The buoyancy force makes velocity.y less negative
+    REQUIRE(player.velocity.y > -0.13f);
+}
+
+TEST_CASE("isInWater: detects player in water block", "[phase6][water]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->setBlock(5, 200, 5, BlockType::WATER);
+
+    // Player AABB overlapping water block
+    AABB playerBox{Vec3{4.5f, 199.5f, 4.5f}, Vec3{5.1f, 201.3f, 5.1f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, playerBox) == true);
+
+    // Player not in water
+    AABB playerBox2{Vec3{10.f, 200.f, 10.f}, Vec3{10.6f, 201.8f, 10.6f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, playerBox2) == false);
+}

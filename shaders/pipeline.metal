@@ -1,35 +1,21 @@
 #include <metal_stdlib>
+#include <render/shader_types.hpp>
 using namespace metal;
-
-// ---------------------------------------------------------------------------
-// Uniforms — bound as a constant buffer via [[buffer(N)]]
-// ---------------------------------------------------------------------------
-struct Uniforms {
-    float4x4 modelMatrix;
-    float4x4 viewMatrix;
-    float4x4 projectionMatrix;
-    float3 sunDirection;   // Normalized direction to the sun
-    float3 sunColor;
-    float3 ambientColor;
-    float _padding;
-    // Fog (Phase 8)
-    float3 fogColor;
-    float fogDensity;
-    float3 cameraPosition;
-    float _padding2;
-};
 
 // ---------------------------------------------------------------------------
 // Vertex input — bound through the vertex descriptor (not argument buffer)
 //
 // Attribute layout matches include/render/vertex.hpp:
-//   attribute(0)  uint     normalIdx         offset 0   4 bytes  (UInt)
+//   attribute(0)  uint     faceAttr          offset 0   4 bytes  (UInt)
+//                          face normal in bits 0-2, texture layer in bits 3+
 //   attribute(1)  float3   px, py, pz        offset 4   6 bytes  (Half3)
+//                          CHUNK-LOCAL position; ChunkOrigin restores world
 //   attribute(2)  float2   u, v              offset 10  4 bytes  (Half2)
+//                          spans the quad extent in blocks (repeat-sampled)
 //   stride = 16 bytes
 // ---------------------------------------------------------------------------
 struct VertexInput {
-    uint normalIdx [[attribute(0)]];
+    uint faceAttr [[attribute(0)]];
     float3 position [[attribute(1)]];
     float2 uv [[attribute(2)]];
 };
@@ -42,7 +28,9 @@ struct VertexOutput {
     float3 vNormal;
     float2 vUV;
     float vLight;
+    float vSkyLight;       // column skylight 0-1 (cast shade, cave darkness)
     float3 vWorldPosition; // World-space position for fog calculation
+    uint vTextureLayer [[flat]];
 };
 
 // ---------------------------------------------------------------------------
@@ -65,22 +53,25 @@ float3 getFaceNormal(uint index) {
 // ---------------------------------------------------------------------------
 vertex VertexOutput vertexMain(
     VertexInput in [[stage_in]],
-    constant Uniforms &uniforms [[buffer(1)]]
+    constant Uniforms &uniforms [[buffer(1)]],
+    constant ChunkOrigin &chunkOrigin [[buffer(2)]]
 ) {
     VertexOutput out;
 
-    // Transform position through MVP
-    float4 worldPos = uniforms.modelMatrix * float4(in.position, 1.0);
+    // Restore world space from the chunk-local position, then run MVP
+    float4 worldPos =
+        uniforms.modelMatrix * float4(in.position + chunkOrigin.origin.xyz, 1.0);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
 
     // Pass through UV
     out.vUV = in.uv;
 
-    // Look up face normal and transform to world space.
-    // Multiply by float4(normal, 0.0) to apply only the rotation/scale
-    // portion of the model matrix (no translation).
-    float3 normal = getFaceNormal(in.normalIdx);
+    // Unpack face normal (bits 0-2), texture layer (bits 3-10), and
+    // column skylight (bits 11-14)
+    out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
+    out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
+    float3 normal = getFaceNormal(in.faceAttr & 7u);
     out.vNormal = normalize(
         (uniforms.modelMatrix * float4(normal, 0.0)).xyz
     );
@@ -97,17 +88,25 @@ vertex VertexOutput vertexMain(
 // ---------------------------------------------------------------------------
 fragment float4 fragmentMain(
     VertexOutput in [[stage_in]],
-    texture2d<float> atlas [[texture(0)]],
+    texture2d_array<float> blockTextures [[texture(0)]],
+    sampler blockSampler [[sampler(0)]],
     constant Uniforms &uniforms [[buffer(1)]]
 ) {
-    // Nearest-neighbor sampling for crisp voxel textures
-    constexpr sampler atlasSampler(mag_filter::nearest,
-                                    min_filter::nearest);
+    // The bound sampler uses repeat addressing + nearest filtering: UVs span
+    // the quad extent in blocks, so each block gets one full texture tile.
+    float4 texColor = blockTextures.sample(blockSampler, in.vUV, in.vTextureLayer);
 
-    float4 texColor = atlas.sample(atlasSampler, in.vUV);
+    // Alpha cutout for foliage/glass: transparent texels simply don't exist.
+    // Runs in the opaque pass with depth writes, so no sorting is needed.
+    if (texColor.a < 0.5f) {
+        discard_fragment();
+    }
 
-    // Combine directional sun light with ambient
-    float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight + uniforms.ambientColor);
+    // Combine directional sun light with ambient, both attenuated by the
+    // column skylight so covered ground and caves sit in shadow
+    float sky = 0.25f + 0.75f * in.vSkyLight;
+    float3 litColor =
+        texColor.rgb * (uniforms.sunColor * in.vLight * sky + uniforms.ambientColor * sky);
 
     // ---- Distance fog (Phase 8) ----
     // Use world position passed from vertex shader
@@ -121,4 +120,43 @@ fragment float4 fragmentMain(
     float3 finalColor = mix(litColor, uniforms.fogColor, fogFactor);
 
     return float4(finalColor, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Entity shaders — voxel-box animal models, lit like terrain
+// ---------------------------------------------------------------------------
+struct EntityVertexOutput {
+    float4 clipPosition [[position]];
+    float3 vNormal;
+    float3 vColor;
+    float3 vWorldPosition;
+};
+
+vertex EntityVertexOutput entityVertexMain(
+    device const EntityVertex* vertices [[buffer(0)]],
+    constant Uniforms &uniforms [[buffer(1)]],
+    constant EntityModel &entityModel [[buffer(2)]],
+    uint vertexID [[vertex_id]]
+) {
+    device const EntityVertex& v = vertices[vertexID];
+
+    EntityVertexOutput out;
+    float4 worldPos = entityModel.model * float4(v.position, 1.0);
+    out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
+    out.vWorldPosition = worldPos.xyz;
+    out.vNormal = normalize((entityModel.model * float4(v.normal, 0.0)).xyz);
+    out.vColor = v.color;
+    return out;
+}
+
+fragment float4 entityFragmentMain(
+    EntityVertexOutput in [[stage_in]],
+    constant Uniforms &uniforms [[buffer(1)]]
+) {
+    float light = max(dot(in.vNormal, uniforms.sunDirection), 0.0f);
+    float3 litColor = in.vColor * (uniforms.sunColor * light + uniforms.ambientColor);
+
+    float distanceToFrag = distance(in.vWorldPosition, uniforms.cameraPosition);
+    float fogFactor = clamp(1.0f - exp(-uniforms.fogDensity * distanceToFrag), 0.0f, 1.0f);
+    return float4(mix(litColor, uniforms.fogColor, fogFactor), 1.0);
 }

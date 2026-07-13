@@ -1,7 +1,7 @@
 #pragma once
 
-#include "world/noise.hpp"
 #include "world/chunk.hpp"
+#include "world/noise.hpp"
 
 #include <cstdint>
 

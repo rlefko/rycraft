@@ -1,9 +1,10 @@
 #pragma once
+#include "common/math.hpp"
+#include "world/block_properties.hpp"
 #include <array>
-#include <vector>
 #include <cstdint>
 #include <optional>
-#include "common/math.hpp"
+#include <vector>
 
 // Backwards compatibility alias
 constexpr int CHUNK_SIZE = 16;
@@ -13,47 +14,18 @@ constexpr int CHUNK_DEPTH = 16;
 constexpr int CHUNK_HEIGHT = 256;
 constexpr int CHUNK_VOLUME = CHUNK_WIDTH * CHUNK_DEPTH * CHUNK_HEIGHT;
 
-enum class BlockType : uint8_t {
-    AIR = 0,
-    STONE = 1,
-    GRASS = 2,
-    DIRT = 3,
-    SAND = 4,
-    GRAVEL = 5,
-    WATER = 6,
-    BEDROCK = 7,
-    LOG = 8,
-    LEAVES = 9,
-    SNOW = 10,
-    COAL_ORE = 11,
-    IRON_ORE = 12,
-    GOLD_ORE = 13,
-    DIAMOND_ORE = 14,
-    PLANKS = 15,
-    GLASS = 16,
-    COUNT = 17
-};
-
-inline bool isTransparent(BlockType type) {
-    return type == BlockType::AIR || type == BlockType::WATER || type == BlockType::LEAVES || type == BlockType::GLASS;
-}
-
-inline bool isSolid(BlockType type) {
-    return type != BlockType::AIR && type != BlockType::WATER;
-}
-
 enum class Biome : uint8_t {
-    DeepOcean = 0,
-    Ocean = 1,
-    Plains = 2,
-    Forest = 3,
-    Taiga = 4,
-    Desert = 5,
-    ExtremeHills = 6,
-    Swamp = 7,
-    MushroomIsland = 8,
-    IceSpikes = 9,
-    Count = 10
+    DEEP_OCEAN = 0,
+    OCEAN = 1,
+    PLAINS = 2,
+    FOREST = 3,
+    TAIGA = 4,
+    DESERT = 5,
+    EXTREME_HILLS = 6,
+    SWAMP = 7,
+    MUSHROOM_ISLAND = 8,
+    ICE_SPIKES = 9,
+    COUNT = 10
 };
 
 struct Chunk {

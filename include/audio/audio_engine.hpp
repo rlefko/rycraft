@@ -1,12 +1,12 @@
 #pragma once
 
-#import <CoreAudio/CoreAudio.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudio.h>
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <vector>
-#include <cstdint>
-#include <atomic>
 
 // ---------------------------------------------------------------------------
 // AudioEngine — Core Audio RemoteIO engine for rycraft.
@@ -40,9 +40,9 @@ public:
     void stop();
 
     // Play a sound buffer. Returns voice index (0-15) or -1 if no slots available.
-    int32_t playSound(const std::vector<float>& buffer,
-                      uint32_t sampleRate,
-                      float gain);
+    // Looping voices repeat until stopVoice() is called (ambient beds).
+    int32_t playSound(const std::vector<float>& buffer, uint32_t sampleRate, float gain,
+                      bool looping = false);
 
     // Stop a specific voice by index.
     void stopVoice(int32_t voiceIndex);
@@ -83,9 +83,6 @@ private:
 };
 
 // Audio callback wrapper (C function → C++ method bridge)
-OSStatus audioRenderCallback(void* inRefCon,
-                             AudioUnitRenderActionFlags* ioActionFlags,
-                             const AudioTimeStamp* inTimeStamp,
-                             UInt32 inBusNumber,
-                             UInt32 inNumberFrames,
-                             AudioBufferList* ioData);
+OSStatus audioRenderCallback(void* inRefCon, AudioUnitRenderActionFlags* ioActionFlags,
+                             const AudioTimeStamp* inTimeStamp, UInt32 inBusNumber,
+                             UInt32 inNumberFrames, AudioBufferList* ioData);

@@ -1,9 +1,3 @@
-lz4_dep = dependency('lz4', required : false)
-if not lz4_dep.found()
-  lz4_proj = subproject('lz4')
-  lz4_dep = lz4_proj.get_variable('liblz4_dep')
-endif
-
 world_sources = files(
   'world.cpp',
   'noise.cpp',

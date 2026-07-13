@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <render/shader_types.hpp>
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -15,15 +16,6 @@ using namespace metal;
 //   float3 sunColor       — color of the sun
 //   float sunIntensity    — brightness multiplier (0 at night, 1 at noon)
 // ---------------------------------------------------------------------------
-
-struct SkyUniforms {
-    float3 zenithColor;
-    float3 horizonColor;
-    float3 sunDirection;
-    float3 sunColor;
-    float sunIntensity;
-    float padding;
-};
 
 struct SkyVertexOutput {
     float4 clipPosition [[position]];

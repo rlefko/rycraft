@@ -17,8 +17,8 @@ struct CaveConfig {
     double noodleScale = 4.0;
 
     // Height distribution
-    double caveCeiling = 128.0;  // No caves above this
-    double caveFloor = 4.0;       // No caves below this
+    double caveCeiling = 128.0; // No caves above this
+    double caveFloor = 4.0;     // No caves below this
 };
 
 class CaveGenerator {

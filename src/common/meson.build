@@ -1,4 +1,4 @@
-common_sources = files('common.cpp', 'thread_pool.cpp')
+common_sources = files('thread_pool.cpp')
 
 libcommon = static_library('common',
   common_sources,

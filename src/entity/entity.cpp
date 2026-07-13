@@ -19,16 +19,16 @@ uint64_t Entity::nextId() {
 // ---------------------------------------------------------------------------
 EntityConfig Entity::getConfig(EntityType type) {
     switch (type) {
-    case EntityType::SHEEP:
-        return {0.6f, 0.9f, 0.025f, Vec3{0.9f, 0.9f, 0.9f}};
-    case EntityType::COW:
-        return {0.9f, 1.4f, 0.02f, Vec3{0.55f, 0.27f, 0.07f}};
-    case EntityType::PIG:
-        return {0.7f, 0.9f, 0.025f, Vec3{0.9f, 0.65f, 0.75f}};
-    case EntityType::CHICKEN:
-        return {0.4f, 0.7f, 0.03f, Vec3{0.95f, 0.95f, 0.9f}};
-    default:
-        std::unreachable();
+        case EntityType::SHEEP:
+            return {0.6f, 0.9f, 0.025f, Vec3{0.9f, 0.9f, 0.9f}};
+        case EntityType::COW:
+            return {0.9f, 1.4f, 0.02f, Vec3{0.55f, 0.27f, 0.07f}};
+        case EntityType::PIG:
+            return {0.7f, 0.9f, 0.025f, Vec3{0.9f, 0.65f, 0.75f}};
+        case EntityType::CHICKEN:
+            return {0.4f, 0.7f, 0.03f, Vec3{0.95f, 0.95f, 0.9f}};
+        default:
+            std::unreachable();
     }
 }
 
@@ -36,7 +36,10 @@ EntityConfig Entity::getConfig(EntityType type) {
 // Entity constructor
 // ---------------------------------------------------------------------------
 Entity::Entity(uint64_t entityId, EntityType entityType, const Vec3& spawnPos)
-    : id(entityId), type(entityType), position(spawnPos), velocity(Vec3::zero()) {
+    : id(entityId)
+    , type(entityType)
+    , position(spawnPos)
+    , velocity(Vec3::zero()) {
     aabb = computeAABB();
 }
 
@@ -49,10 +52,8 @@ AABB Entity::computeAABB() const {
     float effectiveHeight = isBaby ? cfg.height * 0.5f : cfg.height;
     float halfWidth = effectiveWidth * 0.5f;
 
-    return AABB{
-        Vec3{position.x - halfWidth, position.y, position.z - halfWidth},
-        Vec3{position.x + halfWidth, position.y + effectiveHeight, position.z + halfWidth}
-    };
+    return AABB{Vec3{position.x - halfWidth, position.y, position.z - halfWidth},
+                Vec3{position.x + halfWidth, position.y + effectiveHeight, position.z + halfWidth}};
 }
 
 // ---------------------------------------------------------------------------
@@ -186,85 +187,102 @@ std::vector<VoxelBlock> Entity::getVoxelModel(EntityType type, bool isBaby) {
     auto scaled = [&](Vec3 v) { return v * scale; };
 
     switch (type) {
-    case EntityType::SHEEP: {
-        Vec3 woolColor = Vec3{0.9f, 0.9f, 0.9f};
-        Vec3 legColor = Vec3{0.3f, 0.2f, 0.15f};
+        case EntityType::SHEEP: {
+            Vec3 woolColor = Vec3{0.9f, 0.9f, 0.9f};
+            Vec3 legColor = Vec3{0.3f, 0.2f, 0.15f};
 
-        // Body (3-block wide, centered)
-        blocks.push_back({{0.f, 0.5f * scale, 0.f}, scaled({0.6f, 0.5f, 0.6f}), woolColor});
-        // Head
-        blocks.push_back({{0.f, 0.8f * scale, -0.35f * scale}, scaled({0.35f, 0.35f, 0.35f}), woolColor});
-        // Legs
-        for (int lx = -1; lx <= 1; lx += 2) {
-            for (int lz = -1; lz <= 1; lz += 2) {
-                blocks.push_back({{lx * 0.15f * scale, 0.f, lz * 0.15f * scale},
-                                  scaled({0.1f, 0.3f, 0.1f}), legColor});
+            // Body (3-block wide, centered)
+            blocks.push_back({{0.f, 0.5f * scale, 0.f}, scaled({0.6f, 0.5f, 0.6f}), woolColor});
+            // Head
+            blocks.push_back(
+                {{0.f, 0.8f * scale, -0.35f * scale}, scaled({0.35f, 0.35f, 0.35f}), woolColor});
+            // Legs
+            for (int lx = -1; lx <= 1; lx += 2) {
+                for (int lz = -1; lz <= 1; lz += 2) {
+                    blocks.push_back({{lx * 0.15f * scale, 0.f, lz * 0.15f * scale},
+                                      scaled({0.1f, 0.3f, 0.1f}),
+                                      legColor});
+                }
             }
+            break;
         }
-        break;
-    }
-    case EntityType::COW: {
-        Vec3 bodyColor = Vec3{0.55f, 0.27f, 0.07f};
-        Vec3 whitePatch = Vec3{0.9f, 0.9f, 0.9f};
-        Vec3 legColor = Vec3{0.4f, 0.2f, 0.1f};
+        case EntityType::COW: {
+            Vec3 bodyColor = Vec3{0.55f, 0.27f, 0.07f};
+            Vec3 whitePatch = Vec3{0.9f, 0.9f, 0.9f};
+            Vec3 legColor = Vec3{0.4f, 0.2f, 0.1f};
 
-        // Body (larger)
-        blocks.push_back({{0.f, 0.6f * scale, 0.f}, scaled({0.9f, 0.6f, 0.8f}), bodyColor});
-        // White patch on body
-        blocks.push_back({{0.1f * scale, 0.7f * scale, 0.f}, scaled({0.3f, 0.3f, 0.4f}), whitePatch});
-        // Head
-        blocks.push_back({{0.f, 1.0f * scale, -0.5f * scale}, scaled({0.4f, 0.4f, 0.4f}), bodyColor});
-        // Legs
-        for (int lx = -1; lx <= 1; lx += 2) {
-            for (int lz = -1; lz <= 1; lz += 2) {
-                blocks.push_back({{lx * 0.25f * scale, 0.f, lz * 0.25f * scale},
-                                  scaled({0.12f, 0.4f, 0.12f}), legColor});
+            // Body (larger)
+            blocks.push_back({{0.f, 0.6f * scale, 0.f}, scaled({0.9f, 0.6f, 0.8f}), bodyColor});
+            // White patch on body
+            blocks.push_back(
+                {{0.1f * scale, 0.7f * scale, 0.f}, scaled({0.3f, 0.3f, 0.4f}), whitePatch});
+            // Head
+            blocks.push_back(
+                {{0.f, 1.0f * scale, -0.5f * scale}, scaled({0.4f, 0.4f, 0.4f}), bodyColor});
+            // Legs
+            for (int lx = -1; lx <= 1; lx += 2) {
+                for (int lz = -1; lz <= 1; lz += 2) {
+                    blocks.push_back({{lx * 0.25f * scale, 0.f, lz * 0.25f * scale},
+                                      scaled({0.12f, 0.4f, 0.12f}),
+                                      legColor});
+                }
             }
+            // Udder
+            blocks.push_back({{0.f, 0.2f * scale, 0.35f * scale},
+                              scaled({0.2f, 0.15f, 0.15f}),
+                              Vec3{0.9f, 0.7f, 0.8f}});
+            break;
         }
-        // Udder
-        blocks.push_back({{0.f, 0.2f * scale, 0.35f * scale}, scaled({0.2f, 0.15f, 0.15f}), Vec3{0.9f, 0.7f, 0.8f}});
-        break;
-    }
-    case EntityType::PIG: {
-        Vec3 bodyColor = Vec3{0.9f, 0.65f, 0.75f};
-        Vec3 legColor = Vec3{0.8f, 0.55f, 0.65f};
+        case EntityType::PIG: {
+            Vec3 bodyColor = Vec3{0.9f, 0.65f, 0.75f};
+            Vec3 legColor = Vec3{0.8f, 0.55f, 0.65f};
 
-        // Body (compact)
-        blocks.push_back({{0.f, 0.45f * scale, 0.f}, scaled({0.7f, 0.5f, 0.6f}), bodyColor});
-        // Head
-        blocks.push_back({{0.f, 0.7f * scale, -0.35f * scale}, scaled({0.3f, 0.3f, 0.3f}), bodyColor});
-        // Snout
-        blocks.push_back({{0.f, 0.65f * scale, -0.5f * scale}, scaled({0.2f, 0.15f, 0.15f}), Vec3{0.8f, 0.4f, 0.5f}});
-        // Legs
-        for (int lx = -1; lx <= 1; lx += 2) {
-            for (int lz = -1; lz <= 1; lz += 2) {
-                blocks.push_back({{lx * 0.2f * scale, 0.f, lz * 0.15f * scale},
-                                  scaled({0.1f, 0.25f, 0.1f}), legColor});
+            // Body (compact)
+            blocks.push_back({{0.f, 0.45f * scale, 0.f}, scaled({0.7f, 0.5f, 0.6f}), bodyColor});
+            // Head
+            blocks.push_back(
+                {{0.f, 0.7f * scale, -0.35f * scale}, scaled({0.3f, 0.3f, 0.3f}), bodyColor});
+            // Snout
+            blocks.push_back({{0.f, 0.65f * scale, -0.5f * scale},
+                              scaled({0.2f, 0.15f, 0.15f}),
+                              Vec3{0.8f, 0.4f, 0.5f}});
+            // Legs
+            for (int lx = -1; lx <= 1; lx += 2) {
+                for (int lz = -1; lz <= 1; lz += 2) {
+                    blocks.push_back({{lx * 0.2f * scale, 0.f, lz * 0.15f * scale},
+                                      scaled({0.1f, 0.25f, 0.1f}),
+                                      legColor});
+                }
             }
+            break;
         }
-        break;
-    }
-    case EntityType::CHICKEN: {
-        Vec3 bodyColor = Vec3{0.95f, 0.95f, 0.9f};
-        Vec3 beakColor = Vec3{0.9f, 0.7f, 0.1f};
-        Vec3 combColor = Vec3{0.9f, 0.1f, 0.1f};
+        case EntityType::CHICKEN: {
+            Vec3 bodyColor = Vec3{0.95f, 0.95f, 0.9f};
+            Vec3 beakColor = Vec3{0.9f, 0.7f, 0.1f};
+            Vec3 combColor = Vec3{0.9f, 0.1f, 0.1f};
 
-        // Body (small)
-        blocks.push_back({{0.f, 0.3f * scale, 0.f}, scaled({0.4f, 0.35f, 0.4f}), bodyColor});
-        // Head
-        blocks.push_back({{0.f, 0.55f * scale, -0.15f * scale}, scaled({0.25f, 0.25f, 0.25f}), bodyColor});
-        // Beak
-        blocks.push_back({{0.f, 0.5f * scale, -0.3f * scale}, scaled({0.1f, 0.08f, 0.1f}), beakColor});
-        // Comb
-        blocks.push_back({{0.f, 0.7f * scale, -0.1f * scale}, scaled({0.1f, 0.1f, 0.1f}), combColor});
-        // Legs (2)
-        blocks.push_back({{-0.08f * scale, 0.f, 0.f}, scaled({0.06f, 0.15f, 0.06f}), beakColor});
-        blocks.push_back({{0.08f * scale, 0.f, 0.f}, scaled({0.06f, 0.15f, 0.06f}), beakColor});
-        // Wings
-        blocks.push_back({{-0.25f * scale, 0.35f * scale, 0.f}, scaled({0.08f, 0.2f, 0.1f}), bodyColor});
-        blocks.push_back({{0.25f * scale, 0.35f * scale, 0.f}, scaled({0.08f, 0.2f, 0.1f}), bodyColor});
-        break;
-    }
+            // Body (small)
+            blocks.push_back({{0.f, 0.3f * scale, 0.f}, scaled({0.4f, 0.35f, 0.4f}), bodyColor});
+            // Head
+            blocks.push_back(
+                {{0.f, 0.55f * scale, -0.15f * scale}, scaled({0.25f, 0.25f, 0.25f}), bodyColor});
+            // Beak
+            blocks.push_back(
+                {{0.f, 0.5f * scale, -0.3f * scale}, scaled({0.1f, 0.08f, 0.1f}), beakColor});
+            // Comb
+            blocks.push_back(
+                {{0.f, 0.7f * scale, -0.1f * scale}, scaled({0.1f, 0.1f, 0.1f}), combColor});
+            // Legs (2)
+            blocks.push_back(
+                {{-0.08f * scale, 0.f, 0.f}, scaled({0.06f, 0.15f, 0.06f}), beakColor});
+            blocks.push_back({{0.08f * scale, 0.f, 0.f}, scaled({0.06f, 0.15f, 0.06f}), beakColor});
+            // Wings
+            blocks.push_back(
+                {{-0.25f * scale, 0.35f * scale, 0.f}, scaled({0.08f, 0.2f, 0.1f}), bodyColor});
+            blocks.push_back(
+                {{0.25f * scale, 0.35f * scale, 0.f}, scaled({0.08f, 0.2f, 0.1f}), bodyColor});
+            break;
+        }
     }
 
     return blocks;

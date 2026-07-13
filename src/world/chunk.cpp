@@ -8,9 +8,8 @@ Chunk::Chunk(int cx, int cz)
     , chunkZ(cz)
     , blocks(CHUNK_VOLUME, BlockType::AIR)
     , biomes{}
-    , heightMap{}
-{
-    biomes.fill(Biome::Plains);
+    , heightMap{} {
+    biomes.fill(Biome::PLAINS);
     heightMap.fill(0);
 }
 
@@ -48,7 +47,8 @@ void Chunk::setBlockWorld(int x, int y, int z, BlockType type) {
 
 int Chunk::worldToChunk(int worldCoord) {
     // Truncate toward zero for positive, floor for negative
-    return (worldCoord >= 0) ? (worldCoord / CHUNK_WIDTH) : ((worldCoord - CHUNK_WIDTH + 1) / CHUNK_WIDTH);
+    return (worldCoord >= 0) ? (worldCoord / CHUNK_WIDTH)
+                             : ((worldCoord - CHUNK_WIDTH + 1) / CHUNK_WIDTH);
 }
 
 int Chunk::chunkToWorld(int chunkCoord, int localCoord) {
@@ -56,8 +56,7 @@ int Chunk::chunkToWorld(int chunkCoord, int localCoord) {
 }
 
 Vec3 Chunk::getWorldPosition() const {
-    return Vec3{static_cast<float>(chunkX * CHUNK_WIDTH),
-                0.f,
+    return Vec3{static_cast<float>(chunkX * CHUNK_WIDTH), 0.f,
                 static_cast<float>(chunkZ * CHUNK_DEPTH)};
 }
 
@@ -71,11 +70,9 @@ void Chunk::setMeshed(bool value) {
 }
 
 AABB Chunk::getAABB() const {
-    Vec3 min{static_cast<float>(chunkX * CHUNK_WIDTH),
-             0.f,
+    Vec3 min{static_cast<float>(chunkX * CHUNK_WIDTH), 0.f,
              static_cast<float>(chunkZ * CHUNK_DEPTH)};
-    Vec3 max{static_cast<float>((chunkX + 1) * CHUNK_WIDTH),
-             static_cast<float>(CHUNK_HEIGHT),
+    Vec3 max{static_cast<float>((chunkX + 1) * CHUNK_WIDTH), static_cast<float>(CHUNK_HEIGHT),
              static_cast<float>((chunkZ + 1) * CHUNK_DEPTH)};
     return AABB{min, max};
 }

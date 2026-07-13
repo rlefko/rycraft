@@ -9,10 +9,7 @@ static uint32_t oreLcg(uint32_t& state) {
     return (state >> 16) & 0x7fff;
 }
 
-OreGenerator::OreGenerator(uint32_t seed)
-    : oreNoise_(seed)
-{
-}
+OreGenerator::OreGenerator(uint32_t seed) : oreNoise_(seed) {}
 
 double OreGenerator::getOreDensity(double y, const OreConfig::OreDistribution& dist) const {
     // Trapezoid height distribution:
@@ -39,8 +36,8 @@ double OreGenerator::getOreDensity(double y, const OreConfig::OreDistribution& d
     return 1.0;
 }
 
-void OreGenerator::generateOreVein(Chunk& chunk, int x, int y, int z,
-                                   int veinSize, BlockType ore) const {
+void OreGenerator::generateOreVein(Chunk& chunk, int x, int y, int z, int veinSize,
+                                   BlockType ore) const {
     // Generate a sphere of ore replacing only STONE blocks
     int radiusSq = veinSize * veinSize;
 
@@ -82,11 +79,9 @@ void OreGenerator::generate(Chunk& chunk, const OreConfig& config) const {
             int noiseX = worldBaseX + (oreLcg(state) % (CHUNK_WIDTH * 3));
             int noiseZ = worldBaseZ + (oreLcg(state) % (CHUNK_DEPTH * 3));
 
-            double noiseVal = oreNoise_.noise3D(
-                static_cast<double>(noiseX) * 0.1,
-                static_cast<double>(cluster) * 0.5,
-                static_cast<double>(noiseZ) * 0.1
-            );
+            double noiseVal = oreNoise_.noise3D(static_cast<double>(noiseX) * 0.1,
+                                                static_cast<double>(cluster) * 0.5,
+                                                static_cast<double>(noiseZ) * 0.1);
 
             // Map from [-1, 1] to [0, 1]
             double normalized = (noiseVal + 1.0) * 0.5;
@@ -111,9 +106,9 @@ void OreGenerator::generate(Chunk& chunk, const OreConfig& config) const {
 
             // Vein size scaled by density
             int veinRange = oreDist.maxVeinSize - oreDist.minVeinSize;
-            int veinSize = oreDist.minVeinSize + static_cast<int>(
-                (static_cast<double>(oreLcg(state)) / 32767.0) * veinRange * density
-            );
+            int veinSize = oreDist.minVeinSize +
+                           static_cast<int>((static_cast<double>(oreLcg(state)) / 32767.0) *
+                                            veinRange * density);
             veinSize = std::max(1, veinSize);
 
             // Generate the ore vein

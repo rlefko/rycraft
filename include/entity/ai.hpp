@@ -40,19 +40,17 @@ public:
     // Per-state data
     Vec3 targetPosition = Vec3::zero();
     std::optional<uint64_t> targetEntityId = std::nullopt;
-    int stateTimer = 0;         // ticks in current state
-    int idleTimer = 0;          // ticks since last state change (for idle→wander)
-    int fleeTimer = 0;          // ticks in FLEE state
+    int stateTimer = 0; // ticks in current state
+    int idleTimer = 0;  // ticks since last state change (for idle→wander)
+    int fleeTimer = 0;  // ticks in FLEE state
 
     // -----------------------------------------------------------------------
     // State transitions
     // -----------------------------------------------------------------------
     // Evaluate conditions and update state.
     // Returns the velocity offset to apply (AI-driven movement).
-    Vec3 update(Entity& entity, World& world,
-                 const Vec3& playerPosition, bool playerMovingToward,
-                 bool playerHoldingFood,
-                 Spawner& spawner);
+    Vec3 update(Entity& entity, World& world, const Vec3& playerPosition, bool playerMovingToward,
+                bool playerHoldingFood, Spawner& spawner);
 
     // Transition to a new state
     void transitionTo(AnimalState newState);
@@ -77,11 +75,10 @@ public:
     // -----------------------------------------------------------------------
     // Condition checks (pure functions)
     // -----------------------------------------------------------------------
-    static bool shouldFlee(const Vec3& entityPos, const Vec3& playerPos,
-                           bool playerMovingToward, float fleeDistance = 6.0f);
-    static bool shouldStopFleeing(const Vec3& entityPos, const Vec3& playerPos,
-                                  int fleeTicks, float safeDistance = 10.0f,
-                                  int maxFleeTicks = 300);
+    static bool shouldFlee(const Vec3& entityPos, const Vec3& playerPos, bool playerMovingToward,
+                           float fleeDistance = 6.0f);
+    static bool shouldStopFleeing(const Vec3& entityPos, const Vec3& playerPos, int fleeTicks,
+                                  float safeDistance = 10.0f, int maxFleeTicks = 300);
     static bool shouldEat(int hungerTicks, int eatThreshold = 300);
     static bool shouldWander(int idleTicks, int minIdle = 30, int maxIdle = 120);
     static bool shouldStopWandering(int wanderTicks, int maxWander = 200);
@@ -120,15 +117,12 @@ public:
 
 private:
     // Pure functions for each flocking rule
-    static Vec3 computeSeparation(Entity& entity,
-                                   const std::vector<uint64_t>& neighborIds,
-                                   Spawner& spawner);
-    static Vec3 computeAlignment(Entity& entity,
-                                  const std::vector<uint64_t>& neighborIds,
+    static Vec3 computeSeparation(Entity& entity, const std::vector<uint64_t>& neighborIds,
                                   Spawner& spawner);
-    static Vec3 computeCohesion(Entity& entity,
-                                 const std::vector<uint64_t>& neighborIds,
+    static Vec3 computeAlignment(Entity& entity, const std::vector<uint64_t>& neighborIds,
                                  Spawner& spawner);
+    static Vec3 computeCohesion(Entity& entity, const std::vector<uint64_t>& neighborIds,
+                                Spawner& spawner);
 };
 
 // ---------------------------------------------------------------------------
@@ -141,8 +135,8 @@ class EdgeDetector {
 public:
     // Check if movement toward `direction` is safe.
     // Returns false if there's a cliff or (for non-pigs) water ahead.
-    static bool isSafeToMove(const Vec3& entityPos, const Vec3& direction,
-                             EntityType entityType, World& world);
+    static bool isSafeToMove(const Vec3& entityPos, const Vec3& direction, EntityType entityType,
+                             World& world);
 
     // Check for cliff: block ahead is AIR and block below that is also AIR
     static bool isCliffAhead(const Vec3& entityPos, const Vec3& direction, World& world);
@@ -164,7 +158,7 @@ public:
 
     // Execute follow-player behavior: steer toward player
     static Vec3 computeFollowSteering(const Vec3& entityPos, const Vec3& playerPos,
-                                       float minDistance = 3.0f, float maxDistance = 6.0f);
+                                      float minDistance = 3.0f, float maxDistance = 6.0f);
 
     // Check if entity is standing on grass
     static bool isOnGrass(Entity& entity, World& world);

@@ -2,21 +2,30 @@
 
 #import <QuartzCore/QuartzCore.h>
 
+#include <audio/audio_engine.hpp>
+#include <audio/sfx.hpp>
 #include <common/error.hpp>
 #include <common/math.hpp>
-#include <render/render_pipeline.hpp>
+#include <common/random.hpp>
 #include <engine/camera.hpp>
+#include <engine/game_state.hpp>
 #include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
+#include <entity/ai.hpp>
 #include <entity/player.hpp>
+#include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
-#include <world/world.hpp>
+#include <render/render_pipeline.hpp>
+#include <render/ui_menu.hpp>
 #include <world/save_manager.hpp>
+#include <world/world.hpp>
 
+#include <algorithm>
 #include <chrono>
-#include <memory>
 #include <cmath>
+#include <memory>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 
 // ---------------------------------------------------------------------------
@@ -51,14 +60,43 @@ struct EngineState {
     Vec3 highlightedBlock; // Block currently targeted by crosshair
     bool hasHighlightedBlock = false;
 
+    // ---- Game flow & UI ----
+    GameFlow flow;               // Title → Playing ⇄ Paused ⇄ Settings
+    bool spawnValidated = false; // player unstuck from stale-save terrain
+    SettingsValues settings;     // live values shown in the settings menu
+    MenuLayout menuLayout;       // rebuilt each frame while a menu is open
+    int hoveredButton = -1;
+    bool showDebugHud = false;
+
+    // ---- Performance stats (exponential moving averages) ----
+    float smoothedFrameMs = 16.7f;
+    uint32_t cachedChunkCount = 0;
+
     // ---- Player & World ----
     Player player;
     std::shared_ptr<World> world;
     std::unique_ptr<SaveManager> saveManager;
     Camera camera;
 
+    // ---- Animals ----
+    std::unique_ptr<Spawner> spawner;
+    std::unordered_map<uint64_t, StateMachine> entityBrains;
+    bool populationSpawned = false;
+    int animalCallCooldown = 0;
+
+    // ---- Audio ----
+    std::unique_ptr<AudioEngine> audio;
+    std::vector<float> sfxBlockBreak;
+    std::vector<float> sfxBlockPlace;
+    std::vector<float> sfxFootstep;
+    std::vector<float> sfxWind;
+    std::vector<float> sfxAnimal[4]; // indexed by EntityType
+    int32_t windVoice = -1;
+    float footstepDistance = 0.f; // ground distance walked since last step
+    Vec3 lastFootstepPos{0.f, 0.f, 0.f};
+
     // ---- Input manager (set after window creation) ----
-    InputManager* inputManager = nullptr;
+    std::unique_ptr<InputManager> inputManager;
 };
 
 @implementation Engine {
@@ -76,6 +114,9 @@ struct EngineState {
 
     // Scroll wheel tracking
     float _scrollAccumulator;
+
+    // Save-on-quit guard (terminate can be reached from several paths)
+    bool _savedWorld;
 }
 
 // ---- C++ bridge helper — must be inside @implementation to access _state ----
@@ -102,10 +143,24 @@ static EngineState* _engineGetState(Engine* engine) {
         _queue = nil;
         _scrollAccumulator = 0;
         _state = std::make_unique<EngineState>();
-        _state->world = std::make_shared<World>(42);
         _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
-        // Spawn player above terrain
-        _state->player.position = Vec3{0.f, 100.f, 0.f};
+
+        // Resume the saved world when one exists; otherwise start fresh
+        uint32_t seed = 42;
+        Vec3 spawnPos{0.f, 100.f, 0.f};
+        if (auto meta = _state->saveManager->loadMetadata()) {
+            seed = meta->seed;
+            spawnPos = meta->spawnPos;
+            _state->worldTime = meta->worldTime;
+        }
+
+        // View distance 12 keeps the full-detail mesh set comfortably inside
+        // the 128 MB mega-buffer (25×25 chunks ≈ 60 MB of vertex data).
+        _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
+        // Chunks load from disk before regenerating, so block edits persist
+        _state->world->setSaveManager(_state->saveManager.get());
+        _state->spawner = std::make_unique<Spawner>(*_state->world);
+        _state->player.position = spawnPos;
     }
     return self;
 }
@@ -117,9 +172,9 @@ static EngineState* _engineGetState(Engine* engine) {
         RY_LOG_FATAL("Failed to create NSApplication");
         return NO;
     }
-    [_app setActivationPolicy: NSApplicationActivationPolicyRegular];
-    [_app activateIgnoringOtherApps: true];
-    [_app setDelegate: self];
+    [_app setActivationPolicy:NSApplicationActivationPolicyRegular];
+    [_app activateIgnoringOtherApps:true];
+    [_app setDelegate:self];
 
     // 2. Create Metal device
     _device = MTLCreateSystemDefaultDevice();
@@ -137,40 +192,32 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // 4. Create NSWindow
     NSRect screenFrame = [[NSScreen mainScreen] visibleFrame];
-    NSRect windowRect = NSMakeRect(
-        (screenFrame.size.width - 1024) * 0.5,
-        (screenFrame.size.height - 768) * 0.5,
-        1024, 768
-    );
+    NSRect windowRect = NSMakeRect((screenFrame.size.width - 1024) * 0.5,
+                                   (screenFrame.size.height - 768) * 0.5, 1024, 768);
     _window = [[NSWindow alloc]
-        initWithContentRect: windowRect
-        styleMask: NSWindowStyleMaskTitled
-             | NSWindowStyleMaskClosable
-             | NSWindowStyleMaskMiniaturizable
-             | NSWindowStyleMaskResizable
-        backing: NSBackingStoreBuffered
-        defer: false];
+        initWithContentRect:windowRect
+                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                    backing:NSBackingStoreBuffered
+                      defer:false];
     if (!_window) {
         RY_LOG_FATAL("Failed to create NSWindow");
         return NO;
     }
-    [_window setTitle: @"rycraft"];
-    [_window setDelegate: self];
-    [_window makeKeyAndOrderFront: nil];
+    [_window setTitle:@"rycraft"];
+    [_window setDelegate:self];
+    [_window makeKeyAndOrderFront:nil];
 
     // 5. Create and configure MTKView
-    _view = [[MTKView alloc]
-        initWithFrame: windowRect
-        device: _device];
+    _view = [[MTKView alloc] initWithFrame:windowRect device:_device];
     if (!_view) {
         RY_LOG_FATAL("Failed to create MTKView");
         return NO;
     }
 
-    // Pixel formats
+    // Drawable pixel format. The render pipeline builds its own MSAA render
+    // passes, so the view carries no sample count or depth buffer of its own.
     _view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    _view.sampleCount = 4;  // 4x MSAA
-    _view.depthStencilPixelFormat = MTLPixelFormatDepth32Float;
 
     // Disable automatic setNeedsDisplay — we drive rendering from the game loop
     _view.enableSetNeedsDisplay = false;
@@ -180,11 +227,11 @@ static EngineState* _engineGetState(Engine* engine) {
     _view.delegate = self;
 
     // Set as window content
-    [_window setContentView: _view];
+    [_window setContentView:_view];
 
-    // 7. Create InputManager
-    _state->inputManager = new InputManager(_window);
-    _state->inputManager->hideAndConfineCursor();
+    // 7. Create InputManager (the game opens on the title screen with a
+    // free cursor; clicking PLAY captures the mouse)
+    _state->inputManager = std::make_unique<InputManager>(_window);
 
     // 6. Load shader library and create render pipeline
     NSString* exePath = [[NSBundle mainBundle] executablePath];
@@ -192,25 +239,56 @@ static EngineState* _engineGetState(Engine* engine) {
     NSString* libPath = [dirPath stringByAppendingPathComponent:@"pipeline.metallib"];
     NSURL* libURL = [NSURL fileURLWithPath:libPath];
     NSError* libError = nil;
-    id<MTLLibrary> library = [_device newLibraryWithURL:libURL
-                                                    error:&libError];
+    id<MTLLibrary> library = [_device newLibraryWithURL:libURL error:&libError];
     if (libError) {
-        NSString* msg = [NSString stringWithFormat:@"Failed to load shader library: %@",
-                         libError.localizedDescription];
+        NSString* msg = [NSString
+            stringWithFormat:@"Failed to load shader library: %@", libError.localizedDescription];
         RY_LOG_FATAL([msg UTF8String]);
     }
 
     _renderPipeline = std::make_unique<RenderPipeline>(
-        _device,
-        library,
-        static_cast<uint32_t>(_view.bounds.size.width),
-        static_cast<uint32_t>(_view.bounds.size.height)
-    );
+        _device, library, static_cast<uint32_t>(_view.bounds.size.width),
+        static_cast<uint32_t>(_view.bounds.size.height));
+
+    // Playtest/diagnostic override: RYCRAFT_BLOOM=<0..1> scales or disables bloom
+    if (const char* bloomEnv = std::getenv("RYCRAFT_BLOOM")) {
+        _renderPipeline->setBloomIntensity(static_cast<float>(std::atof(bloomEnv)));
+    }
+
+    // Playtest override: start on a specific screen (title|playing|paused|settings)
+    if (const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN")) {
+        std::string name = screenEnv;
+        if (name == "playing") {
+            _state->flow.screen = GameScreen::PLAYING;
+            _state->inputManager->captureMouse();
+        } else if (name == "paused") {
+            _state->flow.screen = GameScreen::PAUSED;
+        } else if (name == "settings") {
+            _state->flow.screen = GameScreen::SETTINGS;
+        }
+    }
+
+    // 8. Audio: non-fatal on failure — the game is fully playable silent
+    _state->audio = std::make_unique<AudioEngine>();
+    if (_state->audio->initialize()) {
+        _state->sfxBlockBreak = SoundEffect::generateBlockBreak();
+        _state->sfxBlockPlace = SoundEffect::generateBlockPlace();
+        _state->sfxFootstep = SoundEffect::generateFootstep();
+        _state->sfxWind = SoundEffect::generateAmbientWind();
+        _state->sfxAnimal[0] = SoundEffect::generateSheepBaa();
+        _state->sfxAnimal[1] = SoundEffect::generateCowMoo();
+        _state->sfxAnimal[2] = SoundEffect::generatePigOink();
+        _state->sfxAnimal[3] = SoundEffect::generateChickenCluck();
+        [self syncAudioVolume];
+    } else {
+        RY_LOG_ERROR("Audio engine failed to initialize — continuing without sound");
+        _state->audio.reset();
+    }
 
     RY_LOG_INFO(std::string("Engine initialized — window: ") +
-        std::to_string(static_cast<int>(_view.bounds.size.width)) + "x" +
-        std::to_string(static_cast<int>(_view.bounds.size.height)) +
-        ", device: " + std::string([[_device name] UTF8String]));
+                std::to_string(static_cast<int>(_view.bounds.size.width)) + "x" +
+                std::to_string(static_cast<int>(_view.bounds.size.height)) +
+                ", device: " + std::string([[_device name] UTF8String]));
 
     return YES;
 }
@@ -221,20 +299,22 @@ static EngineState* _engineGetState(Engine* engine) {
 
 - (void)terminate {
     if (_app) {
-        [_app terminate: nil];
+        [_app terminate:nil];
     }
 }
 
 // ---- MTKViewDelegate: game loop with fixed timestep ----
 
 - (void)drawInMTKView:(MTKView*)view {
-    if (!_device || !_queue) return;
+    if (!_device || !_queue)
+        return;
 
     EngineState* state = _state.get();
 
     // 1. Calculate elapsed time
     double currentTime = CACurrentMediaTime();
-    double frameTime = (state->lastTime > 0) ? (currentTime - state->lastTime) : EngineState::TICK_DT;
+    double frameTime =
+        (state->lastTime > 0) ? (currentTime - state->lastTime) : EngineState::TICK_DT;
     state->lastTime = currentTime;
 
     // Clamp frame time to prevent spiral of death after long pause
@@ -247,13 +327,21 @@ static EngineState* _engineGetState(Engine* engine) {
     // 2. Add to accumulator
     state->accumulator += frameTime;
 
-    // 3. Fixed timestep game tick
-    while (state->accumulator >= EngineState::TICK_DT) {
-        [self gameTick:state];
-        state->accumulator -= EngineState::TICK_DT;
+    // 3. Screen-level input (ESC, menu clicks, F3) — runs every frame so
+    // menus stay responsive while the simulation is frozen
+    [self handleGlobalInput];
+
+    // 4. Fixed timestep game tick — menus freeze the world
+    if (state->flow.screen == GameScreen::PLAYING) {
+        while (state->accumulator >= EngineState::TICK_DT) {
+            [self gameTick:state];
+            state->accumulator -= EngineState::TICK_DT;
+        }
+    } else {
+        state->accumulator = 0;
     }
 
-    // 4. Render
+    // 5. Render
     [self render];
 
     // 5. Increment frame count
@@ -269,48 +357,263 @@ static EngineState* _engineGetState(Engine* engine) {
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)newSize {
     if (_renderPipeline && newSize.width > 0 && newSize.height > 0) {
-        _renderPipeline->resize(
-            static_cast<uint32_t>(newSize.width),
-            static_cast<uint32_t>(newSize.height)
-        );
+        _renderPipeline->resize(static_cast<uint32_t>(newSize.width),
+                                static_cast<uint32_t>(newSize.height));
     }
     (void)view;
+}
+
+// ---- Audio ----
+
+// Master volume follows the settings slider while playing and mutes in
+// menus (paused world = paused soundscape). The ambient wind bed starts on
+// the first transition into gameplay.
+- (void)syncAudioVolume {
+    EngineState* state = _state.get();
+    if (!state->audio)
+        return;
+
+    const bool playing = state->flow.screen == GameScreen::PLAYING;
+    float volume = static_cast<float>(state->settings.volumeLevel) / 10.0f;
+    state->audio->setMasterVolume(playing ? volume : 0.0f);
+
+    if (playing && state->windVoice < 0 && !state->sfxWind.empty()) {
+        state->windVoice = state->audio->playSound(state->sfxWind, SoundEffect::SAMPLE_RATE, 0.18f,
+                                                   /*looping=*/true);
+    }
+}
+
+- (void)playSfx:(const std::vector<float>&)buffer gain:(float)gain {
+    EngineState* state = _state.get();
+    if (!state->audio || state->flow.screen != GameScreen::PLAYING)
+        return;
+    state->audio->playSound(buffer, SoundEffect::SAMPLE_RATE, gain);
+}
+
+// ---- Screen-level input: ESC, menu interaction, debug HUD toggle ----
+
+- (void)applyFlowEffects:(GameFlowEffects)effects {
+    EngineState* state = _state.get();
+    if (effects.captureCursor && state->inputManager) {
+        state->inputManager->captureMouse();
+    }
+    if (effects.releaseCursor && state->inputManager) {
+        state->inputManager->releaseMouse();
+    }
+    if (effects.resetTiming) {
+        state->accumulator = 0;
+        if (state->inputManager) {
+            // Drop buffered look deltas AND pending tick presses — the click
+            // that pressed RESUME must not break a block on the next tick
+            state->inputManager->state().clearMouseDelta();
+            state->inputManager->state().clearTickPresses();
+        }
+    }
+    if (effects.requestQuit) {
+        [self requestQuit];
+    }
+    [self syncAudioVolume];
+}
+
+// Settings steppers mutate live engine state; the screen doesn't change.
+- (void)applySettingAction:(MenuAction)action {
+    EngineState* state = _state.get();
+    SettingsValues& settings = state->settings;
+
+    switch (action) {
+        case MenuAction::VIEW_DISTANCE_DOWN:
+        case MenuAction::VIEW_DISTANCE_UP: {
+            int step = (action == MenuAction::VIEW_DISTANCE_UP) ? 2 : -2;
+            settings.viewDistance = std::clamp(settings.viewDistance + step, 4, 32);
+            if (state->world) {
+                state->world->setViewDistance(settings.viewDistance);
+            }
+            break;
+        }
+        case MenuAction::FOG_DOWN:
+        case MenuAction::FOG_UP: {
+            int step = (action == MenuAction::FOG_UP) ? 1 : -1;
+            settings.fogLevel = std::clamp(settings.fogLevel + step, 0, 10);
+            if (_renderPipeline) {
+                _renderPipeline->setFogDensity(static_cast<float>(settings.fogLevel) * 0.0001f);
+            }
+            break;
+        }
+        case MenuAction::SENSITIVITY_DOWN:
+        case MenuAction::SENSITIVITY_UP: {
+            int step = (action == MenuAction::SENSITIVITY_UP) ? 1 : -1;
+            settings.sensitivityLevel = std::clamp(settings.sensitivityLevel + step, 1, 10);
+            state->camera.setMouseSensitivity(static_cast<float>(settings.sensitivityLevel) *
+                                              0.0005f);
+            break;
+        }
+        case MenuAction::VOLUME_DOWN:
+        case MenuAction::VOLUME_UP: {
+            int step = (action == MenuAction::VOLUME_UP) ? 1 : -1;
+            settings.volumeLevel = std::clamp(settings.volumeLevel + step, 0, 10);
+            [self syncAudioVolume];
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+- (void)handleGlobalInput {
+    EngineState* state = _state.get();
+    if (!state->inputManager)
+        return;
+    InputState& input = state->inputManager->state();
+
+    if (input.isJustPressed(Key::Escape)) {
+        [self applyFlowEffects:state->flow.onEscape()];
+    }
+    if (input.isJustPressed(Key::F3)) {
+        state->showDebugHud = !state->showDebugHud;
+    }
+
+    if (state->flow.inMenu()) {
+        // Rebuild the layout each frame (settings values can change) and
+        // hit-test in window points — the same normalized space it's drawn in
+        float boundsW = static_cast<float>(_view.bounds.size.width);
+        float boundsH = static_cast<float>(_view.bounds.size.height);
+        state->menuLayout = buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings);
+
+        Vec2 mouse = input.mousePosition;
+        state->hoveredButton = menuHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
+
+        if (input.isJustPressed(Key::MouseLeft) && state->hoveredButton >= 0) {
+            MenuAction action =
+                state->menuLayout.buttons[static_cast<size_t>(state->hoveredButton)].action;
+            [self applySettingAction:action];
+            [self applyFlowEffects:state->flow.onMenuAction(action)];
+        }
+    } else {
+        state->hoveredButton = -1;
+
+        // Hotbar: scroll wheel cycles slots (frame-level, gameplay only)
+        _scrollAccumulator += input.scrollDelta;
+        while (_scrollAccumulator >= 10.0f) {
+            state->hotbar.selectNext();
+            _scrollAccumulator -= 10.0f;
+        }
+        while (_scrollAccumulator <= -10.0f) {
+            state->hotbar.selectPrev();
+            _scrollAccumulator += 10.0f;
+        }
+    }
+}
+
+// ---- Clean quit: save the world, then terminate through AppKit ----
+
+- (void)saveWorldState {
+    if (_savedWorld)
+        return;
+    _savedWorld = true;
+
+    EngineState* state = _state.get();
+    if (state->saveManager && state->world) {
+        state->saveManager->saveMetadata(state->world->getSeed(), state->player.position,
+                                         state->worldTime);
+        state->saveManager->flush();
+        RY_LOG_INFO("World state saved");
+    }
+}
+
+- (void)requestQuit {
+    if (_state->inputManager) {
+        _state->inputManager->releaseMouse();
+    }
+    [NSApp terminate:self];
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+    (void)sender;
+    [self saveWorldState];
+    return NSTerminateNow;
+}
+
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
+    (void)sender;
+    // The red close button routes through applicationShouldTerminate: above,
+    // so the save-on-quit path has no duplicate
+    return YES;
+}
+
+- (void)applicationWillTerminate:(NSNotification*)notification {
+    (void)notification;
+    // Belt and braces: the mouse association is global system state
+    CGAssociateMouseAndMouseCursorPosition(true);
+    [self saveWorldState];
+}
+
+- (void)windowDidResignKey:(NSNotification*)notification {
+    (void)notification;
+    // Cmd-Tab (or any focus loss) must never leave the pointer locked
+    [self applyFlowEffects:_state->flow.onFocusLost()];
 }
 
 // ---- Game Tick (fixed timestep at 20Hz) ----
 
 - (void)gameTick:(EngineState*)state {
-    if (!state->inputManager || !state->world) return;
+    if (!state->inputManager || !state->world)
+        return;
 
     InputState& input = state->inputManager->state();
+
+    // Playtest hook: RYCRAFT_AUTOPILOT=walk holds W down so headless runs
+    // can verify the full input→tick→physics path end to end
+    static const char* autopilot = std::getenv("RYCRAFT_AUTOPILOT");
+    if (autopilot && std::string(autopilot) == "walk") {
+        input.keysDown[Key::W] = true;
+    }
 
     // 1. Advance world time (1 tick per game tick)
     state->worldTime++;
 
+    // 1b. Unstick a stale spawn: a resumed save can place the player inside
+    // terrain when world generation has changed shape since the save was
+    // written — collision then zeroes every move. Once the spawn chunk
+    // exists, lift the player to the surface if they are embedded.
+    if (!state->spawnValidated) {
+        int px = static_cast<int>(std::floor(state->player.position.x));
+        int pz = static_cast<int>(std::floor(state->player.position.z));
+        auto chunk = state->world->getChunk(Chunk::worldToChunk(px), Chunk::worldToChunk(pz));
+        if (chunk && chunk->generated) {
+            int feetY = static_cast<int>(std::floor(state->player.position.y));
+            bool embedded = isSolid(state->world->getBlock(px, feetY, pz)) ||
+                            isSolid(state->world->getBlock(px, feetY + 1, pz));
+            if (embedded) {
+                for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
+                    if (isSolid(state->world->getBlock(px, y, pz))) {
+                        state->player.position.y = static_cast<float>(y + 1);
+                        state->player.velocity = Vec3{0.f, 0.f, 0.f};
+                        RY_LOG_INFO("Spawn was inside terrain — moved player to the surface");
+                        break;
+                    }
+                }
+            }
+            state->spawnValidated = true;
+        }
+    }
+
     // 2. Hotbar input: keys 1-9 select slots
     for (int i = 0; i < Hotbar::SLOTS; ++i) {
         Key key = static_cast<Key>(static_cast<int>(Key::One) + i);
-        if (input.isJustPressed(key)) {
+        if (input.isPressedForTick(key)) {
             state->hotbar.selectSlot(i);
             break;
         }
     }
 
-    // 3. Hotbar input: scroll wheel cycles slots
-    _scrollAccumulator += input.mouseDelta.y;
-    while (_scrollAccumulator >= 30.0f) {
-        state->hotbar.selectNext();
-        _scrollAccumulator -= 30.0f;
-    }
-    while (_scrollAccumulator <= -30.0f) {
-        state->hotbar.selectPrev();
-        _scrollAccumulator += 30.0f;
-    }
-
-    // 4. Update camera from player state
-    state->camera.setPosition(state->player.position);
+    // 3. Update camera from player state (at EYE height, not the feet), then
+    // consume the look delta so a second tick in the same frame doesn't
+    // re-apply it
+    Vec3 eyePosition = state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f};
+    state->camera.setPosition(eyePosition);
     InputBindings bindings;
-    state->camera.update(state->deltaTime, input, bindings, state->player.position);
+    state->camera.update(state->deltaTime, input, bindings, eyePosition);
+    input.clearMouseDelta();
 
     // 5. Sync player yaw from camera so WASD uses the correct direction
     state->player.yaw = state->camera.yaw();
@@ -319,22 +622,106 @@ static EngineState* _engineGetState(Engine* engine) {
     bool sprinting = input.isDown(Key::LeftControl);
     state->player.tick(*state->world, input, sprinting);
 
+    // 6b. Footsteps: one thud roughly every two blocks walked on the ground
+    if (state->audio) {
+        Vec3 moved = state->player.position - state->lastFootstepPos;
+        moved.y = 0.f;
+        state->lastFootstepPos = state->player.position;
+        if (state->player.onGround) {
+            state->footstepDistance += moved.length();
+            if (state->footstepDistance >= 2.2f) {
+                state->footstepDistance = 0.f;
+                [self playSfx:state->sfxFootstep gain:0.5f];
+            }
+        } else {
+            state->footstepDistance = 0.f;
+        }
+    }
+
     // 7. Update loaded chunks around player
-    state->world->updatePlayerPosition(
-        Chunk::worldToChunk(state->player.position.x),
-        Chunk::worldToChunk(state->player.position.z));
+    // updatePlayerPosition takes WORLD coordinates (it converts to chunk
+    // coords itself) — passing pre-converted chunk coords made streaming
+    // track chunk/16, so the world unloaded under the player ~200 blocks out
+    state->world->updatePlayerPosition(static_cast<int>(std::floor(state->player.position.x)),
+                                       static_cast<int>(std::floor(state->player.position.z)));
+
+    // 7b. Animals: initial population once the spawn area streamed in, then
+    // per-tick AI steering + physics for every living entity
+    if (state->spawner) {
+        if (!state->populationSpawned && state->world->getPendingChunkCount() == 0) {
+            // Populate only the chunks near spawn, with a hard cap — biome
+            // densities over the full view distance produce thousands of
+            // animals, which neither the AI tick nor the player needs.
+            constexpr int SPAWN_CHUNK_RADIUS = 3;
+            constexpr size_t MAX_ANIMALS = 64;
+            int playerChunkX = Chunk::worldToChunk(static_cast<int>(state->player.position.x));
+            int playerChunkZ = Chunk::worldToChunk(static_cast<int>(state->player.position.z));
+            for (int dz = -SPAWN_CHUNK_RADIUS; dz <= SPAWN_CHUNK_RADIUS; ++dz) {
+                for (int dx = -SPAWN_CHUNK_RADIUS; dx <= SPAWN_CHUNK_RADIUS; ++dx) {
+                    if (state->spawner->getEntities().size() >= MAX_ANIMALS)
+                        break;
+                    state->spawner->spawnForChunk(playerChunkX + dx, playerChunkZ + dz);
+                }
+            }
+            state->populationSpawned = true;
+            RY_LOG_INFO(std::string("Spawned ") +
+                        std::to_string(state->spawner->getEntities().size()) + " animals");
+        }
+
+        auto& entities = state->spawner->getEntities();
+        auto& spatialHash = state->spawner->getSpatialHash();
+        // Index-based over a size snapshot with a shared_ptr copy: breeding
+        // inside StateMachine::update can push_back into this very vector,
+        // which would invalidate range-for iterators mid-loop.
+        const size_t entityCount = entities.size();
+        for (size_t i = 0; i < entityCount; ++i) {
+            std::shared_ptr<Entity> entity = entities[i];
+            if (!entity || !entity->alive)
+                continue;
+
+            // Simulation distance: distant animals stand still (cheap and
+            // invisible — they are beyond the fog anyway)
+            Vec3 offset = entity->position - state->player.position;
+            if (offset.length() > 96.f)
+                continue;
+
+            StateMachine& brain = state->entityBrains[entity->id];
+            Vec3 steering = brain.update(*entity, *state->world, state->player.position,
+                                         /*playerMovingToward=*/false,
+                                         /*playerHoldingFood=*/false, *state->spawner);
+            entity->velocity.x += steering.x;
+            entity->velocity.z += steering.z;
+            entity->tick(*state->world);
+
+            // Keep the spatial hash in sync for flocking neighbor queries
+            spatialHash.remove(entity->id);
+            spatialHash.insert(entity->id, entity->position);
+        }
+
+        // Occasional ambient animal call from something nearby
+        if (state->animalCallCooldown > 0) {
+            --state->animalCallCooldown;
+        } else if (state->audio && !entities.empty()) {
+            static SeededRng callRng(0xA111CA11u);
+            const auto& candidate =
+                entities[callRng.nextInt(0, static_cast<int>(entities.size()) - 1)];
+            if (candidate && candidate->alive) {
+                Vec3 toPlayer = candidate->position - state->player.position;
+                if (toPlayer.length() < 24.f && callRng.nextFloat() < 0.3f) {
+                    int type = static_cast<int>(candidate->type);
+                    [self playSfx:state->sfxAnimal[type] gain:0.35f];
+                }
+            }
+            state->animalCallCooldown = 120 + callRng.nextInt(0, 120); // 6-12s
+        }
+    }
 
     // 8. Player jump on space
-    if (input.isJustPressed(Key::Space)) {
+    if (input.isPressedForTick(Key::Space)) {
         state->player.jump();
     }
 
-    // 9. ESC to quit (only when cursor is active)
-    if (input.isJustPressed(Key::Escape)) {
-        exit(0);
-    }
-
-    // 10. Update weather particles
+    // 9. Update weather particles
     if (_renderPipeline) {
         _renderPipeline->tickParticles(state->deltaTime, *state->world, state->player.position);
     }
@@ -353,20 +740,24 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // Block breaking (left mouse click)
-    if (input.isJustPressed(Key::MouseLeft)) {
+    if (input.isPressedForTick(Key::MouseLeft)) {
         [self breakBlock:state hit:rayHit];
     }
 
     // Block placing (right mouse click)
-    if (input.isJustPressed(Key::MouseRight)) {
+    if (input.isPressedForTick(Key::MouseRight)) {
         [self placeBlock:state hit:rayHit];
     }
+
+    // Tick-edge input consumed — a second tick in this frame must not re-fire
+    input.clearTickPresses();
 }
 
 // ---- Block Breaking (Task 6.1) ----
 
 - (void)breakBlock:(EngineState*)state hit:(BlockRayHit)hit {
-    if (!hit.has_value()) return;
+    if (!hit.has_value())
+        return;
 
     int hitX = static_cast<int>(std::floor(hit->first.x));
     int hitY = static_cast<int>(std::floor(hit->first.y));
@@ -374,7 +765,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Cannot break bedrock
     BlockType current = state->world->getBlock(hitX, hitY, hitZ);
-    if (current == BlockType::BEDROCK) return;
+    if (current == BlockType::BEDROCK)
+        return;
 
     // Set block to air
     state->world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
@@ -394,12 +786,15 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Clear highlight since block is now air
     state->hasHighlightedBlock = false;
+
+    [self playSfx:state->sfxBlockBreak gain:0.8f];
 }
 
 // ---- Block Placing (Task 6.2) ----
 
 - (void)placeBlock:(EngineState*)state hit:(BlockRayHit)hit {
-    if (!hit.has_value()) return;
+    if (!hit.has_value())
+        return;
 
     // Calculate placement position: hit block + face normal
     int placeX = static_cast<int>(std::floor(hit->first.x)) + static_cast<int>(hit->second.x);
@@ -409,10 +804,11 @@ static EngineState* _engineGetState(Engine* engine) {
     // Validate: placement AABB must not overlap player AABB
     AABB placeBox{
         Vec3{static_cast<float>(placeX), static_cast<float>(placeY), static_cast<float>(placeZ)},
-        Vec3{static_cast<float>(placeX + 1), static_cast<float>(placeY + 1), static_cast<float>(placeZ + 1)}
-    };
+        Vec3{static_cast<float>(placeX + 1), static_cast<float>(placeY + 1),
+             static_cast<float>(placeZ + 1)}};
 
-    if (placeBox.intersects(state->player.getAABB())) return;
+    if (placeBox.intersects(state->player.getAABB()))
+        return;
 
     // Place block
     BlockType selectedType = state->hotbar.getSelectedBlockType();
@@ -424,7 +820,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
     auto markChunkDirty = [&](int cx, int cz) {
         auto c = state->world->getChunk(cx, cz);
-        if (c) c->markDirty();
+        if (c)
+            c->markDirty();
     };
 
     markChunkDirty(chunkX, chunkZ);
@@ -432,16 +829,23 @@ static EngineState* _engineGetState(Engine* engine) {
     // Check if block is on chunk boundary and mark neighbor
     int localX = placeX - chunkX * CHUNK_WIDTH;
     int localZ = placeZ - chunkZ * CHUNK_DEPTH;
-    if (localX == 0) markChunkDirty(chunkX - 1, chunkZ);
-    if (localX == CHUNK_WIDTH - 1) markChunkDirty(chunkX + 1, chunkZ);
-    if (localZ == 0) markChunkDirty(chunkX, chunkZ - 1);
-    if (localZ == CHUNK_DEPTH - 1) markChunkDirty(chunkX, chunkZ + 1);
+    if (localX == 0)
+        markChunkDirty(chunkX - 1, chunkZ);
+    if (localX == CHUNK_WIDTH - 1)
+        markChunkDirty(chunkX + 1, chunkZ);
+    if (localZ == 0)
+        markChunkDirty(chunkX, chunkZ - 1);
+    if (localZ == CHUNK_DEPTH - 1)
+        markChunkDirty(chunkX, chunkZ + 1);
 
     // Save affected chunk
     if (state->saveManager) {
         auto chunk = state->world->getChunk(chunkX, chunkZ);
-        if (chunk) state->saveManager->saveChunk(*chunk);
+        if (chunk)
+            state->saveManager->saveChunk(*chunk);
     }
+
+    [self playSfx:state->sfxBlockPlace gain:0.8f];
 }
 
 // ---- Block Highlight Update (Task 6.9) ----
@@ -456,42 +860,70 @@ static EngineState* _engineGetState(Engine* engine) {
     CGSize currentSize = _view.drawableSize;
     if (currentSize.width > 0 && currentSize.height > 0) {
         state->drawableSize = currentSize;
-        float aspect = static_cast<float>(currentSize.width) /
-                        static_cast<float>(currentSize.height);
-        state->projectionMatrix = Mat4::perspective(
-            70.0f * (static_cast<float>(M_PI) / 180.0f),  // 70° FOV in radians
-            aspect,
-            0.1f,
-            1000.0f
-        );
+        float aspect =
+            static_cast<float>(currentSize.width) / static_cast<float>(currentSize.height);
+        state->projectionMatrix =
+            Mat4::perspective(70.0f * (static_cast<float>(M_PI) / 180.0f), // 70° FOV in radians
+                              aspect, 0.1f, 1000.0f);
     }
 
     id<CAMetalDrawable> drawable = _view.currentDrawable;
-    if (!drawable) return;
+    if (!drawable)
+        return;
 
-    if (!_renderPipeline || !state->world) return;
+    if (!_renderPipeline || !state->world)
+        return;
 
     // Log render diagnostics every 60 frames
     if (state->frameCount % 60 == 1) {
         auto chunks = state->world->getLoadedChunks();
+        char pos[64];
+        snprintf(pos, sizeof(pos), " player (%.1f, %.1f, %.1f)", state->player.position.x,
+                 state->player.position.y, state->player.position.z);
         RY_LOG_INFO(std::string("Render: ") + std::to_string(chunks.size()) +
-            " loaded chunks, frame " + std::to_string(state->frameCount));
+                    " loaded chunks, frame " + std::to_string(state->frameCount) + pos);
+    }
+
+    // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
+    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered.
+    static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
+    if (capturePath && *capturePath) {
+        static const uint64_t captureFrame = [] {
+            const char* frameEnv = std::getenv("RYCRAFT_CAPTURE_FRAME");
+            return frameEnv ? static_cast<uint64_t>(std::atoll(frameEnv)) : uint64_t{240};
+        }();
+        if (state->frameCount == captureFrame) {
+            _renderPipeline->requestFrameCapture(capturePath);
+        }
     }
 
     // Camera view matrix
     Mat4 viewMatrix = state->camera.viewMatrix();
 
+    // Real performance stats for the F3 HUD (EMA-smoothed frame time; chunk
+    // count sampled every 30 frames — getLoadedChunks copies under a lock)
+    state->smoothedFrameMs =
+        state->smoothedFrameMs * 0.95f + static_cast<float>(state->deltaTime) * 1000.0f * 0.05f;
+    if (state->frameCount % 30 == 0) {
+        state->cachedChunkCount = static_cast<uint32_t>(state->world->getLoadedChunks().size());
+    }
+
+    UIFrameState uiFrame;
+    uiFrame.screen = state->flow.screen;
+    uiFrame.hoveredButton = state->hoveredButton;
+    uiFrame.showDebugHud = state->showDebugHud;
+    uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
+    uiFrame.stats.fps = state->smoothedFrameMs > 0.f ? 1000.0f / state->smoothedFrameMs : 0.f;
+    uiFrame.stats.chunkCount = state->cachedChunkCount;
+    uiFrame.stats.entityCount =
+        state->spawner ? static_cast<uint32_t>(state->spawner->getEntities().size()) : 0;
+    uiFrame.menu = state->menuLayout;
+
     _renderPipeline->render(
-        _queue,
-        drawable,
-        viewMatrix,
-        state->projectionMatrix,
-        *state->world,
-        state->camera,
+        _queue, drawable, viewMatrix, state->projectionMatrix, *state->world, state->camera,
         state->worldTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
-        state->hotbar
-    );
+        state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
 }
 
 - (double)deltaTime {
@@ -516,6 +948,7 @@ Mat4 engineProjectionMatrix(Engine* engine) {
 CGSize engineDrawableSize(Engine* engine) {
     extern EngineState* _engineGetState(Engine*);
     EngineState* state = _engineGetState(engine);
-    if (!state) return {0, 0};
+    if (!state)
+        return {0, 0};
     return state->drawableSize;
 }

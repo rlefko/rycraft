@@ -65,30 +65,54 @@ double SimplexNoise::noise3D(double x, double y, double z) const {
     if (x0 >= y0) {
         if (y0 >= z0) {
             // x >= y >= z
-            i1 = 1; j1 = 0; k1 = 0;
-            i2 = 1; j2 = 1; k2 = 0;
+            i1 = 1;
+            j1 = 0;
+            k1 = 0;
+            i2 = 1;
+            j2 = 1;
+            k2 = 0;
         } else if (x0 >= z0) {
             // x >= z >= y
-            i1 = 1; j1 = 0; k1 = 0;
-            i2 = 1; j2 = 0; k2 = 1;
+            i1 = 1;
+            j1 = 0;
+            k1 = 0;
+            i2 = 1;
+            j2 = 0;
+            k2 = 1;
         } else {
             // z >= x >= y
-            i1 = 0; j1 = 0; k1 = 1;
-            i2 = 1; j2 = 0; k2 = 1;
+            i1 = 0;
+            j1 = 0;
+            k1 = 1;
+            i2 = 1;
+            j2 = 0;
+            k2 = 1;
         }
     } else {
         if (y0 < z0) {
             // z >= y >= x
-            i1 = 0; j1 = 0; k1 = 1;
-            i2 = 0; j2 = 1; k2 = 1;
+            i1 = 0;
+            j1 = 0;
+            k1 = 1;
+            i2 = 0;
+            j2 = 1;
+            k2 = 1;
         } else if (x0 < z0) {
             // y >= z >= x
-            i1 = 0; j1 = 1; k1 = 0;
-            i2 = 0; j2 = 1; k2 = 1;
+            i1 = 0;
+            j1 = 1;
+            k1 = 0;
+            i2 = 0;
+            j2 = 1;
+            k2 = 1;
         } else {
             // y >= x >= z
-            i1 = 0; j1 = 1; k1 = 0;
-            i2 = 1; j2 = 1; k2 = 0;
+            i1 = 0;
+            j1 = 1;
+            k1 = 0;
+            i2 = 1;
+            j2 = 1;
+            k2 = 0;
         }
     }
 
@@ -157,7 +181,8 @@ double SimplexNoise::operator()(double x, double y) const {
     return noise2D(x, y);
 }
 
-double SimplexNoise::octave2D(double x, double y, int octaves, double persistence, double lacunarity) const {
+double SimplexNoise::octave2D(double x, double y, int octaves, double persistence,
+                              double lacunarity) const {
     if (octaves <= 0) return 0.0;
 
     double total = 0.0;
@@ -176,7 +201,8 @@ double SimplexNoise::octave2D(double x, double y, int octaves, double persistenc
     return total / maxAmplitude;
 }
 
-double SimplexNoise::octave3D(double x, double y, double z, int octaves, double persistence, double lacunarity) const {
+double SimplexNoise::octave3D(double x, double y, double z, int octaves, double persistence,
+                              double lacunarity) const {
     if (octaves <= 0) return 0.0;
 
     double total = 0.0;
@@ -194,7 +220,8 @@ double SimplexNoise::octave3D(double x, double y, double z, int octaves, double 
     return total / maxAmplitude;
 }
 
-double SimplexNoise::ridged2D(double x, double y, int octaves, double persistence, double lacunarity) const {
+double SimplexNoise::ridged2D(double x, double y, int octaves, double persistence,
+                              double lacunarity) const {
     if (octaves <= 0) return 0.0;
 
     double total = 0.0;
@@ -221,7 +248,8 @@ double SimplexNoise::ridged2D(double x, double y, int octaves, double persistenc
     return total / maxAmplitude;
 }
 
-double SimplexNoise::ridged3D(double x, double y, double z, int octaves, double persistence, double lacunarity) const {
+double SimplexNoise::ridged3D(double x, double y, double z, int octaves, double persistence,
+                              double lacunarity) const {
     if (octaves <= 0) return 0.0;
 
     double total = 0.0;

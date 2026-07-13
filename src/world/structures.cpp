@@ -1,34 +1,29 @@
 #include "world/structures.hpp"
 
+#include "common/random.hpp"
+
 #include <cmath>
 
-StructureGenerator::StructureGenerator(uint32_t seed)
-    : seed_(seed)
-{
-}
+StructureGenerator::StructureGenerator(uint32_t seed) : seed_(seed) {}
 
 uint32_t StructureGenerator::hashCoords(int x, int z, uint32_t seed) {
-    // FNV-1a inspired hash
-    uint64_t hash = 14695981039346656037ULL ^ seed;
-    hash ^= static_cast<uint64_t>(x) * 374761393ULL;
-    hash ^= static_cast<uint64_t>(z) * 668265263ULL;
-    hash *= 1099511628211ULL;
-    return static_cast<uint32_t>(hash);
+    return static_cast<uint32_t>(::hashCoords(x, z, seed));
 }
 
-bool StructureGenerator::shouldPlaceStructure(int chunkX, int chunkZ, const std::string& type) const {
+bool StructureGenerator::shouldPlaceStructure(int chunkX, int chunkZ,
+                                              const std::string& type) const {
     // Grid-based placement using hash
     uint32_t hash = hashCoords(chunkX, chunkZ, seed_);
 
     // Different structure types have different spacing
     int spacing;
     if (type == "house") {
-        spacing = 16;  // One house every ~16 chunks
+        spacing = 16; // One house every ~16 chunks
     } else {
-        spacing = 32;  // Default spacing
+        spacing = 32; // Default spacing
     }
 
-    return (hash % spacing) < 2;  // 2 in spacing chance
+    return (hash % spacing) < 2; // 2 in spacing chance
 }
 
 void StructureGenerator::generateHouse(Chunk& chunk, int localX, int localY, int localZ) const {
@@ -52,8 +47,7 @@ void StructureGenerator::generateHouse(Chunk& chunk, int localX, int localY, int
                 // Build walls, floor, and roof
                 bool isFloor = (dy == 0);
                 bool isRoof = (dy == houseHeight - 1);
-                bool isWall = (dx == 0 || dx == houseWidth - 1 ||
-                               dz == 0 || dz == houseDepth - 1);
+                bool isWall = (dx == 0 || dx == houseWidth - 1 || dz == 0 || dz == houseDepth - 1);
 
                 // Place blocks for walls, floor, and roof
                 if (isFloor || isRoof || isWall) {
@@ -70,15 +64,16 @@ void StructureGenerator::generateHouse(Chunk& chunk, int localX, int localY, int
 
 bool biomeAllowsStructure(Biome biome) {
     switch (biome) {
-        case Biome::Plains:
-        case Biome::Forest:
+        case Biome::PLAINS:
+        case Biome::FOREST:
             return true;
         default:
             return false;
     }
 }
 
-void StructureGenerator::generate(Chunk& chunk, const std::array<Biome, CHUNK_WIDTH * CHUNK_DEPTH>& biomes) const {
+void StructureGenerator::generate(
+    Chunk& chunk, const std::array<Biome, CHUNK_WIDTH * CHUNK_DEPTH>& biomes) const {
     // Check if any structure should spawn in this chunk
     if (!shouldPlaceStructure(chunk.chunkX, chunk.chunkZ, "house")) {
         return;
@@ -118,7 +113,10 @@ void StructureGenerator::generate(Chunk& chunk, const std::array<Biome, CHUNK_WI
             bool clear = true;
             for (int dy = 1; dy <= 4; ++dy) {
                 int checkY = surfaceY + dy;
-                if (checkY >= CHUNK_HEIGHT) { clear = false; break; }
+                if (checkY >= CHUNK_HEIGHT) {
+                    clear = false;
+                    break;
+                }
                 if (chunk.getBlock(testX, checkY, testZ) != BlockType::AIR) {
                     clear = false;
                     break;
@@ -129,7 +127,7 @@ void StructureGenerator::generate(Chunk& chunk, const std::array<Biome, CHUNK_WI
 
             // Place the house
             generateHouse(chunk, testX, surfaceY + 1, testZ);
-            return;  // Only one structure per chunk
+            return; // Only one structure per chunk
         }
     }
 }

@@ -4,11 +4,13 @@
 #include <cmath>
 
 // ---------------------------------------------------------------------------
-// isSolid — Block type check (excludes AIR, WATER, GLASS)
+// isSolid — collision check, delegating to the shared block property table
+// (block_properties.hpp). Notably glass IS solid: it used to be excluded
+// here while the mesher rendered it as a full block, so entities fell
+// through what looked like floor.
 // ---------------------------------------------------------------------------
 bool PhysicsEngine::isSolid(World& world, int x, int y, int z) {
-    BlockType type = world.getBlock(x, y, z);
-    return type != BlockType::AIR && type != BlockType::WATER && type != BlockType::GLASS;
+    return ::isSolid(world.getBlock(x, y, z));
 }
 
 // ---------------------------------------------------------------------------
@@ -61,10 +63,8 @@ std::vector<AABB> PhysicsEngine::collectObstacles(const AABB& expandedAABB, Worl
                 if (PhysicsEngine::isSolid(world, x, y, z)) {
                     obstacles.emplace_back(
                         Vec3{static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)},
-                        Vec3{static_cast<float>(x) + 1.f,
-                             static_cast<float>(y) + 1.f,
-                             static_cast<float>(z) + 1.f}
-                    );
+                        Vec3{static_cast<float>(x) + 1.f, static_cast<float>(y) + 1.f,
+                             static_cast<float>(z) + 1.f});
                 }
             }
         }
@@ -74,20 +74,28 @@ std::vector<AABB> PhysicsEngine::collectObstacles(const AABB& expandedAABB, Worl
 }
 
 // ---------------------------------------------------------------------------
-// resolveAxis — Resolve collision along a single axis
+// resolveAxis — Resolve collision along a single axis.
+//
+// Clamps the axis movement to the nearest obstacle face AHEAD of the entity
+// that the entity actually overlaps on the two other axes. The previous
+// version skipped that overlap test and treated every nearby solid block —
+// including the ground underfoot — as a wall, so horizontal movement zeroed
+// out the moment the player landed ("the stuck player" bug).
 // ---------------------------------------------------------------------------
-static Vec3 resolveAxis(const Vec3& position, const Vec3& entitySize,
-                        const Vec3& remainingMovement, int axis,
-                        World& world, bool& wasPushed) {
+static Vec3 resolveAxis(const Vec3& position, const Vec3& entitySize, const Vec3& remainingMovement,
+                        int axis, World& world, bool& wasPushed) {
     Vec3 newRemaining = remainingMovement;
 
     auto getAxis = [](const Vec3& v, int a) -> float {
         return (a == 0) ? v.x : (a == 1) ? v.y : v.z;
     };
     auto setAxis = [](Vec3& v, int a, float val) {
-        if (a == 0) v.x = val;
-        else if (a == 1) v.y = val;
-        else v.z = val;
+        if (a == 0)
+            v.x = val;
+        else if (a == 1)
+            v.y = val;
+        else
+            v.z = val;
     };
 
     float moveAmount = getAxis(newRemaining, axis);
@@ -97,71 +105,54 @@ static Vec3 resolveAxis(const Vec3& position, const Vec3& entitySize,
         return newRemaining;
     }
 
-    // Build entity AABB at current position
-    AABB currentAABB{position, position + entitySize};
-
-    // Build swept AABB: covers the range from current position to position+movement
-    // on this axis (sweep volume, not translation)
-    AABB sweptAABB = currentAABB;
+    // Entity AABB at current position, and the volume the move sweeps through
+    AABB entity{position, position + entitySize};
+    AABB swept = entity;
     if (moveAmount > 0.f) {
-        // Extend max in movement direction
-        if (axis == 0) sweptAABB.max.x += moveAmount;
-        else if (axis == 1) sweptAABB.max.y += moveAmount;
-        else sweptAABB.max.z += moveAmount;
-    } else if (moveAmount < 0.f) {
-        // Extend min in movement direction
-        if (axis == 0) sweptAABB.min.x += moveAmount;
-        else if (axis == 1) sweptAABB.min.y += moveAmount;
-        else sweptAABB.min.z += moveAmount;
+        setAxis(swept.max, axis, getAxis(swept.max, axis) + moveAmount);
+    } else {
+        setAxis(swept.min, axis, getAxis(swept.min, axis) + moveAmount);
     }
 
-    // Collect obstacles intersecting the swept AABB
-    std::vector<AABB> obstacles = PhysicsEngine::collectObstacles(sweptAABB, world);
+    std::vector<AABB> obstacles = PhysicsEngine::collectObstacles(swept, world);
 
-    float sign = (moveAmount > 0.f) ? 1.f : -1.f;
+    const float sign = (moveAmount > 0.f) ? 1.f : -1.f;
+    float allowed = std::abs(moveAmount);
+
+    // Keep a hair of separation so surfaces never mathematically touch and
+    // re-register as collisions on the next axis or tick
+    constexpr float SKIN = 1e-4f;
 
     for (const auto& obstacle : obstacles) {
-        float overlap = 0.f;
+        // Only blocks the entity overlaps on the OTHER two axes can block
+        // this axis — the floor underfoot must not stop a horizontal step.
+        bool overlapsOthers = true;
+        for (int other = 0; other < 3 && overlapsOthers; ++other) {
+            if (other == axis) continue;
+            if (getAxis(entity.max, other) <= getAxis(obstacle.min, other) + 1e-6f ||
+                getAxis(entity.min, other) >= getAxis(obstacle.max, other) - 1e-6f) {
+                overlapsOthers = false;
+            }
+        }
+        if (!overlapsOthers) continue;
 
-        if (sign > 0.f) {
-            float entityMax = getAxis(sweptAABB.max, axis);
-            float obstacleMin = getAxis(obstacle.min, axis);
-            overlap = entityMax - obstacleMin;
-        } else {
-            float entityMin = getAxis(sweptAABB.min, axis);
-            float obstacleMax = getAxis(obstacle.max, axis);
-            overlap = obstacleMax - entityMin;
+        // Gap from the entity's leading face to the obstacle's near face
+        float gap = (sign > 0.f) ? getAxis(obstacle.min, axis) - getAxis(entity.max, axis)
+                                 : getAxis(entity.min, axis) - getAxis(obstacle.max, axis);
+        if (gap < -1e-6f) {
+            // Obstacle is behind the leading face (or interpenetrating);
+            // it cannot block this direction of travel
+            continue;
         }
 
-        if (overlap > 0.f) {
+        float limit = std::max(gap - SKIN, 0.f);
+        if (limit < allowed) {
+            allowed = limit;
             wasPushed = true;
-
-            // Reduce remaining movement
-            float reducedMove = moveAmount - overlap * sign;
-            if (reducedMove * sign <= 1e-6f) {
-                // Movement fully blocked
-                setAxis(newRemaining, axis, 0.f);
-                return newRemaining;
-            }
-
-            // Update remaining movement for this axis
-            setAxis(newRemaining, axis, reducedMove);
-            moveAmount = reducedMove;
-
-            // Rebuild swept AABB with reduced movement for next obstacle
-            sweptAABB = currentAABB;
-            if (moveAmount > 0.f) {
-                if (axis == 0) sweptAABB.max.x += moveAmount;
-                else if (axis == 1) sweptAABB.max.y += moveAmount;
-                else sweptAABB.max.z += moveAmount;
-            } else if (moveAmount < 0.f) {
-                if (axis == 0) sweptAABB.min.x += moveAmount;
-                else if (axis == 1) sweptAABB.min.y += moveAmount;
-                else sweptAABB.min.z += moveAmount;
-            }
         }
     }
 
+    setAxis(newRemaining, axis, sign * allowed);
     return newRemaining;
 }
 
@@ -185,8 +176,10 @@ Vec3 PhysicsEngine::sweepCollision(const AABB& entityAABB, const Vec3& movement,
 
     // Resolve second horizontal axis
     remaining = resolveAxis(position, entitySize, remaining, secondAxis, world, wasPushed);
-    if (secondAxis == 0) position.x += remaining.x;
-    else position.z += remaining.z;
+    if (secondAxis == 0)
+        position.x += remaining.x;
+    else
+        position.z += remaining.z;
 
     // Resolve third horizontal axis
     remaining = resolveAxis(position, entitySize, remaining, thirdAxis, world, wasPushed);

@@ -47,10 +47,5 @@ Checks: >-
   -*misc-const-correctness,
   -*misc-confusable-identifiers,
   -*misc-no-recursion,
-FormatLanguage: cpp
 HeaderFilterRegex: '.*\.(hpp|h|hxx|hh)$'
-AnalyzeTemporaryDtors: false
-CheckOptions:
-  - Key: cppcoreguidelines-explicit-virtual-functions.Ignore ConstructorsAndNonVirtualDestructors
-    Value: true
-User: llvm
+

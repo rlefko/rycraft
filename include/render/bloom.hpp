@@ -20,23 +20,18 @@
 // ---------------------------------------------------------------------------
 class Bloom {
 public:
-    Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
-          uint32_t width, uint32_t height);
+    Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width, uint32_t height);
 
     ~Bloom();
 
     // Execute the bloom post-processing pipeline.
     // sceneTexture: the resolved MSAA scene color
-    // outputTexture: the final display texture
-    void renderBloom(id<MTLCommandBuffer> commandBuffer,
-                     id<MTLTexture> sceneTexture,
+    // outputTexture: the final display texture (BGRA8, e.g. the drawable)
+    void renderBloom(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture,
                      id<MTLTexture> outputTexture);
 
     // Reallocate textures for new resolution.
     void resize(uint32_t width, uint32_t height);
-
-    // Get the intermediate bloom output texture (for chaining effects).
-    id<MTLTexture> bloomOutputTexture() const { return _bloomOutput; }
 
     // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
     // When intensity is 0, renderBloom skips the entire pipeline as early exit.
@@ -58,9 +53,6 @@ private:
     static constexpr int PYRAMID_LEVELS = 4;
     id<MTLTexture> _blurPyramid[PYRAMID_LEVELS][2]; // [level][ping/pong]
 
-    // ---- Composite output ----
-    id<MTLTexture> _bloomOutput;
-
     // ---- Uniform buffers ----
     id<MTLBuffer> _uniformsBuffer;
 
@@ -76,23 +68,17 @@ private:
     // ---- Texture allocation helpers ----
     void allocateExtractTexture();
     void allocateBlurPyramid();
-    void allocateCompositeOutput();
 
     // ---- Render pass helpers ----
-    void renderExtractPass(id<MTLCommandBuffer> commandBuffer,
-                           id<MTLTexture> sceneTexture);
+    void renderExtractPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture);
 
-    void renderBlurPass(id<MTLCommandBuffer> commandBuffer,
-                        id<MTLTexture> source,
-                        id<MTLTexture> destination,
-                        float blurRadius);
+    void renderBlurPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> source,
+                        id<MTLTexture> destination, float blurRadius);
 
-    void renderCompositePass(id<MTLCommandBuffer> commandBuffer,
-                             id<MTLTexture> sceneTexture,
-                             id<MTLTexture> bloomTexture,
-                             id<MTLTexture> outputTexture);
+    void renderCompositePass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture,
+                             id<MTLTexture> bloomTexture, id<MTLTexture> outputTexture);
 
     // Upload bloom uniforms
-    void uploadUniforms(float resolution[2], float texelSize[2],
-                        float threshold, float intensity, float blurRadius);
+    void uploadUniforms(float resolution[2], float texelSize[2], float threshold, float intensity,
+                        float blurRadius);
 };

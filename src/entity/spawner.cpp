@@ -1,6 +1,6 @@
 #include "entity/spawner.hpp"
-#include "entity/entity.hpp"
 #include "entity/ai.hpp"
+#include "entity/entity.hpp"
 #include "entity/physics.hpp"
 
 #include <algorithm>
@@ -9,36 +9,34 @@
 // ---------------------------------------------------------------------------
 // Spawner constructor
 // ---------------------------------------------------------------------------
-Spawner::Spawner(World& world)
-    : world_(world), rng_(static_cast<uint64_t>(world.getSeed())) {
-}
+Spawner::Spawner(World& world) : world_(world), rng_(static_cast<uint64_t>(world.getSeed())) {}
 
 // ---------------------------------------------------------------------------
 // getSpawnRule — Biome → entity spawn counts
 // ---------------------------------------------------------------------------
 BiomeSpawnRule Spawner::getSpawnRule(Biome biome) {
     switch (biome) {
-    case Biome::Plains:
-        return {8, 4, 2, 0};
-    case Biome::Forest:
-        return {4, 4, 4, 0};
-    case Biome::Desert:
-        return {0, 0, 0, 0};
-    case Biome::Ocean:
-    case Biome::DeepOcean:
-        return {0, 0, 0, 0};
-    case Biome::Taiga:
-        return {6, 2, 0, 0};
-    case Biome::Swamp:
-        return {0, 2, 2, 0};
-    case Biome::ExtremeHills:
-        return {2, 2, 1, 0};
-    case Biome::MushroomIsland:
-        return {4, 0, 0, 0};
-    case Biome::IceSpikes:
-        return {2, 1, 0, 0};
-    default:
-        return {0, 0, 0, 0};
+        case Biome::PLAINS:
+            return {8, 4, 2, 0};
+        case Biome::FOREST:
+            return {4, 4, 4, 0};
+        case Biome::DESERT:
+            return {0, 0, 0, 0};
+        case Biome::OCEAN:
+        case Biome::DEEP_OCEAN:
+            return {0, 0, 0, 0};
+        case Biome::TAIGA:
+            return {6, 2, 0, 0};
+        case Biome::SWAMP:
+            return {0, 2, 2, 0};
+        case Biome::EXTREME_HILLS:
+            return {2, 2, 1, 0};
+        case Biome::MUSHROOM_ISLAND:
+            return {4, 0, 0, 0};
+        case Biome::ICE_SPIKES:
+            return {2, 1, 0, 0};
+        default:
+            return {0, 0, 0, 0};
     }
 }
 
@@ -49,7 +47,7 @@ std::optional<int> Spawner::findSpawnHeight(int x, int z) {
     // Scan from top to bottom for the first solid block
     for (int y = 255; y >= 0; --y) {
         BlockType block = world_.getBlock(x, y, z);
-        if (block != BlockType::AIR && block != BlockType::WATER) {
+        if (isSolid(block)) {
             return y + 1; // Spawn on top of solid block
         }
     }
@@ -79,8 +77,7 @@ bool Spawner::isSpawnValid(int x, int y, int z) {
 // ---------------------------------------------------------------------------
 int Spawner::randomInt(int min, int max) {
     if (min > max) std::swap(min, max);
-    std::uniform_int_distribution<int> dist(min, max);
-    return dist(rng_);
+    return rng_.nextInt(min, max);
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +94,7 @@ std::shared_ptr<Entity> Spawner::spawnEntity(EntityType type, const Vec3& positi
 // spawnBaby — Create a baby entity
 // ---------------------------------------------------------------------------
 std::shared_ptr<Entity> Spawner::spawnBaby(EntityType type, const Vec3& position,
-                                            uint64_t parentId) {
+                                           uint64_t parentId) {
     auto baby = std::make_shared<Entity>(Entity::nextId(), type, position);
     baby->isBaby = true;
     baby->babyTimer = 600; // 600 ticks = 30 seconds
@@ -135,11 +132,8 @@ void Spawner::spawnForChunk(int chunkX, int chunkZ) {
             if (!isSpawnValid(worldX, height.value(), worldZ)) continue;
 
             // Spawn entity
-            Vec3 spawnPos{
-                static_cast<float>(worldX) + 0.5f,
-                static_cast<float>(height.value()),
-                static_cast<float>(worldZ) + 0.5f
-            };
+            Vec3 spawnPos{static_cast<float>(worldX) + 0.5f, static_cast<float>(height.value()),
+                          static_cast<float>(worldZ) + 0.5f};
             spawnEntity(type, spawnPos);
         }
     };
@@ -193,13 +187,11 @@ std::unordered_map<uint64_t, Vec3> Spawner::getEntityPositions() const {
 // ---------------------------------------------------------------------------
 void Spawner::removeEntity(uint64_t entityId) {
     spatialHash_.remove(entityId);
-    entities_.erase(
-        std::remove_if(entities_.begin(), entities_.end(),
-                       [entityId](const std::shared_ptr<Entity>& e) {
-                           return e->id == entityId && !e->alive;
-                       }),
-        entities_.end()
-    );
+    entities_.erase(std::remove_if(entities_.begin(), entities_.end(),
+                                   [entityId](const std::shared_ptr<Entity>& e) {
+                                       return e->id == entityId && !e->alive;
+                                   }),
+                    entities_.end());
 }
 
 // ---------------------------------------------------------------------------

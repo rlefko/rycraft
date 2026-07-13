@@ -7,16 +7,21 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/math.hpp"
 #include "engine/hotbar.hpp"
+#include "render/block_texture_array.hpp"
 #include "render/mega_buffer.hpp"
 #include "render/particles.hpp"
-#include "render/texture_atlas.hpp"
+#include "render/shader_types.hpp"
+#include "render/ui_menu.hpp"
 #include "render/vertex.hpp"
 
 // Forward declarations
+class Entity;
+class EntityRenderer;
 class World;
 class Camera;
 class UIOverlay;
@@ -29,75 +34,32 @@ struct ChunkMeshState {
     bool uploaded = false;
 };
 
-// Sky uniforms for day/night cycle
-struct SkyUniforms {
-    float zenithColor[3];
-    float horizonColor[3];
-    float sunDirection[3];
-    float sunColor[3];
-    float sunIntensity;
-    float padding;
-};
-
-// Cloud uniforms (Phase 8)
-struct CloudUniforms {
-    float cameraPosition[3];
-    float _pad0;
-    float sunDirection[3];
-    float _pad1;
-    float windOffset;
-    float cloudAltitude;
-    float noiseFrequency;
-    float cloudThreshold;
-};
-
-// MetalFX Upscaler stub (Phase 8.4 — placeholder for Phase 9.4 optimization)
-class MetalFXUpscaler {
-public:
-    MetalFXUpscaler(id<MTLDevice> /*device*/, uint32_t /*srcWidth*/, uint32_t /*srcHeight*/,
-                    uint32_t /*dstWidth*/, uint32_t /*dstHeight*/);
-    ~MetalFXUpscaler();
-
-    // Upscale source texture to destination using bilinear sampling.
-    // (Placeholder — full MetalFX temporal upscaling in Phase 9.4)
-    void upscale(id<MTLCommandBuffer> commandBuffer,
-                 id<MTLTexture> source,
-                 id<MTLTexture> destination);
-};
-
 // ---------------------------------------------------------------------------
-// RenderPipeline — Full Metal render pass with MSAA 4x and frustum culling.
+// RenderPipeline — Metal renderer with a single 4x MSAA scene pass.
 //
-// Responsibilities:
-//   • Create and manage render/depth pipeline states
-//   • Allocate MSAA + resolve textures
-//   • Upload uniforms (model/view/projection/lighting) each frame
-//   • Frustum-cull chunks before drawing
-//   • Mesh dirty chunks on-demand and upload to GPU
-//   • Render sky, water, block highlight, and UI overlay
-//   • Post-processing: bloom, fog, clouds (Phase 8)
-//   • Render target upscaling preparation (Phase 8.4)
+// Frame structure:
+//   1. Scene pass (MSAA, native resolution): sky → chunks → block highlight
+//      → weather particles → clouds, resolved into _colorResolve
+//   2. Bloom: extract/blur/composite from _colorResolve into the drawable
+//      (plain blit when bloom intensity is zero)
+//   3. UI overlay pass onto the drawable
+//
+// Also owns frustum culling and the on-demand chunk mesh cache.
 // ---------------------------------------------------------------------------
 class RenderPipeline {
 public:
-    RenderPipeline(id<MTLDevice> device,
-                    id<MTLLibrary> shaderLibrary,
-                    uint32_t width,
-                    uint32_t height);
+    RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
+                   uint32_t height);
 
     ~RenderPipeline();
 
     // Render a single frame.
     // Handles empty world gracefully (sky-only output).
-    void render(id<MTLCommandQueue> queue,
-                id<CAMetalDrawable> drawable,
-                const Mat4& viewMatrix,
-                const Mat4& projectionMatrix,
-                const World& world,
-                const Camera& camera,
-                uint64_t worldTime = 0,
-                std::optional<Vec3> highlightedBlock = std::nullopt,
-                const Hotbar& hotbar = Hotbar());
+    void render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable, const Mat4& viewMatrix,
+                const Mat4& projectionMatrix, const World& world, const Camera& camera,
+                uint64_t worldTime = 0, std::optional<Vec3> highlightedBlock = std::nullopt,
+                const Hotbar& hotbar = Hotbar(), const UIFrameState& uiFrame = UIFrameState{},
+                const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
 
     // Reallocate MSAA and resolve textures for new viewport size.
     void resize(uint32_t width, uint32_t height);
@@ -110,19 +72,27 @@ public:
     // Update particle system physics (call each game tick).
     void tickParticles(float dt, const World& world, const Vec3& playerPosition);
 
+    // Exponential fog density per block (settings menu).
+    void setFogDensity(float density) { _fogDensity = density; }
+
+    // Write the next presented frame to `path` as a PNG (async, off the
+    // render thread). Used by the playtest workflow for headless visual
+    // verification — macOS screen-recording permissions don't apply.
+    void requestFrameCapture(const std::string& path);
+
 private:
     // ---- Metal resources ----
     id<MTLDevice> _device;
     id<MTLRenderPipelineState> _pipelineState;
     id<MTLDepthStencilState> _depthState;
 
-    // Sky pipeline state
+    // Sky pipeline state (drawn first in the scene pass, behind everything)
     id<MTLRenderPipelineState> _skyPipelineState;
+    id<MTLDepthStencilState> _skyDepthState;
     id<MTLBuffer> _skyUniformsBuffer;
 
-    // Water pipeline state (transparent pass)
-    id<MTLRenderPipelineState> _waterPipelineState;
-    id<MTLDepthStencilState> _waterDepthState;
+    // Depth-tested but non-writing state (block highlight)
+    id<MTLDepthStencilState> _noDepthWriteState;
 
     // Block highlight pipeline state (wireframe lines)
     id<MTLRenderPipelineState> _highlightPipelineState;
@@ -134,98 +104,87 @@ private:
     id<MTLDepthStencilState> _cloudDepthState;
     id<MTLBuffer> _cloudUniformsBuffer;
 
-    // MSAA textures (multisample, at render resolution).
+    // MSAA render targets (memoryless — resolved or discarded at pass end)
     id<MTLTexture> _colorMSAA;
     id<MTLTexture> _depthMSAA;
 
-    // Resolve textures (single-sample, at render resolution).
-    // With upscaling: render at half-resolution, upscale to display.
+    // Single-sample resolve target feeding bloom / the drawable blit
     id<MTLTexture> _colorResolve;
-    id<MTLTexture> _depthResolve;
 
     // Uniform buffer (512 bytes with fog + camera position).
     id<MTLBuffer> _uniformsBuffer;
 
     // MegaBuffer for centralized GPU memory management.
-    MegaBuffer* _megaBuffer;
+    std::unique_ptr<MegaBuffer> _megaBuffer;
 
-    // Texture atlas for procedural block textures.
-    TextureAtlas* _textureAtlas;
+    // Array texture of procedural block textures.
+    std::unique_ptr<BlockTextureArray> _blockTextures;
 
-    // UI overlay for HUD rendering (crosshair, hotbar).
-    UIOverlay* _uiOverlay;
+    // UI overlay for HUD rendering (crosshair, hotbar, menus).
+    std::unique_ptr<UIOverlay> _uiOverlay;
 
     // Bloom post-processing (Phase 8)
-    Bloom* _bloom;
-
-    // MetalFX upscaler (Phase 8.4)
-    MetalFXUpscaler* _upscaler;
+    std::unique_ptr<Bloom> _bloom;
 
     // Weather particle system (rain/snow)
-    ParticleSystem* _particles;
+    std::unique_ptr<ParticleSystem> _particles;
+
+    // Animal voxel-model renderer
+    std::unique_ptr<EntityRenderer> _entityRenderer;
 
     // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
     float _bloomIntensity;
 
-    // Render target dimensions (may differ from display for upscaling)
-    uint32_t _renderWidth;
-    uint32_t _renderHeight;
+    // Exponential fog density per block
+    float _fogDensity = 0.0003f;
+
+    // Drawable dimensions (the scene renders at native resolution)
     uint32_t _displayWidth;
     uint32_t _displayHeight;
+
+    // Pending frame-capture destination (empty when no capture is queued)
+    std::string _capturePath;
+
+    // (Re)allocate the MSAA + resolve textures at the current drawable size.
+    void allocateSceneTargets();
+
+    // Encode the drawable readback + async PNG write for requestFrameCapture.
+    void encodeFrameCapture(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> frameTexture);
 
     // ---- Frustum culling ----
     void extractFrustumPlanes(const Mat4& vpMatrix);
     bool isChunkInFrustum(const AABB& chunkAABB) const;
     float _frustumPlanes[6][4];
 
-    // ---- Chunk mesh cache (per-LOD) ----
-    // Outer key: packed int64 ((uint32_t)chunkX << 32 | (uint32_t)chunkZ)
-    // Inner key: LOD level (0-2), enables multiple mesh resolutions per chunk.
-    std::unordered_map<uint64_t, std::unordered_map<int, ChunkMeshState>> _chunkMeshes;
+    // ---- Chunk mesh cache ----
+    // Key: packed int64 ((uint32_t)chunkX << 32 | (uint32_t)chunkZ).
+    // An entry with uploaded == false marks a chunk whose mesh is empty
+    // (all air) so it is not rebuilt every frame.
+    std::unordered_map<uint64_t, ChunkMeshState> _chunkMeshes;
+
+    // Scratch set reused each frame to sweep meshes of unloaded chunks
+    // without per-frame allocation.
+    std::unordered_set<uint64_t> _liveChunkKeys;
 
     // ---- Day/Night Cycle (Task 6.4-6.5) ----
-    void computeDayNightUniforms(uint64_t worldTime,
-                                  float sunDirection[3],
-                                  float sunColor[3],
-                                  float ambientColor[3],
-                                  SkyUniforms& skyUniforms);
+    void computeDayNightUniforms(uint64_t worldTime, float sunDirection[3], float sunColor[3],
+                                 float ambientColor[3], SkyUniforms& skyUniforms);
 
-    // ---- Render passes ----
-    void renderSky(id<MTLCommandBuffer> commandBuffer,
-                   id<CAMetalDrawable> drawable,
-                   const SkyUniforms& skyUniforms);
+    // ---- Scene pass stages (all encode into the single MSAA scene encoder) ----
+    void renderSky(id<MTLRenderCommandEncoder> encoder);
 
-    void renderChunks(id<MTLRenderCommandEncoder> encoder,
-                      const World& world,
-                      const Mat4& viewMatrix,
-                      const Mat4& projectionMatrix,
-                      const float sunDirection[3],
-                      const float sunColor[3],
-                      const float ambientColor[3],
+    void renderChunks(id<MTLRenderCommandEncoder> encoder, const World& world,
+                      const Mat4& viewMatrix, const Mat4& projectionMatrix,
+                      const Vec3& cameraPosition, const float sunDirection[3],
+                      const float sunColor[3], const float ambientColor[3],
                       const float fogColor[3]);
 
-    void renderWater(id<MTLCommandBuffer> commandBuffer,
-                      id<CAMetalDrawable> drawable,
-                      const Mat4& viewMatrix,
-                     const Mat4& projectionMatrix,
-                     const float sunDirection[3],
-                     const float sunColor[3],
-                     const float ambientColor[3]);
+    void renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, const Vec3& blockPos,
+                              const Mat4& viewMatrix, const Mat4& projectionMatrix);
 
-    void renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
-                              const Vec3& blockPos,
-                              const Mat4& viewMatrix,
-                              const Mat4& projectionMatrix);
+    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
+                         const UIFrameState& uiFrame);
 
-    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
-                         const Hotbar& hotbar);
-
-    // ---- Phase 8: Clouds ----
-    void renderClouds(id<MTLCommandBuffer> commandBuffer,
-                      id<CAMetalDrawable> drawable,
-                      const Mat4& viewMatrix,
-                      const Mat4& projectionMatrix,
-                      const Camera& camera,
-                      uint64_t worldTime,
+    void renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera, uint64_t worldTime,
                       const float sunDirection[3]);
 };

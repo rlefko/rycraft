@@ -21,15 +21,15 @@ public:
     // DDA ray marching through voxel grid.
     // Returns the first solid block hit, or std::nullopt if none within range.
     // maxDistance limits traversal range (default 6.0 blocks).
-    static std::optional<Vec3> traceRay(const Vec3& origin, const Vec3& direction,
-                                         World& world, float maxDistance = 6.0f);
+    static std::optional<Vec3> traceRay(const Vec3& origin, const Vec3& direction, World& world,
+                                        float maxDistance = 6.0f);
 
     // Returns the hit block position AND the face normal of the hit surface.
     // Face normal indicates which face of the block was struck.
     static std::optional<std::pair<Vec3, Vec3>> traceRayWithNormal(const Vec3& origin,
-                                                                    const Vec3& direction,
-                                                                    World& world,
-                                                                    float maxDistance = 6.0f);
+                                                                   const Vec3& direction,
+                                                                   World& world,
+                                                                   float maxDistance = 6.0f);
 
 private:
     // Check if a block at integer coordinates is solid (for ray tracing).

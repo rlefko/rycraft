@@ -64,11 +64,11 @@ public:
     bool alive = true;
 
     // AI timers
-    int hungerTimer = 0;       // ticks since last eat
-    bool isFed = false;        // true if recently fed (for breeding)
-    bool isBaby = false;       // baby entities are smaller
-    int babyTimer = 0;         // ticks remaining as baby (0 = adult)
-    uint64_t parentId = 0;     // parent entity ID (for babies)
+    int hungerTimer = 0;   // ticks since last eat
+    bool isFed = false;    // true if recently fed (for breeding)
+    bool isBaby = false;   // baby entities are smaller
+    int babyTimer = 0;     // ticks remaining as baby (0 = adult)
+    uint64_t parentId = 0; // parent entity ID (for babies)
 
     // Animation
     int eatAnimationTimer = 0; // ticks remaining for eat bob animation

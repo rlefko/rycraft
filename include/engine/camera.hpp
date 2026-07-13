@@ -19,8 +19,8 @@ public:
     Camera();
 
     // Update orientation from mouse delta and movement from keys
-    void update(double deltaTime, const InputState& input,
-                const InputBindings& bindings, const Vec3& playerPos);
+    void update(double deltaTime, const InputState& input, const InputBindings& bindings,
+                const Vec3& playerPos);
 
     Mat4 viewMatrix() const;
     Vec3 position() const;
@@ -43,8 +43,8 @@ public:
 
 private:
     Vec3 position_;
-    float pitch_ = 0;  // radians, clamped to [-89°, 89°]
-    float yaw_ = 0;    // radians, wrapped to [-PI, PI]
+    float pitch_ = 0; // radians, clamped to [-89°, 89°]
+    float yaw_ = 0;   // radians, wrapped to [-PI, PI]
 
     float moveSpeed_ = 5.0f;
     float mouseSensitivity_ = 0.002f;

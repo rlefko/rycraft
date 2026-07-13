@@ -1,44 +1,32 @@
 #include <metal_stdlib>
+#include <render/shader_types.hpp>
 using namespace metal;
 
 // ---------------------------------------------------------------------------
-// Cloud Layer Shader — Procedural volumetric-style clouds
+// Cloud Layer Shader — Procedural clouds on a world-space plane
 //
-// Renders a fullscreen quad at cloud altitude (Y=192) with:
-//   • 2D Simplex noise for cloud patterns (frequency 0.005, threshold 0.4)
-//   • White clouds with 0.8 opacity, sunlit side brighter
-//   • Wind-driven animation via noise coordinate offset
-//
-// Uniforms (buffer 0):
-//   float3 cameraPosition — for parallax and sun direction
-//   float3 sunDirection   — for cloud lighting
-//   float windOffset      — worldTime * windSpeed (0.02 blocks/tick)
-//   float cloudAltitude   — Y level of cloud layer (192)
-//   float noiseFrequency  — noise scale (0.005)
-//   float cloudThreshold  — noise threshold for cloud presence (0.4)
+// A fullscreen quad rides at the far end of the depth range so terrain
+// occludes it. Each fragment reconstructs its view ray from the camera basis
+// and intersects the horizontal cloud plane (Y = cloudAltitude); rays that
+// never reach the plane (looking away from it) draw nothing. Cloud shapes
+// come from wind-scrolled fractal value noise over the plane's XZ coords, so
+// the layer holds still in world space while the camera moves through it.
 // ---------------------------------------------------------------------------
-
-struct CloudUniforms {
-    float3 cameraPosition;
-    float3 sunDirection;
-    float windOffset;
-    float cloudAltitude;
-    float noiseFrequency;
-    float cloudThreshold;
-};
 
 struct CloudVertexOut {
     float4 clipPosition [[position]];
-    float2 vUV;
-    float3 vWorldPos;
+    float2 vNdc;
 };
 
-// ---- Hash-based pseudo-random noise (for simplex-like clouds) ----
+// ---- Hash-based value noise ----
 
-// Fast hash function for noise
+// Integer hash with good avalanche behavior (xorshift-multiply mix)
 uint hash2D(uint2 p) {
-    p = p * uint2(16843009u, 8884513u);
-    return (p.x ^ p.y) * 1274126177u;
+    uint h = p.x * 0x8da6b343u ^ p.y * 0xd8163841u;
+    h ^= h >> 13;
+    h *= 0x9E3779B1u;
+    h ^= h >> 16;
+    return h;
 }
 
 // Smooth noise using hash + interpolation
@@ -47,10 +35,14 @@ float noise2D(float2 p) {
     float2 fp = fract(p);
     fp = fp * fp * (3.0f - 2.0f * fp); // Smoothstep
 
-    uint2 i00 = uint2(ip);
-    uint2 i10 = i00 + uint2(1u, 0u);
-    uint2 i01 = i00 + uint2(0u, 1u);
-    uint2 i11 = i00 + uint2(1u, 1u);
+    // Lattice coords can be negative (world space around the camera); go
+    // through int2 and reinterpret the two's-complement bits, because a
+    // direct float→uint conversion clamps negatives and bands the noise.
+    int2 base = int2(ip);
+    uint2 i00 = as_type<uint2>(base);
+    uint2 i10 = as_type<uint2>(base + int2(1, 0));
+    uint2 i01 = as_type<uint2>(base + int2(0, 1));
+    uint2 i11 = as_type<uint2>(base + int2(1, 1));
 
     float v00 = float(hash2D(i00) % 65536u) / 65535.0f;
     float v10 = float(hash2D(i10) % 65536u) / 65535.0f;
@@ -77,14 +69,13 @@ float fractalNoise(float2 p, int octaves) {
 }
 
 // ============================================================================
-// Vertex shader — fullscreen quad at cloud altitude
+// Vertex shader — fullscreen quad parked at the far depth plane
 // ============================================================================
 
 vertex CloudVertexOut cloudVertexMain(
     uint vertexID [[vertex_id]],
     constant CloudUniforms &uniforms [[buffer(0)]]
 ) {
-    // Fullscreen quad vertices in NDC
     const float2 ndcPositions[6] = {
         float2(-1.0f, -1.0f),
         float2( 1.0f, -1.0f),
@@ -96,31 +87,42 @@ vertex CloudVertexOut cloudVertexMain(
 
     CloudVertexOut out;
     float2 ndc = ndcPositions[vertexID];
-    out.clipPosition = float4(ndc, 0.99f, 1.0f); // Slight Z offset to sit behind scene
-    out.vUV = ndc * 0.5f + 0.5f;
-
-    // World position at cloud altitude for noise sampling
-    // Spread the quad over a large area for noise sampling
-    float spread = 2000.0f;
-    out.vWorldPos = float3(
-        uniforms.cameraPosition.x + ndc.x * spread,
-        uniforms.cloudAltitude,
-        uniforms.cameraPosition.z + ndc.y * spread
-    );
+    // Near the far plane in Metal's [0,1] depth range: terrain always wins
+    // the depth test, sky (which writes no depth) never does.
+    out.clipPosition = float4(ndc, 0.9999f, 1.0f);
+    out.vNdc = ndc;
 
     return out;
 }
 
 // ============================================================================
-// Fragment shader — procedural cloud noise with wind animation
+// Fragment shader — ray-cast onto the cloud plane, then sample cloud noise
 // ============================================================================
 
 fragment float4 cloudFragmentMain(
     CloudVertexOut in [[stage_in]],
     constant CloudUniforms &uniforms [[buffer(0)]]
 ) {
+    // View ray through this pixel from the camera basis + projection shape
+    float3 dir = normalize(
+        uniforms.cameraForward
+        + in.vNdc.x * uniforms.aspect * uniforms.tanHalfFov * uniforms.cameraRight
+        + in.vNdc.y * uniforms.tanHalfFov * uniforms.cameraUp);
+
+    // Intersect with the horizontal cloud plane
+    float heightToPlane = uniforms.cloudAltitude - uniforms.cameraPosition.y;
+    if (fabs(dir.y) < 1e-4f) {
+        discard_fragment();
+    }
+    float t = heightToPlane / dir.y;
+    if (t <= 0.0f) {
+        discard_fragment();
+    }
+
+    float2 planeXZ = uniforms.cameraPosition.xz + dir.xz * t;
+
     // Wind-driven noise coordinates
-    float2 noiseCoord = in.vWorldPos.xz * uniforms.noiseFrequency;
+    float2 noiseCoord = planeXZ * uniforms.noiseFrequency;
     noiseCoord.x += uniforms.windOffset;
 
     // Multi-octave noise for cloud detail
@@ -133,17 +135,15 @@ fragment float4 cloudFragmentMain(
         cloudDensity
     );
 
-    // Cloud color: white base
+    // Cloud color: white base, sunlit side brighter
     float3 cloudColor = float3(1.0f);
-
-    // Sunlit side brighter
     float sunDot = max(dot(normalize(uniforms.sunDirection), float3(0.0f, 1.0f, 0.0f)), 0.0f);
     cloudColor *= 0.6f + 0.4f * sunDot;
 
-    // Base opacity
-    float alpha = cloudMask * 0.8f;
+    // Fade with distance along the ray so the layer dissolves at the horizon
+    float fade = exp(-t * 0.0015f);
+    float alpha = cloudMask * 0.8f * fade;
 
-    // Discard non-cloud pixels
     if (alpha < 0.01f) {
         discard_fragment();
     }

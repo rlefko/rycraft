@@ -19,11 +19,10 @@ Camera::Camera()
     , fov_(70.0f)
     , bobPhase_(0)
     , previousPosition_{position_}
-    , front_{0.f, 0.f, -1.f} {
-}
+    , front_{0.f, 0.f, -1.f} {}
 
-void Camera::update(double deltaTime, const InputState& input,
-                    const InputBindings& bindings, const Vec3& playerPos) {
+void Camera::update(double deltaTime, const InputState& input, const InputBindings& bindings,
+                    const Vec3& playerPos) {
     // Store current position for speed calculation
     previousPosition_ = position_;
 
@@ -44,8 +43,10 @@ void Camera::update(double deltaTime, const InputState& input,
     pitch_ = std::clamp(pitch_, -maxPitch, maxPitch);
 
     // Wrap yaw to [-PI, PI]
-    while (yaw_ > float(M_PI)) yaw_ -= 2.f * float(M_PI);
-    while (yaw_ < -float(M_PI)) yaw_ += 2.f * float(M_PI);
+    while (yaw_ > float(M_PI))
+        yaw_ -= 2.f * float(M_PI);
+    while (yaw_ < -float(M_PI))
+        yaw_ += 2.f * float(M_PI);
 
     // Recalculate forward vector
     updateFront();
@@ -53,7 +54,7 @@ void Camera::update(double deltaTime, const InputState& input,
     // ---- Head bobbing ----
     // Calculate horizontal movement speed
     Vec3 horizontalDelta = position_ - previousPosition_;
-    horizontalDelta.y = 0.f;  // ignore vertical movement
+    horizontalDelta.y = 0.f; // ignore vertical movement
     float dt = deltaTime > 0 ? deltaTime : 1.0 / 60.0;
     float horizontalSpeed = horizontalDelta.length() / dt;
 

@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <render/shader_types.hpp>
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -10,15 +11,6 @@ using namespace metal;
 //   3. Composite pass — additive blend bloom onto original scene
 //   4. ACES tone mapping applied during composite
 // ---------------------------------------------------------------------------
-
-// ---- Uniforms for bloom passes ----
-struct BloomUniforms {
-    float2 resolution;    // output texture width, height
-    float2 texelSize;     // 1.0/width, 1.0/height
-    float threshold;      // brightness threshold for extract (default 1.0)
-    float intensity;      // bloom intensity multiplier (default 1.0)
-    float blurRadius;     // Kawase blur radius in texels
-};
 
 // ---- Fullscreen quad vertex output ----
 struct BloomVertexOut {
@@ -41,7 +33,10 @@ vertex BloomVertexOut bloomExtractVertex(uint vertexID [[vertex_id]]) {
     };
     BloomVertexOut out;
     out.clipPosition = float4(positions[vertexID], 0.0, 1.0);
-    out.vUV = positions[vertexID] * 0.5f + 0.5f;
+    // Texture v runs downward in Metal while NDC y runs up; flip v so
+    // every sampling pass preserves the image orientation.
+    out.vUV = float2(positions[vertexID].x * 0.5f + 0.5f,
+                     0.5f - positions[vertexID].y * 0.5f);
     return out;
 }
 
@@ -83,7 +78,10 @@ vertex BloomVertexOut bloomBlurVertex(uint vertexID [[vertex_id]]) {
     };
     BloomVertexOut out;
     out.clipPosition = float4(positions[vertexID], 0.0, 1.0);
-    out.vUV = positions[vertexID] * 0.5f + 0.5f;
+    // Texture v runs downward in Metal while NDC y runs up; flip v so
+    // every sampling pass preserves the image orientation.
+    out.vUV = float2(positions[vertexID].x * 0.5f + 0.5f,
+                     0.5f - positions[vertexID].y * 0.5f);
     return out;
 }
 
@@ -141,7 +139,10 @@ vertex BloomVertexOut bloomCompositeVertex(uint vertexID [[vertex_id]]) {
     };
     BloomVertexOut out;
     out.clipPosition = float4(positions[vertexID], 0.0, 1.0);
-    out.vUV = positions[vertexID] * 0.5f + 0.5f;
+    // Texture v runs downward in Metal while NDC y runs up; flip v so
+    // every sampling pass preserves the image orientation.
+    out.vUV = float2(positions[vertexID].x * 0.5f + 0.5f,
+                     0.5f - positions[vertexID].y * 0.5f);
     return out;
 }
 

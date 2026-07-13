@@ -1,10 +1,10 @@
 #pragma once
 
+#include "render/vertex.hpp"
 #import <Metal/Metal.h>
 #include <cstdint>
 #include <mutex>
 #include <vector>
-#include "render/vertex.hpp"
 
 class MegaBuffer {
 public:
@@ -19,11 +19,8 @@ public:
 
     static constexpr uint64_t ALIGNMENT = 256;
 
-    explicit MegaBuffer(
-        id<MTLDevice> device,
-        uint64_t vertexSize = 128 * 1024 * 1024,
-        uint64_t indexSize = 64 * 1024 * 1024
-    );
+    explicit MegaBuffer(id<MTLDevice> device, uint64_t vertexSize = 128 * 1024 * 1024,
+                        uint64_t indexSize = 64 * 1024 * 1024);
 
     ChunkAllocation allocate(uint32_t vertexCount, uint32_t indexCount);
 
@@ -48,17 +45,9 @@ private:
     std::vector<std::pair<uint64_t, uint64_t>> _indexFreeList;
     mutable std::mutex _mutex;
 
-    bool tryBumpAllocate(
-        uint64_t& outOffset,
-        uint64_t alignedSize,
-        uint64_t bufferSize,
-        uint64_t& bumpPtr
-    ) const;
+    bool tryBumpAllocate(uint64_t& outOffset, uint64_t alignedSize, uint64_t bufferSize,
+                         uint64_t& bumpPtr) const;
 
-    bool tryFreeListAllocate(
-        uint64_t& outOffset,
-        uint64_t alignedSize,
-        uint64_t bufferSize,
-        std::vector<std::pair<uint64_t, uint64_t>>& freeList
-    );
+    bool tryFreeListAllocate(uint64_t& outOffset, uint64_t alignedSize, uint64_t bufferSize,
+                             std::vector<std::pair<uint64_t, uint64_t>>& freeList);
 };

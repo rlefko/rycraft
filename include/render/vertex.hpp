@@ -14,12 +14,19 @@ using float16_t = __fp16;
 // with a fixed-size format that matches its byte width.
 //
 // Layout (16 bytes total, 16-byte aligned):
-//   normalIdx    : uint32_t       (4 bytes)  — index into 6 face normals
-//   px, py, pz   : float16_t × 3  (6 bytes)  — position
-//   u, v         : float16_t × 2  (4 bytes)  — texture atlas UV
+//   faceAttr     : uint32_t       (4 bytes)  — face normal (bits 0-2) +
+//                                              texture array layer (bits 3+),
+//                                              packed by packFaceAttr()
+//   px, py, pz   : float16_t × 3  (6 bytes)  — CHUNK-LOCAL position (0..256,
+//                                              exact in fp16; the per-draw
+//                                              ChunkOrigin restores world
+//                                              space in the vertex shader)
+//   u, v         : float16_t × 2  (4 bytes)  — UV spanning the quad extent
+//                                              in blocks; the repeat sampler
+//                                              tiles greedy-merged quads
 //
 // Metal vertex descriptor offsets:
-//   attribute(0) normalIdx: offset 0,  format UInt   (4 bytes)
+//   attribute(0) faceAttr:  offset 0,  format UInt   (4 bytes)
 //   attribute(1) position:  offset 4,  format Half3  (6 bytes)
 //   attribute(2) uv:        offset 10, format Half2  (4 bytes)
 //   stride = 16 bytes
@@ -28,8 +35,8 @@ using float16_t = __fp16;
 //   0 = +X, 1 = -X, 2 = +Z, 3 = -Z, 4 = +Y, 5 = -Y
 
 struct alignas(16) Vertex {
-    // Normal index: uint32_t (4 bytes) — offset 0
-    uint32_t normalIdx;
+    // Packed face normal + texture layer — offset 0
+    uint32_t faceAttr;
 
     // Position: 3 × float16_t = 6 bytes — offset 4
     float16_t px;
@@ -46,10 +53,10 @@ static_assert(alignof(Vertex) == 16, "Vertex must be 16-byte aligned");
 
 // Face normal index constants
 enum class FaceNormal : uint8_t {
-    PlusX = 0,
-    MinusX = 1,
-    PlusZ = 2,
-    MinusZ = 3,
-    PlusY = 4,
-    MinusY = 5,
+    PLUS_X = 0,
+    MINUS_X = 1,
+    PLUS_Z = 2,
+    MINUS_Z = 3,
+    PLUS_Y = 4,
+    MINUS_Y = 5,
 };

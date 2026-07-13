@@ -1,13 +1,13 @@
 #pragma once
 
-#include <entity/entity.hpp>
 #include <entity/ai.hpp>
+#include <entity/entity.hpp>
 #include <entity/spatial_hash.hpp>
-#include <world/world.hpp>
 #include <world/biome.hpp>
+#include <world/world.hpp>
 
+#include "common/random.hpp"
 #include <memory>
-#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -50,8 +50,7 @@ public:
     void removeEntity(uint64_t entityId);
 
     // Spawn a baby entity (called from breed behavior)
-    std::shared_ptr<Entity> spawnBaby(EntityType type, const Vec3& position,
-                                      uint64_t parentId);
+    std::shared_ptr<Entity> spawnBaby(EntityType type, const Vec3& position, uint64_t parentId);
 
     // Get spatial hash for neighbor queries
     SpatialHash& getSpatialHash();
@@ -72,7 +71,7 @@ private:
     World& world_;
     std::vector<std::shared_ptr<Entity>> entities_;
     SpatialHash spatialHash_;
-    std::mt19937 rng_;
+    SeededRng rng_;
 
     // Random number in [min, max]
     int randomInt(int min, int max);

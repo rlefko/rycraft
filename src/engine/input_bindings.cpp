@@ -1,12 +1,11 @@
 #include <engine/input_bindings.hpp>
 
 #include <common/error.hpp>
-#include <common/result.hpp>
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <filesystem>
 
 namespace fs = std::filesystem;
 
@@ -32,15 +31,14 @@ static bool ensureDirectory(const std::string& path) {
 // InputBindings — Serialization
 // ---------------------------------------------------------------------------
 
-Result<InputBindings, EngineError> InputBindings::save(const std::string& path) {
+bool InputBindings::save(const std::string& path) const {
     // Ensure parent directory exists
     fs::path p(path);
     fs::path parent = p.parent_path();
     if (!parent.empty()) {
         if (!ensureDirectory(parent.string())) {
-            return Result<InputBindings, EngineError>::err(
-                EngineError{ErrorCode::Fatal,
-                    "Failed to create directory: " + parent.string()});
+            RY_LOG_ERROR("Failed to create directory: " + parent.string());
+            return false;
         }
     }
 
@@ -72,33 +70,29 @@ Result<InputBindings, EngineError> InputBindings::save(const std::string& path) 
 
     std::ofstream file(path);
     if (!file.is_open()) {
-        return Result<InputBindings, EngineError>::err(
-            EngineError{ErrorCode::Fatal,
-                "Failed to open file for writing: " + path});
+        RY_LOG_ERROR("Failed to open file for writing: " + path);
+        return false;
     }
 
     file << json.str();
 
     if (file.fail()) {
         file.close();
-        return Result<InputBindings, EngineError>::err(
-            EngineError{ErrorCode::Fatal,
-                "Failed to write bindings file: " + path});
+        RY_LOG_ERROR("Failed to write bindings file: " + path);
+        return false;
     }
 
     file.close();
-    return Result<InputBindings, EngineError>::ok(*this);
+    return true;
 }
 
-Result<InputBindings, EngineError> InputBindings::load(const std::string& path) {
+std::optional<InputBindings> InputBindings::load(const std::string& path) {
     // Open file
     std::ifstream file(path);
     if (!file.is_open()) {
-        // File not found — return defaults
-        RY_LOG_ERROR("Input bindings file not found at " + path +
-                     ", using defaults");
+        // File not found — first launch, use defaults
         InputBindings defaults;
-        return Result<InputBindings, EngineError>::ok(defaults);
+        return defaults;
     }
 
     // Read entire file into string
@@ -110,14 +104,13 @@ Result<InputBindings, EngineError> InputBindings::load(const std::string& path) 
     if (content.empty()) {
         RY_LOG_ERROR("Input bindings file is empty, using defaults");
         InputBindings defaults;
-        return Result<InputBindings, EngineError>::ok(defaults);
+        return defaults;
     }
 
     // Minimal JSON parsing: find "key": "value" pairs
     InputBindings bindings;
 
-    auto parseBinding = [&](ActionBinding& field,
-                            const std::string& jsonKey) -> bool {
+    auto parseBinding = [&](ActionBinding& field, const std::string& jsonKey) -> bool {
         std::string searchKey = "\"" + jsonKey + "\"";
         size_t pos = content.find(searchKey);
         if (pos == std::string::npos) return false;
@@ -133,12 +126,11 @@ Result<InputBindings, EngineError> InputBindings::load(const std::string& path) 
         size_t quoteEnd = content.find('"', quoteStart + 1);
         if (quoteEnd == std::string::npos) return false;
 
-        std::string value = content.substr(quoteStart + 1,
-                                            quoteEnd - quoteStart - 1);
+        std::string value = content.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
         auto parsedKey = keyFromString(value);
         if (parsedKey == Key::None && !value.empty()) {
-            RY_LOG_ERROR(std::string("Invalid binding value '") + value +
-                         "' for '" + jsonKey + "', using default");
+            RY_LOG_ERROR(std::string("Invalid binding value '") + value + "' for '" + jsonKey +
+                         "', using default");
         }
         field.key = parsedKey;
         return true;
@@ -161,7 +153,7 @@ Result<InputBindings, EngineError> InputBindings::load(const std::string& path) 
         parseBinding(bindings.hotbar[i], slotName);
     }
 
-    return Result<InputBindings, EngineError>::ok(bindings);
+    return bindings;
 }
 
 std::string InputBindings::defaultPath() {

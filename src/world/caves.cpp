@@ -7,9 +7,7 @@ CaveGenerator::CaveGenerator(uint32_t seed)
     , spaghettiNoise1_(seed + 1)
     , spaghettiNoise2_(seed + 2)
     , noodleNoise1_(seed + 3)
-    , noodleNoise2_(seed + 4)
-{
-}
+    , noodleNoise2_(seed + 4) {}
 
 bool CaveGenerator::isCheeseCave(int x, int y, int z, const CaveConfig& config) const {
     double nx = static_cast<double>(x) / config.cheeseScale;

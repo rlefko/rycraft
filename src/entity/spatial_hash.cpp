@@ -1,13 +1,12 @@
 #include "entity/spatial_hash.hpp"
 
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 
 // ---------------------------------------------------------------------------
 // SpatialHash constructor
 // ---------------------------------------------------------------------------
-SpatialHash::SpatialHash(float cellSize)
-    : cellSize_(cellSize), invCellSize_(1.f / cellSize) {
+SpatialHash::SpatialHash(float cellSize) : cellSize_(cellSize), invCellSize_(1.f / cellSize) {
     // Guard: cell size must be positive
     if (cellSize_ <= 0.f) {
         cellSize_ = 8.0f;
@@ -37,11 +36,8 @@ int64_t SpatialHash::cellKey(int cx, int cy, int cz) {
     uint32_t uy = static_cast<uint32_t>(cy + OFFSET) & 0x1FFFFF;
     uint32_t uz = static_cast<uint32_t>(cz + OFFSET) & 0x1FFFFF;
 
-    return static_cast<int64_t>(
-        (static_cast<int64_t>(ux) << 42) |
-        (static_cast<int64_t>(uy) << 21) |
-        static_cast<int64_t>(uz)
-    );
+    return static_cast<int64_t>((static_cast<int64_t>(ux) << 42) |
+                                (static_cast<int64_t>(uy) << 21) | static_cast<int64_t>(uz));
 }
 
 void SpatialHash::cellToCoords(int64_t key, int& cx, int& cy, int& cz) {
@@ -63,10 +59,7 @@ void SpatialHash::insert(uint64_t entityId, const Vec3& position) {
     if (it != entityCell_.end()) {
         int64_t oldCell = it->second;
         auto& cellList = grid_[oldCell];
-        cellList.erase(
-            std::remove(cellList.begin(), cellList.end(), entityId),
-            cellList.end()
-        );
+        cellList.erase(std::remove(cellList.begin(), cellList.end(), entityId), cellList.end());
         if (cellList.empty()) {
             grid_.erase(oldCell);
         }
@@ -89,10 +82,7 @@ void SpatialHash::remove(uint64_t entityId) {
     entityCell_.erase(it);
 
     auto& cellList = grid_[cell];
-    cellList.erase(
-        std::remove(cellList.begin(), cellList.end(), entityId),
-        cellList.end()
-    );
+    cellList.erase(std::remove(cellList.begin(), cellList.end(), entityId), cellList.end());
     if (cellList.empty()) {
         grid_.erase(cell);
     }
@@ -130,8 +120,9 @@ std::vector<uint64_t> SpatialHash::queryCells(const Vec3& position, float radius
 // ---------------------------------------------------------------------------
 // query — Find all entities within radius with distance filtering
 // ---------------------------------------------------------------------------
-std::vector<uint64_t> SpatialHash::query(const Vec3& position, float radius,
-                                          const std::unordered_map<uint64_t, Vec3>& entityPositions) const {
+std::vector<uint64_t>
+SpatialHash::query(const Vec3& position, float radius,
+                   const std::unordered_map<uint64_t, Vec3>& entityPositions) const {
     std::vector<uint64_t> results;
     float radiusSq = radius * radius;
 

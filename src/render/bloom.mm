@@ -1,42 +1,27 @@
 #import "render/bloom.hpp"
 
 #include "common/error.hpp"
+#include "render/shader_types.hpp"
 
 #include <cstring>
 
 // ---------------------------------------------------------------------------
-// BloomUniforms — matches the Metal shader struct exactly
-// ---------------------------------------------------------------------------
-struct alignas(16) BloomUniforms {
-    float resolution[2];
-    float texelSize[2];
-    float threshold;
-    float intensity;
-    float blurRadius;
-    float _padding;
-};
-
-// ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
-Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
-             uint32_t width, uint32_t height)
-    : _device(device)
-    , _blurPyramid{}
-    , _width(width)
-    , _height(height)
-    , _intensity(1.0f)
-{
+Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width, uint32_t height)
+    : _device(device), _blurPyramid{}, _width(width), _height(height), _intensity(1.0f) {
     // ---- Load shader functions ----
     id<MTLFunction> extractVertexFunc = [shaderLibrary newFunctionWithName:@"bloomExtractVertex"];
-    id<MTLFunction> extractFragmentFunc = [shaderLibrary newFunctionWithName:@"bloomExtractFragment"];
+    id<MTLFunction> extractFragmentFunc =
+        [shaderLibrary newFunctionWithName:@"bloomExtractFragment"];
     id<MTLFunction> blurVertexFunc = [shaderLibrary newFunctionWithName:@"bloomBlurVertex"];
     id<MTLFunction> blurFragmentFunc = [shaderLibrary newFunctionWithName:@"bloomBlurFragment"];
-    id<MTLFunction> compositeVertexFunc = [shaderLibrary newFunctionWithName:@"bloomCompositeVertex"];
-    id<MTLFunction> compositeFragmentFunc = [shaderLibrary newFunctionWithName:@"bloomCompositeFragment"];
+    id<MTLFunction> compositeVertexFunc =
+        [shaderLibrary newFunctionWithName:@"bloomCompositeVertex"];
+    id<MTLFunction> compositeFragmentFunc =
+        [shaderLibrary newFunctionWithName:@"bloomCompositeFragment"];
 
-    if (!extractVertexFunc || !extractFragmentFunc ||
-        !blurVertexFunc || !blurFragmentFunc ||
+    if (!extractVertexFunc || !extractFragmentFunc || !blurVertexFunc || !blurFragmentFunc ||
         !compositeVertexFunc || !compositeFragmentFunc) {
         RY_LOG_FATAL("Failed to load bloom shader functions");
     }
@@ -70,14 +55,15 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
     compositeDesc.fragmentFunction = compositeFragmentFunc;
     compositeDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
-    _compositePipelineState = [_device newRenderPipelineStateWithDescriptor:compositeDesc error:&error];
+    _compositePipelineState = [_device newRenderPipelineStateWithDescriptor:compositeDesc
+                                                                      error:&error];
     if (!_compositePipelineState) {
         RY_LOG_FATAL("Failed to create bloom composite pipeline state");
     }
 
     // ---- Uniforms buffer ----
     _uniformsBuffer = [_device newBufferWithLength:sizeof(BloomUniforms)
-                                             options:MTLResourceStorageModeShared];
+                                           options:MTLResourceStorageModeShared];
     if (!_uniformsBuffer) {
         RY_LOG_FATAL("Failed to allocate bloom uniforms buffer");
     }
@@ -95,7 +81,6 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
     // ---- Allocate textures ----
     allocateExtractTexture();
     allocateBlurPyramid();
-    allocateCompositeOutput();
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +89,6 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
 Bloom::~Bloom() {
     // Metal objects are reference-counted; nil assignment releases them
     _extractTexture = nil;
-    _bloomOutput = nil;
     for (int i = 0; i < PYRAMID_LEVELS; ++i) {
         _blurPyramid[i][0] = nil;
         _blurPyramid[i][1] = nil;
@@ -118,7 +102,7 @@ void Bloom::allocateExtractTexture() {
     auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                    width:_width
                                                                   height:_height
-                                                              mipmapped:false];
+                                                               mipmapped:false];
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     _extractTexture = [_device newTextureWithDescriptor:desc];
     if (!_extractTexture) {
@@ -139,10 +123,11 @@ void Bloom::allocateBlurPyramid() {
         h = std::max(h / 2, 1u);
 
         for (int pingpong = 0; pingpong < 2; ++pingpong) {
-            auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                            width:w
-                                                                           height:h
-                                                                       mipmapped:false];
+            auto desc =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                   width:w
+                                                                  height:h
+                                                               mipmapped:false];
             desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             _blurPyramid[level][pingpong] = [_device newTextureWithDescriptor:desc];
             if (!_blurPyramid[level][pingpong]) {
@@ -153,32 +138,17 @@ void Bloom::allocateBlurPyramid() {
 }
 
 // ---------------------------------------------------------------------------
-// allocateCompositeOutput
-// ---------------------------------------------------------------------------
-void Bloom::allocateCompositeOutput() {
-    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                   width:_width
-                                                                  height:_height
-                                                              mipmapped:false];
-    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    _bloomOutput = [_device newTextureWithDescriptor:desc];
-    if (!_bloomOutput) {
-        RY_LOG_FATAL("Failed to allocate bloom composite output texture");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // resize
 // ---------------------------------------------------------------------------
 void Bloom::resize(uint32_t width, uint32_t height) {
-    if (width == _width && height == _height) return;
+    if (width == _width && height == _height)
+        return;
 
     _width = width;
     _height = height;
 
     // Release and reallocate all textures
     _extractTexture = nil;
-    _bloomOutput = nil;
     for (int i = 0; i < PYRAMID_LEVELS; ++i) {
         _blurPyramid[i][0] = nil;
         _blurPyramid[i][1] = nil;
@@ -186,20 +156,16 @@ void Bloom::resize(uint32_t width, uint32_t height) {
 
     allocateExtractTexture();
     allocateBlurPyramid();
-    allocateCompositeOutput();
 }
 
 // ---------------------------------------------------------------------------
 // uploadUniforms
 // ---------------------------------------------------------------------------
-void Bloom::uploadUniforms(float resolution[2], float texelSize[2],
-                           float threshold, float intensity, float blurRadius)
-{
+void Bloom::uploadUniforms(float resolution[2], float texelSize[2], float threshold,
+                           float intensity, float blurRadius) {
     BloomUniforms uniforms{};
-    uniforms.resolution[0] = resolution[0];
-    uniforms.resolution[1] = resolution[1];
-    uniforms.texelSize[0] = texelSize[0];
-    uniforms.texelSize[1] = texelSize[1];
+    uniforms.resolution = simd_make_float2(resolution[0], resolution[1]);
+    uniforms.texelSize = simd_make_float2(texelSize[0], texelSize[1]);
     uniforms.threshold = threshold;
     uniforms.intensity = intensity;
     uniforms.blurRadius = blurRadius;
@@ -210,10 +176,9 @@ void Bloom::uploadUniforms(float resolution[2], float texelSize[2],
 // ---------------------------------------------------------------------------
 // renderExtractPass
 // ---------------------------------------------------------------------------
-void Bloom::renderExtractPass(id<MTLCommandBuffer> commandBuffer,
-                              id<MTLTexture> sceneTexture)
-{
-    if (!commandBuffer || !sceneTexture) return;
+void Bloom::renderExtractPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture) {
+    if (!commandBuffer || !sceneTexture)
+        return;
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];
     passDesc.colorAttachments[0].texture = _extractTexture;
@@ -221,8 +186,10 @@ void Bloom::renderExtractPass(id<MTLCommandBuffer> commandBuffer,
     passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
     passDesc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
 
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
-    if (!encoder) return;
+    id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
+    if (!encoder)
+        return;
 
     [encoder setRenderPipelineState:_extractPipelineState];
     [encoder setFragmentTexture:sceneTexture atIndex:0];
@@ -241,12 +208,10 @@ void Bloom::renderExtractPass(id<MTLCommandBuffer> commandBuffer,
 // ---------------------------------------------------------------------------
 // renderBlurPass
 // ---------------------------------------------------------------------------
-void Bloom::renderBlurPass(id<MTLCommandBuffer> commandBuffer,
-                           id<MTLTexture> source,
-                           id<MTLTexture> destination,
-                           float blurRadius)
-{
-    if (!commandBuffer || !source || !destination) return;
+void Bloom::renderBlurPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> source,
+                           id<MTLTexture> destination, float blurRadius) {
+    if (!commandBuffer || !source || !destination)
+        return;
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];
     passDesc.colorAttachments[0].texture = destination;
@@ -254,16 +219,20 @@ void Bloom::renderBlurPass(id<MTLCommandBuffer> commandBuffer,
     passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
     passDesc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
 
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
-    if (!encoder) return;
+    id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
+    if (!encoder)
+        return;
 
     [encoder setRenderPipelineState:_blurPipelineState];
     [encoder setFragmentTexture:source atIndex:0];
     [encoder setFragmentSamplerState:_linearSampler atIndex:0];
 
     // Upload uniforms
-    float resolution[2] = {static_cast<float>(destination.width), static_cast<float>(destination.height)};
-    float texelSize[2] = {1.0f / static_cast<float>(destination.width), 1.0f / static_cast<float>(destination.height)};
+    float resolution[2] = {static_cast<float>(destination.width),
+                           static_cast<float>(destination.height)};
+    float texelSize[2] = {1.0f / static_cast<float>(destination.width),
+                          1.0f / static_cast<float>(destination.height)};
     uploadUniforms(resolution, texelSize, 1.0f, 1.0f, blurRadius);
     [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:0];
 
@@ -274,12 +243,10 @@ void Bloom::renderBlurPass(id<MTLCommandBuffer> commandBuffer,
 // ---------------------------------------------------------------------------
 // renderCompositePass
 // ---------------------------------------------------------------------------
-void Bloom::renderCompositePass(id<MTLCommandBuffer> commandBuffer,
-                                id<MTLTexture> sceneTexture,
-                                id<MTLTexture> bloomTexture,
-                                id<MTLTexture> outputTexture)
-{
-    if (!commandBuffer || !sceneTexture || !bloomTexture || !outputTexture) return;
+void Bloom::renderCompositePass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture,
+                                id<MTLTexture> bloomTexture, id<MTLTexture> outputTexture) {
+    if (!commandBuffer || !sceneTexture || !bloomTexture || !outputTexture)
+        return;
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];
     passDesc.colorAttachments[0].texture = outputTexture;
@@ -287,8 +254,10 @@ void Bloom::renderCompositePass(id<MTLCommandBuffer> commandBuffer,
     passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
     passDesc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
 
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
-    if (!encoder) return;
+    id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
+    if (!encoder)
+        return;
 
     [encoder setRenderPipelineState:_compositePipelineState];
     [encoder setFragmentTexture:sceneTexture atIndex:0];
@@ -297,8 +266,10 @@ void Bloom::renderCompositePass(id<MTLCommandBuffer> commandBuffer,
     [encoder setFragmentSamplerState:_linearSampler atIndex:1];
 
     // Upload uniforms — intensity controls bloom strength in composite shader.
-    float resolution[2] = {static_cast<float>(outputTexture.width), static_cast<float>(outputTexture.height)};
-    float texelSize[2] = {1.0f / static_cast<float>(outputTexture.width), 1.0f / static_cast<float>(outputTexture.height)};
+    float resolution[2] = {static_cast<float>(outputTexture.width),
+                           static_cast<float>(outputTexture.height)};
+    float texelSize[2] = {1.0f / static_cast<float>(outputTexture.width),
+                          1.0f / static_cast<float>(outputTexture.height)};
     uploadUniforms(resolution, texelSize, 1.0f, _intensity, 1.0f);
     [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:0];
 
@@ -309,15 +280,15 @@ void Bloom::renderCompositePass(id<MTLCommandBuffer> commandBuffer,
 // ---------------------------------------------------------------------------
 // renderBloom — Full bloom pipeline
 // ---------------------------------------------------------------------------
-void Bloom::renderBloom(id<MTLCommandBuffer> commandBuffer,
-                        id<MTLTexture> sceneTexture,
-                        id<MTLTexture> outputTexture)
-{
-    if (!commandBuffer || !sceneTexture || !outputTexture) return;
+void Bloom::renderBloom(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture,
+                        id<MTLTexture> outputTexture) {
+    if (!commandBuffer || !sceneTexture || !outputTexture)
+        return;
 
     // Early exit: zero intensity means bloom is effectively disabled.
     // Avoids 13 render passes (1 extract + 8 blur + 3 upsample + 1 composite).
-    if (_intensity <= 0.0f) return;
+    if (_intensity <= 0.0f)
+        return;
 
     // 1. Extract bright pixels
     renderExtractPass(commandBuffer, sceneTexture);

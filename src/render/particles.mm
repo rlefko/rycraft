@@ -3,20 +3,16 @@
 #include "common/error.hpp"
 #include "world/world.hpp"
 
+#include "common/random.hpp"
 #include <cmath>
 #include <cstring>
-#include <random>
 
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
 ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrary)
-    : _device(device)
-    , _pipelineState(nil)
-    , _depthState(nil)
-    , _particleBuffer(nil)
-    , _uniformsBuffer(nil)
-{
+    : _device(device), _pipelineState(nil), _depthState(nil), _particleBuffer(nil),
+      _uniformsBuffer(nil) {
     // Zero-initialize all particles
     std::memset(particles_, 0, sizeof(particles_));
 
@@ -31,29 +27,12 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         RY_LOG_FATAL("Failed to load particle fragment shader 'particleFragmentMain'");
     }
 
-    // ---- Vertex descriptor: GPUParticle at buffer 0 ----
-    auto vertexDesc = [MTLVertexDescriptor vertexDescriptor];
-
-    // GPUParticle layout (32 bytes):
-    //   position(12) + pad(4) + velocity(12) + pad(4) + lifetime(4) + type(4)
-    vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
-    vertexDesc.attributes[0].offset = 0;
-    vertexDesc.attributes[0].bufferIndex = 0;
-
-    vertexDesc.attributes[1].format = MTLVertexFormatFloat;
-    vertexDesc.attributes[1].offset = 28;
-    vertexDesc.attributes[1].bufferIndex = 0;
-
-    // Stride = sizeof(GPUParticle) = 32 bytes
-    vertexDesc.layouts[0].stride = sizeof(GPUParticle);
-    vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
-    vertexDesc.layouts[0].stepRate = 1;
-
     // ---- Render pipeline state (alpha-blended points) ----
+    // The vertex shader indexes the GPUParticle buffer directly by vertex_id,
+    // so no vertex descriptor is involved.
     auto pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
-    pipelineDesc.vertexDescriptor = vertexDesc;
 
     pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pipelineDesc.colorAttachments[0].blendingEnabled = true;
@@ -62,15 +41,17 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
     pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
     pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    // Particles draw inside the 4x MSAA scene pass
+    pipelineDesc.rasterSampleCount = 4;
 
     NSError* error = nil;
-    _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc
-                                                             error:&error];
+    _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
     if (!_pipelineState) {
         NSString* msg = [NSString stringWithFormat:@"Failed to create particle pipeline state: %@",
-                         error.localizedDescription];
+                                                   error.localizedDescription];
         RY_LOG_FATAL(msg.UTF8String);
     }
 
@@ -85,14 +66,14 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
     // ---- GPU particle buffer ----
     _particleBuffer = [_device newBufferWithLength:sizeof(GPUParticle) * MAX_PARTICLES
-                                             options:MTLResourceStorageModeShared];
+                                           options:MTLResourceStorageModeShared];
     if (!_particleBuffer) {
         RY_LOG_FATAL("Failed to allocate particle GPU buffer");
     }
 
     // ---- Uniform buffer ----
     _uniformsBuffer = [_device newBufferWithLength:sizeof(ParticleUniforms)
-                                             options:MTLResourceStorageModeShared];
+                                           options:MTLResourceStorageModeShared];
     if (!_uniformsBuffer) {
         RY_LOG_FATAL("Failed to allocate particle uniforms buffer");
     }
@@ -113,7 +94,8 @@ ParticleSystem::~ParticleSystem() {
 // tick — Update particle physics each game tick
 // ---------------------------------------------------------------------------
 void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPosition) {
-    if (dt <= 0.f) return;
+    if (dt <= 0.f)
+        return;
 
     // Clamp dt to prevent physics explosions after long pauses
     float clampedDt = std::min(dt, 0.1f);
@@ -132,7 +114,8 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
     // ---- Update existing particles ----
     for (size_t i = 0; i < MAX_PARTICLES; ++i) {
         Particle& p = particles_[i];
-        if (!p.active) continue;
+        if (!p.active)
+            continue;
 
         // Advance lifetime
         p.lifetime += clampedDt;
@@ -182,7 +165,8 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
                     break;
                 }
             }
-            if (!found) continue; // Pool full, skip this spawn
+            if (!found)
+                continue; // Pool full, skip this spawn
         }
         Particle& p = particles_[slot];
 
@@ -202,23 +186,21 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
 // spawnRainParticle
 // ---------------------------------------------------------------------------
 void ParticleSystem::spawnRainParticle(Particle& p, const Vec3& playerPos, float spawnRadius) {
-    static thread_local std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<float> angleDist(0.f, 2.f * static_cast<float>(M_PI));
-    std::uniform_real_distribution<float> radiusDist(0.f, spawnRadius);
-    std::uniform_real_distribution<float> unitDist(0.f, 1.f);
+    // Deterministic weather: the same seed always rains the same way
+    static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
 
-    float angle = angleDist(rng);
-    float radius = radiusDist(rng);
+    float angle = rng.nextFloat() * 2.f * static_cast<float>(M_PI);
+    float radius = rng.nextFloat() * spawnRadius;
 
     // Spawn above player at high altitude
     p.position[0] = playerPos.x + std::cos(angle) * radius;
-    p.position[1] = playerPos.y + 128.f + unitDist(rng) * 32.f;
+    p.position[1] = playerPos.y + 128.f + rng.nextFloat() * 32.f;
     p.position[2] = playerPos.z + std::sin(angle) * radius;
 
     // Fall speed ~10 blocks/s with slight wind drift
-    p.velocity[0] = (unitDist(rng) - 0.5f) * 1.0f;
+    p.velocity[0] = (rng.nextFloat() - 0.5f) * 1.0f;
     p.velocity[1] = -10.f;
-    p.velocity[2] = (unitDist(rng) - 0.5f) * 1.0f;
+    p.velocity[2] = (rng.nextFloat() - 0.5f) * 1.0f;
 
     p.lifetime = 0.f;
     p.maxLifetime = 2.0f;
@@ -230,23 +212,21 @@ void ParticleSystem::spawnRainParticle(Particle& p, const Vec3& playerPos, float
 // spawnSnowParticle
 // ---------------------------------------------------------------------------
 void ParticleSystem::spawnSnowParticle(Particle& p, const Vec3& playerPos, float spawnRadius) {
-    static thread_local std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<float> angleDist(0.f, 2.f * static_cast<float>(M_PI));
-    std::uniform_real_distribution<float> radiusDist(0.f, spawnRadius);
-    std::uniform_real_distribution<float> unitDist(0.f, 1.f);
+    // Deterministic weather: the same seed always rains the same way
+    static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
 
-    float angle = angleDist(rng);
-    float radius = radiusDist(rng);
+    float angle = rng.nextFloat() * 2.f * static_cast<float>(M_PI);
+    float radius = rng.nextFloat() * spawnRadius;
 
     // Spawn above player
     p.position[0] = playerPos.x + std::cos(angle) * radius;
-    p.position[1] = playerPos.y + 96.f + unitDist(rng) * 32.f;
+    p.position[1] = playerPos.y + 96.f + rng.nextFloat() * 32.f;
     p.position[2] = playerPos.z + std::sin(angle) * radius;
 
     // Fall speed ~3 blocks/s with gentle initial drift
-    p.velocity[0] = (unitDist(rng) - 0.5f) * 0.5f;
+    p.velocity[0] = (rng.nextFloat() - 0.5f) * 0.5f;
     p.velocity[1] = -3.f;
-    p.velocity[2] = (unitDist(rng) - 0.5f) * 0.5f;
+    p.velocity[2] = (rng.nextFloat() - 0.5f) * 0.5f;
 
     p.lifetime = 0.f;
     p.maxLifetime = 5.0f;
@@ -259,18 +239,16 @@ void ParticleSystem::spawnSnowParticle(Particle& p, const Vec3& playerPos, float
 // ---------------------------------------------------------------------------
 bool ParticleSystem::isSnowBiome(const World& world, int x, int z) const {
     Biome biome = world.getBiome(x, z);
-    return biome == Biome::IceSpikes || biome == Biome::Taiga;
+    return biome == Biome::ICE_SPIKES || biome == Biome::TAIGA;
 }
 
 // ---------------------------------------------------------------------------
 // render — Draw active particles as billboards
 // ---------------------------------------------------------------------------
-void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder,
-                            const Mat4& viewMatrix,
-                            const Mat4& projectionMatrix,
-                            const Vec3& cameraPosition)
-{
-    if (!encoder || !_pipelineState) return;
+void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, const Mat4& viewMatrix,
+                            const Mat4& projectionMatrix, const Vec3& cameraPosition) {
+    if (!encoder || !_pipelineState)
+        return;
 
     // ---- Upload particle data to GPU ----
     GPUParticle* gpuParticles = reinterpret_cast<GPUParticle*>(_particleBuffer.contents);
@@ -278,30 +256,28 @@ void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder,
 
     for (size_t i = 0; i < MAX_PARTICLES; ++i) {
         const Particle& p = particles_[i];
-        if (!p.active) continue;
+        if (!p.active)
+            continue;
 
         GPUParticle& gp = gpuParticles[activeCount];
-        gp.position[0] = p.position[0];
-        gp.position[1] = p.position[1];
-        gp.position[2] = p.position[2];
-        gp.velocity[0] = p.velocity[0];
-        gp.velocity[1] = p.velocity[1];
-        gp.velocity[2] = p.velocity[2];
+        gp.position = simd_make_float3(p.position[0], p.position[1], p.position[2]);
+        gp.velocity = simd_make_float3(p.velocity[0], p.velocity[1], p.velocity[2]);
         gp.lifetime = p.lifetime;
         gp.type = static_cast<float>(static_cast<uint8_t>(p.type));
         ++activeCount;
     }
 
     // Skip draw if no active particles
-    if (activeCount == 0) return;
+    if (activeCount == 0)
+        return;
 
     // ---- Upload uniforms ----
     ParticleUniforms uniforms{};
-    std::memcpy(uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
-    std::memcpy(uniforms.projectionMatrix, projectionMatrix.data.data(), sizeof(uniforms.projectionMatrix));
-    uniforms.cameraPosition[0] = cameraPosition.x;
-    uniforms.cameraPosition[1] = cameraPosition.y;
-    uniforms.cameraPosition[2] = cameraPosition.z;
+    std::memcpy(&uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
+    std::memcpy(&uniforms.projectionMatrix, projectionMatrix.data.data(),
+                sizeof(uniforms.projectionMatrix));
+    uniforms.cameraPosition =
+        simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
     std::memcpy((void*)_uniformsBuffer.contents, &uniforms, sizeof(uniforms));
 
     // ---- Bind and draw ----
@@ -313,7 +289,5 @@ void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder,
     [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
 
     // Draw as point primitives (one point per particle)
-    [encoder drawPrimitives:MTLPrimitiveTypePoint
-                  vertexStart:0
-                   vertexCount:activeCount];
+    [encoder drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:activeCount];
 }

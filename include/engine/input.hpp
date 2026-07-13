@@ -1,8 +1,7 @@
 #pragma once
 
-#include <common/math.hpp>
-#include <common/result.hpp>
 #include <common/error.hpp>
+#include <common/math.hpp>
 
 #include <string>
 #include <unordered_map>
@@ -74,14 +73,24 @@ struct InputState {
     std::unordered_map<Key, bool> keysDown;
     std::unordered_map<Key, bool> keysJustPressed;
     std::unordered_map<Key, bool> keysJustReleased;
-    Vec2 mouseDelta;
-    Vec2 mousePosition;
+    // Presses accumulated for the 20 Hz game tick. keysJustPressed clears
+    // every FRAME (60 fps), but most frames run zero ticks — without this,
+    // jumps, hotbar keys, and block clicks were silently dropped whenever
+    // the press landed on a tickless frame.
+    std::unordered_map<Key, bool> keysPressedForTick;
+    Vec2 mouseDelta;         // accumulated raw look deltas while captured
+    Vec2 mousePosition;      // window points, bottom-left origin
+    float scrollDelta = 0.f; // accumulated scroll-wheel Y this frame
     bool mouseLeftDown = false;
     bool mouseRightDown = false;
 
     bool isDown(Key key) const;
     bool isJustPressed(Key key) const;
     bool isJustReleased(Key key) const;
+
+    // Edge-since-last-tick (consumed by clearTickPresses at tick end)
+    bool isPressedForTick(Key key) const;
+    void clearTickPresses();
 
     void update();
     void clearMouseDelta();
@@ -112,17 +121,28 @@ public:
     void handleMouseDown(NSEvent* event);
     void handleMouseUp(NSEvent* event);
 
-    // Cursor control
-    void hideAndConfineCursor();
-    void showCursor();
+    void handleScrollWheel(NSEvent* event);
+    void handleFlagsChanged(NSEvent* event);
+
+    // Pointer lock. While captured the hardware cursor is hidden and frozen
+    // (CGAssociateMouseAndMouseCursorPosition) and look input comes from raw
+    // NSEvent deltas, so the cursor can never wander out of the window
+    // mid-play. Release restores a normal cursor centered in the window.
+    void captureMouse();
+    void releaseMouse();
+    bool isMouseCaptured() const { return captured_; }
 
 private:
     InputState state_;
     NSWindow* window_ = nil;
 
-    // Cursor tracking
+    // Cursor state
     Vec2 lastMousePosition_;
-    bool cursorActive_ = false;
+    bool captured_ = false;
+    bool cursorHidden_ = false; // NSCursor hide/unhide must stay balanced
+
+    // Move the hardware cursor to the window center (CG coordinates).
+    void warpCursorToWindowCenter();
 
     // Event monitors
     id keyDownMonitor_ = nil;
@@ -131,7 +151,9 @@ private:
     id mouseDraggedMonitor_ = nil;
     id mouseDownMonitor_ = nil;
     id mouseUpMonitor_ = nil;
+    id scrollWheelMonitor_ = nil;
+    id flagsChangedMonitor_ = nil;
 
     static Key keyCodeToKey(NSInteger keyCode);
 };
-#endif  // __OBJC__
+#endif // __OBJC__
