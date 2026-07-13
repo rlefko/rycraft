@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <render/shader_types.hpp>
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -17,15 +18,6 @@ using namespace metal;
 //   float noiseFrequency  — noise scale (0.005)
 //   float cloudThreshold  — noise threshold for cloud presence (0.4)
 // ---------------------------------------------------------------------------
-
-struct CloudUniforms {
-    float3 cameraPosition;
-    float3 sunDirection;
-    float windOffset;
-    float cloudAltitude;
-    float noiseFrequency;
-    float cloudThreshold;
-};
 
 struct CloudVertexOut {
     float4 clipPosition [[position]];

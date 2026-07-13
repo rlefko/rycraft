@@ -1,20 +1,9 @@
 #import "render/bloom.hpp"
 
 #include "common/error.hpp"
+#include "render/shader_types.hpp"
 
 #include <cstring>
-
-// ---------------------------------------------------------------------------
-// BloomUniforms — matches the Metal shader struct exactly
-// ---------------------------------------------------------------------------
-struct alignas(16) BloomUniforms {
-    float resolution[2];
-    float texelSize[2];
-    float threshold;
-    float intensity;
-    float blurRadius;
-    float _padding;
-};
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -196,10 +185,8 @@ void Bloom::uploadUniforms(float resolution[2], float texelSize[2],
                            float threshold, float intensity, float blurRadius)
 {
     BloomUniforms uniforms{};
-    uniforms.resolution[0] = resolution[0];
-    uniforms.resolution[1] = resolution[1];
-    uniforms.texelSize[0] = texelSize[0];
-    uniforms.texelSize[1] = texelSize[1];
+    uniforms.resolution = simd_make_float2(resolution[0], resolution[1]);
+    uniforms.texelSize = simd_make_float2(texelSize[0], texelSize[1]);
     uniforms.threshold = threshold;
     uniforms.intensity = intensity;
     uniforms.blurRadius = blurRadius;

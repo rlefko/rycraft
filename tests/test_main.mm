@@ -15,7 +15,7 @@
 #include <render/texture_atlas.hpp>
 #include <render/mega_buffer.hpp>
 #include <render/ui_overlay.hpp>
-#include <render/uniforms.hpp>
+#include <render/shader_types.hpp>
 #include <entity/physics.hpp>
 #include <entity/player.hpp>
 #include <entity/voxel_traversal.hpp>
@@ -3838,35 +3838,49 @@ TEST_CASE("Performance HUD: float to string conversion", "[phase8][hud]") {
     REQUIRE(std::string(buf) == "0.5");
 }
 
-// ---- Uniforms struct tests ----
+// ---- Shared shader struct layout pins ----
+// shader_types.hpp is compiled by BOTH clang++ and the Metal compiler; simd
+// types have the same layout in each. These pins catch accidental drift
+// (reordered fields, ad-hoc padding) that previously corrupted fog, camera
+// position, sky colors, and particle data.
 
-TEST_CASE("Uniforms: size fits in 512-byte buffer", "[phase8][uniforms]") {
-    REQUIRE(sizeof(Uniforms) <= 512);
-}
-
-TEST_CASE("Uniforms: alignment is 16 bytes", "[phase8][uniforms]") {
+TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(Uniforms) == 288);
+    REQUIRE(offsetof(Uniforms, sunDirection) == 192);
+    REQUIRE(offsetof(Uniforms, fogColor) == 240);
+    REQUIRE(offsetof(Uniforms, fogDensity) == 256);
+    REQUIRE(offsetof(Uniforms, cameraPosition) == 272);
     REQUIRE(alignof(Uniforms) == 16);
 }
 
-TEST_CASE("Uniforms: fog fields are present", "[phase8][uniforms]") {
-    Uniforms u{};
-    std::memset(&u, 0, sizeof(u));
+TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(SkyUniforms) == 80);
+    REQUIRE(offsetof(SkyUniforms, horizonColor) == 16);
+    REQUIRE(offsetof(SkyUniforms, sunIntensity) == 64);
+}
 
-    // Set fog parameters
-    u.fogColor[0] = 0.5f;
-    u.fogColor[1] = 0.6f;
-    u.fogColor[2] = 0.7f;
-    u.fogDensity = 0.0003f;
-    u.cameraPosition[0] = 10.0f;
-    u.cameraPosition[1] = 64.0f;
-    u.cameraPosition[2] = -5.0f;
+TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(CloudUniforms) == 48);
+    REQUIRE(offsetof(CloudUniforms, sunDirection) == 16);
+    REQUIRE(offsetof(CloudUniforms, windOffset) == 32);
+    REQUIRE(offsetof(CloudUniforms, cloudThreshold) == 44);
+}
 
-    // Verify values are stored correctly
-    REQUIRE(u.fogColor[0] == Catch::Approx(0.5f));
-    REQUIRE(u.fogColor[1] == Catch::Approx(0.6f));
-    REQUIRE(u.fogColor[2] == Catch::Approx(0.7f));
-    REQUIRE(u.fogDensity == Catch::Approx(0.0003f));
-    REQUIRE(u.cameraPosition[0] == Catch::Approx(10.0f));
-    REQUIRE(u.cameraPosition[1] == Catch::Approx(64.0f));
-    REQUIRE(u.cameraPosition[2] == Catch::Approx(-5.0f));
+TEST_CASE("Shader types: GPUParticle layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(GPUParticle) == 48);
+    REQUIRE(offsetof(GPUParticle, velocity) == 16);
+    REQUIRE(offsetof(GPUParticle, lifetime) == 32);
+    REQUIRE(offsetof(GPUParticle, type) == 36);
+}
+
+TEST_CASE("Shader types: ParticleUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(ParticleUniforms) == 144);
+    REQUIRE(offsetof(ParticleUniforms, cameraPosition) == 128);
+}
+
+TEST_CASE("Shader types: BloomUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(BloomUniforms) == 32);
+    REQUIRE(offsetof(BloomUniforms, texelSize) == 8);
+    REQUIRE(offsetof(BloomUniforms, threshold) == 16);
+    REQUIRE(offsetof(BloomUniforms, blurRadius) == 24);
 }

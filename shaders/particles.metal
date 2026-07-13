@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <render/shader_types.hpp>
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -15,24 +16,9 @@ using namespace metal;
 // Vertices (buffer 0): GPUParticle array (position, velocity, lifetime, type)
 // ---------------------------------------------------------------------------
 
-struct ParticleUniforms {
-    float4x4 viewMatrix;
-    float4x4 projectionMatrix;
-    float3 cameraPosition;
-    float _pad0;
-};
-
-struct GPUParticle {
-    float3 position;
-    float _pad0;
-    float3 velocity;
-    float _pad1;
-    float lifetime;
-    float type;
-};
-
 struct ParticleVertexOutput {
     float4 clipPosition [[position]];
+    float pointSize [[point_size]];
     float particleType;
 };
 
@@ -40,10 +26,12 @@ struct ParticleVertexOutput {
 // Vertex shader — transform particle to clip space
 // ---------------------------------------------------------------------------
 vertex ParticleVertexOutput particleVertexMain(
-    constant GPUParticle& particle [[buffer(0)]],
+    device const GPUParticle* particles [[buffer(0)]],
     constant ParticleUniforms& uniforms [[buffer(1)]],
     uint vertexID [[vertex_id]]
 ) {
+    device const GPUParticle& particle = particles[vertexID];
+
     // Transform particle world position to clip space
     float4 worldPos = float4(particle.position, 1.0);
     float4 viewPos = uniforms.viewMatrix * worldPos;
@@ -52,6 +40,10 @@ vertex ParticleVertexOutput particleVertexMain(
     ParticleVertexOutput out;
     out.clipPosition = clipPos;
     out.particleType = particle.type;
+
+    // Point sprite size shrinks with distance (clamped so far particles stay visible)
+    float dist = max(length(viewPos.xyz), 1.0f);
+    out.pointSize = clamp(160.0f / dist, 2.0f, 12.0f);
 
     return out;
 }

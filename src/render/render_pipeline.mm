@@ -6,7 +6,6 @@
 #include "render/mesher.hpp"
 #include "render/particles.hpp"
 #include "render/ui_overlay.hpp"
-#include "render/uniforms.hpp"
 #include "world/chunk.hpp"
 #include "world/world.hpp"
 #include "engine/camera.hpp"
@@ -239,7 +238,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     }
 
     // Highlight uniforms buffer (same layout as Uniforms)
-    _highlightUniformsBuffer = [_device newBufferWithLength:256
+    _highlightUniformsBuffer = [_device newBufferWithLength:sizeof(Uniforms)
                                                       options:MTLResourceStorageModeShared];
     if (!_highlightUniformsBuffer) {
         RY_LOG_FATAL("Failed to allocate highlight uniforms buffer");
@@ -292,8 +291,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         RY_LOG_FATAL("Failed to allocate depth resolve texture");
     }
 
-    // ---- Uniforms buffer (512 bytes with fog + camera position) ----
-    _uniformsBuffer = [_device newBufferWithLength:512
+    // ---- Uniforms buffer ----
+    _uniformsBuffer = [_device newBufferWithLength:sizeof(Uniforms)
                                               options:MTLResourceStorageModeShared];
     if (!_uniformsBuffer) {
         RY_LOG_FATAL("Failed to allocate uniforms buffer");
@@ -412,9 +411,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     renderPassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
     renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(
-        skyUniforms.horizonColor[0],
-        skyUniforms.horizonColor[1],
-        skyUniforms.horizonColor[2],
+        skyUniforms.horizonColor.x,
+        skyUniforms.horizonColor.y,
+        skyUniforms.horizonColor.z,
         1.0f
     );
 
@@ -429,8 +428,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     if (!encoder) return;
 
     // ---- Opaque chunk pass ----
+    const float fogColor[3] = {skyUniforms.horizonColor.x,
+                               skyUniforms.horizonColor.y,
+                               skyUniforms.horizonColor.z};
     renderChunks(encoder, world, viewMatrix, projectionMatrix,
-                 sunDirection, sunColor, ambientColor, skyUniforms.horizonColor);
+                 sunDirection, sunColor, ambientColor, fogColor);
 
     // ---- Block highlight pass (after opaque chunks, before UI) ----
     if (highlightedBlock.has_value()) {
@@ -574,10 +576,10 @@ void RenderPipeline::computeDayNightUniforms(uint64_t worldTime,
         horizonColor = nightHorizon;
     }
 
-    std::memcpy(skyUniforms.zenithColor, zenithColor, sizeof(skyUniforms.zenithColor));
-    std::memcpy(skyUniforms.horizonColor, horizonColor, sizeof(skyUniforms.horizonColor));
-    std::memcpy(skyUniforms.sunDirection, sunDirection, sizeof(skyUniforms.sunDirection));
-    std::memcpy(skyUniforms.sunColor, sunColor, sizeof(skyUniforms.sunColor));
+    skyUniforms.zenithColor = simd_make_float3(zenithColor[0], zenithColor[1], zenithColor[2]);
+    skyUniforms.horizonColor = simd_make_float3(horizonColor[0], horizonColor[1], horizonColor[2]);
+    skyUniforms.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
+    skyUniforms.sunColor = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
     skyUniforms.sunIntensity = std::max(0.0f, sunElevation);
 }
 
@@ -593,9 +595,9 @@ void RenderPipeline::renderSky(id<MTLCommandBuffer> commandBuffer,
     skyPassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
     skyPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
     skyPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(
-        skyUniforms.horizonColor[0],
-        skyUniforms.horizonColor[1],
-        skyUniforms.horizonColor[2],
+        skyUniforms.horizonColor.x,
+        skyUniforms.horizonColor.y,
+        skyUniforms.horizonColor.z,
         1.0f
     );
 
@@ -636,33 +638,23 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
 
     // Pack and upload uniforms
     Uniforms uniforms{};
-    std::memset(&uniforms, 0, sizeof(Uniforms));
 
-    // Identity model matrix
-    uniforms.modelMatrix[0] = 1.f;
-    uniforms.modelMatrix[5] = 1.f;
-    uniforms.modelMatrix[10] = 1.f;
-    uniforms.modelMatrix[15] = 1.f;
-
-    // View and projection
-    std::memcpy(uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
-    std::memcpy(uniforms.projectionMatrix, projectionMatrix.data.data(), sizeof(uniforms.projectionMatrix));
+    uniforms.modelMatrix = matrix_identity_float4x4;
+    std::memcpy(&uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
+    std::memcpy(&uniforms.projectionMatrix, projectionMatrix.data.data(),
+                sizeof(uniforms.projectionMatrix));
 
     // Lighting
-    std::memcpy(uniforms.sunDirection, sunDirection, sizeof(uniforms.sunDirection));
-    std::memcpy(uniforms.sunColor, sunColor, sizeof(uniforms.sunColor));
-    std::memcpy(uniforms.ambientColor, ambientColor, sizeof(uniforms.ambientColor));
+    uniforms.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
+    uniforms.sunColor = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
+    uniforms.ambientColor = simd_make_float3(ambientColor[0], ambientColor[1], ambientColor[2]);
 
-    // Fog parameters (Phase 8)
-    uniforms.fogColor[0] = fogColor[0];
-    uniforms.fogColor[1] = fogColor[1];
-    uniforms.fogColor[2] = fogColor[2];
+    // Fog parameters
+    uniforms.fogColor = simd_make_float3(fogColor[0], fogColor[1], fogColor[2]);
     uniforms.fogDensity = 0.0003f; // Per block
 
     // Camera position for fog distance calculation
-    uniforms.cameraPosition[0] = camX;
-    uniforms.cameraPosition[1] = camY;
-    uniforms.cameraPosition[2] = camZ;
+    uniforms.cameraPosition = simd_make_float3(camX, camY, camZ);
 
     // Upload to GPU
     std::memcpy((void*)_uniformsBuffer.contents, &uniforms, sizeof(Uniforms));
@@ -798,31 +790,21 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
 {
     // Upload highlight-specific uniforms with translation to block position
     Uniforms uniforms{};
-    std::memset(&uniforms, 0, sizeof(Uniforms));
 
     // Translation matrix to move wireframe box to block position
     // With slight offset (0.002) to prevent z-fighting
-    uniforms.modelMatrix[0] = 1.f;
-    uniforms.modelMatrix[5] = 1.f;
-    uniforms.modelMatrix[10] = 1.f;
-    uniforms.modelMatrix[15] = 1.f;
-    uniforms.modelMatrix[12] = blockPos.x - 0.002f;
-    uniforms.modelMatrix[13] = blockPos.y - 0.002f;
-    uniforms.modelMatrix[14] = blockPos.z - 0.002f;
+    uniforms.modelMatrix = matrix_identity_float4x4;
+    uniforms.modelMatrix.columns[3] =
+        simd_make_float4(blockPos.x - 0.002f, blockPos.y - 0.002f, blockPos.z - 0.002f, 1.0f);
 
-    std::memcpy(uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
-    std::memcpy(uniforms.projectionMatrix, projectionMatrix.data.data(), sizeof(uniforms.projectionMatrix));
+    std::memcpy(&uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
+    std::memcpy(&uniforms.projectionMatrix, projectionMatrix.data.data(),
+                sizeof(uniforms.projectionMatrix));
 
     // Yellow highlight color
-    uniforms.sunDirection[0] = 1.0f;
-    uniforms.sunDirection[1] = 1.0f;
-    uniforms.sunDirection[2] = 0.0f;
-    uniforms.sunColor[0] = 1.0f;
-    uniforms.sunColor[1] = 1.0f;
-    uniforms.sunColor[2] = 0.0f;
-    uniforms.ambientColor[0] = 0.0f;
-    uniforms.ambientColor[1] = 0.0f;
-    uniforms.ambientColor[2] = 0.0f;
+    uniforms.sunDirection = simd_make_float3(1.0f, 1.0f, 0.0f);
+    uniforms.sunColor = simd_make_float3(1.0f, 1.0f, 0.0f);
+    uniforms.ambientColor = simd_make_float3(0.0f, 0.0f, 0.0f);
 
     std::memcpy((void*)_highlightUniformsBuffer.contents, &uniforms, sizeof(Uniforms));
 
@@ -1126,18 +1108,11 @@ void RenderPipeline::renderClouds(id<MTLCommandBuffer> commandBuffer,
 
     // Cloud uniforms
     CloudUniforms cloudUniforms{};
-    std::memset(&cloudUniforms, 0, sizeof(cloudUniforms));
 
-    // Camera position
     Vec3 camPos = camera.getPosition();
-    cloudUniforms.cameraPosition[0] = camPos.x;
-    cloudUniforms.cameraPosition[1] = camPos.y;
-    cloudUniforms.cameraPosition[2] = camPos.z;
-
-    // Sun direction
-    cloudUniforms.sunDirection[0] = sunDirection[0];
-    cloudUniforms.sunDirection[1] = sunDirection[1];
-    cloudUniforms.sunDirection[2] = sunDirection[2];
+    cloudUniforms.cameraPosition = simd_make_float3(camPos.x, camPos.y, camPos.z);
+    cloudUniforms.sunDirection =
+        simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
 
     // Wind offset: worldTime * windSpeed (0.02 blocks/tick)
     cloudUniforms.windOffset = static_cast<float>(worldTime) * 0.02f;

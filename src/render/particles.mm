@@ -31,29 +31,12 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         RY_LOG_FATAL("Failed to load particle fragment shader 'particleFragmentMain'");
     }
 
-    // ---- Vertex descriptor: GPUParticle at buffer 0 ----
-    auto vertexDesc = [MTLVertexDescriptor vertexDescriptor];
-
-    // GPUParticle layout (32 bytes):
-    //   position(12) + pad(4) + velocity(12) + pad(4) + lifetime(4) + type(4)
-    vertexDesc.attributes[0].format = MTLVertexFormatFloat3;
-    vertexDesc.attributes[0].offset = 0;
-    vertexDesc.attributes[0].bufferIndex = 0;
-
-    vertexDesc.attributes[1].format = MTLVertexFormatFloat;
-    vertexDesc.attributes[1].offset = 28;
-    vertexDesc.attributes[1].bufferIndex = 0;
-
-    // Stride = sizeof(GPUParticle) = 32 bytes
-    vertexDesc.layouts[0].stride = sizeof(GPUParticle);
-    vertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
-    vertexDesc.layouts[0].stepRate = 1;
-
     // ---- Render pipeline state (alpha-blended points) ----
+    // The vertex shader indexes the GPUParticle buffer directly by vertex_id,
+    // so no vertex descriptor is involved.
     auto pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
-    pipelineDesc.vertexDescriptor = vertexDesc;
 
     pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pipelineDesc.colorAttachments[0].blendingEnabled = true;
@@ -281,12 +264,8 @@ void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder,
         if (!p.active) continue;
 
         GPUParticle& gp = gpuParticles[activeCount];
-        gp.position[0] = p.position[0];
-        gp.position[1] = p.position[1];
-        gp.position[2] = p.position[2];
-        gp.velocity[0] = p.velocity[0];
-        gp.velocity[1] = p.velocity[1];
-        gp.velocity[2] = p.velocity[2];
+        gp.position = simd_make_float3(p.position[0], p.position[1], p.position[2]);
+        gp.velocity = simd_make_float3(p.velocity[0], p.velocity[1], p.velocity[2]);
         gp.lifetime = p.lifetime;
         gp.type = static_cast<float>(static_cast<uint8_t>(p.type));
         ++activeCount;
@@ -297,11 +276,10 @@ void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder,
 
     // ---- Upload uniforms ----
     ParticleUniforms uniforms{};
-    std::memcpy(uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
-    std::memcpy(uniforms.projectionMatrix, projectionMatrix.data.data(), sizeof(uniforms.projectionMatrix));
-    uniforms.cameraPosition[0] = cameraPosition.x;
-    uniforms.cameraPosition[1] = cameraPosition.y;
-    uniforms.cameraPosition[2] = cameraPosition.z;
+    std::memcpy(&uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
+    std::memcpy(&uniforms.projectionMatrix, projectionMatrix.data.data(),
+                sizeof(uniforms.projectionMatrix));
+    uniforms.cameraPosition = simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
     std::memcpy((void*)_uniformsBuffer.contents, &uniforms, sizeof(uniforms));
 
     // ---- Bind and draw ----

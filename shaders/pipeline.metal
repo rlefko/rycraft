@@ -1,23 +1,6 @@
 #include <metal_stdlib>
+#include <render/shader_types.hpp>
 using namespace metal;
-
-// ---------------------------------------------------------------------------
-// Uniforms — bound as a constant buffer via [[buffer(N)]]
-// ---------------------------------------------------------------------------
-struct Uniforms {
-    float4x4 modelMatrix;
-    float4x4 viewMatrix;
-    float4x4 projectionMatrix;
-    float3 sunDirection;   // Normalized direction to the sun
-    float3 sunColor;
-    float3 ambientColor;
-    float _padding;
-    // Fog (Phase 8)
-    float3 fogColor;
-    float fogDensity;
-    float3 cameraPosition;
-    float _padding2;
-};
 
 // ---------------------------------------------------------------------------
 // Vertex input — bound through the vertex descriptor (not argument buffer)

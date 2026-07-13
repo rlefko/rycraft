@@ -17,6 +17,7 @@ foreach name : shader_names
       '-o', '@OUTPUT@',
       '@INPUT@',
     ],
+    depend_files : files('../include/render/shader_types.hpp'),
   )
 endforeach
 

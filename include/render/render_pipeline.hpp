@@ -13,6 +13,7 @@
 #include "engine/hotbar.hpp"
 #include "render/mega_buffer.hpp"
 #include "render/particles.hpp"
+#include "render/shader_types.hpp"
 #include "render/texture_atlas.hpp"
 #include "render/vertex.hpp"
 
@@ -27,28 +28,6 @@ class ParticleSystem;
 struct ChunkMeshState {
     MegaBuffer::ChunkAllocation alloc;
     bool uploaded = false;
-};
-
-// Sky uniforms for day/night cycle
-struct SkyUniforms {
-    float zenithColor[3];
-    float horizonColor[3];
-    float sunDirection[3];
-    float sunColor[3];
-    float sunIntensity;
-    float padding;
-};
-
-// Cloud uniforms (Phase 8)
-struct CloudUniforms {
-    float cameraPosition[3];
-    float _pad0;
-    float sunDirection[3];
-    float _pad1;
-    float windOffset;
-    float cloudAltitude;
-    float noiseFrequency;
-    float cloudThreshold;
 };
 
 // MetalFX Upscaler stub (Phase 8.4 — placeholder for Phase 9.4 optimization)

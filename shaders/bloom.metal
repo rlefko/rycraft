@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <render/shader_types.hpp>
 using namespace metal;
 
 // ---------------------------------------------------------------------------
@@ -10,15 +11,6 @@ using namespace metal;
 //   3. Composite pass — additive blend bloom onto original scene
 //   4. ACES tone mapping applied during composite
 // ---------------------------------------------------------------------------
-
-// ---- Uniforms for bloom passes ----
-struct BloomUniforms {
-    float2 resolution;    // output texture width, height
-    float2 texelSize;     // 1.0/width, 1.0/height
-    float threshold;      // brightness threshold for extract (default 1.0)
-    float intensity;      // bloom intensity multiplier (default 1.0)
-    float blurRadius;     // Kawase blur radius in texels
-};
 
 // ---- Fullscreen quad vertex output ----
 struct BloomVertexOut {

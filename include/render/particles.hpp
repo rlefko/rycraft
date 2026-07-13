@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "common/math.hpp"
+#include "render/shader_types.hpp"
 #include "world/chunk.hpp"
 
 #include <cstdint>
@@ -35,30 +36,8 @@ struct alignas(16) Particle {
     uint8_t _pad[2];
 };
 
-// ---------------------------------------------------------------------------
-// GPUParticle — Per-particle data uploaded to GPU each frame
-//
-// Layout: position(12) + velocity(12) + lifetime(4) + type(4) = 32 bytes
-// Aligned to 16 bytes for Metal buffer stride.
-// ---------------------------------------------------------------------------
-struct alignas(16) GPUParticle {
-    float position[3];
-    float _pad0;
-    float velocity[3];
-    float _pad1;
-    float lifetime;
-    float type;
-};
-
-// ---------------------------------------------------------------------------
-// ParticleUniforms — GPU uniform buffer for particle vertex shader
-// ---------------------------------------------------------------------------
-struct alignas(16) ParticleUniforms {
-    float viewMatrix[16];
-    float projectionMatrix[16];
-    float cameraPosition[3];
-    float _pad0;
-};
+// GPUParticle and ParticleUniforms live in render/shader_types.hpp, shared
+// with particles.metal so the two sides can never disagree on layout.
 
 // ---------------------------------------------------------------------------
 // ParticleSystem — CPU-simulated, GPU-rendered weather particles.
