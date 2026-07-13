@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // Audio callback C function → C++ method bridge
@@ -29,7 +30,8 @@ OSStatus audioRenderCallback(void* inRefCon, AudioUnitRenderActionFlags* ioActio
 // Constructor
 // ---------------------------------------------------------------------------
 AudioEngine::AudioEngine() : _audioUnit(nullptr), _outputFormat{} {
-    std::memset(_voices, 0, sizeof(_voices));
+    // _voices default-initialize on their own; a memset here would be UB over
+    // the std::vector members (and it wiped their sampleRate/gain defaults).
 }
 
 // ---------------------------------------------------------------------------
@@ -171,13 +173,19 @@ int32_t AudioEngine::playSound(const std::vector<float>& buffer, uint32_t sample
     if (buffer.empty())
         return -1;
 
+    // Copy the incoming buffer OUTSIDE the lock, then swap it into the slot
+    // UNDER the lock. This keeps the critical section O(1) — no malloc/free
+    // runs while the real-time render thread may be blocked on the mutex, and
+    // the slot's previous buffer frees after the lock is released.
+    std::vector<float> incoming = buffer;
+
     std::lock_guard<std::mutex> lock(_voiceMutex);
 
     int32_t voiceIndex = allocateVoice();
     if (voiceIndex < 0)
         return -1;
 
-    _voices[voiceIndex].samples = buffer;
+    std::swap(_voices[voiceIndex].samples, incoming);
     _voices[voiceIndex].sampleRate = sampleRate;
     _voices[voiceIndex].gain = gain;
     _voices[voiceIndex].readPosition = 0;
@@ -220,12 +228,22 @@ void AudioEngine::audioCallback(AudioBufferList* outputData) {
     // Clear output buffer
     std::memset(outputBuffer, 0, outputData->mBuffers[0].mDataByteSize);
 
+    // Hold the voice lock for the WHOLE mix. playSound/stopVoice mutate the
+    // voice table (including reallocating a voice's sample buffer) under this
+    // same lock; reading it here without the lock was a data race — a torn
+    // std::vector read / use-after-free on the real-time thread that corrupted
+    // the heap and made libmalloc trap (the "trace trap"). This finally makes
+    // the code honor the documented "voice table is mutex-guarded" invariant.
+    std::lock_guard<std::mutex> lock(_voiceMutex);
+
+    const float masterVolume = _masterVolume.load();
+
     // Mix all active voices
     for (int i = 0; i < MAX_VOICES; ++i) {
         if (!_voices[i].active)
             continue;
 
-        const auto& voice = _voices[i];
+        auto& voice = _voices[i];
         if (voice.samples.empty())
             continue;
 
@@ -234,22 +252,21 @@ void AudioEngine::audioCallback(AudioBufferList* outputData) {
 
         for (uint32_t f = 0; f < framesToMix; ++f) {
             float sample = voice.samples[voice.readPosition + f];
-            float mixedSample = sample * voice.gain * _masterVolume;
+            float mixedSample = sample * voice.gain * masterVolume;
 
             // Write to both channels (mono → stereo)
             outputBuffer[f * 2] += mixedSample;     // left
             outputBuffer[f * 2 + 1] += mixedSample; // right
         }
 
-        // Advance read position
-        if (!_voices[i].looping) {
+        // Advance read position (already holding _voiceMutex — deallocate
+        // directly; a nested lock_guard would deadlock the non-recursive mutex)
+        if (!voice.looping) {
             uint32_t newReadPos = voice.readPosition + framesToMix;
             if (newReadPos >= samplesAvailable) {
-                // Voice finished — deallocate
-                std::lock_guard<std::mutex> lock(_voiceMutex);
-                deallocateVoice(i);
+                deallocateVoice(i); // voice finished
             } else {
-                _voices[i].readPosition = newReadPos;
+                voice.readPosition = newReadPos;
             }
         }
     }

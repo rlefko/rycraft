@@ -22,7 +22,7 @@ public:
     float pitch = 0.f;
     bool onGround = false;
     int health = 20;
-    int fallDistance = 0;
+    float fallDistance = 0.f; // blocks descended since last landing/reset
     int jumpCooldown = 0;
     int fallResetTimer = 0;
 
@@ -30,7 +30,9 @@ public:
     static constexpr float WIDTH = 0.6f;
     static constexpr float HEIGHT = 1.8f;
 
-    // Physics constants (Minecraft-tuned)
+    // Physics constants — authentic vanilla Minecraft: gravity -0.08 blocks/tick²,
+    // vertical drag 0.98, terminal velocity -3.92 blocks/tick (= 49 × gravity),
+    // jump velocity 0.42 (giving a ~1.25-block apex that clears a 1-block step).
     static constexpr float GRAVITY = -0.08f;
     static constexpr float HORIZONTAL_DRAG_AIR = 0.91f;
     static constexpr float HORIZONTAL_DRAG_GROUND = 0.546f;

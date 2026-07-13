@@ -24,6 +24,7 @@ The F3 debug HUD shows the real numbers (EMA frame time, live chunk/entity count
 
 - **Never generate, load, or perform I/O under `chunksMutex_`** — it's on the render thread's path. Release, do the work, re-insert with `try_emplace`; a rare duplicate generation beats a guaranteed stall. **Why:** `getChunk` once generated whole chunks inside the lock.
 - Accepted trade-off: two threads may occasionally generate the same chunk; `try_emplace` keeps one and drops the other. Document any new instance of this pattern.
+- **The audio render callback holds `_voiceMutex` for the entire mix, and `playSound` must not allocate under it** — copy the incoming buffer outside the lock, then `std::swap` it into the slot so the critical section is O(1). **Why:** one-sided locking (callback read the voice table lock-free while `playSound` reallocated it) let the real-time thread read a torn `std::vector` and trap; a `malloc`/`free` under the lock would instead stall that thread.
 
 ## 3. Simulation cost scales with what the player can perceive
 

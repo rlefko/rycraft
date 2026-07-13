@@ -322,13 +322,15 @@ TEST_CASE("Player gravity: velocity.y decreases by 0.08 per tick", "[player]") {
     InputState input;
     player.tick(*world, input, false);
 
-    // After one tick: gravity (-0.08) applied, then vertical drag (0.98)
-    // velocity.y = (0 + (-0.08)) * 0.98 = -0.0784
+    // After one tick, gravity then vertical drag have been applied for the
+    // next tick: velocity.y = (0 + GRAVITY) * VERTICAL_DRAG. Reference the
+    // constants so the assertion survives feel-tuning of gravity.
     REQUIRE(player.velocity.y < 0.f);
-    REQUIRE(player.velocity.y == Catch::Approx(-0.08f * 0.98f).margin(0.01f));
+    REQUIRE(player.velocity.y ==
+            Catch::Approx(Player::GRAVITY * Player::VERTICAL_DRAG).margin(0.01f));
 }
 
-TEST_CASE("Player terminal velocity: clamped to -3.92", "[player]") {
+TEST_CASE("Player terminal velocity: clamped to TERMINAL_VELOCITY", "[player]") {
     auto world = std::make_shared<World>(42);
     // Place floor very far below
     for (int x = -10; x <= 10; ++x) {
@@ -344,8 +346,8 @@ TEST_CASE("Player terminal velocity: clamped to -3.92", "[player]") {
     InputState input;
     player.tick(*world, input, false);
 
-    // Velocity should be clamped to terminal velocity (after drag)
-    // -10 * 0.98 = -9.8, then clamped to -3.92
+    // Velocity should be clamped to terminal velocity: -10 * drag is still
+    // below TERMINAL_VELOCITY, so the clamp pins it exactly there.
     REQUIRE(player.velocity.y >= Player::TERMINAL_VELOCITY);
 }
 
@@ -397,6 +399,141 @@ TEST_CASE("Player resetFallDistance clears fall tracking", "[player]") {
     player.fallDistance = 10;
     player.resetFallDistance();
     REQUIRE(player.fallDistance == 0);
+}
+
+// Helper: a flat stone platform whose top surface is y = groundTopY.
+static std::shared_ptr<World> makePlatform(int groundTopY, int radius = 6) {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    for (int x = -radius; x <= radius; ++x) {
+        for (int z = -radius; z <= radius; ++z) {
+            world->setBlock(x, groundTopY - 1, z, BlockType::STONE);
+        }
+    }
+    return world;
+}
+
+TEST_CASE("Player jump clears a full block (apex ~1.25, at least 1.0)", "[player][physics]") {
+    auto world = makePlatform(201);
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    InputState input;
+
+    // Settle onto the ground first
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, input, false);
+    REQUIRE(player.onGround);
+
+    float startY = player.position.y;
+    player.jump();
+    REQUIRE(player.velocity.y == Catch::Approx(Player::JUMP_VELOCITY));
+
+    float maxY = startY;
+    for (int i = 0; i < 15; ++i) {
+        player.tick(*world, input, false);
+        if (player.position.y > maxY)
+            maxY = player.position.y;
+    }
+
+    float apex = maxY - startY;
+    REQUIRE(apex >= 1.0f); // must rise a full block to land on a 1-block step
+    REQUIRE(apex < 1.5f);  // but the vanilla apex is ~1.25, not a moon jump
+}
+
+TEST_CASE("Player jumps onto a 1-block step while walking into it", "[player][physics]") {
+    auto world = makePlatform(201);
+    // Raise the ground one block for z >= 3 → a 1-block step up (top y = 202)
+    for (int x = -6; x <= 6; ++x) {
+        for (int z = 3; z <= 6; ++z) {
+            world->setBlock(x, 201, z, BlockType::STONE);
+        }
+    }
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    player.yaw = 0.f; // facing +Z, straight at the step
+    InputState input;
+    input.keysDown[Key::W] = true;
+
+    // Walk forward, jumping whenever grounded, until the player is standing on
+    // top of the raised step (grounded at y ~= 202, not merely mid-jump).
+    bool onStep = false;
+    for (int i = 0; i < 120; ++i) {
+        if (player.onGround)
+            player.jump();
+        player.tick(*world, input, false);
+        if (player.onGround && player.position.y > 201.5f) {
+            onStep = true;
+            break;
+        }
+    }
+
+    REQUIRE(onStep);
+    REQUIRE(player.position.y == Catch::Approx(202.f).margin(0.05f)); // on the step top
+    REQUIRE(player.position.z > 3.f);                                 // advanced onto it
+}
+
+TEST_CASE("Player vertical velocity never saturates while standing", "[player][physics]") {
+    auto world = makePlatform(201);
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    InputState input;
+
+    // Standing for 3 s of ticks must not let velocity.y creep toward terminal.
+    // (Before the fix it accumulated to ~-3.4 and dropped the player a whole
+    // block the instant they stepped off a ledge.)
+    for (int i = 0; i < 60; ++i) {
+        player.tick(*world, input, false);
+        REQUIRE(std::abs(player.velocity.y) < 0.2f);
+    }
+    REQUIRE(player.onGround);
+
+    // Step off the edge — the first airborne tick falls only a little.
+    player.position = Vec3{20.f, 201.f, 20.f}; // nothing underfoot
+    player.onGround = false;
+    float beforeY = player.position.y;
+    player.tick(*world, input, false);
+    float drop = beforeY - player.position.y;
+    REQUIRE(drop > 0.f);  // it does fall
+    REQUIRE(drop < 0.2f); // but gradually, not ~1 block in one tick
+}
+
+TEST_CASE("Player takes no fall damage from a 1-block drop", "[player][physics]") {
+    auto world = makePlatform(201);
+
+    Player player;
+    player.health = 20;
+    player.position = Vec3{0.f, 202.f, 0.f}; // exactly one block above the surface
+    player.onGround = false;
+    InputState input;
+
+    for (int i = 0; i < 40; ++i)
+        player.tick(*world, input, false);
+
+    REQUIRE(player.onGround);
+    REQUIRE(player.position.y == Catch::Approx(201.f).margin(0.02f));
+    REQUIRE(player.health == 20); // a 1-block fall is harmless
+}
+
+TEST_CASE("Player still takes fall damage from a tall drop", "[player][physics]") {
+    auto world = makePlatform(101);
+
+    Player player;
+    player.health = 20;
+    player.position = Vec3{0.f, 130.f, 0.f}; // ~29 blocks up
+    player.onGround = false;
+    InputState input;
+
+    for (int i = 0; i < 200; ++i) {
+        player.tick(*world, input, false);
+        if (player.onGround)
+            break;
+    }
+
+    REQUIRE(player.onGround);
+    REQUIRE(player.health < 20); // a long fall still hurts
 }
 
 // ============================================================================
@@ -645,6 +782,25 @@ TEST_CASE("Entity physics: entity stops on ground", "[entity][physics]") {
     REQUIRE(entity->position.y >= 200.f);
     // Vertical velocity should be reduced (collision absorbs some)
     REQUIRE(std::abs(entity->velocity.y) < 2.f);
+}
+
+TEST_CASE("Entity vertical velocity does not saturate on the ground", "[entity][physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    for (int x = -3; x <= 3; ++x) {
+        for (int z = -3; z <= 3; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    auto sheep = std::make_shared<Entity>(202, EntityType::SHEEP, Vec3{0.f, 201.f, 0.f});
+    // Standing on the ground must keep velocity.y from creeping toward terminal
+    // velocity — the same missing reset that made the player fall instantly.
+    for (int i = 0; i < 60; ++i) {
+        sheep->tick(*world);
+        REQUIRE(std::abs(sheep->velocity.y) < 0.2f);
+    }
+    REQUIRE(sheep->onGround);
 }
 
 TEST_CASE("Entity physics: step assist climbs 1-block gap", "[entity][physics]") {

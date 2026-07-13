@@ -154,6 +154,13 @@ void Entity::tick(World& world) {
     int footZ = static_cast<int>(std::floor(position.z));
     onGround = PhysicsEngine::isSolid(world, footX, footY, footZ);
 
+    // Zero downward velocity while grounded so it does not saturate toward
+    // terminal velocity between ticks — the same missing reset that made the
+    // player fall a whole block in a single tick after standing still.
+    if (onGround && velocity.y < 0.f) {
+        velocity.y = 0.f;
+    }
+
     // 6. Update AABB
     aabb = computeAABB();
 
