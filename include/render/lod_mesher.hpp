@@ -1,6 +1,8 @@
 #pragma once
 
 #include "render/vertex.hpp"
+#include "world/block_properties.hpp"
+#include "world/mesh_snapshot.hpp"
 #include <cstdint>
 #include <vector>
 
@@ -36,6 +38,17 @@ enum class ChunkLOD : int {
     COUNT = 3
 };
 
+// Reusable per-thread meshing buffers. Building a full chunk mesh used to
+// heap-allocate ~2.25 MB of scratch per build (~36 MB/frame during
+// streaming bursts); assign() on long-lived vectors keeps the capacity.
+struct MeshScratch {
+    std::vector<bool> faceMask;
+    std::vector<BlockType> blockTypes;
+    std::vector<uint8_t> cellLight;
+    std::vector<bool> merged;
+    std::vector<int> skyHeight;
+};
+
 // Greedy mesher with level-of-detail support. This is the single mesher in
 // the engine: ChunkLOD::FULL runs the standard 16×16×256 greedy meshing, the
 // coarser levels sample the chunk at reduced resolution first.
@@ -44,6 +57,12 @@ enum class ChunkLOD : int {
 //   LOD 1 (mid,   128-256 blocks): 2× downsampling (8×8×128)
 //   LOD 2 (far,   256-512 blocks): 4× downsampling (4×4×64)
 //   Beyond 512 blocks: returns empty mesh (distance culling)
+//
+// The game meshes through the MeshSnapshot overload: real neighbor walls
+// make chunk-boundary faces symmetric (no hidden interior walls between
+// solid chunks, no holes or light seams at borders). The Chunk overload
+// treats out-of-chunk as air and remains for the coarse LODs and for
+// single-chunk unit tests.
 //
 // NOTE: the renderer currently draws everything at ChunkLOD::FULL — the
 // coarse levels emit geometry at grid scale (not world scale) and switching
@@ -54,6 +73,10 @@ public:
     // Build mesh for the given chunk at the specified LOD level.
     // Returns empty mesh when lodLevel >= ChunkLOD::COUNT (distance-culled).
     MeshOutput buildMesh(const Chunk& chunk, int lodLevel);
+
+    // Neighbor-aware full-detail build — the game's meshing path. Pure CPU
+    // (no Metal), safe to run on any thread with a per-thread scratch.
+    static MeshOutput buildMesh(const MeshSnapshot& snapshot, MeshScratch& scratch);
 
     // Determine LOD level from distance (in blocks) to chunk center.
     // Returns ChunkLOD::COUNT when chunk is beyond render distance.

@@ -13,11 +13,13 @@
 #include "common/math.hpp"
 #include "engine/hotbar.hpp"
 #include "render/block_texture_array.hpp"
+#include "render/lod_mesher.hpp"
 #include "render/mega_buffer.hpp"
 #include "render/particles.hpp"
 #include "render/shader_types.hpp"
 #include "render/ui_menu.hpp"
 #include "render/vertex.hpp"
+#include "world/mesh_snapshot.hpp"
 
 // Forward declarations
 class Entity;
@@ -205,6 +207,11 @@ private:
 
     // HUD counters, written only by the render thread during renderChunks.
     ChunkRenderStats _chunkStats;
+
+    // Reused meshing buffers (render thread only) — snapshot + scratch keep
+    // their capacity across builds instead of reallocating ~85 KB each time.
+    MeshSnapshot _meshSnapshot;
+    MeshScratch _meshScratch;
 
     // ---- Day/Night Cycle (Task 6.4-6.5) ----
     void computeDayNightUniforms(uint64_t worldTime, float sunDirection[3], float sunColor[3],

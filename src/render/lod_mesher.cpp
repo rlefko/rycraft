@@ -6,24 +6,27 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <functional>
 #include <unordered_map>
 
 // ==========================================================================
 // Generic greedy mesher — works with any grid dimensions.
 //
-// Replaces the hardcoded 16×16×256 constants with template parameters and
-// uses a block accessor callback instead of a Chunk reference. This allows
-// the same meshing pipeline to run on full-resolution and coarse-resolution
-// grids without code duplication.
+// The block accessor is a template parameter (a chunk read used to go
+// through std::function — ~1M indirect calls per full build, the mesher's
+// documented hot-path debt). The six directional passes run twice per build
+// with different visibility predicates: once for the opaque cube section,
+// once for water surfaces (drawn by the dedicated water pass).
 //
-// The six directional passes run twice per build with different visibility
-// predicates: once for the opaque cube section, once for water surfaces
-// (drawn by the dedicated water pass). Flat 1D arrays used throughout to
-// avoid vector<vector<T>> allocation overhead.
+// `padded` builds (MeshSnapshot) read one real neighbor block beyond every
+// XZ edge: boundary faces emit exactly when the neighbor doesn't hide them
+// — the same rule as interior faces. Unpadded builds (coarse LODs, unit
+// tests) treat out-of-grid as air and skip the +X/+Z boundary layer, which
+// over-draws interior walls but can't read neighbors it doesn't have.
+//
+// Flat 1D arrays used throughout to avoid vector<vector<T>> allocation
+// overhead. Indexing: idx(row, col, width) = row * width + col.
 // ==========================================================================
 
-using BlockAccessor = std::function<BlockType(int, int, int)>;
 inline static int idx(int row, int col, int width) {
     return row * width + col;
 }
@@ -136,20 +139,27 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
 // The six directional passes for one visibility predicate. topDrop lowers
 // the +Y face plane (the water surface sits 0.125 below the cell top —
 // fp16-exact at every chunk-local magnitude, so no cracks).
-template <typename Visible>
-static void runGreedyPasses(int gridW, int gridH, int gridD, const BlockAccessor& getBlock,
-                            const Visible& visible, const auto& lightAt, float topDrop,
-                            std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices) {
-    // Reusable flat buffers for face processing (avoid reallocation per face)
-    std::vector<bool> faceMask;
-    std::vector<BlockType> blockTypes;
-    std::vector<uint8_t> cellLight;
-    std::vector<bool> merged;
+template <typename Access, typename Visible>
+static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBlock,
+                            const Visible& visible, const auto& lightAt, float topDrop, bool padded,
+                            MeshScratch& scratch, std::vector<Vertex>& outVertices,
+                            std::vector<uint32_t>& outIndices) {
+    std::vector<bool>& faceMask = scratch.faceMask;
+    std::vector<BlockType>& blockTypes = scratch.blockTypes;
+    std::vector<uint8_t>& cellLight = scratch.cellLight;
+    std::vector<bool>& merged = scratch.merged;
+
+    // Padded builds know their +X/+Z neighbor walls, so the boundary layer
+    // meshes like any other; unpadded builds must skip it (assuming air
+    // there would paint a wall inside the neighbor).
+    const int xEnd = padded ? gridW : gridW - 1;
+    const int zEnd = padded ? gridD : gridD - 1;
 
     // ======================================================================
     // Face: +Y (top) — visible when the block above doesn't hide it
+    // (the world's top layer reads air above and gets a lid)
     // ======================================================================
-    for (int ly = 0; ly < gridH - 1; ++ly) {
+    for (int ly = 0; ly < gridH; ++ly) {
         faceMask.assign(gridD * gridW, false);
         blockTypes.assign(gridD * gridW, BlockType::AIR);
         cellLight.assign(gridD * gridW, 15);
@@ -236,7 +246,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const BlockAccessor
     // ======================================================================
     // Face: +X (right) — exposed when visible toward the +X neighbor
     // ======================================================================
-    for (int lx = 0; lx < gridW - 1; ++lx) {
+    for (int lx = 0; lx < xEnd; ++lx) {
         faceMask.assign(gridH * gridD, false);
         blockTypes.assign(gridH * gridD, BlockType::AIR);
         cellLight.assign(gridH * gridD, 15);
@@ -323,7 +333,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const BlockAccessor
     // ======================================================================
     // Face: +Z (front) — exposed when visible toward the +Z neighbor
     // ======================================================================
-    for (int lz = 0; lz < gridD - 1; ++lz) {
+    for (int lz = 0; lz < zEnd; ++lz) {
         faceMask.assign(gridH * gridW, false);
         blockTypes.assign(gridH * gridW, BlockType::AIR);
         cellLight.assign(gridH * gridW, 15);
@@ -436,40 +446,46 @@ static void emitFloraCross(int x, int y, int z, BlockType bt, uint8_t skyLight,
     pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalB);
 }
 
-static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockAccessor& getBlock,
-                                   bool emitFlora = false) {
+template <typename Access>
+static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access& getBlock,
+                                   bool padded, bool emitFlora, MeshScratch& scratch) {
     MeshOutput output;
 
-    // Pre-allocate reasonable capacity (6 faces × grid area × 4 verts)
-    output.vertices.reserve(6 * gridW * gridD * gridH / 4);
-    output.indices.reserve(6 * gridW * gridD * gridH / 2);
+    // Typical full chunks mesh to a few thousand vertices; growth beyond
+    // this is amortized (the old code reserved 1.5 MB per build)
+    output.vertices.reserve(8192);
+    output.indices.reserve(12288);
 
     // ---- Column skylight ----
-    // The first open Y above the topmost solid block per column. A face is
-    // lit by how close its exposure cell sits to that height: open sky is
-    // 15, shade under a canopy or overhang steps down, caves bottom out at 4.
-    std::vector<int> skyHeight(gridW * gridD, 0);
-    for (int z = 0; z < gridD; ++z) {
-        for (int x = 0; x < gridW; ++x) {
+    // The first open Y above the topmost solid block per column, computed
+    // over the padded ring too so border faces read their real neighbor
+    // column instead of a clamped copy (that clamp painted a visible light
+    // seam along every chunk edge). A face is lit by how close its exposure
+    // cell sits to that height: open sky is 15, shade under a canopy or
+    // overhang steps down, caves bottom out at 4.
+    const int ringW = gridW + 2;
+    const int ringD = gridD + 2;
+    std::vector<int>& skyHeight = scratch.skyHeight;
+    skyHeight.assign(ringW * ringD, 0);
+    for (int z = -1; z <= gridD; ++z) {
+        for (int x = -1; x <= gridW; ++x) {
             for (int y = gridH - 1; y >= 0; --y) {
                 if (isSolid(getBlock(x, y, z))) {
-                    skyHeight[idx(z, x, gridW)] = y + 1;
+                    skyHeight[idx(z + 1, x + 1, ringW)] = y + 1;
                     break;
                 }
             }
         }
     }
     auto lightAt = [&](int x, int y, int z) -> uint8_t {
-        x = std::clamp(x, 0, gridW - 1);
-        z = std::clamp(z, 0, gridD - 1);
-        int depth = skyHeight[idx(z, x, gridW)] - y;
+        int depth = skyHeight[idx(z + 1, x + 1, ringW)] - y;
         if (depth <= 0) return 15;
         return static_cast<uint8_t>(std::max(12 - depth, 4));
     };
 
     // ---- Opaque section: cubes, then flora crosses (full LOD only) ----
-    runGreedyPasses(gridW, gridH, gridD, getBlock, cubeFaceVisible, lightAt, 0.f, output.vertices,
-                    output.indices);
+    runGreedyPasses(gridW, gridH, gridD, getBlock, cubeFaceVisible, lightAt, 0.f, padded, scratch,
+                    output.vertices, output.indices);
 
     if (emitFlora) {
         for (int z = 0; z < gridD; ++z) {
@@ -485,18 +501,22 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
         }
     }
 
-    // ---- Water section: everything after this index draws in the water pass.
-    // Out-of-chunk neighbors count as water: oceans continue into the next
-    // chunk virtually always, and emitting walls there painted phantom
-    // stripes along every chunk border. (Neighbor-aware meshing will replace
-    // this assumption with real neighbor blocks.)
+    // ---- Water section: everything after this index draws in the water
+    // pass. Padded builds read real neighbor water; unpadded builds assume
+    // water continues past the edge (oceans virtually always do, and a wall
+    // there painted phantom stripes along every chunk border).
     output.opaqueIndexCount = static_cast<uint32_t>(output.indices.size());
-    BlockAccessor waterEdgeBlock = [&getBlock, gridW, gridD](int x, int y, int z) -> BlockType {
-        if (x < 0 || x >= gridW || z < 0 || z >= gridD) return BlockType::WATER;
-        return getBlock(x, y, z);
-    };
-    runGreedyPasses(gridW, gridH, gridD, waterEdgeBlock, waterFaceVisible, lightAt, 0.125f,
-                    output.vertices, output.indices);
+    if (padded) {
+        runGreedyPasses(gridW, gridH, gridD, getBlock, waterFaceVisible, lightAt, 0.125f, padded,
+                        scratch, output.vertices, output.indices);
+    } else {
+        auto waterEdgeBlock = [&getBlock, gridW, gridD](int x, int y, int z) -> BlockType {
+            if (x < 0 || x >= gridW || z < 0 || z >= gridD) return BlockType::WATER;
+            return getBlock(x, y, z);
+        };
+        runGreedyPasses(gridW, gridH, gridD, waterEdgeBlock, waterFaceVisible, lightAt, 0.125f,
+                        padded, scratch, output.vertices, output.indices);
+    }
 
     return output;
 }
@@ -505,20 +525,30 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
 // LODMesher implementation
 // ==========================================================================
 
+MeshOutput LODMesher::buildMesh(const MeshSnapshot& snapshot, MeshScratch& scratch) {
+    auto blockFn = [&snapshot](int x, int y, int z) -> BlockType { return snapshot.at(x, y, z); };
+    return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn, /*padded=*/true,
+                            /*emitFlora=*/true, scratch);
+}
+
 MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
     // Beyond render distance — return empty mesh (distance culling)
     if (lodLevel >= static_cast<int>(ChunkLOD::COUNT)) {
         return MeshOutput{};
     }
 
+    thread_local MeshScratch scratch;
+
     switch (static_cast<ChunkLOD>(lodLevel)) {
         case ChunkLOD::FULL: {
-            // LOD 0: Full resolution greedy meshing (16×16×256)
+            // LOD 0: Full resolution greedy meshing (16×16×256),
+            // neighbor-blind (tests and tools; the game uses the
+            // MeshSnapshot overload)
             auto blockFn = [&chunk](int x, int y, int z) -> BlockType {
                 return chunk.getBlock(x, y, z);
             };
             return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn,
-                                    /*emitFlora=*/true);
+                                    /*padded=*/false, /*emitFlora=*/true, scratch);
         }
 
         case ChunkLOD::MEDIUM: {
@@ -554,7 +584,8 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
                 }
                 return dominant;
             };
-            return buildGenericMesh(8, 128, 8, blockFn);
+            return buildGenericMesh(8, 128, 8, blockFn, /*padded=*/false, /*emitFlora=*/false,
+                                    scratch);
         }
 
         case ChunkLOD::COARSE: {
@@ -587,7 +618,8 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
                 }
                 return dominant;
             };
-            return buildGenericMesh(4, 64, 4, blockFn);
+            return buildGenericMesh(4, 64, 4, blockFn, /*padded=*/false, /*emitFlora=*/false,
+                                    scratch);
         }
 
         default:

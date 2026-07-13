@@ -801,12 +801,15 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
     [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
 
-    // LOD mesher instance (stateless — safe to reuse). Everything renders at
-    // full detail; see the LOD note in lod_mesher.hpp.
-    LODMesher lodMesher;
-
     // Water draws recorded here render later, in the dedicated water pass
     _waterDraws.clear();
+
+    // Builds only happen within the render radius: the generation radius is
+    // one chunk wider, so every meshable chunk has generated neighbors for
+    // its snapshot (frontier chunks simply wait their turn).
+    const int camChunkX = Chunk::worldToChunk(static_cast<int>(std::floor(camX)));
+    const int camChunkZ = Chunk::worldToChunk(static_cast<int>(std::floor(camZ)));
+    const int renderRadius = world.getViewDistance();
 
     auto loadedChunks = world.getLoadedChunks();
 
@@ -848,10 +851,18 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         if (!isChunkInFrustum(chunkAABB))
             continue;
 
-        // (Re)build the mesh when the chunk is dirty or was never meshed
+        // (Re)build the mesh when the chunk is dirty or was never meshed,
+        // within the render radius and once its neighbor snapshot exists
         auto cached = _chunkMeshes.find(key);
-        const bool needsBuild = chunk->needsMeshUpdate || cached == _chunkMeshes.end();
+        bool needsBuild = chunk->needsMeshUpdate || cached == _chunkMeshes.end();
+        if (needsBuild && (std::abs(chunk->chunkX - camChunkX) > renderRadius ||
+                           std::abs(chunk->chunkZ - camChunkZ) > renderRadius)) {
+            needsBuild = false; // frontier ring: generated but not rendered
+        }
         if (needsBuild && meshBuilds < MAX_MESH_BUILDS_PER_FRAME) {
+            if (!world.snapshotForMeshing(ChunkPos{chunk->chunkX, chunk->chunkZ}, _meshSnapshot)) {
+                continue; // a neighbor is still generating — retry next frame
+            }
             ++meshBuilds;
 
             if (cached != _chunkMeshes.end()) {
@@ -862,7 +873,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             }
 
             auto buildStart = std::chrono::steady_clock::now();
-            MeshOutput mesh = lodMesher.buildMesh(*chunk, static_cast<int>(ChunkLOD::FULL));
+            MeshOutput mesh = LODMesher::buildMesh(_meshSnapshot, _meshScratch);
             meshMsThisFrame += std::chrono::duration<float, std::milli>(
                                    std::chrono::steady_clock::now() - buildStart)
                                    .count();

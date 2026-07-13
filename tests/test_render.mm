@@ -240,6 +240,114 @@ TEST_CASE("Mesher: lava renders as an opaque cube section", "[render][mesher][wa
     REQUIRE(output.indices.size() == 36);
 }
 
+// ============================================================================
+// Neighbor-aware (snapshot) meshing — chunk border correctness
+// ============================================================================
+
+TEST_CASE("Snapshot mesher: boundary faces follow real neighbor blocks",
+          "[render][mesher][border]") {
+    MeshSnapshot snapshot;
+    snapshot.resize();
+    // One stone block on the +X border of the chunk
+    snapshot.blocks[MeshSnapshot::index(15, 64, 8)] = BlockType::STONE;
+
+    MeshScratch scratch;
+
+    // Case 1: neighbor cell across the border is AIR → the +X boundary face
+    // must exist (the old mesher skipped the boundary layer: a hole)
+    {
+        MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+        REQUIRE(output.vertices.size() == 24); // full cube
+        bool plusXAt16 = false;
+        for (const Vertex& v : output.vertices) {
+            if (unpackFace(v.faceAttr) == FaceNormal::PLUS_X && static_cast<float>(v.px) == 16.f)
+                plusXAt16 = true;
+        }
+        REQUIRE(plusXAt16);
+    }
+
+    // Case 2: neighbor cell solid → the boundary face is culled (the old
+    // mesher's -X pass always emitted a hidden wall from the other side)
+    {
+        snapshot.blocks[MeshSnapshot::index(16, 64, 8)] = BlockType::STONE;
+        MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+        REQUIRE(output.vertices.size() == 20); // cube minus the shared face
+        for (const Vertex& v : output.vertices) {
+            REQUIRE(!(unpackFace(v.faceAttr) == FaceNormal::PLUS_X &&
+                      static_cast<float>(v.px) == 16.f));
+        }
+    }
+}
+
+TEST_CASE("Snapshot mesher: -X border wall culled against a solid neighbor",
+          "[render][mesher][border]") {
+    MeshSnapshot snapshot;
+    snapshot.resize();
+    snapshot.blocks[MeshSnapshot::index(0, 64, 8)] = BlockType::STONE;
+    // Solid neighbor wall behind it (x = -1)
+    snapshot.blocks[MeshSnapshot::index(-1, 64, 8)] = BlockType::STONE;
+
+    MeshScratch scratch;
+    MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    REQUIRE(output.vertices.size() == 20);
+    for (const Vertex& v : output.vertices) {
+        REQUIRE(
+            !(unpackFace(v.faceAttr) == FaceNormal::MINUS_X && static_cast<float>(v.px) == 0.f));
+    }
+}
+
+TEST_CASE("World snapshotForMeshing requires generated neighbors", "[world][mesher][border]") {
+    World world(4242, 2);
+    MeshSnapshot snapshot;
+
+    // Nothing generated yet
+    REQUIRE(!world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
+
+    // Self + only some neighbors
+    world.getChunk(0, 0);
+    world.getChunk(1, 0);
+    REQUIRE(!world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
+
+    world.getChunk(-1, 0);
+    world.getChunk(0, 1);
+    world.getChunk(0, -1);
+    REQUIRE(world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
+
+    // The padded walls carry the neighbors' real border blocks
+    auto neighbor = world.getChunk(1, 0);
+    for (int y = 0; y < CHUNK_HEIGHT; y += 13) {
+        for (int z = 0; z < CHUNK_DEPTH; ++z) {
+            REQUIRE(snapshot.at(CHUNK_WIDTH, y, z) == neighbor->getBlock(0, y, z));
+        }
+    }
+}
+
+TEST_CASE("World setBlock marks boundary neighbors for remeshing", "[world][mesher][border]") {
+    World world(7, 2);
+    world.getChunk(0, 0);
+    world.getChunk(-1, 0);
+    world.getChunk(0, -1);
+    auto self = world.getChunk(0, 0);
+    auto negX = world.getChunk(-1, 0);
+    auto negZ = world.getChunk(0, -1);
+
+    self->needsMeshUpdate = false;
+    negX->needsMeshUpdate = false;
+    negZ->needsMeshUpdate = false;
+
+    // Interior edit: only the chunk itself
+    world.setBlock(8, 100, 8, BlockType::STONE);
+    REQUIRE(self->needsMeshUpdate);
+    REQUIRE(!negX->needsMeshUpdate);
+
+    // Boundary edit at local x == 0: the -X neighbor re-meshes too
+    self->needsMeshUpdate = false;
+    world.setBlock(0, 100, 8, BlockType::STONE);
+    REQUIRE(self->needsMeshUpdate);
+    REQUIRE(negX->needsMeshUpdate);
+    REQUIRE(!negZ->needsMeshUpdate);
+}
+
 TEST_CASE("Mesher: flora is skipped at coarse LODs", "[render][mesher][flora]") {
     Chunk chunk(0, 0);
     for (int z = 0; z < CHUNK_DEPTH; ++z)

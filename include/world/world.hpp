@@ -3,6 +3,7 @@
 #include "world/chunk.hpp"
 #include "world/chunk_generator.hpp"
 #include "world/chunk_pos.hpp"
+#include "world/mesh_snapshot.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -52,6 +53,11 @@ public:
 
     // Get all loaded chunks
     std::vector<std::shared_ptr<Chunk>> getLoadedChunks() const;
+
+    // Copy a chunk + one-block neighbor walls for lock-free meshing.
+    // Returns false until the chunk and all four face neighbors are
+    // generated (the caller simply retries next frame).
+    bool snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const;
 
     // Get chunks that need mesh updates
     std::vector<std::shared_ptr<Chunk>> getDirtyChunks();

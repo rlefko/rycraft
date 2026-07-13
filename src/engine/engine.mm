@@ -789,13 +789,8 @@ static EngineState* _engineGetState(Engine* engine) {
         state->world->setBlock(hitX, hitY + 1, hitZ, BlockType::AIR);
     }
 
-    // Mark chunk dirty (edits persist via save-on-unload + the quit sweep)
-    int chunkX = Chunk::worldToChunk(hitX);
-    int chunkZ = Chunk::worldToChunk(hitZ);
-    auto chunk = state->world->getChunk(chunkX, chunkZ);
-    if (chunk) {
-        chunk->markDirty();
-    }
+    // World::setBlock marks the chunk (and boundary neighbors) dirty and
+    // flags it for save-on-unload
 
     // Clear highlight since block is now air
     state->hasHighlightedBlock = false;
@@ -823,33 +818,10 @@ static EngineState* _engineGetState(Engine* engine) {
     if (placeBox.intersects(state->player.getAABB()))
         return;
 
-    // Place block
+    // Place block (World::setBlock marks the chunk and boundary neighbors
+    // dirty and flags the chunk for save-on-unload)
     BlockType selectedType = state->hotbar.getSelectedBlockType();
     state->world->setBlock(placeX, placeY, placeZ, selectedType);
-
-    // Mark both adjacent chunks dirty (boundary case)
-    int chunkX = Chunk::worldToChunk(placeX);
-    int chunkZ = Chunk::worldToChunk(placeZ);
-
-    auto markChunkDirty = [&](int cx, int cz) {
-        auto c = state->world->getChunk(cx, cz);
-        if (c)
-            c->markDirty();
-    };
-
-    markChunkDirty(chunkX, chunkZ);
-
-    // Check if block is on chunk boundary and mark neighbor
-    int localX = placeX - chunkX * CHUNK_WIDTH;
-    int localZ = placeZ - chunkZ * CHUNK_DEPTH;
-    if (localX == 0)
-        markChunkDirty(chunkX - 1, chunkZ);
-    if (localX == CHUNK_WIDTH - 1)
-        markChunkDirty(chunkX + 1, chunkZ);
-    if (localZ == 0)
-        markChunkDirty(chunkX, chunkZ - 1);
-    if (localZ == CHUNK_DEPTH - 1)
-        markChunkDirty(chunkX, chunkZ + 1);
 
     [self playSfx:state->sfxBlockPlace gain:0.8f];
 }
