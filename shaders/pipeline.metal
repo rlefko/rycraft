@@ -6,13 +6,16 @@ using namespace metal;
 // Vertex input — bound through the vertex descriptor (not argument buffer)
 //
 // Attribute layout matches include/render/vertex.hpp:
-//   attribute(0)  uint     normalIdx         offset 0   4 bytes  (UInt)
+//   attribute(0)  uint     faceAttr          offset 0   4 bytes  (UInt)
+//                          face normal in bits 0-2, texture layer in bits 3+
 //   attribute(1)  float3   px, py, pz        offset 4   6 bytes  (Half3)
+//                          CHUNK-LOCAL position; ChunkOrigin restores world
 //   attribute(2)  float2   u, v              offset 10  4 bytes  (Half2)
+//                          spans the quad extent in blocks (repeat-sampled)
 //   stride = 16 bytes
 // ---------------------------------------------------------------------------
 struct VertexInput {
-    uint normalIdx [[attribute(0)]];
+    uint faceAttr [[attribute(0)]];
     float3 position [[attribute(1)]];
     float2 uv [[attribute(2)]];
 };
@@ -26,6 +29,7 @@ struct VertexOutput {
     float2 vUV;
     float vLight;
     float3 vWorldPosition; // World-space position for fog calculation
+    uint vTextureLayer [[flat]];
 };
 
 // ---------------------------------------------------------------------------
@@ -48,22 +52,23 @@ float3 getFaceNormal(uint index) {
 // ---------------------------------------------------------------------------
 vertex VertexOutput vertexMain(
     VertexInput in [[stage_in]],
-    constant Uniforms &uniforms [[buffer(1)]]
+    constant Uniforms &uniforms [[buffer(1)]],
+    constant ChunkOrigin &chunkOrigin [[buffer(2)]]
 ) {
     VertexOutput out;
 
-    // Transform position through MVP
-    float4 worldPos = uniforms.modelMatrix * float4(in.position, 1.0);
+    // Restore world space from the chunk-local position, then run MVP
+    float4 worldPos =
+        uniforms.modelMatrix * float4(in.position + chunkOrigin.origin.xyz, 1.0);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
 
     // Pass through UV
     out.vUV = in.uv;
 
-    // Look up face normal and transform to world space.
-    // Multiply by float4(normal, 0.0) to apply only the rotation/scale
-    // portion of the model matrix (no translation).
-    float3 normal = getFaceNormal(in.normalIdx);
+    // Unpack face normal (bits 0-2) and texture layer (bits 3+)
+    out.vTextureLayer = in.faceAttr >> 3;
+    float3 normal = getFaceNormal(in.faceAttr & 7u);
     out.vNormal = normalize(
         (uniforms.modelMatrix * float4(normal, 0.0)).xyz
     );
@@ -80,14 +85,13 @@ vertex VertexOutput vertexMain(
 // ---------------------------------------------------------------------------
 fragment float4 fragmentMain(
     VertexOutput in [[stage_in]],
-    texture2d<float> atlas [[texture(0)]],
+    texture2d_array<float> blockTextures [[texture(0)]],
+    sampler blockSampler [[sampler(0)]],
     constant Uniforms &uniforms [[buffer(1)]]
 ) {
-    // Nearest-neighbor sampling for crisp voxel textures
-    constexpr sampler atlasSampler(mag_filter::nearest,
-                                    min_filter::nearest);
-
-    float4 texColor = atlas.sample(atlasSampler, in.vUV);
+    // The bound sampler uses repeat addressing + nearest filtering: UVs span
+    // the quad extent in blocks, so each block gets one full texture tile.
+    float4 texColor = blockTextures.sample(blockSampler, in.vUV, in.vTextureLayer);
 
     // Combine directional sun light with ambient
     float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight + uniforms.ambientColor);

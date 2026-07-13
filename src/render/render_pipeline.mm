@@ -2,6 +2,7 @@
 
 #include "common/error.hpp"
 #include "render/bloom.hpp"
+#include "render/block_textures.hpp"
 #include "render/lod_mesher.hpp"
 
 #include "render/particles.hpp"
@@ -28,7 +29,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
                                 uint32_t height)
     : _device(device)
     , _megaBuffer(nullptr)
-    , _textureAtlas(nullptr)
+    , _blockTextures(nullptr)
     , _uiOverlay(nullptr)
     , _bloom(nullptr)
     , _particles(nullptr)
@@ -178,14 +179,15 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     }
 
     // Highlight vertex buffer: 24 vertices for wireframe box (12 lines × 2 endpoints)
-    // Each vertex: normalIdx(4) + position(6) + uv(4) = 16 bytes
-    // We use normalIdx=4 (+Y face) and uv=(0,0) as placeholders; color comes from uniforms
+    // Each vertex: faceAttr(4) + position(6) + uv(4) = 16 bytes.
+    // The white texture layer makes the wireframe take its color purely from
+    // the uniforms (yellow sun color).
     struct alignas(16) HighlightVertex {
-        uint8_t normalIdx;
-        uint8_t _pad[3];
+        uint32_t faceAttr;
         float16_t px, py, pz;
         float16_t u, v;
     };
+    const uint32_t highlightAttr = packFaceAttr(FaceNormal::PlusY, TEXTURE_LAYER_WHITE);
     HighlightVertex highlightVerts[24];
     std::memset(highlightVerts, 0, sizeof(highlightVerts));
 
@@ -204,12 +206,12 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     for (int i = 0; i < 12; ++i) {
         int a = edges[i][0];
         int b = edges[i][1];
-        highlightVerts[i * 2] = {4, {0, 0},
+        highlightVerts[i * 2] = {highlightAttr,
                                  static_cast<float16_t>(corners[a][0] - 0.002f),
                                  static_cast<float16_t>(corners[a][1] - 0.002f),
                                  static_cast<float16_t>(corners[a][2] - 0.002f),
                                  0, 0};
-        highlightVerts[i * 2 + 1] = {4, {0, 0},
+        highlightVerts[i * 2 + 1] = {highlightAttr,
                                      static_cast<float16_t>(corners[b][0] - 0.002f),
                                      static_cast<float16_t>(corners[b][1] - 0.002f),
                                      static_cast<float16_t>(corners[b][2] - 0.002f),
@@ -243,8 +245,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     // ---- MegaBuffer (centralized GPU memory for chunk meshes) ----
     _megaBuffer = new MegaBuffer(_device);
 
-    // ---- TextureAtlas (procedural block textures) ----
-    _textureAtlas = new TextureAtlas(_device);
+    // ---- Block textures (procedural, one array layer per face texture) ----
+    _blockTextures = new BlockTextureArray(_device);
 
     // ---- UIOverlay (screen-space HUD rendering) ----
     _uiOverlay = new UIOverlay(_device, shaderLibrary, _displayWidth, _displayHeight);
@@ -704,8 +706,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
     // Bind the shared atlas + uniforms once; every chunk draw reuses them
     [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
-    [encoder setFragmentTexture:_textureAtlas->texture() atIndex:0];
-    [encoder setFragmentSamplerState:_textureAtlas->sampler() atIndex:0];
+    [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
+    [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
 
     // LOD mesher instance (stateless — safe to reuse). Everything renders at
     // full detail; see the LOD note in lod_mesher.hpp.
@@ -780,6 +782,13 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
         const auto& meshState = cached->second;
         if (meshState.alloc.indexCount == 0) continue;
 
+        // Mesh vertices are chunk-local; this restores world space (and keeps
+        // fp16 positions exact regardless of how far the chunk is from origin)
+        ChunkOrigin origin{};
+        origin.origin = simd_make_float4(static_cast<float>(chunk->chunkX * CHUNK_WIDTH), 0.0f,
+                                         static_cast<float>(chunk->chunkZ * CHUNK_DEPTH), 0.0f);
+        [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
+
         // Bind vertex buffer from MegaBuffer allocation
         [encoder setVertexBuffer:meshState.alloc.vertexBuffer
                             offset:meshState.alloc.vertexOffset
@@ -840,10 +849,14 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
     [encoder setVertexBuffer:_highlightVertexBuffer offset:0 atIndex:0];
     [encoder setVertexBuffer:_highlightUniformsBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:_highlightUniformsBuffer offset:0 atIndex:1];
+
+    // Highlight vertices carry their translation in the model matrix
+    ChunkOrigin zeroOrigin{};
+    [encoder setVertexBytes:&zeroOrigin length:sizeof(zeroOrigin) atIndex:2];
     // fragmentMain samples the atlas; bind it so the highlight never relies
     // on a texture left over from the chunk loop (e.g. when no chunks drew).
-    [encoder setFragmentTexture:_textureAtlas->texture() atIndex:0];
-    [encoder setFragmentSamplerState:_textureAtlas->sampler() atIndex:0];
+    [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
+    [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
 
     // Draw 12 lines (24 vertices) for wireframe box
     [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:24];
@@ -943,7 +956,7 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
 // ---------------------------------------------------------------------------
 RenderPipeline::~RenderPipeline() {
     delete _megaBuffer;
-    delete _textureAtlas;
+    delete _blockTextures;
     delete _uiOverlay;
     delete _bloom;
     delete _particles;

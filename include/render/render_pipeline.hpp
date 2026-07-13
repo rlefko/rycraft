@@ -15,7 +15,7 @@
 #include "render/mega_buffer.hpp"
 #include "render/particles.hpp"
 #include "render/shader_types.hpp"
-#include "render/texture_atlas.hpp"
+#include "render/block_texture_array.hpp"
 #include "render/vertex.hpp"
 
 // Forward declarations
@@ -117,8 +117,8 @@ private:
     // MegaBuffer for centralized GPU memory management.
     MegaBuffer* _megaBuffer;
 
-    // Texture atlas for procedural block textures.
-    TextureAtlas* _textureAtlas;
+    // Array texture of procedural block textures.
+    BlockTextureArray* _blockTextures;
 
     // UI overlay for HUD rendering (crosshair, hotbar).
     UIOverlay* _uiOverlay;

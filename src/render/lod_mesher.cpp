@@ -1,5 +1,6 @@
 #include "render/lod_mesher.hpp"
 
+#include "render/block_textures.hpp"
 #include "world/chunk.hpp"
 
 #include <array>
@@ -22,6 +23,31 @@
 using BlockAccessor = std::function<BlockType(int, int, int)>;
 inline static int idx(int row, int col, int width) { return row * width + col; }
 
+// One vertex of a quad corner: position + UV (UVs span the quad extent in
+// blocks so the repeat sampler tiles the texture per block).
+struct QuadCorner {
+    float x, y, z;
+    float u, v;
+};
+
+// Append one greedy quad (4 vertices + 6 indices). Corners arrive in the
+// same winding the face's caller always used.
+static void pushQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs,
+                     FaceNormal face, BlockType bt, const QuadCorner (&corners)[4]) {
+    const uint32_t attr = packFaceAttr(face, textureLayerFor(bt, face));
+    for (const QuadCorner& c : corners) {
+        verts.push_back(Vertex{attr,
+            static_cast<float16_t>(c.x),
+            static_cast<float16_t>(c.y),
+            static_cast<float16_t>(c.z),
+            static_cast<float16_t>(c.u),
+            static_cast<float16_t>(c.v)});
+    }
+    uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
+    idxs.push_back(bi); idxs.push_back(bi + 1); idxs.push_back(bi + 2);
+    idxs.push_back(bi); idxs.push_back(bi + 2); idxs.push_back(bi + 3);
+}
+
 // Greedy merge on a face plane of arbitrary dimensions.
 //
 // faceMask[row*faceWidth + col] == true means that face cell is exposed.
@@ -35,7 +61,7 @@ static void meshFaceGeneric(
     const std::vector<bool>& faceMask,
     const std::vector<BlockType>& blockTypes,
     std::vector<bool>& merged,
-    uint8_t normalIdx,
+    FaceNormal face,
     std::vector<Vertex>& vertices,
     std::vector<uint32_t>& indices,
     const auto& emitQuadFn
@@ -83,7 +109,7 @@ static void meshFaceGeneric(
             }
 
             // Emit quad via callback
-            emitQuadFn(col, row, width, height, normalIdx, leadType,
+            emitQuadFn(col, row, width, height, face, leadType,
                        vertices, indices);
         }
     }
@@ -91,8 +117,7 @@ static void meshFaceGeneric(
 
 static MeshOutput buildGenericMesh(
     int gridW, int gridH, int gridD,
-    const BlockAccessor& getBlock,
-    float worldX, float worldZ
+    const BlockAccessor& getBlock
 ) {
     MeshOutput output;
 
@@ -148,41 +173,25 @@ static MeshOutput buildGenericMesh(
             }
         }
 
-        auto emitQuad = [ly, worldX, worldZ](
+        auto emitQuad = [ly](
             int col, int row, int width, int height,
-            uint8_t normalIdx, BlockType bt,
+            FaceNormal face, BlockType bt,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
-            float u = static_cast<float>(static_cast<int>(bt) % 16) / 16.0f;
-            float v = static_cast<float>(static_cast<int>(bt) / 16) / 16.0f;
             // +Y face: y = ly+1, CCW from above
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + worldX),
-                static_cast<float16_t>(ly + 1),
-                static_cast<float16_t>(row + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + width + worldX),
-                static_cast<float16_t>(ly + 1),
-                static_cast<float16_t>(row + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + width + worldX),
-                static_cast<float16_t>(ly + 1),
-                static_cast<float16_t>(row + height + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + worldX),
-                static_cast<float16_t>(ly + 1),
-                static_cast<float16_t>(row + height + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
-            idxs.push_back(bi); idxs.push_back(bi + 1); idxs.push_back(bi + 2);
-            idxs.push_back(bi); idxs.push_back(bi + 2); idxs.push_back(bi + 3);
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(col), static_cast<float>(ly + 1), static_cast<float>(row), 0.f, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(ly + 1), static_cast<float>(row), fw, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(ly + 1), static_cast<float>(row + height), fw, fh},
+                {static_cast<float>(col), static_cast<float>(ly + 1), static_cast<float>(row + height), 0.f, fh},
+            };
+            pushQuad(verts, idxs, face, bt, corners);
         };
 
         meshFaceGeneric(gridD, gridW, faceMask, blockTypes, merged,
-                        static_cast<uint8_t>(FaceNormal::PlusY),
+                        FaceNormal::PlusY,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -214,41 +223,25 @@ static MeshOutput buildGenericMesh(
             }
         }
 
-        auto emitQuad = [ly, worldX, worldZ](
+        auto emitQuad = [ly](
             int col, int row, int width, int height,
-            uint8_t normalIdx, BlockType bt,
+            FaceNormal face, BlockType bt,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
-            float u = static_cast<float>(static_cast<int>(bt) % 16) / 16.0f;
-            float v = static_cast<float>(static_cast<int>(bt) / 16) / 16.0f;
             // -Y face: y = ly, CCW from below
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + worldX),
-                static_cast<float16_t>(ly),
-                static_cast<float16_t>(row + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + width + worldX),
-                static_cast<float16_t>(ly),
-                static_cast<float16_t>(row + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + width + worldX),
-                static_cast<float16_t>(ly),
-                static_cast<float16_t>(row + height + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + worldX),
-                static_cast<float16_t>(ly),
-                static_cast<float16_t>(row + height + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
-            idxs.push_back(bi); idxs.push_back(bi + 1); idxs.push_back(bi + 2);
-            idxs.push_back(bi); idxs.push_back(bi + 2); idxs.push_back(bi + 3);
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(col), static_cast<float>(ly), static_cast<float>(row), 0.f, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(ly), static_cast<float>(row), fw, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(ly), static_cast<float>(row + height), fw, fh},
+                {static_cast<float>(col), static_cast<float>(ly), static_cast<float>(row + height), 0.f, fh},
+            };
+            pushQuad(verts, idxs, face, bt, corners);
         };
 
         meshFaceGeneric(gridD, gridW, faceMask, blockTypes, merged,
-                        static_cast<uint8_t>(FaceNormal::MinusY),
+                        FaceNormal::MinusY,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -269,41 +262,25 @@ static MeshOutput buildGenericMesh(
             }
         }
 
-        auto emitQuad = [lx, worldX, worldZ](
+        auto emitQuad = [lx](
             int col, int row, int width, int height,
-            uint8_t normalIdx, BlockType bt,
+            FaceNormal face, BlockType bt,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
-            float u = static_cast<float>(static_cast<int>(bt) % 16) / 16.0f;
-            float v = static_cast<float>(static_cast<int>(bt) / 16) / 16.0f;
-            // +X face: x = lx+1, CCW from +X
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(lx + worldX),
-                static_cast<float16_t>(row),
-                static_cast<float16_t>(col + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(lx + worldX),
-                static_cast<float16_t>(row + height),
-                static_cast<float16_t>(col + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(lx + worldX),
-                static_cast<float16_t>(row + height),
-                static_cast<float16_t>(col + width + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(lx + worldX),
-                static_cast<float16_t>(row),
-                static_cast<float16_t>(col + width + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
-            idxs.push_back(bi); idxs.push_back(bi + 1); idxs.push_back(bi + 2);
-            idxs.push_back(bi); idxs.push_back(bi + 2); idxs.push_back(bi + 3);
+            // +X face: x = lx+1, CCW from +X (rows are Y, cols are Z)
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(lx + 1), static_cast<float>(row), static_cast<float>(col), 0.f, 0.f},
+                {static_cast<float>(lx + 1), static_cast<float>(row + height), static_cast<float>(col), 0.f, fh},
+                {static_cast<float>(lx + 1), static_cast<float>(row + height), static_cast<float>(col + width), fw, fh},
+                {static_cast<float>(lx + 1), static_cast<float>(row), static_cast<float>(col + width), fw, 0.f},
+            };
+            pushQuad(verts, idxs, face, bt, corners);
         };
 
         meshFaceGeneric(gridH, gridD, faceMask, blockTypes, merged,
-                        static_cast<uint8_t>(FaceNormal::PlusX),
+                        FaceNormal::PlusX,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -324,41 +301,26 @@ static MeshOutput buildGenericMesh(
             }
         }
 
-        auto emitQuad = [lx, worldX, worldZ](
+        auto emitQuad = [lx](
             int col, int row, int width, int height,
-            uint8_t normalIdx, BlockType bt,
+            FaceNormal face, BlockType bt,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
-            float u = static_cast<float>(static_cast<int>(bt) % 16) / 16.0f;
-            float v = static_cast<float>(static_cast<int>(bt) / 16) / 16.0f;
-            // -X face: x = lx, CCW from -X
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(lx - 1 + worldX),
-                static_cast<float16_t>(row),
-                static_cast<float16_t>(col + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(lx - 1 + worldX),
-                static_cast<float16_t>(row),
-                static_cast<float16_t>(col + width + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(lx - 1 + worldX),
-                static_cast<float16_t>(row + height),
-                static_cast<float16_t>(col + width + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(lx - 1 + worldX),
-                static_cast<float16_t>(row + height),
-                static_cast<float16_t>(col + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
-            idxs.push_back(bi); idxs.push_back(bi + 1); idxs.push_back(bi + 2);
-            idxs.push_back(bi); idxs.push_back(bi + 2); idxs.push_back(bi + 3);
+            // -X face: the face plane of block lx is x = lx (the old code
+            // emitted at lx-1, one unit inside the neighbor)
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col), 0.f, 0.f},
+                {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col + width), fw, 0.f},
+                {static_cast<float>(lx), static_cast<float>(row + height), static_cast<float>(col + width), fw, fh},
+                {static_cast<float>(lx), static_cast<float>(row + height), static_cast<float>(col), 0.f, fh},
+            };
+            pushQuad(verts, idxs, face, bt, corners);
         };
 
         meshFaceGeneric(gridH, gridD, faceMask, blockTypes, merged,
-                        static_cast<uint8_t>(FaceNormal::MinusX),
+                        FaceNormal::MinusX,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -379,41 +341,26 @@ static MeshOutput buildGenericMesh(
             }
         }
 
-        auto emitQuad = [lz, worldX, worldZ](
+        auto emitQuad = [lz](
             int col, int row, int width, int height,
-            uint8_t normalIdx, BlockType bt,
+            FaceNormal face, BlockType bt,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
-            float u = static_cast<float>(static_cast<int>(bt) % 16) / 16.0f;
-            float v = static_cast<float>(static_cast<int>(bt) / 16) / 16.0f;
-            // +Z face: z = lz+1, CCW from +Z
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + worldX),
-                static_cast<float16_t>(row),
-                static_cast<float16_t>(lz + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + worldX),
-                static_cast<float16_t>(row + height),
-                static_cast<float16_t>(lz + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + width + worldX),
-                static_cast<float16_t>(row + height),
-                static_cast<float16_t>(lz + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + width + worldX),
-                static_cast<float16_t>(row),
-                static_cast<float16_t>(lz + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
-            idxs.push_back(bi); idxs.push_back(bi + 1); idxs.push_back(bi + 2);
-            idxs.push_back(bi); idxs.push_back(bi + 2); idxs.push_back(bi + 3);
+            // +Z face: z = lz+1 (the old code emitted at lz, coplanar with
+            // the block interior)
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz + 1), 0.f, 0.f},
+                {static_cast<float>(col), static_cast<float>(row + height), static_cast<float>(lz + 1), 0.f, fh},
+                {static_cast<float>(col + width), static_cast<float>(row + height), static_cast<float>(lz + 1), fw, fh},
+                {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz + 1), fw, 0.f},
+            };
+            pushQuad(verts, idxs, face, bt, corners);
         };
 
         meshFaceGeneric(gridH, gridW, faceMask, blockTypes, merged,
-                        static_cast<uint8_t>(FaceNormal::PlusZ),
+                        FaceNormal::PlusZ,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -434,41 +381,26 @@ static MeshOutput buildGenericMesh(
             }
         }
 
-        auto emitQuad = [lz, worldX, worldZ](
+        auto emitQuad = [lz](
             int col, int row, int width, int height,
-            uint8_t normalIdx, BlockType bt,
+            FaceNormal face, BlockType bt,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
-            float u = static_cast<float>(static_cast<int>(bt) % 16) / 16.0f;
-            float v = static_cast<float>(static_cast<int>(bt) / 16) / 16.0f;
-            // -Z face: z = lz, CCW from -Z
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + worldX),
-                static_cast<float16_t>(row),
-                static_cast<float16_t>(lz - 1 + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + width + worldX),
-                static_cast<float16_t>(row),
-                static_cast<float16_t>(lz - 1 + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + width + worldX),
-                static_cast<float16_t>(row + height),
-                static_cast<float16_t>(lz - 1 + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            verts.push_back(Vertex{normalIdx,
-                static_cast<float16_t>(col + worldX),
-                static_cast<float16_t>(row + height),
-                static_cast<float16_t>(lz - 1 + worldZ),
-                static_cast<float16_t>(u), static_cast<float16_t>(v)});
-            uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
-            idxs.push_back(bi); idxs.push_back(bi + 1); idxs.push_back(bi + 2);
-            idxs.push_back(bi); idxs.push_back(bi + 2); idxs.push_back(bi + 3);
+            // -Z face: the face plane of block lz is z = lz (the old code
+            // emitted at lz-1, one unit inside the neighbor)
+            const float fw = static_cast<float>(width);
+            const float fh = static_cast<float>(height);
+            const QuadCorner corners[4] = {
+                {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz), 0.f, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz), fw, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(row + height), static_cast<float>(lz), fw, fh},
+                {static_cast<float>(col), static_cast<float>(row + height), static_cast<float>(lz), 0.f, fh},
+            };
+            pushQuad(verts, idxs, face, bt, corners);
         };
 
         meshFaceGeneric(gridH, gridW, faceMask, blockTypes, merged,
-                        static_cast<uint8_t>(FaceNormal::MinusZ),
+                        FaceNormal::MinusZ,
                         output.vertices, output.indices, emitQuad);
     }
 
@@ -485,17 +417,13 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
         return MeshOutput{};
     }
 
-    float worldX = static_cast<float>(chunk.chunkX * CHUNK_WIDTH);
-    float worldZ = static_cast<float>(chunk.chunkZ * CHUNK_DEPTH);
-
     switch (static_cast<ChunkLOD>(lodLevel)) {
         case ChunkLOD::Full: {
             // LOD 0: Full resolution greedy meshing (16×16×256)
             auto blockFn = [&chunk](int x, int y, int z) -> BlockType {
                 return chunk.getBlock(x, y, z);
             };
-            return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH,
-                                    blockFn, worldX, worldZ);
+            return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn);
         }
 
         case ChunkLOD::Medium: {
@@ -529,7 +457,7 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
                 }
                 return dominant;
             };
-            return buildGenericMesh(8, 128, 8, blockFn, worldX, worldZ);
+            return buildGenericMesh(8, 128, 8, blockFn);
         }
 
         case ChunkLOD::Coarse: {
@@ -562,7 +490,7 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
                 }
                 return dominant;
             };
-            return buildGenericMesh(4, 64, 4, blockFn, worldX, worldZ);
+            return buildGenericMesh(4, 64, 4, blockFn);
         }
 
         default:

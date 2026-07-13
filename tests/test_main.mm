@@ -12,7 +12,8 @@
 #include <world/save_manager.hpp>
 #include <render/vertex.hpp>
 #include <render/lod_mesher.hpp>
-#include <render/texture_atlas.hpp>
+#include <render/block_textures.hpp>
+#include <render/block_texture_array.hpp>
 #include <render/mega_buffer.hpp>
 #include <render/ui_overlay.hpp>
 #include <render/shader_types.hpp>
@@ -1213,13 +1214,13 @@ TEST_CASE("Mesher: 2x2 flat merges top face", "[render][mesher]") {
     REQUIRE(output.indices.size() == 36);
 
     // Verify the top face is a single quad (first 4 vertices)
-    // All 4 top-face vertices should have normalIdx == FaceNormal::PlusY (4)
+    // All 4 top-face vertices should decode to FaceNormal::PlusY
     bool foundTopQuad = false;
     for (size_t i = 0; i + 3 < output.vertices.size(); ++i) {
-        if (output.vertices[i].normalIdx == static_cast<uint8_t>(FaceNormal::PlusY) &&
-            output.vertices[i + 1].normalIdx == static_cast<uint8_t>(FaceNormal::PlusY) &&
-            output.vertices[i + 2].normalIdx == static_cast<uint8_t>(FaceNormal::PlusY) &&
-            output.vertices[i + 3].normalIdx == static_cast<uint8_t>(FaceNormal::PlusY)) {
+        if (unpackFace(output.vertices[i].faceAttr) == FaceNormal::PlusY &&
+            unpackFace(output.vertices[i + 1].faceAttr) == FaceNormal::PlusY &&
+            unpackFace(output.vertices[i + 2].faceAttr) == FaceNormal::PlusY &&
+            unpackFace(output.vertices[i + 3].faceAttr) == FaceNormal::PlusY) {
             foundTopQuad = true;
             break;
         }
@@ -1251,12 +1252,12 @@ TEST_CASE("Mesher: vertical column merges side faces", "[render][mesher]") {
     // Each side quad should have vertices at y=64 and y=68 (height=4)
     bool foundSideQuad = false;
     for (size_t i = 0; i + 3 < output.vertices.size(); ++i) {
-        uint8_t ni = output.vertices[i].normalIdx;
-        // Check side faces (normalIdx 0-3)
+        uint8_t ni = static_cast<uint8_t>(unpackFace(output.vertices[i].faceAttr));
+        // Check side faces (face indices 0-3)
         if (ni <= 3 &&
-            output.vertices[i + 1].normalIdx == ni &&
-            output.vertices[i + 2].normalIdx == ni &&
-            output.vertices[i + 3].normalIdx == ni) {
+            static_cast<uint8_t>(unpackFace(output.vertices[i + 1].faceAttr)) == ni &&
+            static_cast<uint8_t>(unpackFace(output.vertices[i + 2].faceAttr)) == ni &&
+            static_cast<uint8_t>(unpackFace(output.vertices[i + 3].faceAttr)) == ni) {
             // Check that the quad spans 4 units in Y
             float minY = std::min({
                 static_cast<float>(output.vertices[i].py),
@@ -1300,86 +1301,42 @@ TEST_CASE("Mesher: produces mesh without side effects", "[render][mesher]") {
 }
 
 // ============================================================================
-// TextureAtlas Constant Tests (no Metal device required)
+// Block texture mapping tests (no Metal device required)
 // ============================================================================
-TEST_CASE("TextureAtlas constants are consistent", "[render][atlas]") {
-    REQUIRE(TextureAtlas::TILE_SIZE == 16);
-    REQUIRE(TextureAtlas::ATLAS_WIDTH == 1024);
-    REQUIRE(TextureAtlas::ATLAS_HEIGHT == 1024);
-    REQUIRE(TextureAtlas::TILES_PER_ROW == 64);
-    REQUIRE(TextureAtlas::TOTAL_TILES == 4096);
-    REQUIRE(TextureAtlas::MAX_BLOCK_TYPES == 256);
-}
-
-TEST_CASE("TextureAtlas tile allocation: 256 tiles fit without overlap", "[render][atlas]") {
-    // Verify that 256 unique tile indices produce unique UV coordinates.
-    // The UV grid is 64×64 tiles, so 256 tiles (16×16 sub-grid) fit easily.
-    float uvSize = 1.0f / static_cast<float>(TextureAtlas::TILES_PER_ROW);
-
-    struct UVBounds {
-        float uMin, vMin, uMax, vMax;
-    };
-
-    std::vector<UVBounds> tileBounds;
-    tileBounds.reserve(256);
-
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t col = i % TextureAtlas::TILES_PER_ROW;
-        uint32_t row = i / TextureAtlas::TILES_PER_ROW;
-        float u = static_cast<float>(col) * uvSize;
-        float v = static_cast<float>(row) * uvSize;
-        tileBounds.push_back({u, v, u + uvSize, v + uvSize});
-    }
-
-    // Verify no two tiles overlap
-    for (size_t i = 0; i < tileBounds.size(); ++i) {
-        for (size_t j = i + 1; j < tileBounds.size(); ++j) {
-            // Tiles overlap if their UV ranges intersect
-            bool overlap = !(tileBounds[i].uMax <= tileBounds[j].uMin ||
-                             tileBounds[i].uMin >= tileBounds[j].uMax ||
-                             tileBounds[i].vMax <= tileBounds[j].vMin ||
-                             tileBounds[i].vMin >= tileBounds[j].vMax);
-            REQUIRE(!overlap);
+TEST_CASE("Block textures: every block type maps to a valid layer", "[render][textures]") {
+    for (int t = 0; t < static_cast<int>(BlockType::COUNT); ++t) {
+        for (int f = 0; f < 6; ++f) {
+            uint8_t layer = textureLayerFor(static_cast<BlockType>(t),
+                                            static_cast<FaceNormal>(f));
+            REQUIRE(layer < TEXTURE_LAYER_COUNT);
         }
     }
 }
 
-TEST_CASE("TextureAtlas UV computation within tile bounds", "[render][atlas]") {
-    float uvSize = 1.0f / static_cast<float>(TextureAtlas::TILES_PER_ROW);
+TEST_CASE("Block textures: grass uses per-face layers", "[render][textures]") {
+    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::PlusY) ==
+            static_cast<uint8_t>(BlockType::GRASS));
+    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::MinusY) ==
+            static_cast<uint8_t>(BlockType::DIRT));
+    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::PlusX) == TEXTURE_LAYER_GRASS_SIDE);
+    REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::MinusZ) == TEXTURE_LAYER_GRASS_SIDE);
+}
 
-    // Test UV for tiles at various positions
-    uint32_t testIndices[] = {0, 1, 63, 64, 100, 1023, 4095};
-
-    for (uint32_t tileIdx : testIndices) {
-        uint32_t col = tileIdx % TextureAtlas::TILES_PER_ROW;
-        uint32_t row = tileIdx / TextureAtlas::TILES_PER_ROW;
-
-        float expectedU = static_cast<float>(col) * uvSize;
-        float expectedV = static_cast<float>(row) * uvSize;
-
-        // Verify UV is within [0, 1) range
-        REQUIRE(expectedU >= 0.0f);
-        REQUIRE(expectedU < 1.0f);
-        REQUIRE(expectedV >= 0.0f);
-        REQUIRE(expectedV < 1.0f);
-
-        // Verify tile size is consistent
-        REQUIRE(uvSize == Catch::Approx(1.0f / 64.0f));
-
-        // Verify tile stays within atlas bounds
-        REQUIRE(expectedU + uvSize <= 1.0f);
-        REQUIRE(expectedV + uvSize <= 1.0f);
+TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][textures]") {
+    for (int f = 0; f < 6; ++f) {
+        for (uint8_t layer : {uint8_t{0}, uint8_t{7}, TEXTURE_LAYER_GRASS_SIDE,
+                              TEXTURE_LAYER_WHITE}) {
+            uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer);
+            REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
+            REQUIRE(unpackTextureLayer(attr) == layer);
+        }
     }
 }
 
-TEST_CASE("TextureAtlas exhaustion: total tiles equals grid capacity", "[render][atlas]") {
-    // TOTAL_TILES must equal TILES_PER_ROW * (ATLAS_HEIGHT / TILE_SIZE)
-    uint32_t expectedTotal = TextureAtlas::TILES_PER_ROW *
-                             (TextureAtlas::ATLAS_HEIGHT / TextureAtlas::TILE_SIZE);
-    REQUIRE(TextureAtlas::TOTAL_TILES == expectedTotal);
-
-    // MAX_BLOCK_TYPES (256) must be <= TOTAL_TILES (4096)
-    REQUIRE(TextureAtlas::MAX_BLOCK_TYPES <= TextureAtlas::TOTAL_TILES);
+TEST_CASE("Block textures: extra layers extend past the block types", "[render][textures]") {
+    REQUIRE(TEXTURE_LAYER_GRASS_SIDE == static_cast<uint8_t>(BlockType::COUNT));
+    REQUIRE(TEXTURE_LAYER_COUNT > TEXTURE_LAYER_GRASS_SIDE);
+    REQUIRE(BlockTextureArray::TILE_SIZE == 16);
 }
 
 // ============================================================================
