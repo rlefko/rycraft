@@ -20,9 +20,14 @@ bool PhysicsEngine::isInWater(World& world, const AABB& entityAABB) {
     int minX = static_cast<int>(std::floor(entityAABB.min.x));
     int minY = static_cast<int>(std::floor(entityAABB.min.y));
     int minZ = static_cast<int>(std::floor(entityAABB.min.z));
-    int maxX = static_cast<int>(std::ceil(entityAABB.max.x));
-    int maxY = static_cast<int>(std::ceil(entityAABB.max.y));
-    int maxZ = static_cast<int>(std::ceil(entityAABB.max.z));
+    // Half-open [min, max): the highest block the box overlaps is ceil(max) - 1.
+    // The old code used ceil(max) with an inclusive loop, so it reached one block
+    // PAST the box on +X/+Y/+Z — water on the far side of a wall then registered
+    // as "in water" and applied swimming physics (reduced gravity, buoyancy) to a
+    // player standing in dry air below sea level, near any ocean or lake.
+    int maxX = static_cast<int>(std::ceil(entityAABB.max.x)) - 1;
+    int maxY = static_cast<int>(std::ceil(entityAABB.max.y)) - 1;
+    int maxZ = static_cast<int>(std::ceil(entityAABB.max.z)) - 1;
 
     for (int x = minX; x <= maxX; ++x) {
         for (int y = minY; y <= maxY; ++y) {
