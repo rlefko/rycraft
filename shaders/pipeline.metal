@@ -152,10 +152,10 @@ vertex WaterVertexOutput waterVertexMain(
     float3 pos = in.position + chunkOrigin.origin.xyz;
     uint normalIdx = in.faceAttr & 7u;
     if (normalIdx == 4u) {
-        // Top surfaces bob; world-space input keeps waves continuous
+        // Top surfaces bob gently; world-space input keeps waves continuous
         // across chunk borders
         pos.y += sin(pos.x * 0.55f + water.time * 1.4f) *
-                 cos(pos.z * 0.45f + water.time * 1.1f) * 0.06f;
+                 cos(pos.z * 0.45f + water.time * 1.1f) * 0.04f;
     }
 
     WaterVertexOutput out;
@@ -167,13 +167,14 @@ vertex WaterVertexOutput waterVertexMain(
 }
 
 // Analytic normal of the same wave field the vertex stage displaces with,
-// plus a finer ripple set for sparkle.
+// plus a faint finer ripple set for sparkle. The slope scale keeps the
+// surface glassy — pushing it higher reads as chop.
 static float3 waterWaveNormal(float2 p, float t) {
-    float ddx = 0.55f * cos(p.x * 0.55f + t * 1.4f) * cos(p.y * 0.45f + t * 1.1f) * 0.06f +
-                cos(p.x * 1.9f + t * 2.3f) * 0.9f * 0.015f;
-    float ddz = -0.45f * sin(p.x * 0.55f + t * 1.4f) * sin(p.y * 0.45f + t * 1.1f) * 0.06f +
-                cos(p.y * 2.2f - t * 2.0f) * 1.1f * 0.015f;
-    return normalize(float3(-ddx * 6.0f, 1.0f, -ddz * 6.0f));
+    float ddx = 0.55f * cos(p.x * 0.55f + t * 1.4f) * cos(p.y * 0.45f + t * 1.1f) * 0.04f +
+                cos(p.x * 1.9f + t * 2.3f) * 0.9f * 0.008f;
+    float ddz = -0.45f * sin(p.x * 0.55f + t * 1.4f) * sin(p.y * 0.45f + t * 1.1f) * 0.04f +
+                cos(p.y * 2.2f - t * 2.0f) * 1.1f * 0.008f;
+    return normalize(float3(-ddx * 2.5f, 1.0f, -ddz * 2.5f));
 }
 
 // Interfering sine bands sharpened into bright filaments — the classic
@@ -214,7 +215,7 @@ fragment float4 waterFragmentMain(
     // ---- Refraction: wave-distorted resample of the scene, pinned at the
     // shoreline so shallow edges don't smear
     float distortion = min(waterDepth, 4.0f) * 0.25f;
-    float2 refractUV = clamp(screenUV + N.xz * 0.05f * distortion, 0.001f, 0.999f);
+    float2 refractUV = clamp(screenUV + N.xz * 0.035f * distortion, 0.001f, 0.999f);
     float refractDepth = sceneDepth.sample(screenSampler, refractUV);
     if (refractDepth < in.clipPosition.z) {
         // The distorted tap landed on something in FRONT of the surface —
@@ -232,7 +233,7 @@ fragment float4 waterFragmentMain(
     float depthBelow = max(in.vWorldPosition.y - rworld.y, 0.0f);
 
     // ---- Caustics: bright ripple filaments on the shallow floor
-    float caustic = causticPattern(rworld.xz * 1.3f, water.time) * exp(-depthBelow * 0.22f);
+    float caustic = causticPattern(rworld.xz * 0.6f, water.time) * exp(-depthBelow * 0.22f);
     refracted += water.sunColor * caustic * 0.4f * in.vSkyLight *
                  saturate(water.sunDirection.y * 2.0f);
 
@@ -287,6 +288,7 @@ vertex OverlayVertexOutput underwaterOverlayVertex(uint vertexID [[vertex_id]]) 
 
 fragment float4 underwaterOverlayFragment(
     OverlayVertexOutput in [[stage_in]],
+    depth2d<float> sceneDepth [[texture(1)]],
     constant WaterUniforms &water [[buffer(3)]]
 ) {
     // Slanted shafts of light, banded and animated, fading with depth on
@@ -299,8 +301,27 @@ fragment float4 underwaterOverlayFragment(
     float sunUp = saturate(water.sunDirection.y);
     float3 rayColor = water.sunColor * rays * topFade * sunUp * 0.9f;
 
+    // Caustics on every submerged surface around the camera — the water
+    // pass only shades pixels behind a surface quad, so without this the
+    // floor at the player's feet had none. Reconstruct the opaque world
+    // position and project the same caustic field onto up-facing geometry.
+    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear,
+                                    address::clamp_to_edge);
+    float depth = sceneDepth.sample(screenSampler, in.uv);
+    float4 clip = float4(in.uv.x * 2.0f - 1.0f, 1.0f - in.uv.y * 2.0f, depth, 1.0f);
+    float4 worldH = water.invViewProjection * clip;
+    float3 world = worldH.xyz / worldH.w;
+    // Screen-space derivatives give the surface normal: walls get none
+    float3 surfaceNormal = normalize(cross(dfdx(world), dfdy(world)));
+    float upFacing = saturate(abs(surfaceNormal.y));
+    float submerged = step(world.y, 63.9f); // sea level; dry land gets none
+    float dist = distance(world, water.cameraPosition);
+    float caustic = causticPattern(world.xz * 0.85f, t) *
+                    exp(-max(64.0f - world.y, 0.0f) * 0.10f) * exp(-dist * 0.03f);
+    float3 causticColor = water.sunColor * caustic * upFacing * submerged * sunUp * 2.4f;
+
     float3 veil = float3(0.05f, 0.18f, 0.32f);
-    return float4(veil + rayColor, 0.35f);
+    return float4(veil + rayColor + causticColor, 0.35f);
 }
 
 // ---------------------------------------------------------------------------

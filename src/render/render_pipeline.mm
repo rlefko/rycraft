@@ -1045,6 +1045,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     if (cameraUnderwater) {
         [encoder setRenderPipelineState:_underwaterOverlayState];
         [encoder setFragmentBuffer:_waterUniformsBuffer offset:0 atIndex:3];
+        [encoder setFragmentTexture:_depthResolve atIndex:1];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
 

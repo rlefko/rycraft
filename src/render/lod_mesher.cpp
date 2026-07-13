@@ -485,9 +485,17 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
         }
     }
 
-    // ---- Water section: everything after this index draws in the water pass
+    // ---- Water section: everything after this index draws in the water pass.
+    // Out-of-chunk neighbors count as water: oceans continue into the next
+    // chunk virtually always, and emitting walls there painted phantom
+    // stripes along every chunk border. (Neighbor-aware meshing will replace
+    // this assumption with real neighbor blocks.)
     output.opaqueIndexCount = static_cast<uint32_t>(output.indices.size());
-    runGreedyPasses(gridW, gridH, gridD, getBlock, waterFaceVisible, lightAt, 0.125f,
+    BlockAccessor waterEdgeBlock = [&getBlock, gridW, gridD](int x, int y, int z) -> BlockType {
+        if (x < 0 || x >= gridW || z < 0 || z >= gridD) return BlockType::WATER;
+        return getBlock(x, y, z);
+    };
+    runGreedyPasses(gridW, gridH, gridD, waterEdgeBlock, waterFaceVisible, lightAt, 0.125f,
                     output.vertices, output.indices);
 
     return output;
