@@ -36,21 +36,24 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
     float moveX = 0.f;
     float moveZ = 0.f;
 
+    // Camera basis (see Camera::updateFront/right): forward is
+    // (+sin yaw, +cos yaw) and right is (-cos yaw, +sin yaw). These signs
+    // were all inverted before, so W walked backwards and D strafed left.
     if (input.isDown(Key::W)) {
-        moveX -= std::sin(yaw) * speed;
-        moveZ -= std::cos(yaw) * speed;
-    }
-    if (input.isDown(Key::S)) {
         moveX += std::sin(yaw) * speed;
         moveZ += std::cos(yaw) * speed;
     }
-    if (input.isDown(Key::A)) {
-        moveX -= std::cos(yaw) * speed;
-        moveZ += std::sin(yaw) * speed;
+    if (input.isDown(Key::S)) {
+        moveX -= std::sin(yaw) * speed;
+        moveZ -= std::cos(yaw) * speed;
     }
-    if (input.isDown(Key::D)) {
+    if (input.isDown(Key::A)) {
         moveX += std::cos(yaw) * speed;
         moveZ -= std::sin(yaw) * speed;
+    }
+    if (input.isDown(Key::D)) {
+        moveX -= std::cos(yaw) * speed;
+        moveZ += std::sin(yaw) * speed;
     }
 
     velocity.x = moveX;

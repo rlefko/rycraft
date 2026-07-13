@@ -1907,6 +1907,35 @@ TEST_CASE("isInWater: returns true when entity AABB overlaps water block", "[phy
 // ============================================================================
 // Player Tests (Phase 5)
 // ============================================================================
+TEST_CASE("Player movement follows the camera basis", "[player]") {
+  auto world = std::make_shared<World>(42);
+  world->getChunk(0, 0);
+
+  // At yaw = 0 the camera looks down +Z (Camera::updateFront), so W must
+  // accelerate toward +Z and D toward the camera's right (-X at yaw 0).
+  // These were inverted once: W walked backwards, D strafed left.
+  {
+    Player player;
+    player.position = Vec3{8.f, 250.f, 8.f};  // high in the air, no collisions
+    player.yaw = 0.f;
+    InputState input;
+    input.keysDown[Key::W] = true;
+    player.tick(*world, input, false);
+    REQUIRE(player.velocity.z > 0.f);
+    REQUIRE(std::abs(player.velocity.x) < 1e-4f);
+  }
+  {
+    Player player;
+    player.position = Vec3{8.f, 250.f, 8.f};
+    player.yaw = 0.f;
+    InputState input;
+    input.keysDown[Key::D] = true;
+    player.tick(*world, input, false);
+    REQUIRE(player.velocity.x < 0.f);
+    REQUIRE(std::abs(player.velocity.z) < 1e-4f);
+  }
+}
+
 TEST_CASE("Player AABB: correct dimensions (0.6x1.8x0.6)", "[player]") {
     Player player;
     player.position = Vec3{10.f, 64.f, 10.f};
