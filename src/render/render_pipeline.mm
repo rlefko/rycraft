@@ -79,6 +79,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
 
     pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    pipelineDesc.rasterSampleCount = 4;
 
     NSError* error = nil;
     _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc
@@ -104,6 +105,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     waterPipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     waterPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     waterPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    waterPipelineDesc.rasterSampleCount = 4;
 
     _waterPipelineState = [_device newRenderPipelineStateWithDescriptor:waterPipelineDesc
                                                                  error:&error];
@@ -146,6 +148,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     skyPipelineDesc.vertexFunction = skyVertexFunc;
     skyPipelineDesc.fragmentFunction = skyFragmentFunc;
     skyPipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    skyPipelineDesc.rasterSampleCount = 4;
 
     _skyPipelineState = [_device newRenderPipelineStateWithDescriptor:skyPipelineDesc
                                                                error:&error];
@@ -179,6 +182,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     highlightPipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     highlightPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     highlightPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    highlightPipelineDesc.rasterSampleCount = 4;
 
     _highlightPipelineState = [_device newRenderPipelineStateWithDescriptor:highlightPipelineDesc
                                                                      error:&error];
@@ -241,10 +245,34 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         RY_LOG_FATAL("Failed to allocate highlight uniforms buffer");
     }
 
-    // ---- Render target textures (single-sample, at render resolution) ----
-    // MSAA disabled: sampleCount=4 crashes on M4 Max with assertion
-    // "MTLTextureDescriptor has sampleCount set but is using a type that
-    // does not allow sampleCount". Render directly to resolve textures.
+    // ---- MSAA textures (multisample, at render resolution) ----
+    auto colorMSAADesc = [[MTLTextureDescriptor alloc] init];
+    colorMSAADesc.textureType = MTLTextureType2DMultisample;
+    colorMSAADesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    colorMSAADesc.width = _renderWidth;
+    colorMSAADesc.height = _renderHeight;
+    colorMSAADesc.sampleCount = 4;
+    colorMSAADesc.usage = MTLTextureUsageRenderTarget;
+    colorMSAADesc.storageMode = MTLStorageModeMemoryless;
+    _colorMSAA = [_device newTextureWithDescriptor:colorMSAADesc];
+    if (!_colorMSAA) {
+        RY_LOG_FATAL("Failed to allocate MSAA color texture");
+    }
+
+    auto depthMSAADesc = [[MTLTextureDescriptor alloc] init];
+    depthMSAADesc.textureType = MTLTextureType2DMultisample;
+    depthMSAADesc.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    depthMSAADesc.width = _renderWidth;
+    depthMSAADesc.height = _renderHeight;
+    depthMSAADesc.sampleCount = 4;
+    depthMSAADesc.usage = MTLTextureUsageRenderTarget;
+    depthMSAADesc.storageMode = MTLStorageModePrivate;
+    _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
+    if (!_depthMSAA) {
+        RY_LOG_FATAL("Failed to allocate MSAA depth texture");
+    }
+
+    // ---- Resolve textures (single-sample, at render resolution) ----
     auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                    width:_renderWidth
                                                                                   height:_renderHeight
@@ -256,9 +284,9 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     }
 
     auto depthResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                  width:_renderWidth
-                                                                                 height:_renderHeight
-                                                                             mipmapped:false];
+                                                                                   width:_renderWidth
+                                                                                  height:_renderHeight
+                                                                              mipmapped:false];
     _depthResolve = [_device newTextureWithDescriptor:depthResolveDesc];
     if (!_depthResolve) {
         RY_LOG_FATAL("Failed to allocate depth resolve texture");
@@ -297,6 +325,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
         cloudPipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         cloudPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         cloudPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        cloudPipelineDesc.rasterSampleCount = 4;
 
         _cloudPipelineState = [_device newRenderPipelineStateWithDescriptor:cloudPipelineDesc
                                                                      error:&error];
@@ -374,13 +403,14 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
     // ---- Main render pass descriptor (render at half-resolution for upscaling) ----
     auto renderPassDesc = [[MTLRenderPassDescriptor alloc] init];
 
-    // Color attachment: render directly to _colorResolve (MSAA disabled).
-    // Deferred store: MTLStoreActionStore keeps _colorResolve for bloom/upscale.
-    // When bloom is active, _colorResolve feeds the bloom extract pass; when
-    // bloom is off, _colorResolve feeds the upscaler directly.
-    renderPassDesc.colorAttachments[0].texture = _colorResolve;
+    // Color attachment: render to MSAA, resolve to _colorResolve.
+    // MTLStoreActionMultisampleResolve resolves 4x MSAA into _colorResolve
+    // and discards the MSAA texture contents. _colorResolve then feeds
+    // bloom and the upscaler.
+    renderPassDesc.colorAttachments[0].texture = _colorMSAA;
+    renderPassDesc.colorAttachments[0].resolveTexture = _colorResolve;
     renderPassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
-    renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+    renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(
         skyUniforms.horizonColor[0],
         skyUniforms.horizonColor[1],
@@ -388,10 +418,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue,
         1.0f
     );
 
-    // Depth attachment: render directly to _depthResolve (MSAA disabled)
-    renderPassDesc.depthAttachment.texture = _depthResolve;
+    // Depth attachment: render to MSAA depth, resolve to single-sample
+    renderPassDesc.depthAttachment.texture = _depthMSAA;
+    renderPassDesc.depthAttachment.resolveTexture = _depthResolve;
     renderPassDesc.depthAttachment.loadAction = MTLLoadActionClear;
-    renderPassDesc.depthAttachment.storeAction = MTLStoreActionStore;
+    renderPassDesc.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.depthAttachment.clearDepth = 1.0;
 
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
@@ -920,10 +951,39 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
     _renderHeight = height / 2;
 
     // Release old textures
+    _colorMSAA = nil;
     _colorResolve = nil;
+    _depthMSAA = nil;
     _depthResolve = nil;
 
-    // Reallocate render target textures at render resolution (MSAA disabled)
+    // Reallocate MSAA textures at render resolution
+    auto colorMSAADesc = [[MTLTextureDescriptor alloc] init];
+    colorMSAADesc.textureType = MTLTextureType2DMultisample;
+    colorMSAADesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    colorMSAADesc.width = _renderWidth;
+    colorMSAADesc.height = _renderHeight;
+    colorMSAADesc.sampleCount = 4;
+    colorMSAADesc.usage = MTLTextureUsageRenderTarget;
+    colorMSAADesc.storageMode = MTLStorageModeMemoryless;
+    _colorMSAA = [_device newTextureWithDescriptor:colorMSAADesc];
+    if (!_colorMSAA) {
+        RY_LOG_FATAL("Failed to reallocate MSAA color texture after resize");
+    }
+
+    auto depthMSAADesc = [[MTLTextureDescriptor alloc] init];
+    depthMSAADesc.textureType = MTLTextureType2DMultisample;
+    depthMSAADesc.pixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+    depthMSAADesc.width = _renderWidth;
+    depthMSAADesc.height = _renderHeight;
+    depthMSAADesc.sampleCount = 4;
+    depthMSAADesc.usage = MTLTextureUsageRenderTarget;
+    depthMSAADesc.storageMode = MTLStorageModePrivate;
+    _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
+    if (!_depthMSAA) {
+        RY_LOG_FATAL("Failed to reallocate MSAA depth texture after resize");
+    }
+
+    // Reallocate resolve textures at render resolution
     auto colorResolveDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                                    width:_renderWidth
                                                                                   height:_renderHeight
@@ -1128,25 +1188,19 @@ void MetalFXUpscaler::upscale(id<MTLCommandBuffer> commandBuffer,
 {
     if (!commandBuffer || !source || !destination) return;
 
-    // Use Metal's built-in blit for bilinear upscale.
-    // This is a placeholder — Phase 9.4 will replace with MetalFX temporal upscaling.
+    // Use Metal's built-in copy for upscale (nearest-neighbor).
+    // A bilinear upscale shader would be needed for higher quality.
     id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
     if (blitEncoder) {
-        [blitEncoder generateMipmapsForTexture:source];
+        [blitEncoder copyFromTexture:source
+                        sourceSlice:0
+                        sourceLevel:0
+                       sourceOrigin:MTLOriginMake(0, 0, 0)
+                         sourceSize:MTLSizeMake(source.width, source.height, 1)
+                              toTexture:destination
+                     destinationSlice:0
+                     destinationLevel:0
+                destinationOrigin:MTLOriginMake(0, 0, 0)];
         [blitEncoder endEncoding];
     }
-
-    // Draw fullscreen quad with bilinear sampling for upscale.
-    // Since we don't have a dedicated upscale shader yet, we use a render pass
-    // that samples the source texture with linear filtering into the destination.
-    auto upscalePassDesc = [[MTLRenderPassDescriptor alloc] init];
-    upscalePassDesc.colorAttachments[0].texture = destination;
-    upscalePassDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
-    upscalePassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    upscalePassDesc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-
-    // The UI overlay pipeline can serve as a simple fullscreen quad drawer.
-    // For now, we skip the upscale and let the MSAA resolve handle it.
-    // (The MSAA resolve already does a quality bilinear interpolation.)
-    (void)upscalePassDesc;
 }
