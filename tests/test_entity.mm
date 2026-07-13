@@ -194,6 +194,22 @@ TEST_CASE("isInWater: returns true when entity AABB overlaps water block", "[phy
     REQUIRE(PhysicsEngine::isInWater(*world, notInWater) == false);
 }
 
+TEST_CASE("isInWater: water one block away is not 'in water'", "[physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->setBlock(11, 200, 5, BlockType::WATER); // water block spans x[11,12)
+
+    // Player-width box occupying x[9.7,10.3]: its +X face is at 10.3, so it does
+    // NOT overlap the water at x[11,12). This used to falsely read as in-water
+    // because the scan reached one block past the box.
+    AABB dryBox{Vec3{9.7f, 200.f, 4.7f}, Vec3{10.3f, 201.8f, 5.3f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, dryBox) == false);
+
+    // Shift it east so the box actually overlaps the water block → in water.
+    AABB wetBox{Vec3{10.7f, 200.f, 4.7f}, Vec3{11.3f, 201.8f, 5.3f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, wetBox) == true);
+}
+
 // ============================================================================
 // Player Tests (Phase 5)
 // ============================================================================
