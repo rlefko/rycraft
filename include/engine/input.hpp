@@ -1,7 +1,6 @@
 #pragma once
 
 #include <common/math.hpp>
-#include <common/result.hpp>
 #include <common/error.hpp>
 
 #include <string>

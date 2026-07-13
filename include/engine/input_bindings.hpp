@@ -3,6 +3,7 @@
 #include <engine/input.hpp>
 
 #include <array>
+#include <optional>
 #include <string>
 
 // ---------------------------------------------------------------------------
@@ -36,8 +37,12 @@ struct InputBindings {
         {Key::Eight, "Slot 8"}, {Key::Nine, "Slot 9"},
     }};
 
-    Result<InputBindings, EngineError> save(const std::string& path);
-    static Result<InputBindings, EngineError> load(const std::string& path);
+    // Returns false (with a logged error) when the file cannot be written.
+    bool save(const std::string& path) const;
+
+    // Returns nullopt only when the file exists but cannot be parsed; a
+    // missing file yields the defaults (first launch is not an error).
+    static std::optional<InputBindings> load(const std::string& path);
 
     static std::string defaultPath();
 };

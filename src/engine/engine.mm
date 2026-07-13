@@ -95,7 +95,7 @@ struct EngineState {
     Vec3 lastFootstepPos{0.f, 0.f, 0.f};
 
     // ---- Input manager (set after window creation) ----
-    InputManager* inputManager = nullptr;
+    std::unique_ptr<InputManager> inputManager;
 };
 
 @implementation Engine {
@@ -237,7 +237,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // 7. Create InputManager (the game opens on the title screen with a
     // free cursor; clicking PLAY captures the mouse)
-    _state->inputManager = new InputManager(_window);
+    _state->inputManager = std::make_unique<InputManager>(_window);
 
     // 6. Load shader library and create render pipeline
     NSString* exePath = [[NSBundle mainBundle] executablePath];

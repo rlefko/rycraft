@@ -31,12 +31,6 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
                                 uint32_t width,
                                 uint32_t height)
     : _device(device)
-    , _megaBuffer(nullptr)
-    , _blockTextures(nullptr)
-    , _uiOverlay(nullptr)
-    , _bloom(nullptr)
-    , _particles(nullptr)
-    , _entityRenderer(nullptr)
     , _bloomIntensity(1.0f)
     , _displayWidth(width)
     , _displayHeight(height)
@@ -247,13 +241,13 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
     }
 
     // ---- MegaBuffer (centralized GPU memory for chunk meshes) ----
-    _megaBuffer = new MegaBuffer(_device);
+    _megaBuffer = std::make_unique<MegaBuffer>(_device);
 
     // ---- Block textures (procedural, one array layer per face texture) ----
-    _blockTextures = new BlockTextureArray(_device);
+    _blockTextures = std::make_unique<BlockTextureArray>(_device);
 
     // ---- UIOverlay (screen-space HUD rendering) ----
-    _uiOverlay = new UIOverlay(_device, shaderLibrary, _displayWidth, _displayHeight);
+    _uiOverlay = std::make_unique<UIOverlay>(_device, shaderLibrary, _displayWidth, _displayHeight);
 
     // ---- Cloud pipeline state (Phase 8) ----
     id<MTLFunction> cloudVertexFunc = [shaderLibrary newFunctionWithName:@"cloudVertexMain"];
@@ -289,14 +283,14 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device,
                                                   options:MTLResourceStorageModeShared];
 
     // ---- Bloom post-processing (Phase 8) ----
-    _bloom = new Bloom(_device, shaderLibrary, _displayWidth, _displayHeight);
+    _bloom = std::make_unique<Bloom>(_device, shaderLibrary, _displayWidth, _displayHeight);
     _bloom->setIntensity(_bloomIntensity);
 
     // ---- Weather Particle System ----
-    _particles = new ParticleSystem(_device, shaderLibrary);
+    _particles = std::make_unique<ParticleSystem>(_device, shaderLibrary);
 
     // ---- Animal renderer ----
-    _entityRenderer = new EntityRenderer(_device, shaderLibrary);
+    _entityRenderer = std::make_unique<EntityRenderer>(_device, shaderLibrary);
 }
 
 // ---------------------------------------------------------------------------
@@ -893,14 +887,7 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
 // ---------------------------------------------------------------------------
 // Destructor
 // ---------------------------------------------------------------------------
-RenderPipeline::~RenderPipeline() {
-    delete _megaBuffer;
-    delete _blockTextures;
-    delete _uiOverlay;
-    delete _bloom;
-    delete _particles;
-    delete _entityRenderer;
-}
+RenderPipeline::~RenderPipeline() = default;
 
 // ---------------------------------------------------------------------------
 // resize()

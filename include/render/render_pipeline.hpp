@@ -123,22 +123,22 @@ private:
     id<MTLBuffer> _uniformsBuffer;
 
     // MegaBuffer for centralized GPU memory management.
-    MegaBuffer* _megaBuffer;
+    std::unique_ptr<MegaBuffer> _megaBuffer;
 
     // Array texture of procedural block textures.
-    BlockTextureArray* _blockTextures;
+    std::unique_ptr<BlockTextureArray> _blockTextures;
 
-    // UI overlay for HUD rendering (crosshair, hotbar).
-    UIOverlay* _uiOverlay;
+    // UI overlay for HUD rendering (crosshair, hotbar, menus).
+    std::unique_ptr<UIOverlay> _uiOverlay;
 
     // Bloom post-processing (Phase 8)
-    Bloom* _bloom;
+    std::unique_ptr<Bloom> _bloom;
 
     // Weather particle system (rain/snow)
-    ParticleSystem* _particles;
+    std::unique_ptr<ParticleSystem> _particles;
 
     // Animal voxel-model renderer
-    EntityRenderer* _entityRenderer;
+    std::unique_ptr<EntityRenderer> _entityRenderer;
 
     // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
     float _bloomIntensity;

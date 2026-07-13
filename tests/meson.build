@@ -4,8 +4,17 @@ assert(catch2_proj.found(), 'Catch2 subproject failed to initialize')
 
 catch2_with_main_dep = catch2_proj.get_variable('catch2_with_main_dep')
 
+test_sources = files(
+  'test_common.mm',
+  'test_world.mm',
+  'test_render.mm',
+  'test_entity.mm',
+  'test_engine.mm',
+  'test_audio.mm',
+)
+
 test_exe = executable('test_rycraft',
-  'test_main.mm',
+  test_sources,
   include_directories : inc,
   link_with : [libcommon, libworld, librender, libentity, libengine, libaudio],
   dependencies : [catch2_with_main_dep, lz4_dep],

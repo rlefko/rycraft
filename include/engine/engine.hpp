@@ -2,7 +2,6 @@
 
 #include <common/error.hpp>
 #include <common/math.hpp>
-#include <common/result.hpp>
 
 #include <cstdint>
 
