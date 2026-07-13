@@ -11,7 +11,7 @@
 #include <world/serialization.hpp>
 #include <world/save_manager.hpp>
 #include <render/vertex.hpp>
-#include <render/mesher.hpp>
+#include <render/lod_mesher.hpp>
 #include <render/texture_atlas.hpp>
 #include <render/mega_buffer.hpp>
 #include <render/ui_overlay.hpp>
@@ -1136,23 +1136,23 @@ TEST_CASE("Vertex fields have expected sizes", "[render][vertex]") {
 // ============================================================================
 // Greedy Mesher Tests
 // ============================================================================
-TEST_CASE("GreedyMesher empty chunk produces no geometry", "[render][mesher]") {
+TEST_CASE("Mesher: empty chunk produces no geometry", "[render][mesher]") {
     Chunk chunk(0, 0);
     // All AIR — no solid blocks
 
-    GreedyMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk);
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
 
     REQUIRE(output.vertices.empty());
     REQUIRE(output.indices.empty());
 }
 
-TEST_CASE("GreedyMesher single block produces 6 faces", "[render][mesher]") {
+TEST_CASE("Mesher: single block produces 6 faces", "[render][mesher]") {
     Chunk chunk(0, 0);
     chunk.setBlock(8, 64, 8, BlockType::STONE);
 
-    GreedyMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk);
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
 
     // 6 faces × 4 vertices = 24 vertices
     REQUIRE(output.vertices.size() == 24);
@@ -1160,7 +1160,7 @@ TEST_CASE("GreedyMesher single block produces 6 faces", "[render][mesher]") {
     REQUIRE(output.indices.size() == 36);
 }
 
-TEST_CASE("GreedyMesher 2x2 flat merges top face", "[render][mesher]") {
+TEST_CASE("Mesher: 2x2 flat merges top face", "[render][mesher]") {
     Chunk chunk(0, 0);
     // 2x2 square of STONE at y=64
     chunk.setBlock(0, 64, 0, BlockType::STONE);
@@ -1168,8 +1168,8 @@ TEST_CASE("GreedyMesher 2x2 flat merges top face", "[render][mesher]") {
     chunk.setBlock(0, 64, 1, BlockType::STONE);
     chunk.setBlock(1, 64, 1, BlockType::STONE);
 
-    GreedyMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk);
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
 
     // Without greedy merge: 4 top faces = 16 vertices
     // With greedy merge: 1 top face = 4 vertices
@@ -1207,7 +1207,7 @@ TEST_CASE("GreedyMesher 2x2 flat merges top face", "[render][mesher]") {
     REQUIRE(foundTopQuad);
 }
 
-TEST_CASE("GreedyMesher vertical column merges side faces", "[render][mesher]") {
+TEST_CASE("Mesher: vertical column merges side faces", "[render][mesher]") {
     Chunk chunk(0, 0);
     // 4-block tall column of STONE at (8, 64..67, 8)
     chunk.setBlock(8, 64, 8, BlockType::STONE);
@@ -1215,8 +1215,8 @@ TEST_CASE("GreedyMesher vertical column merges side faces", "[render][mesher]") 
     chunk.setBlock(8, 66, 8, BlockType::STONE);
     chunk.setBlock(8, 67, 8, BlockType::STONE);
 
-    GreedyMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk);
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
 
     // Top (+Y): 1 quad at y=67 top = 4 vertices, 6 indices
     // Bottom (-Y): 1 quad at y=64 bottom = 4 vertices, 6 indices
@@ -1259,13 +1259,13 @@ TEST_CASE("GreedyMesher vertical column merges side faces", "[render][mesher]") 
     REQUIRE(foundSideQuad);
 }
 
-TEST_CASE("GreedyMesher produces mesh without side effects", "[render][mesher]") {
+TEST_CASE("Mesher: produces mesh without side effects", "[render][mesher]") {
     Chunk chunk(0, 0);
     chunk.setBlock(8, 64, 8, BlockType::STONE);
     REQUIRE(chunk.needsMeshUpdate == true);
 
-    GreedyMesher mesher;
-    MeshOutput mesh = mesher.buildMesh(chunk);
+    LODMesher mesher;
+    MeshOutput mesh = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
 
     // buildMesh is pure — it does not modify the chunk
     REQUIRE(chunk.needsMeshUpdate == true);

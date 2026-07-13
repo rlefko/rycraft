@@ -3,10 +3,19 @@
 #include <vector>
 #include <cstdint>
 #include "render/vertex.hpp"
-#include "render/mesher.hpp"
 
 // Forward declaration
 struct Chunk;
+
+// Output of a single chunk mesh build.
+struct MeshOutput {
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+
+    MeshOutput() = default;
+    MeshOutput(MeshOutput&&) = default;
+    MeshOutput& operator=(MeshOutput&&) = default;
+};
 
 // Distance thresholds (in blocks, not chunk units).
 // A chunk is 16 blocks wide, so 8 chunks = 128 blocks.
@@ -23,16 +32,19 @@ enum class ChunkLOD : int {
     Count = 3
 };
 
-// Level of Detail mesher — reduces polygon count for distant chunks.
+// Greedy mesher with level-of-detail support. This is the single mesher in
+// the engine: ChunkLOD::Full runs the standard 16×16×256 greedy meshing, the
+// coarser levels sample the chunk at reduced resolution first.
 //
-// Selects mesh resolution based on camera-to-chunk distance:
 //   LOD 0 (near,  < 128 blocks):  full greedy meshing (16×16×256)
 //   LOD 1 (mid,   128-256 blocks): 2× downsampling (8×8×128)
 //   LOD 2 (far,   256-512 blocks): 4× downsampling (4×4×64)
 //   Beyond 512 blocks: returns empty mesh (distance culling)
 //
-// Each LOD level builds a coarse representation by sampling the chunk at
-// reduced resolution, then runs greedy meshing on the coarse grid.
+// NOTE: the renderer currently draws everything at ChunkLOD::Full — the
+// coarse levels emit geometry at grid scale (not world scale) and switching
+// levels invalidates nothing, so LOD selection is parked until those are
+// reworked (see docs/rendering-conventions.md).
 class LODMesher {
 public:
     // Build mesh for the given chunk at the specified LOD level.
