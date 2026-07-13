@@ -34,8 +34,8 @@ public:
     int getSelectedIndex() const;
 
 private:
-    BlockType _slots[SLOTS] = {BlockType::STONE,   BlockType::DIRT,     BlockType::GRASS,
-                               BlockType::LOG,     BlockType::SAND,     BlockType::PLANKS,
-                               BlockType::BEDROCK, BlockType::COAL_ORE, BlockType::IRON_ORE};
+    BlockType _slots[SLOTS] = {BlockType::STONE,     BlockType::DIRT,   BlockType::GRASS,
+                               BlockType::LOG,       BlockType::PLANKS, BlockType::SAND,
+                               BlockType::SANDSTONE, BlockType::GLASS,  BlockType::FLOWER_RED};
     int _selectedIndex = 0;
 };

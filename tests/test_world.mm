@@ -57,6 +57,7 @@ TEST_CASE("Chunk coordinates are multiples of CHUNK_SIZE", "[chunk]") {
 }
 
 TEST_CASE("BlockType enum values are as expected", "[block]") {
+    // Saves store raw enum bytes: existing values must never renumber
     REQUIRE(static_cast<int>(BlockType::AIR) == 0);
     REQUIRE(static_cast<int>(BlockType::STONE) == 1);
     REQUIRE(static_cast<int>(BlockType::GRASS) == 2);
@@ -65,7 +66,46 @@ TEST_CASE("BlockType enum values are as expected", "[block]") {
     REQUIRE(static_cast<int>(BlockType::BEDROCK) == 7);
     REQUIRE(static_cast<int>(BlockType::LOG) == 8);
     REQUIRE(static_cast<int>(BlockType::LEAVES) == 9);
-    REQUIRE(static_cast<int>(BlockType::COUNT) == 17);
+    REQUIRE(static_cast<int>(BlockType::GLASS) == 16);
+    REQUIRE(static_cast<int>(BlockType::COBBLESTONE) == 17);
+    REQUIRE(static_cast<int>(BlockType::REED) == 31);
+    REQUIRE(static_cast<int>(BlockType::ICE) == 33);
+    REQUIRE(static_cast<int>(BlockType::COUNT) == 34);
+}
+
+TEST_CASE("Block properties: flora, liquid, and targetable sets", "[block]") {
+    // Flora: cross-quad plants — non-solid, non-opaque, but targetable
+    for (BlockType bt : {BlockType::DEAD_BUSH, BlockType::TALL_GRASS, BlockType::FLOWER_YELLOW,
+                         BlockType::FLOWER_RED, BlockType::MUSHROOM_BROWN, BlockType::MUSHROOM_RED,
+                         BlockType::REED}) {
+        REQUIRE(isFlora(bt));
+        REQUIRE(!isSolid(bt));
+        REQUIRE(!isOpaque(bt));
+        REQUIRE(isTargetable(bt));
+    }
+    REQUIRE(!isFlora(BlockType::CACTUS)); // cactus is a full cube
+
+    // Liquids: swimmable, non-solid, click-through
+    for (BlockType bt : {BlockType::WATER, BlockType::LAVA}) {
+        REQUIRE(isLiquid(bt));
+        REQUIRE(!isSolid(bt));
+        REQUIRE(!isOpaque(bt));
+        REQUIRE(!isTargetable(bt));
+    }
+
+    // Cube blocks added by the worldgen overhaul stay solid + opaque
+    for (BlockType bt :
+         {BlockType::COBBLESTONE, BlockType::MOSSY_COBBLESTONE, BlockType::SANDSTONE,
+          BlockType::BIRCH_LOG, BlockType::SPRUCE_LOG, BlockType::CACTUS, BlockType::ICE}) {
+        REQUIRE(isSolid(bt));
+        REQUIRE(isOpaque(bt));
+    }
+
+    // Leaf variants cut out like oak leaves
+    for (BlockType bt : {BlockType::BIRCH_LEAVES, BlockType::SPRUCE_LEAVES}) {
+        REQUIRE(isSolid(bt));
+        REQUIRE(!isOpaque(bt));
+    }
 }
 
 // ============================================================================

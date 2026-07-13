@@ -174,8 +174,8 @@ TEST_CASE("Block properties: the three predicates agree on every type", "[physic
         if (isOpaque(bt)) {
             REQUIRE(isSolid(bt));
         }
-        // Air and water are the only non-solid types today
-        bool expectedSolid = bt != BlockType::AIR && bt != BlockType::WATER;
+        // Non-solid = air, liquids, and walk-through flora — nothing else
+        bool expectedSolid = bt != BlockType::AIR && !isLiquid(bt) && !isFlora(bt);
         REQUIRE(isSolid(bt) == expectedSolid);
     }
 }

@@ -96,6 +96,101 @@ void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
                 g = 0.5f;
                 b = 0.45f;
                 break;
+            case BlockType::GLASS:
+                r = 0.85f;
+                g = 0.9f;
+                b = 0.95f;
+                break;
+            case BlockType::COBBLESTONE:
+                r = 0.45f;
+                g = 0.45f;
+                b = 0.47f;
+                break;
+            case BlockType::MOSSY_COBBLESTONE:
+                r = 0.35f;
+                g = 0.45f;
+                b = 0.3f;
+                break;
+            case BlockType::SANDSTONE:
+                r = 0.8f;
+                g = 0.72f;
+                b = 0.5f;
+                break;
+            case BlockType::BIRCH_LOG:
+                r = 0.85f;
+                g = 0.83f;
+                b = 0.75f;
+                break;
+            case BlockType::BIRCH_LEAVES:
+                r = 0.35f;
+                g = 0.55f;
+                b = 0.25f;
+                break;
+            case BlockType::SPRUCE_LOG:
+                r = 0.3f;
+                g = 0.2f;
+                b = 0.1f;
+                break;
+            case BlockType::SPRUCE_LEAVES:
+                r = 0.12f;
+                g = 0.35f;
+                b = 0.18f;
+                break;
+            case BlockType::CACTUS:
+                r = 0.2f;
+                g = 0.45f;
+                b = 0.15f;
+                break;
+            case BlockType::DEAD_BUSH:
+                r = 0.55f;
+                g = 0.4f;
+                b = 0.22f;
+                break;
+            case BlockType::TALL_GRASS:
+                r = 0.35f;
+                g = 0.65f;
+                b = 0.25f;
+                break;
+            case BlockType::FLOWER_YELLOW:
+                r = 0.9f;
+                g = 0.85f;
+                b = 0.2f;
+                break;
+            case BlockType::FLOWER_RED:
+                r = 0.85f;
+                g = 0.2f;
+                b = 0.2f;
+                break;
+            case BlockType::MUSHROOM_BROWN:
+                r = 0.55f;
+                g = 0.4f;
+                b = 0.3f;
+                break;
+            case BlockType::MUSHROOM_RED:
+                r = 0.8f;
+                g = 0.15f;
+                b = 0.15f;
+                break;
+            case BlockType::REED:
+                r = 0.5f;
+                g = 0.75f;
+                b = 0.35f;
+                break;
+            case BlockType::LAVA:
+                r = 0.9f;
+                g = 0.4f;
+                b = 0.1f;
+                break;
+            case BlockType::ICE:
+                r = 0.7f;
+                g = 0.85f;
+                b = 0.95f;
+                break;
+            case BlockType::WATER:
+                r = 0.25f;
+                g = 0.45f;
+                b = 0.85f;
+                break;
             default:
                 r = 0.5f;
                 g = 0.5f;

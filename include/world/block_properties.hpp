@@ -29,25 +29,82 @@ enum class BlockType : uint8_t {
     DIAMOND_ORE = 14,
     PLANKS = 15,
     GLASS = 16,
-    COUNT = 17
+    // Values are persisted as raw bytes in saves: only append, never renumber.
+    COBBLESTONE = 17,
+    MOSSY_COBBLESTONE = 18,
+    SANDSTONE = 19,
+    BIRCH_LOG = 20,
+    BIRCH_LEAVES = 21,
+    SPRUCE_LOG = 22,
+    SPRUCE_LEAVES = 23,
+    CACTUS = 24,
+    DEAD_BUSH = 25,
+    TALL_GRASS = 26,
+    FLOWER_YELLOW = 27,
+    FLOWER_RED = 28,
+    MUSHROOM_BROWN = 29,
+    MUSHROOM_RED = 30,
+    REED = 31,
+    LAVA = 32,
+    ICE = 33,
+    COUNT = 34
 };
 
-// Collision: blocks entities cannot pass through. Water is swimmable (see
-// PhysicsEngine::isInWater); glass IS solid.
+// Cross-quad rendered, walk-through decoration blocks (plants). They occupy
+// a cell but never collide, occlude, or cast column shadows.
+constexpr bool isFlora(BlockType type) {
+    switch (type) {
+        case BlockType::DEAD_BUSH:
+        case BlockType::TALL_GRASS:
+        case BlockType::FLOWER_YELLOW:
+        case BlockType::FLOWER_RED:
+        case BlockType::MUSHROOM_BROWN:
+        case BlockType::MUSHROOM_RED:
+        case BlockType::REED:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Liquids are swimmable (see PhysicsEngine::isInLiquid) and render in the
+// translucent pass, not the opaque chunk pass.
+constexpr bool isLiquid(BlockType type) {
+    return type == BlockType::WATER || type == BlockType::LAVA;
+}
+
+// Collision: blocks entities cannot pass through. Liquids are swimmable,
+// flora is walk-through; glass and ice ARE solid.
 constexpr bool isSolid(BlockType type) {
-    return type != BlockType::AIR && type != BlockType::WATER;
+    return type != BlockType::AIR && !isLiquid(type) && !isFlora(type);
 }
 
-// Meshing/occlusion: blocks that fully hide their neighbors' faces. Leaves
-// and glass are alpha-cutout textures (their transparent texels are
-// discarded in the fragment shader), so the faces behind them must render.
+// Meshing/occlusion: blocks that fully hide their neighbors' faces. Leaf
+// variants and glass are alpha-cutout textures (their transparent texels
+// are discarded in the fragment shader), so the faces behind them must
+// render; the same goes for non-cube flora and for liquids.
 constexpr bool isOpaque(BlockType type) {
-    return type != BlockType::AIR && type != BlockType::WATER && type != BlockType::LEAVES &&
-           type != BlockType::GLASS;
+    switch (type) {
+        case BlockType::AIR:
+        case BlockType::WATER:
+        case BlockType::LAVA:
+        case BlockType::LEAVES:
+        case BlockType::BIRCH_LEAVES:
+        case BlockType::SPRUCE_LEAVES:
+        case BlockType::GLASS:
+            return false;
+        default:
+            return !isFlora(type);
+    }
 }
 
-// Light/visibility: blocks you can (partially) see through.
+// Light/visibility: blocks you can (at least partially) see through.
 constexpr bool isTransparent(BlockType type) {
-    return type == BlockType::AIR || type == BlockType::WATER || type == BlockType::LEAVES ||
-           type == BlockType::GLASS;
+    return !isOpaque(type);
+}
+
+// Interaction: blocks the crosshair raycast stops on. Everything you can
+// stand on plus flora (breakable in place); liquids are click-through.
+constexpr bool isTargetable(BlockType type) {
+    return isSolid(type) || isFlora(type);
 }
