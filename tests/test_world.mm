@@ -36,6 +36,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <memory>
 #include <thread>
 
 // ============================================================================
@@ -261,7 +262,7 @@ TEST_CASE("selectBiome: ordered rules on the climate fields", "[climate]") {
     shape.climate.temperature = 0.3;
     shape.climate.humidity = 0.4;
     REQUIRE(ClimateSampler::selectBiome(shape) == Biome::FOREST);
-    shape.climate.temperature = 0.0;
+    shape.climate.temperature = -0.2;
     REQUIRE(ClimateSampler::selectBiome(shape) == Biome::BIRCH_FOREST);
 
     shape.climate.humidity = 0.6;
@@ -305,6 +306,28 @@ TEST_CASE("Terrain height is continuous — no biome cliffs", "[climate][worldge
 // ============================================================================
 
 namespace {
+// Blocks the terrain fill + surface pass produce — decorations (trees,
+// structures, flora, ice caps) may legitimately rise above the height map,
+// raw terrain must not.
+bool isTerrainBlock(BlockType b) {
+    switch (b) {
+        case BlockType::STONE:
+        case BlockType::DIRT:
+        case BlockType::GRASS:
+        case BlockType::SAND:
+        case BlockType::GRAVEL:
+        case BlockType::SNOW:
+        case BlockType::BEDROCK:
+        case BlockType::COAL_ORE:
+        case BlockType::IRON_ORE:
+        case BlockType::GOLD_ORE:
+        case BlockType::DIAMOND_ORE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Column-level invariants every generated chunk must satisfy.
 void checkChunkInvariants(const Chunk& chunk) {
     for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
@@ -313,20 +336,22 @@ void checkChunkInvariants(const Chunk& chunk) {
             REQUIRE(chunk.getBlock(lx, 0, lz) == BlockType::BEDROCK);
             REQUIRE(chunk.getBlock(lx, 1, lz) == BlockType::BEDROCK);
 
+            // heightMap records the raw terrain surface; structures may
+            // later carve or pave that exact cell, so only the "no terrain
+            // above it" direction is asserted.
             int top = chunk.heightMap[lx + lz * CHUNK_WIDTH];
             REQUIRE(top >= 2);
-            REQUIRE(isSolid(chunk.getBlock(lx, top, lz)));
 
             for (int y = 0; y < CHUNK_HEIGHT; ++y) {
                 BlockType b = chunk.getBlock(lx, y, lz);
-                // Nothing solid above the height map
+                // No raw terrain above the height map (the old carver's
+                // floating-surface bug); decorations are allowed there
                 if (y > top) {
-                    REQUIRE(!isSolid(b));
+                    REQUIRE(!isTerrainBlock(b));
                 }
-                // Water never rests directly on air, and stays below sea
-                // level; lava only pools at the very bottom
-                if (b == BlockType::WATER) {
-                    REQUIRE(y < 64);
+                // Water never rests directly on air; lava only pools at
+                // the very bottom (well shafts sit above ground level)
+                if (b == BlockType::WATER && y < 64) {
                     REQUIRE(chunk.getBlock(lx, y - 1, lz) != BlockType::AIR);
                 }
                 if (b == BlockType::LAVA) {
@@ -421,6 +446,193 @@ TEST_CASE("ChunkGenerator: chunks are generation-order independent", "[worldgen]
     REQUIRE(a1.blocks == b1.blocks);
     REQUIRE(a0.biomes == b0.biomes);
     REQUIRE(a1.biomes == b1.biomes);
+}
+
+// ============================================================================
+// Feature / decoration tests
+// ============================================================================
+
+namespace {
+bool isLeafBlock(BlockType b) {
+    return b == BlockType::LEAVES || b == BlockType::BIRCH_LEAVES || b == BlockType::SPRUCE_LEAVES;
+}
+bool isLogBlock(BlockType b) {
+    return b == BlockType::LOG || b == BlockType::BIRCH_LOG || b == BlockType::SPRUCE_LOG;
+}
+} // namespace
+
+TEST_CASE("Trees span chunk borders and no canopy is orphaned", "[worldgen][trees]") {
+    // Generate a 3x3 area and inspect the center chunk: every leaf must have
+    // a trunk within canopy range in the combined area (a clipped border
+    // canopy would orphan leaves), and at least one border column must carry
+    // leaves whose trunk lives in the neighbor chunk.
+    ChunkGenerator gen(2024);
+    std::vector<std::unique_ptr<Chunk>> area;
+    auto blockAt = [&](int wx, int y, int wz) -> BlockType {
+        for (auto& c : area) {
+            int lx = wx - c->chunkX * CHUNK_WIDTH;
+            int lz = wz - c->chunkZ * CHUNK_DEPTH;
+            if (lx >= 0 && lx < CHUNK_WIDTH && lz >= 0 && lz < CHUNK_DEPTH)
+                return c->getBlock(lx, y, lz);
+        }
+        return BlockType::AIR;
+    };
+    // Pick a center chunk in forest-ish terrain by scanning for one with
+    // plenty of leaves.
+    int bestCX = 0, bestCZ = 0, bestLeaves = -1;
+    for (int cz = -6; cz <= 6; cz += 3) {
+        for (int cx = -6; cx <= 6; cx += 3) {
+            Chunk probe(cx, cz);
+            gen.generate(probe);
+            int leaves = 0;
+            for (BlockType b : probe.blocks)
+                if (isLeafBlock(b))
+                    ++leaves;
+            if (leaves > bestLeaves) {
+                bestLeaves = leaves;
+                bestCX = cx;
+                bestCZ = cz;
+            }
+        }
+    }
+    REQUIRE(bestLeaves > 0); // some forest exists near spawn scale
+
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            auto chunk = std::make_unique<Chunk>(bestCX + dx, bestCZ + dz);
+            gen.generate(*chunk);
+            area.push_back(std::move(chunk));
+        }
+    }
+
+    const Chunk& center = *area[4]; // dz=0, dx=0 (row-major -1..1)
+    bool foundBorderLeaf = false;
+    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+            for (int y = 60; y < 140; ++y) {
+                if (!isLeafBlock(center.getBlock(lx, y, lz)))
+                    continue;
+                int wx = center.chunkX * CHUNK_WIDTH + lx;
+                int wz = center.chunkZ * CHUNK_DEPTH + lz;
+                // A trunk must exist within canopy range in the 3x3 area
+                bool hasTrunk = false;
+                bool trunkInNeighbor = false;
+                for (int tz = -3; tz <= 3 && !hasTrunk; ++tz) {
+                    for (int tx = -3; tx <= 3 && !hasTrunk; ++tx) {
+                        for (int ty = -4; ty <= 2 && !hasTrunk; ++ty) {
+                            if (isLogBlock(blockAt(wx + tx, y + ty, wz + tz))) {
+                                hasTrunk = true;
+                                int trunkLX = wx + tx - center.chunkX * CHUNK_WIDTH;
+                                int trunkLZ = wz + tz - center.chunkZ * CHUNK_DEPTH;
+                                trunkInNeighbor = trunkLX < 0 || trunkLX >= CHUNK_WIDTH ||
+                                                  trunkLZ < 0 || trunkLZ >= CHUNK_DEPTH;
+                            }
+                        }
+                    }
+                }
+                REQUIRE(hasTrunk);
+                if (trunkInNeighbor)
+                    foundBorderLeaf = true;
+            }
+        }
+    }
+    // With ~6 trees per forest chunk, a 16-wide chunk essentially always has
+    // at least one canopy reaching across its border.
+    REQUIRE(foundBorderLeaf);
+}
+
+TEST_CASE("Ores stay in their depth bands and replace only stone", "[worldgen][ores]") {
+    ChunkGenerator gen(808);
+    for (auto [cx, cz] : {std::pair{0, 0}, {7, -3}, {-11, 5}}) {
+        Chunk chunk(cx, cz);
+        gen.generate(chunk);
+        for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+            for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+                for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                    switch (chunk.getBlock(lx, y, lz)) {
+                        case BlockType::DIAMOND_ORE:
+                            REQUIRE(y >= 2);
+                            REQUIRE(y <= 17);
+                            break;
+                        case BlockType::GOLD_ORE:
+                            REQUIRE(y >= 4);
+                            REQUIRE(y <= 35);
+                            break;
+                        case BlockType::IRON_ORE:
+                            REQUIRE(y >= 8);
+                            REQUIRE(y <= 71);
+                            break;
+                        case BlockType::COAL_ORE:
+                            REQUIRE(y >= 48);
+                            REQUIRE(y <= 131);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Flora sits on valid ground", "[worldgen][flora]") {
+    ChunkGenerator gen(606);
+    int floraSeen = 0;
+    for (int cz = -4; cz <= 4; cz += 2) {
+        for (int cx = -4; cx <= 4; cx += 2) {
+            Chunk chunk(cx, cz);
+            gen.generate(chunk);
+            for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+                for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+                    for (int y = 3; y < CHUNK_HEIGHT - 1; ++y) {
+                        BlockType b = chunk.getBlock(lx, y, lz);
+                        BlockType below = chunk.getBlock(lx, y - 1, lz);
+                        if (b == BlockType::CACTUS && below != BlockType::CACTUS) {
+                            REQUIRE(below == BlockType::SAND);
+                            ++floraSeen;
+                        } else if (b == BlockType::REED && below != BlockType::REED) {
+                            REQUIRE((below == BlockType::GRASS || below == BlockType::SAND ||
+                                     below == BlockType::DIRT));
+                            ++floraSeen;
+                        } else if (isFlora(b) && b != BlockType::REED) {
+                            if (b != BlockType::CACTUS && b != BlockType::DEAD_BUSH) {
+                                REQUIRE(below == BlockType::GRASS);
+                            }
+                            ++floraSeen;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    REQUIRE(floraSeen > 0);
+}
+
+TEST_CASE("Structures are deterministic and land on validated ground", "[worldgen][structures]") {
+    ChunkGenerator g1(112233);
+    ChunkGenerator g2(112233);
+    GenScratch s1, s2;
+    s1.reset(&g1);
+    s2.reset(&g2);
+    StructurePlacer placer(112233);
+
+    int validCount = 0;
+    for (int rz = -6; rz <= 6; ++rz) {
+        for (int rx = -6; rx <= 6; ++rx) {
+            const StructurePlacement& a = placer.regionPlacement(rx, rz, g1, s1);
+            const StructurePlacement& b = placer.regionPlacement(rx, rz, g2, s2);
+            REQUIRE(a.valid == b.valid);
+            REQUIRE(a.anchorX == b.anchorX);
+            REQUIRE(a.anchorZ == b.anchorZ);
+            REQUIRE(a.floorY == b.floorY);
+            if (a.valid) {
+                ++validCount;
+                REQUIRE(a.floorY >= 64);
+            }
+        }
+    }
+    // 13x13 regions of mixed terrain: some sites must validate
+    REQUIRE(validCount > 0);
 }
 
 // ============================================================================

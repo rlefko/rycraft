@@ -85,7 +85,10 @@ ChunkGenerator::ChunkGenerator(uint32_t worldSeed)
     , bedrockSeed_(genseed::subSeed(worldSeed, genseed::BEDROCK))
     , surfaceSeed_(genseed::subSeed(worldSeed, genseed::SURFACE))
     , climate_(worldSeed)
-    , density_(worldSeed) {}
+    , density_(worldSeed)
+    , ores_(worldSeed)
+    , structures_(worldSeed)
+    , features_(worldSeed) {}
 
 const ColumnShape& ChunkGenerator::latticeShape(int lx, int lz, GenScratch& scratch) const {
     uint64_t key = latticeKey(lx, lz);
@@ -302,6 +305,14 @@ void ChunkGenerator::generate(Chunk& chunk) const {
             applyColumnSurface(chunk, lx, lz, shape, biome);
         }
     }
+
+    // Decoration: ores → structures → trees → flora. Structures go before
+    // trees so tree placement can reject anchors inside their footprints;
+    // flora is last so it reads the chunk's real final surface.
+    ores_.place(chunk);
+    structures_.place(chunk, *this, scratch);
+    features_.placeTrees(chunk, *this, structures_, scratch);
+    features_.placeFlora(chunk);
 
     chunk.generated = true;
     chunk.needsMeshUpdate = true;

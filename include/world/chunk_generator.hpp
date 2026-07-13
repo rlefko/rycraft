@@ -3,6 +3,9 @@
 #include "world/chunk.hpp"
 #include "world/climate.hpp"
 #include "world/density_field.hpp"
+#include "world/features.hpp"
+#include "world/ores.hpp"
+#include "world/structures.hpp"
 
 #include <cstdint>
 #include <unordered_map>
@@ -28,11 +31,13 @@ struct GenScratch {
     const void* owner = nullptr;
     std::unordered_map<uint64_t, ColumnShape> shapes;
     std::unordered_map<uint64_t, std::vector<double>> densityColumns;
+    std::unordered_map<uint64_t, StructurePlacement> structurePlacements;
 
     void reset(const void* newOwner) {
         owner = newOwner;
         shapes.clear();
         densityColumns.clear();
+        structurePlacements.clear();
     }
 };
 
@@ -65,6 +70,9 @@ private:
     uint32_t surfaceSeed_;
     ClimateSampler climate_;
     DensityField density_;
+    OrePlacer ores_;
+    StructurePlacer structures_;
+    FeaturePlacer features_;
 
     const ColumnShape& latticeShape(int lx, int lz, GenScratch& scratch) const;
     const std::vector<double>& latticeDensityColumn(int lx, int lz, GenScratch& scratch) const;

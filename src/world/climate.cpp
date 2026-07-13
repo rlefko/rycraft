@@ -80,9 +80,10 @@ ColumnShape ClimateSampler::shapeColumn(double x, double z) const {
     // 4-5 block deep river; smoothstep gives sloped banks.
     if (c.continentalness > -0.10 && height > 59.0) {
         double r = std::abs(c.ridges);
-        // The wide band keeps banks below ~2 blocks of drop per column so
-        // rivers cannot read as cliffs (the continuity test pins this).
-        double cutFactor = smoothstep(0.090, 0.030, r);
+        // Band width trades river coverage against bank steepness: 0.02 of
+        // channel keeps rivers at a few percent of the land, and the 0.04
+        // ramp keeps banks under the continuity test's slope bound.
+        double cutFactor = smoothstep(0.060, 0.020, r);
         shape.riverCut = cutFactor * (height - 59.0);
         height -= shape.riverCut;
     }
@@ -121,9 +122,9 @@ Biome ClimateSampler::selectBiome(const ColumnShape& shape) {
     if (h > 102.0 && pv01 > 0.55) return Biome::EXTREME_HILLS;
 
     if (c.temperature < -0.45) return c.humidity < -0.1 ? Biome::ICE_SPIKES : Biome::TAIGA;
-    if (c.temperature > 0.5 && c.humidity < -0.25) return Biome::DESERT;
+    if (c.temperature > 0.4 && c.humidity < -0.15) return Biome::DESERT;
     if (c.humidity > 0.55 && h < 70.0) return Biome::SWAMP;
-    if (c.humidity > 0.30) return c.temperature < 0.15 ? Biome::BIRCH_FOREST : Biome::FOREST;
-    if (c.humidity > 0.02 && c.humidity < 0.20 && c.temperature > 0.25) return Biome::FLOWER_FIELD;
+    if (c.humidity > 0.30) return c.temperature < -0.05 ? Biome::BIRCH_FOREST : Biome::FOREST;
+    if (c.humidity > 0.0 && c.humidity < 0.22 && c.temperature > 0.15) return Biome::FLOWER_FIELD;
     return Biome::PLAINS;
 }
