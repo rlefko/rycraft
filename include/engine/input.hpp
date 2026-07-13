@@ -73,6 +73,11 @@ struct InputState {
     std::unordered_map<Key, bool> keysDown;
     std::unordered_map<Key, bool> keysJustPressed;
     std::unordered_map<Key, bool> keysJustReleased;
+    // Presses accumulated for the 20 Hz game tick. keysJustPressed clears
+    // every FRAME (60 fps), but most frames run zero ticks — without this,
+    // jumps, hotbar keys, and block clicks were silently dropped whenever
+    // the press landed on a tickless frame.
+    std::unordered_map<Key, bool> keysPressedForTick;
     Vec2 mouseDelta;      // accumulated raw look deltas while captured
     Vec2 mousePosition;   // window points, bottom-left origin
     float scrollDelta = 0.f;  // accumulated scroll-wheel Y this frame
@@ -82,6 +87,10 @@ struct InputState {
     bool isDown(Key key) const;
     bool isJustPressed(Key key) const;
     bool isJustReleased(Key key) const;
+
+    // Edge-since-last-tick (consumed by clearTickPresses at tick end)
+    bool isPressedForTick(Key key) const;
+    void clearTickPresses();
 
     void update();
     void clearMouseDelta();

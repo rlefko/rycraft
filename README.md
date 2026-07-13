@@ -1,86 +1,90 @@
 # rycraft
 
-A full Minecraft-like voxel game for macOS, built from the ground up with Metal, C++23, and Meson.
+A Minecraft-like voxel game for macOS, built from scratch in C++23 on Metal. No engine, no asset files — the terrain, the block textures, and even the sound effects are all generated procedurally at runtime.
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue)
 ![Apple Silicon](https://img.shields.io/badge/CPU-Apple%20Silicon-orange)
 ![License](https://img.shields.io/badge/license-GPLv3-green)
 ![C++](https://img.shields.io/badge/C%2B%2B-23-lightgrey)
 
-## Features
-
-- **Infinite procedural world** - Simplex noise terrain with range crossfading, 10 biomes, caves (cheese/spaghetti/noodle), ore deposits, trees, and grid-placed structures
-- **Day/night cycle** - Dynamic sun position, sky gradient with twilight transitions, star field at night, directional lighting with color temperature shifts
-- **Block interaction** - Raycast-based block breaking and placing with hotbar (9 slots), block highlight wireframe, world persistence with LZ4 compression
-- **AABB physics** - Per-axis sweep collision (Y-first), gravity, drag, terminal velocity, jump, sprint, fall damage, step assist, water buoyancy
-- **Animal AI** - State machine with 6 states (idle/wander/flee/eat/breed/follow), flocking behavior (separation/alignment/cohesion), edge detection, spatial hash partitioning
-- **Weather** - Rain and snow particle system (4096 particles), biome-aware spawning, CPU-simulated physics, GPU billboard rendering
-- **Post-processing** - Bloom (extract + Kawase blur + ACES tone mapping), exponential distance fog, procedural clouds with wind animation
-- **Audio** - Core Audio RemoteIO engine, 16-voice mixer, procedural sound effects (block break/place, footsteps, ambient wind, animal sounds)
-- **Performance** - Binary greedy meshing (50-200μs/chunk), 16-byte packed vertices, mega-buffer allocator (128MB vertex + 64MB index), chunk LOD (3 levels), frustum culling, MSAA 4x
-
-## Requirements
-
-- macOS 13 (Ventura) or later
-- Apple Silicon (M1 or later)
-- Xcode command line tools
-- Meson build system
-
-## Build Instructions
+## Quick start
 
 ```bash
-# Install dependencies
-brew install meson
-
-# Configure and build
+brew install meson ninja        # requires Xcode command line tools
 meson setup build
 ninja -C build
-
-# Run tests
-ninja -C build test
+./build/src/rycraft
 ```
 
-## Tech Stack
+Run the tests with `ninja -C build test`.
+
+**Controls:** WASD to move, mouse to look, Space to jump, Ctrl to sprint, left/right click to break/place blocks, 1–9 or scroll for the hotbar, F3 for the debug HUD, ESC to pause (and to resume). The window opens on a title screen; click PLAY to capture the mouse.
+
+## What's in the game
+
+- **Infinite procedural world** — simplex-noise terrain across 10 biomes, three kinds of caves, ore veins, trees, and grid-placed structures, streaming around the player on a worker pool
+- **A day** — twenty-minute day/night cycle with a moving sun, dawn/dusk skies, drifting procedural clouds, and column-skylight shadows under trees and inside caves
+- **Building** — raycast block breaking and placing with a highlight wireframe; edits persist to LZ4-compressed region files and load back next session
+- **Animals** — sheep, cows, pigs, and chickens with state-machine AI, flocking, and ambient calls, rendered from procedural voxel models
+- **Sound** — procedural block, footstep, wind, and animal sounds through a 16-voice Core Audio mixer
+- **A real game shell** — title screen, ESC pause menu, settings (render distance, fog, sensitivity, volume), pointer lock that never loses your cursor, and save-on-quit
+- **A lean renderer** — one 4x MSAA scene pass at native resolution plus bloom and fog, batched UI, ~60 FPS
+
+Full design notes live in [docs/game-concept.md](docs/game-concept.md).
+
+## Project structure
+
+```
+include/, src/
+  engine/      Game loop, game flow (title/pause), input, camera
+  render/      Metal pipeline, mesher, textures, UI, entities
+  world/       Terrain generation, chunks, saving/loading
+  entity/      Player physics, animal AI, spawning
+  audio/       Core Audio mixer, procedural sound effects
+  common/      Math, seeded randomness, thread pool
+shaders/       Metal shaders (compiled to one metallib)
+tests/         Catch2 suite — six hermetic modules, all headless
+docs/          Architecture, conventions, and domain references
+```
+
+The deeper references: [architecture](docs/architecture.md) · [world generation & saves](docs/world-generation.md) · [rendering conventions](docs/rendering-conventions.md) · [performance conventions](docs/performance-conventions.md) · [code conventions](docs/code-conventions.md)
+
+## Tech stack
 
 | Component | Technology |
 |-----------|------------|
-| Language | C++23 |
-| Build System | Meson + Ninja |
-| Rendering | Metal API (MSL 3.0) |
-| Windowing | Direct Cocoa + MTKView |
-| Input | Direct Cocoa (NSEvent) + GameKit |
-| Audio | Core Audio RemoteIO |
-| Math | Custom Vec2/Vec3/Vec4/Mat4/AABB |
-| Testing | Catch2 3.14.0 |
-| Compression | LZ4 |
+| Language | C++23 (+ Objective-C++ at the Cocoa/Metal boundary) |
+| Rendering | Metal 3, MSL shaders shared with C++ via one types header |
+| Windowing & input | Cocoa, MTKView, NSEvent with CG pointer lock |
+| Audio | Core Audio (DefaultOutput unit) |
+| Build | Meson + Ninja |
+| Tests | Catch2 (via Meson wrap) |
+| Compression | LZ4 (system copy or wrap) |
 
-## Performance Targets
+## Development
 
-| Metric | Target |
-|--------|--------|
-| Frame rate | 60 FPS at 1024×768 |
-| View distance | 32 chunks default, 64 chunks max |
-| Memory | <4GB RAM |
-| Chunk generation | <200ms/chunk (async) |
-| Mesh building | <200μs/chunk |
-| Physics tick | 20Hz fixed (50ms budget) |
-
-## Project Structure
-
+```bash
+meson setup build                  # once (wraps download on first setup)
+ninja -C build                     # build (werror, warning_level=3)
+ninja -C build test                # run the test suite
+clang-format -i <files>            # format touched files (config in .clang-format)
 ```
-rycraft/
-├── include/
-│   ├── engine/      # Game loop, input, camera, hotbar
-│   ├── render/      # Metal pipeline, meshing, bloom, particles
-│   ├── world/       # Terrain, biomes, chunks, save/load
-│   ├── entity/      # Player, physics, AI, spawning
-│   ├── audio/       # Core Audio engine, procedural SFX
-│   └── common/      # Math, error handling, thread pool
-├── src/             # Implementation files
-├── shaders/         # Metal shader sources (.metal)
-├── tests/           # Catch2 test suite (260+ tests)
-└── docs/            # Project documentation
+
+Playtest hooks (used by CI-less visual verification and the `playtest` skill):
+
+```bash
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ./build/src/rycraft   # Metal validation
+RYCRAFT_CAPTURE=/tmp/frame.png ./build/src/rycraft              # dump a frame as PNG
+RYCRAFT_CAPTURE_FRAME=300 RYCRAFT_START_SCREEN=paused ...       # pick frame/screen
+RYCRAFT_BLOOM=0 ...                                             # scale/disable bloom
 ```
+
+## Troubleshooting
+
+- **`meson setup` fails finding `xcrun metal`** — install the Xcode command line tools (`xcode-select --install`); the shader pipeline compiles `.metal` sources with the Metal CLI.
+- **First `meson setup` downloads things** — Catch2 (and LZ4, when no system copy exists) come from Meson wraps into `subprojects/`; that's expected and cached.
+- **Stale build directory after big changes** — `meson setup --wipe build`.
+- **The game saves next to where you run it** — world data lands in `./rycraft_world/`; delete it for a fresh world.
 
 ## Author
 
@@ -88,4 +92,4 @@ Ryan Lefkowitz ([rlefkowitz1800@yahoo.com](mailto:rlefkowitz1800@yahoo.com))
 
 ## License
 
-GNU General Public License v3.0 (GPLv3)
+GNU General Public License v3.0 — see [LICENSE](LICENSE).

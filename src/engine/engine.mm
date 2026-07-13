@@ -62,6 +62,7 @@ struct EngineState {
 
     // ---- Game flow & UI ----
     GameFlow flow;                 // Title → Playing ⇄ Paused ⇄ Settings
+    bool spawnValidated = false;   // player unstuck from stale-save terrain
     SettingsValues settings;       // live values shown in the settings menu
     MenuLayout menuLayout;         // rebuilt each frame while a menu is open
     int hoveredButton = -1;
@@ -411,7 +412,10 @@ static EngineState* _engineGetState(Engine* engine) {
     if (effects.resetTiming) {
         state->accumulator = 0;
         if (state->inputManager) {
+            // Drop buffered look deltas AND pending tick presses — the click
+            // that pressed RESUME must not break a block on the next tick
             state->inputManager->state().clearMouseDelta();
+            state->inputManager->state().clearTickPresses();
         }
     }
     if (effects.requestQuit) {
@@ -568,10 +572,36 @@ static EngineState* _engineGetState(Engine* engine) {
     // 1. Advance world time (1 tick per game tick)
     state->worldTime++;
 
+    // 1b. Unstick a stale spawn: a resumed save can place the player inside
+    // terrain when world generation has changed shape since the save was
+    // written — collision then zeroes every move. Once the spawn chunk
+    // exists, lift the player to the surface if they are embedded.
+    if (!state->spawnValidated) {
+        int px = static_cast<int>(std::floor(state->player.position.x));
+        int pz = static_cast<int>(std::floor(state->player.position.z));
+        auto chunk = state->world->getChunk(Chunk::worldToChunk(px), Chunk::worldToChunk(pz));
+        if (chunk && chunk->generated) {
+            int feetY = static_cast<int>(std::floor(state->player.position.y));
+            bool embedded = isSolid(state->world->getBlock(px, feetY, pz)) ||
+                            isSolid(state->world->getBlock(px, feetY + 1, pz));
+            if (embedded) {
+                for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
+                    if (isSolid(state->world->getBlock(px, y, pz))) {
+                        state->player.position.y = static_cast<float>(y + 1);
+                        state->player.velocity = Vec3{0.f, 0.f, 0.f};
+                        RY_LOG_INFO("Spawn was inside terrain — moved player to the surface");
+                        break;
+                    }
+                }
+            }
+            state->spawnValidated = true;
+        }
+    }
+
     // 2. Hotbar input: keys 1-9 select slots
     for (int i = 0; i < Hotbar::SLOTS; ++i) {
         Key key = static_cast<Key>(static_cast<int>(Key::One) + i);
-        if (input.isJustPressed(key)) {
+        if (input.isPressedForTick(key)) {
             state->hotbar.selectSlot(i);
             break;
         }
@@ -676,7 +706,7 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 8. Player jump on space
-    if (input.isJustPressed(Key::Space)) {
+    if (input.isPressedForTick(Key::Space)) {
         state->player.jump();
     }
 
@@ -699,14 +729,17 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // Block breaking (left mouse click)
-    if (input.isJustPressed(Key::MouseLeft)) {
+    if (input.isPressedForTick(Key::MouseLeft)) {
         [self breakBlock:state hit:rayHit];
     }
 
     // Block placing (right mouse click)
-    if (input.isJustPressed(Key::MouseRight)) {
+    if (input.isPressedForTick(Key::MouseRight)) {
         [self placeBlock:state hit:rayHit];
     }
+
+    // Tick-edge input consumed — a second tick in this frame must not re-fire
+    input.clearTickPresses();
 }
 
 // ---- Block Breaking (Task 6.1) ----

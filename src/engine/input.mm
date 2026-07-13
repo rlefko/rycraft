@@ -126,11 +126,20 @@ bool InputState::isJustReleased(Key key) const {
 }
 
 void InputState::update() {
-    // Clear one-frame events
+    // Clear one-frame events (keysPressedForTick survives until a tick runs)
     keysJustPressed.clear();
     keysJustReleased.clear();
     mouseDelta = Vec2{0, 0};
     scrollDelta = 0.f;
+}
+
+bool InputState::isPressedForTick(Key key) const {
+    auto it = keysPressedForTick.find(key);
+    return it != keysPressedForTick.end() && it->second;
+}
+
+void InputState::clearTickPresses() {
+    keysPressedForTick.clear();
 }
 
 void InputState::clearMouseDelta() {
@@ -290,6 +299,7 @@ void InputManager::handleKeyDown(NSEvent* event) {
     Key key = keyCodeToKey([event keyCode]);
 
     state_.keysJustPressed[key] = true;
+    state_.keysPressedForTick[key] = true;
     state_.keysDown[key] = true;
 }
 
@@ -325,13 +335,16 @@ void InputManager::handleMouseDown(NSEvent* event) {
     if (button == 0) {
         state_.mouseLeftDown = true;
         state_.keysJustPressed[Key::MouseLeft] = true;
+        state_.keysPressedForTick[Key::MouseLeft] = true;
         state_.keysDown[Key::MouseLeft] = true;
     } else if (button == 1) {
         state_.mouseRightDown = true;
         state_.keysJustPressed[Key::MouseRight] = true;
+        state_.keysPressedForTick[Key::MouseRight] = true;
         state_.keysDown[Key::MouseRight] = true;
     } else if (button == 2) {
         state_.keysJustPressed[Key::MouseMiddle] = true;
+        state_.keysPressedForTick[Key::MouseMiddle] = true;
         state_.keysDown[Key::MouseMiddle] = true;
     }
 }
