@@ -84,6 +84,10 @@ Vec3 Camera::forward() const {
     return front_;
 }
 
+float Camera::yaw() const {
+    return yaw_;
+}
+
 Vec3 Camera::right() const {
     // Right vector: cross(forward, worldUp)
     return front_.cross(Vec3::up()).normalize();

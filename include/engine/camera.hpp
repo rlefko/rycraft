@@ -25,6 +25,7 @@ public:
     Mat4 viewMatrix() const;
     Vec3 position() const;
     Vec3 forward() const;
+    float yaw() const;
     Vec3 right() const;
     Vec3 up() const;
 
