@@ -57,60 +57,67 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
     velocity.x = moveX;
     velocity.z = moveZ;
 
-    // 2. Apply gravity (reduced in water)
-    float effectiveGravity = GRAVITY;
-    if (inWater) {
-        effectiveGravity *= WATER_GRAVITY_MULTIPLIER;
-    }
-    velocity.y += effectiveGravity;
-
-    // 3. Vertical drag only: horizontal velocity is overwritten from input
-    // every tick, so horizontal drag merely rescaled the walk speed.
-    velocity.y *= VERTICAL_DRAG;
-
-    // 4. Apply buoyancy force when in water
-    if (inWater && velocity.y < 0.f) {
-        velocity.y += WATER_BUOYANCY_FORCE;
-    }
-
-    // 5. Clamp velocity to terminal velocity
-    if (velocity.y < TERMINAL_VELOCITY) {
-        velocity.y = TERMINAL_VELOCITY;
-    }
-
-    // 6. Resolve collisions via physics engine
+    // 2. Move FIRST using the current velocity, then integrate gravity/drag
+    // for the NEXT tick (vanilla-Minecraft semi-implicit order). Applying
+    // gravity+drag before the move used to spend the fresh 0.42 jump impulse
+    // on decay instead of displacement, capping the jump apex at ~0.83 blocks
+    // — below a 1-block step, so the player could never climb onto one. Moving
+    // first restores the ~1.25-block apex.
     PhysicsEngine physics;
     Vec3 resolvedMovement = physics.sweepCollision(playerAABB, velocity, world);
 
-    // 7. Update position by resolved movement
     position.x += resolvedMovement.x;
     position.y += resolvedMovement.y;
     position.z += resolvedMovement.z;
 
-    // 8. Track fall distance: accumulate negative Y displacement
-    if (resolvedMovement.y < 0.f) {
-        fallDistance += static_cast<int>(std::ceil(-resolvedMovement.y * 20.f));
+    // 3. Vertical collision response: when the sweep clips the intended Y move
+    // (floor or ceiling), zero velocity.y. Without this reset velocity.y kept
+    // integrating downward while merely standing, saturating toward terminal
+    // velocity; the instant the player stepped off a ledge that stored speed
+    // dropped them a whole block in a single tick ("instantaneous fall").
+    bool yBlocked = std::abs(resolvedMovement.y - velocity.y) > 1e-6f;
+    onGround = yBlocked && velocity.y < 0.f;
+    if (yBlocked) {
+        velocity.y = 0.f;
     }
 
-    // 9. Check if on ground (zero vertical movement while velocity was negative)
-    onGround = (std::abs(resolvedMovement.y) < 1e-6f && velocity.y < 0.f);
+    // 4. Track fall distance in BLOCKS actually descended (the old ceil(·×20)
+    // summed velocities, so a 1-block fall registered as ~17 blocks of damage).
+    if (resolvedMovement.y < 0.f) {
+        fallDistance += -resolvedMovement.y;
+    }
 
     // If on ground, apply fall damage and reset
     if (onGround) {
-        if (fallDistance > 3) {
+        if (fallDistance > 3.f) {
             applyFallDamage();
         }
         resetFallDistance();
     }
 
-    // 10. Reset fall distance every 100 ticks to avoid FP drift
+    // 5. Integrate gravity, drag, buoyancy, and terminal velocity for the next
+    // tick (reduced gravity + buoyancy in water)
+    float effectiveGravity = GRAVITY;
+    if (inWater) {
+        effectiveGravity *= WATER_GRAVITY_MULTIPLIER;
+    }
+    velocity.y += effectiveGravity;
+    velocity.y *= VERTICAL_DRAG;
+    if (inWater && velocity.y < 0.f) {
+        velocity.y += WATER_BUOYANCY_FORCE;
+    }
+    if (velocity.y < TERMINAL_VELOCITY) {
+        velocity.y = TERMINAL_VELOCITY;
+    }
+
+    // 6. Reset fall distance every 100 ticks to avoid FP drift
     fallResetTimer++;
     if (fallResetTimer >= 100) {
         resetFallDistance();
         fallResetTimer = 0;
     }
 
-    // 11. Decrement jump cooldown
+    // 7. Decrement jump cooldown
     if (jumpCooldown > 0) {
         jumpCooldown--;
     }
@@ -135,7 +142,7 @@ void Player::jump() {
 // applyFallDamage — Deal damage based on fall distance
 // ---------------------------------------------------------------------------
 void Player::applyFallDamage() {
-    if (fallDistance <= 3) return;
+    if (fallDistance <= 3.f) return;
 
     int damage = static_cast<int>(std::ceil(fallDistance - 3.f));
     health -= damage;
@@ -149,5 +156,5 @@ void Player::applyFallDamage() {
 // resetFallDistance — Clear fall distance tracking
 // ---------------------------------------------------------------------------
 void Player::resetFallDistance() {
-    fallDistance = 0;
+    fallDistance = 0.f;
 }

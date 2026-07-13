@@ -128,6 +128,51 @@ TEST_CASE("Audio engine: master volume clamping", "[phase8][audio]") {
     REQUIRE(clampVolume(2.0f) == Catch::Approx(1.0f));
 }
 
+TEST_CASE("Audio engine: real playSound path mixes and drains through the callback",
+          "[phase8][audio]") {
+    // Exercise the ACTUAL AudioEngine mixer (not a reimplemented copy). No
+    // initialize() — the render callback never touches the AudioUnit, so this
+    // runs headlessly. This is the path whose one-sided locking used to trap.
+    AudioEngine engine;
+
+    std::vector<float> buf = {0.5f, 0.5f, 0.5f, 0.5f};
+    int32_t voice = engine.playSound(buf, SoundEffect::SAMPLE_RATE, 1.0f);
+    REQUIRE(voice >= 0);
+
+    // A stereo output block: 4 frames × 2 channels × float
+    constexpr uint32_t kFrames = 4;
+    float out[kFrames * 2] = {0.f};
+    AudioBufferList abl;
+    abl.mNumberBuffers = 1;
+    abl.mBuffers[0].mNumberChannels = 2;
+    abl.mBuffers[0].mDataByteSize = sizeof(out);
+    abl.mBuffers[0].mData = out;
+
+    engine.audioCallback(&abl);
+
+    // Each sample lands in both channels at full gain
+    REQUIRE(out[0] == Catch::Approx(0.5f)); // frame 0 left
+    REQUIRE(out[1] == Catch::Approx(0.5f)); // frame 0 right
+    REQUIRE(out[6] == Catch::Approx(0.5f)); // frame 3 left
+
+    // The voice was fully consumed (4 samples) → it deallocates, so a second
+    // callback produces silence.
+    float out2[kFrames * 2] = {0.f};
+    abl.mBuffers[0].mData = out2;
+    engine.audioCallback(&abl);
+    REQUIRE(out2[0] == Catch::Approx(0.f));
+
+    // Master volume scales the mix.
+    engine.setMasterVolume(0.5f);
+    REQUIRE(engine.getMasterVolume() == Catch::Approx(0.5f));
+    int32_t voice2 = engine.playSound(buf, SoundEffect::SAMPLE_RATE, 1.0f);
+    REQUIRE(voice2 >= 0);
+    float out3[kFrames * 2] = {0.f};
+    abl.mBuffers[0].mData = out3;
+    engine.audioCallback(&abl);
+    REQUIRE(out3[0] == Catch::Approx(0.25f)); // 0.5 sample × 0.5 master
+}
+
 // ---- SFX Tests ----
 
 TEST_CASE("SFX: block break generates non-empty buffer", "[phase8][sfx]") {
