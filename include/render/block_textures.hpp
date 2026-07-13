@@ -31,10 +31,13 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
     return static_cast<uint8_t>(type);
 }
 
-// Pack a face normal and texture layer into the vertex faceAttr field.
-// The face fits in 3 bits (6 values); the layer rides above it.
-constexpr uint32_t packFaceAttr(FaceNormal face, uint8_t layer) {
-    return static_cast<uint32_t>(face) | (static_cast<uint32_t>(layer) << 3);
+// Pack a face normal, texture layer, and sky-light level into the vertex
+// faceAttr field: face in bits 0-2, layer in bits 3-10, light in bits 11-14.
+// Light 15 = open sky; lower values darken faces under cover (the column
+// skylight that gives trees and overhangs their cast shadows).
+constexpr uint32_t packFaceAttr(FaceNormal face, uint8_t layer, uint8_t skyLight = 15) {
+    return static_cast<uint32_t>(face) | (static_cast<uint32_t>(layer) << 3) |
+           (static_cast<uint32_t>(skyLight & 15u) << 11);
 }
 
 constexpr FaceNormal unpackFace(uint32_t faceAttr) {
@@ -42,5 +45,9 @@ constexpr FaceNormal unpackFace(uint32_t faceAttr) {
 }
 
 constexpr uint8_t unpackTextureLayer(uint32_t faceAttr) {
-    return static_cast<uint8_t>(faceAttr >> 3);
+    return static_cast<uint8_t>((faceAttr >> 3) & 0xFFu);
+}
+
+constexpr uint8_t unpackSkyLight(uint32_t faceAttr) {
+    return static_cast<uint8_t>((faceAttr >> 11) & 15u);
 }

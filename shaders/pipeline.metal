@@ -28,6 +28,7 @@ struct VertexOutput {
     float3 vNormal;
     float2 vUV;
     float vLight;
+    float vSkyLight;       // column skylight 0-1 (cast shade, cave darkness)
     float3 vWorldPosition; // World-space position for fog calculation
     uint vTextureLayer [[flat]];
 };
@@ -66,8 +67,10 @@ vertex VertexOutput vertexMain(
     // Pass through UV
     out.vUV = in.uv;
 
-    // Unpack face normal (bits 0-2) and texture layer (bits 3+)
-    out.vTextureLayer = in.faceAttr >> 3;
+    // Unpack face normal (bits 0-2), texture layer (bits 3-10), and
+    // column skylight (bits 11-14)
+    out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
+    out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
     float3 normal = getFaceNormal(in.faceAttr & 7u);
     out.vNormal = normalize(
         (uniforms.modelMatrix * float4(normal, 0.0)).xyz
@@ -99,8 +102,11 @@ fragment float4 fragmentMain(
         discard_fragment();
     }
 
-    // Combine directional sun light with ambient
-    float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight + uniforms.ambientColor);
+    // Combine directional sun light with ambient, both attenuated by the
+    // column skylight so covered ground and caves sit in shadow
+    float sky = 0.25f + 0.75f * in.vSkyLight;
+    float3 litColor =
+        texColor.rgb * (uniforms.sunColor * in.vLight * sky + uniforms.ambientColor * sky);
 
     // ---- Distance fog (Phase 8) ----
     // Use world position passed from vertex shader

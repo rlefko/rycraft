@@ -1417,11 +1417,43 @@ TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][texture
     for (int f = 0; f < 6; ++f) {
         for (uint8_t layer : {uint8_t{0}, uint8_t{7}, TEXTURE_LAYER_GRASS_SIDE,
                               TEXTURE_LAYER_WHITE}) {
-            uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer);
-            REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
-            REQUIRE(unpackTextureLayer(attr) == layer);
+            for (uint8_t light : {uint8_t{0}, uint8_t{4}, uint8_t{15}}) {
+                uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer, light);
+                REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
+                REQUIRE(unpackTextureLayer(attr) == layer);
+                REQUIRE(unpackSkyLight(attr) == light);
+            }
         }
     }
+}
+
+TEST_CASE("Mesher: faces under cover carry reduced skylight", "[render][mesher]") {
+    Chunk chunk(0, 0);
+    // Ground block with a "canopy" three blocks above it
+    chunk.setBlock(8, 64, 8, BlockType::STONE);
+    chunk.setBlock(8, 68, 8, BlockType::LEAVES);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::Full));
+
+    bool foundShadedTop = false;
+    bool foundLitCanopyTop = false;
+    for (const Vertex& v : output.vertices) {
+        if (unpackFace(v.faceAttr) != FaceNormal::PlusY) continue;
+        float y = static_cast<float>(v.py);
+        if (y > 64.5f && y < 65.5f) {
+            // The ground's top face sits under the canopy → shaded
+            REQUIRE(unpackSkyLight(v.faceAttr) < 15);
+            foundShadedTop = true;
+        }
+        if (y > 68.5f && y < 69.5f) {
+            // The canopy's own top face sees open sky
+            REQUIRE(unpackSkyLight(v.faceAttr) == 15);
+            foundLitCanopyTop = true;
+        }
+    }
+    REQUIRE(foundShadedTop);
+    REQUIRE(foundLitCanopyTop);
 }
 
 TEST_CASE("Block textures: extra layers extend past the block types", "[render][textures]") {

@@ -41,8 +41,9 @@ struct QuadCorner {
 // Append one greedy quad (4 vertices + 6 indices). Corners arrive in the
 // same winding the face's caller always used.
 static void pushQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs,
-                     FaceNormal face, BlockType bt, const QuadCorner (&corners)[4]) {
-    const uint32_t attr = packFaceAttr(face, textureLayerFor(bt, face));
+                     FaceNormal face, BlockType bt, uint8_t skyLight,
+                     const QuadCorner (&corners)[4]) {
+    const uint32_t attr = packFaceAttr(face, textureLayerFor(bt, face), skyLight);
     for (const QuadCorner& c : corners) {
         verts.push_back(Vertex{attr,
             static_cast<float16_t>(c.x),
@@ -68,6 +69,7 @@ static void meshFaceGeneric(
     int faceHeight, int faceWidth,
     const std::vector<bool>& faceMask,
     const std::vector<BlockType>& blockTypes,
+    const std::vector<uint8_t>& cellLight,
     std::vector<bool>& merged,
     FaceNormal face,
     std::vector<Vertex>& vertices,
@@ -84,23 +86,27 @@ static void meshFaceGeneric(
             }
 
             BlockType leadType = blockTypes[i];
+            uint8_t leadLight = cellLight[i];
 
-            // Extend right (horizontal) as far as possible with same block type
+            // Extend right (horizontal) while type AND light match — a quad
+            // carries one light value, so shading boundaries end the merge
             int width = 1;
             while (col + width < faceWidth &&
                    faceMask[idx(row, col + width, faceWidth)] &&
                    !merged[idx(row, col + width, faceWidth)] &&
-                   blockTypes[idx(row, col + width, faceWidth)] == leadType) {
+                   blockTypes[idx(row, col + width, faceWidth)] == leadType &&
+                   cellLight[idx(row, col + width, faceWidth)] == leadLight) {
                 ++width;
             }
 
-            // Extend down (vertical) as far as possible with same width and type
+            // Extend down (vertical) as far as possible with same width, type, light
             int height = 1;
             while (row + height < faceHeight) {
                 bool rowValid = true;
                 for (int w = 0; w < width; ++w) {
                     int j = idx(row + height, col + w, faceWidth);
-                    if (!faceMask[j] || merged[j] || blockTypes[j] != leadType) {
+                    if (!faceMask[j] || merged[j] || blockTypes[j] != leadType ||
+                        cellLight[j] != leadLight) {
                         rowValid = false;
                         break;
                     }
@@ -117,7 +123,7 @@ static void meshFaceGeneric(
             }
 
             // Emit quad via callback
-            emitQuadFn(col, row, width, height, face, leadType,
+            emitQuadFn(col, row, width, height, face, leadType, leadLight,
                        vertices, indices);
         }
     }
@@ -133,9 +139,33 @@ static MeshOutput buildGenericMesh(
     output.vertices.reserve(6 * gridW * gridD * gridH / 4);
     output.indices.reserve(6 * gridW * gridD * gridH / 2);
 
+    // ---- Column skylight ----
+    // The first open Y above the topmost solid block per column. A face is
+    // lit by how close its exposure cell sits to that height: open sky is
+    // 15, shade under a canopy or overhang steps down, caves bottom out at 4.
+    std::vector<int> skyHeight(gridW * gridD, 0);
+    for (int z = 0; z < gridD; ++z) {
+        for (int x = 0; x < gridW; ++x) {
+            for (int y = gridH - 1; y >= 0; --y) {
+                if (isSolid(getBlock(x, y, z))) {
+                    skyHeight[idx(z, x, gridW)] = y + 1;
+                    break;
+                }
+            }
+        }
+    }
+    auto lightAt = [&](int x, int y, int z) -> uint8_t {
+        x = std::clamp(x, 0, gridW - 1);
+        z = std::clamp(z, 0, gridD - 1);
+        int depth = skyHeight[idx(z, x, gridW)] - y;
+        if (depth <= 0) return 15;
+        return static_cast<uint8_t>(std::max(12 - depth, 4));
+    };
+
     // Reusable flat buffers for face processing (avoid reallocation per face)
     std::vector<bool> faceMask;
     std::vector<BlockType> blockTypes;
+    std::vector<uint8_t> cellLight;
     std::vector<bool> merged;
 
     // ======================================================================
@@ -144,6 +174,7 @@ static MeshOutput buildGenericMesh(
     for (int ly = 0; ly < gridH - 1; ++ly) {
         faceMask.assign(gridD * gridW, false);
         blockTypes.assign(gridD * gridW, BlockType::AIR);
+        cellLight.assign(gridD * gridW, 15);
 
         bool anyExposed = false;
         for (int z = 0; z < gridD; ++z) {
@@ -152,6 +183,7 @@ static MeshOutput buildGenericMesh(
                 if (faceVisible(cur, getBlock(x, ly + 1, z))) {
                     faceMask[idx(z, x, gridW)] = true;
                     blockTypes[idx(z, x, gridW)] = cur;
+                    cellLight[idx(z, x, gridW)] = lightAt(x, ly + 1, z);
                     anyExposed = true;
                 }
             }
@@ -160,7 +192,7 @@ static MeshOutput buildGenericMesh(
 
         auto emitQuad = [ly](
             int col, int row, int width, int height,
-            FaceNormal face, BlockType bt,
+            FaceNormal face, BlockType bt, uint8_t skyLight,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
             // +Y face: y = ly+1, CCW from above
@@ -172,10 +204,10 @@ static MeshOutput buildGenericMesh(
                 {static_cast<float>(col + width), static_cast<float>(ly + 1), static_cast<float>(row + height), fw, fh},
                 {static_cast<float>(col), static_cast<float>(ly + 1), static_cast<float>(row + height), 0.f, fh},
             };
-            pushQuad(verts, idxs, face, bt, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
 
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, merged,
+        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged,
                         FaceNormal::PlusY,
                         output.vertices, output.indices, emitQuad);
     }
@@ -186,6 +218,7 @@ static MeshOutput buildGenericMesh(
     for (int ly = 1; ly < gridH; ++ly) {
         faceMask.assign(gridD * gridW, false);
         blockTypes.assign(gridD * gridW, BlockType::AIR);
+        cellLight.assign(gridD * gridW, 15);
 
         bool anyExposed = false;
         for (int z = 0; z < gridD; ++z) {
@@ -194,6 +227,7 @@ static MeshOutput buildGenericMesh(
                 if (faceVisible(cur, getBlock(x, ly - 1, z))) {
                     faceMask[idx(z, x, gridW)] = true;
                     blockTypes[idx(z, x, gridW)] = cur;
+                    cellLight[idx(z, x, gridW)] = lightAt(x, ly - 1, z);
                     anyExposed = true;
                 }
             }
@@ -202,7 +236,7 @@ static MeshOutput buildGenericMesh(
 
         auto emitQuad = [ly](
             int col, int row, int width, int height,
-            FaceNormal face, BlockType bt,
+            FaceNormal face, BlockType bt, uint8_t skyLight,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
             // -Y face: y = ly, CCW from below
@@ -214,10 +248,10 @@ static MeshOutput buildGenericMesh(
                 {static_cast<float>(col + width), static_cast<float>(ly), static_cast<float>(row + height), fw, fh},
                 {static_cast<float>(col), static_cast<float>(ly), static_cast<float>(row + height), 0.f, fh},
             };
-            pushQuad(verts, idxs, face, bt, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
 
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, merged,
+        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged,
                         FaceNormal::MinusY,
                         output.vertices, output.indices, emitQuad);
     }
@@ -228,6 +262,7 @@ static MeshOutput buildGenericMesh(
     for (int lx = 0; lx < gridW - 1; ++lx) {
         faceMask.assign(gridH * gridD, false);
         blockTypes.assign(gridH * gridD, BlockType::AIR);
+        cellLight.assign(gridH * gridD, 15);
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
@@ -235,13 +270,14 @@ static MeshOutput buildGenericMesh(
                 if (faceVisible(cur, getBlock(lx + 1, y, z))) {
                     faceMask[idx(y, z, gridD)] = true;
                     blockTypes[idx(y, z, gridD)] = cur;
+                    cellLight[idx(y, z, gridD)] = lightAt(lx + 1, y, z);
                 }
             }
         }
 
         auto emitQuad = [lx](
             int col, int row, int width, int height,
-            FaceNormal face, BlockType bt,
+            FaceNormal face, BlockType bt, uint8_t skyLight,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
             // +X face: x = lx+1, CCW from +X (rows are Y, cols are Z)
@@ -253,10 +289,10 @@ static MeshOutput buildGenericMesh(
                 {static_cast<float>(lx + 1), static_cast<float>(row + height), static_cast<float>(col + width), fw, fh},
                 {static_cast<float>(lx + 1), static_cast<float>(row), static_cast<float>(col + width), fw, 0.f},
             };
-            pushQuad(verts, idxs, face, bt, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
 
-        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, merged,
+        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged,
                         FaceNormal::PlusX,
                         output.vertices, output.indices, emitQuad);
     }
@@ -267,6 +303,7 @@ static MeshOutput buildGenericMesh(
     for (int lx = 0; lx < gridW; ++lx) {
         faceMask.assign(gridH * gridD, false);
         blockTypes.assign(gridH * gridD, BlockType::AIR);
+        cellLight.assign(gridH * gridD, 15);
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
@@ -274,13 +311,14 @@ static MeshOutput buildGenericMesh(
                 if (faceVisible(cur, getBlock(lx - 1, y, z))) {
                     faceMask[idx(y, z, gridD)] = true;
                     blockTypes[idx(y, z, gridD)] = cur;
+                    cellLight[idx(y, z, gridD)] = lightAt(lx - 1, y, z);
                 }
             }
         }
 
         auto emitQuad = [lx](
             int col, int row, int width, int height,
-            FaceNormal face, BlockType bt,
+            FaceNormal face, BlockType bt, uint8_t skyLight,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
             // -X face: the face plane of block lx is x = lx (the old code
@@ -293,10 +331,10 @@ static MeshOutput buildGenericMesh(
                 {static_cast<float>(lx), static_cast<float>(row + height), static_cast<float>(col + width), fw, fh},
                 {static_cast<float>(lx), static_cast<float>(row + height), static_cast<float>(col), 0.f, fh},
             };
-            pushQuad(verts, idxs, face, bt, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
 
-        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, merged,
+        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged,
                         FaceNormal::MinusX,
                         output.vertices, output.indices, emitQuad);
     }
@@ -307,6 +345,7 @@ static MeshOutput buildGenericMesh(
     for (int lz = 0; lz < gridD - 1; ++lz) {
         faceMask.assign(gridH * gridW, false);
         blockTypes.assign(gridH * gridW, BlockType::AIR);
+        cellLight.assign(gridH * gridW, 15);
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
@@ -314,13 +353,14 @@ static MeshOutput buildGenericMesh(
                 if (faceVisible(cur, getBlock(x, y, lz + 1))) {
                     faceMask[idx(y, x, gridW)] = true;
                     blockTypes[idx(y, x, gridW)] = cur;
+                    cellLight[idx(y, x, gridW)] = lightAt(x, y, lz + 1);
                 }
             }
         }
 
         auto emitQuad = [lz](
             int col, int row, int width, int height,
-            FaceNormal face, BlockType bt,
+            FaceNormal face, BlockType bt, uint8_t skyLight,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
             // +Z face: z = lz+1 (the old code emitted at lz, coplanar with
@@ -333,10 +373,10 @@ static MeshOutput buildGenericMesh(
                 {static_cast<float>(col + width), static_cast<float>(row + height), static_cast<float>(lz + 1), fw, fh},
                 {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz + 1), fw, 0.f},
             };
-            pushQuad(verts, idxs, face, bt, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
 
-        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, merged,
+        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged,
                         FaceNormal::PlusZ,
                         output.vertices, output.indices, emitQuad);
     }
@@ -347,6 +387,7 @@ static MeshOutput buildGenericMesh(
     for (int lz = 0; lz < gridD; ++lz) {
         faceMask.assign(gridH * gridW, false);
         blockTypes.assign(gridH * gridW, BlockType::AIR);
+        cellLight.assign(gridH * gridW, 15);
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
@@ -354,13 +395,14 @@ static MeshOutput buildGenericMesh(
                 if (faceVisible(cur, getBlock(x, y, lz - 1))) {
                     faceMask[idx(y, x, gridW)] = true;
                     blockTypes[idx(y, x, gridW)] = cur;
+                    cellLight[idx(y, x, gridW)] = lightAt(x, y, lz - 1);
                 }
             }
         }
 
         auto emitQuad = [lz](
             int col, int row, int width, int height,
-            FaceNormal face, BlockType bt,
+            FaceNormal face, BlockType bt, uint8_t skyLight,
             std::vector<Vertex>& verts,
             std::vector<uint32_t>& idxs) {
             // -Z face: the face plane of block lz is z = lz (the old code
@@ -373,10 +415,10 @@ static MeshOutput buildGenericMesh(
                 {static_cast<float>(col + width), static_cast<float>(row + height), static_cast<float>(lz), fw, fh},
                 {static_cast<float>(col), static_cast<float>(row + height), static_cast<float>(lz), 0.f, fh},
             };
-            pushQuad(verts, idxs, face, bt, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners);
         };
 
-        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, merged,
+        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged,
                         FaceNormal::MinusZ,
                         output.vertices, output.indices, emitQuad);
     }
