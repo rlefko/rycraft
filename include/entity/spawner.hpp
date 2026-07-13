@@ -7,7 +7,7 @@
 #include <world/biome.hpp>
 
 #include <memory>
-#include <random>
+#include "common/random.hpp"
 #include <unordered_map>
 #include <vector>
 
@@ -72,7 +72,7 @@ private:
     World& world_;
     std::vector<std::shared_ptr<Entity>> entities_;
     SpatialHash spatialHash_;
-    std::mt19937 rng_;
+    SeededRng rng_;
 
     // Random number in [min, max]
     int randomInt(int min, int max);

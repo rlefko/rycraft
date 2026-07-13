@@ -4,11 +4,11 @@
 #include <cmath>
 
 // ---------------------------------------------------------------------------
-// isBlockSolid — Block solidity check for ray tracing
+// isBlockSolid — ray targeting, delegating to the shared block property
+// table so raycasts agree with collision (glass is targetable).
 // ---------------------------------------------------------------------------
 bool VoxelTraversal::isBlockSolid(World& world, int x, int y, int z) {
-    BlockType type = world.getBlock(x, y, z);
-    return type != BlockType::AIR && type != BlockType::WATER && type != BlockType::GLASS;
+    return isSolid(world.getBlock(x, y, z));
 }
 
 // ---------------------------------------------------------------------------

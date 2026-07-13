@@ -106,6 +106,8 @@ static EngineState* _engineGetState(Engine* engine) {
         // the 128 MB mega-buffer (25×25 chunks ≈ 60 MB of vertex data).
         _state->world = std::make_shared<World>(42, 12);
         _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
+        // Chunks load from disk before regenerating, so block edits persist
+        _state->world->setSaveManager(_state->saveManager.get());
         // Spawn player above terrain
         _state->player.position = Vec3{0.f, 100.f, 0.f};
     }

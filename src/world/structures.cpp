@@ -1,5 +1,7 @@
 #include "world/structures.hpp"
 
+#include "common/random.hpp"
+
 #include <cmath>
 
 StructureGenerator::StructureGenerator(uint32_t seed)
@@ -8,12 +10,7 @@ StructureGenerator::StructureGenerator(uint32_t seed)
 }
 
 uint32_t StructureGenerator::hashCoords(int x, int z, uint32_t seed) {
-    // FNV-1a inspired hash
-    uint64_t hash = 14695981039346656037ULL ^ seed;
-    hash ^= static_cast<uint64_t>(x) * 374761393ULL;
-    hash ^= static_cast<uint64_t>(z) * 668265263ULL;
-    hash *= 1099511628211ULL;
-    return static_cast<uint32_t>(hash);
+    return static_cast<uint32_t>(::hashCoords(x, z, seed));
 }
 
 bool StructureGenerator::shouldPlaceStructure(int chunkX, int chunkZ, const std::string& type) const {

@@ -133,7 +133,7 @@ static MeshOutput buildGenericMesh(
     for (int y = 0; y < gridH; ++y) {
         for (int z = 0; z < gridD; ++z) {
             for (int x = 0; x < gridW; ++x) {
-                if (isSolid(getBlock(x, y, z))) {
+                if (isOpaque(getBlock(x, y, z))) {
                     solidY[idx(y, idx(z, x, gridW), gridD * gridW)] = true;
                 }
             }
@@ -254,8 +254,8 @@ static MeshOutput buildGenericMesh(
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
-                if (isSolid(getBlock(lx, y, z)) &&
-                    !isSolid(getBlock(lx + 1, y, z))) {
+                if (isOpaque(getBlock(lx, y, z)) &&
+                    !isOpaque(getBlock(lx + 1, y, z))) {
                     faceMask[idx(y, z, gridD)] = true;
                     blockTypes[idx(y, z, gridD)] = getBlock(lx, y, z);
                 }
@@ -293,8 +293,8 @@ static MeshOutput buildGenericMesh(
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
-                if (isSolid(getBlock(lx, y, z)) &&
-                    !isSolid(getBlock(lx - 1, y, z))) {
+                if (isOpaque(getBlock(lx, y, z)) &&
+                    !isOpaque(getBlock(lx - 1, y, z))) {
                     faceMask[idx(y, z, gridD)] = true;
                     blockTypes[idx(y, z, gridD)] = getBlock(lx, y, z);
                 }
@@ -333,8 +333,8 @@ static MeshOutput buildGenericMesh(
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
-                if (isSolid(getBlock(x, y, lz)) &&
-                    !isSolid(getBlock(x, y, lz + 1))) {
+                if (isOpaque(getBlock(x, y, lz)) &&
+                    !isOpaque(getBlock(x, y, lz + 1))) {
                     faceMask[idx(y, x, gridW)] = true;
                     blockTypes[idx(y, x, gridW)] = getBlock(x, y, lz);
                 }
@@ -373,8 +373,8 @@ static MeshOutput buildGenericMesh(
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
-                if (isSolid(getBlock(x, y, lz)) &&
-                    !isSolid(getBlock(x, y, lz - 1))) {
+                if (isOpaque(getBlock(x, y, lz)) &&
+                    !isOpaque(getBlock(x, y, lz - 1))) {
                     faceMask[idx(y, x, gridW)] = true;
                     blockTypes[idx(y, x, gridW)] = getBlock(x, y, lz);
                 }

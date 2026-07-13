@@ -5,7 +5,7 @@
 
 #include <cmath>
 #include <cstring>
-#include <random>
+#include "common/random.hpp"
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -187,23 +187,21 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
 // spawnRainParticle
 // ---------------------------------------------------------------------------
 void ParticleSystem::spawnRainParticle(Particle& p, const Vec3& playerPos, float spawnRadius) {
-    static thread_local std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<float> angleDist(0.f, 2.f * static_cast<float>(M_PI));
-    std::uniform_real_distribution<float> radiusDist(0.f, spawnRadius);
-    std::uniform_real_distribution<float> unitDist(0.f, 1.f);
-
-    float angle = angleDist(rng);
-    float radius = radiusDist(rng);
+    // Deterministic weather: the same seed always rains the same way
+    static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
+            
+    float angle = rng.nextFloat() * 2.f * static_cast<float>(M_PI);
+    float radius = rng.nextFloat() * spawnRadius;
 
     // Spawn above player at high altitude
     p.position[0] = playerPos.x + std::cos(angle) * radius;
-    p.position[1] = playerPos.y + 128.f + unitDist(rng) * 32.f;
+    p.position[1] = playerPos.y + 128.f + rng.nextFloat() * 32.f;
     p.position[2] = playerPos.z + std::sin(angle) * radius;
 
     // Fall speed ~10 blocks/s with slight wind drift
-    p.velocity[0] = (unitDist(rng) - 0.5f) * 1.0f;
+    p.velocity[0] = (rng.nextFloat() - 0.5f) * 1.0f;
     p.velocity[1] = -10.f;
-    p.velocity[2] = (unitDist(rng) - 0.5f) * 1.0f;
+    p.velocity[2] = (rng.nextFloat() - 0.5f) * 1.0f;
 
     p.lifetime = 0.f;
     p.maxLifetime = 2.0f;
@@ -215,23 +213,21 @@ void ParticleSystem::spawnRainParticle(Particle& p, const Vec3& playerPos, float
 // spawnSnowParticle
 // ---------------------------------------------------------------------------
 void ParticleSystem::spawnSnowParticle(Particle& p, const Vec3& playerPos, float spawnRadius) {
-    static thread_local std::mt19937 rng(std::random_device{}());
-    std::uniform_real_distribution<float> angleDist(0.f, 2.f * static_cast<float>(M_PI));
-    std::uniform_real_distribution<float> radiusDist(0.f, spawnRadius);
-    std::uniform_real_distribution<float> unitDist(0.f, 1.f);
-
-    float angle = angleDist(rng);
-    float radius = radiusDist(rng);
+    // Deterministic weather: the same seed always rains the same way
+    static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
+            
+    float angle = rng.nextFloat() * 2.f * static_cast<float>(M_PI);
+    float radius = rng.nextFloat() * spawnRadius;
 
     // Spawn above player
     p.position[0] = playerPos.x + std::cos(angle) * radius;
-    p.position[1] = playerPos.y + 96.f + unitDist(rng) * 32.f;
+    p.position[1] = playerPos.y + 96.f + rng.nextFloat() * 32.f;
     p.position[2] = playerPos.z + std::sin(angle) * radius;
 
     // Fall speed ~3 blocks/s with gentle initial drift
-    p.velocity[0] = (unitDist(rng) - 0.5f) * 0.5f;
+    p.velocity[0] = (rng.nextFloat() - 0.5f) * 0.5f;
     p.velocity[1] = -3.f;
-    p.velocity[2] = (unitDist(rng) - 0.5f) * 0.5f;
+    p.velocity[2] = (rng.nextFloat() - 0.5f) * 0.5f;
 
     p.lifetime = 0.f;
     p.maxLifetime = 5.0f;

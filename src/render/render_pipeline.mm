@@ -8,6 +8,7 @@
 #include "render/particles.hpp"
 #include "render/ui_overlay.hpp"
 #include "world/chunk.hpp"
+#include "world/chunk_pos.hpp"
 #include "world/world.hpp"
 #include "engine/camera.hpp"
 #include "engine/hotbar.hpp"
@@ -726,9 +727,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder,
     for (auto& chunk : loadedChunks) {
         if (!chunk || !chunk->generated) continue;
 
-        // Chunk key for mesh cache lookup (packed int64, no allocation)
-        uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(chunk->chunkX)) << 32) |
-                        static_cast<uint64_t>(static_cast<uint32_t>(chunk->chunkZ));
+        // Chunk key for mesh cache lookup (packed, no allocation)
+        uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
         _liveChunkKeys.insert(key);
 
         // Frustum culling

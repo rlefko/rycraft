@@ -1,5 +1,6 @@
 #pragma once
 #include "world/chunk.hpp"
+#include "world/chunk_pos.hpp"
 #include "world/terrain.hpp"
 #include "world/biome.hpp"
 #include "world/surface.hpp"
@@ -15,9 +16,10 @@
 #include <memory>
 #include <optional>
 #include <vector>
-#include <string>
 #include <cstdint>
 #include <future>
+
+class SaveManager;
 
 class World {
 public:
@@ -73,13 +75,21 @@ public:
     // Get generation queue status
     size_t getPendingChunkCount() const;
 
+    // Attach the save manager (non-owning). Once set, getChunk and the async
+    // generation path try loading a chunk from disk before generating it —
+    // without this, saved block edits were written but never read back.
+    void setSaveManager(SaveManager* saveManager);
+
 private:
     uint32_t seed_;
     int viewDistance_;
 
-    // Chunk storage — spatial hash
-    std::unordered_map<std::string, std::shared_ptr<Chunk>> chunks_;
+    // Chunk storage keyed by chunk grid coordinate
+    std::unordered_map<ChunkPos, std::shared_ptr<Chunk>> chunks_;
     mutable std::mutex chunksMutex_;
+
+    // Persistence (non-owning; the engine owns the SaveManager)
+    SaveManager* saveManager_ = nullptr;
 
     // Generation components
     TerrainGenerator terrainGen_;
@@ -98,15 +108,16 @@ private:
 
     // Async generation state
     std::shared_ptr<ThreadPool> genPool_;  // lazily initialized
-    std::unordered_map<std::string, std::future<void>> pendingGenerations_;
+    std::unordered_map<ChunkPos, std::future<void>> pendingGenerations_;
     mutable std::mutex pendingMutex_;
 
     // Generate a single chunk (synchronous)
     void generateChunk(std::shared_ptr<Chunk> chunk);
 
-    // Generate chunk asynchronously with LOD
-    void generateChunkAsync(int chunkX, int chunkZ, int playerChunkX, int playerChunkZ);
+    // Generate chunk asynchronously
+    void generateChunkAsync(int chunkX, int chunkZ);
 
-    // Chunk key
-    static std::string chunkKey(int cx, int cz);
+    // Load the chunk from disk when possible, otherwise generate it
+    // (with the flat-fallback policy on generation failure).
+    std::shared_ptr<Chunk> loadOrGenerateChunk(int chunkX, int chunkZ);
 };

@@ -4,11 +4,13 @@
 #include <cmath>
 
 // ---------------------------------------------------------------------------
-// isSolid — Block type check (excludes AIR, WATER, GLASS)
+// isSolid — collision check, delegating to the shared block property table
+// (block_properties.hpp). Notably glass IS solid: it used to be excluded
+// here while the mesher rendered it as a full block, so entities fell
+// through what looked like floor.
 // ---------------------------------------------------------------------------
 bool PhysicsEngine::isSolid(World& world, int x, int y, int z) {
-    BlockType type = world.getBlock(x, y, z);
-    return type != BlockType::AIR && type != BlockType::WATER && type != BlockType::GLASS;
+    return ::isSolid(world.getBlock(x, y, z));
 }
 
 // ---------------------------------------------------------------------------

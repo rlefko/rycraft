@@ -1,9 +1,11 @@
 #include "world/trees.hpp"
 
+#include "common/random.hpp"
+
 #include <cmath>
 
 uint32_t TreeGenerator::treeRand(uint32_t& state) {
-    state = state * 1664525u + 1013904223u;
+    state = static_cast<uint32_t>(hash64(state));
     return (state >> 16) & 0x7fff;
 }
 

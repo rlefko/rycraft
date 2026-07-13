@@ -3,7 +3,9 @@
 #include <common/math.hpp>
 #include <common/result.hpp>
 #include <common/thread_pool.hpp>
+#include <common/random.hpp>
 #include <world/chunk.hpp>
+#include <world/chunk_pos.hpp>
 #include <world/noise.hpp>
 #include <world/terrain.hpp>
 #include <world/biome.hpp>
@@ -862,6 +864,93 @@ TEST_CASE("Serialization roundtrip", "[serialization]") {
   REQUIRE(restored->heightMap[100] == 72);
 }
 
+TEST_CASE("Serialization: heights at 128 and above survive the roundtrip", "[serialization]") {
+  // Terrain reaches height 128, which overflowed the old int8 height field
+  // to -128 on load and corrupted tree/structure placement.
+  Chunk chunk(3, 4);
+  chunk.generated = true;
+  chunk.heightMap[0] = 127;
+  chunk.heightMap[1] = 128;
+  chunk.heightMap[2] = 255;
+
+  auto data = ChunkSerializer::serialize(chunk);
+  auto restored = ChunkSerializer::deserialize(data);
+  REQUIRE(restored.has_value());
+  REQUIRE(restored->heightMap[0] == 127);
+  REQUIRE(restored->heightMap[1] == 128);
+  REQUIRE(restored->heightMap[2] == 255);
+}
+
+TEST_CASE("Serialization: pre-v2 chunks are rejected so they regenerate", "[serialization]") {
+  Chunk chunk(0, 0);
+  chunk.generated = true;
+  auto data = ChunkSerializer::serialize(chunk);
+
+  // Rewrite the version field (offset 4) to the old v1
+  uint32_t oldVersion = 1;
+  std::memcpy(data.data() + 4, &oldVersion, sizeof(oldVersion));
+  REQUIRE(!ChunkSerializer::deserialize(data).has_value());
+}
+
+TEST_CASE("World loads saved chunks before generating", "[world][save]") {
+  std::string tempDir = "/tmp/rycraft_test_load_before_generate";
+  std::system(("rm -rf " + tempDir).c_str());
+
+  uint32_t seed = 777;
+  int editX = 8, editY = 200, editZ = 8;
+
+  {
+    // First session: edit a block and persist the chunk
+    SaveManager saver(tempDir);
+    auto world = std::make_shared<World>(seed);
+    world->setSaveManager(&saver);
+    auto chunk = world->getChunk(0, 0);
+    world->setBlock(editX, editY, editZ, BlockType::DIAMOND_ORE);
+    saver.saveChunk(*chunk);
+    saver.flush();
+  }
+
+  {
+    // Second session: the edit must come back from disk, not the generator
+    SaveManager saver(tempDir);
+    auto world = std::make_shared<World>(seed);
+    world->setSaveManager(&saver);
+    REQUIRE(world->getBlock(editX, editY, editZ) == BlockType::DIAMOND_ORE);
+  }
+
+  std::system(("rm -rf " + tempDir).c_str());
+}
+
+TEST_CASE("ChunkPos packs and hashes distinctly", "[world]") {
+  REQUIRE(ChunkPos{0, 0} == ChunkPos{0, 0});
+  REQUIRE(!(ChunkPos{1, 0} == ChunkPos{0, 1}));
+  REQUIRE(ChunkPos{1, 0}.packed() != ChunkPos{0, 1}.packed());
+  REQUIRE(ChunkPos{-1, -1}.packed() != ChunkPos{1, 1}.packed());
+
+  std::unordered_map<ChunkPos, int> map;
+  map[ChunkPos{5, -3}] = 42;
+  REQUIRE(map.at(ChunkPos{5, -3}) == 42);
+  REQUIRE(map.find(ChunkPos{-3, 5}) == map.end());
+}
+
+TEST_CASE("SeededRng is deterministic and bounded", "[common]") {
+  SeededRng a(1234);
+  SeededRng b(1234);
+  for (int i = 0; i < 100; ++i) {
+    REQUIRE(a.next() == b.next());
+  }
+
+  SeededRng r(99);
+  for (int i = 0; i < 1000; ++i) {
+    float f = r.nextFloat();
+    REQUIRE(f >= 0.0f);
+    REQUIRE(f < 1.0f);
+    int v = r.nextInt(-3, 7);
+    REQUIRE(v >= -3);
+    REQUIRE(v <= 7);
+  }
+}
+
 TEST_CASE("Serialization size is correct", "[serialization]") {
   Chunk chunk(0, 0);
   size_t expected = ChunkSerializer::serializedSize(chunk);
@@ -1625,7 +1714,7 @@ TEST_CASE("Obstacle collection: returns correct blocks in range", "[physics]") {
     }
 }
 
-TEST_CASE("isSolid: returns true for STONE, false for AIR/WATER/GLASS", "[physics]") {
+TEST_CASE("isSolid: solid for STONE and GLASS, passable for AIR/WATER", "[physics]") {
     auto world = std::make_shared<World>(42);
     world->getChunk(0, 0);
 
@@ -1640,9 +1729,25 @@ TEST_CASE("isSolid: returns true for STONE, false for AIR/WATER/GLASS", "[physic
     REQUIRE(PhysicsEngine::isSolid(*world, 1, 200, 1) == true);  // STONE
     REQUIRE(PhysicsEngine::isSolid(*world, 2, 200, 2) == false); // AIR
     REQUIRE(PhysicsEngine::isSolid(*world, 3, 200, 3) == false); // WATER
-    REQUIRE(PhysicsEngine::isSolid(*world, 4, 200, 4) == false); // GLASS
+    // GLASS collides: it renders as a full block, so physics must agree
+    // (it used to be passable — the fall-through-glass bug).
+    REQUIRE(PhysicsEngine::isSolid(*world, 4, 200, 4) == true);
     REQUIRE(PhysicsEngine::isSolid(*world, 5, 200, 5) == true);  // DIRT
     REQUIRE(PhysicsEngine::isSolid(*world, 6, 200, 6) == true);  // BEDROCK
+}
+
+TEST_CASE("Block properties: the three predicates agree on every type", "[physics][world]") {
+    for (int t = 0; t < static_cast<int>(BlockType::COUNT); ++t) {
+        BlockType bt = static_cast<BlockType>(t);
+        // Anything that occludes neighbors must also collide — a block that
+        // renders as a full cube but lets entities through reads as a bug.
+        if (isOpaque(bt)) {
+            REQUIRE(isSolid(bt));
+        }
+        // Air and water are the only non-solid types today
+        bool expectedSolid = bt != BlockType::AIR && bt != BlockType::WATER;
+        REQUIRE(isSolid(bt) == expectedSolid);
+    }
 }
 
 TEST_CASE("isInWater: returns true when entity AABB overlaps water block", "[physics]") {

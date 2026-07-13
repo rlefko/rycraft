@@ -49,7 +49,7 @@ std::optional<int> Spawner::findSpawnHeight(int x, int z) {
     // Scan from top to bottom for the first solid block
     for (int y = 255; y >= 0; --y) {
         BlockType block = world_.getBlock(x, y, z);
-        if (block != BlockType::AIR && block != BlockType::WATER) {
+        if (isSolid(block)) {
             return y + 1; // Spawn on top of solid block
         }
     }
@@ -79,8 +79,7 @@ bool Spawner::isSpawnValid(int x, int y, int z) {
 // ---------------------------------------------------------------------------
 int Spawner::randomInt(int min, int max) {
     if (min > max) std::swap(min, max);
-    std::uniform_int_distribution<int> dist(min, max);
-    return dist(rng_);
+    return rng_.nextInt(min, max);
 }
 
 // ---------------------------------------------------------------------------

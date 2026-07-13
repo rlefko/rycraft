@@ -5,25 +5,19 @@
 #include "entity/spawner.hpp"
 #include "world/world.hpp"
 
+#include "common/random.hpp"
+
 #include <algorithm>
 #include <cmath>
-#include <random>
 
 // ---------------------------------------------------------------------------
 // Simple deterministic random for AI (seeded per entity ID)
 // ---------------------------------------------------------------------------
 static float entityRandom(uint64_t seed) {
-    // MurmurHash3-style finalizer for deterministic per-entity randomness
-    static std::mt19937 rng(42);
-    static std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    uint64_t hash = seed ^ 0x5deece66d;
-    hash = (hash ^ (hash >> 9)) * 0xcc9e2d51;
-    hash = (hash ^ (hash >> 17)) * 0x1b873593;
-    hash = hash ^ (hash >> 13);
-    for (uint64_t i = 0; i < (hash % 100 + 1); ++i) {
-        rng.discard(1);
-    }
-    return dist(rng);
+    // Pure hash → [-1, 1): deterministic per seed and safe from any thread
+    // (the old version advanced a shared static mt19937, so results depended
+    // on global call order and raced across threads).
+    return static_cast<float>(hash64(seed) >> 40) / static_cast<float>(1u << 23) - 1.0f;
 }
 
 // ---------------------------------------------------------------------------

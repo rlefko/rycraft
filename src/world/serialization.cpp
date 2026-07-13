@@ -28,9 +28,12 @@ std::vector<uint8_t> ChunkSerializer::serialize(const Chunk& chunk) {
     std::memcpy(buffer.data() + offset, chunk.biomes.data(), BIOME_DATA_SIZE);
     offset += BIOME_DATA_SIZE;
 
-    // Write height map (convert int to int8_t)
+    // Write height map as little-endian int16 (heights reach 128+, which
+    // overflowed the old int8 format)
     for (size_t i = 0; i < chunk.heightMap.size(); ++i) {
-        buffer[offset + i] = static_cast<int8_t>(chunk.heightMap[i]);
+        auto h = static_cast<int16_t>(chunk.heightMap[i]);
+        buffer[offset + i * 2] = static_cast<uint8_t>(h & 0xFF);
+        buffer[offset + i * 2 + 1] = static_cast<uint8_t>((h >> 8) & 0xFF);
     }
     offset += HEIGHT_MAP_SIZE;
 
@@ -82,9 +85,11 @@ std::optional<Chunk> ChunkSerializer::deserialize(const std::span<const uint8_t>
     std::memcpy(chunk.biomes.data(), data.data() + offset, BIOME_DATA_SIZE);
     offset += BIOME_DATA_SIZE;
 
-    // Read height map (convert int8_t to int)
+    // Read height map (little-endian int16)
     for (size_t i = 0; i < chunk.heightMap.size(); ++i) {
-        chunk.heightMap[i] = static_cast<int>(data[offset + i]);
+        auto h = static_cast<int16_t>(static_cast<uint16_t>(data[offset + i * 2]) |
+                                      (static_cast<uint16_t>(data[offset + i * 2 + 1]) << 8));
+        chunk.heightMap[i] = h;
     }
 
     chunk.generated = true;
