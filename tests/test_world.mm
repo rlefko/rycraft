@@ -999,13 +999,10 @@ TEST_CASE("Water physics: increased horizontal drag in water", "[phase6][water]"
     input.keysDown[Key::W] = true;
     player.tick(*world, input, false);
 
-    // In water, horizontal drag is 0.7 (vs 0.91 in air)
-    // Movement should be significantly reduced
+    // Water halves the walking pace (0.216 → 0.108 blocks/tick)
     float totalHorizontalSpeed =
         std::sqrt(player.velocity.x * player.velocity.x + player.velocity.z * player.velocity.z);
-    // In air: speed = 0.05 * 0.91 = 0.0455
-    // In water: speed = 0.05 * 0.7 = 0.035
-    REQUIRE(totalHorizontalSpeed < 0.0455f);
+    REQUIRE(totalHorizontalSpeed == Catch::Approx(0.108f).epsilon(0.01f));
 }
 
 TEST_CASE("Water physics: buoyancy pushes player upward", "[phase6][water]") {

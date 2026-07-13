@@ -122,6 +122,7 @@ public:
     void handleMouseUp(NSEvent* event);
 
     void handleScrollWheel(NSEvent* event);
+    void handleFlagsChanged(NSEvent* event);
 
     // Pointer lock. While captured the hardware cursor is hidden and frozen
     // (CGAssociateMouseAndMouseCursorPosition) and look input comes from raw
@@ -151,6 +152,7 @@ private:
     id mouseDownMonitor_ = nil;
     id mouseUpMonitor_ = nil;
     id scrollWheelMonitor_ = nil;
+    id flagsChangedMonitor_ = nil;
 
     static Key keyCodeToKey(NSInteger keyCode);
 };

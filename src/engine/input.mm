@@ -166,10 +166,12 @@ bool InputState::isJustReleased(Key key) const {
 }
 
 void InputState::update() {
-    // Clear one-frame events (keysPressedForTick survives until a tick runs)
+    // Clear one-frame events. keysPressedForTick and mouseDelta survive
+    // until a tick consumes them: at 60 fps most frames run zero 20 Hz
+    // ticks, and clearing the look delta per frame silently discarded about
+    // two-thirds of mouse motion.
     keysJustPressed.clear();
     keysJustReleased.clear();
-    mouseDelta = Vec2{0, 0};
     scrollDelta = 0.f;
 }
 
@@ -299,6 +301,16 @@ InputManager::InputManager(NSWindow* window)
                                                                     return event;
                                                                 }];
 
+    // Modifier keys (Shift, Control) never arrive as keyDown/keyUp — macOS
+    // delivers them as flagsChanged. Without this monitor sprint/sneak keys
+    // read as never pressed.
+    flagsChangedMonitor_ =
+        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskFlagsChanged
+                                              handler:^NSEvent*(NSEvent* event) {
+                                                  self->handleFlagsChanged(event);
+                                                  return event;
+                                              }];
+
     // Enable tracking for mouse events
     [window_ setAcceptsMouseMovedEvents:true];
 }
@@ -319,6 +331,8 @@ InputManager::~InputManager() {
         [NSEvent removeMonitor:mouseUpMonitor_];
     if (scrollWheelMonitor_)
         [NSEvent removeMonitor:scrollWheelMonitor_];
+    if (flagsChangedMonitor_)
+        [NSEvent removeMonitor:flagsChangedMonitor_];
 
     // Never leave the (global) mouse association broken behind us
     if (captured_) {
@@ -334,6 +348,12 @@ InputState& InputManager::state() {
 }
 
 void InputManager::handleKeyDown(NSEvent* event) {
+    // Auto-repeats would re-fire edge-triggered actions (held ESC flickered
+    // pause/resume at the key-repeat rate)
+    if ([event isARepeat]) {
+        return;
+    }
+
     Key key = keyCodeToKey([event keyCode]);
 
     state_.keysJustPressed[key] = true;
@@ -407,6 +427,24 @@ void InputManager::handleScrollWheel(NSEvent* event) {
     state_.scrollDelta += static_cast<float>([event scrollingDeltaY]);
 }
 
+void InputManager::handleFlagsChanged(NSEvent* event) {
+    NSEventModifierFlags flags = [event modifierFlags];
+
+    auto applyModifier = [this](Key key, bool down) {
+        bool wasDown = state_.isDown(key);
+        state_.keysDown[key] = down;
+        if (down && !wasDown) {
+            state_.keysJustPressed[key] = true;
+            state_.keysPressedForTick[key] = true;
+        } else if (!down && wasDown) {
+            state_.keysJustReleased[key] = true;
+        }
+    };
+
+    applyModifier(Key::LeftShift, (flags & NSEventModifierFlagShift) != 0);
+    applyModifier(Key::LeftControl, (flags & NSEventModifierFlagControl) != 0);
+}
+
 void InputManager::warpCursorToWindowCenter() {
     if (!window_)
         return;
@@ -442,6 +480,14 @@ void InputManager::releaseMouse() {
     if (!captured_)
         return;
     captured_ = false;
+
+    // Keys held at release get their keyUp delivered elsewhere (menus,
+    // another app after Cmd-Tab) — without this the player auto-walks on
+    // resume until the key is tapped again
+    state_.keysDown.clear();
+    state_.keysPressedForTick.clear();
+    state_.mouseLeftDown = false;
+    state_.mouseRightDown = false;
 
     // Warp BEFORE re-associating so the first hover events aren't suppressed
     warpCursorToWindowCenter();

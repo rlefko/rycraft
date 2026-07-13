@@ -38,7 +38,15 @@ public:
     static constexpr float TERMINAL_VELOCITY = -3.92f;
     static constexpr float JUMP_VELOCITY = 0.42f;
     static constexpr float SPRINT_MULTIPLIER = 1.3f;
-    static constexpr float WALK_SPEED = 0.05f;
+    // Blocks per tick (0.216 × 20 Hz ≈ 4.3 blocks/s, classic voxel-game
+    // walking pace). This was 0.05 with ground drag shrinking it further to
+    // ~0.55 blocks/s — slow enough to read as "the player can't move".
+    static constexpr float WALK_SPEED = 0.216f;
+
+    // Camera height above the feet. position is the AABB bottom; rendering
+    // from it puts the horizon at ankle level and reads as being sunk
+    // waist-deep into the ground.
+    static constexpr float EYE_HEIGHT = 1.62f;
     static constexpr int JUMP_COOLDOWN_TICKS = 10;
 
     // Get player's AABB based on current position

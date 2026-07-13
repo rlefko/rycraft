@@ -5,7 +5,6 @@
 
 // Water physics modifiers (Task 6.7-6.8)
 static constexpr float WATER_GRAVITY_MULTIPLIER = 0.3f;
-static constexpr float WATER_HORIZONTAL_DRAG = 0.7f;
 static constexpr float WATER_BUOYANCY_FORCE = 0.02f;
 
 // ---------------------------------------------------------------------------
@@ -25,8 +24,9 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
     AABB playerAABB = getAABB();
     bool inWater = PhysicsEngine::isInWater(world, playerAABB);
 
-    // 1. Apply input: WASD → horizontal velocity based on yaw
-    float speed = WALK_SPEED;
+    // 1. Apply input: WASD → horizontal velocity based on yaw.
+    // Water halves the pace (horizontal drag used to approximate this).
+    float speed = inWater ? WALK_SPEED * 0.5f : WALK_SPEED;
     if (sprinting) {
         speed *= SPRINT_MULTIPLIER;
     }
@@ -64,13 +64,8 @@ void Player::tick(World& world, const InputState& input, bool sprinting) {
     }
     velocity.y += effectiveGravity;
 
-    // 3. Apply drag (increased in water)
-    float horizontalDrag = onGround ? HORIZONTAL_DRAG_GROUND : HORIZONTAL_DRAG_AIR;
-    if (inWater) {
-        horizontalDrag = WATER_HORIZONTAL_DRAG;
-    }
-    velocity.x *= horizontalDrag;
-    velocity.z *= horizontalDrag;
+    // 3. Vertical drag only: horizontal velocity is overwritten from input
+    // every tick, so horizontal drag merely rescaled the walk speed.
     velocity.y *= VERTICAL_DRAG;
 
     // 4. Apply buoyancy force when in water

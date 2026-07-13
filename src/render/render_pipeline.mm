@@ -696,13 +696,30 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
 
     auto loadedChunks = world.getLoadedChunks();
 
+    // Sweep mesh allocations of chunks the world has since unloaded BEFORE
+    // building, so the freed mega-buffer space serves this frame's builds
+    _liveChunkKeys.clear();
+    for (const auto& chunk : loadedChunks) {
+        if (chunk) {
+            _liveChunkKeys.insert(ChunkPos{chunk->chunkX, chunk->chunkZ}.packed());
+        }
+    }
+    for (auto it = _chunkMeshes.begin(); it != _chunkMeshes.end();) {
+        if (_liveChunkKeys.count(it->first) == 0) {
+            if (it->second.uploaded) {
+                _megaBuffer->free(it->second.alloc);
+            }
+            it = _chunkMeshes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     // Cap mesh builds per frame so a burst of freshly generated chunks
     // amortizes over a few frames instead of stalling one.
     constexpr int MAX_MESH_BUILDS_PER_FRAME = 16;
     int meshBuilds = 0;
     bool allocFailureLogged = false;
-
-    _liveChunkKeys.clear();
 
     for (auto& chunk : loadedChunks) {
         if (!chunk || !chunk->generated)
@@ -710,7 +727,6 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
 
         // Chunk key for mesh cache lookup (packed, no allocation)
         uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
-        _liveChunkKeys.insert(key);
 
         // Frustum culling
         AABB chunkAABB = chunk->getAABB();
@@ -753,6 +769,11 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                             (std::string("Chunk mesh upload failed: ") + e.what()).c_str());
                         allocFailureLogged = true;
                     }
+                    // Transient failure (e.g. mega-buffer momentarily full):
+                    // leave the chunk dirty and cache NOTHING, so it retries
+                    // next frame instead of becoming a permanent hole
+                    chunk->needsMeshUpdate = true;
+                    continue;
                 }
             }
             _chunkMeshes[key] = state;
@@ -784,18 +805,6 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                              indexType:MTLIndexTypeUInt32
                            indexBuffer:meshState.alloc.indexBuffer
                      indexBufferOffset:meshState.alloc.indexOffset];
-    }
-
-    // Sweep mesh allocations of chunks the world has since unloaded
-    for (auto it = _chunkMeshes.begin(); it != _chunkMeshes.end();) {
-        if (_liveChunkKeys.count(it->first) == 0) {
-            if (it->second.uploaded) {
-                _megaBuffer->free(it->second.alloc);
-            }
-            it = _chunkMeshes.erase(it);
-        } else {
-            ++it;
-        }
     }
 }
 

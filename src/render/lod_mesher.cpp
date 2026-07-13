@@ -321,8 +321,7 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
             const float fw = static_cast<float>(width);
             const float fh = static_cast<float>(height);
             const QuadCorner corners[4] = {
-                {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col), 0.f,
-                 fh},
+                {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col), 0.f, fh},
                 {static_cast<float>(lx), static_cast<float>(row), static_cast<float>(col + width),
                  fw, fh},
                 {static_cast<float>(lx), static_cast<float>(row + height),
@@ -407,8 +406,7 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const BlockA
             const float fw = static_cast<float>(width);
             const float fh = static_cast<float>(height);
             const QuadCorner corners[4] = {
-                {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz), 0.f,
-                 fh},
+                {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz), 0.f, fh},
                 {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz),
                  fw, fh},
                 {static_cast<float>(col + width), static_cast<float>(row + height),

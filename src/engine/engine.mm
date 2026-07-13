@@ -561,6 +561,13 @@ static EngineState* _engineGetState(Engine* engine) {
 
     InputState& input = state->inputManager->state();
 
+    // Playtest hook: RYCRAFT_AUTOPILOT=walk holds W down so headless runs
+    // can verify the full input→tick→physics path end to end
+    static const char* autopilot = std::getenv("RYCRAFT_AUTOPILOT");
+    if (autopilot && std::string(autopilot) == "walk") {
+        input.keysDown[Key::W] = true;
+    }
+
     // 1. Advance world time (1 tick per game tick)
     state->worldTime++;
 
@@ -599,11 +606,13 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 3. Update camera from player state, then consume the look delta so a
-    // second tick in the same frame doesn't re-apply it
-    state->camera.setPosition(state->player.position);
+    // 3. Update camera from player state (at EYE height, not the feet), then
+    // consume the look delta so a second tick in the same frame doesn't
+    // re-apply it
+    Vec3 eyePosition = state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f};
+    state->camera.setPosition(eyePosition);
     InputBindings bindings;
-    state->camera.update(state->deltaTime, input, bindings, state->player.position);
+    state->camera.update(state->deltaTime, input, bindings, eyePosition);
     input.clearMouseDelta();
 
     // 5. Sync player yaw from camera so WASD uses the correct direction
@@ -630,8 +639,11 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 7. Update loaded chunks around player
-    state->world->updatePlayerPosition(Chunk::worldToChunk(state->player.position.x),
-                                       Chunk::worldToChunk(state->player.position.z));
+    // updatePlayerPosition takes WORLD coordinates (it converts to chunk
+    // coords itself) — passing pre-converted chunk coords made streaming
+    // track chunk/16, so the world unloaded under the player ~200 blocks out
+    state->world->updatePlayerPosition(static_cast<int>(std::floor(state->player.position.x)),
+                                       static_cast<int>(std::floor(state->player.position.z)));
 
     // 7b. Animals: initial population once the spawn area streamed in, then
     // per-tick AI steering + physics for every living entity
@@ -865,8 +877,11 @@ static EngineState* _engineGetState(Engine* engine) {
     // Log render diagnostics every 60 frames
     if (state->frameCount % 60 == 1) {
         auto chunks = state->world->getLoadedChunks();
+        char pos[64];
+        snprintf(pos, sizeof(pos), " player (%.1f, %.1f, %.1f)", state->player.position.x,
+                 state->player.position.y, state->player.position.z);
         RY_LOG_INFO(std::string("Render: ") + std::to_string(chunks.size()) +
-                    " loaded chunks, frame " + std::to_string(state->frameCount));
+                    " loaded chunks, frame " + std::to_string(state->frameCount) + pos);
     }
 
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk

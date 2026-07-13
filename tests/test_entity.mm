@@ -198,6 +198,69 @@ TEST_CASE("isInWater: returns true when entity AABB overlaps water block", "[phy
 // Player Tests (Phase 5)
 // ============================================================================
 
+TEST_CASE("Player walks across flat ground while standing on it", "[player][physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    // Flat stone platform high above the terrain
+    for (int x = 2; x <= 13; ++x) {
+        for (int z = 2; z <= 13; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+
+    Player player;
+    player.position = Vec3{4.f, 201.f, 4.f}; // feet on the platform
+    player.yaw = 0.f;                        // facing +Z
+
+    InputState input;
+    input.keysDown[Key::W] = true;
+
+    // Settle onto the ground, then walk forward for a second of ticks.
+    // The old sweep treated the floor underfoot as a wall, so horizontal
+    // movement zeroed the moment the player landed — the "stuck player" bug.
+    Vec3 start = player.position;
+    for (int i = 0; i < 20; ++i) {
+        player.tick(*world, input, false);
+    }
+
+    REQUIRE(player.onGround);
+    REQUIRE(player.position.z - start.z > 1.0f);                      // actually moved forward
+    REQUIRE(std::abs(player.position.x - start.x) < 0.05f);           // no sideways drift
+    REQUIRE(player.position.y == Catch::Approx(201.f).margin(0.01f)); // stayed on top
+}
+
+TEST_CASE("Player is stopped by a wall but slides along it", "[player][physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+
+    for (int x = 2; x <= 13; ++x) {
+        for (int z = 2; z <= 13; ++z) {
+            world->setBlock(x, 200, z, BlockType::STONE);
+        }
+    }
+    // Wall across +Z at z = 8
+    for (int x = 2; x <= 13; ++x) {
+        for (int y = 201; y <= 203; ++y) {
+            world->setBlock(x, y, 8, BlockType::STONE);
+        }
+    }
+
+    Player player;
+    player.position = Vec3{6.f, 201.f, 5.f};
+    player.yaw = 0.f; // facing +Z, straight at the wall
+
+    InputState input;
+    input.keysDown[Key::W] = true;
+    for (int i = 0; i < 30; ++i) {
+        player.tick(*world, input, false);
+    }
+
+    // Blocked at the wall face (player half-width 0.3 → z stops near 7.7)
+    REQUIRE(player.position.z < 7.75f);
+    REQUIRE(player.position.z > 7.0f);
+}
+
 TEST_CASE("Player movement follows the camera basis", "[player]") {
     auto world = std::make_shared<World>(42);
     world->getChunk(0, 0);
