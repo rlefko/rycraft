@@ -1003,12 +1003,15 @@ TEST_CASE("World updatePlayerPosition loads surrounding chunks", "[world]") {
     world->updatePlayerPosition(256, 256);
 
     // Generation streams in on the worker pool; wait for it to settle.
+    // The self-sustaining pump must drain the whole backlog without any
+    // further updatePlayerPosition calls (workers refill the window).
     for (int i = 0; i < 500 && world->getPendingChunkCount() > 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    // Generation reaches one chunk past the render radius: (2·(vd+1)+1)²
     auto chunks = world->getLoadedChunks();
-    REQUIRE(chunks.size() == 25);
+    REQUIRE(chunks.size() == 49);
 }
 
 TEST_CASE("World updatePlayerPosition streams the spawn area on first call", "[world]") {
@@ -1022,7 +1025,38 @@ TEST_CASE("World updatePlayerPosition streams the spawn area on first call", "[w
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    REQUIRE(world->getLoadedChunks().size() == 9);
+    REQUIRE(world->getLoadedChunks().size() == 25);
+}
+
+TEST_CASE("sortChunksByDistance orders farthest-first for pop_back consumption",
+          "[world][priority]") {
+    std::vector<ChunkPos> chunks = {{10, 0}, {0, 0}, {3, 4}, {-1, 0}, {0, -7}};
+    sortChunksByDistance(chunks, 0, 0);
+    // Farthest first…
+    REQUIRE(chunks.front() == ChunkPos{10, 0});
+    // …so pop_back() yields the player's own chunk before anything else
+    REQUIRE(chunks.back() == ChunkPos{0, 0});
+    for (size_t i = 1; i < chunks.size(); ++i) {
+        auto d2 = [](const ChunkPos& p) { return p.x * p.x + p.z * p.z; };
+        REQUIRE(d2(chunks[i - 1]) >= d2(chunks[i]));
+    }
+}
+
+TEST_CASE("World generation window stays bounded", "[world][priority]") {
+    auto world = std::make_shared<World>(42);
+    world->setViewDistance(5); // gen radius 6 → 169 chunks, well over the window
+    world->updatePlayerPosition(0, 0);
+
+    // Immediately after the first pump, at most MAX_INFLIGHT_GEN tasks may
+    // be in flight; the rest wait in the backlog (all still counted).
+    size_t pending = world->getPendingChunkCount();
+    size_t loaded = world->getLoadedChunks().size();
+    REQUIRE(pending + loaded >= 169 - MAX_INFLIGHT_GEN); // nothing lost
+
+    for (int i = 0; i < 2000 && world->getPendingChunkCount() > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(world->getLoadedChunks().size() == 169);
 }
 
 // ============================================================================

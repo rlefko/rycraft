@@ -15,6 +15,15 @@
 
 class SaveManager;
 
+// Sorts farthest-first so pop_back() consumes the nearest chunk next
+// (free function so priority ordering is unit-testable).
+void sortChunksByDistance(std::vector<ChunkPos>& chunks, int centerChunkX, int centerChunkZ);
+
+// Generation submission window: nearest chunks stream through a small
+// in-flight set so a boundary cross re-prioritizes everything still queued
+// instead of fighting hundreds of already-submitted stale-priority tasks.
+inline constexpr size_t MAX_INFLIGHT_GEN = 32;
+
 class World {
 public:
     explicit World(uint32_t seed, int viewDistance = 32);
@@ -68,8 +77,12 @@ public:
     // must not mutate blocks afterward until SaveManager::flush returns)
     void saveModifiedChunks();
 
-    // Start async generation of chunks around player
+    // Rebuild the generation backlog (nearest-first) and start pumping
     void generateAroundPlayer(int playerX, int playerZ);
+
+    // Submit backlog chunks up to the in-flight window. Called every tick
+    // and by finishing workers, so the pipeline sustains itself.
+    void pumpGeneration();
 
     // Get generation queue status
     size_t getPendingChunkCount() const;
@@ -104,9 +117,13 @@ private:
     int playerChunkZ_ = 0;
     bool hasPlayerChunk_ = false;
 
-    // Async generation state
+    // Async generation state. genBacklog_ holds not-yet-submitted chunks
+    // sorted farthest-first (pop_back = nearest); both containers are
+    // guarded by pendingMutex_ (lock order: pendingMutex_ → chunksMutex_).
     std::shared_ptr<ThreadPool> genPool_; // lazily initialized
     std::unordered_map<ChunkPos, std::future<void>> pendingGenerations_;
+    std::vector<ChunkPos> genBacklog_;
+    std::atomic<bool> shuttingDown_{false};
     mutable std::mutex pendingMutex_;
 
     // Generation-time EMA as float bits: workers CAS-update, HUD reads

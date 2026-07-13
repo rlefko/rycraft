@@ -13,13 +13,39 @@ World::World(uint32_t seed, int viewDistance)
     , viewDistance_(viewDistance)
     , generator_(seed) {}
 
+void sortChunksByDistance(std::vector<ChunkPos>& chunks, int centerChunkX, int centerChunkZ) {
+    auto distanceSq = [&](const ChunkPos& p) {
+        int64_t dx = p.x - centerChunkX;
+        int64_t dz = p.z - centerChunkZ;
+        return dx * dx + dz * dz;
+    };
+    std::sort(chunks.begin(), chunks.end(),
+              [&](const ChunkPos& a, const ChunkPos& b) { return distanceSq(a) > distanceSq(b); });
+}
+
 World::~World() {
     // Wait for in-flight generation tasks: they capture `this` and insert
-    // into chunks_, so destroying the World underneath them is a use-after-free.
-    std::lock_guard<std::mutex> lock(pendingMutex_);
-    for (auto& [key, future] : pendingGenerations_) {
-        if (future.valid()) {
-            future.wait();
+    // into chunks_, so destroying the World underneath them is a
+    // use-after-free. Waiting happens OUTSIDE pendingMutex_ (a finishing
+    // worker pumps the backlog under that mutex — holding it while waiting
+    // on the worker's future would deadlock), and loops because a worker
+    // may slip one more submission in before it observes shuttingDown_.
+    shuttingDown_.store(true);
+    for (;;) {
+        std::unordered_map<ChunkPos, std::future<void>> pending;
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            genBacklog_.clear();
+            if (pendingGenerations_.empty()) {
+                break;
+            }
+            pending = std::move(pendingGenerations_);
+            pendingGenerations_.clear();
+        }
+        for (auto& [key, future] : pending) {
+            if (future.valid()) {
+                future.wait();
+            }
         }
     }
 }
@@ -30,6 +56,10 @@ void World::generateChunk(std::shared_ptr<Chunk> chunk) {
 
 void World::generateChunkAsync(int chunkX, int chunkZ) {
     ChunkPos key{chunkX, chunkZ};
+
+    if (shuttingDown_.load()) {
+        return;
+    }
 
     // Guard: avoid generating chunk twice
     {
@@ -48,10 +78,15 @@ void World::generateChunkAsync(int chunkX, int chunkZ) {
     auto pool = genPool_;
     auto future = pool->submit([this, pool, chunkX, chunkZ, key]() {
         auto chunk = loadOrGenerateChunk(chunkX, chunkZ);
-        std::lock_guard<std::mutex> lock(chunksMutex_);
-        // try_emplace: if another path (e.g. a synchronous getChunk) won the
-        // race, keep its chunk — it may already hold player edits.
-        chunks_.try_emplace(key, std::move(chunk));
+        {
+            std::lock_guard<std::mutex> lock(chunksMutex_);
+            // try_emplace: if another path (e.g. a synchronous getChunk) won
+            // the race, keep its chunk — it may already hold player edits.
+            chunks_.try_emplace(key, std::move(chunk));
+        }
+        // A freed window slot pulls the next-nearest backlog chunk in, so
+        // streaming continues without waiting for the next tick
+        pumpGeneration();
     });
 
     std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -198,6 +233,8 @@ void World::updatePlayerPosition(int playerX, int playerZ) {
     int newPlayerChunkZ = Chunk::worldToChunk(playerZ);
 
     if (hasPlayerChunk_ && newPlayerChunkX == playerChunkX_ && newPlayerChunkZ == playerChunkZ_) {
+        // Same chunk: keep the submission window full anyway
+        pumpGeneration();
         return;
     }
 
@@ -226,7 +263,9 @@ void World::unloadDistantChunks() {
             int distX = std::abs(cx - playerChunkX_);
             int distZ = std::abs(cz - playerChunkZ_);
 
-            if (distX > viewDistance_ || distZ > viewDistance_) {
+            // Generation reaches vd+1; unloading at vd+2 adds hysteresis so
+            // strafing across a boundary doesn't churn the frontier ring
+            if (distX > viewDistance_ + 2 || distZ > viewDistance_ + 2) {
                 if (it->second->modifiedSinceSave && saveManager_) {
                     it->second->modifiedSinceSave = false;
                     toSave.push_back(it->second);
@@ -273,8 +312,42 @@ void World::generateAroundPlayer(int playerX, int playerZ) {
     int playerChunkX = Chunk::worldToChunk(playerX);
     int playerChunkZ = Chunk::worldToChunk(playerZ);
 
+    // Rebuild the backlog from scratch: chunks that left the radius are
+    // implicitly cancelled, and everything still missing re-sorts against
+    // the new center. Generation reaches one chunk beyond the render
+    // radius so visible chunks always have generated neighbors (the
+    // neighbor-aware mesher needs them).
+    {
+        std::lock_guard<std::mutex> lock1(pendingMutex_);
+        std::lock_guard<std::mutex> lock2(chunksMutex_);
+        genBacklog_.clear();
+        int genRadius = viewDistance_ + 1;
+        for (int dz = -genRadius; dz <= genRadius; ++dz) {
+            for (int dx = -genRadius; dx <= genRadius; ++dx) {
+                ChunkPos key{playerChunkX + dx, playerChunkZ + dz};
+                if (chunks_.find(key) != chunks_.end()) {
+                    continue;
+                }
+                if (pendingGenerations_.find(key) != pendingGenerations_.end()) {
+                    continue;
+                }
+                genBacklog_.push_back(key);
+            }
+        }
+        sortChunksByDistance(genBacklog_, playerChunkX, playerChunkZ);
+    }
+
+    pumpGeneration();
+}
+
+void World::pumpGeneration() {
+    if (!genPool_ || shuttingDown_.load()) {
+        return;
+    }
+
     // Clean up completed futures. valid() stays true until get() is called,
     // so poll readiness instead — otherwise this map only ever grows.
+    std::vector<ChunkPos> toSubmit;
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         auto it = pendingGenerations_.begin();
@@ -286,32 +359,17 @@ void World::generateAroundPlayer(int playerX, int playerZ) {
                 ++it;
             }
         }
-    }
 
-    // Collect chunks needing generation
-    std::vector<std::pair<int, int>> chunksToGenerate;
-    {
-        std::lock_guard<std::mutex> lock1(pendingMutex_);
-        std::lock_guard<std::mutex> lock2(chunksMutex_);
-        for (int dz = -viewDistance_; dz <= viewDistance_; ++dz) {
-            for (int dx = -viewDistance_; dx <= viewDistance_; ++dx) {
-                int chunkX = playerChunkX + dx;
-                int chunkZ = playerChunkZ + dz;
-                ChunkPos key{chunkX, chunkZ};
-                if (chunks_.find(key) != chunks_.end()) {
-                    continue;
-                }
-                if (pendingGenerations_.find(key) != pendingGenerations_.end()) {
-                    continue;
-                }
-                chunksToGenerate.emplace_back(chunkX, chunkZ);
-            }
+        while (pendingGenerations_.size() + toSubmit.size() < MAX_INFLIGHT_GEN &&
+               !genBacklog_.empty()) {
+            toSubmit.push_back(genBacklog_.back());
+            genBacklog_.pop_back();
         }
     }
 
-    // Submit async tasks
-    for (const auto& [chunkX, chunkZ] : chunksToGenerate) {
-        generateChunkAsync(chunkX, chunkZ);
+    // Submit outside the lock (generateChunkAsync re-takes it)
+    for (const ChunkPos& pos : toSubmit) {
+        generateChunkAsync(pos.x, pos.z);
     }
 }
 
@@ -334,7 +392,9 @@ float World::averageGenMs() const {
 
 size_t World::getPendingChunkCount() const {
     std::lock_guard<std::mutex> lock(pendingMutex_);
-    size_t pending = 0;
+    // Backlogged + genuinely in-flight: consumers (the HUD, the animal
+    // spawn gate) care about "is streaming still working", not window size
+    size_t pending = genBacklog_.size();
     for (const auto& [key, future] : pendingGenerations_) {
         // A future stays valid() until get(); only count genuinely unfinished work
         if (future.valid() &&
