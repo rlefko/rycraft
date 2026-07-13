@@ -1,10 +1,39 @@
-[whitespace]
-tab_width  = 2
-indent_width = 2
-use_tab    = Always
-
-[sort_includes]
-enabled = true
-
-[sort_using_declarations]
-enabled = true
+# rycraft formatting rules. Matches the prevailing hand-written style so the
+# initial repo-wide reformat is a small diff, not a rewrite.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+PointerAlignment: Left
+DerivePointerAlignment: false
+BreakConstructorInitializers: BeforeComma
+PackConstructorInitializers: CurrentLine
+ConstructorInitializerIndentWidth: 4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakTemplateDeclarations: Yes
+SpacesBeforeTrailingComments: 1
+IndentCaseLabels: true
+AccessModifierOffset: -4
+NamespaceIndentation: None
+FixNamespaceComments: true
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+KeepEmptyLinesAtTheStartOfBlocks: false
+---
+Language: ObjC
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+PointerAlignment: Left
+DerivePointerAlignment: false
+ObjCBlockIndentWidth: 4
+AllowShortFunctionsOnASingleLine: Inline
+SpacesBeforeTrailingComments: 1
+IndentCaseLabels: true
+AccessModifierOffset: -4
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+KeepEmptyLinesAtTheStartOfBlocks: false
