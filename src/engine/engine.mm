@@ -166,6 +166,10 @@ static EngineState* _engineGetState(Engine* engine) {
             spawnPos = meta->spawnPos;
             _state->worldTime = meta->worldTime;
         }
+        // Playtest hook: pin the time of day (0..23999; 6000 = noon).
+        if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
+            _state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
+        }
 
         // Persisted settings load before the World exists (view distance
         // feeds its constructor); env overrides win over the file for
@@ -694,8 +698,17 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 1. Advance world time (1 tick per game tick)
-    state->worldTime++;
+    // 1. Advance world time (1 tick per game tick). Playtest hooks:
+    // RYCRAFT_TIME=<0..23999> pins the time of day at launch and
+    // RYCRAFT_TIME_FREEZE=1 stops it advancing, so captures at noon /
+    // sunset / midnight don't depend on hand-editing the save.
+    static const bool freezeTime = [] {
+        const char* f = std::getenv("RYCRAFT_TIME_FREEZE");
+        return f && *f && std::strcmp(f, "0") != 0;
+    }();
+    if (!freezeTime) {
+        state->worldTime++;
+    }
 
     // 1b. Unstick a stale spawn: a resumed save can place the player inside
     // terrain when world generation has changed shape since the save was

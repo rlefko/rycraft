@@ -58,6 +58,61 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
     if (!_linearSampler) {
         RY_LOG_FATAL("Failed to create post-stack sampler");
     }
+
+    // ---- Auto-exposure compute pipeline + persistent state ----
+    id<MTLFunction> exposureFunc = [shaderLibrary newFunctionWithName:@"exposureReduce"];
+    if (!exposureFunc) {
+        RY_LOG_FATAL("Failed to load exposureReduce compute function");
+    }
+    _exposurePipelineState = [_device newComputePipelineStateWithFunction:exposureFunc
+                                                                    error:&error];
+    if (!_exposurePipelineState) {
+        RY_LOG_FATAL("Failed to create exposure compute pipeline state");
+    }
+    // Seed the persistent state so the very first frames aren't black while
+    // the EMA converges (mid-grey log-luminance, exposure 1).
+    ExposureState seed{};
+    seed.smoothedLogLum = 0.0f;
+    seed.exposure = 1.0f;
+    _exposureBuffer = [_device newBufferWithBytes:&seed
+                                           length:sizeof(ExposureState)
+                                          options:MTLResourceStorageModeShared];
+    if (!_exposureBuffer) {
+        RY_LOG_FATAL("Failed to allocate exposure state buffer");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// encodeExposure — one threadgroup reduces average scene luminance and eases
+// the persistent exposure toward it.
+// ---------------------------------------------------------------------------
+void PostStack::encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR) {
+    if (!commandBuffer || !sceneHDR)
+        return;
+
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (!encoder)
+        return;
+
+    ExposureParams params{};
+    // keyValue ≈ a lit surface's average luminance, so daylight maps near
+    // exposure 1.0 (a middle-grey 0.18 target over-darkened bright scenes).
+    params.keyValue = 0.5f;
+    params.adaptationRate = 0.04f; // ~0.4 s to adapt at 60 fps
+    params.minLogLum = -8.0f;
+    params.maxLogLum = 4.0f;
+    params.sampleGrid = simd_make_uint2(16, 16); // 256 samples = 1 threadgroup
+    // Floor 0.7 keeps bright outdoors from dimming; ceiling 4 lifts caves.
+    params.minExposure = 0.7f;
+    params.maxExposure = 4.0f;
+
+    [encoder setComputePipelineState:_exposurePipelineState];
+    [encoder setTexture:sceneHDR atIndex:0];
+    [encoder setBuffer:_exposureBuffer offset:0 atIndex:0];
+    [encoder setBytes:&params length:sizeof(params) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +138,9 @@ void PostStack::encodeComposite(id<MTLCommandBuffer> commandBuffer, id<MTLTextur
     PostUniforms uniforms{};
     uniforms.resolution = simd_make_float2(static_cast<float>(outputTexture.width),
                                            static_cast<float>(outputTexture.height));
-    uniforms.exposure = 1.0f; // static until the auto-exposure commit
+    // Exposure is applied in-shader from the persistent state buffer; the
+    // uniform field stays 1 so the two never double-apply.
+    uniforms.exposure = 1.0f;
     uniforms.bloomIntensity = bloomOn ? gfx.bloomIntensity() : 0.0f;
     // vibrance 0-10 → 0..2 grade multiplier; 5 = 1.0 (stock look)
     uniforms.vibrance = static_cast<float>(gfx.vibrance) * 0.2f;
@@ -95,6 +152,7 @@ void PostStack::encodeComposite(id<MTLCommandBuffer> commandBuffer, id<MTLTextur
     [encoder setFragmentTexture:bloomOn ? bloomTexture : _blackFallback atIndex:1];
     [encoder setFragmentSamplerState:_linearSampler atIndex:0];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+    [encoder setFragmentBuffer:_exposureBuffer offset:0 atIndex:1];
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];

@@ -108,6 +108,32 @@ struct BloomUniforms {
     float blurRadius;       // Kawase blur radius in texels
 };
 
+// Persistent auto-exposure state (device buffer, survives across frames).
+// The reduction kernel blends each frame's average scene luminance into
+// smoothedLogLum and derives the exposure the composite multiplies by; the
+// CPU seeds it once so the first frames aren't black. Bound at buffer(0) in
+// exposure.metal and read at buffer(1) by post.metal.
+struct ExposureState {
+    float smoothedLogLum; // EMA of log2(scene luminance)
+    float exposure;       // derived multiplier the composite applies
+};
+
+// Bound at buffer(1) in exposure.metal via setBytes.
+struct ExposureParams {
+    // keyValue sets where typical daylight lands: exposure = keyValue/avgLum,
+    // so keyValue ≈ a lit surface's average luminance keeps day near 1.0
+    // (mapping the average to middle grey instead over-darkens bright scenes).
+    float keyValue;
+    float adaptationRate;  // 0..1 EMA weight for this frame (eye adaptation speed)
+    float minLogLum;       // clamp floor for scene log-luminance
+    float maxLogLum;       // clamp ceiling
+    simd_uint2 sampleGrid; // reduction sample count across the frame (e.g. 16×16)
+    // Exposure clamp: minExposure well above 0 keeps bright outdoor scenes
+    // from being crushed dim; maxExposure lifts caves/night without blowing up.
+    float minExposure;
+    float maxExposure;
+};
+
 // Bound at buffer(0) in the final composite (post.metal): the one pass that
 // converts the linear HDR scene to the display — exposure, bloom add,
 // Uchimura tonemap, vibrance grade, optional CAS sharpen, dither. It always
@@ -163,4 +189,13 @@ static_assert(offsetof(BloomUniforms, threshold) == 16);
 static_assert(sizeof(PostUniforms) == 32);
 static_assert(offsetof(PostUniforms, exposure) == 8);
 static_assert(offsetof(PostUniforms, frameIndex) == 24);
+
+static_assert(sizeof(ExposureState) == 8);
+static_assert(offsetof(ExposureState, exposure) == 4);
+
+static_assert(sizeof(ExposureParams) == 32);
+static_assert(offsetof(ExposureParams, adaptationRate) == 4);
+static_assert(offsetof(ExposureParams, sampleGrid) == 16);
+static_assert(offsetof(ExposureParams, minExposure) == 24);
+static_assert(offsetof(ExposureParams, maxExposure) == 28);
 #endif

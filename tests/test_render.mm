@@ -1025,3 +1025,19 @@ TEST_CASE("Shader types: PostUniforms layout matches MSL", "[render][shader-type
     REQUIRE(offsetof(PostUniforms, sharpening) == 20);
     REQUIRE(offsetof(PostUniforms, frameIndex) == 24);
 }
+
+TEST_CASE("Shader types: ExposureState + ExposureParams layout match MSL",
+          "[render][shader-types]") {
+    REQUIRE(sizeof(ExposureState) == 8);
+    REQUIRE(offsetof(ExposureState, smoothedLogLum) == 0);
+    REQUIRE(offsetof(ExposureState, exposure) == 4);
+
+    REQUIRE(sizeof(ExposureParams) == 32);
+    REQUIRE(offsetof(ExposureParams, keyValue) == 0);
+    REQUIRE(offsetof(ExposureParams, adaptationRate) == 4);
+    REQUIRE(offsetof(ExposureParams, minLogLum) == 8);
+    REQUIRE(offsetof(ExposureParams, maxLogLum) == 12);
+    REQUIRE(offsetof(ExposureParams, sampleGrid) == 16);
+    REQUIRE(offsetof(ExposureParams, minExposure) == 24);
+    REQUIRE(offsetof(ExposureParams, maxExposure) == 28);
+}

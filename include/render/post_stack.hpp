@@ -22,6 +22,11 @@ class PostStack {
 public:
     PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary);
 
+    // Measure scene luminance and ease the persistent exposure toward it
+    // (eye adaptation). Run after the scene + water are composited, before
+    // the composite reads the exposure.
+    void encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR);
+
     // Encode the composite from sceneHDR (+ bloom) into outputTexture.
     // Pass a nil bloomTexture to composite with no bloom (the black
     // fallback is substituted). `frameIndex` drives the deterministic dither.
@@ -32,6 +37,8 @@ public:
 private:
     id<MTLDevice> _device;
     id<MTLRenderPipelineState> _compositePipelineState;
+    id<MTLComputePipelineState> _exposurePipelineState;
+    id<MTLBuffer> _exposureBuffer; // persistent ExposureState, GPU-only
     id<MTLTexture> _blackFallback; // 4×4, bound when bloom is off
     id<MTLSamplerState> _linearSampler;
 };

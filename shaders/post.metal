@@ -74,10 +74,10 @@ static float3 applyVibrance(float3 c, float vibrance) {
 // Exposure + bloom + tonemap + grade for one sample position — CAS needs
 // the display-referred value of each tap, so the whole chain is reused.
 static float3 displayColor(texture2d<float> scene, texture2d<float> bloom, sampler s, float2 uv,
-                           constant PostUniforms& post) {
+                           constant PostUniforms& post, float exposure) {
     float3 hdr = scene.sample(s, uv).rgb;
     hdr += bloom.sample(s, uv).rgb * post.bloomIntensity;
-    hdr *= post.exposure;
+    hdr *= exposure * post.exposure;
     float3 mapped = uchimura3(max(hdr, 0.0f));
     return applyVibrance(mapped, post.vibrance - 1.0f);
 }
@@ -92,24 +92,26 @@ static float interleavedGradientNoise(float2 px, uint frame) {
 fragment float4 postCompositeFragment(PostVertexOut in [[stage_in]],
                                       texture2d<float> sceneTexture [[texture(0)]],
                                       texture2d<float> bloomTexture [[texture(1)]],
-                                      constant PostUniforms& post [[buffer(0)]]) {
+                                      constant PostUniforms& post [[buffer(0)]],
+                                      constant ExposureState& exposureState [[buffer(1)]]) {
     constexpr sampler linearSampler(mag_filter::linear, min_filter::linear,
                                     address::clamp_to_edge);
+    float exposure = exposureState.exposure;
 
-    float3 color = displayColor(sceneTexture, bloomTexture, linearSampler, in.vUV, post);
+    float3 color = displayColor(sceneTexture, bloomTexture, linearSampler, in.vUV, post, exposure);
 
     // CAS-style adaptive sharpen: 4 cross taps, each run through the same
     // display transform (sharpening must operate on what the eye sees).
     if (post.sharpening > 0.0f) {
         float2 texel = 1.0f / post.resolution;
         float3 n = displayColor(sceneTexture, bloomTexture, linearSampler,
-                                in.vUV + float2(0.0f, -texel.y), post);
+                                in.vUV + float2(0.0f, -texel.y), post, exposure);
         float3 s = displayColor(sceneTexture, bloomTexture, linearSampler,
-                                in.vUV + float2(0.0f, texel.y), post);
+                                in.vUV + float2(0.0f, texel.y), post, exposure);
         float3 w = displayColor(sceneTexture, bloomTexture, linearSampler,
-                                in.vUV + float2(-texel.x, 0.0f), post);
+                                in.vUV + float2(-texel.x, 0.0f), post, exposure);
         float3 e = displayColor(sceneTexture, bloomTexture, linearSampler,
-                                in.vUV + float2(texel.x, 0.0f), post);
+                                in.vUV + float2(texel.x, 0.0f), post, exposure);
         float3 minC = min(color, min(min(n, s), min(w, e)));
         float3 maxC = max(color, max(max(n, s), max(w, e)));
         // Weight from local contrast: flat areas sharpen, edges saturate less

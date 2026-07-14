@@ -529,6 +529,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                 skyUniforms, fogColor, worldTime);
     _fogDensity = savedFogDensity;
 
+    // ---- Auto-exposure (measure the finished HDR scene, ease adaptation) ----
+    _postStack->encodeExposure(commandBuffer, _colorResolve);
+
     // ---- Bloom (HDR extract + blur; result feeds the composite) ----
     // At zero intensity renderBloom early-outs and the composite binds a
     // black fallback, so no bloom texture is produced.
