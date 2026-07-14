@@ -350,6 +350,80 @@ static float causticPattern(float2 p, float t) {
     return pow(saturate(1.0f - abs(c)), 6.0f);
 }
 
+// World position of a screen UV + its stored depth, via the camera inverse.
+static float3 reconstructWorld(float2 uv, float depth, constant WaterUniforms& water) {
+    float4 clip = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, depth, 1.0f);
+    float4 world = water.invViewProjection * clip;
+    return world.xyz / world.w;
+}
+
+// ---------------------------------------------------------------------------
+// Screen-space reflection for water. Marches the reflected ray through world
+// space, projecting each step to screen and comparing its device depth against
+// the resolved opaque depth, so the far shore, trees, and terrain mirror in
+// the surface. The forward projection already yields both the screen UV and
+// the ray's device z, so the crossing test needs no per-step world
+// reconstruction — only the final thickness reject reconstructs a world point.
+// Returns rgb + a confidence in .a (0 when the ray misses, leaves the screen,
+// or only finds sky); the caller falls back to the procedural-sky reflection.
+// Depth is point-sampled: linear across a depth edge reads a value between two
+// surfaces, so the crossing test would flicker.
+// ---------------------------------------------------------------------------
+static float4 traceWaterSSR(float3 origin, float3 dir, depth2d<float> sceneDepth,
+                            texture2d<float> sceneColor, constant WaterUniforms& water) {
+    constexpr sampler depthPoint(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
+    constexpr sampler colorLinear(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+
+    const int STEPS = 24;
+    float stride = 1.5f;
+    float3 pos = origin;
+    for (int i = 0; i < STEPS; ++i) {
+        float3 prev = pos;
+        pos += dir * stride;
+        stride *= 1.13f; // grow the step so distant reflections stay cheap
+
+        float4 clip = water.viewProjection * float4(pos, 1.0f);
+        if (clip.w <= 0.0f) {
+            break; // stepped behind the camera plane
+        }
+        float2 uv = (clip.xy / clip.w) * float2(0.5f, -0.5f) + 0.5f;
+        if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+            break; // left the screen — no data to reflect
+        }
+        float sceneZ = sceneDepth.sample(depthPoint, uv);
+        if (sceneZ >= 1.0f) {
+            continue; // sky pixel: keep marching, maybe the ray dips into terrain
+        }
+        if (clip.z / clip.w <= sceneZ) {
+            continue; // ray still in front of the visible surface
+        }
+
+        // Crossed behind the depth buffer — bisect prev..pos for the contact.
+        float3 lo = prev, hi = pos;
+        for (int j = 0; j < 6; ++j) {
+            float3 mid = (lo + hi) * 0.5f;
+            float4 mclip = water.viewProjection * float4(mid, 1.0f);
+            float2 muv = (mclip.xy / mclip.w) * float2(0.5f, -0.5f) + 0.5f;
+            if (mclip.z / mclip.w > sceneDepth.sample(depthPoint, muv)) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        float4 hclip = water.viewProjection * float4(hi, 1.0f);
+        float2 hitUV = (hclip.xy / hclip.w) * float2(0.5f, -0.5f) + 0.5f;
+        // Reject a hit hiding far behind a thick occluder (a false crossing).
+        float3 hitWorld = reconstructWorld(hitUV, sceneDepth.sample(depthPoint, hitUV), water);
+        if (distance(water.cameraPosition, hi) - distance(water.cameraPosition, hitWorld) > 1.5f) {
+            break;
+        }
+        // Fade as the hit nears a screen edge (data runs out there).
+        float2 e = smoothstep(0.0f, 0.12f, hitUV) * smoothstep(0.0f, 0.12f, 1.0f - hitUV);
+        return float4(sceneColor.sample(colorLinear, hitUV).rgb, e.x * e.y);
+    }
+    return float4(0.0f);
+}
+
 fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
                                   texture2d<float> sceneColor [[texture(0)]],
                                   depth2d<float> sceneDepth [[texture(1)]],
@@ -368,9 +442,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     bool fromBelow = water.cameraUnderwater > 0.5f;
 
     // Reconstruct the opaque world position behind this fragment
-    float4 clip = float4(screenUV.x * 2.0f - 1.0f, 1.0f - screenUV.y * 2.0f, opaqueDepth, 1.0f);
-    float4 behindH = water.invViewProjection * clip;
-    float3 behind = behindH.xyz / behindH.w;
+    float3 behind = reconstructWorld(screenUV, opaqueDepth, water);
     float waterDepth = max(distance(behind, in.vWorldPosition), 0.0f);
 
     // ---- Refraction: wave-distorted resample of the scene, pinned at the
@@ -387,9 +459,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     float3 refracted = sceneColor.sample(screenSampler, refractUV).rgb;
 
     // World position of the refracted floor sample (caustics + absorption)
-    float4 rclip = float4(refractUV.x * 2.0f - 1.0f, 1.0f - refractUV.y * 2.0f, refractDepth, 1.0f);
-    float4 rworldH = water.invViewProjection * rclip;
-    float3 rworld = rworldH.xyz / rworldH.w;
+    float3 rworld = reconstructWorld(refractUV, refractDepth, water);
     float depthBelow = max(in.vWorldPosition.y - rworld.y, 0.0f);
 
     // ---- Caustics: bright ripple filaments on the shallow floor
@@ -404,11 +474,20 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
 
     // ---- Fresnel sky reflection + sun sparkle (skylight gates both, so
     // flooded caves reflect darkness rather than open sky)
-    float3 R = reflect(-V, N);
-    R.y = abs(R.y);
-    float horizonBlend = pow(1.0f - saturate(R.y), 2.0f);
+    float3 R = reflect(-V, N);                // true reflection, for SSR marching
+    float3 Rsky = float3(R.x, abs(R.y), R.z); // up-facing form for sky + sparkle
+    float horizonBlend = pow(1.0f - saturate(Rsky.y), 2.0f);
     float3 skyReflection = mix(water.zenithColor, water.horizonColor, horizonBlend);
-    float sunAlign = saturate(dot(R, water.sunDirection));
+
+    // Screen-space reflection layered over the procedural sky: where the
+    // reflected ray finds on-screen geometry (far shore, trees), mirror it;
+    // elsewhere the sky term shows through. Skipped when looking up from below.
+    if (water.ssrStrength > 0.0f && !fromBelow) {
+        float4 ssr = traceWaterSSR(in.vWorldPosition, R, sceneDepth, sceneColor, water);
+        skyReflection = mix(skyReflection, ssr.rgb, ssr.a * water.ssrStrength);
+    }
+
+    float sunAlign = saturate(dot(Rsky, water.sunDirection));
     float sparkle = pow(sunAlign, 240.0f) * 2.0f + pow(sunAlign, 32.0f) * 0.25f;
     float fresnel = mix(0.04f, 1.0f, pow(1.0f - saturate(dot(V, N)), 5.0f));
     if (fromBelow) {
@@ -458,9 +537,7 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     // position and project the same caustic field onto up-facing geometry.
     constexpr sampler screenSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float depth = sceneDepth.sample(screenSampler, in.uv);
-    float4 clip = float4(in.uv.x * 2.0f - 1.0f, 1.0f - in.uv.y * 2.0f, depth, 1.0f);
-    float4 worldH = water.invViewProjection * clip;
-    float3 world = worldH.xyz / worldH.w;
+    float3 world = reconstructWorld(in.uv, depth, water);
     // Screen-space derivatives give the surface normal: walls get none
     float3 surfaceNormal = normalize(cross(dfdx(world), dfdy(world)));
     float upFacing = saturate(abs(surfaceNormal.y));

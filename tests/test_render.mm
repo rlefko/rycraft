@@ -1103,12 +1103,14 @@ TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types
 }
 
 TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(WaterUniforms) == 192);
-    REQUIRE(offsetof(WaterUniforms, zenithColor) == 64);
-    REQUIRE(offsetof(WaterUniforms, resolution) == 160);
-    REQUIRE(offsetof(WaterUniforms, fogDensity) == 168);
-    REQUIRE(offsetof(WaterUniforms, time) == 172);
-    REQUIRE(offsetof(WaterUniforms, cameraUnderwater) == 176);
+    REQUIRE(sizeof(WaterUniforms) == 256);
+    REQUIRE(offsetof(WaterUniforms, viewProjection) == 64);
+    REQUIRE(offsetof(WaterUniforms, zenithColor) == 128);
+    REQUIRE(offsetof(WaterUniforms, resolution) == 224);
+    REQUIRE(offsetof(WaterUniforms, fogDensity) == 232);
+    REQUIRE(offsetof(WaterUniforms, time) == 236);
+    REQUIRE(offsetof(WaterUniforms, cameraUnderwater) == 240);
+    REQUIRE(offsetof(WaterUniforms, ssrStrength) == 244);
 }
 
 TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-types]") {

@@ -1268,6 +1268,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     std::memcpy(&view, viewMatrix.data.data(), sizeof(view));
     std::memcpy(&proj, projectionMatrix.data.data(), sizeof(proj));
     wu.invViewProjection = simd_inverse(simd_mul(proj, view));
+    wu.viewProjection = simd_mul(proj, view);
     wu.zenithColor = skyUniforms.zenithColor;
     wu.horizonColor = skyUniforms.horizonColor;
     wu.sunDirection = skyUniforms.sunDirection;
@@ -1280,6 +1281,9 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     // 20 Hz world time → seconds (the same stepping the clouds animate with)
     wu.time = static_cast<float>(worldTime % 24000) * 0.05f;
     wu.cameraUnderwater = cameraUnderwater ? 1.f : 0.f;
+    // Screen-space reflections layer onto the fresnel sky term; 0 keeps the
+    // pre-SSR look (also the RYCRAFT_SSR=0 / setting-off path).
+    wu.ssrStrength = _gfx.waterReflections ? 1.0f : 0.0f;
     FrameRing::Alloc waterAlloc = _frameRing.push(&wu, sizeof(WaterUniforms));
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];

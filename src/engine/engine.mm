@@ -756,6 +756,36 @@ static EngineState* _engineGetState(Engine* engine) {
                 }
             }
 
+            // Playtest hook: RYCRAFT_SPAWN_WATER=1 sinks a broad pool ahead of
+            // spawn (between the camera and the tree line) so headless captures
+            // can show the water reflections/refraction at a grazing angle.
+            static const bool spawnWater = [] {
+                const char* v = std::getenv("RYCRAFT_SPAWN_WATER");
+                return v && *v && std::strcmp(v, "0") != 0;
+            }();
+            if (spawnWater) {
+                auto isTrunk = [](BlockType b) {
+                    return b == BlockType::LOG || b == BlockType::BIRCH_LOG ||
+                           b == BlockType::SPRUCE_LOG;
+                };
+                for (int dz = 3; dz <= 22; ++dz) {
+                    for (int dx = -10; dx <= 10; ++dx) {
+                        int wx = px + dx, wz = pz + dz;
+                        // Scan down to the terrain surface, past any tree trunk,
+                        // so the pool sits at ground level (no floating water).
+                        for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
+                            BlockType b = state->world->getBlock(wx, y, wz);
+                            if (isSolid(b) && !isTrunk(b)) {
+                                state->world->setBlock(wx, y, wz, BlockType::WATER);
+                                state->world->setBlock(wx, y - 1, wz, BlockType::WATER);
+                                state->world->setBlock(wx, y + 1, wz, BlockType::AIR);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             state->spawnValidated = true;
         }
     }

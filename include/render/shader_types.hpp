@@ -54,6 +54,7 @@ struct ShadowUniforms {
 // the sky palette that the fresnel reflection samples procedurally.
 struct WaterUniforms {
     simd_float4x4 invViewProjection; // clip → world, for depth reconstruction
+    simd_float4x4 viewProjection;    // world → clip, for SSR ray projection
     simd_float3 zenithColor;
     simd_float3 horizonColor;
     simd_float3 sunDirection;
@@ -64,6 +65,7 @@ struct WaterUniforms {
     float fogDensity;
     float time;             // seconds; drives waves + caustics
     float cameraUnderwater; // 1.0 when the camera is inside water
+    float ssrStrength;      // 0 = sky-only reflection (the pre-SSR look)
 };
 
 // Atmospheric sky, bound at buffer(1) in sky.metal. The fragment shader
@@ -222,12 +224,14 @@ static_assert(offsetof(Uniforms, fogColor) == 240);
 static_assert(offsetof(Uniforms, fogDensity) == 256);
 static_assert(offsetof(Uniforms, cameraPosition) == 272);
 
-static_assert(sizeof(WaterUniforms) == 192);
-static_assert(offsetof(WaterUniforms, zenithColor) == 64);
-static_assert(offsetof(WaterUniforms, resolution) == 160);
-static_assert(offsetof(WaterUniforms, fogDensity) == 168);
-static_assert(offsetof(WaterUniforms, time) == 172);
-static_assert(offsetof(WaterUniforms, cameraUnderwater) == 176);
+static_assert(sizeof(WaterUniforms) == 256);
+static_assert(offsetof(WaterUniforms, viewProjection) == 64);
+static_assert(offsetof(WaterUniforms, zenithColor) == 128);
+static_assert(offsetof(WaterUniforms, resolution) == 224);
+static_assert(offsetof(WaterUniforms, fogDensity) == 232);
+static_assert(offsetof(WaterUniforms, time) == 236);
+static_assert(offsetof(WaterUniforms, cameraUnderwater) == 240);
+static_assert(offsetof(WaterUniforms, ssrStrength) == 244);
 
 static_assert(sizeof(ShadowPassUniforms) == 64);
 
