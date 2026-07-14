@@ -25,13 +25,13 @@
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
 #include <render/vertex.hpp>
-#include <world/biome.hpp>
 #include <world/chunk.hpp>
+#include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
+#include <world/climate.hpp>
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
-#include <world/terrain.hpp>
 #include <world/world.hpp>
 
 #include <chrono>
@@ -169,13 +169,14 @@ TEST_CASE("isSolid: solid for STONE and GLASS, passable for AIR/WATER", "[physic
 TEST_CASE("Block properties: the three predicates agree on every type", "[physics][world]") {
     for (int t = 0; t < static_cast<int>(BlockType::COUNT); ++t) {
         BlockType bt = static_cast<BlockType>(t);
-        // Anything that occludes neighbors must also collide — a block that
-        // renders as a full cube but lets entities through reads as a bug.
+        // Anything that occludes neighbors must also render as a full cube —
+        // an occluder without geometry punches holes into its neighbors.
+        // (Lava is the one swim-through cube: opaque but not solid.)
         if (isOpaque(bt)) {
-            REQUIRE(isSolid(bt));
+            REQUIRE(rendersAsCube(bt));
         }
-        // Air and water are the only non-solid types today
-        bool expectedSolid = bt != BlockType::AIR && bt != BlockType::WATER;
+        // Non-solid = air, liquids, and walk-through flora — nothing else
+        bool expectedSolid = bt != BlockType::AIR && !isLiquid(bt) && !isFlora(bt);
         REQUIRE(isSolid(bt) == expectedSolid);
     }
 }

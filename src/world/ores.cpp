@@ -1,118 +1,77 @@
 #include "world/ores.hpp"
 
-#include <cmath>
-#include <cstdlib>
+#include "world/gen_seeds.hpp"
 
-// Simple deterministic PRNG for ore placement
-static uint32_t oreLcg(uint32_t& state) {
-    state = state * 1664525u + 1013904223u;
-    return (state >> 16) & 0x7fff;
-}
+#include <algorithm>
 
-OreGenerator::OreGenerator(uint32_t seed) : oreNoise_(seed) {}
+namespace {
 
-double OreGenerator::getOreDensity(double y, const OreConfig::OreDistribution& dist) const {
-    // Trapezoid height distribution:
-    // - 0 below minHeight
-    // - linearly increases to 1.0 at falloffHeight
-    // - stays at 1.0 until maxHeight * 0.75 (mid-peak)
-    // - linearly decreases to 0 at maxHeight
-    if (y < dist.minHeight || y > dist.maxHeight) {
-        return 0.0;
-    }
+struct OreKind {
+    BlockType block;
+    int minY;
+    int maxY;
+    int attemptsPerChunk;
+    int blobMin;
+    int blobMax; // walk steps, capped ≤ 12 (see header)
+};
 
-    // Rising edge: minHeight -> falloffHeight
-    if (y < dist.falloffHeight) {
-        return (y - dist.minHeight) / (dist.falloffHeight - dist.minHeight);
-    }
+// Depth bands: common coal up high, precious metals compressed toward
+// bedrock so deep caves are worth exploring.
+constexpr OreKind ORE_KINDS[] = {
+    {BlockType::COAL_ORE, 48, 131, 14, 6, 12},
+    {BlockType::IRON_ORE, 8, 71, 10, 4, 8},
+    {BlockType::GOLD_ORE, 4, 35, 5, 3, 6},
+    {BlockType::DIAMOND_ORE, 2, 17, 4, 2, 5},
+};
 
-    // Falling edge: maxHeight * 0.75 -> maxHeight
-    double fallStart = dist.maxHeight * 0.75;
-    if (y > fallStart) {
-        return (dist.maxHeight - y) / (dist.maxHeight - fallStart);
-    }
+} // namespace
 
-    // Peak plateau
-    return 1.0;
-}
+OrePlacer::OrePlacer(uint32_t worldSeed) : seed_(worldSeed) {}
 
-void OreGenerator::generateOreVein(Chunk& chunk, int x, int y, int z, int veinSize,
-                                   BlockType ore) const {
-    // Generate a sphere of ore replacing only STONE blocks
-    int radiusSq = veinSize * veinSize;
+void OrePlacer::place(Chunk& chunk) const {
+    const int baseX = chunk.chunkX * CHUNK_WIDTH;
+    const int baseZ = chunk.chunkZ * CHUNK_DEPTH;
 
-    for (int dx = -veinSize; dx <= veinSize; ++dx) {
-        for (int dy = -veinSize; dy <= veinSize; ++dy) {
-            for (int dz = -veinSize; dz <= veinSize; ++dz) {
-                int distSq = dx * dx + dy * dy + dz * dz;
-                if (distSq > radiusSq) continue;
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int sourceChunkX = chunk.chunkX + dx;
+            int sourceChunkZ = chunk.chunkZ + dz;
+            int sourceBaseX = sourceChunkX * CHUNK_WIDTH;
+            int sourceBaseZ = sourceChunkZ * CHUNK_DEPTH;
 
-                int targetX = x + dx;
-                int targetY = y + dy;
-                int targetZ = z + dz;
+            for (size_t oreIndex = 0; oreIndex < std::size(ORE_KINDS); ++oreIndex) {
+                const OreKind& ore = ORE_KINDS[oreIndex];
+                SeededRng rng(hashCoords(sourceChunkX, sourceChunkZ,
+                                         genseed::subSeed(seed_, genseed::ORES + oreIndex)));
 
-                // Bounds check
-                if (targetX < 0 || targetX >= CHUNK_WIDTH) continue;
-                if (targetY < 0 || targetY >= CHUNK_HEIGHT) continue;
-                if (targetZ < 0 || targetZ >= CHUNK_DEPTH) continue;
+                for (int attempt = 0; attempt < ore.attemptsPerChunk; ++attempt) {
+                    // Fixed draw order — every neighbor re-rolls the same
+                    // sequence, so a skipped attempt costs the same draws.
+                    int x = sourceBaseX + rng.nextInt(0, CHUNK_WIDTH - 1);
+                    int z = sourceBaseZ + rng.nextInt(0, CHUNK_DEPTH - 1);
+                    int y = rng.nextInt(ore.minY, ore.maxY);
+                    int steps = rng.nextInt(ore.blobMin, ore.blobMax);
 
-                // Only replace STONE blocks
-                if (chunk.getBlock(targetX, targetY, targetZ) == BlockType::STONE) {
-                    chunk.setBlock(targetX, targetY, targetZ, ore);
+                    for (int i = 0; i < steps; ++i) {
+                        int lx = x - baseX;
+                        int lz = z - baseZ;
+                        if (lx >= 0 && lx < CHUNK_WIDTH && lz >= 0 && lz < CHUNK_DEPTH &&
+                            chunk.getBlock(lx, y, lz) == BlockType::STONE) {
+                            chunk.setBlock(lx, y, lz, ore.block);
+                        }
+                        // Random-walk one axis step; y stays inside the band
+                        int axis = rng.nextInt(0, 2);
+                        int dir = rng.nextInt(0, 1) == 0 ? -1 : 1;
+                        if (axis == 0) {
+                            x += dir;
+                        } else if (axis == 1) {
+                            y = std::clamp(y + dir, ore.minY, ore.maxY);
+                        } else {
+                            z += dir;
+                        }
+                    }
                 }
             }
-        }
-    }
-}
-
-void OreGenerator::generate(Chunk& chunk, const OreConfig& config) const {
-    int worldBaseX = chunk.chunkX * CHUNK_WIDTH;
-    int worldBaseZ = chunk.chunkZ * CHUNK_DEPTH;
-
-    // Seed for deterministic PRNG within this chunk
-    uint32_t state = static_cast<uint32_t>(worldBaseX * 374761393u + worldBaseZ * 668265263u);
-
-    for (const auto& oreDist : config.ores) {
-        for (int cluster = 0; cluster < oreDist.clustersPerChunk; ++cluster) {
-            // Use noise to determine cluster placement
-            // Spread clusters across a 3x3 chunk area to avoid seams
-            int noiseX = worldBaseX + (oreLcg(state) % (CHUNK_WIDTH * 3));
-            int noiseZ = worldBaseZ + (oreLcg(state) % (CHUNK_DEPTH * 3));
-
-            double noiseVal = oreNoise_.noise3D(static_cast<double>(noiseX) * 0.1,
-                                                static_cast<double>(cluster) * 0.5,
-                                                static_cast<double>(noiseZ) * 0.1);
-
-            // Map from [-1, 1] to [0, 1]
-            double normalized = (noiseVal + 1.0) * 0.5;
-
-            // Discard cluster if noise is too high
-            if (normalized > oreDist.discardThreshold) {
-                continue;
-            }
-
-            // Determine cluster center position
-            int centerX = (oreLcg(state) % (CHUNK_WIDTH * 3)) - CHUNK_WIDTH;
-            int centerZ = (oreLcg(state) % (CHUNK_DEPTH * 3)) - CHUNK_DEPTH;
-
-            // Height based on ore distribution
-            double heightRange = oreDist.maxHeight - oreDist.minHeight;
-            double heightT = (static_cast<double>(oreLcg(state)) / 32767.0) * heightRange;
-            int centerY = static_cast<int>(oreDist.minHeight + heightT);
-
-            // Apply density weighting
-            double density = getOreDensity(static_cast<double>(centerY), oreDist);
-            if (density <= 0.0) continue;
-
-            // Vein size scaled by density
-            int veinRange = oreDist.maxVeinSize - oreDist.minVeinSize;
-            int veinSize = oreDist.minVeinSize +
-                           static_cast<int>((static_cast<double>(oreLcg(state)) / 32767.0) *
-                                            veinRange * density);
-            veinSize = std::max(1, veinSize);
-
-            // Generate the ore vein
-            generateOreVein(chunk, centerX, centerY, centerZ, veinSize, oreDist.ore);
         }
     }
 }

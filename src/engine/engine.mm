@@ -71,6 +71,7 @@ struct EngineState {
     // ---- Performance stats (exponential moving averages) ----
     float smoothedFrameMs = 16.7f;
     uint32_t cachedChunkCount = 0;
+    uint32_t cachedPendingChunks = 0;
 
     // ---- Player & World ----
     Player player;
@@ -154,8 +155,11 @@ static EngineState* _engineGetState(Engine* engine) {
             _state->worldTime = meta->worldTime;
         }
 
-        // View distance 12 keeps the full-detail mesh set comfortably inside
-        // the 128 MB mega-buffer (25×25 chunks ≈ 60 MB of vertex data).
+        // Default view distance 12; the mega-buffer grows with the setting
+        // (see renderChunks). Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..32>.
+        if (const char* vdEnv = std::getenv("RYCRAFT_VIEW_DISTANCE")) {
+            _state->settings.viewDistance = std::clamp(std::atoi(vdEnv), 4, 32);
+        }
         _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
         // Chunks load from disk before regenerating, so block edits persist
         _state->world->setSaveManager(_state->saveManager.get());
@@ -518,8 +522,16 @@ static EngineState* _engineGetState(Engine* engine) {
         return;
     _savedWorld = true;
 
+    // Mesh workers reference the World — stop them before anything else
+    // (ivar destruction order at teardown is not something to bet on)
+    if (_renderPipeline) {
+        _renderPipeline->shutdownMeshWorkers();
+    }
+
     EngineState* state = _state.get();
     if (state->saveManager && state->world) {
+        // Edited chunks persist on unload; the quit path sweeps the rest
+        state->world->saveModifiedChunks();
         state->saveManager->saveMetadata(state->world->getSeed(), state->player.position,
                                          state->worldTime);
         state->saveManager->flush();
@@ -780,18 +792,14 @@ static EngineState* _engineGetState(Engine* engine) {
     // Set block to air
     state->world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
 
-    // Mark chunk dirty
-    int chunkX = Chunk::worldToChunk(hitX);
-    int chunkZ = Chunk::worldToChunk(hitZ);
-    auto chunk = state->world->getChunk(chunkX, chunkZ);
-    if (chunk) {
-        chunk->markDirty();
+    // Flora standing on the broken block loses its support and pops with it
+    // (same column → same chunk → the dirty/save below covers it)
+    if (isFlora(state->world->getBlock(hitX, hitY + 1, hitZ))) {
+        state->world->setBlock(hitX, hitY + 1, hitZ, BlockType::AIR);
     }
 
-    // Trigger save of dirty chunk
-    if (state->saveManager && chunk) {
-        state->saveManager->saveChunk(*chunk);
-    }
+    // World::setBlock marks the chunk (and boundary neighbors) dirty and
+    // flags it for save-on-unload
 
     // Clear highlight since block is now air
     state->hasHighlightedBlock = false;
@@ -819,40 +827,10 @@ static EngineState* _engineGetState(Engine* engine) {
     if (placeBox.intersects(state->player.getAABB()))
         return;
 
-    // Place block
+    // Place block (World::setBlock marks the chunk and boundary neighbors
+    // dirty and flags the chunk for save-on-unload)
     BlockType selectedType = state->hotbar.getSelectedBlockType();
     state->world->setBlock(placeX, placeY, placeZ, selectedType);
-
-    // Mark both adjacent chunks dirty (boundary case)
-    int chunkX = Chunk::worldToChunk(placeX);
-    int chunkZ = Chunk::worldToChunk(placeZ);
-
-    auto markChunkDirty = [&](int cx, int cz) {
-        auto c = state->world->getChunk(cx, cz);
-        if (c)
-            c->markDirty();
-    };
-
-    markChunkDirty(chunkX, chunkZ);
-
-    // Check if block is on chunk boundary and mark neighbor
-    int localX = placeX - chunkX * CHUNK_WIDTH;
-    int localZ = placeZ - chunkZ * CHUNK_DEPTH;
-    if (localX == 0)
-        markChunkDirty(chunkX - 1, chunkZ);
-    if (localX == CHUNK_WIDTH - 1)
-        markChunkDirty(chunkX + 1, chunkZ);
-    if (localZ == 0)
-        markChunkDirty(chunkX, chunkZ - 1);
-    if (localZ == CHUNK_DEPTH - 1)
-        markChunkDirty(chunkX, chunkZ + 1);
-
-    // Save affected chunk
-    if (state->saveManager) {
-        auto chunk = state->world->getChunk(chunkX, chunkZ);
-        if (chunk)
-            state->saveManager->saveChunk(*chunk);
-    }
 
     [self playSfx:state->sfxBlockPlace gain:0.8f];
 }
@@ -883,14 +861,21 @@ static EngineState* _engineGetState(Engine* engine) {
     if (!_renderPipeline || !state->world)
         return;
 
-    // Log render diagnostics every 60 frames
+    // Log render + streaming diagnostics every 60 frames (the same numbers
+    // the F3 HUD shows, so headless playtests can measure against budgets;
+    // the chunk count reuses the HUD's 30-frame sample instead of copying
+    // the whole chunk vector)
     if (state->frameCount % 60 == 1) {
-        auto chunks = state->world->getLoadedChunks();
-        char pos[64];
-        snprintf(pos, sizeof(pos), " player (%.1f, %.1f, %.1f)", state->player.position.x,
-                 state->player.position.y, state->player.position.z);
-        RY_LOG_INFO(std::string("Render: ") + std::to_string(chunks.size()) +
-                    " loaded chunks, frame " + std::to_string(state->frameCount) + pos);
+        auto chunkStats = _renderPipeline->chunkRenderStats();
+        char line[224];
+        snprintf(line, sizeof(line),
+                 "Render: %u loaded chunks, frame %llu player (%.1f, %.1f, %.1f) | %.2f ms/frame "
+                 "gen %.2f ms mesh %.2f ms pending %zu vram %.0f/%.0f MB",
+                 state->cachedChunkCount, static_cast<unsigned long long>(state->frameCount),
+                 state->player.position.x, state->player.position.y, state->player.position.z,
+                 state->smoothedFrameMs, state->world->averageGenMs(), chunkStats.meshMsAvg,
+                 state->world->getPendingChunkCount(), chunkStats.megaUsedMB, chunkStats.megaCapMB);
+        RY_LOG_INFO(line);
     }
 
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
@@ -915,17 +900,34 @@ static EngineState* _engineGetState(Engine* engine) {
         state->smoothedFrameMs * 0.95f + static_cast<float>(state->deltaTime) * 1000.0f * 0.05f;
     if (state->frameCount % 30 == 0) {
         state->cachedChunkCount = static_cast<uint32_t>(state->world->getLoadedChunks().size());
+        state->cachedPendingChunks = static_cast<uint32_t>(state->world->getPendingChunkCount());
     }
 
     UIFrameState uiFrame;
     uiFrame.screen = state->flow.screen;
     uiFrame.hoveredButton = state->hoveredButton;
     uiFrame.showDebugHud = state->showDebugHud;
+    // Underwater view (veil, god rays, dense fog): the camera cell is water.
+    // Non-generating read — a streaming lag must never stall the frame.
+    {
+        Vec3 camPos = state->camera.getPosition();
+        uiFrame.cameraUnderwater =
+            state->world->getBlockIfLoaded(
+                static_cast<int>(std::floor(camPos.x)), static_cast<int>(std::floor(camPos.y)),
+                static_cast<int>(std::floor(camPos.z))) == BlockType::WATER;
+    }
     uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
     uiFrame.stats.fps = state->smoothedFrameMs > 0.f ? 1000.0f / state->smoothedFrameMs : 0.f;
     uiFrame.stats.chunkCount = state->cachedChunkCount;
     uiFrame.stats.entityCount =
         state->spawner ? static_cast<uint32_t>(state->spawner->getEntities().size()) : 0;
+    uiFrame.stats.pendingChunks = state->cachedPendingChunks;
+    uiFrame.stats.genMsAvg = state->world->averageGenMs();
+    auto chunkStats = _renderPipeline->chunkRenderStats();
+    uiFrame.stats.meshMsAvg = chunkStats.meshMsAvg;
+    uiFrame.stats.meshBuildsFrame = chunkStats.meshBuildsLastFrame;
+    uiFrame.stats.megaUsedMB = chunkStats.megaUsedMB;
+    uiFrame.stats.megaCapMB = chunkStats.megaCapMB;
     uiFrame.menu = state->menuLayout;
 
     _renderPipeline->render(

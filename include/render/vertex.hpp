@@ -51,7 +51,10 @@ struct alignas(16) Vertex {
 static_assert(sizeof(Vertex) == 16, "Vertex must be 16 bytes");
 static_assert(alignof(Vertex) == 16, "Vertex must be 16-byte aligned");
 
-// Face normal index constants
+// Face normal index constants. CROSS marks flora cross-quads: the vertex
+// shader gives them a fixed up-facing light instead of face shading (so the
+// two diagonal quads of one plant never shade differently), and rendering
+// them double-sided relies on the scene pass keeping cull mode None.
 enum class FaceNormal : uint8_t {
     PLUS_X = 0,
     MINUS_X = 1,
@@ -59,4 +62,5 @@ enum class FaceNormal : uint8_t {
     MINUS_Z = 3,
     PLUS_Y = 4,
     MINUS_Y = 5,
+    CROSS = 6,
 };

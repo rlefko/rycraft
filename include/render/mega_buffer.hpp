@@ -31,6 +31,15 @@ public:
 
     uint64_t vertexUsed() const;
     uint64_t indexUsed() const;
+    uint64_t vertexCapacity() const { return _vertexSize; }
+    uint64_t indexCapacity() const { return _indexSize; }
+
+    // Sort {offset, size} regions and merge adjacent ones in place. Public
+    // static so tests can pin it without a Metal device — the previous
+    // in-line version wrote one element past the end of the vector on a
+    // single-entry list (slow heap corruption: garbled audio, then malloc
+    // traps minutes later) and dropped the last region on every pass.
+    static void coalesceFreeList(std::vector<std::pair<uint64_t, uint64_t>>& freeList);
 
 private:
     static uint64_t alignUp(uint64_t value);

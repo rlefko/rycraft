@@ -367,7 +367,7 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
 
     // Background: semi-transparent dark rectangle
     float bgWidth = 220.0f / static_cast<float>(_width);
-    float bgHeight = 80.0f / static_cast<float>(_height);
+    float bgHeight = 140.0f / static_cast<float>(_height);
     drawQuad(hudX - 4.0f / _width, hudY - bgHeight, bgWidth, bgHeight, 0.0f, 0.0f, 0.0f, 0.6f);
 
     // Line height (including spacing)
@@ -401,5 +401,39 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
     floatToString(stats.frameTimeMs, ftBuf, sizeof(ftBuf));
     drawString("Frame: ", textX, textY, 1.0f, 1.0f, 0.8f, 0.4f);
     drawString(ftBuf, textX + 60.0f / _width, textY, 1.0f, 1.0f, 0.8f, 0.4f);
+    textY -= lineHeight;
+
+    // Chunk generation: pending count + per-chunk ms
+    char genBuf[32];
+    char genMsBuf[16];
+    intToString(static_cast<int>(stats.pendingChunks), genBuf, sizeof(genBuf));
+    floatToString(stats.genMsAvg, genMsBuf, sizeof(genMsBuf));
+    drawString("Gen: ", textX, textY, 1.0f, 0.5f, 0.9f, 1.0f);
+    drawString(genBuf, textX + 40.0f / _width, textY, 1.0f, 0.5f, 0.9f, 1.0f);
+    drawString(genMsBuf, textX + 96.0f / _width, textY, 1.0f, 0.5f, 0.9f, 1.0f);
+    drawString("ms", textX + 152.0f / _width, textY, 1.0f, 0.5f, 0.9f, 1.0f);
+    textY -= lineHeight;
+
+    // Mesh builds: count last frame + per-build ms
+    char meshBuf[16];
+    char meshMsBuf[16];
+    intToString(static_cast<int>(stats.meshBuildsFrame), meshBuf, sizeof(meshBuf));
+    floatToString(stats.meshMsAvg, meshMsBuf, sizeof(meshMsBuf));
+    drawString("Mesh: ", textX, textY, 1.0f, 0.4f, 0.9f, 0.6f);
+    drawString(meshBuf, textX + 48.0f / _width, textY, 1.0f, 0.4f, 0.9f, 0.6f);
+    drawString(meshMsBuf, textX + 96.0f / _width, textY, 1.0f, 0.4f, 0.9f, 0.6f);
+    drawString("ms", textX + 152.0f / _width, textY, 1.0f, 0.4f, 0.9f, 0.6f);
+    textY -= lineHeight;
+
+    // Mega-buffer vertex usage
+    char usedBuf[16];
+    char capBuf[16];
+    intToString(static_cast<int>(stats.megaUsedMB), usedBuf, sizeof(usedBuf));
+    intToString(static_cast<int>(stats.megaCapMB), capBuf, sizeof(capBuf));
+    drawString("VRAM: ", textX, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    drawString(usedBuf, textX + 48.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    drawString("/", textX + 96.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    drawString(capBuf, textX + 108.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    drawString("MB", textX + 156.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
     (void)textY; // Suppress unused variable warning
 }

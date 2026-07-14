@@ -13,6 +13,44 @@ Chunk::Chunk(int cx, int cz)
     heightMap.fill(0);
 }
 
+Chunk::Chunk(const Chunk& other)
+    : chunkX(other.chunkX)
+    , chunkZ(other.chunkZ)
+    , blocks(other.blocks)
+    , biomes(other.biomes)
+    , heightMap(other.heightMap)
+    , needsMeshUpdate(other.needsMeshUpdate)
+    , meshed(other.meshed)
+    , generated(other.generated)
+    , modifiedSinceSave(other.modifiedSinceSave)
+    , version(other.version.load()) {}
+
+Chunk::Chunk(Chunk&& other) noexcept
+    : chunkX(other.chunkX)
+    , chunkZ(other.chunkZ)
+    , blocks(std::move(other.blocks))
+    , biomes(other.biomes)
+    , heightMap(other.heightMap)
+    , needsMeshUpdate(other.needsMeshUpdate)
+    , meshed(other.meshed)
+    , generated(other.generated)
+    , modifiedSinceSave(other.modifiedSinceSave)
+    , version(other.version.load()) {}
+
+Chunk& Chunk::operator=(const Chunk& other) {
+    chunkX = other.chunkX;
+    chunkZ = other.chunkZ;
+    blocks = other.blocks;
+    biomes = other.biomes;
+    heightMap = other.heightMap;
+    needsMeshUpdate = other.needsMeshUpdate;
+    meshed = other.meshed;
+    generated = other.generated;
+    modifiedSinceSave = other.modifiedSinceSave;
+    version.store(other.version.load());
+    return *this;
+}
+
 // Internal index calculation: Y-major for greedy meshing
 static int chunkIndex(int x, int y, int z) {
     return x + z * CHUNK_WIDTH + y * CHUNK_WIDTH * CHUNK_DEPTH;

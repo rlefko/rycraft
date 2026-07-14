@@ -33,6 +33,19 @@ struct VertexOutput {
     uint vTextureLayer [[flat]];
 };
 
+// Face indices — must match FaceNormal in include/render/vertex.hpp
+constant uint FACE_PLUS_Y = 4u;
+constant uint FACE_CROSS = 6u;
+
+// Shared exponential distance fog — one definition so the terrain, water,
+// and entity passes can never drift apart.
+static float3 applyFog(float3 color, float3 worldPos, float3 cameraPos, float density,
+                       float3 fogColor) {
+    float dist = distance(worldPos, cameraPos);
+    float fogFactor = clamp(1.0f - exp(-density * dist), 0.0f, 1.0f);
+    return mix(color, fogColor, fogFactor);
+}
+
 // ---------------------------------------------------------------------------
 // Face normal lookup — indices match FaceNormal enum (0=+X … 5=-Y)
 // ---------------------------------------------------------------------------
@@ -71,7 +84,15 @@ vertex VertexOutput vertexMain(
     // column skylight (bits 11-14)
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
-    float3 normal = getFaceNormal(in.faceAttr & 7u);
+    uint normalIdx = in.faceAttr & 7u;
+    if (normalIdx == FACE_CROSS) {
+        // Flora cross-quads: orientation-free lighting tracking the sun's
+        // elevation, so the two diagonal quads never shade differently
+        out.vNormal = float3(0.0, 1.0, 0.0);
+        out.vLight = max(uniforms.sunDirection.y, 0.0f) * 0.9f;
+        return out;
+    }
+    float3 normal = getFaceNormal(normalIdx);
     out.vNormal = normalize(
         (uniforms.modelMatrix * float4(normal, 0.0)).xyz
     );
@@ -108,18 +129,203 @@ fragment float4 fragmentMain(
     float3 litColor =
         texColor.rgb * (uniforms.sunColor * in.vLight * sky + uniforms.ambientColor * sky);
 
-    // ---- Distance fog (Phase 8) ----
-    // Use world position passed from vertex shader
-    float distanceToFrag = distance(in.vWorldPosition, uniforms.cameraPosition);
-
-    // Exponential fog: fogFactor = 1.0 - exp(-density * distance)
-    float fogFactor = 1.0f - exp(-uniforms.fogDensity * distanceToFrag);
-    fogFactor = clamp(fogFactor, 0.0f, 1.0f);
-
-    // Blend between fog color and lit color
-    float3 finalColor = mix(litColor, uniforms.fogColor, fogFactor);
-
+    float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
+                                 uniforms.fogDensity, uniforms.fogColor);
     return float4(finalColor, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Water pass — runs after the opaque scene resolves, compositing its own
+// pixels from the resolved color + depth: screen-space refraction with
+// depth-based absorption, procedural caustics on the submerged floor,
+// fresnel sky reflection with a sun sparkle, and animated waves. No depth
+// attachment: the fragment depth-tests manually against the resolved depth.
+// ---------------------------------------------------------------------------
+struct WaterVertexOutput {
+    float4 clipPosition [[position]];
+    float3 vWorldPosition;
+    float vSkyLight;
+};
+
+vertex WaterVertexOutput waterVertexMain(
+    VertexInput in [[stage_in]],
+    constant Uniforms &uniforms [[buffer(1)]],
+    constant ChunkOrigin &chunkOrigin [[buffer(2)]],
+    constant WaterUniforms &water [[buffer(3)]]
+) {
+    float3 pos = in.position + chunkOrigin.origin.xyz;
+    uint normalIdx = in.faceAttr & 7u;
+    if (normalIdx == FACE_PLUS_Y) {
+        // Top surfaces bob gently; world-space input keeps waves continuous
+        // across chunk borders
+        pos.y += sin(pos.x * 0.55f + water.time * 1.4f) *
+                 cos(pos.z * 0.45f + water.time * 1.1f) * 0.04f;
+    }
+
+    WaterVertexOutput out;
+    float4 worldPos = uniforms.modelMatrix * float4(pos, 1.0);
+    out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
+    out.vWorldPosition = worldPos.xyz;
+    out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
+    return out;
+}
+
+// Analytic normal of the same wave field the vertex stage displaces with,
+// plus a faint finer ripple set for sparkle. The slope scale keeps the
+// surface glassy — pushing it higher reads as chop.
+static float3 waterWaveNormal(float2 p, float t) {
+    float ddx = 0.55f * cos(p.x * 0.55f + t * 1.4f) * cos(p.y * 0.45f + t * 1.1f) * 0.04f +
+                cos(p.x * 1.9f + t * 2.3f) * 0.9f * 0.008f;
+    float ddz = -0.45f * sin(p.x * 0.55f + t * 1.4f) * sin(p.y * 0.45f + t * 1.1f) * 0.04f +
+                cos(p.y * 2.2f - t * 2.0f) * 1.1f * 0.008f;
+    return normalize(float3(-ddx * 2.5f, 1.0f, -ddz * 2.5f));
+}
+
+// Interfering sine bands sharpened into bright filaments — the classic
+// cheap caustic, projected on the floor's world xz.
+static float causticPattern(float2 p, float t) {
+    float c1 = sin(p.x * 0.9f + t * 1.7f) + sin(p.y * 1.1f - t * 1.3f);
+    float c2 = sin((p.x + p.y) * 0.7f + t * 2.1f) + sin((p.x - p.y) * 0.8f + t * 1.1f);
+    float c = (c1 + c2) * 0.25f;
+    return pow(saturate(1.0f - abs(c)), 6.0f);
+}
+
+fragment float4 waterFragmentMain(
+    WaterVertexOutput in [[stage_in]],
+    texture2d<float> sceneColor [[texture(0)]],
+    depth2d<float> sceneDepth [[texture(1)]],
+    constant WaterUniforms &water [[buffer(3)]]
+) {
+    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear,
+                                    address::clamp_to_edge);
+    float2 screenUV = in.clipPosition.xy / water.resolution;
+
+    // Manual depth test against the resolved opaque scene
+    float opaqueDepth = sceneDepth.sample(screenSampler, screenUV);
+    if (in.clipPosition.z > opaqueDepth) {
+        discard_fragment();
+    }
+
+    float3 V = normalize(water.cameraPosition - in.vWorldPosition);
+    float3 N = waterWaveNormal(in.vWorldPosition.xz, water.time);
+    bool fromBelow = water.cameraUnderwater > 0.5f;
+
+    // Reconstruct the opaque world position behind this fragment
+    float4 clip = float4(screenUV.x * 2.0f - 1.0f, 1.0f - screenUV.y * 2.0f, opaqueDepth, 1.0f);
+    float4 behindH = water.invViewProjection * clip;
+    float3 behind = behindH.xyz / behindH.w;
+    float waterDepth = max(distance(behind, in.vWorldPosition), 0.0f);
+
+    // ---- Refraction: wave-distorted resample of the scene, pinned at the
+    // shoreline so shallow edges don't smear
+    float distortion = min(waterDepth, 4.0f) * 0.25f;
+    float2 refractUV = clamp(screenUV + N.xz * 0.035f * distortion, 0.001f, 0.999f);
+    float refractDepth = sceneDepth.sample(screenSampler, refractUV);
+    if (refractDepth < in.clipPosition.z) {
+        // The distorted tap landed on something in FRONT of the surface —
+        // fall back to the undistorted sample
+        refractUV = screenUV;
+        refractDepth = opaqueDepth;
+    }
+    float3 refracted = sceneColor.sample(screenSampler, refractUV).rgb;
+
+    // World position of the refracted floor sample (caustics + absorption)
+    float4 rclip =
+        float4(refractUV.x * 2.0f - 1.0f, 1.0f - refractUV.y * 2.0f, refractDepth, 1.0f);
+    float4 rworldH = water.invViewProjection * rclip;
+    float3 rworld = rworldH.xyz / rworldH.w;
+    float depthBelow = max(in.vWorldPosition.y - rworld.y, 0.0f);
+
+    // ---- Caustics: bright ripple filaments on the shallow floor
+    float caustic = causticPattern(rworld.xz * 0.6f, water.time) * exp(-depthBelow * 0.22f);
+    refracted += water.sunColor * caustic * 0.4f * in.vSkyLight *
+                 saturate(water.sunDirection.y * 2.0f);
+
+    // ---- Absorption: the water column filters toward deep blue
+    float3 deepColor = float3(0.02f, 0.12f, 0.25f);
+    float absorb = 1.0f - exp(-waterDepth * 0.16f);
+    float3 body = mix(refracted * float3(0.85f, 0.95f, 1.0f), deepColor, absorb);
+
+    // ---- Fresnel sky reflection + sun sparkle (skylight gates both, so
+    // flooded caves reflect darkness rather than open sky)
+    float3 R = reflect(-V, N);
+    R.y = abs(R.y);
+    float horizonBlend = pow(1.0f - saturate(R.y), 2.0f);
+    float3 skyReflection = mix(water.zenithColor, water.horizonColor, horizonBlend);
+    float sunAlign = saturate(dot(R, water.sunDirection));
+    float sparkle = pow(sunAlign, 240.0f) * 2.0f + pow(sunAlign, 32.0f) * 0.25f;
+    float fresnel = mix(0.04f, 1.0f, pow(1.0f - saturate(dot(V, N)), 5.0f));
+    if (fromBelow) {
+        fresnel *= 0.3f; // looking up at the surface: mostly see through it
+    }
+
+    float3 color = mix(body, skyReflection, fresnel * in.vSkyLight);
+    color += water.sunColor * sparkle * in.vSkyLight;
+
+    color = applyFog(color, in.vWorldPosition, water.cameraPosition, water.fogDensity,
+                     water.fogColor);
+
+    // Hairline shorelines dissolve into the shore instead of aliasing
+    color = mix(refracted, color, saturate(waterDepth * 3.0f));
+    return float4(color, 1.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Underwater overlay — fullscreen veil + god rays when the camera is
+// submerged, drawn after the water surfaces with alpha blending.
+// ---------------------------------------------------------------------------
+struct OverlayVertexOutput {
+    float4 clipPosition [[position]];
+    float2 uv;
+};
+
+vertex OverlayVertexOutput underwaterOverlayVertex(uint vertexID [[vertex_id]]) {
+    // Fullscreen triangle
+    float2 pos[3] = {float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0)};
+    OverlayVertexOutput out;
+    out.clipPosition = float4(pos[vertexID], 0.0, 1.0);
+    out.uv = float2(pos[vertexID].x * 0.5f + 0.5f, 1.0f - (pos[vertexID].y * 0.5f + 0.5f));
+    return out;
+}
+
+fragment float4 underwaterOverlayFragment(
+    OverlayVertexOutput in [[stage_in]],
+    depth2d<float> sceneDepth [[texture(1)]],
+    constant WaterUniforms &water [[buffer(3)]]
+) {
+    // Slanted shafts of light, banded and animated, fading with depth on
+    // screen (light enters from the surface above)
+    float slant = in.uv.x * 1.4f + in.uv.y * 0.6f;
+    float t = water.time;
+    float rays = pow(max(sin(slant * 9.0f - t * 0.7f) * 0.5f + 0.5f, 0.0f), 3.0f) * 0.5f +
+                 pow(max(sin(slant * 17.0f + t * 0.45f + 1.7f) * 0.5f + 0.5f, 0.0f), 4.0f) * 0.35f;
+    float topFade = pow(saturate(1.0f - in.uv.y), 1.5f);
+    float sunUp = saturate(water.sunDirection.y);
+    float3 rayColor = water.sunColor * rays * topFade * sunUp * 0.9f;
+
+    // Caustics on every submerged surface around the camera — the water
+    // pass only shades pixels behind a surface quad, so without this the
+    // floor at the player's feet had none. Reconstruct the opaque world
+    // position and project the same caustic field onto up-facing geometry.
+    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear,
+                                    address::clamp_to_edge);
+    float depth = sceneDepth.sample(screenSampler, in.uv);
+    float4 clip = float4(in.uv.x * 2.0f - 1.0f, 1.0f - in.uv.y * 2.0f, depth, 1.0f);
+    float4 worldH = water.invViewProjection * clip;
+    float3 world = worldH.xyz / worldH.w;
+    // Screen-space derivatives give the surface normal: walls get none
+    float3 surfaceNormal = normalize(cross(dfdx(world), dfdy(world)));
+    float upFacing = saturate(abs(surfaceNormal.y));
+    // SEA_LEVEL (64, chunk.hpp) minus an epsilon: the water surface renders
+    // at 63.875, so shore blocks at y >= 64 must not catch caustics
+    float submerged = step(world.y, 63.9f);
+    float dist = distance(world, water.cameraPosition);
+    float caustic = causticPattern(world.xz * 0.85f, t) *
+                    exp(-max(64.0f - world.y, 0.0f) * 0.10f) * exp(-dist * 0.03f);
+    float3 causticColor = water.sunColor * caustic * upFacing * submerged * sunUp * 2.4f;
+
+    float3 veil = float3(0.05f, 0.18f, 0.32f);
+    return float4(veil + rayColor + causticColor, 0.35f);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +362,7 @@ fragment float4 entityFragmentMain(
     float light = max(dot(in.vNormal, uniforms.sunDirection), 0.0f);
     float3 litColor = in.vColor * (uniforms.sunColor * light + uniforms.ambientColor);
 
-    float distanceToFrag = distance(in.vWorldPosition, uniforms.cameraPosition);
-    float fogFactor = clamp(1.0f - exp(-uniforms.fogDensity * distanceToFrag), 0.0f, 1.0f);
-    return float4(mix(litColor, uniforms.fogColor, fogFactor), 1.0);
+    return float4(applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
+                           uniforms.fogDensity, uniforms.fogColor),
+                  1.0);
 }

@@ -14,7 +14,8 @@ bool PhysicsEngine::isSolid(World& world, int x, int y, int z) {
 }
 
 // ---------------------------------------------------------------------------
-// isInWater — Check if any water block intersects the entity AABB
+// isInWater — Check if any liquid block intersects the entity AABB (lava
+// swims like water; damage is out of scope)
 // ---------------------------------------------------------------------------
 bool PhysicsEngine::isInWater(World& world, const AABB& entityAABB) {
     int minX = static_cast<int>(std::floor(entityAABB.min.x));
@@ -27,7 +28,7 @@ bool PhysicsEngine::isInWater(World& world, const AABB& entityAABB) {
     for (int x = minX; x <= maxX; ++x) {
         for (int y = minY; y <= maxY; ++y) {
             for (int z = minZ; z <= maxZ; ++z) {
-                if (world.getBlock(x, y, z) == BlockType::WATER) {
+                if (isLiquid(world.getBlock(x, y, z))) {
                     return true;
                 }
             }

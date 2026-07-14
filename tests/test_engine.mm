@@ -25,13 +25,13 @@
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
 #include <render/vertex.hpp>
-#include <world/biome.hpp>
 #include <world/chunk.hpp>
+#include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
+#include <world/climate.hpp>
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
-#include <world/terrain.hpp>
 #include <world/world.hpp>
 
 #include <chrono>
@@ -444,11 +444,11 @@ TEST_CASE("Hotbar: default slot contents", "[phase6][hotbar]") {
     REQUIRE(hotbar.getSlot(1) == BlockType::DIRT);
     REQUIRE(hotbar.getSlot(2) == BlockType::GRASS);
     REQUIRE(hotbar.getSlot(3) == BlockType::LOG);
-    REQUIRE(hotbar.getSlot(4) == BlockType::SAND);
-    REQUIRE(hotbar.getSlot(5) == BlockType::PLANKS);
-    REQUIRE(hotbar.getSlot(6) == BlockType::BEDROCK);
-    REQUIRE(hotbar.getSlot(7) == BlockType::COAL_ORE);
-    REQUIRE(hotbar.getSlot(8) == BlockType::IRON_ORE);
+    REQUIRE(hotbar.getSlot(4) == BlockType::PLANKS);
+    REQUIRE(hotbar.getSlot(5) == BlockType::SAND);
+    REQUIRE(hotbar.getSlot(6) == BlockType::SANDSTONE);
+    REQUIRE(hotbar.getSlot(7) == BlockType::GLASS);
+    REQUIRE(hotbar.getSlot(8) == BlockType::FLOWER_RED);
 }
 
 // ---- Performance HUD Tests ----

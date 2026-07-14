@@ -4,73 +4,63 @@
 #include "world/save_manager.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 
 World::World(uint32_t seed, int viewDistance)
     : seed_(seed)
     , viewDistance_(viewDistance)
-    , terrainGen_(seed)
-    , biomeGen_(seed)
-    , caveGen_(seed)
-    , oreGen_(seed)
-    , treeGen_(seed)
-    , structureGen_(seed) {}
+    , generator_(seed) {}
+
+void sortChunksByDistance(std::vector<ChunkPos>& chunks, int centerChunkX, int centerChunkZ) {
+    auto distanceSq = [&](const ChunkPos& p) {
+        int64_t dx = p.x - centerChunkX;
+        int64_t dz = p.z - centerChunkZ;
+        return dx * dx + dz * dz;
+    };
+    std::sort(chunks.begin(), chunks.end(),
+              [&](const ChunkPos& a, const ChunkPos& b) { return distanceSq(a) > distanceSq(b); });
+}
 
 World::~World() {
     // Wait for in-flight generation tasks: they capture `this` and insert
-    // into chunks_, so destroying the World underneath them is a use-after-free.
-    std::lock_guard<std::mutex> lock(pendingMutex_);
-    for (auto& [key, future] : pendingGenerations_) {
-        if (future.valid()) {
-            future.wait();
+    // into chunks_, so destroying the World underneath them is a
+    // use-after-free. Waiting happens OUTSIDE pendingMutex_ (a finishing
+    // worker pumps the backlog under that mutex — holding it while waiting
+    // on the worker's future would deadlock), and loops because a worker
+    // may slip one more submission in before it observes shuttingDown_.
+    shuttingDown_.store(true);
+    for (;;) {
+        std::unordered_map<ChunkPos, std::future<void>> pending;
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            genBacklog_.clear();
+            if (pendingGenerations_.empty()) {
+                break;
+            }
+            pending = std::move(pendingGenerations_);
+            pendingGenerations_.clear();
+        }
+        for (auto& [key, future] : pending) {
+            if (future.valid()) {
+                future.wait();
+            }
         }
     }
 }
 
 void World::generateChunk(std::shared_ptr<Chunk> chunk) {
-    int worldBaseX = chunk->chunkX * CHUNK_WIDTH;
-    int worldBaseZ = chunk->chunkZ * CHUNK_DEPTH;
-
-    TerrainConfig terrainConfig;
-    BiomeConfig biomeConfig;
-
-    std::vector<double> heights(CHUNK_WIDTH * CHUNK_DEPTH);
-    std::array<Biome, CHUNK_WIDTH * CHUNK_DEPTH> biomes;
-
-    for (int z = 0; z < CHUNK_DEPTH; ++z) {
-        for (int x = 0; x < CHUNK_WIDTH; ++x) {
-            int worldX = worldBaseX + x;
-            int worldZ = worldBaseZ + z;
-            int xzIndex = x + z * CHUNK_WIDTH;
-
-            double height = terrainGen_.getHeight(static_cast<double>(worldX),
-                                                  static_cast<double>(worldZ), terrainConfig);
-            heights[xzIndex] = height;
-
-            Biome biome = biomeGen_.getBiome(static_cast<double>(worldX),
-                                             static_cast<double>(worldZ), height, biomeConfig);
-            biomes[xzIndex] = biome;
-        }
-    }
-
-    SurfaceGenerator::generateSurface(*chunk, heights, biomes);
-
-    CaveConfig caveConfig;
-    caveGen_.carve(*chunk, caveConfig);
-
-    OreConfig oreConfig;
-    oreGen_.generate(*chunk, oreConfig);
-
-    treeGen_.generate(*chunk, biomes);
-    structureGen_.generate(*chunk, biomes);
-
-    chunk->biomes = biomes;
-    chunk->generated = true;
-    chunk->needsMeshUpdate = true;
+    generator_.generate(*chunk);
 }
 
 void World::generateChunkAsync(int chunkX, int chunkZ) {
     ChunkPos key{chunkX, chunkZ};
+
+    if (shuttingDown_.load()) {
+        return;
+    }
 
     // Guard: avoid generating chunk twice
     {
@@ -89,10 +79,15 @@ void World::generateChunkAsync(int chunkX, int chunkZ) {
     auto pool = genPool_;
     auto future = pool->submit([this, pool, chunkX, chunkZ, key]() {
         auto chunk = loadOrGenerateChunk(chunkX, chunkZ);
-        std::lock_guard<std::mutex> lock(chunksMutex_);
-        // try_emplace: if another path (e.g. a synchronous getChunk) won the
-        // race, keep its chunk — it may already hold player edits.
-        chunks_.try_emplace(key, std::move(chunk));
+        {
+            std::lock_guard<std::mutex> lock(chunksMutex_);
+            // try_emplace: if another path (e.g. a synchronous getChunk) won
+            // the race, keep its chunk — it may already hold player edits.
+            chunks_.try_emplace(key, std::move(chunk));
+        }
+        // A freed window slot pulls the next-nearest backlog chunk in, so
+        // streaming continues without waiting for the next tick
+        pumpGeneration();
     });
 
     std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -114,7 +109,11 @@ std::shared_ptr<Chunk> World::loadOrGenerateChunk(int chunkX, int chunkZ) {
 
     try {
         auto chunk = std::make_shared<Chunk>(chunkX, chunkZ);
+        auto start = std::chrono::steady_clock::now();
         generateChunk(chunk);
+        genMs_.record(
+            std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start)
+                .count());
         return chunk;
     } catch (const std::exception& e) {
         RY_LOG_ERROR(
@@ -159,6 +158,18 @@ BlockType World::getBlock(int x, int y, int z) {
     return chunk->getBlockWorld(x, y, z);
 }
 
+BlockType World::getBlockIfLoaded(int x, int y, int z) const {
+    int cx = Chunk::worldToChunk(x);
+    int cz = Chunk::worldToChunk(z);
+
+    std::lock_guard<std::mutex> lock(chunksMutex_);
+    auto it = chunks_.find(ChunkPos{cx, cz});
+    if (it == chunks_.end()) {
+        return BlockType::AIR;
+    }
+    return it->second->getBlockWorld(x, y, z);
+}
+
 void World::setBlock(int x, int y, int z, BlockType type) {
     int cx = Chunk::worldToChunk(x);
     int cz = Chunk::worldToChunk(z);
@@ -166,18 +177,87 @@ void World::setBlock(int x, int y, int z, BlockType type) {
     std::lock_guard<std::mutex> lock(chunksMutex_);
 
     auto it = chunks_.find(ChunkPos{cx, cz});
-    if (it != chunks_.end()) {
-        it->second->setBlockWorld(x, y, z, type);
+    if (it == chunks_.end()) {
+        return;
     }
+    it->second->setBlockWorld(x, y, z, type);
+    it->second->modifiedSinceSave = true;
+    it->second->needsMeshUpdate = true;
+    it->second->version.fetch_add(1, std::memory_order_relaxed);
+
+    // Meshes read one block into each face neighbor: an edit on a boundary
+    // column changes the neighbor's border faces too
+    auto markNeighbor = [&](int ncx, int ncz) {
+        auto neighbor = chunks_.find(ChunkPos{ncx, ncz});
+        if (neighbor != chunks_.end()) {
+            neighbor->second->needsMeshUpdate = true;
+            neighbor->second->version.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    int lx = x - cx * CHUNK_WIDTH;
+    int lz = z - cz * CHUNK_DEPTH;
+    if (lx == 0) markNeighbor(cx - 1, cz);
+    if (lx == CHUNK_WIDTH - 1) markNeighbor(cx + 1, cz);
+    if (lz == 0) markNeighbor(cx, cz - 1);
+    if (lz == CHUNK_DEPTH - 1) markNeighbor(cx, cz + 1);
+}
+
+// ---------------------------------------------------------------------------
+// snapshotForMeshing — one bounded copy under chunksMutex_ (see
+// mesh_snapshot.hpp for why this is safe and why the ring exists). This is
+// the deliberate exception to "no work under chunksMutex_": ~83 KB of
+// memcpy costs microseconds, unlike generation/IO.
+// ---------------------------------------------------------------------------
+bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
+    std::lock_guard<std::mutex> lock(chunksMutex_);
+
+    auto self = chunks_.find(pos);
+    if (self == chunks_.end() || !self->second->generated) {
+        return false;
+    }
+    const Chunk* neighbors[4] = {nullptr, nullptr, nullptr, nullptr};
+    const ChunkPos neighborPos[4] = {
+        {pos.x - 1, pos.z}, {pos.x + 1, pos.z}, {pos.x, pos.z - 1}, {pos.x, pos.z + 1}};
+    for (int i = 0; i < 4; ++i) {
+        auto it = chunks_.find(neighborPos[i]);
+        if (it == chunks_.end() || !it->second->generated) {
+            return false;
+        }
+        neighbors[i] = it->second.get();
+    }
+
+    out.chunkX = pos.x;
+    out.chunkZ = pos.z;
+    out.version = self->second->version.load(std::memory_order_relaxed);
+    out.resize();
+    const Chunk& chunk = *self->second;
+    for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+        for (int z = 0; z < CHUNK_DEPTH; ++z) {
+            // Interior row: 16 contiguous blocks in both layouts
+            std::memcpy(&out.blocks[MeshSnapshot::index(0, y, z)],
+                        &chunk.blocks[z * CHUNK_WIDTH + y * CHUNK_WIDTH * CHUNK_DEPTH],
+                        CHUNK_WIDTH * sizeof(BlockType));
+            // ±X neighbor walls
+            out.blocks[MeshSnapshot::index(-1, y, z)] =
+                neighbors[0]->getBlock(CHUNK_WIDTH - 1, y, z);
+            out.blocks[MeshSnapshot::index(CHUNK_WIDTH, y, z)] = neighbors[1]->getBlock(0, y, z);
+        }
+        // ±Z neighbor walls
+        for (int x = 0; x < CHUNK_WIDTH; ++x) {
+            out.blocks[MeshSnapshot::index(x, y, -1)] =
+                neighbors[2]->getBlock(x, y, CHUNK_DEPTH - 1);
+            out.blocks[MeshSnapshot::index(x, y, CHUNK_DEPTH)] = neighbors[3]->getBlock(x, y, 0);
+        }
+    }
+    return true;
 }
 
 double World::getTerrainHeight(int x, int z) const {
-    return terrainGen_.getHeight(static_cast<double>(x), static_cast<double>(z));
+    return generator_.baseHeightAt(x, z);
 }
 
 Biome World::getBiome(int x, int z) const {
-    double height = getTerrainHeight(x, z);
-    return biomeGen_.getBiome(static_cast<double>(x), static_cast<double>(z), height);
+    return generator_.biomeAt(x, z);
 }
 
 std::vector<std::shared_ptr<Chunk>> World::getLoadedChunks() const {
@@ -235,6 +315,8 @@ void World::updatePlayerPosition(int playerX, int playerZ) {
     int newPlayerChunkZ = Chunk::worldToChunk(playerZ);
 
     if (hasPlayerChunk_ && newPlayerChunkX == playerChunkX_ && newPlayerChunkZ == playerChunkZ_) {
+        // Same chunk: keep the submission window full anyway
+        pumpGeneration();
         return;
     }
 
@@ -250,20 +332,56 @@ void World::updatePlayerPosition(int playerX, int playerZ) {
 }
 
 void World::unloadDistantChunks() {
-    std::lock_guard<std::mutex> lock(chunksMutex_);
-    auto it = chunks_.begin();
-    while (it != chunks_.end()) {
-        int cx = it->second->chunkX;
-        int cz = it->second->chunkZ;
+    // Collect under the lock, save after releasing it (never do I/O under
+    // chunksMutex_ — the render thread takes it every frame)
+    std::vector<std::shared_ptr<Chunk>> toSave;
+    {
+        std::lock_guard<std::mutex> lock(chunksMutex_);
+        auto it = chunks_.begin();
+        while (it != chunks_.end()) {
+            int cx = it->second->chunkX;
+            int cz = it->second->chunkZ;
 
-        int distX = std::abs(cx - playerChunkX_);
-        int distZ = std::abs(cz - playerChunkZ_);
+            int distX = std::abs(cx - playerChunkX_);
+            int distZ = std::abs(cz - playerChunkZ_);
 
-        if (distX > viewDistance_ || distZ > viewDistance_) {
-            it = chunks_.erase(it);
-        } else {
-            ++it;
+            // Generation reaches vd+1; unloading at vd+2 adds hysteresis so
+            // strafing across a boundary doesn't churn the frontier ring
+            if (distX > viewDistance_ + 2 || distZ > viewDistance_ + 2) {
+                if (it->second->modifiedSinceSave && saveManager_) {
+                    it->second->modifiedSinceSave = false;
+                    toSave.push_back(it->second);
+                }
+                it = chunks_.erase(it);
+            } else {
+                ++it;
+            }
         }
+    }
+
+    for (auto& chunk : toSave) {
+        // The chunk left the map: no game thread mutates it anymore, so the
+        // save thread may serialize it lock-free
+        saveManager_->saveChunkAsync(std::move(chunk));
+    }
+}
+
+void World::saveModifiedChunks() {
+    if (!saveManager_) {
+        return;
+    }
+    std::vector<std::shared_ptr<Chunk>> toSave;
+    {
+        std::lock_guard<std::mutex> lock(chunksMutex_);
+        for (auto& [key, chunk] : chunks_) {
+            if (chunk->modifiedSinceSave) {
+                chunk->modifiedSinceSave = false;
+                toSave.push_back(chunk);
+            }
+        }
+    }
+    for (auto& chunk : toSave) {
+        saveManager_->saveChunkAsync(std::move(chunk));
     }
 }
 
@@ -276,8 +394,42 @@ void World::generateAroundPlayer(int playerX, int playerZ) {
     int playerChunkX = Chunk::worldToChunk(playerX);
     int playerChunkZ = Chunk::worldToChunk(playerZ);
 
+    // Rebuild the backlog from scratch: chunks that left the radius are
+    // implicitly cancelled, and everything still missing re-sorts against
+    // the new center. Generation reaches one chunk beyond the render
+    // radius so visible chunks always have generated neighbors (the
+    // neighbor-aware mesher needs them).
+    {
+        std::lock_guard<std::mutex> lock1(pendingMutex_);
+        std::lock_guard<std::mutex> lock2(chunksMutex_);
+        genBacklog_.clear();
+        int genRadius = viewDistance_ + 1;
+        for (int dz = -genRadius; dz <= genRadius; ++dz) {
+            for (int dx = -genRadius; dx <= genRadius; ++dx) {
+                ChunkPos key{playerChunkX + dx, playerChunkZ + dz};
+                if (chunks_.find(key) != chunks_.end()) {
+                    continue;
+                }
+                if (pendingGenerations_.find(key) != pendingGenerations_.end()) {
+                    continue;
+                }
+                genBacklog_.push_back(key);
+            }
+        }
+        sortChunksByDistance(genBacklog_, playerChunkX, playerChunkZ);
+    }
+
+    pumpGeneration();
+}
+
+void World::pumpGeneration() {
+    if (!genPool_ || shuttingDown_.load()) {
+        return;
+    }
+
     // Clean up completed futures. valid() stays true until get() is called,
     // so poll readiness instead — otherwise this map only ever grows.
+    std::vector<ChunkPos> toSubmit;
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         auto it = pendingGenerations_.begin();
@@ -289,38 +441,29 @@ void World::generateAroundPlayer(int playerX, int playerZ) {
                 ++it;
             }
         }
-    }
 
-    // Collect chunks needing generation
-    std::vector<std::pair<int, int>> chunksToGenerate;
-    {
-        std::lock_guard<std::mutex> lock1(pendingMutex_);
-        std::lock_guard<std::mutex> lock2(chunksMutex_);
-        for (int dz = -viewDistance_; dz <= viewDistance_; ++dz) {
-            for (int dx = -viewDistance_; dx <= viewDistance_; ++dx) {
-                int chunkX = playerChunkX + dx;
-                int chunkZ = playerChunkZ + dz;
-                ChunkPos key{chunkX, chunkZ};
-                if (chunks_.find(key) != chunks_.end()) {
-                    continue;
-                }
-                if (pendingGenerations_.find(key) != pendingGenerations_.end()) {
-                    continue;
-                }
-                chunksToGenerate.emplace_back(chunkX, chunkZ);
-            }
+        while (pendingGenerations_.size() + toSubmit.size() < MAX_INFLIGHT_GEN &&
+               !genBacklog_.empty()) {
+            toSubmit.push_back(genBacklog_.back());
+            genBacklog_.pop_back();
         }
     }
 
-    // Submit async tasks
-    for (const auto& [chunkX, chunkZ] : chunksToGenerate) {
-        generateChunkAsync(chunkX, chunkZ);
+    // Submit outside the lock (generateChunkAsync re-takes it)
+    for (const ChunkPos& pos : toSubmit) {
+        generateChunkAsync(pos.x, pos.z);
     }
+}
+
+float World::averageGenMs() const {
+    return genMs_.value();
 }
 
 size_t World::getPendingChunkCount() const {
     std::lock_guard<std::mutex> lock(pendingMutex_);
-    size_t pending = 0;
+    // Backlogged + genuinely in-flight: consumers (the HUD, the animal
+    // spawn gate) care about "is streaming still working", not window size
+    size_t pending = genBacklog_.size();
     for (const auto& [key, future] : pendingGenerations_) {
         // A future stays valid() until get(); only count genuinely unfinished work
         if (future.valid() &&

@@ -21,7 +21,7 @@ The frame must be **provably correct before it is clever**: shared struct layout
 ## 3. Resolution and storage
 
 - **Scene targets are sized from the drawable (pixels), never the view bounds (points)** — Retina drawables are 2x. `render()` re-checks the drawable size each frame. **Why:** point-sized targets left the scene in the top-left quarter of the window.
-- **MSAA targets are memoryless**: color resolves (`MultisampleResolve` into `_colorResolve`), depth is `DontCare`. Their contents must never be read later.
+- **MSAA targets are memoryless**: color resolves (`MultisampleResolve` into `_colorResolve`), depth resolves too (`MultisampleResolve` into `_depthResolve`, min filter — the water pass depth-tests against it). Tile contents themselves must never be loaded or stored across passes.
 - **CPU-visible buffers are `StorageModeShared`.** On Apple Silicon unified memory this is the correct default; `contents` on a `Private` buffer returns nil. **Why:** the mega-buffer was `Private` yet memcpy'd through `contents` — the moment the terrain path came alive, it dereferenced nil.
 - **A dynamic buffer written per frame is ring-buffered (3 slots), and one draw call's data is never rewritten before the GPU reads it.** The GPU consumes vertex buffers at execution time, not encode time. **Why:** the UI overlay rewrote one 64-byte buffer per quad — every HUD quad rendered as the last one written.
 
@@ -29,7 +29,20 @@ The frame must be **provably correct before it is clever**: shared struct layout
 
 - **Column-major matrices, column vectors, right-handed, Metal [0,1] NDC depth.** `Mat4::perspective` maps near→0/far→1; `lookAt` puts basis vectors in rows and translation in column 3; `extractFrustumPlanes` uses the row-form Gribb-Hartmann with `near = row2` alone. All three are pinned by tests, including a memcpy-to-`simd_float4x4` equivalence test. **Why:** `lookAt` was transposed and `perspective` used the OpenGL [-1,1] convention; nothing consuming them had ever rendered, so both hid until terrain drew.
 - **Mesh vertices are chunk-local** (fp16-exact in 0..256); the per-draw `ChunkOrigin` restores world space in the vertex shader. **Why:** fp16 world-space coordinates quantize beyond ±2048 blocks.
+- **Sub-block offsets in chunk-local fp16 must be multiples of 0.125** — the fp16 ulp in [128, 256) is 0.125, so anything finer quantizes differently at different heights and opens cracks. The water surface sits at `+0.875`, flora crosses inset by `0.125`.
 - **Face planes sit on block boundaries**: the -X face of block `lx` is at `x = lx`, its +X face at `lx + 1`. **Why:** four of six face emitters were off by one, drawing faces a block inside the neighbor.
+- **The game meshes through `MeshSnapshot`** (chunk + one-block neighbor walls): boundary faces emit from real neighbor blocks, symmetrically with interior faces. **Why:** treating out-of-chunk as air painted a hidden wall between every pair of solid chunks, holes at the loaded edge, and a skylight seam along every border.
+- **Cull mode is None in the scene and water passes** — flora cross-quads are single-winding double-sided, and the water surface is visible from below. Pinned explicitly in `renderChunks` so a future cull change can't silently clip them. `FaceNormal::CROSS` (index 6) marks flora quads; the vertex shader gives them fixed up-facing light so the two diagonals never shade differently.
+
+## 4b. The water pass
+
+Water renders **after the scene pass resolves**, in its own single-sample color-only pass onto `_colorResolve`:
+
+- The fragment shader composites its own pixels: screen-space **refraction** from a blit copy of the resolved color (a render target cannot sample itself), depth-based absorption, procedural caustics on the refracted floor, fresnel sky reflection + sun sparkle, and the shared exponential fog. No blending state — the shader owns the pixel.
+- **No depth attachment**: the shader depth-tests manually against `_depthResolve` and discards occluded fragments. **Why:** binding the resolved depth as an attachment while also sampling it for world-position reconstruction is a same-texture hazard.
+- Draws sort **back-to-front by chunk distance** so the nearest surface writes last; intra-chunk order is unsorted (accepted artifact: stacked same-color water surfaces blend in encounter order).
+- The underwater overlay (veil + god rays + floor caustics) draws last in this pass with alpha blending when the camera cell is water.
+- Anything that must appear **behind** water has to encode in the scene pass; anything drawn after the water pass floats above it.
 
 ## 5. Verification is part of the change
 
@@ -47,4 +60,6 @@ For any diff touching `src/render/`, `shaders/`, or Metal API calls, check in or
 4. New fullscreen sampling pass: V flipped?
 5. Per-frame dynamic data: ring-buffered or otherwise safe against encode-vs-execute overwrite?
 6. Matrix or coordinate math: consistent with column-vector/[0,1]-depth conventions, and covered by the math tests if a factory changed?
-7. Was the game actually run with validation on, and a captured frame inspected? Say so in the PR.
+7. New geometry with sub-block offsets: multiples of 0.125 in chunk-local fp16?
+8. New translucent or post-resolve geometry: encoded in the right pass relative to water (behind → scene pass, above → after), and verified with an over-water and underwater capture?
+9. Was the game actually run with validation on, and a captured frame inspected? Say so in the PR.

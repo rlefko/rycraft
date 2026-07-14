@@ -1,5 +1,7 @@
 #include "world/save_manager.hpp"
 
+#include "world/chunk_pos.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -29,38 +31,37 @@ SaveManager::~SaveManager() {
 }
 
 void SaveManager::saveChunk(const Chunk& chunk) {
-    // Serialize chunk
-    std::vector<uint8_t> serialized = ChunkSerializer::serialize(chunk);
+    saveChunkAsync(std::make_shared<const Chunk>(chunk));
+}
 
-    // Compress with LZ4
-    std::vector<uint8_t> compressed = compress(serialized);
-
-    // Determine region file path
-    std::string regionPath = getRegionPath(chunk.chunkX, chunk.chunkZ);
-
-    // Create save job
-    SaveJob job;
-    job.regionFile = regionPath;
-    job.compressedData = std::move(compressed);
-    job.chunkIndex = getChunkIndexInRegion(chunk.chunkX, chunk.chunkZ);
-
-    // Queue the job
+void SaveManager::saveChunkAsync(std::shared_ptr<const Chunk> chunk) {
+    uint64_t key = packChunkKey(chunk->chunkX, chunk->chunkZ);
     {
         std::lock_guard<std::mutex> lock(saveMutex_);
-        saveQueue_.push(std::move(job));
+        // A newer snapshot of the same chunk simply replaces the shield
+        // entry; both queued jobs still write (last write wins on disk)
+        pendingChunks_[key] = chunk;
+        saveQueue_.push(SaveJob{std::move(chunk)});
     }
 
-    // Mark as pending write
     pendingWrites_.fetch_add(1, std::memory_order_acq_rel);
-
     saveCondition_.notify_one();
 }
 
 std::optional<Chunk> SaveManager::loadChunk(int chunkX, int chunkZ) const {
-    std::string regionPath = getRegionPath(chunkX, chunkZ);
+    // Load shield: a chunk that was just unloaded may still sit in the save
+    // queue — walking back toward it must see the queued edits, not the
+    // stale file on disk.
+    {
+        std::lock_guard<std::mutex> lock(saveMutex_);
+        auto it = pendingChunks_.find(packChunkKey(chunkX, chunkZ));
+        if (it != pendingChunks_.end()) {
+            return Chunk(*it->second);
+        }
+    }
 
     // Read file
-    auto fileData = readFile(regionPath);
+    auto fileData = readFile(getChunkPath(chunkX, chunkZ));
     if (!fileData.has_value()) {
         return std::nullopt;
     }
@@ -231,8 +232,21 @@ void SaveManager::saveLoop() {
             saveQueue_.pop();
         }
 
-        // Write to file
-        writeFile(job.regionFile, job.compressedData);
+        // Serialize + compress here, off the game threads
+        std::vector<uint8_t> compressed = compress(ChunkSerializer::serialize(*job.chunk));
+        std::string path = getChunkPath(job.chunk->chunkX, job.chunk->chunkZ);
+        ensureDirectory(getChunkDir(job.chunk->chunkX, job.chunk->chunkZ));
+        writeFile(path, compressed);
+
+        // Drop the load shield only if no newer snapshot replaced ours
+        {
+            std::lock_guard<std::mutex> lock(saveMutex_);
+            uint64_t key = packChunkKey(job.chunk->chunkX, job.chunk->chunkZ);
+            auto it = pendingChunks_.find(key);
+            if (it != pendingChunks_.end() && it->second == job.chunk) {
+                pendingChunks_.erase(it);
+            }
+        }
 
         // Mark write as complete
         pendingWrites_.fetch_sub(1, std::memory_order_release);
@@ -285,12 +299,15 @@ std::vector<uint8_t> SaveManager::decompress(const std::vector<uint8_t>& data,
     return decompressed;
 }
 
-std::string SaveManager::getRegionPath(int chunkX, int chunkZ) const {
-    int regionX = getRegionCoord(chunkX);
-    int regionZ = getRegionCoord(chunkZ);
-
+std::string SaveManager::getChunkDir(int chunkX, int chunkZ) const {
     std::ostringstream oss;
-    oss << regionsPath_ << "/r." << regionX << "." << regionZ << ".dat";
+    oss << regionsPath_ << "/r." << getRegionCoord(chunkX) << "." << getRegionCoord(chunkZ);
+    return oss.str();
+}
+
+std::string SaveManager::getChunkPath(int chunkX, int chunkZ) const {
+    std::ostringstream oss;
+    oss << getChunkDir(chunkX, chunkZ) << "/c." << chunkX << "." << chunkZ << ".dat";
     return oss.str();
 }
 
@@ -300,10 +317,8 @@ int SaveManager::getRegionCoord(int chunkCoord) {
     return (chunkCoord >= 0) ? (chunkCoord / 32) : ((chunkCoord - 31) / 32);
 }
 
-int SaveManager::getChunkIndexInRegion(int chunkX, int chunkZ) {
-    int localX = (chunkX % 32 + 32) % 32;
-    int localZ = (chunkZ % 32 + 32) % 32;
-    return localZ * 32 + localX;
+uint64_t SaveManager::packChunkKey(int chunkX, int chunkZ) {
+    return ChunkPos{chunkX, chunkZ}.packed(); // THE xz key bit layout
 }
 
 bool SaveManager::ensureDirectory(const std::string& path) const {
@@ -316,15 +331,24 @@ bool SaveManager::ensureDirectory(const std::string& path) const {
 }
 
 bool SaveManager::writeFile(const std::string& path, const std::vector<uint8_t>& data) const {
-    std::ofstream file(path, std::ios::binary);
-    if (!file.is_open()) {
-        return false;
+    // Write-temp-then-rename: a crash mid-write can never leave a truncated
+    // chunk file behind (rename is atomic on APFS)
+    std::string tempPath = path + ".tmp";
+    {
+        std::ofstream file(tempPath, std::ios::binary);
+        if (!file.is_open()) {
+            return false;
+        }
+        file.write(reinterpret_cast<const char*>(data.data()),
+                   static_cast<std::streamsize>(data.size()));
+        if (!file.good()) {
+            return false;
+        }
     }
 
-    file.write(reinterpret_cast<const char*>(data.data()),
-               static_cast<std::streamsize>(data.size()));
-    file.close();
-    return true;
+    std::error_code ec;
+    fs::rename(tempPath, path, ec);
+    return !ec;
 }
 
 std::optional<std::vector<uint8_t>> SaveManager::readFile(const std::string& path) const {

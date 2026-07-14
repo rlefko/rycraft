@@ -16,19 +16,46 @@
 // lookup table.
 // ---------------------------------------------------------------------------
 
-// Extra layers beyond the per-block-type ones.
+// Extra layers beyond the per-block-type ones (anchored at BlockType::COUNT
+// so they slide automatically when the enum grows).
 inline constexpr uint8_t TEXTURE_LAYER_GRASS_SIDE = static_cast<uint8_t>(BlockType::COUNT);
 inline constexpr uint8_t TEXTURE_LAYER_WHITE = TEXTURE_LAYER_GRASS_SIDE + 1;
-inline constexpr uint8_t TEXTURE_LAYER_COUNT = TEXTURE_LAYER_WHITE + 1;
+inline constexpr uint8_t TEXTURE_LAYER_LOG_TOP = TEXTURE_LAYER_WHITE + 1;
+inline constexpr uint8_t TEXTURE_LAYER_BIRCH_LOG_TOP = TEXTURE_LAYER_LOG_TOP + 1;
+inline constexpr uint8_t TEXTURE_LAYER_CACTUS_TOP = TEXTURE_LAYER_BIRCH_LOG_TOP + 1;
+inline constexpr uint8_t TEXTURE_LAYER_SANDSTONE_TOP = TEXTURE_LAYER_CACTUS_TOP + 1;
+inline constexpr uint8_t TEXTURE_LAYER_COUNT = TEXTURE_LAYER_SANDSTONE_TOP + 1;
 
 // Which array layer a given face of a block samples.
 constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
-    if (type == BlockType::GRASS) {
-        if (face == FaceNormal::PLUS_Y) return static_cast<uint8_t>(BlockType::GRASS);
-        if (face == FaceNormal::MINUS_Y) return static_cast<uint8_t>(BlockType::DIRT);
-        return TEXTURE_LAYER_GRASS_SIDE;
+    switch (type) {
+        case BlockType::GRASS:
+            if (face == FaceNormal::PLUS_Y) return static_cast<uint8_t>(BlockType::GRASS);
+            if (face == FaceNormal::MINUS_Y) return static_cast<uint8_t>(BlockType::DIRT);
+            return TEXTURE_LAYER_GRASS_SIDE;
+        case BlockType::LOG:
+            if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
+                return TEXTURE_LAYER_LOG_TOP;
+            return static_cast<uint8_t>(type);
+        case BlockType::BIRCH_LOG:
+            if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
+                return TEXTURE_LAYER_BIRCH_LOG_TOP;
+            return static_cast<uint8_t>(type);
+        case BlockType::SPRUCE_LOG: // dark bark shares the oak end-grain rings
+            if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
+                return TEXTURE_LAYER_LOG_TOP;
+            return static_cast<uint8_t>(type);
+        case BlockType::CACTUS:
+            if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
+                return TEXTURE_LAYER_CACTUS_TOP;
+            return static_cast<uint8_t>(type);
+        case BlockType::SANDSTONE:
+            if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
+                return TEXTURE_LAYER_SANDSTONE_TOP;
+            return static_cast<uint8_t>(type);
+        default:
+            return static_cast<uint8_t>(type);
     }
-    return static_cast<uint8_t>(type);
 }
 
 // Pack a face normal, texture layer, and sky-light level into the vertex

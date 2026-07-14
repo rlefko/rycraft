@@ -21,17 +21,18 @@
 #include <render/block_textures.hpp>
 #include <render/lod_mesher.hpp>
 #include <render/mega_buffer.hpp>
+#include <render/mesh_scheduler.hpp>
 #include <render/shader_types.hpp>
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
 #include <render/vertex.hpp>
-#include <world/biome.hpp>
 #include <world/chunk.hpp>
+#include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
+#include <world/climate.hpp>
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
-#include <world/terrain.hpp>
 #include <world/world.hpp>
 
 #include <chrono>
@@ -136,6 +137,299 @@ TEST_CASE("Mesher: 2x2 flat merges top face", "[render][mesher]") {
         }
     }
     REQUIRE(foundTopQuad);
+}
+
+TEST_CASE("Mesher: flora emits an inset cross of two quads", "[render][mesher][flora]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::GRASS);
+    chunk.setBlock(8, 65, 8, BlockType::TALL_GRASS);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // Grass cube: 6 quads = 24 vertices. Flora: 2 quads = 8 vertices.
+    // (Flora is non-opaque, so all six grass faces still render.)
+    REQUIRE(output.vertices.size() == 32);
+    REQUIRE(output.indices.size() == 48);
+
+    int crossVerts = 0;
+    for (const Vertex& v : output.vertices) {
+        if (unpackFace(v.faceAttr) != FaceNormal::CROSS)
+            continue;
+        ++crossVerts;
+        REQUIRE(unpackTextureLayer(v.faceAttr) == static_cast<uint8_t>(BlockType::TALL_GRASS));
+        // Inset 0.125 from the cell walls, spanning the full cell height
+        float px = static_cast<float>(v.px);
+        float py = static_cast<float>(v.py);
+        float pz = static_cast<float>(v.pz);
+        REQUIRE((px == 8.125f || px == 8.875f));
+        REQUIRE((pz == 8.125f || pz == 8.875f));
+        REQUIRE((py == 65.f || py == 66.f));
+    }
+    REQUIRE(crossVerts == 8);
+}
+
+TEST_CASE("Mesher: flora does not break greedy merging of the ground", "[render][mesher][flora]") {
+    Chunk chunk(0, 0);
+    // 2x2 grass floor with one flower on top: the floor's +Y face must still
+    // merge into a single quad (flora neither occludes nor casts shade)
+    for (int z = 0; z < 2; ++z)
+        for (int x = 0; x < 2; ++x)
+            chunk.setBlock(x, 64, z, BlockType::GRASS);
+    chunk.setBlock(0, 65, 0, BlockType::FLOWER_RED);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // 2x2 slab = 24 vertices (all faces merged) + 8 flora vertices
+    REQUIRE(output.vertices.size() == 32);
+}
+
+TEST_CASE("Mesher: water surfaces land in the water section", "[render][mesher][water]") {
+    Chunk chunk(0, 0);
+    // Stone floor with one water block on top: the water's top face (under
+    // air) and four sides are water-section; the floor's faces are opaque.
+    chunk.setBlock(8, 60, 8, BlockType::STONE);
+    chunk.setBlock(8, 61, 8, BlockType::WATER);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // Opaque: stone cube 6 faces (water doesn't hide the +Y face) = 36 idx.
+    // Water: top + 4 sides = 5 quads = 30 indices (bottom hidden by stone).
+    REQUIRE(output.opaqueIndexCount == 36);
+    REQUIRE(output.indices.size() == 66);
+
+    // The water top surface sits 0.125 below the cell top (fp16-exact)
+    bool foundDroppedTop = false;
+    for (const Vertex& v : output.vertices) {
+        if (static_cast<float>(v.py) == 61.875f)
+            foundDroppedTop = true;
+    }
+    REQUIRE(foundDroppedTop);
+}
+
+TEST_CASE("Mesher: interior water-water faces are culled", "[render][mesher][water]") {
+    Chunk chunk(0, 0);
+    // 2x2x2 water cube on a stone slab
+    for (int z = 4; z < 6; ++z)
+        for (int x = 4; x < 6; ++x) {
+            chunk.setBlock(x, 59, z, BlockType::STONE);
+            chunk.setBlock(x, 60, z, BlockType::WATER);
+            chunk.setBlock(x, 61, z, BlockType::WATER);
+        }
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // Water section: greedy-merged top (1 quad) + 4 merged side walls
+    // (2 wide × 2 tall each → 1 quad per direction) = 5 quads = 30 indices
+    uint32_t waterIndexCount =
+        static_cast<uint32_t>(output.indices.size()) - output.opaqueIndexCount;
+    REQUIRE(waterIndexCount == 30);
+}
+
+TEST_CASE("Mesher: lava renders as an opaque cube section", "[render][mesher][water]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 8, 8, BlockType::LAVA);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    // 6 faces, all in the opaque section; nothing in the water section
+    REQUIRE(output.opaqueIndexCount == 36);
+    REQUIRE(output.indices.size() == 36);
+}
+
+// ============================================================================
+// Neighbor-aware (snapshot) meshing — chunk border correctness
+// ============================================================================
+
+TEST_CASE("Snapshot mesher: boundary faces follow real neighbor blocks",
+          "[render][mesher][border]") {
+    MeshSnapshot snapshot;
+    snapshot.resize();
+    // One stone block on the +X border of the chunk
+    snapshot.blocks[MeshSnapshot::index(15, 64, 8)] = BlockType::STONE;
+
+    MeshScratch scratch;
+
+    // Case 1: neighbor cell across the border is AIR → the +X boundary face
+    // must exist (the old mesher skipped the boundary layer: a hole)
+    {
+        MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+        REQUIRE(output.vertices.size() == 24); // full cube
+        bool plusXAt16 = false;
+        for (const Vertex& v : output.vertices) {
+            if (unpackFace(v.faceAttr) == FaceNormal::PLUS_X && static_cast<float>(v.px) == 16.f)
+                plusXAt16 = true;
+        }
+        REQUIRE(plusXAt16);
+    }
+
+    // Case 2: neighbor cell solid → the boundary face is culled (the old
+    // mesher's -X pass always emitted a hidden wall from the other side)
+    {
+        snapshot.blocks[MeshSnapshot::index(16, 64, 8)] = BlockType::STONE;
+        MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+        REQUIRE(output.vertices.size() == 20); // cube minus the shared face
+        for (const Vertex& v : output.vertices) {
+            REQUIRE(!(unpackFace(v.faceAttr) == FaceNormal::PLUS_X &&
+                      static_cast<float>(v.px) == 16.f));
+        }
+    }
+}
+
+TEST_CASE("Snapshot mesher: -X border wall culled against a solid neighbor",
+          "[render][mesher][border]") {
+    MeshSnapshot snapshot;
+    snapshot.resize();
+    snapshot.blocks[MeshSnapshot::index(0, 64, 8)] = BlockType::STONE;
+    // Solid neighbor wall behind it (x = -1)
+    snapshot.blocks[MeshSnapshot::index(-1, 64, 8)] = BlockType::STONE;
+
+    MeshScratch scratch;
+    MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    REQUIRE(output.vertices.size() == 20);
+    for (const Vertex& v : output.vertices) {
+        REQUIRE(
+            !(unpackFace(v.faceAttr) == FaceNormal::MINUS_X && static_cast<float>(v.px) == 0.f));
+    }
+}
+
+TEST_CASE("MegaBuffer free-list coalescing is bounds-safe and lossless", "[render][megabuffer]") {
+    using Region = std::pair<uint64_t, uint64_t>;
+
+    // Regression: a single-entry list made the old compaction write one
+    // element past the vector's end — slow heap corruption that surfaced as
+    // buzzing audio and malloc traps minutes into a session.
+    std::vector<Region> single = {{256, 512}};
+    MegaBuffer::coalesceFreeList(single);
+    REQUIRE(single == std::vector<Region>{{256, 512}});
+
+    // Adjacent regions merge (any input order)…
+    std::vector<Region> adjacent = {{768, 256}, {256, 512}};
+    MegaBuffer::coalesceFreeList(adjacent);
+    REQUIRE(adjacent == std::vector<Region>{{256, 768}});
+
+    // …gaps survive, and the LAST region is kept (the old code erased it)
+    std::vector<Region> gapped = {{0, 256}, {512, 256}, {2048, 256}};
+    MegaBuffer::coalesceFreeList(gapped);
+    REQUIRE(gapped == std::vector<Region>{{0, 256}, {512, 256}, {2048, 256}});
+
+    // Chain of three merges into one
+    std::vector<Region> chain = {{512, 256}, {0, 512}, {768, 1024}};
+    MegaBuffer::coalesceFreeList(chain);
+    REQUIRE(chain == std::vector<Region>{{0, 1792}});
+
+    std::vector<Region> empty;
+    MegaBuffer::coalesceFreeList(empty);
+    REQUIRE(empty.empty());
+}
+
+TEST_CASE("MeshScheduler: builds off-thread with version stamps", "[render][scheduler]") {
+    World world(42, 2);
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dx = -1; dx <= 1; ++dx)
+            world.getChunk(dx, dz);
+
+    MeshScheduler scheduler(world, 1);
+    REQUIRE(scheduler.enqueue(ChunkPos{0, 0}));
+
+    std::vector<MeshResult> results;
+    for (int i = 0; i < 500 && results.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        scheduler.drainCompleted(results);
+    }
+    REQUIRE(results.size() == 1);
+    REQUIRE(results[0].pos == ChunkPos{0, 0});
+    REQUIRE(results[0].snapshotOk);
+    REQUIRE(results[0].builtVersion == world.getChunk(0, 0)->version.load());
+    REQUIRE(!results[0].mesh.vertices.empty());
+
+    // A chunk without generated neighbors reports the failed snapshot
+    // instead of blocking (the renderer retries once the frontier catches up)
+    REQUIRE(scheduler.enqueue(ChunkPos{40, 40}));
+    results.clear();
+    for (int i = 0; i < 500 && results.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        scheduler.drainCompleted(results);
+    }
+    REQUIRE(results.size() == 1);
+    REQUIRE(!results[0].snapshotOk);
+
+    // Shutdown is idempotent and refuses further work
+    scheduler.shutdown();
+    scheduler.shutdown();
+    REQUIRE(!scheduler.enqueue(ChunkPos{0, 0}));
+}
+
+TEST_CASE("World snapshotForMeshing requires generated neighbors", "[world][mesher][border]") {
+    World world(4242, 2);
+    MeshSnapshot snapshot;
+
+    // Nothing generated yet
+    REQUIRE(!world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
+
+    // Self + only some neighbors
+    world.getChunk(0, 0);
+    world.getChunk(1, 0);
+    REQUIRE(!world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
+
+    world.getChunk(-1, 0);
+    world.getChunk(0, 1);
+    world.getChunk(0, -1);
+    REQUIRE(world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
+
+    // The padded walls carry the neighbors' real border blocks
+    auto neighbor = world.getChunk(1, 0);
+    for (int y = 0; y < CHUNK_HEIGHT; y += 13) {
+        for (int z = 0; z < CHUNK_DEPTH; ++z) {
+            REQUIRE(snapshot.at(CHUNK_WIDTH, y, z) == neighbor->getBlock(0, y, z));
+        }
+    }
+}
+
+TEST_CASE("World setBlock marks boundary neighbors for remeshing", "[world][mesher][border]") {
+    World world(7, 2);
+    world.getChunk(0, 0);
+    world.getChunk(-1, 0);
+    world.getChunk(0, -1);
+    auto self = world.getChunk(0, 0);
+    auto negX = world.getChunk(-1, 0);
+    auto negZ = world.getChunk(0, -1);
+
+    self->needsMeshUpdate = false;
+    negX->needsMeshUpdate = false;
+    negZ->needsMeshUpdate = false;
+
+    // Interior edit: only the chunk itself
+    world.setBlock(8, 100, 8, BlockType::STONE);
+    REQUIRE(self->needsMeshUpdate);
+    REQUIRE(!negX->needsMeshUpdate);
+
+    // Boundary edit at local x == 0: the -X neighbor re-meshes too
+    self->needsMeshUpdate = false;
+    world.setBlock(0, 100, 8, BlockType::STONE);
+    REQUIRE(self->needsMeshUpdate);
+    REQUIRE(negX->needsMeshUpdate);
+    REQUIRE(!negZ->needsMeshUpdate);
+}
+
+TEST_CASE("Mesher: flora is skipped at coarse LODs", "[render][mesher][flora]") {
+    Chunk chunk(0, 0);
+    for (int z = 0; z < CHUNK_DEPTH; ++z)
+        for (int x = 0; x < CHUNK_WIDTH; ++x) {
+            chunk.setBlock(x, 64, z, BlockType::GRASS);
+            chunk.setBlock(x, 65, z, BlockType::TALL_GRASS);
+        }
+
+    LODMesher mesher;
+    MeshOutput medium = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::MEDIUM));
+    for (const Vertex& v : medium.vertices) {
+        REQUIRE(unpackFace(v.faceAttr) != FaceNormal::CROSS);
+        REQUIRE(unpackTextureLayer(v.faceAttr) != static_cast<uint8_t>(BlockType::TALL_GRASS));
+    }
 }
 
 TEST_CASE("Mesher: vertical column merges side faces", "[render][mesher]") {
@@ -654,6 +948,15 @@ TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types
     REQUIRE(sizeof(SkyUniforms) == 80);
     REQUIRE(offsetof(SkyUniforms, horizonColor) == 16);
     REQUIRE(offsetof(SkyUniforms, sunIntensity) == 64);
+}
+
+TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(WaterUniforms) == 192);
+    REQUIRE(offsetof(WaterUniforms, zenithColor) == 64);
+    REQUIRE(offsetof(WaterUniforms, resolution) == 160);
+    REQUIRE(offsetof(WaterUniforms, fogDensity) == 168);
+    REQUIRE(offsetof(WaterUniforms, time) == 172);
+    REQUIRE(offsetof(WaterUniforms, cameraUnderwater) == 176);
 }
 
 TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-types]") {

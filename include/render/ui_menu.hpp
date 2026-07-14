@@ -59,6 +59,12 @@ struct PerformanceStats {
     uint32_t chunkCount = 0;
     uint32_t entityCount = 0;
     float frameTimeMs = 0.f;
+    uint32_t pendingChunks = 0; // generation backlog + in-flight
+    float genMsAvg = 0.f;       // EMA of per-chunk generation time
+    float meshMsAvg = 0.f;      // EMA of per-chunk mesh build time
+    uint32_t meshBuildsFrame = 0;
+    float megaUsedMB = 0.f; // mega-buffer vertex bytes in use
+    float megaCapMB = 0.f;
 };
 
 // Everything the UI pass needs to draw one frame.
@@ -66,6 +72,7 @@ struct UIFrameState {
     GameScreen screen = GameScreen::TITLE;
     int hoveredButton = -1; // index into menu.buttons, -1 = none
     bool showDebugHud = false;
+    bool cameraUnderwater = false; // drives the underwater veil + god rays
     PerformanceStats stats{};
     MenuLayout menu;
 };

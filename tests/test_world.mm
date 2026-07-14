@@ -25,17 +25,18 @@
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
 #include <render/vertex.hpp>
-#include <world/biome.hpp>
 #include <world/chunk.hpp>
+#include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
+#include <world/climate.hpp>
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
-#include <world/terrain.hpp>
 #include <world/world.hpp>
 
 #include <chrono>
 #include <cmath>
+#include <memory>
 #include <thread>
 
 // ============================================================================
@@ -57,6 +58,7 @@ TEST_CASE("Chunk coordinates are multiples of CHUNK_SIZE", "[chunk]") {
 }
 
 TEST_CASE("BlockType enum values are as expected", "[block]") {
+    // Saves store raw enum bytes: existing values must never renumber
     REQUIRE(static_cast<int>(BlockType::AIR) == 0);
     REQUIRE(static_cast<int>(BlockType::STONE) == 1);
     REQUIRE(static_cast<int>(BlockType::GRASS) == 2);
@@ -65,7 +67,50 @@ TEST_CASE("BlockType enum values are as expected", "[block]") {
     REQUIRE(static_cast<int>(BlockType::BEDROCK) == 7);
     REQUIRE(static_cast<int>(BlockType::LOG) == 8);
     REQUIRE(static_cast<int>(BlockType::LEAVES) == 9);
-    REQUIRE(static_cast<int>(BlockType::COUNT) == 17);
+    REQUIRE(static_cast<int>(BlockType::GLASS) == 16);
+    REQUIRE(static_cast<int>(BlockType::COBBLESTONE) == 17);
+    REQUIRE(static_cast<int>(BlockType::REED) == 31);
+    REQUIRE(static_cast<int>(BlockType::ICE) == 33);
+    REQUIRE(static_cast<int>(BlockType::COUNT) == 34);
+}
+
+TEST_CASE("Block properties: flora, liquid, and targetable sets", "[block]") {
+    // Flora: cross-quad plants — non-solid, non-opaque, but targetable
+    for (BlockType bt : {BlockType::DEAD_BUSH, BlockType::TALL_GRASS, BlockType::FLOWER_YELLOW,
+                         BlockType::FLOWER_RED, BlockType::MUSHROOM_BROWN, BlockType::MUSHROOM_RED,
+                         BlockType::REED}) {
+        REQUIRE(isFlora(bt));
+        REQUIRE(!isSolid(bt));
+        REQUIRE(!isOpaque(bt));
+        REQUIRE(isTargetable(bt));
+    }
+    REQUIRE(!isFlora(BlockType::CACTUS)); // cactus is a full cube
+
+    // Liquids: swimmable, non-solid, click-through. Water renders in the
+    // water pass (non-opaque); lava draws as an emissive opaque cube.
+    for (BlockType bt : {BlockType::WATER, BlockType::LAVA}) {
+        REQUIRE(isLiquid(bt));
+        REQUIRE(!isSolid(bt));
+        REQUIRE(!isTargetable(bt));
+    }
+    REQUIRE(!isOpaque(BlockType::WATER));
+    REQUIRE(isOpaque(BlockType::LAVA));
+    REQUIRE(rendersAsCube(BlockType::LAVA));
+    REQUIRE(!rendersAsCube(BlockType::WATER));
+
+    // Cube blocks added by the worldgen overhaul stay solid + opaque
+    for (BlockType bt :
+         {BlockType::COBBLESTONE, BlockType::MOSSY_COBBLESTONE, BlockType::SANDSTONE,
+          BlockType::BIRCH_LOG, BlockType::SPRUCE_LOG, BlockType::CACTUS, BlockType::ICE}) {
+        REQUIRE(isSolid(bt));
+        REQUIRE(isOpaque(bt));
+    }
+
+    // Leaf variants cut out like oak leaves
+    for (BlockType bt : {BlockType::BIRCH_LEAVES, BlockType::SPRUCE_LEAVES}) {
+        REQUIRE(isSolid(bt));
+        REQUIRE(!isOpaque(bt));
+    }
 }
 
 // ============================================================================
@@ -181,143 +226,415 @@ TEST_CASE("SimplexNoise operator() equals noise2D", "[noise]") {
 }
 
 // ============================================================================
-// Terrain Generator Tests
+// Climate / terrain shaping tests
 // ============================================================================
 
-TEST_CASE("TerrainGenerator height within [minHeight, maxHeight]", "[terrain]") {
-    TerrainGenerator terrain(42);
-    TerrainConfig config;
-    config.minHeight = 20.0;
-    config.maxHeight = 128.0;
+TEST_CASE("ClimateSampler shapeColumn is deterministic and sane", "[climate]") {
+    ClimateSampler c1(123);
+    ClimateSampler c2(123);
+    for (int i = -50; i <= 50; i += 7) {
+        ColumnShape a = c1.shapeColumn(i * 31.0, i * 17.0);
+        ColumnShape b = c2.shapeColumn(i * 31.0, i * 17.0);
+        REQUIRE(a.height == b.height);
+        REQUIRE(a.climate.temperature == b.climate.temperature);
+        REQUIRE(a.height >= 20.0);
+        REQUIRE(a.height <= 240.0);
+        REQUIRE(a.detailAmp >= 0.0);
+        REQUIRE(a.ravineEdge >= 0.0);
+        REQUIRE(a.ravineEdge <= 1.0);
+    }
+}
 
-    for (int ix = -100; ix <= 100; ix += 10) {
-        for (int iz = -100; iz <= 100; iz += 10) {
-            double h = terrain.getHeight(static_cast<double>(ix), static_cast<double>(iz), config);
-            REQUIRE(h >= config.minHeight);
-            REQUIRE(h <= config.maxHeight);
+TEST_CASE("selectBiome: ordered rules on the climate fields", "[climate]") {
+    ColumnShape shape;
+    shape.height = 40.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::DEEP_OCEAN);
+    shape.height = 58.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::OCEAN);
+
+    shape.height = 80.0;
+    shape.climate.temperature = -0.6;
+    shape.climate.humidity = 0.3;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::TAIGA);
+    shape.climate.humidity = -0.3;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::ICE_SPIKES);
+
+    shape.climate.temperature = 0.7;
+    shape.climate.humidity = -0.5;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::DESERT);
+
+    shape.climate.temperature = 0.3;
+    shape.climate.humidity = 0.4;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::FOREST);
+    shape.climate.temperature = -0.2;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::BIRCH_FOREST);
+
+    shape.climate.humidity = 0.6;
+    shape.height = 66.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::SWAMP);
+
+    shape.climate.humidity = 0.1;
+    shape.climate.temperature = 0.4;
+    shape.height = 80.0;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::FLOWER_FIELD);
+
+    shape.climate.humidity = -0.1;
+    shape.climate.temperature = 0.1;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::PLAINS);
+
+    shape.riverCut = 4.0;
+    shape.height = 60.0;
+    shape.climate.continentalness = 0.3;
+    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::RIVER);
+}
+
+TEST_CASE("Terrain height is continuous — no biome cliffs", "[climate][worldgen]") {
+    // The old design added per-biome height offsets after a discrete biome
+    // pick, which produced 15-block-in-one-step walls at biome borders.
+    // Height now reads continuous splines only. The steepest legitimate
+    // slope is a river gorge bank through a high plateau (~7 blocks per
+    // column); a discrete-biome cliff would blow well past this bound.
+    ChunkGenerator gen(4242);
+    GenScratch scratch;
+    scratch.reset(&gen);
+    double prev = gen.baseHeightAt(-256, 100, scratch);
+    for (int x = -255; x <= 256; ++x) {
+        double h = gen.baseHeightAt(x, 100, scratch);
+        REQUIRE(std::abs(h - prev) <= 8.0);
+        prev = h;
+    }
+}
+
+// ============================================================================
+// ChunkGenerator tests
+// ============================================================================
+
+namespace {
+// Blocks the terrain fill + surface pass produce — decorations (trees,
+// structures, flora, ice caps) may legitimately rise above the height map,
+// raw terrain must not.
+bool isTerrainBlock(BlockType b) {
+    switch (b) {
+        case BlockType::STONE:
+        case BlockType::DIRT:
+        case BlockType::GRASS:
+        case BlockType::SAND:
+        case BlockType::GRAVEL:
+        case BlockType::SNOW:
+        case BlockType::BEDROCK:
+        case BlockType::COAL_ORE:
+        case BlockType::IRON_ORE:
+        case BlockType::GOLD_ORE:
+        case BlockType::DIAMOND_ORE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Column-level invariants every generated chunk must satisfy.
+void checkChunkInvariants(const Chunk& chunk) {
+    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+            // Bedrock floor
+            REQUIRE(chunk.getBlock(lx, 0, lz) == BlockType::BEDROCK);
+            REQUIRE(chunk.getBlock(lx, 1, lz) == BlockType::BEDROCK);
+
+            // heightMap records the raw terrain surface; structures may
+            // later carve or pave that exact cell, so only the "no terrain
+            // above it" direction is asserted.
+            int top = chunk.heightMap[lx + lz * CHUNK_WIDTH];
+            REQUIRE(top >= 2);
+
+            for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                BlockType b = chunk.getBlock(lx, y, lz);
+                // No raw terrain above the height map (the old carver's
+                // floating-surface bug); decorations are allowed there
+                if (y > top) {
+                    REQUIRE(!isTerrainBlock(b));
+                }
+                // Water never rests directly on air; lava only pools at
+                // the very bottom (well shafts sit above ground level)
+                if (b == BlockType::WATER && y < 64) {
+                    REQUIRE(chunk.getBlock(lx, y - 1, lz) != BlockType::AIR);
+                }
+                if (b == BlockType::LAVA) {
+                    REQUIRE(y <= 10);
+                }
+                if (b == BlockType::ICE) {
+                    REQUIRE(y == 63);
+                }
+            }
+        }
+    }
+}
+} // namespace
+
+TEST_CASE("ChunkGenerator: same seed → bit-identical chunk, different seed differs", "[worldgen]") {
+    ChunkGenerator g1(777);
+    ChunkGenerator g2(777);
+    ChunkGenerator g3(778);
+    Chunk a(5, -3), b(5, -3), c(5, -3);
+    g1.generate(a);
+    g2.generate(b);
+    g3.generate(c);
+    REQUIRE(a.blocks == b.blocks);
+    REQUIRE(a.biomes == b.biomes);
+    REQUIRE(a.heightMap == b.heightMap);
+    REQUIRE(a.blocks != c.blocks);
+}
+
+TEST_CASE("ChunkGenerator: column invariants hold across varied chunks", "[worldgen]") {
+    ChunkGenerator gen(1234);
+    for (auto [cx, cz] : {std::pair{0, 0}, {5, 7}, {-3, 2}, {40, -25}}) {
+        Chunk chunk(cx, cz);
+        gen.generate(chunk);
+        checkChunkInvariants(chunk);
+    }
+}
+
+TEST_CASE("ChunkGenerator: underground carve fraction is sane", "[worldgen][caves]") {
+    // The old carver's inverted threshold hollowed out ~99% of the
+    // underground (the bug this overhaul fixes). Keep the carved fraction
+    // in a believable band across several chunks.
+    ChunkGenerator gen(31337);
+    int air = 0, total = 0;
+    for (auto [cx, cz] : {std::pair{0, 0}, {3, 1}, {-2, -4}, {10, 6}}) {
+        Chunk chunk(cx, cz);
+        gen.generate(chunk);
+        for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+            for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+                int top = chunk.heightMap[lx + lz * CHUNK_WIDTH];
+                for (int y = 8; y < top - 10; ++y) {
+                    ++total;
+                    BlockType b = chunk.getBlock(lx, y, lz);
+                    if (b == BlockType::AIR || b == BlockType::LAVA)
+                        ++air;
+                }
+            }
+        }
+    }
+    REQUIRE(total > 0);
+    double fraction = static_cast<double>(air) / static_cast<double>(total);
+    REQUIRE(fraction >= 0.01);
+    REQUIRE(fraction <= 0.30);
+}
+
+TEST_CASE("ChunkGenerator: surfaceYAt matches the generated height map", "[worldgen]") {
+    ChunkGenerator gen(9999);
+    GenScratch scratch;
+    scratch.reset(&gen);
+    Chunk chunk(2, -7);
+    gen.generate(chunk);
+    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+            int wx = chunk.chunkX * CHUNK_WIDTH + lx;
+            int wz = chunk.chunkZ * CHUNK_DEPTH + lz;
+            REQUIRE(gen.surfaceYAt(wx, wz, scratch) == chunk.heightMap[lx + lz * CHUNK_WIDTH]);
         }
     }
 }
 
-TEST_CASE("TerrainGenerator deterministic output", "[terrain]") {
-    TerrainGenerator t1(123);
-    TerrainGenerator t2(123);
-
-    double a = t1.getHeight(100.0, 200.0);
-    double b = t2.getHeight(100.0, 200.0);
-    REQUIRE(a == b);
-}
-
-TEST_CASE("TerrainGenerator getNoise is deterministic", "[terrain]") {
-    TerrainGenerator terrain(42);
-    double a = terrain.getNoise(10.0, 20.0);
-    double b = terrain.getNoise(10.0, 20.0);
-    REQUIRE(a == b);
+TEST_CASE("ChunkGenerator: chunks are generation-order independent", "[worldgen]") {
+    // Generate the same 2x1 area in both orders across separate generators;
+    // every block must agree (the purity contract for infinite worlds).
+    ChunkGenerator g1(5150);
+    ChunkGenerator g2(5150);
+    Chunk a0(0, 0), a1(1, 0);
+    g1.generate(a0);
+    g1.generate(a1);
+    Chunk b1(1, 0), b0(0, 0);
+    g2.generate(b1);
+    g2.generate(b0);
+    REQUIRE(a0.blocks == b0.blocks);
+    REQUIRE(a1.blocks == b1.blocks);
+    REQUIRE(a0.biomes == b0.biomes);
+    REQUIRE(a1.biomes == b1.biomes);
 }
 
 // ============================================================================
-// Biome Generator Tests
+// Feature / decoration tests
 // ============================================================================
 
-TEST_CASE("BiomeGenerator lookup: DeepOcean for very low elevation", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.5, 0.5, 50.0);
-    REQUIRE(b == Biome::DEEP_OCEAN);
+namespace {
+// isLeafBlock comes from block_properties.hpp (the single property table)
+bool isLogBlock(BlockType b) {
+    return b == BlockType::LOG || b == BlockType::BIRCH_LOG || b == BlockType::SPRUCE_LOG;
+}
+} // namespace
+
+TEST_CASE("Trees span chunk borders and no canopy is orphaned", "[worldgen][trees]") {
+    // Generate a 3x3 area and inspect the center chunk: every leaf must have
+    // a trunk within canopy range in the combined area (a clipped border
+    // canopy would orphan leaves), and at least one border column must carry
+    // leaves whose trunk lives in the neighbor chunk.
+    ChunkGenerator gen(2024);
+    std::vector<std::unique_ptr<Chunk>> area;
+    auto blockAt = [&](int wx, int y, int wz) -> BlockType {
+        for (auto& c : area) {
+            int lx = wx - c->chunkX * CHUNK_WIDTH;
+            int lz = wz - c->chunkZ * CHUNK_DEPTH;
+            if (lx >= 0 && lx < CHUNK_WIDTH && lz >= 0 && lz < CHUNK_DEPTH)
+                return c->getBlock(lx, y, lz);
+        }
+        return BlockType::AIR;
+    };
+    // Pick a center chunk in forest-ish terrain by scanning for one with
+    // plenty of leaves.
+    int bestCX = 0, bestCZ = 0, bestLeaves = -1;
+    for (int cz = -6; cz <= 6; cz += 3) {
+        for (int cx = -6; cx <= 6; cx += 3) {
+            Chunk probe(cx, cz);
+            gen.generate(probe);
+            int leaves = 0;
+            for (BlockType b : probe.blocks)
+                if (isLeafBlock(b))
+                    ++leaves;
+            if (leaves > bestLeaves) {
+                bestLeaves = leaves;
+                bestCX = cx;
+                bestCZ = cz;
+            }
+        }
+    }
+    REQUIRE(bestLeaves > 0); // some forest exists near spawn scale
+
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            auto chunk = std::make_unique<Chunk>(bestCX + dx, bestCZ + dz);
+            gen.generate(*chunk);
+            area.push_back(std::move(chunk));
+        }
+    }
+
+    const Chunk& center = *area[4]; // dz=0, dx=0 (row-major -1..1)
+    bool foundBorderLeaf = false;
+    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+            for (int y = 60; y < 140; ++y) {
+                if (!isLeafBlock(center.getBlock(lx, y, lz)))
+                    continue;
+                int wx = center.chunkX * CHUNK_WIDTH + lx;
+                int wz = center.chunkZ * CHUNK_DEPTH + lz;
+                // A trunk must exist within canopy range in the 3x3 area
+                bool hasTrunk = false;
+                bool trunkInNeighbor = false;
+                for (int tz = -3; tz <= 3 && !hasTrunk; ++tz) {
+                    for (int tx = -3; tx <= 3 && !hasTrunk; ++tx) {
+                        for (int ty = -4; ty <= 2 && !hasTrunk; ++ty) {
+                            if (isLogBlock(blockAt(wx + tx, y + ty, wz + tz))) {
+                                hasTrunk = true;
+                                int trunkLX = wx + tx - center.chunkX * CHUNK_WIDTH;
+                                int trunkLZ = wz + tz - center.chunkZ * CHUNK_DEPTH;
+                                trunkInNeighbor = trunkLX < 0 || trunkLX >= CHUNK_WIDTH ||
+                                                  trunkLZ < 0 || trunkLZ >= CHUNK_DEPTH;
+                            }
+                        }
+                    }
+                }
+                REQUIRE(hasTrunk);
+                if (trunkInNeighbor)
+                    foundBorderLeaf = true;
+            }
+        }
+    }
+    // With ~6 trees per forest chunk, a 16-wide chunk essentially always has
+    // at least one canopy reaching across its border.
+    REQUIRE(foundBorderLeaf);
 }
 
-TEST_CASE("BiomeGenerator lookup: Ocean for below sea level", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.5, 0.5, 62.0);
-    REQUIRE(b == Biome::OCEAN);
-}
-
-TEST_CASE("BiomeGenerator lookup: Swamp for low elevation + wet", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.6, 0.7, 66.0);
-    REQUIRE(b == Biome::SWAMP);
-}
-
-TEST_CASE("BiomeGenerator lookup: ExtremeHills for cold + dry", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.2, 0.2, 80.0);
-    REQUIRE(b == Biome::EXTREME_HILLS);
-}
-
-TEST_CASE("BiomeGenerator lookup: IceSpikes for cold + medium moisture", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.2, 0.4, 80.0);
-    REQUIRE(b == Biome::ICE_SPIKES);
-}
-
-TEST_CASE("BiomeGenerator lookup: Taiga for cold + wet", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.2, 0.7, 80.0);
-    REQUIRE(b == Biome::TAIGA);
-}
-
-TEST_CASE("BiomeGenerator lookup: Desert for hot + dry", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.8, 0.2, 80.0);
-    REQUIRE(b == Biome::DESERT);
-}
-
-TEST_CASE("BiomeGenerator lookup: Forest for warm + wet", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.5, 0.6, 80.0);
-    REQUIRE(b == Biome::FOREST);
-}
-
-TEST_CASE("BiomeGenerator lookup: Plains for warm + dry", "[biome]") {
-    BiomeGenerator bg(42);
-    Biome b = bg.lookupBiome(0.5, 0.4, 80.0);
-    REQUIRE(b == Biome::PLAINS);
-}
-
-TEST_CASE("BiomeGenerator temperature in [0, 1]", "[biome]") {
-    BiomeGenerator bg(42);
-    for (int i = 0; i < 20; ++i) {
-        double t = bg.getTemperature(static_cast<double>(i) * 10.0, static_cast<double>(i) * 10.0);
-        REQUIRE(t >= 0.0);
-        REQUIRE(t <= 1.0);
+TEST_CASE("Ores stay in their depth bands and replace only stone", "[worldgen][ores]") {
+    ChunkGenerator gen(808);
+    for (auto [cx, cz] : {std::pair{0, 0}, {7, -3}, {-11, 5}}) {
+        Chunk chunk(cx, cz);
+        gen.generate(chunk);
+        for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+            for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+                for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                    switch (chunk.getBlock(lx, y, lz)) {
+                        case BlockType::DIAMOND_ORE:
+                            REQUIRE(y >= 2);
+                            REQUIRE(y <= 17);
+                            break;
+                        case BlockType::GOLD_ORE:
+                            REQUIRE(y >= 4);
+                            REQUIRE(y <= 35);
+                            break;
+                        case BlockType::IRON_ORE:
+                            REQUIRE(y >= 8);
+                            REQUIRE(y <= 71);
+                            break;
+                        case BlockType::COAL_ORE:
+                            REQUIRE(y >= 48);
+                            REQUIRE(y <= 131);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+        }
     }
 }
 
-TEST_CASE("BiomeGenerator moisture in [0, 1]", "[biome]") {
-    BiomeGenerator bg(42);
-    for (int i = 0; i < 20; ++i) {
-        double m = bg.getMoisture(static_cast<double>(i) * 10.0, static_cast<double>(i) * 10.0);
-        REQUIRE(m >= 0.0);
-        REQUIRE(m <= 1.0);
+TEST_CASE("Flora sits on valid ground", "[worldgen][flora]") {
+    ChunkGenerator gen(606);
+    int floraSeen = 0;
+    for (int cz = -4; cz <= 4; cz += 2) {
+        for (int cx = -4; cx <= 4; cx += 2) {
+            Chunk chunk(cx, cz);
+            gen.generate(chunk);
+            for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
+                for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
+                    for (int y = 3; y < CHUNK_HEIGHT - 1; ++y) {
+                        BlockType b = chunk.getBlock(lx, y, lz);
+                        BlockType below = chunk.getBlock(lx, y - 1, lz);
+                        if (b == BlockType::CACTUS && below != BlockType::CACTUS) {
+                            REQUIRE(below == BlockType::SAND);
+                            ++floraSeen;
+                        } else if (b == BlockType::REED && below != BlockType::REED) {
+                            REQUIRE((below == BlockType::GRASS || below == BlockType::SAND ||
+                                     below == BlockType::DIRT));
+                            ++floraSeen;
+                        } else if (isFlora(b) && b != BlockType::REED) {
+                            if (b != BlockType::CACTUS && b != BlockType::DEAD_BUSH) {
+                                REQUIRE(below == BlockType::GRASS);
+                            }
+                            ++floraSeen;
+                        }
+                    }
+                }
+            }
+        }
     }
+    REQUIRE(floraSeen > 0);
 }
 
-TEST_CASE("BiomeGenerator height modifier values", "[biome]") {
-    BiomeGenerator bg(42);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::EXTREME_HILLS) == 30.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::DESERT) == 5.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::PLAINS) == 0.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::FOREST) == 10.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::TAIGA) == 15.0);
-    REQUIRE(bg.getBiomeHeightModifier(Biome::SWAMP) == -5.0);
-}
+TEST_CASE("Structures are deterministic and land on validated ground", "[worldgen][structures]") {
+    ChunkGenerator g1(112233);
+    ChunkGenerator g2(112233);
+    GenScratch s1, s2;
+    s1.reset(&g1);
+    s2.reset(&g2);
+    StructurePlacer placer(112233);
 
-TEST_CASE("BiomeGenerator surface block values", "[biome]") {
-    BiomeGenerator bg(42);
-    REQUIRE(bg.getSurfaceBlock(Biome::PLAINS) == BlockType::GRASS);
-    REQUIRE(bg.getSurfaceBlock(Biome::FOREST) == BlockType::GRASS);
-    REQUIRE(bg.getSurfaceBlock(Biome::TAIGA) == BlockType::GRASS);
-    REQUIRE(bg.getSurfaceBlock(Biome::DESERT) == BlockType::AIR);
-    REQUIRE(bg.getSurfaceBlock(Biome::EXTREME_HILLS) == BlockType::STONE);
-    REQUIRE(bg.getSurfaceBlock(Biome::ICE_SPIKES) == BlockType::STONE);
-}
-
-TEST_CASE("BiomeGenerator getBiome is deterministic", "[biome]") {
-    BiomeGenerator bg1(42);
-    BiomeGenerator bg2(42);
-
-    Biome b1 = bg1.getBiome(100.0, 200.0, 80.0);
-    Biome b2 = bg2.getBiome(100.0, 200.0, 80.0);
-    REQUIRE(b1 == b2);
+    int validCount = 0;
+    for (int rz = -6; rz <= 6; ++rz) {
+        for (int rx = -6; rx <= 6; ++rx) {
+            const StructurePlacement& a = placer.regionPlacement(rx, rz, g1, s1);
+            const StructurePlacement& b = placer.regionPlacement(rx, rz, g2, s2);
+            REQUIRE(a.valid == b.valid);
+            REQUIRE(a.anchorX == b.anchorX);
+            REQUIRE(a.anchorZ == b.anchorZ);
+            REQUIRE(a.floorY == b.floorY);
+            if (a.valid) {
+                ++validCount;
+                REQUIRE(a.floorY >= 64);
+            }
+        }
+    }
+    // 13x13 regions of mixed terrain: some sites must validate
+    REQUIRE(validCount > 0);
 }
 
 // ============================================================================
@@ -684,12 +1001,15 @@ TEST_CASE("World updatePlayerPosition loads surrounding chunks", "[world]") {
     world->updatePlayerPosition(256, 256);
 
     // Generation streams in on the worker pool; wait for it to settle.
+    // The self-sustaining pump must drain the whole backlog without any
+    // further updatePlayerPosition calls (workers refill the window).
     for (int i = 0; i < 500 && world->getPendingChunkCount() > 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    // Generation reaches one chunk past the render radius: (2·(vd+1)+1)²
     auto chunks = world->getLoadedChunks();
-    REQUIRE(chunks.size() == 25);
+    REQUIRE(chunks.size() == 49);
 }
 
 TEST_CASE("World updatePlayerPosition streams the spawn area on first call", "[world]") {
@@ -703,7 +1023,38 @@ TEST_CASE("World updatePlayerPosition streams the spawn area on first call", "[w
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    REQUIRE(world->getLoadedChunks().size() == 9);
+    REQUIRE(world->getLoadedChunks().size() == 25);
+}
+
+TEST_CASE("sortChunksByDistance orders farthest-first for pop_back consumption",
+          "[world][priority]") {
+    std::vector<ChunkPos> chunks = {{10, 0}, {0, 0}, {3, 4}, {-1, 0}, {0, -7}};
+    sortChunksByDistance(chunks, 0, 0);
+    // Farthest first…
+    REQUIRE(chunks.front() == ChunkPos{10, 0});
+    // …so pop_back() yields the player's own chunk before anything else
+    REQUIRE(chunks.back() == ChunkPos{0, 0});
+    for (size_t i = 1; i < chunks.size(); ++i) {
+        auto d2 = [](const ChunkPos& p) { return p.x * p.x + p.z * p.z; };
+        REQUIRE(d2(chunks[i - 1]) >= d2(chunks[i]));
+    }
+}
+
+TEST_CASE("World generation window stays bounded", "[world][priority]") {
+    auto world = std::make_shared<World>(42);
+    world->setViewDistance(5); // gen radius 6 → 169 chunks, well over the window
+    world->updatePlayerPosition(0, 0);
+
+    // Immediately after the first pump, at most MAX_INFLIGHT_GEN tasks may
+    // be in flight; the rest wait in the backlog (all still counted).
+    size_t pending = world->getPendingChunkCount();
+    size_t loaded = world->getLoadedChunks().size();
+    REQUIRE(pending + loaded >= 169 - MAX_INFLIGHT_GEN); // nothing lost
+
+    for (int i = 0; i < 2000 && world->getPendingChunkCount() > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(world->getLoadedChunks().size() == 169);
 }
 
 // ============================================================================
@@ -732,6 +1083,71 @@ TEST_CASE("SaveManager save/load chunk roundtrip", "[save]") {
         REQUIRE(loaded->chunkZ == -5);
         REQUIRE(loaded->getBlock(8, 100, 8) == BlockType::IRON_ORE);
     }
+}
+
+TEST_CASE("SaveManager: chunks in one region never clobber each other", "[save]") {
+    // Regression: the old packed-region format wrote ONE chunk per region
+    // file, so every chunk save silently destroyed its 1023 region-mates.
+    TempDir tempDirGuard("save_multi");
+    SaveManager saver(tempDirGuard.path());
+
+    // Same region (0,0), region border, and the next region over
+    const std::pair<int, int> coords[] = {{0, 0}, {1, 0}, {31, 31}, {32, 0}, {-1, -1}};
+    int marker = 1;
+    for (auto [cx, cz] : coords) {
+        Chunk chunk(cx, cz);
+        chunk.setBlock(1, 100 + marker, 1, BlockType::GOLD_ORE);
+        chunk.generated = true;
+        saver.saveChunk(chunk);
+        ++marker;
+    }
+    saver.flush();
+
+    marker = 1;
+    for (auto [cx, cz] : coords) {
+        auto loaded = saver.loadChunk(cx, cz);
+        REQUIRE(loaded.has_value());
+        REQUIRE(loaded->chunkX == cx);
+        REQUIRE(loaded->chunkZ == cz);
+        REQUIRE(loaded->getBlock(1, 100 + marker, 1) == BlockType::GOLD_ORE);
+        ++marker;
+    }
+}
+
+TEST_CASE("SaveManager: queued chunks are readable before the write lands", "[save]") {
+    // The load shield: unloading a chunk queues it; walking straight back
+    // must return the queued edits even if the file hasn't been written yet.
+    TempDir tempDirGuard("save_shield");
+    SaveManager saver(tempDirGuard.path());
+
+    auto chunk = std::make_shared<Chunk>(3, 4);
+    chunk->setBlock(2, 90, 2, BlockType::DIAMOND_ORE);
+    chunk->generated = true;
+    saver.saveChunkAsync(chunk);
+
+    // No flush: the job may or may not have been written yet — either way
+    // the loaded chunk must carry the edit.
+    auto loaded = saver.loadChunk(3, 4);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->getBlock(2, 90, 2) == BlockType::DIAMOND_ORE);
+    saver.flush();
+}
+
+TEST_CASE("World: edited chunks persist through unload-and-return", "[world][save]") {
+    TempDir tempDirGuard("save_unload");
+    SaveManager saver(tempDirGuard.path());
+    World world(4321, 1);
+    world.setSaveManager(&saver);
+
+    world.getChunk(0, 0);
+    world.setBlock(5, 150, 5, BlockType::PLANKS);
+
+    // Walk far away: (0,0) leaves the radius and queues for saving…
+    world.updatePlayerPosition(10 * CHUNK_WIDTH, 10 * CHUNK_DEPTH);
+    // …then come back: the reloaded chunk must carry the edit
+    auto chunk = world.getChunk(0, 0);
+    REQUIRE(chunk->getBlock(5, 150, 5) == BlockType::PLANKS);
+    saver.flush();
 }
 
 TEST_CASE("SaveManager load non-existent chunk returns nullopt", "[save]") {
