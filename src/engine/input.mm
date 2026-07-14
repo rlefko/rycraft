@@ -175,13 +175,34 @@ void InputState::update() {
     scrollDelta = 0.f;
 }
 
+void InputState::recordPress(Key key, double timeSeconds) {
+    keysJustPressed[key] = true;
+    keysPressedForTick[key] = true;
+    keysDown[key] = true;
+
+    auto it = lastPressTimes.find(key);
+    if (it != lastPressTimes.end() && timeSeconds - it->second <= DOUBLE_TAP_WINDOW) {
+        keysDoubleTappedForTick[key] = true;
+        // Consume the history so a triple-tap fires one gesture, not two
+        lastPressTimes.erase(it);
+    } else {
+        lastPressTimes[key] = timeSeconds;
+    }
+}
+
 bool InputState::isPressedForTick(Key key) const {
     auto it = keysPressedForTick.find(key);
     return it != keysPressedForTick.end() && it->second;
 }
 
+bool InputState::isDoubleTappedForTick(Key key) const {
+    auto it = keysDoubleTappedForTick.find(key);
+    return it != keysDoubleTappedForTick.end() && it->second;
+}
+
 void InputState::clearTickPresses() {
     keysPressedForTick.clear();
+    keysDoubleTappedForTick.clear();
 }
 
 void InputState::clearMouseDelta() {
@@ -356,9 +377,9 @@ void InputManager::handleKeyDown(NSEvent* event) {
 
     Key key = keyCodeToKey([event keyCode]);
 
-    state_.keysJustPressed[key] = true;
-    state_.keysPressedForTick[key] = true;
-    state_.keysDown[key] = true;
+    // NSEvent.timestamp is monotonic seconds since boot — the same clock
+    // family as CACurrentMediaTime, so double-tap windows measure real time.
+    state_.recordPress(key, [event timestamp]);
 }
 
 void InputManager::handleKeyUp(NSEvent* event) {
@@ -392,18 +413,12 @@ void InputManager::handleMouseDown(NSEvent* event) {
     NSInteger button = [event buttonNumber];
     if (button == 0) {
         state_.mouseLeftDown = true;
-        state_.keysJustPressed[Key::MouseLeft] = true;
-        state_.keysPressedForTick[Key::MouseLeft] = true;
-        state_.keysDown[Key::MouseLeft] = true;
+        state_.recordPress(Key::MouseLeft, [event timestamp]);
     } else if (button == 1) {
         state_.mouseRightDown = true;
-        state_.keysJustPressed[Key::MouseRight] = true;
-        state_.keysPressedForTick[Key::MouseRight] = true;
-        state_.keysDown[Key::MouseRight] = true;
+        state_.recordPress(Key::MouseRight, [event timestamp]);
     } else if (button == 2) {
-        state_.keysJustPressed[Key::MouseMiddle] = true;
-        state_.keysPressedForTick[Key::MouseMiddle] = true;
-        state_.keysDown[Key::MouseMiddle] = true;
+        state_.recordPress(Key::MouseMiddle, [event timestamp]);
     }
 }
 
@@ -430,6 +445,8 @@ void InputManager::handleScrollWheel(NSEvent* event) {
 void InputManager::handleFlagsChanged(NSEvent* event) {
     NSEventModifierFlags flags = [event modifierFlags];
 
+    // Modifiers bypass recordPress on purpose: no gesture double-taps a
+    // modifier, and flagsChanged reports combined flag words, not presses.
     auto applyModifier = [this](Key key, bool down) {
         bool wasDown = state_.isDown(key);
         state_.keysDown[key] = down;
@@ -486,6 +503,10 @@ void InputManager::releaseMouse() {
     // resume until the key is tapped again
     state_.keysDown.clear();
     state_.keysPressedForTick.clear();
+    // Drop tap history too: a press before the pause must not pair with a
+    // press after resume into a phantom double-tap (the clock keeps running)
+    state_.lastPressTimes.clear();
+    state_.keysDoubleTappedForTick.clear();
     state_.mouseLeftDown = false;
     state_.mouseRightDown = false;
 

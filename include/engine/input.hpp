@@ -78,9 +78,17 @@ struct InputState {
     // jumps, hotbar keys, and block clicks were silently dropped whenever
     // the press landed on a tickless frame.
     std::unordered_map<Key, bool> keysPressedForTick;
-    Vec2 mouseDelta;         // accumulated raw look deltas while captured
-    Vec2 mousePosition;      // window points, bottom-left origin
-    float scrollDelta = 0.f; // accumulated scroll-wheel Y this frame
+    // Double-tap gestures (sprint on W, fly toggle on Space). Latched at
+    // press time and cleared by clearTickPresses(), like keysPressedForTick,
+    // so a tap pair isn't dropped on tickless frames. Timing uses the
+    // monotonic event clock, not ticks: a frame hitch can run several ticks
+    // in a burst, which would misread the gesture's real-time spacing.
+    std::unordered_map<Key, double> lastPressTimes; // monotonic seconds
+    std::unordered_map<Key, bool> keysDoubleTappedForTick;
+    static constexpr double DOUBLE_TAP_WINDOW = 0.3; // seconds between presses
+    Vec2 mouseDelta;                                 // accumulated raw look deltas while captured
+    Vec2 mousePosition;                              // window points, bottom-left origin
+    float scrollDelta = 0.f;                         // accumulated scroll-wheel Y this frame
     bool mouseLeftDown = false;
     bool mouseRightDown = false;
 
@@ -88,8 +96,14 @@ struct InputState {
     bool isJustPressed(Key key) const;
     bool isJustReleased(Key key) const;
 
+    // Record a physical key press (down + both edge maps) and detect a
+    // double-tap against the previous press time. Pure C++ so gesture
+    // timing stays unit-testable without Cocoa events.
+    void recordPress(Key key, double timeSeconds);
+
     // Edge-since-last-tick (consumed by clearTickPresses at tick end)
     bool isPressedForTick(Key key) const;
+    bool isDoubleTappedForTick(Key key) const;
     void clearTickPresses();
 
     void update();
