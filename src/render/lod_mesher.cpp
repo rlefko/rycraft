@@ -457,12 +457,15 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
     output.indices.reserve(12288);
 
     // ---- Column skylight ----
-    // The first open Y above the topmost solid block per column, computed
+    // The first open Y above the topmost OPAQUE block per column, computed
     // over the padded ring too so border faces read their real neighbor
     // column instead of a clamped copy (that clamp painted a visible light
-    // seam along every chunk edge). A face is lit by how close its exposure
-    // cell sits to that height: open sky is 15, shade under a canopy or
-    // overhang steps down, caves bottom out at 4.
+    // seam along every chunk edge). Only opaque blocks block the sky: a tree
+    // canopy is non-opaque leaves, so it must NOT darken the ground below with
+    // a fake column shadow — the real cascade shadow does that, and doubling
+    // them put a second shadow directly under every tree. Genuine cover
+    // (opaque stone/dirt: caves, overhangs) still steps skylight down toward
+    // its floor of 4; open sky is 15.
     const int ringW = gridW + 2;
     const int ringD = gridD + 2;
     std::vector<int>& skyHeight = scratch.skyHeight;
@@ -470,7 +473,7 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
     for (int z = -1; z <= gridD; ++z) {
         for (int x = -1; x <= gridW; ++x) {
             for (int y = gridH - 1; y >= 0; --y) {
-                if (isSolid(getBlock(x, y, z))) {
+                if (isOpaque(getBlock(x, y, z))) {
                     skyHeight[idx(z + 1, x + 1, ringW)] = y + 1;
                     break;
                 }

@@ -183,24 +183,21 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
         discard_fragment();
     }
 
-    // Direct sun occlusion. With real cascade shadows on, they own the
-    // directional term entirely — the baked per-column skylight is NOT folded
-    // in, or its blocky under-cover darkening would double up with the smooth
-    // cast shadow. When shadows are off (strength 0) the skylight is the
-    // fallback fake shadow so covered ground still reads as shaded.
-    float directOcclusion;
-    if (shadow.shadowParams.z > 0.001f) {
-        directOcclusion = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition,
-                                       shadowMap, shadowSampler, shadow);
-    } else {
-        directOcclusion = 0.25f + 0.75f * in.vSkyLight;
-    }
+    // Sky access from the baked per-column skylight. Because the mesher now
+    // treats only OPAQUE blocks as sky-blockers, a tree canopy (non-opaque
+    // leaves) no longer casts a fake column shadow on the ground below — that
+    // shading comes entirely from the real cascade shadow. Genuine cover
+    // (opaque terrain: caves, overhangs) still lowers skylight and darkens.
+    float sky = 0.25f + 0.75f * in.vSkyLight;
 
-    // Ambient is modulated by sky access (how much open sky the point sees) so
-    // caves and deep overhangs — which the cascades may not reach — stay dark.
-    float ambientAccess = 0.3f + 0.7f * in.vSkyLight;
-    float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight * directOcclusion +
-                                      uniforms.ambientColor * ambientAccess);
+    // The real cascade shadow gates the direct sun; sampleShadow returns 1.0
+    // when shadows are disabled, so the term falls back to the sky access
+    // alone (the old fake shadow) with no branch and no doubling.
+    float lit = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition, shadowMap,
+                             shadowSampler, shadow);
+
+    float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight * sky * lit +
+                                      uniforms.ambientColor * sky);
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);

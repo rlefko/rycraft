@@ -535,34 +535,37 @@ TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][texture
     }
 }
 
-TEST_CASE("Mesher: faces under cover carry reduced skylight", "[render][mesher]") {
+TEST_CASE("Mesher: opaque cover reduces skylight; non-opaque leaves do not", "[render][mesher]") {
+    // Only OPAQUE blocks block the sky. A stone slab overhead shades the
+    // ground below; a leaf canopy does not (its real cast shadow handles that,
+    // and a column skylight shadow would double up under every tree).
     Chunk chunk(0, 0);
-    // Ground block with a "canopy" three blocks above it
-    chunk.setBlock(8, 64, 8, BlockType::STONE);
-    chunk.setBlock(8, 68, 8, BlockType::LEAVES);
+    chunk.setBlock(4, 64, 8, BlockType::STONE);  // ground under stone cover
+    chunk.setBlock(4, 68, 8, BlockType::STONE);  // opaque cover
+    chunk.setBlock(12, 64, 8, BlockType::STONE); // ground under a leaf canopy
+    chunk.setBlock(12, 68, 8, BlockType::LEAVES);
 
     LODMesher mesher;
     MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
-    bool foundShadedTop = false;
-    bool foundLitCanopyTop = false;
+    bool foundShadedUnderStone = false;
+    bool foundLitUnderLeaves = false;
     for (const Vertex& v : output.vertices) {
         if (unpackFace(v.faceAttr) != FaceNormal::PLUS_Y)
             continue;
+        float x = static_cast<float>(v.px);
         float y = static_cast<float>(v.py);
-        if (y > 64.5f && y < 65.5f) {
-            // The ground's top face sits under the canopy → shaded
-            REQUIRE(unpackSkyLight(v.faceAttr) < 15);
-            foundShadedTop = true;
+        if (y > 64.5f && y < 65.5f && x > 4.4f && x < 5.6f) {
+            REQUIRE(unpackSkyLight(v.faceAttr) < 15); // under opaque stone → shaded
+            foundShadedUnderStone = true;
         }
-        if (y > 68.5f && y < 69.5f) {
-            // The canopy's own top face sees open sky
-            REQUIRE(unpackSkyLight(v.faceAttr) == 15);
-            foundLitCanopyTop = true;
+        if (y > 64.5f && y < 65.5f && x > 12.4f && x < 13.6f) {
+            REQUIRE(unpackSkyLight(v.faceAttr) == 15); // under leaves → still open
+            foundLitUnderLeaves = true;
         }
     }
-    REQUIRE(foundShadedTop);
-    REQUIRE(foundLitCanopyTop);
+    REQUIRE(foundShadedUnderStone);
+    REQUIRE(foundLitUnderLeaves);
 }
 
 TEST_CASE("Block textures: extra layers extend past the block types", "[render][textures]") {
