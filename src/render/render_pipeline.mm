@@ -351,6 +351,11 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
     // ---- Animal renderer ----
     _entityRenderer = std::make_unique<EntityRenderer>(_device, shaderLibrary);
+
+    // ---- GPU timing (per-pass sampling is a diagnostic opt-in) ----
+    const char* counters = std::getenv("RYCRAFT_GPU_COUNTERS");
+    _gpuTimer = std::make_unique<GpuFrameTimer>(_device, counters && *counters &&
+                                                             std::strcmp(counters, "0") != 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +476,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     if (!commandBuffer)
         return;
 
+    _gpuTimer->beginFrame();
+
     // Upload sky uniforms
     std::memcpy((void*)_skyUniformsBuffer.contents, &skyUniforms, sizeof(SkyUniforms));
 
@@ -493,6 +500,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderPassDesc.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterMin;
     renderPassDesc.depthAttachment.clearDepth = 1.0;
+    _gpuTimer->attachPass(renderPassDesc, "scene");
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
@@ -562,6 +570,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     uiPassDesc.colorAttachments[0].texture = drawable.texture;
     uiPassDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
     uiPassDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+    _gpuTimer->attachPass(uiPassDesc, "ui");
 
     id<MTLRenderCommandEncoder> uiEncoder =
         [commandBuffer renderCommandEncoderWithDescriptor:uiPassDesc];
@@ -574,6 +583,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     if (!_capturePath.empty()) {
         encodeFrameCapture(commandBuffer, drawable.texture);
     }
+
+    _gpuTimer->endFrame(commandBuffer);
 
     // Present and commit
     [commandBuffer presentDrawable:drawable];
@@ -1110,6 +1121,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     passDesc.colorAttachments[0].texture = _colorResolve;
     passDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
     passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+    _gpuTimer->attachPass(passDesc, "water");
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:passDesc];

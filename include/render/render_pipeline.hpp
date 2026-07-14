@@ -13,6 +13,7 @@
 #include "common/math.hpp"
 #include "engine/hotbar.hpp"
 #include "render/block_texture_array.hpp"
+#include "render/gpu_timer.hpp"
 #include "render/lod_mesher.hpp"
 #include "render/mega_buffer.hpp"
 #include "render/mesh_scheduler.hpp"
@@ -111,6 +112,13 @@ public:
     };
     ChunkRenderStats chunkRenderStats() const { return _chunkStats; }
 
+    // Real GPU frame time (EMA over completed command buffers) for the F3
+    // HUD and the 60-frame diagnostic log.
+    float gpuFrameMs() const { return _gpuTimer->frameMsEma(); }
+
+    // Per-pass GPU breakdown; empty unless RYCRAFT_GPU_COUNTERS is set.
+    std::string gpuPassBreakdown() const { return _gpuTimer->passBreakdown(); }
+
     // Stop the mesh workers (they reference the World). The engine calls
     // this on the quit path BEFORE the world is destroyed; the scheduler's
     // destructor also calls it defensively.
@@ -180,6 +188,9 @@ private:
 
     // Animal voxel-model renderer
     std::unique_ptr<EntityRenderer> _entityRenderer;
+
+    // GPU frame/pass timing (per-pass sampling only under RYCRAFT_GPU_COUNTERS)
+    std::unique_ptr<GpuFrameTimer> _gpuTimer;
 
     // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
     float _bloomIntensity;

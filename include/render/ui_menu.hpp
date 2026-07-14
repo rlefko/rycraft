@@ -59,6 +59,7 @@ struct PerformanceStats {
     uint32_t chunkCount = 0;
     uint32_t entityCount = 0;
     float frameTimeMs = 0.f;
+    float gpuFrameMs = 0.f;     // EMA of command-buffer GPUEndTime − GPUStartTime
     uint32_t pendingChunks = 0; // generation backlog + in-flight
     float genMsAvg = 0.f;       // EMA of per-chunk generation time
     float meshMsAvg = 0.f;      // EMA of per-chunk mesh build time

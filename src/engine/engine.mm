@@ -899,15 +899,22 @@ static EngineState* _engineGetState(Engine* engine) {
     // the whole chunk vector)
     if (state->frameCount % 60 == 1) {
         auto chunkStats = _renderPipeline->chunkRenderStats();
-        char line[224];
+        char line[288];
         snprintf(line, sizeof(line),
                  "Render: %u loaded chunks, frame %llu player (%.1f, %.1f, %.1f) | %.2f ms/frame "
-                 "gen %.2f ms mesh %.2f ms pending %zu vram %.0f/%.0f MB",
+                 "gpu %.2f ms gen %.2f ms mesh %.2f ms pending %zu vram %.0f/%.0f MB",
                  state->cachedChunkCount, static_cast<unsigned long long>(state->frameCount),
                  state->player.position.x, state->player.position.y, state->player.position.z,
-                 state->smoothedFrameMs, state->world->averageGenMs(), chunkStats.meshMsAvg,
+                 state->smoothedFrameMs, _renderPipeline->gpuFrameMs(),
+                 state->world->averageGenMs(), chunkStats.meshMsAvg,
                  state->world->getPendingChunkCount(), chunkStats.megaUsedMB, chunkStats.megaCapMB);
         RY_LOG_INFO(line);
+        // Per-pass GPU breakdown (RYCRAFT_GPU_COUNTERS=1) mirrors to the log
+        // so headless runs can attribute frame cost to individual passes.
+        std::string passes = _renderPipeline->gpuPassBreakdown();
+        if (!passes.empty()) {
+            RY_LOG_INFO(("GPU passes (ms): " + passes).c_str());
+        }
     }
 
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
@@ -949,6 +956,7 @@ static EngineState* _engineGetState(Engine* engine) {
                 static_cast<int>(std::floor(camPos.z))) == BlockType::WATER;
     }
     uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
+    uiFrame.stats.gpuFrameMs = _renderPipeline->gpuFrameMs();
     uiFrame.stats.fps = state->smoothedFrameMs > 0.f ? 1000.0f / state->smoothedFrameMs : 0.f;
     uiFrame.stats.chunkCount = state->cachedChunkCount;
     uiFrame.stats.entityCount =

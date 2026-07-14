@@ -367,7 +367,7 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
 
     // Background: semi-transparent dark rectangle
     float bgWidth = 220.0f / static_cast<float>(_width);
-    float bgHeight = 140.0f / static_cast<float>(_height);
+    float bgHeight = 152.0f / static_cast<float>(_height);
     drawQuad(hudX - 4.0f / _width, hudY - bgHeight, bgWidth, bgHeight, 0.0f, 0.0f, 0.0f, 0.6f);
 
     // Line height (including spacing)
@@ -401,6 +401,14 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
     floatToString(stats.frameTimeMs, ftBuf, sizeof(ftBuf));
     drawString("Frame: ", textX, textY, 1.0f, 1.0f, 0.8f, 0.4f);
     drawString(ftBuf, textX + 60.0f / _width, textY, 1.0f, 1.0f, 0.8f, 0.4f);
+    textY -= lineHeight;
+
+    // GPU frame time (real, from completed command buffers)
+    char gpuBuf[16];
+    floatToString(stats.gpuFrameMs, gpuBuf, sizeof(gpuBuf));
+    drawString("GPU: ", textX, textY, 1.0f, 1.0f, 0.6f, 0.6f);
+    drawString(gpuBuf, textX + 44.0f / _width, textY, 1.0f, 1.0f, 0.6f, 0.6f);
+    drawString("ms", textX + 100.0f / _width, textY, 1.0f, 1.0f, 0.6f, 0.6f);
     textY -= lineHeight;
 
     // Chunk generation: pending count + per-chunk ms
