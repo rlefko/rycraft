@@ -52,6 +52,14 @@ struct EngineState {
     Mat4 projectionMatrix = Mat4::identity();
     CGSize drawableSize = {0, 0};
 
+    // ---- Field of view ----
+    // Sprinting widens the FOV for a feeling of speed; the value eases
+    // per frame (render parameter, not sim state) toward the mode's target.
+    static constexpr float BASE_FOV = 70.0f;
+    static constexpr float SPRINT_FOV = 77.0f; // +10%, the classic sprint cue
+    static constexpr float FOV_EASE_SECONDS = 0.1f;
+    float fovCurrent = BASE_FOV;
+
     // ---- Day/Night Cycle ----
     static constexpr uint64_t TICKS_PER_DAY = 24000; // 20 min at 20Hz
     uint64_t worldTime = 0;
@@ -858,15 +866,24 @@ static EngineState* _engineGetState(Engine* engine) {
 - (void)render {
     EngineState* state = _state.get();
 
+    // Ease the FOV toward the movement mode's target (dt-correct exponential,
+    // so the zoom speed doesn't depend on frame rate) and hand it to the
+    // camera — the cloud shader reads camera.FOV(), so routing the projection
+    // through the same value keeps clouds registered with the world mid-zoom.
+    float targetFov = state->player.sprinting ? EngineState::SPRINT_FOV : EngineState::BASE_FOV;
+    state->fovCurrent +=
+        (targetFov - state->fovCurrent) *
+        (1.0f - std::exp(-static_cast<float>(state->deltaTime) / EngineState::FOV_EASE_SECONDS));
+    state->camera.setFOV(state->fovCurrent);
+
     // Update projection matrix from current drawable size
     CGSize currentSize = _view.drawableSize;
     if (currentSize.width > 0 && currentSize.height > 0) {
         state->drawableSize = currentSize;
         float aspect =
             static_cast<float>(currentSize.width) / static_cast<float>(currentSize.height);
-        state->projectionMatrix =
-            Mat4::perspective(70.0f * (static_cast<float>(M_PI) / 180.0f), // 70° FOV in radians
-                              aspect, 0.1f, 1000.0f);
+        state->projectionMatrix = Mat4::perspective(
+            state->camera.FOV() * (static_cast<float>(M_PI) / 180.0f), aspect, 0.1f, 1000.0f);
     }
 
     id<CAMetalDrawable> drawable = _view.currentDrawable;
