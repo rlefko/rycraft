@@ -626,4 +626,3 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
             return MeshOutput{};
     }
 }
-

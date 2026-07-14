@@ -10,7 +10,6 @@ namespace {
 
 constexpr int TREE_ATTEMPTS_PER_CHUNK = 12;
 
-
 enum class TreeKind : uint8_t { OAK, LARGE_OAK, BIRCH, SPRUCE };
 
 struct TreeProfile {
