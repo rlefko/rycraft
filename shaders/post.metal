@@ -45,9 +45,9 @@ static float uchimura(float x) {
     float w2 = step(m + l0, x);
     float w1 = 1.0f - w0 - w2;
 
-    float T = m * pow(x / m, c) + b;                    // toe
-    float L = m + a * (x - m);                          // linear
-    float S = P - (P - S1) * exp(CP * (x - S0));        // shoulder
+    float T = m * pow(x / m, c) + b;             // toe
+    float L = m + a * (x - m);                   // linear
+    float S = P - (P - S1) * exp(CP * (x - S0)); // shoulder
 
     return T * w0 + L * w1 + S * w2;
 }
@@ -82,11 +82,10 @@ static float3 displayColor(texture2d<float> scene, texture2d<float> bloom, sampl
     return applyVibrance(mapped, post.vibrance - 1.0f);
 }
 
-// Interleaved gradient noise — deterministic per pixel/frame (convention:
-// no nondeterministic randomness), breaks 8-bit banding in sky gradients.
+// Frame-offset wrapper over the shared IGN (shader_types.hpp) — deterministic
+// per pixel/frame, breaks 8-bit banding in sky gradients.
 static float interleavedGradientNoise(float2 px, uint frame) {
-    px += float2(frame % 64u) * 5.588238f;
-    return fract(52.9829189f * fract(dot(px, float2(0.06711056f, 0.00583715f))));
+    return interleavedGradientNoise(px + float2(frame % 64u) * 5.588238f);
 }
 
 fragment float4 postCompositeFragment(PostVertexOut in [[stage_in]],
@@ -94,8 +93,7 @@ fragment float4 postCompositeFragment(PostVertexOut in [[stage_in]],
                                       texture2d<float> bloomTexture [[texture(1)]],
                                       constant PostUniforms& post [[buffer(0)]],
                                       constant ExposureState& exposureState [[buffer(1)]]) {
-    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear,
-                                    address::clamp_to_edge);
+    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float exposure = exposureState.exposure;
 
     float3 color = displayColor(sceneTexture, bloomTexture, linearSampler, in.vUV, post, exposure);

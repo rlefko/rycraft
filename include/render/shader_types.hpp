@@ -7,6 +7,17 @@
 // corrupted frame.
 #include <simd/simd.h>
 
+#ifdef __METAL_VERSION__
+// Interleaved gradient noise — the engine's one deterministic per-pixel
+// dither/rotation source (convention: seeded randomness only, no temporal
+// noise). One definition here because five passes sample it and the magic
+// constants must never drift apart.
+static inline float interleavedGradientNoise(metal::float2 px) {
+    return metal::fract(52.9829189f *
+                        metal::fract(metal::dot(px, metal::float2(0.06711056f, 0.00583715f))));
+}
+#endif
+
 // Bound at buffer(1) in the main chunk/highlight shaders.
 struct Uniforms {
     simd_float4x4 modelMatrix;
@@ -89,8 +100,9 @@ struct SkyUniforms {
 };
 
 // Procedural cloud layer, bound at buffer(0) in clouds.metal. The fragment
-// shader ray-casts from the camera through each pixel onto the horizontal
-// cloud plane, so the camera basis and projection shape ride along.
+// shader ray-casts from the camera through each pixel onto the flat cloud
+// plane (mode 1) or marches the volumetric slab above it (mode 2), so the
+// camera basis and projection shape ride along.
 struct CloudUniforms {
     simd_float3 cameraPosition;
     simd_float3 cameraForward;
@@ -103,6 +115,8 @@ struct CloudUniforms {
     float cloudAltitude;
     float noiseFrequency;
     float cloudThreshold;
+    float volumetric;   // 0 = flat plane layer, 1 = ray-marched volume
+    float sunElevation; // sun height 0..1, dims clouds toward night
 };
 
 // Weather particle instance data, bound at buffer(0) in particles.metal.
@@ -250,6 +264,8 @@ static_assert(sizeof(CloudUniforms) == 112);
 static_assert(offsetof(CloudUniforms, sunDirection) == 64);
 static_assert(offsetof(CloudUniforms, tanHalfFov) == 80);
 static_assert(offsetof(CloudUniforms, cloudThreshold) == 100);
+static_assert(offsetof(CloudUniforms, volumetric) == 104);
+static_assert(offsetof(CloudUniforms, sunElevation) == 108);
 
 static_assert(sizeof(GPUParticle) == 48);
 static_assert(offsetof(GPUParticle, velocity) == 16);

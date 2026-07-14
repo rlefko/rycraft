@@ -558,7 +558,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     }
 
     if (_gfx.cloudMode != 0) {
-        renderClouds(encoder, camera, worldTime, sunDirection);
+        renderClouds(encoder, camera, worldTime, sunDirection, skyUniforms.sunIntensity);
     }
 
     [encoder endEncoding];
@@ -1520,7 +1520,8 @@ bool RenderPipeline::isChunkInFrustum(const AABB& chunkAABB) const {
 // renderClouds — alpha-blended cloud layer, drawn last in the scene pass
 // ============================================================================
 void RenderPipeline::renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera,
-                                  uint64_t worldTime, const float sunDirection[3]) {
+                                  uint64_t worldTime, const float sunDirection[3],
+                                  float sunIntensity) {
     if (!_cloudPipelineState)
         return;
 
@@ -1550,6 +1551,11 @@ void RenderPipeline::renderClouds(id<MTLRenderCommandEncoder> encoder, const Cam
     cloudUniforms.cloudAltitude = 192.0f;
     cloudUniforms.noiseFrequency = 0.005f;
     cloudUniforms.cloudThreshold = 0.55f;
+    cloudUniforms.volumetric = _gfx.cloudMode >= 2 ? 1.0f : 0.0f;
+    // Sun height 0..1 from the sky's single source (NOT the active light's
+    // direction — that swaps to the MOON below the horizon, whose +y at
+    // midnight would keep clouds daytime-bright all night).
+    cloudUniforms.sunElevation = sunIntensity;
 
     FrameRing::Alloc cloudAlloc = _frameRing.push(&cloudUniforms, sizeof(cloudUniforms));
 

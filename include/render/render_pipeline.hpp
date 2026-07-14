@@ -315,5 +315,5 @@ private:
                          const UIFrameState& uiFrame);
 
     void renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera, uint64_t worldTime,
-                      const float sunDirection[3]);
+                      const float sunDirection[3], float sunIntensity);
 };

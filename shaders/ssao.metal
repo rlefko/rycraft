@@ -77,7 +77,7 @@ fragment float4 ssaoGenerateFragment(SsaoVertexOut in [[stage_in]],
 
     // Per-pixel rotation angle (IGN) to decorrelate the fixed kernel.
     float2 fragPx = in.clipPosition.xy + float2(s.frameIndex % 4u) * 7.13f;
-    float rnd = fract(52.9829189f * fract(dot(fragPx, float2(0.06711056f, 0.00583715f))));
+    float rnd = interleavedGradientNoise(fragPx);
     float ca = cos(rnd * 6.2831853f);
     float sa = sin(rnd * 6.2831853f);
 

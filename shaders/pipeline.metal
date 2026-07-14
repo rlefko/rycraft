@@ -186,7 +186,7 @@ static float sampleShadow(float3 worldPos, float3 normal, float3 cameraPos, floa
     // the SCREEN pixel — bounded coordinates keep float precision (world-space
     // coords reach the thousands and collapse the hash), deterministic and
     // static so the penumbra dither never crawls (convention 9).
-    float ign = fract(52.9829189f * fract(dot(screenPos, float2(0.06711056f, 0.00583715f))));
+    float ign = interleavedGradientNoise(screenPos);
     float ang = ign * 6.2831853f;
     float2 rc = float2(cos(ang), sin(ang));
     float2x2 rot = float2x2(rc.x, -rc.y, rc.y, rc.x);

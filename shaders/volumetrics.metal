@@ -68,8 +68,7 @@ fragment float4 volumetricFragment(VolVertexOut in [[stage_in]],
                                    sampler shadowSampler [[sampler(1)]],
                                    constant VolumetricUniforms& vol [[buffer(0)]],
                                    constant ShadowUniforms& shadow [[buffer(1)]]) {
-    constexpr sampler depthSampler(mag_filter::linear, min_filter::linear,
-                                   address::clamp_to_edge);
+    constexpr sampler depthSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
 
     // Reconstruct the world position of the opaque scene behind this pixel.
     float depth = sceneDepth.sample(depthSampler, in.vUV);
@@ -87,8 +86,8 @@ fragment float4 volumetricFragment(VolVertexOut in [[stage_in]],
 
     // Dithered start offset (interleaved gradient noise on the screen pixel +
     // frame index) so the coarse march reads as smooth haze, not slabs.
-    float2 px = in.clipPosition.xy + float2(vol.frameIndex % 8u) * 5.588f;
-    float dither = fract(52.9829189f * fract(dot(px, float2(0.06711056f, 0.00583715f))));
+    float dither =
+        interleavedGradientNoise(in.clipPosition.xy + float2(vol.frameIndex % 8u) * 5.588f);
 
     float3 sunDir = normalize(vol.sunDirection);
     float cosTheta = dot(rayDir, sunDir);
@@ -125,7 +124,6 @@ vertex VolVertexOut volumetricCompositeVertex(uint vertexID [[vertex_id]]) {
 
 fragment float4 volumetricCompositeFragment(VolVertexOut in [[stage_in]],
                                             texture2d<float> volumetricTex [[texture(0)]]) {
-    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear,
-                                    address::clamp_to_edge);
+    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     return float4(volumetricTex.sample(linearSampler, in.vUV).rgb, 1.0f);
 }

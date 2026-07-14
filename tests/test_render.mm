@@ -1118,6 +1118,8 @@ TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-typ
     REQUIRE(offsetof(CloudUniforms, sunDirection) == 64);
     REQUIRE(offsetof(CloudUniforms, tanHalfFov) == 80);
     REQUIRE(offsetof(CloudUniforms, cloudThreshold) == 100);
+    REQUIRE(offsetof(CloudUniforms, volumetric) == 104);
+    REQUIRE(offsetof(CloudUniforms, sunElevation) == 108);
 }
 
 TEST_CASE("Shader types: GPUParticle layout matches MSL", "[render][shader-types]") {
