@@ -976,9 +976,13 @@ TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]")
 }
 
 TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(SkyUniforms) == 80);
-    REQUIRE(offsetof(SkyUniforms, horizonColor) == 16);
-    REQUIRE(offsetof(SkyUniforms, sunIntensity) == 64);
+    REQUIRE(sizeof(SkyUniforms) == 144);
+    REQUIRE(offsetof(SkyUniforms, sunDirection) == 48);
+    REQUIRE(offsetof(SkyUniforms, moonDirection) == 64);
+    REQUIRE(offsetof(SkyUniforms, zenithColor) == 96);
+    REQUIRE(offsetof(SkyUniforms, tanHalfFov) == 128);
+    REQUIRE(offsetof(SkyUniforms, sunIntensity) == 136);
+    REQUIRE(offsetof(SkyUniforms, starStrength) == 140);
 }
 
 TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-types]") {

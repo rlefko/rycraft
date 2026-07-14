@@ -44,13 +44,24 @@ struct WaterUniforms {
     float cameraUnderwater; // 1.0 when the camera is inside water
 };
 
-// Sky gradient + sun disc, bound at buffer(1) in sky.metal.
+// Atmospheric sky, bound at buffer(1) in sky.metal. The fragment shader
+// reconstructs a per-pixel view ray from the camera basis (like clouds.metal)
+// so the sun and moon are true direction-projected discs, not screen-space
+// blobs, and the gradient tracks where the camera looks. zenith/horizon come
+// from computeDayNightUniforms (also the fog palette — one source).
 struct SkyUniforms {
+    simd_float3 cameraForward;
+    simd_float3 cameraRight;
+    simd_float3 cameraUp;
+    simd_float3 sunDirection;
+    simd_float3 moonDirection; // opposes the sun; lights the night sky
+    simd_float3 sunColor;
     simd_float3 zenithColor;
     simd_float3 horizonColor;
-    simd_float3 sunDirection;
-    simd_float3 sunColor;
+    float tanHalfFov;
+    float aspect;
     float sunIntensity; // 0 at night, 1 at noon
+    float starStrength; // 0 by day, 1 deep night — fades the star field
 };
 
 // Procedural cloud layer, bound at buffer(0) in clouds.metal. The fragment
@@ -163,8 +174,12 @@ static_assert(offsetof(WaterUniforms, fogDensity) == 168);
 static_assert(offsetof(WaterUniforms, time) == 172);
 static_assert(offsetof(WaterUniforms, cameraUnderwater) == 176);
 
-static_assert(sizeof(SkyUniforms) == 80);
-static_assert(offsetof(SkyUniforms, sunIntensity) == 64);
+static_assert(sizeof(SkyUniforms) == 144);
+static_assert(offsetof(SkyUniforms, moonDirection) == 64);
+static_assert(offsetof(SkyUniforms, zenithColor) == 96);
+static_assert(offsetof(SkyUniforms, tanHalfFov) == 128);
+static_assert(offsetof(SkyUniforms, sunIntensity) == 136);
+static_assert(offsetof(SkyUniforms, starStrength) == 140);
 
 static_assert(sizeof(CloudUniforms) == 112);
 static_assert(offsetof(CloudUniforms, sunDirection) == 64);

@@ -450,6 +450,21 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         sunDirection[2] /= sunLen;
     }
 
+    // Fill the sky's per-pixel-ray inputs (the sun/moon are true
+    // direction-projected discs now, so the atmosphere needs the camera
+    // basis — computeDayNightUniforms only knows the time of day).
+    {
+        Vec3 camFwd = camera.forward();
+        Vec3 camRight = camera.right();
+        Vec3 camUp = camera.up();
+        skyUniforms.cameraForward = simd_make_float3(camFwd.x, camFwd.y, camFwd.z);
+        skyUniforms.cameraRight = simd_make_float3(camRight.x, camRight.y, camRight.z);
+        skyUniforms.cameraUp = simd_make_float3(camUp.x, camUp.y, camUp.z);
+        skyUniforms.tanHalfFov = std::tan(camera.FOV() * 0.5f * static_cast<float>(M_PI) / 180.0f);
+        skyUniforms.aspect =
+            static_cast<float>(_displayWidth) / static_cast<float>(std::max(_displayHeight, 1u));
+    }
+
     // Create command buffer
     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
     if (!commandBuffer)
@@ -729,6 +744,11 @@ void RenderPipeline::computeDayNightUniforms(uint64_t worldTime, float sunDirect
     skyUniforms.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
     skyUniforms.sunColor = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
     skyUniforms.sunIntensity = std::max(0.0f, sunElevation);
+
+    // The moon rides opposite the sun so night has a light source; stars
+    // fade in as the sun drops below the horizon (fully out by −0.2 elev).
+    skyUniforms.moonDirection = simd_make_float3(-sunDirection[0], -sunDirection[1], 0.3f);
+    skyUniforms.starStrength = std::clamp(-sunElevation / 0.2f, 0.0f, 1.0f);
 }
 
 // ---------------------------------------------------------------------------
