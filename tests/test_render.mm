@@ -21,6 +21,7 @@
 #include <render/block_textures.hpp>
 #include <render/lod_mesher.hpp>
 #include <render/mega_buffer.hpp>
+#include <render/mesh_scheduler.hpp>
 #include <render/shader_types.hpp>
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
@@ -294,6 +295,43 @@ TEST_CASE("Snapshot mesher: -X border wall culled against a solid neighbor",
         REQUIRE(
             !(unpackFace(v.faceAttr) == FaceNormal::MINUS_X && static_cast<float>(v.px) == 0.f));
     }
+}
+
+TEST_CASE("MeshScheduler: builds off-thread with version stamps", "[render][scheduler]") {
+    World world(42, 2);
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dx = -1; dx <= 1; ++dx)
+            world.getChunk(dx, dz);
+
+    MeshScheduler scheduler(world, 1);
+    REQUIRE(scheduler.enqueue(ChunkPos{0, 0}));
+
+    std::vector<MeshResult> results;
+    for (int i = 0; i < 500 && results.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        scheduler.drainCompleted(results);
+    }
+    REQUIRE(results.size() == 1);
+    REQUIRE(results[0].pos == ChunkPos{0, 0});
+    REQUIRE(results[0].snapshotOk);
+    REQUIRE(results[0].builtVersion == world.getChunk(0, 0)->version.load());
+    REQUIRE(!results[0].mesh.vertices.empty());
+
+    // A chunk without generated neighbors reports the failed snapshot
+    // instead of blocking (the renderer retries once the frontier catches up)
+    REQUIRE(scheduler.enqueue(ChunkPos{40, 40}));
+    results.clear();
+    for (int i = 0; i < 500 && results.empty(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        scheduler.drainCompleted(results);
+    }
+    REQUIRE(results.size() == 1);
+    REQUIRE(!results[0].snapshotOk);
+
+    // Shutdown is idempotent and refuses further work
+    scheduler.shutdown();
+    scheduler.shutdown();
+    REQUIRE(!scheduler.enqueue(ChunkPos{0, 0}));
 }
 
 TEST_CASE("World snapshotForMeshing requires generated neighbors", "[world][mesher][border]") {

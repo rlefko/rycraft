@@ -25,6 +25,7 @@ struct MeshSnapshot {
 
     int chunkX = 0;
     int chunkZ = 0;
+    uint32_t version = 0;          // chunk revision captured with the blocks
     std::vector<BlockType> blocks; // PADDED_WIDTH × PADDED_DEPTH × CHUNK_HEIGHT
 
     void resize() { blocks.assign(PADDED_WIDTH * PADDED_DEPTH * CHUNK_HEIGHT, BlockType::AIR); }

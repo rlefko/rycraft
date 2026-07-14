@@ -832,13 +832,144 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         }
     }
 
-    // Cap mesh builds per frame so a burst of freshly generated chunks
-    // amortizes over a few frames instead of stalling one.
-    constexpr int MAX_MESH_BUILDS_PER_FRAME = 16;
-    int meshBuilds = 0;
-    bool allocFailureLogged = false;
-    float meshMsThisFrame = 0.f;
+    // ---- Async meshing: workers build, the render thread only uploads ----
+    if (!_meshScheduler) {
+        _meshScheduler = std::make_unique<MeshScheduler>(world, 2);
+    }
 
+    // Upload one finished mesh into the registry. Returns false on a
+    // transient MegaBuffer-full failure (builtVersion stays 0, so the chunk
+    // re-requests once space frees up).
+    bool allocFailureLogged = false;
+    auto applyMesh = [&](uint64_t key, const MeshOutput& mesh, uint32_t builtVersion) -> bool {
+        ChunkMeshState& state = _chunkMeshes[key];
+        if (state.uploaded) {
+            _megaBuffer->free(state.alloc);
+            state.uploaded = false;
+        }
+        state.requestedVersion = 0;
+        state.opaqueIndexCount = mesh.opaqueIndexCount;
+        if (mesh.vertices.empty()) {
+            state.builtVersion = builtVersion; // all-air: nothing to draw
+            return true;
+        }
+        try {
+            auto alloc = _megaBuffer->allocate(static_cast<uint32_t>(mesh.vertices.size()),
+                                               static_cast<uint32_t>(mesh.indices.size()));
+            _megaBuffer->uploadVertices(mesh.vertices.data(), mesh.vertices.size() * sizeof(Vertex),
+                                        alloc.vertexOffset);
+            _megaBuffer->uploadIndices(mesh.indices.data(), mesh.indices.size() * sizeof(uint32_t),
+                                       alloc.indexOffset);
+            state.alloc = alloc;
+            state.uploaded = true;
+            state.builtVersion = builtVersion;
+            return true;
+        } catch (const std::exception& e) {
+            if (!allocFailureLogged) {
+                RY_LOG_ERROR((std::string("Chunk mesh upload failed: ") + e.what()).c_str());
+                allocFailureLogged = true;
+            }
+            state.builtVersion = 0;
+            return false;
+        }
+    };
+
+    // 1. Drain worker results and upload within the per-frame budget; the
+    //    leftovers stay in _pendingResults for next frame.
+    _meshScheduler->drainCompleted(_pendingResults);
+    constexpr int MAX_MESH_UPLOADS_PER_FRAME = 24;
+    constexpr size_t MAX_UPLOAD_BYTES_PER_FRAME = 8 * 1024 * 1024;
+    int uploads = 0;
+    size_t uploadBytes = 0;
+    size_t resultsConsumed = 0;
+    for (MeshResult& result : _pendingResults) {
+        if (uploads >= MAX_MESH_UPLOADS_PER_FRAME || uploadBytes >= MAX_UPLOAD_BYTES_PER_FRAME) {
+            break;
+        }
+        uint64_t key = result.pos.packed();
+        if (_liveChunkKeys.count(key) == 0) {
+            ++resultsConsumed; // chunk unloaded while meshing — drop
+            continue;
+        }
+        if (!result.snapshotOk) {
+            // A neighbor was missing: forget the request so the candidate
+            // scan below retries once the frontier catches up
+            auto it = _chunkMeshes.find(key);
+            if (it != _chunkMeshes.end()) {
+                it->second.requestedVersion = 0;
+            }
+            ++resultsConsumed;
+            continue;
+        }
+        if (!applyMesh(key, result.mesh, result.builtVersion)) {
+            break; // MegaBuffer full: retry this result next frame
+        }
+        ++uploads;
+        uploadBytes += result.mesh.vertices.size() * sizeof(Vertex) +
+                       result.mesh.indices.size() * sizeof(uint32_t);
+        ++resultsConsumed;
+    }
+    _pendingResults.erase(_pendingResults.begin(),
+                          _pendingResults.begin() + static_cast<long>(resultsConsumed));
+
+    // 2. Edit fast path: chunks right next to the camera re-mesh
+    //    synchronously so breaking a block never shows a stale frame.
+    int syncBuilds = 0;
+    for (auto& chunk : loadedChunks) {
+        if (!chunk || !chunk->generated || syncBuilds >= 2)
+            continue;
+        if (std::abs(chunk->chunkX - camChunkX) > 2 || std::abs(chunk->chunkZ - camChunkZ) > 2)
+            continue;
+        uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
+        auto it = _chunkMeshes.find(key);
+        uint32_t version = chunk->version.load(std::memory_order_relaxed);
+        // Only REBUILDS take the sync path (builtVersion != 0): first-time
+        // builds stream through the workers like everything else
+        if (it == _chunkMeshes.end() || it->second.builtVersion == 0 ||
+            it->second.builtVersion == version) {
+            continue;
+        }
+        if (!world.snapshotForMeshing(ChunkPos{chunk->chunkX, chunk->chunkZ}, _meshSnapshot)) {
+            continue;
+        }
+        MeshOutput mesh = LODMesher::buildMesh(_meshSnapshot, _meshScratch);
+        applyMesh(key, mesh, _meshSnapshot.version);
+        ++syncBuilds;
+        ++uploads;
+    }
+
+    // 3. Candidate scan: every generated chunk in the render radius whose
+    //    mesh is missing or stale, nearest first, until the in-flight cap.
+    _meshCandidates.clear();
+    for (auto& chunk : loadedChunks) {
+        if (!chunk || !chunk->generated)
+            continue;
+        if (std::abs(chunk->chunkX - camChunkX) > renderRadius ||
+            std::abs(chunk->chunkZ - camChunkZ) > renderRadius)
+            continue; // frontier ring: generated but not rendered
+        uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
+        uint32_t version = chunk->version.load(std::memory_order_relaxed);
+        auto it = _chunkMeshes.find(key);
+        if (it != _chunkMeshes.end() &&
+            (it->second.builtVersion == version || it->second.requestedVersion == version)) {
+            continue; // up to date, or a build is already on its way
+        }
+        float dx = static_cast<float>(chunk->chunkX * CHUNK_WIDTH + CHUNK_WIDTH / 2) - camX;
+        float dz = static_cast<float>(chunk->chunkZ * CHUNK_DEPTH + CHUNK_DEPTH / 2) - camZ;
+        _meshCandidates.push_back({dx * dx + dz * dz, chunk.get()});
+    }
+    std::sort(_meshCandidates.begin(), _meshCandidates.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [distSq, chunkPtr] : _meshCandidates) {
+        ChunkPos pos{chunkPtr->chunkX, chunkPtr->chunkZ};
+        if (!_meshScheduler->enqueue(pos)) {
+            break; // in-flight cap reached — re-prioritized next frame
+        }
+        _chunkMeshes[pos.packed()].requestedVersion =
+            chunkPtr->version.load(std::memory_order_relaxed);
+    }
+
+    // ---- Draw everything the registry has uploaded ----
     for (auto& chunk : loadedChunks) {
         if (!chunk || !chunk->generated)
             continue;
@@ -851,66 +982,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         if (!isChunkInFrustum(chunkAABB))
             continue;
 
-        // (Re)build the mesh when the chunk is dirty or was never meshed,
-        // within the render radius and once its neighbor snapshot exists
         auto cached = _chunkMeshes.find(key);
-        bool needsBuild = chunk->needsMeshUpdate || cached == _chunkMeshes.end();
-        if (needsBuild && (std::abs(chunk->chunkX - camChunkX) > renderRadius ||
-                           std::abs(chunk->chunkZ - camChunkZ) > renderRadius)) {
-            needsBuild = false; // frontier ring: generated but not rendered
-        }
-        if (needsBuild && meshBuilds < MAX_MESH_BUILDS_PER_FRAME) {
-            if (!world.snapshotForMeshing(ChunkPos{chunk->chunkX, chunk->chunkZ}, _meshSnapshot)) {
-                continue; // a neighbor is still generating — retry next frame
-            }
-            ++meshBuilds;
-
-            if (cached != _chunkMeshes.end()) {
-                if (cached->second.uploaded) {
-                    _megaBuffer->free(cached->second.alloc);
-                }
-                _chunkMeshes.erase(cached);
-            }
-
-            auto buildStart = std::chrono::steady_clock::now();
-            MeshOutput mesh = LODMesher::buildMesh(_meshSnapshot, _meshScratch);
-            meshMsThisFrame += std::chrono::duration<float, std::milli>(
-                                   std::chrono::steady_clock::now() - buildStart)
-                                   .count();
-            chunk->setMeshed(true);
-            chunk->needsMeshUpdate = false;
-
-            ChunkMeshState state; // uploaded == false marks an empty mesh
-            if (!mesh.vertices.empty()) {
-                try {
-                    auto alloc = _megaBuffer->allocate(static_cast<uint32_t>(mesh.vertices.size()),
-                                                       static_cast<uint32_t>(mesh.indices.size()));
-                    _megaBuffer->uploadVertices(mesh.vertices.data(),
-                                                mesh.vertices.size() * sizeof(Vertex),
-                                                alloc.vertexOffset);
-                    _megaBuffer->uploadIndices(mesh.indices.data(),
-                                               mesh.indices.size() * sizeof(uint32_t),
-                                               alloc.indexOffset);
-                    state.alloc = alloc;
-                    state.opaqueIndexCount = mesh.opaqueIndexCount;
-                    state.uploaded = true;
-                } catch (const std::exception& e) {
-                    if (!allocFailureLogged) {
-                        RY_LOG_ERROR(
-                            (std::string("Chunk mesh upload failed: ") + e.what()).c_str());
-                        allocFailureLogged = true;
-                    }
-                    // Transient failure (e.g. mega-buffer momentarily full):
-                    // leave the chunk dirty and cache NOTHING, so it retries
-                    // next frame instead of becoming a permanent hole
-                    chunk->needsMeshUpdate = true;
-                    continue;
-                }
-            }
-            _chunkMeshes[key] = state;
-        }
-
-        cached = _chunkMeshes.find(key);
         if (cached == _chunkMeshes.end() || !cached->second.uploaded)
             continue;
 
@@ -954,17 +1026,17 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                      indexBufferOffset:meshState.alloc.indexOffset];
     }
 
-    // F3 HUD counters (per-build EMA so the number is comparable across
-    // frames with different build counts)
-    _chunkStats.meshBuildsLastFrame = static_cast<uint32_t>(meshBuilds);
-    if (meshBuilds > 0) {
-        float perBuild = meshMsThisFrame / static_cast<float>(meshBuilds);
-        _chunkStats.meshMsAvg = _chunkStats.meshMsAvg == 0.f
-                                    ? perBuild
-                                    : _chunkStats.meshMsAvg * 0.9f + perBuild * 0.1f;
-    }
+    // F3 HUD counters: uploads applied this frame + the workers' build EMA
+    _chunkStats.meshBuildsLastFrame = static_cast<uint32_t>(uploads);
+    _chunkStats.meshMsAvg = _meshScheduler->meshMsAvg();
     _chunkStats.megaUsedMB = static_cast<float>(_megaBuffer->vertexUsed()) / (1024.f * 1024.f);
     _chunkStats.megaCapMB = static_cast<float>(_megaBuffer->vertexCapacity()) / (1024.f * 1024.f);
+}
+
+void RenderPipeline::shutdownMeshWorkers() {
+    if (_meshScheduler) {
+        _meshScheduler->shutdown();
+    }
 }
 
 // ---------------------------------------------------------------------------

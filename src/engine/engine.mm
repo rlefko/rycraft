@@ -519,6 +519,12 @@ static EngineState* _engineGetState(Engine* engine) {
         return;
     _savedWorld = true;
 
+    // Mesh workers reference the World — stop them before anything else
+    // (ivar destruction order at teardown is not something to bet on)
+    if (_renderPipeline) {
+        _renderPipeline->shutdownMeshWorkers();
+    }
+
     EngineState* state = _state.get();
     if (state->saveManager && state->world) {
         // Edited chunks persist on unload; the quit path sweeps the rest

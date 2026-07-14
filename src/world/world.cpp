@@ -171,6 +171,7 @@ void World::setBlock(int x, int y, int z, BlockType type) {
     it->second->setBlockWorld(x, y, z, type);
     it->second->modifiedSinceSave = true;
     it->second->needsMeshUpdate = true;
+    it->second->version.fetch_add(1, std::memory_order_relaxed);
 
     // Meshes read one block into each face neighbor: an edit on a boundary
     // column changes the neighbor's border faces too
@@ -178,6 +179,7 @@ void World::setBlock(int x, int y, int z, BlockType type) {
         auto neighbor = chunks_.find(ChunkPos{ncx, ncz});
         if (neighbor != chunks_.end()) {
             neighbor->second->needsMeshUpdate = true;
+            neighbor->second->version.fetch_add(1, std::memory_order_relaxed);
         }
     };
     int lx = x - cx * CHUNK_WIDTH;
@@ -214,6 +216,7 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
 
     out.chunkX = pos.x;
     out.chunkZ = pos.z;
+    out.version = self->second->version.load(std::memory_order_relaxed);
     out.resize();
     const Chunk& chunk = *self->second;
     for (int y = 0; y < CHUNK_HEIGHT; ++y) {

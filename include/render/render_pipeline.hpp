@@ -15,6 +15,7 @@
 #include "render/block_texture_array.hpp"
 #include "render/lod_mesher.hpp"
 #include "render/mega_buffer.hpp"
+#include "render/mesh_scheduler.hpp"
 #include "render/particles.hpp"
 #include "render/shader_types.hpp"
 #include "render/ui_menu.hpp"
@@ -32,10 +33,14 @@ class ParticleSystem;
 
 // GPU-side per-chunk mesh allocation tracking. opaqueIndexCount splits the
 // one allocation into the opaque section and the water section (see
-// MeshOutput).
+// MeshOutput). builtVersion/requestedVersion carry the staleness protocol:
+// a chunk re-meshes whenever its content version differs from the mesh it
+// is drawing, and a version already requested isn't requested twice.
 struct ChunkMeshState {
     MegaBuffer::ChunkAllocation alloc;
     uint32_t opaqueIndexCount = 0;
+    uint32_t builtVersion = 0;     // 0 = nothing built yet
+    uint32_t requestedVersion = 0; // 0 = no build in flight
     bool uploaded = false;
 };
 
@@ -105,6 +110,11 @@ public:
         float megaCapMB = 0.f;
     };
     ChunkRenderStats chunkRenderStats() const { return _chunkStats; }
+
+    // Stop the mesh workers (they reference the World). The engine calls
+    // this on the quit path BEFORE the world is destroyed; the scheduler's
+    // destructor also calls it defensively.
+    void shutdownMeshWorkers();
 
 private:
     // ---- Metal resources ----
@@ -210,8 +220,15 @@ private:
 
     // Reused meshing buffers (render thread only) — snapshot + scratch keep
     // their capacity across builds instead of reallocating ~85 KB each time.
+    // (These serve the synchronous edit fast path; workers have their own.)
     MeshSnapshot _meshSnapshot;
     MeshScratch _meshScratch;
+
+    // Async meshing: workers build, renderChunks drains + uploads. Both
+    // vectors are reused across frames.
+    std::unique_ptr<MeshScheduler> _meshScheduler;
+    std::vector<MeshResult> _pendingResults;
+    std::vector<std::pair<float, const Chunk*>> _meshCandidates;
 
     // ---- Day/Night Cycle (Task 6.4-6.5) ----
     void computeDayNightUniforms(uint64_t worldTime, float sunDirection[3], float sunColor[3],

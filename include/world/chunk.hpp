@@ -2,6 +2,7 @@
 #include "common/math.hpp"
 #include "world/block_properties.hpp"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <vector>
@@ -56,7 +57,19 @@ struct Chunk {
     // unload/quit (regenerated chunks are pure functions of the seed)
     bool modifiedSinceSave = false;
 
+    // Content revision, bumped by every block edit (self + boundary
+    // neighbors). The async mesher stamps results with the version it
+    // snapshotted; a mismatch on arrival means "upload, then re-mesh" —
+    // a newer mesh always beats a hole.
+    std::atomic<uint32_t> version{1};
+
     Chunk(int cx, int cz);
+
+    // The atomic makes Chunk non-copyable by default; copies happen only on
+    // single-threaded paths (serialization, the save-queue shield).
+    Chunk(const Chunk& other);
+    Chunk(Chunk&& other) noexcept;
+    Chunk& operator=(const Chunk& other);
 
     // Block access
     BlockType getBlock(int localX, int localY, int localZ) const;
