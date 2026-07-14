@@ -877,7 +877,16 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
         [encoder setDepthStencilState:_shadowMap->depthState()];
         [encoder setCullMode:MTLCullModeNone]; // greedy meshes are single-sided
         // Slope-scaled depth bias fights acne on faces near-parallel to the sun.
-        [encoder setDepthBias:1.0f slopeScale:2.5f clamp:0.005f];
+        // The clamp caps the slope term: vertical flora quads have near-infinite
+        // light-space slope, so they always land ON the clamp — at 0.005 NDC
+        // (~0.7 blocks along the light) stems sank into the ground, detaching
+        // every flower's shadow from its base and erasing thin grass shadows
+        // entirely. Cascade 0 (where that contact detail is visible) gets a
+        // 10x tighter clamp and leans on the receiver normal offset for acne;
+        // the far cascades keep the wide clamp — their NDC unit spans several
+        // blocks, so a tight clamp reintroduces acne at low sun while a
+        // ~1-block caster offset is invisible at 20+ blocks away.
+        [encoder setDepthBias:1.0f slopeScale:2.5f clamp:(cascade == 0 ? 0.0005f : 0.005f)];
         [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
         [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
 

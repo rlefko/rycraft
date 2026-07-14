@@ -32,6 +32,7 @@ struct VertexOutput {
     float vAO;             // baked corner AO 0.5-1 (per-vertex crease shading)
     float vBlockLight;     // lava block light 0-1 (warm cave glow)
     float vEmissive;       // 1 = self-lit block (lava), 0 = normally lit
+    float vCross;          // 1 = flora cross-quad (two-sided sun shading)
     float3 vWorldPosition; // World-space position for fog calculation
     uint vTextureLayer [[flat]];
 };
@@ -98,9 +99,10 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     out.vBlockLight = float((in.faceAttr >> 17) & 15u) / 15.0f;
     out.vEmissive = float((in.faceAttr >> 21) & 1u);
     uint normalIdx = in.faceAttr & 7u;
+    out.vCross = normalIdx == FACE_CROSS ? 1.0f : 0.0f;
     if (normalIdx == FACE_CROSS) {
-        // Flora cross-quads: orientation-free lighting tracking the sun's
-        // elevation, so the two diagonal quads never shade differently
+        // Flora cross-quads: elevation-tracked base light; the fragment stage
+        // adds the two-sided facing term (it needs per-pixel derivatives).
         out.vNormal = float3(0.0, 1.0, 0.0);
         out.vLight = max(uniforms.sunDirection.y, 0.0f) * 0.9f;
         out.vAO = 1.0f;
@@ -277,6 +279,22 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     float lit = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition,
                              in.clipPosition.xy, shadowMap, shadowSampler, shadow);
 
+    // Two-sided flora shading: the geometric normal of the visible blade side
+    // (from screen-space derivatives, flipped toward the camera) modulates the
+    // direct sun, so the face turned away from the sun reads as self-shaded
+    // instead of matching the sunlit side exactly. The term relaxes toward 1
+    // as the sun climbs: vertical blades are edge-on to a high sun, so at noon
+    // BOTH sides of every blade scored ~0.4 and all flora went uniformly dark
+    // — the facing contrast only means something at low sun angles.
+    float direct = in.vLight;
+    if (in.vCross > 0.5f) {
+        float3 blade = normalize(cross(dfdx(in.vWorldPosition), dfdy(in.vWorldPosition)));
+        float3 toCamera = normalize(uniforms.cameraPosition - in.vWorldPosition);
+        blade = dot(blade, toCamera) < 0.0f ? -blade : blade;
+        float facing = 0.4f + 0.6f * saturate(dot(blade, uniforms.sunDirection));
+        direct *= mix(facing, 1.0f, 0.7f * saturate(uniforms.sunDirection.y));
+    }
+
     // Warm block light from lava: a squared falloff so it reads as a punchy
     // pool of orange near the source that fades quickly, added on top of the
     // sun/sky (it is emitted, so the cascade shadow does not gate it).
@@ -289,7 +307,7 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     // SSAO pass layers the broader mid-scale occlusion on top in screen space.
     float3 litColor =
         texColor.rgb * in.vAO *
-        (uniforms.sunColor * in.vLight * sky * lit + uniforms.ambientColor * sky + blockLight);
+        (uniforms.sunColor * direct * sky * lit + uniforms.ambientColor * sky + blockLight);
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);
