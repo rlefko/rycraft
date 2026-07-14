@@ -17,6 +17,7 @@ Chunk::Chunk(const Chunk& other)
     : chunkX(other.chunkX)
     , chunkZ(other.chunkZ)
     , blocks(other.blocks)
+    , blockLight(other.blockLight)
     , biomes(other.biomes)
     , heightMap(other.heightMap)
     , needsMeshUpdate(other.needsMeshUpdate)
@@ -29,6 +30,7 @@ Chunk::Chunk(Chunk&& other) noexcept
     : chunkX(other.chunkX)
     , chunkZ(other.chunkZ)
     , blocks(std::move(other.blocks))
+    , blockLight(std::move(other.blockLight))
     , biomes(other.biomes)
     , heightMap(other.heightMap)
     , needsMeshUpdate(other.needsMeshUpdate)
@@ -41,6 +43,7 @@ Chunk& Chunk::operator=(const Chunk& other) {
     chunkX = other.chunkX;
     chunkZ = other.chunkZ;
     blocks = other.blocks;
+    blockLight = other.blockLight;
     biomes = other.biomes;
     heightMap = other.heightMap;
     needsMeshUpdate = other.needsMeshUpdate;
@@ -69,6 +72,25 @@ void Chunk::setBlock(int localX, int localY, int localZ, BlockType type) {
     if (localZ < 0 || localZ >= CHUNK_DEPTH) return;
     blocks[chunkIndex(localX, localY, localZ)] = type;
     needsMeshUpdate = true;
+}
+
+uint8_t Chunk::getBlockLight(int localX, int localY, int localZ) const {
+    if (blockLight.empty()) return 0;
+    if (localX < 0 || localX >= CHUNK_WIDTH) return 0;
+    if (localY < 0 || localY >= CHUNK_HEIGHT) return 0;
+    if (localZ < 0 || localZ >= CHUNK_DEPTH) return 0;
+    return blockLight[chunkIndex(localX, localY, localZ)];
+}
+
+void Chunk::setBlockLight(int localX, int localY, int localZ, uint8_t level) {
+    if (localX < 0 || localX >= CHUNK_WIDTH) return;
+    if (localY < 0 || localY >= CHUNK_HEIGHT) return;
+    if (localZ < 0 || localZ >= CHUNK_DEPTH) return;
+    if (blockLight.empty()) {
+        if (level == 0) return; // stay unallocated while fully dark
+        blockLight.assign(CHUNK_VOLUME, 0);
+    }
+    blockLight[chunkIndex(localX, localY, localZ)] = level;
 }
 
 BlockType Chunk::getBlockWorld(int x, int y, int z) const {

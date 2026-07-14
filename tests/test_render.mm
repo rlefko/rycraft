@@ -30,6 +30,7 @@
 #include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/climate.hpp>
+#include <world/light_engine.hpp>
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
@@ -542,15 +543,49 @@ TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][texture
              {uint8_t{0}, uint8_t{7}, TEXTURE_LAYER_GRASS_SIDE, TEXTURE_LAYER_WHITE}) {
             for (uint8_t light : {uint8_t{0}, uint8_t{4}, uint8_t{15}}) {
                 for (uint8_t ao : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{3}}) {
-                    uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer, light, ao);
-                    REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
-                    REQUIRE(unpackTextureLayer(attr) == layer);
-                    REQUIRE(unpackSkyLight(attr) == light);
-                    REQUIRE(unpackCornerAO(attr) == ao);
+                    for (uint8_t blockLight : {uint8_t{0}, uint8_t{9}, uint8_t{15}}) {
+                        for (bool emissive : {false, true}) {
+                            uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer, light,
+                                                         ao, blockLight, emissive);
+                            REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
+                            REQUIRE(unpackTextureLayer(attr) == layer);
+                            REQUIRE(unpackSkyLight(attr) == light);
+                            REQUIRE(unpackCornerAO(attr) == ao);
+                            REQUIRE(unpackBlockLight(attr) == blockLight);
+                            REQUIRE(unpackEmissive(attr) == emissive);
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+TEST_CASE("Mesher: bakes lava block light and the emissive flag", "[render][mesher][light]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::LAVA);   // light source
+    chunk.setBlock(10, 64, 8, BlockType::STONE); // a wall two blocks away
+    LightEngine::computeSelfLight(chunk);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    bool foundLitStoneFace = false;
+    bool foundEmissiveLava = false;
+    for (const Vertex& v : output.vertices) {
+        FaceNormal face = unpackFace(v.faceAttr);
+        float x = static_cast<float>(v.px);
+        // The stone's -X face (plane x = 10) samples the lit air at x = 9.
+        if (face == FaceNormal::MINUS_X && x > 9.9f && x < 10.1f) {
+            REQUIRE(unpackBlockLight(v.faceAttr) > 0);
+            foundLitStoneFace = true;
+        }
+        if (unpackEmissive(v.faceAttr)) {
+            foundEmissiveLava = true; // only lava sets the emissive bit
+        }
+    }
+    REQUIRE(foundLitStoneFace);
+    REQUIRE(foundEmissiveLava);
 }
 
 TEST_CASE("Mesher: baked corner AO darkens enclosed voxel corners", "[render][mesher][ao]") {

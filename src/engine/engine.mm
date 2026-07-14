@@ -732,6 +732,30 @@ static EngineState* _engineGetState(Engine* engine) {
                     }
                 }
             }
+
+            // Playtest hook: RYCRAFT_SPAWN_LAVA=1 carves a small surface lava
+            // pool a few blocks from spawn so headless captures can show the
+            // block-light glow (natural lava only forms in deep caves). Best
+            // paired with a night RYCRAFT_TIME so the orange spill stands out.
+            static const bool spawnLava = [] {
+                const char* v = std::getenv("RYCRAFT_SPAWN_LAVA");
+                return v && *v && std::strcmp(v, "0") != 0;
+            }();
+            if (spawnLava) {
+                for (int dz = -2; dz <= 2; ++dz) {
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        int wx = px + dx, wz = pz + 6 + dz; // ahead (+Z) at spawn
+                        for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
+                            if (isSolid(state->world->getBlock(wx, y, wz))) {
+                                state->world->setBlock(wx, y, wz, BlockType::LAVA);
+                                state->world->setBlock(wx, y + 1, wz, BlockType::AIR);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             state->spawnValidated = true;
         }
     }

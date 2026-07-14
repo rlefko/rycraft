@@ -51,6 +51,12 @@ struct Chunk {
     // Block data — flat array for cache-friendly access
     std::vector<BlockType> blocks;
 
+    // Block light (0-15) from lava and other emitters, derived by the
+    // LightEngine and never serialized (RYCH stays untouched). Lazily
+    // allocated: empty means every cell is dark, so the common lava-free
+    // chunk pays nothing. Same Y-major index layout as blocks.
+    std::vector<uint8_t> blockLight;
+
     // Biome map — 16x16 per chunk
     std::array<Biome, CHUNK_WIDTH * CHUNK_DEPTH> biomes;
 
@@ -83,6 +89,11 @@ struct Chunk {
     // Block access
     BlockType getBlock(int localX, int localY, int localZ) const;
     void setBlock(int localX, int localY, int localZ, BlockType type);
+
+    // Block-light access (0 when unallocated or out of range). setBlockLight
+    // allocates on the first non-zero write.
+    uint8_t getBlockLight(int localX, int localY, int localZ) const;
+    void setBlockLight(int localX, int localY, int localZ, uint8_t level);
 
     // World coordinate access
     BlockType getBlockWorld(int x, int y, int z) const;

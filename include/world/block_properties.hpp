@@ -122,3 +122,17 @@ constexpr bool isTransparent(BlockType type) {
 constexpr bool isTargetable(BlockType type) {
     return isSolid(type) || isFlora(type);
 }
+
+// Block light: the level (0-15) a block emits into the world. Lava is the one
+// source today; this is the single home the LightEngine and the mesher share.
+// Light spreads through isTransparent cells losing one level per block.
+constexpr uint8_t blockLightEmission(BlockType type) {
+    return type == BlockType::LAVA ? 15u : 0u;
+}
+
+// Rendering: a self-lit block whose faces glow at a fixed HDR level regardless
+// of sun, shadow, or skylight (and spill orange block light onto their
+// surroundings). Derived from the emission so the two can never disagree.
+constexpr bool isEmissive(BlockType type) {
+    return blockLightEmission(type) > 0u;
+}

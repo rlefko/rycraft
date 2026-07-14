@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class SaveManager;
@@ -82,6 +83,12 @@ public:
     // Update chunks around player position (synchronous)
     void updatePlayerPosition(int playerX, int playerZ);
 
+    // Drain the block-light reconcile queue: pull lava light across chunk
+    // borders until quiescent, bounded to budgetChunks re-floods per call so
+    // the tick never stalls. Called every tick; re-meshes chunks whose light
+    // changed. See LightEngine for the flood/fixed-point rationale.
+    void reconcileLight(int budgetChunks);
+
     // Unload chunks outside the view distance (called by updatePlayerPosition).
     // Edited chunks queue for saving as they leave the map.
     void unloadDistantChunks();
@@ -141,6 +148,20 @@ private:
 
     // Generation-time EMA: workers record, the HUD reads
     AtomicEmaMs genMs_;
+
+    // Block-light reconcile queue: chunks whose stored light may be stale
+    // because a neighbor loaded or an edit landed. Drained by reconcileLight
+    // on the tick thread. lightQueued_ dedups. lightMutex_ is a leaf below
+    // chunksMutex_ (only ever taken innermost; never held while acquiring
+    // another lock).
+    std::vector<ChunkPos> lightQueue_;
+    std::unordered_set<ChunkPos> lightQueued_;
+    mutable std::mutex lightMutex_;
+
+    // Enqueue a chunk (and its four face neighbors) for light reconciliation.
+    void queueLightReconcile(ChunkPos pos);
+    void queueFaceNeighbors(ChunkPos pos);
+    void queueLightReconcileWithNeighbors(ChunkPos pos);
 
     // Generate a single chunk (synchronous)
     void generateChunk(std::shared_ptr<Chunk> chunk);

@@ -58,17 +58,20 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
     }
 }
 
-// Pack a face normal, texture layer, sky-light level, and baked corner
-// ambient-occlusion into the vertex faceAttr field: face in bits 0-2, layer in
-// bits 3-10, light in bits 11-14, corner AO in bits 15-16. Light 15 = open sky;
-// lower values darken faces under cover (the column skylight that gives trees
-// and overhangs their cast shadows). Corner AO 3 = fully open (no darkening),
-// 0 = a fully enclosed voxel corner — the classic per-vertex crease shading.
+// Pack the per-vertex face attributes into the faceAttr field: face in bits
+// 0-2, layer in bits 3-10, sky light in bits 11-14, corner AO in bits 15-16,
+// block light in bits 17-20, emissive flag in bit 21. Sky light 15 = open sky;
+// lower values darken faces under cover. Corner AO 3 = fully open, 0 = a fully
+// enclosed voxel corner. Block light 0-15 is the lava glow reaching a face;
+// emissive marks a self-lit block (lava) that ignores sun/shadow/sky.
 constexpr uint32_t packFaceAttr(FaceNormal face, uint8_t layer, uint8_t skyLight = 15,
-                                uint8_t cornerAO = 3) {
+                                uint8_t cornerAO = 3, uint8_t blockLight = 0,
+                                bool emissive = false) {
     return static_cast<uint32_t>(face) | (static_cast<uint32_t>(layer) << 3) |
            (static_cast<uint32_t>(skyLight & 15u) << 11) |
-           (static_cast<uint32_t>(cornerAO & 3u) << 15);
+           (static_cast<uint32_t>(cornerAO & 3u) << 15) |
+           (static_cast<uint32_t>(blockLight & 15u) << 17) |
+           (static_cast<uint32_t>(emissive ? 1u : 0u) << 21);
 }
 
 constexpr FaceNormal unpackFace(uint32_t faceAttr) {
@@ -85,4 +88,12 @@ constexpr uint8_t unpackSkyLight(uint32_t faceAttr) {
 
 constexpr uint8_t unpackCornerAO(uint32_t faceAttr) {
     return static_cast<uint8_t>((faceAttr >> 15) & 3u);
+}
+
+constexpr uint8_t unpackBlockLight(uint32_t faceAttr) {
+    return static_cast<uint8_t>((faceAttr >> 17) & 15u);
+}
+
+constexpr bool unpackEmissive(uint32_t faceAttr) {
+    return ((faceAttr >> 21) & 1u) != 0u;
 }

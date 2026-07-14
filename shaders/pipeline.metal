@@ -30,6 +30,8 @@ struct VertexOutput {
     float vLight;
     float vSkyLight;       // column skylight 0-1 (cast shade, cave darkness)
     float vAO;             // baked corner AO 0.5-1 (per-vertex crease shading)
+    float vBlockLight;     // lava block light 0-1 (warm cave glow)
+    float vEmissive;       // 1 = self-lit block (lava), 0 = normally lit
     float3 vWorldPosition; // World-space position for fog calculation
     uint vTextureLayer [[flat]];
 };
@@ -92,6 +94,9 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
     out.vAO = 0.5f + float((in.faceAttr >> 15) & 3u) * (1.0f / 6.0f);
+    // Block light (bits 17-20) and the emissive flag (bit 21) — the lava glow.
+    out.vBlockLight = float((in.faceAttr >> 17) & 15u) / 15.0f;
+    out.vEmissive = float((in.faceAttr >> 21) & 1u);
     uint normalIdx = in.faceAttr & 7u;
     if (normalIdx == FACE_CROSS) {
         // Flora cross-quads: orientation-free lighting tracking the sun's
@@ -246,6 +251,19 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
         discard_fragment();
     }
 
+    // Emissive blocks (lava) glow at a fixed HDR level, ignoring sun, shadow,
+    // and skylight — the >1.0 output exceeds the bloom threshold naturally and
+    // makes lava the light source the block-light term below spreads from.
+    // Kept modest so the molten orange survives tonemapping instead of
+    // clipping to white when auto-exposure lifts a dark scene.
+    constexpr float EMISSIVE_BOOST = 3.0f;
+    if (in.vEmissive > 0.5f) {
+        float3 glow = texColor.rgb * EMISSIVE_BOOST;
+        return float4(applyFog(glow, in.vWorldPosition, uniforms.cameraPosition,
+                               uniforms.fogDensity, uniforms.fogColor),
+                      1.0f);
+    }
+
     // Sky access from the baked per-column skylight. Because the mesher now
     // treats only OPAQUE blocks as sky-blockers, a tree canopy (non-opaque
     // leaves) no longer casts a fake column shadow on the ground below — that
@@ -259,11 +277,19 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     float lit = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition,
                              in.clipPosition.xy, shadowMap, shadowSampler, shadow);
 
+    // Warm block light from lava: a squared falloff so it reads as a punchy
+    // pool of orange near the source that fades quickly, added on top of the
+    // sun/sky (it is emitted, so the cascade shadow does not gate it).
+    constexpr float3 BLOCK_LIGHT_TINT = float3(1.0f, 0.55f, 0.22f);
+    constexpr float BLOCK_LIGHT_STRENGTH = 1.5f;
+    float3 blockLight = BLOCK_LIGHT_TINT * (in.vBlockLight * in.vBlockLight) * BLOCK_LIGHT_STRENGTH;
+
     // Baked corner AO darkens ambient and direct alike — the crease shading
     // reads as contact occlusion the same way vanilla applies it. The half-res
     // SSAO pass layers the broader mid-scale occlusion on top in screen space.
-    float3 litColor = texColor.rgb * in.vAO *
-                      (uniforms.sunColor * in.vLight * sky * lit + uniforms.ambientColor * sky);
+    float3 litColor =
+        texColor.rgb * in.vAO *
+        (uniforms.sunColor * in.vLight * sky * lit + uniforms.ambientColor * sky + blockLight);
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);
