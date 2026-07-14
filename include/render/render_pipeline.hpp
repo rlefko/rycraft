@@ -229,6 +229,11 @@ private:
     // Exponential fog density per block
     float _fogDensity = 0.0003f;
 
+    // Frame animation clock (worldTime -> seconds, wraps daily) driving the
+    // foliage sway in the scene AND shadow passes — one value per frame so
+    // the two can never sample different phases.
+    float _animTime = 0.0f;
+
     // Drawable dimensions (the scene renders at native resolution)
     uint32_t _displayWidth;
     uint32_t _displayHeight;
@@ -308,8 +313,8 @@ private:
     // recorded _waterDraws plus the underwater overlay when submerged.
     void renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4& viewMatrix,
                      const Mat4& projectionMatrix, const Vec3& cameraPosition,
-                     bool cameraUnderwater, const SkyUniforms& skyUniforms, const float fogColor[3],
-                     uint64_t worldTime);
+                     bool cameraUnderwater, const SkyUniforms& skyUniforms,
+                     const float fogColor[3]);
 
     void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
                          const UIFrameState& uiFrame);

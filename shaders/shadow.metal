@@ -23,10 +23,13 @@ struct ShadowVertexOutput {
 };
 
 vertex ShadowVertexOutput shadowVertexMain(ShadowVertexInput in [[stage_in]],
-                                           constant ShadowPassUniforms &shadow [[buffer(1)]],
-                                           constant ChunkOrigin &chunkOrigin [[buffer(2)]]) {
+                                           constant ShadowPassUniforms& shadow [[buffer(1)]],
+                                           constant ChunkOrigin& chunkOrigin [[buffer(2)]]) {
     ShadowVertexOutput out;
     float3 worldPos = in.position + chunkOrigin.origin.xyz;
+    // The same sway as the scene pass, or foliage shadows detach from blades.
+    worldPos =
+        applySway(worldPos, (in.faceAttr >> 22) & 3u, in.uv.y, shadow.time, shadow.swayStrength);
     out.clipPosition = shadow.lightViewProj * float4(worldPos, 1.0);
     out.vUV = in.uv;
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;

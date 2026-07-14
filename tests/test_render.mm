@@ -545,20 +545,51 @@ TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][texture
                 for (uint8_t ao : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{3}}) {
                     for (uint8_t blockLight : {uint8_t{0}, uint8_t{9}, uint8_t{15}}) {
                         for (bool emissive : {false, true}) {
-                            uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer, light,
-                                                         ao, blockLight, emissive);
-                            REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
-                            REQUIRE(unpackTextureLayer(attr) == layer);
-                            REQUIRE(unpackSkyLight(attr) == light);
-                            REQUIRE(unpackCornerAO(attr) == ao);
-                            REQUIRE(unpackBlockLight(attr) == blockLight);
-                            REQUIRE(unpackEmissive(attr) == emissive);
+                            for (uint8_t sway : {uint8_t{0}, uint8_t{1}, uint8_t{2}}) {
+                                uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer,
+                                                             light, ao, blockLight, emissive, sway);
+                                REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
+                                REQUIRE(unpackTextureLayer(attr) == layer);
+                                REQUIRE(unpackSkyLight(attr) == light);
+                                REQUIRE(unpackCornerAO(attr) == ao);
+                                REQUIRE(unpackBlockLight(attr) == blockLight);
+                                REQUIRE(unpackEmissive(attr) == emissive);
+                                REQUIRE(unpackSway(attr) == sway);
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+TEST_CASE("Mesher: tags sway class for flora and leaves", "[render][mesher][sway]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(4, 64, 4, BlockType::STONE);
+    chunk.setBlock(4, 65, 4, BlockType::TALL_GRASS);
+    chunk.setBlock(8, 64, 8, BlockType::LEAVES);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    bool sawFlora = false, sawLeaves = false, sawStatic = false;
+    for (const Vertex& v : output.vertices) {
+        uint8_t layer = unpackTextureLayer(v.faceAttr);
+        if (unpackFace(v.faceAttr) == FaceNormal::CROSS) {
+            REQUIRE(unpackSway(v.faceAttr) == 1); // flora bends from the root
+            sawFlora = true;
+        } else if (layer == static_cast<uint8_t>(BlockType::LEAVES)) {
+            REQUIRE(unpackSway(v.faceAttr) == 2); // canopy drifts whole-block
+            sawLeaves = true;
+        } else if (layer == static_cast<uint8_t>(BlockType::STONE)) {
+            REQUIRE(unpackSway(v.faceAttr) == 0); // terrain never sways
+            sawStatic = true;
+        }
+    }
+    REQUIRE(sawFlora);
+    REQUIRE(sawLeaves);
+    REQUIRE(sawStatic);
 }
 
 TEST_CASE("Mesher: bakes lava block light and the emissive flag", "[render][mesher][light]") {
@@ -1063,16 +1094,20 @@ TEST_CASE("Clouds: cloud altitude constant", "[phase8][clouds]") {
 // position, sky colors, and particle data.
 
 TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(Uniforms) == 288);
+    REQUIRE(sizeof(Uniforms) == 304);
     REQUIRE(offsetof(Uniforms, sunDirection) == 192);
     REQUIRE(offsetof(Uniforms, fogColor) == 240);
     REQUIRE(offsetof(Uniforms, fogDensity) == 256);
     REQUIRE(offsetof(Uniforms, cameraPosition) == 272);
+    REQUIRE(offsetof(Uniforms, time) == 288);
+    REQUIRE(offsetof(Uniforms, swayStrength) == 292);
     REQUIRE(alignof(Uniforms) == 16);
 }
 
 TEST_CASE("Shader types: ShadowUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(ShadowPassUniforms) == 64);
+    REQUIRE(sizeof(ShadowPassUniforms) == 80);
+    REQUIRE(offsetof(ShadowPassUniforms, time) == 64);
+    REQUIRE(offsetof(ShadowPassUniforms, swayStrength) == 68);
     REQUIRE(sizeof(ShadowUniforms) == 224);
     REQUIRE(offsetof(ShadowUniforms, cascadeSplitDist) == 192);
     REQUIRE(offsetof(ShadowUniforms, shadowParams) == 208);

@@ -60,18 +60,21 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
 
 // Pack the per-vertex face attributes into the faceAttr field: face in bits
 // 0-2, layer in bits 3-10, sky light in bits 11-14, corner AO in bits 15-16,
-// block light in bits 17-20, emissive flag in bit 21. Sky light 15 = open sky;
-// lower values darken faces under cover. Corner AO 3 = fully open, 0 = a fully
-// enclosed voxel corner. Block light 0-15 is the lava glow reaching a face;
-// emissive marks a self-lit block (lava) that ignores sun/shadow/sky.
+// block light in bits 17-20, emissive flag in bit 21, sway class in bits
+// 22-23. Sky light 15 = open sky; lower values darken faces under cover.
+// Corner AO 3 = fully open, 0 = a fully enclosed voxel corner. Block light
+// 0-15 is the lava glow reaching a face; emissive marks a self-lit block
+// (lava) that ignores sun/shadow/sky. Sway (see swayClass) picks the wind
+// animation the scene and shadow vertex stages both apply.
 constexpr uint32_t packFaceAttr(FaceNormal face, uint8_t layer, uint8_t skyLight = 15,
-                                uint8_t cornerAO = 3, uint8_t blockLight = 0,
-                                bool emissive = false) {
+                                uint8_t cornerAO = 3, uint8_t blockLight = 0, bool emissive = false,
+                                uint8_t sway = 0) {
     return static_cast<uint32_t>(face) | (static_cast<uint32_t>(layer) << 3) |
            (static_cast<uint32_t>(skyLight & 15u) << 11) |
            (static_cast<uint32_t>(cornerAO & 3u) << 15) |
            (static_cast<uint32_t>(blockLight & 15u) << 17) |
-           (static_cast<uint32_t>(emissive ? 1u : 0u) << 21);
+           (static_cast<uint32_t>(emissive ? 1u : 0u) << 21) |
+           (static_cast<uint32_t>(sway & 3u) << 22);
 }
 
 constexpr FaceNormal unpackFace(uint32_t faceAttr) {
@@ -96,4 +99,8 @@ constexpr uint8_t unpackBlockLight(uint32_t faceAttr) {
 
 constexpr bool unpackEmissive(uint32_t faceAttr) {
     return ((faceAttr >> 21) & 1u) != 0u;
+}
+
+constexpr uint8_t unpackSway(uint32_t faceAttr) {
+    return static_cast<uint8_t>((faceAttr >> 22) & 3u);
 }

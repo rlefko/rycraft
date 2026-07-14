@@ -80,8 +80,11 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
                                constant ChunkOrigin& chunkOrigin [[buffer(2)]]) {
     VertexOutput out;
 
-    // Restore world space from the chunk-local position, then run MVP
+    // Restore world space from the chunk-local position, sway foliage in the
+    // wind (bits 22-23; the shadow pass applies the same displacement), then MVP
     float4 worldPos = uniforms.modelMatrix * float4(in.position + chunkOrigin.origin.xyz, 1.0);
+    worldPos.xyz = applySway(worldPos.xyz, (in.faceAttr >> 22) & 3u, in.uv.y, uniforms.time,
+                             uniforms.swayStrength);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
 

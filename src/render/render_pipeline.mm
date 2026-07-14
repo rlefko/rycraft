@@ -458,6 +458,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     computeDayNightUniforms(worldTime, sunDirection, sunColor, ambientColor, skyUniforms,
                             shadowStrength);
 
+    // 20 Hz world time -> seconds (the same stepping the water pass animates with)
+    _animTime = static_cast<float>(worldTime % 24000) * 0.05f;
+
     // Normalize sun direction
     float sunLen = std::sqrt(sunDirection[0] * sunDirection[0] + sunDirection[1] * sunDirection[1] +
                              sunDirection[2] * sunDirection[2]);
@@ -582,7 +585,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
 
     // ---- Water pass (refraction/reflection/caustics over the resolved scene) ----
     renderWater(commandBuffer, viewMatrix, projectionMatrix, camera.getPosition(), cameraUnderwater,
-                skyUniforms, fogColor, worldTime);
+                skyUniforms, fogColor);
     _fogDensity = savedFogDensity;
 
     // ---- Volumetric light shafts (over the resolved opaque + water) ----
@@ -893,6 +896,8 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
         ShadowPassUniforms passUniforms{};
         std::memcpy(&passUniforms.lightViewProj, _shadowMap->cascadeViewProj(cascade).data.data(),
                     sizeof(float) * 16);
+        passUniforms.time = _animTime;
+        passUniforms.swayStrength = _gfx.wavingFoliage ? 1.0f : 0.0f;
         [encoder setVertexBytes:&passUniforms length:sizeof(passUniforms) atIndex:1];
 
         for (auto& chunk : loadedChunks) {
@@ -964,6 +969,10 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
 
     // Camera position for fog distance calculation
     uniforms.cameraPosition = simd_make_float3(camX, camY, camZ);
+
+    // Foliage sway clock + the waving toggle (0 freezes blades at rest)
+    uniforms.time = _animTime;
+    uniforms.swayStrength = _gfx.wavingFoliage ? 1.0f : 0.0f;
 
     // Upload to GPU (kept for the entity renderer + water vertex stage too)
     _frameUniforms = _frameRing.push(&uniforms, sizeof(Uniforms));
@@ -1250,7 +1259,7 @@ void RenderPipeline::shutdownMeshWorkers() {
 void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4& viewMatrix,
                                  const Mat4& projectionMatrix, const Vec3& cameraPosition,
                                  bool cameraUnderwater, const SkyUniforms& skyUniforms,
-                                 const float fogColor[3], uint64_t worldTime) {
+                                 const float fogColor[3]) {
     if (_waterDraws.empty() && !cameraUnderwater)
         return;
 
@@ -1287,8 +1296,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     wu.resolution =
         simd_make_float2(static_cast<float>(_displayWidth), static_cast<float>(_displayHeight));
     wu.fogDensity = _fogDensity;
-    // 20 Hz world time → seconds (the same stepping the clouds animate with)
-    wu.time = static_cast<float>(worldTime % 24000) * 0.05f;
+    wu.time = _animTime; // the shared per-frame animation clock
     wu.cameraUnderwater = cameraUnderwater ? 1.f : 0.f;
     // Screen-space reflections layer onto the fresnel sky term; 0 keeps the
     // pre-SSR look (also the RYCRAFT_SSR=0 / setting-off path).

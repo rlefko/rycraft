@@ -130,6 +130,29 @@ constexpr uint8_t blockLightEmission(BlockType type) {
     return type == BlockType::LAVA ? 15u : 0u;
 }
 
+// Wind sway class the vertex shaders animate: 0 static, 1 flora (bends from
+// the root, tip swings most), 2 leaves (whole canopy drifts). Mushrooms stay
+// static — cave flora sits out of the wind.
+constexpr uint8_t swayClass(BlockType type) {
+    switch (type) {
+        case BlockType::TALL_GRASS:
+        case BlockType::FLOWER_YELLOW:
+        case BlockType::FLOWER_RED:
+        case BlockType::DEAD_BUSH:
+            return 1;
+        // Reeds stack 2-3 blocks: class 1 would root each segment's base while
+        // the segment below swings its top, tearing every joint. The class-2
+        // continuous field displaces shared corners identically.
+        case BlockType::REED:
+        case BlockType::LEAVES:
+        case BlockType::BIRCH_LEAVES:
+        case BlockType::SPRUCE_LEAVES:
+            return 2;
+        default:
+            return 0;
+    }
+}
+
 // Rendering: a self-lit block whose faces glow at a fixed HDR level regardless
 // of sun, shadow, or skylight (and spill orange block light onto their
 // surroundings). Derived from the emission so the two can never disagree.

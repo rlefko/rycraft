@@ -16,6 +16,33 @@ static inline float interleavedGradientNoise(metal::float2 px) {
     return metal::fract(52.9829189f *
                         metal::fract(metal::dot(px, metal::float2(0.06711056f, 0.00583715f))));
 }
+
+// Foliage wind sway, ONE definition shared by the scene and shadow vertex
+// stages so shadows track the displaced geometry exactly (the same
+// never-drift rule as applyFog). sway: 1 = flora (v is the cross-quad texture
+// v, 0 at the tip — the base stays rooted), 2 = leaves (a continuous field of
+// world position, so vertices shared by merged quads displace identically and
+// the canopy never cracks). strength 0 (the waving setting off) is a no-op.
+static inline metal::float3 applySway(metal::float3 worldPos, uint sway, float v, float time,
+                                      float strength) {
+    if (sway == 0u || strength <= 0.0f) {
+        return worldPos;
+    }
+    if (sway == 1u) {
+        float w = (1.0f - v) * (1.0f - v);
+        metal::float2 cell = metal::floor(worldPos.xz) + 0.5f; // whole plant, one phase
+        float phase = cell.x * 0.9f + cell.y * 1.3f;
+        float gust =
+            metal::sin(time * 1.6f + phase) + 0.4f * metal::sin(time * 2.7f + phase * 1.7f);
+        worldPos.x += gust * 0.055f * w * strength;
+        worldPos.z += metal::cos(time * 1.2f + phase) * 0.045f * w * strength;
+    } else {
+        float phase = worldPos.x * 0.35f + worldPos.y * 0.21f + worldPos.z * 0.28f;
+        worldPos.x += metal::sin(time * 0.9f + phase) * 0.03f * strength;
+        worldPos.z += metal::cos(time * 0.7f + phase * 1.3f) * 0.03f * strength;
+    }
+    return worldPos;
+}
 #endif
 
 // Bound at buffer(1) in the main chunk/highlight shaders.
@@ -29,6 +56,8 @@ struct Uniforms {
     simd_float3 fogColor;
     float fogDensity;
     simd_float3 cameraPosition; // for fog distance
+    float time;                 // seconds; drives foliage sway
+    float swayStrength;         // 0 = waving setting off, 1 = full sway
 };
 
 // Per-chunk world offset, bound at buffer(2) via setVertexBytes. Vertices are
@@ -38,9 +67,12 @@ struct ChunkOrigin {
 };
 
 // One cascade's light view-projection, bound at buffer(1) via setVertexBytes
-// in the depth-only shadow pass (shadow.metal).
+// in the depth-only shadow pass (shadow.metal). time/swayStrength must match
+// the scene pass exactly or foliage shadows detach from the swaying blades.
 struct ShadowPassUniforms {
     simd_float4x4 lightViewProj;
+    float time;
+    float swayStrength;
 };
 
 // A macro, not a constexpr int: MSL rejects a program-scope constant outside
@@ -232,11 +264,13 @@ struct PostUniforms {
 #ifndef __METAL_VERSION__
 #include <cstddef>
 
-static_assert(sizeof(Uniforms) == 288);
+static_assert(sizeof(Uniforms) == 304);
 static_assert(offsetof(Uniforms, sunDirection) == 192);
 static_assert(offsetof(Uniforms, fogColor) == 240);
 static_assert(offsetof(Uniforms, fogDensity) == 256);
 static_assert(offsetof(Uniforms, cameraPosition) == 272);
+static_assert(offsetof(Uniforms, time) == 288);
+static_assert(offsetof(Uniforms, swayStrength) == 292);
 
 static_assert(sizeof(WaterUniforms) == 256);
 static_assert(offsetof(WaterUniforms, viewProjection) == 64);
@@ -247,7 +281,9 @@ static_assert(offsetof(WaterUniforms, time) == 236);
 static_assert(offsetof(WaterUniforms, cameraUnderwater) == 240);
 static_assert(offsetof(WaterUniforms, ssrStrength) == 244);
 
-static_assert(sizeof(ShadowPassUniforms) == 64);
+static_assert(sizeof(ShadowPassUniforms) == 80);
+static_assert(offsetof(ShadowPassUniforms, time) == 64);
+static_assert(offsetof(ShadowPassUniforms, swayStrength) == 68);
 
 static_assert(sizeof(ShadowUniforms) == 224);
 static_assert(offsetof(ShadowUniforms, cascadeSplitDist) == 192);

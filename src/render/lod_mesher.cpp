@@ -92,11 +92,12 @@ static void pushQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs, Fa
                       (cornerAOAt(packedAO, 1) + cornerAOAt(packedAO, 3));
     const uint8_t layer = textureLayerFor(bt, face);
     const bool emissive = isEmissive(bt); // constant per quad — bt is a merge key
+    const uint8_t sway = swayClass(bt);   // likewise derived from the merge key
     for (int k = 0; k < 4; ++k) {
         const int c = flip ? (k + 1) & 3 : k;
         const QuadCorner& corner = corners[c];
-        const uint32_t attr =
-            packFaceAttr(face, layer, skyLight, cornerAOAt(packedAO, c), blockLight, emissive);
+        const uint32_t attr = packFaceAttr(face, layer, skyLight, cornerAOAt(packedAO, c),
+                                           blockLight, emissive, sway);
         verts.push_back(Vertex{attr, static_cast<float16_t>(corner.x),
                                static_cast<float16_t>(corner.y), static_cast<float16_t>(corner.z),
                                static_cast<float16_t>(corner.u), static_cast<float16_t>(corner.v)});
