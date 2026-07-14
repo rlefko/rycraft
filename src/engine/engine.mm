@@ -1190,7 +1190,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     _renderPipeline->render(
         _queue, drawable, viewMatrix, state->projectionMatrix, *state->world, state->camera,
-        state->worldTime,
+        state->worldTime, state->deltaTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
         state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
 }

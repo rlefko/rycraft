@@ -434,8 +434,8 @@ void RenderPipeline::allocateSceneTargets() {
 void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
                             const Mat4& viewMatrix, const Mat4& projectionMatrix,
                             const World& world, const Camera& camera, uint64_t worldTime,
-                            std::optional<Vec3> highlightedBlock, const Hotbar& hotbar,
-                            const UIFrameState& uiFrame,
+                            double deltaSeconds, std::optional<Vec3> highlightedBlock,
+                            const Hotbar& hotbar, const UIFrameState& uiFrame,
                             const std::vector<std::shared_ptr<Entity>>* entities) {
     if (!drawable || !queue)
         return;
@@ -462,8 +462,15 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     computeDayNightUniforms(worldTime, sunDirection, sunColor, ambientColor, skyUniforms,
                             shadowStrength);
 
-    // 20 Hz world time -> seconds (the same stepping the water pass animates with)
-    _animTime = static_cast<float>(worldTime % TICKS_PER_DAY) * 0.05f;
+    // Animation clock accumulates the real frame delta (the engine already
+    // clamps it to <= 0.25 s past a hitch/pause), NOT the day-night worldTime,
+    // so water/caustics/foliage keep flowing even when the time of day is frozen
+    // (captures) or paused and never jump at the daily rollover. It wraps at
+    // 3600 s so the float stays sub-millisecond precise.
+    if (deltaSeconds > 0.0) {
+        _animClock = std::fmod(_animClock + deltaSeconds, 3600.0);
+    }
+    _animTime = static_cast<float>(_animClock);
 
     // Normalize sun direction
     float sunLen = std::sqrt(sunDirection[0] * sunDirection[0] + sunDirection[1] * sunDirection[1] +
