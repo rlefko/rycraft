@@ -195,6 +195,26 @@ TEST_CASE("isInWater: returns true when entity AABB overlaps water block", "[phy
     REQUIRE(PhysicsEngine::isInWater(*world, notInWater) == false);
 }
 
+TEST_CASE("isInWater: standing beside water is not in it", "[physics]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    world->setBlock(5, 200, 5, BlockType::WATER); // cell spans [5,6) on each axis
+
+    // Fully inside the neighboring cell — the old inclusive ceil bound
+    // scanned one block past the AABB and slowed (soon: swam) the player
+    // along every shoreline
+    AABB beside{Vec3{4.1f, 200.1f, 4.2f}, Vec3{4.7f, 201.9f, 4.8f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, beside) == false);
+
+    // Touching the shared face exactly still does not count as overlap
+    AABB touching{Vec3{4.4f, 200.1f, 4.2f}, Vec3{5.0f, 201.9f, 4.8f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, touching) == false);
+
+    // Crossing the face by any amount does
+    AABB crossing{Vec3{4.6f, 200.1f, 4.9f}, Vec3{5.2f, 201.9f, 5.5f}};
+    REQUIRE(PhysicsEngine::isInWater(*world, crossing) == true);
+}
+
 // ============================================================================
 // Player Tests (Phase 5)
 // ============================================================================
@@ -214,15 +234,15 @@ TEST_CASE("Player walks across flat ground while standing on it", "[player][phys
     player.position = Vec3{4.f, 201.f, 4.f}; // feet on the platform
     player.yaw = 0.f;                        // facing +Z
 
-    InputState input;
-    input.keysDown[Key::W] = true;
+    PlayerInput input;
+    input.forward = true;
 
     // Settle onto the ground, then walk forward for a second of ticks.
     // The old sweep treated the floor underfoot as a wall, so horizontal
     // movement zeroed the moment the player landed — the "stuck player" bug.
     Vec3 start = player.position;
     for (int i = 0; i < 20; ++i) {
-        player.tick(*world, input, false);
+        player.tick(*world, input);
     }
 
     REQUIRE(player.onGround);
@@ -251,10 +271,10 @@ TEST_CASE("Player is stopped by a wall but slides along it", "[player][physics]"
     player.position = Vec3{6.f, 201.f, 5.f};
     player.yaw = 0.f; // facing +Z, straight at the wall
 
-    InputState input;
-    input.keysDown[Key::W] = true;
+    PlayerInput input;
+    input.forward = true;
     for (int i = 0; i < 30; ++i) {
-        player.tick(*world, input, false);
+        player.tick(*world, input);
     }
 
     // Blocked at the wall face (player half-width 0.3 → z stops near 7.7)
@@ -273,9 +293,9 @@ TEST_CASE("Player movement follows the camera basis", "[player]") {
         Player player;
         player.position = Vec3{8.f, 250.f, 8.f}; // high in the air, no collisions
         player.yaw = 0.f;
-        InputState input;
-        input.keysDown[Key::W] = true;
-        player.tick(*world, input, false);
+        PlayerInput input;
+        input.forward = true;
+        player.tick(*world, input);
         REQUIRE(player.velocity.z > 0.f);
         REQUIRE(std::abs(player.velocity.x) < 1e-4f);
     }
@@ -283,9 +303,9 @@ TEST_CASE("Player movement follows the camera basis", "[player]") {
         Player player;
         player.position = Vec3{8.f, 250.f, 8.f};
         player.yaw = 0.f;
-        InputState input;
-        input.keysDown[Key::D] = true;
-        player.tick(*world, input, false);
+        PlayerInput input;
+        input.right = true;
+        player.tick(*world, input);
         REQUIRE(player.velocity.x < 0.f);
         REQUIRE(std::abs(player.velocity.z) < 1e-4f);
     }
@@ -320,8 +340,8 @@ TEST_CASE("Player gravity: velocity.y decreases by 0.08 per tick", "[player]") {
     player.position = Vec3{0.f, 100.f, 0.f}; // High up
     player.velocity = Vec3::zero();
 
-    InputState input;
-    player.tick(*world, input, false);
+    PlayerInput input;
+    player.tick(*world, input);
 
     // After one tick, gravity then vertical drag have been applied for the
     // next tick: velocity.y = (0 + GRAVITY) * VERTICAL_DRAG. Reference the
@@ -344,8 +364,8 @@ TEST_CASE("Player terminal velocity: clamped to TERMINAL_VELOCITY", "[player]") 
     player.position = Vec3{0.f, 200.f, 0.f};
     player.velocity = Vec3{0.f, -10.f, 0.f}; // Start below terminal
 
-    InputState input;
-    player.tick(*world, input, false);
+    PlayerInput input;
+    player.tick(*world, input);
 
     // Velocity should be clamped to terminal velocity: -10 * drag is still
     // below TERMINAL_VELOCITY, so the clamp pins it exactly there.
@@ -419,11 +439,11 @@ TEST_CASE("Player jump clears a full block (apex ~1.25, at least 1.0)", "[player
 
     Player player;
     player.position = Vec3{0.f, 201.f, 0.f};
-    InputState input;
+    PlayerInput input;
 
     // Settle onto the ground first
     for (int i = 0; i < 5; ++i)
-        player.tick(*world, input, false);
+        player.tick(*world, input);
     REQUIRE(player.onGround);
 
     float startY = player.position.y;
@@ -432,7 +452,7 @@ TEST_CASE("Player jump clears a full block (apex ~1.25, at least 1.0)", "[player
 
     float maxY = startY;
     for (int i = 0; i < 15; ++i) {
-        player.tick(*world, input, false);
+        player.tick(*world, input);
         if (player.position.y > maxY)
             maxY = player.position.y;
     }
@@ -454,8 +474,8 @@ TEST_CASE("Player jumps onto a 1-block step while walking into it", "[player][ph
     Player player;
     player.position = Vec3{0.f, 201.f, 0.f};
     player.yaw = 0.f; // facing +Z, straight at the step
-    InputState input;
-    input.keysDown[Key::W] = true;
+    PlayerInput input;
+    input.forward = true;
 
     // Walk forward, jumping whenever grounded, until the player is standing on
     // top of the raised step (grounded at y ~= 202, not merely mid-jump).
@@ -463,7 +483,7 @@ TEST_CASE("Player jumps onto a 1-block step while walking into it", "[player][ph
     for (int i = 0; i < 120; ++i) {
         if (player.onGround)
             player.jump();
-        player.tick(*world, input, false);
+        player.tick(*world, input);
         if (player.onGround && player.position.y > 201.5f) {
             onStep = true;
             break;
@@ -480,13 +500,13 @@ TEST_CASE("Player vertical velocity never saturates while standing", "[player][p
 
     Player player;
     player.position = Vec3{0.f, 201.f, 0.f};
-    InputState input;
+    PlayerInput input;
 
     // Standing for 3 s of ticks must not let velocity.y creep toward terminal.
     // (Before the fix it accumulated to ~-3.4 and dropped the player a whole
     // block the instant they stepped off a ledge.)
     for (int i = 0; i < 60; ++i) {
-        player.tick(*world, input, false);
+        player.tick(*world, input);
         REQUIRE(std::abs(player.velocity.y) < 0.2f);
     }
     REQUIRE(player.onGround);
@@ -495,7 +515,7 @@ TEST_CASE("Player vertical velocity never saturates while standing", "[player][p
     player.position = Vec3{20.f, 201.f, 20.f}; // nothing underfoot
     player.onGround = false;
     float beforeY = player.position.y;
-    player.tick(*world, input, false);
+    player.tick(*world, input);
     float drop = beforeY - player.position.y;
     REQUIRE(drop > 0.f);  // it does fall
     REQUIRE(drop < 0.2f); // but gradually, not ~1 block in one tick
@@ -508,10 +528,10 @@ TEST_CASE("Player takes no fall damage from a 1-block drop", "[player][physics]"
     player.health = 20;
     player.position = Vec3{0.f, 202.f, 0.f}; // exactly one block above the surface
     player.onGround = false;
-    InputState input;
+    PlayerInput input;
 
     for (int i = 0; i < 40; ++i)
-        player.tick(*world, input, false);
+        player.tick(*world, input);
 
     REQUIRE(player.onGround);
     REQUIRE(player.position.y == Catch::Approx(201.f).margin(0.02f));
@@ -525,16 +545,612 @@ TEST_CASE("Player still takes fall damage from a tall drop", "[player][physics]"
     player.health = 20;
     player.position = Vec3{0.f, 130.f, 0.f}; // ~29 blocks up
     player.onGround = false;
-    InputState input;
+    PlayerInput input;
 
     for (int i = 0; i < 200; ++i) {
-        player.tick(*world, input, false);
+        player.tick(*world, input);
         if (player.onGround)
             break;
     }
 
     REQUIRE(player.onGround);
     REQUIRE(player.health < 20); // a long fall still hurts
+}
+
+// ============================================================================
+// Movement modes: sprint, swim, fly, auto-jump
+// ============================================================================
+
+// Helper: a stone-floored pool. Floor top surface at floorTopY, liquid
+// filling [floorTopY, floorTopY + depth), so the surface sits at
+// floorTopY + depth.
+static std::shared_ptr<World> makePool(int floorTopY, int depth,
+                                       BlockType liquid = BlockType::WATER, int radius = 6) {
+    auto world = makePlatform(floorTopY, radius);
+    for (int x = -radius; x <= radius; ++x) {
+        for (int z = -radius; z <= radius; ++z) {
+            for (int y = floorTopY; y < floorTopY + depth; ++y) {
+                world->setBlock(x, y, z, liquid);
+            }
+        }
+    }
+    return world;
+}
+
+TEST_CASE("Sprint: holding the sprint key while moving forward runs at 1.3x", "[player][modes]") {
+    auto world = makePlatform(201, 12);
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    player.yaw = 0.f;
+    PlayerInput settle;
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, settle);
+
+    PlayerInput in;
+    in.forward = true;
+    in.sprintHeld = true;
+    player.tick(*world, in);
+
+    REQUIRE(player.sprinting);
+    REQUIRE(player.velocity.z ==
+            Catch::Approx(Player::WALK_SPEED * Player::SPRINT_MULTIPLIER).margin(1e-4f));
+}
+
+TEST_CASE("Sprint: a forward double-tap latches until forward is released", "[player][modes]") {
+    auto world = makePlatform(201, 12);
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    player.yaw = 0.f;
+
+    PlayerInput tap;
+    tap.forward = true;
+    tap.doubleTapForward = true;
+    player.tick(*world, tap);
+    REQUIRE(player.sprinting);
+
+    // The latch holds through plain forward ticks (no tap, no sprint key)
+    PlayerInput fwd;
+    fwd.forward = true;
+    for (int i = 0; i < 10; ++i) {
+        player.tick(*world, fwd);
+        REQUIRE(player.sprinting);
+    }
+    REQUIRE(player.velocity.z ==
+            Catch::Approx(Player::WALK_SPEED * Player::SPRINT_MULTIPLIER).margin(1e-4f));
+
+    // Releasing forward drops the latch; walking again is back at base pace
+    PlayerInput none;
+    player.tick(*world, none);
+    REQUIRE(!player.sprinting);
+    player.tick(*world, fwd);
+    REQUIRE(!player.sprinting);
+    REQUIRE(player.velocity.z == Catch::Approx(Player::WALK_SPEED).margin(1e-4f));
+}
+
+TEST_CASE("Sprint: releasing the sprint key alone keeps the latch", "[player][modes]") {
+    auto world = makePlatform(201, 12);
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    player.yaw = 0.f;
+
+    PlayerInput in;
+    in.forward = true;
+    in.sprintHeld = true;
+    player.tick(*world, in);
+    REQUIRE(player.sprinting);
+
+    in.sprintHeld = false; // Ctrl is an initiator, not a maintainer
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, in);
+    REQUIRE(player.sprinting);
+}
+
+TEST_CASE("Sprint: strafing without forward never sprints", "[player][modes]") {
+    auto world = makePlatform(201, 12);
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    player.yaw = 0.f;
+
+    PlayerInput in;
+    in.left = true;
+    in.sprintHeld = true;
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, in);
+
+    REQUIRE(!player.sprinting);
+    // At yaw 0 the camera's left is +X; base walk speed, no multiplier
+    REQUIRE(player.velocity.x == Catch::Approx(Player::WALK_SPEED).margin(1e-4f));
+}
+
+TEST_CASE("Swim: the sprint latch in water follows the look pitch", "[player][modes]") {
+    auto world = makePool(200, 8); // water 200-207, surface at 208
+
+    Player player;
+    player.position = Vec3{0.f, 203.f, 0.f}; // fully submerged
+    player.yaw = 0.f;
+    player.pitch = -0.6f; // camera convention: negative pitch looks down
+
+    PlayerInput tap;
+    tap.forward = true;
+    tap.doubleTapForward = true;
+    player.tick(*world, tap);
+    REQUIRE(player.swimming);
+    REQUIRE(player.sprinting);
+
+    PlayerInput fwd;
+    fwd.forward = true;
+    float startY = player.position.y;
+    for (int i = 0; i < 8; ++i)
+        player.tick(*world, fwd);
+    REQUIRE(player.swimming);
+    REQUIRE(player.position.y < startY - 0.8f); // dove downward
+    REQUIRE(player.velocity.z > 0.1f);          // while still moving forward
+
+    player.pitch = 0.6f; // look up — swim back toward the surface
+    startY = player.position.y;
+    for (int i = 0; i < 8; ++i)
+        player.tick(*world, fwd);
+    REQUIRE(player.position.y > startY + 0.8f);
+}
+
+TEST_CASE("Swim: releasing forward reverts to wading pace", "[player][modes]") {
+    auto world = makePool(200, 8);
+
+    Player player;
+    player.position = Vec3{0.f, 203.f, 0.f};
+    player.yaw = 0.f;
+
+    PlayerInput tap;
+    tap.forward = true;
+    tap.doubleTapForward = true;
+    player.tick(*world, tap);
+    REQUIRE(player.swimming);
+
+    PlayerInput none;
+    player.tick(*world, none);
+    REQUIRE(!player.swimming);
+    REQUIRE(!player.sprinting);
+
+    PlayerInput fwd;
+    fwd.forward = true;
+    player.tick(*world, fwd);
+    REQUIRE(!player.swimming);
+    REQUIRE(player.velocity.z == Catch::Approx(Player::WALK_SPEED * 0.5f).margin(1e-4f));
+}
+
+TEST_CASE("Swim: the latch converts between land sprint and swimming", "[player][modes]") {
+    auto world = makePool(200, 8);
+
+    Player player;
+    player.position = Vec3{0.f, 203.f, 0.f};
+    player.yaw = 0.f;
+
+    PlayerInput tap;
+    tap.forward = true;
+    tap.doubleTapForward = true;
+    player.tick(*world, tap);
+    REQUIRE(player.swimming);
+
+    // Emerging (here: teleported clear of the pool) keeps the sprint latch
+    // but ends the swim — the same latch expresses as a land sprint
+    PlayerInput fwd;
+    fwd.forward = true;
+    player.position = Vec3{0.f, 220.f, 0.f};
+    player.tick(*world, fwd);
+    REQUIRE(player.sprinting);
+    REQUIRE(!player.swimming);
+
+    // Back into water: the latch becomes a swim again with no new tap
+    player.position = Vec3{0.f, 203.f, 0.f};
+    player.tick(*world, fwd);
+    REQUIRE(player.swimming);
+}
+
+TEST_CASE("Swim up: holding jump floats the player up despite jump cooldown", "[player][modes]") {
+    auto world = makePool(200, 8);
+
+    Player player;
+    player.position = Vec3{0.f, 201.5f, 0.f}; // submerged, off the floor
+    player.jumpCooldown = Player::JUMP_COOLDOWN_TICKS;
+
+    PlayerInput in;
+    in.jumpHeld = true;
+    float startY = player.position.y;
+    for (int i = 0; i < 30; ++i) {
+        player.tick(*world, in);
+        // The float-up is capped — no jump-strength pulses from a held key
+        REQUIRE(player.velocity.y <= Player::SWIM_UP_MAX_SPEED + 1e-4f);
+    }
+    REQUIRE(player.position.y > startY + 1.0f);
+}
+
+TEST_CASE("Swim up: a ceiling stops the ascent without grounding", "[player][modes]") {
+    auto world = makePool(200, 6); // water 200-205
+    for (int x = -6; x <= 6; ++x) {
+        for (int z = -6; z <= 6; ++z) {
+            world->setBlock(x, 206, z, BlockType::STONE); // ceiling right above the water
+        }
+    }
+
+    Player player;
+    player.position = Vec3{0.f, 203.f, 0.f};
+
+    PlayerInput in;
+    in.jumpHeld = true;
+    for (int i = 0; i < 40; ++i)
+        player.tick(*world, in);
+
+    // Pressed against the ceiling: head at 206, feet at 206 - HEIGHT
+    REQUIRE(player.position.y == Catch::Approx(206.f - Player::HEIGHT).margin(0.05f));
+    REQUIRE(!player.onGround); // an upward clip must never read as landing
+}
+
+TEST_CASE("Swim up: lava floats the same as water", "[player][modes]") {
+    auto world = makePool(200, 8, BlockType::LAVA);
+
+    Player player;
+    player.position = Vec3{0.f, 201.5f, 0.f};
+
+    PlayerInput in;
+    in.jumpHeld = true;
+    float startY = player.position.y;
+    for (int i = 0; i < 30; ++i)
+        player.tick(*world, in);
+    REQUIRE(player.position.y > startY + 1.0f);
+}
+
+TEST_CASE("A jump press still launches off a lake bed", "[player][modes]") {
+    auto world = makePool(200, 4);
+
+    Player player;
+    player.position = Vec3{0.f, 200.f, 0.f}; // standing on the pool floor
+    PlayerInput settle;
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, settle);
+    REQUIRE(player.onGround);
+
+    // Press (not just hold): the full jump impulse, not the capped float
+    PlayerInput in;
+    in.jumpPressed = true;
+    in.jumpHeld = true;
+    float startY = player.position.y;
+    player.tick(*world, in);
+    REQUIRE(player.position.y - startY == Catch::Approx(Player::JUMP_VELOCITY).margin(0.05f));
+    REQUIRE(player.velocity.y > Player::SWIM_UP_MAX_SPEED);
+}
+
+TEST_CASE("Auto-jump: a held jump key hops on the cooldown cadence", "[player][modes]") {
+    auto world = makePlatform(201, 12);
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    PlayerInput settle;
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, settle);
+    REQUIRE(player.onGround);
+
+    PlayerInput in;
+    in.jumpHeld = true;
+    int launches = 0;
+    int lastLaunchTick = -Player::JUMP_COOLDOWN_TICKS;
+    for (int i = 0; i < 60; ++i) {
+        player.tick(*world, in);
+        // Only the launch tick leaves this much upward velocity behind
+        if (player.velocity.y > 0.3f) {
+            REQUIRE(i - lastLaunchTick >= Player::JUMP_COOLDOWN_TICKS);
+            lastLaunchTick = i;
+            launches++;
+        }
+    }
+    REQUIRE(launches >= 3);
+}
+
+TEST_CASE("Auto-jump climbs a 1-block step while walking into it", "[player][modes]") {
+    auto world = makePlatform(201);
+    for (int x = -6; x <= 6; ++x) {
+        for (int z = 3; z <= 6; ++z) {
+            world->setBlock(x, 201, z, BlockType::STONE); // 1-block step up at z >= 3
+        }
+    }
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    player.yaw = 0.f; // facing +Z, straight at the step
+
+    // No manual jump() calls — the held key does it all
+    PlayerInput in;
+    in.forward = true;
+    in.jumpHeld = true;
+    bool onStep = false;
+    for (int i = 0; i < 200; ++i) {
+        player.tick(*world, in);
+        if (player.onGround && player.position.y > 201.5f) {
+            onStep = true;
+            break;
+        }
+    }
+
+    REQUIRE(onStep);
+    REQUIRE(player.position.y == Catch::Approx(202.f).margin(0.05f));
+    REQUIRE(player.position.z > 3.f);
+}
+
+TEST_CASE("Auto-jump is suppressed while wading — a held key floats instead", "[player][modes]") {
+    auto world = makePool(200, 2); // chest-deep water
+
+    Player player;
+    player.position = Vec3{0.f, 200.f, 0.f}; // standing on the pool floor
+    PlayerInput settle;
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, settle);
+    REQUIRE(player.onGround);
+
+    PlayerInput in;
+    in.jumpHeld = true;
+    for (int i = 0; i < 40; ++i) {
+        player.tick(*world, in);
+        // Never a jump-strength pulse — wading must not bounce off the bottom
+        REQUIRE(player.velocity.y < 0.3f);
+    }
+}
+
+TEST_CASE("The water-exit hop climbs a 1-block bank", "[player][modes]") {
+    auto world = std::make_shared<World>(42);
+    world->getChunk(0, 0);
+    for (int x = -6; x <= 6; ++x) {
+        for (int z = -6; z <= 6; ++z) {
+            world->setBlock(x, 199, z, BlockType::STONE); // pool floor, top at 200
+        }
+        for (int z = -6; z <= 2; ++z) {
+            world->setBlock(x, 200, z, BlockType::WATER); // 2-deep pool,
+            world->setBlock(x, 201, z, BlockType::WATER); // surface at 202
+        }
+        for (int z = 3; z <= 6; ++z) {
+            for (int y = 200; y <= 202; ++y) {
+                world->setBlock(x, y, z, BlockType::STONE); // bank top 203: 1 above surface
+            }
+        }
+    }
+
+    Player player;
+    player.position = Vec3{0.f, 200.f, 0.f};
+    player.yaw = 0.f; // paddling +Z into the bank
+
+    PlayerInput in;
+    in.forward = true;
+    in.jumpHeld = true;
+    bool climbedOut = false;
+    for (int i = 0; i < 200; ++i) {
+        player.tick(*world, in);
+        if (player.onGround && player.position.y > 202.5f && player.position.z > 2.5f) {
+            climbedOut = true;
+            break;
+        }
+    }
+
+    REQUIRE(climbedOut);
+    REQUIRE(player.position.y == Catch::Approx(203.f).margin(0.05f));
+}
+
+TEST_CASE("Fly: a jump double-tap toggles a gravity-free hover", "[player][modes]") {
+    auto world = makePlatform(101);
+
+    Player player;
+    player.position = Vec3{0.f, 150.f, 0.f};
+    PlayerInput none;
+    for (int i = 0; i < 3; ++i)
+        player.tick(*world, none); // build up some fall
+
+    PlayerInput toggle;
+    toggle.doubleTapJump = true;
+    player.tick(*world, toggle);
+    REQUIRE(player.flying);
+    REQUIRE(player.velocity.y == 0.f); // the fall is cancelled, not carried
+    REQUIRE(player.fallDistance == 0.f);
+
+    float hoverY = player.position.y;
+    for (int i = 0; i < 20; ++i)
+        player.tick(*world, none);
+    REQUIRE(player.flying);
+    REQUIRE(player.position.y == Catch::Approx(hoverY).margin(1e-4f)); // no drift, no gravity
+}
+
+TEST_CASE("Fly: ascend, descend, and horizontal speeds", "[player][modes]") {
+    auto world = makePlatform(101);
+
+    Player player;
+    player.position = Vec3{0.f, 150.f, 0.f};
+    player.yaw = 0.f;
+    PlayerInput toggle;
+    toggle.doubleTapJump = true;
+    player.tick(*world, toggle);
+    REQUIRE(player.flying);
+
+    PlayerInput up;
+    up.jumpHeld = true;
+    player.tick(*world, up);
+    REQUIRE(player.velocity.y == Catch::Approx(Player::FLY_VERTICAL_SPEED));
+
+    PlayerInput down;
+    down.descendHeld = true;
+    player.tick(*world, down);
+    REQUIRE(player.velocity.y == Catch::Approx(-Player::FLY_VERTICAL_SPEED));
+
+    PlayerInput fwd;
+    fwd.forward = true;
+    player.tick(*world, fwd);
+    REQUIRE(player.velocity.z ==
+            Catch::Approx(Player::WALK_SPEED * Player::FLY_SPEED_MULTIPLIER).margin(1e-4f));
+
+    // Sprint-fly stacks the sprint multiplier on the fly speed
+    fwd.sprintHeld = true;
+    player.tick(*world, fwd);
+    REQUIRE(player.sprinting);
+    REQUIRE(player.velocity.z == Catch::Approx(Player::WALK_SPEED * Player::FLY_SPEED_MULTIPLIER *
+                                               Player::SPRINT_MULTIPLIER)
+                                     .margin(1e-4f));
+}
+
+TEST_CASE("Fly: descending onto the ground lands and exits flight", "[player][modes]") {
+    auto world = makePlatform(201);
+
+    Player player;
+    player.position = Vec3{0.f, 210.f, 0.f};
+    PlayerInput toggle;
+    toggle.doubleTapJump = true;
+    player.tick(*world, toggle);
+    REQUIRE(player.flying);
+
+    PlayerInput down;
+    down.descendHeld = true;
+    for (int i = 0; i < 60 && player.flying; ++i)
+        player.tick(*world, down);
+
+    REQUIRE(!player.flying);
+    REQUIRE(player.onGround);
+    REQUIRE(player.position.y == Catch::Approx(201.f).margin(0.05f));
+    REQUIRE(player.health == 20); // a controlled landing never hurts
+
+    // Gravity is back: the player stays put on the ground afterwards
+    PlayerInput none;
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, none);
+    REQUIRE(player.onGround);
+}
+
+TEST_CASE("Fly: fall damage counts only from the toggle-off point", "[player][modes]") {
+    auto world = makePlatform(101);
+
+    Player player;
+    player.position = Vec3{0.f, 121.f, 0.f};
+    PlayerInput none;
+    while (player.position.y > 111.f)
+        player.tick(*world, none); // bank ~10 blocks of fall distance
+    REQUIRE(player.fallDistance > 5.f);
+
+    PlayerInput toggle;
+    toggle.doubleTapJump = true;
+    player.tick(*world, toggle); // fly on: the banked distance is forgiven
+    REQUIRE(player.flying);
+    player.tick(*world, toggle); // fly off: the fall restarts from here
+    REQUIRE(!player.flying);
+    float toggleOffY = player.position.y;
+
+    for (int i = 0; i < 200 && !player.onGround; ++i)
+        player.tick(*world, none);
+    REQUIRE(player.onGround);
+
+    int expectedDamage = static_cast<int>(std::ceil(toggleOffY - 101.f - 3.f));
+    REQUIRE(player.health == 20 - expectedDamage);
+    // Strictly less than the un-forgiven fall from 121 would have dealt
+    REQUIRE(20 - player.health < static_cast<int>(std::ceil(121.f - 101.f - 3.f)));
+}
+
+TEST_CASE("Fly: the toggle tap never doubles as a jump", "[player][modes]") {
+    auto world = makePlatform(201);
+
+    Player player;
+    player.position = Vec3{0.f, 201.f, 0.f};
+    PlayerInput settle;
+    for (int i = 0; i < 5; ++i)
+        player.tick(*world, settle);
+    REQUIRE(player.onGround);
+    REQUIRE(player.jumpCooldown == 0);
+
+    // The second tap of the gesture arrives as press + held + double-tap
+    PlayerInput in;
+    in.doubleTapJump = true;
+    in.jumpPressed = true;
+    in.jumpHeld = true;
+    player.tick(*world, in);
+
+    REQUIRE(player.flying);
+    REQUIRE(player.jumpCooldown == 0); // jump() never ran
+    // Held jump reads as fly-ascend, not a 0.42 jump impulse
+    REQUIRE(player.velocity.y == Catch::Approx(Player::FLY_VERTICAL_SPEED));
+}
+
+TEST_CASE("Fly: water physics are fully bypassed", "[player][modes]") {
+    auto world = makePool(200, 8);
+
+    Player player;
+    player.position = Vec3{0.f, 203.f, 0.f};
+    player.yaw = 0.f;
+    PlayerInput toggle;
+    toggle.doubleTapJump = true;
+    player.tick(*world, toggle);
+    REQUIRE(player.flying);
+
+    // No buoyancy, no bobbing — a submerged hover holds its depth
+    PlayerInput none;
+    float hoverY = player.position.y;
+    for (int i = 0; i < 10; ++i)
+        player.tick(*world, none);
+    REQUIRE(player.position.y == Catch::Approx(hoverY).margin(1e-4f));
+
+    // Full fly speed underwater (no halving), and never "swimming"
+    PlayerInput fwd;
+    fwd.forward = true;
+    fwd.doubleTapForward = true;
+    player.tick(*world, fwd);
+    REQUIRE(player.sprinting);
+    REQUIRE(!player.swimming);
+    REQUIRE(player.velocity.z > Player::WALK_SPEED * Player::FLY_SPEED_MULTIPLIER - 1e-4f);
+}
+
+TEST_CASE("Deep water breaks a fall", "[player][modes]") {
+    auto world = makePool(200, 8); // surface at 208
+
+    Player player;
+    player.position = Vec3{0.f, 220.f, 0.f}; // 12 blocks above the surface
+    PlayerInput none;
+    for (int i = 0; i < 300 && !player.onGround; ++i)
+        player.tick(*world, none);
+
+    REQUIRE(player.onGround); // settled on the pool floor
+    REQUIRE(player.health == 20);
+}
+
+TEST_CASE("Movement-mode invariants hold across a mixed input script", "[player][modes]") {
+    auto world = makePool(200, 8);
+
+    Player player;
+    player.position = Vec3{0.f, 206.f, 0.f};
+    player.yaw = 0.f;
+    player.pitch = -0.2f;
+
+    for (int i = 0; i < 200; ++i) {
+        PlayerInput in;
+        in.forward = (i % 3) != 0;
+        in.sprintHeld = (i % 5) == 0;
+        in.jumpHeld = (i % 7) < 3;
+        in.descendHeld = (i % 11) == 0;
+        in.doubleTapForward = (i % 17) == 0;
+        in.doubleTapJump = (i % 23) == 0;
+        player.tick(*world, in);
+
+        REQUIRE(!(player.swimming && !player.sprinting)); // swimming ⇒ sprinting
+        REQUIRE(!(player.swimming && player.flying));     // fly overrides water
+        if (player.flying) {
+            REQUIRE(player.fallDistance == 0.f); // flight never banks a fall
+        }
+        if (!in.forward) {
+            REQUIRE(!player.sprinting); // no forward key, no sprint
+        }
+
+        // Keep the wandering player inside the hand-built pool
+        if (std::abs(player.position.x) > 5.f || std::abs(player.position.z) > 5.f) {
+            player.position.x = 0.f;
+            player.position.z = 0.f;
+        }
+        if (player.position.y > 230.f) {
+            player.position.y = 206.f;
+        }
+    }
 }
 
 // ============================================================================

@@ -155,6 +155,15 @@ struct alignas(16) Vec3 {
     static constexpr Vec3 forward() { return {0.f, 0.f, -1.f}; }
 };
 
+// Unit look direction from yaw/pitch (radians): yaw rotates around world Y,
+// pitch around the local X axis. Already normalized (cos²p·(sin²y+cos²y) +
+// sin²p = 1). Single home for the camera basis — Camera::updateFront and the
+// player's swim direction both use it; a hand-copied variant once shipped
+// with inverted signs (W walked backwards).
+inline Vec3 directionFromYawPitch(float yaw, float pitch) {
+    return {std::cos(pitch) * std::sin(yaw), std::sin(pitch), std::cos(pitch) * std::cos(yaw)};
+}
+
 // Free scalar * vector
 constexpr Vec3 operator*(float s, const Vec3& v) {
     return v * s;

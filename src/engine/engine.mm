@@ -25,6 +25,7 @@
 #include <cmath>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -50,6 +51,14 @@ struct EngineState {
     // ---- Projection ----
     Mat4 projectionMatrix = Mat4::identity();
     CGSize drawableSize = {0, 0};
+
+    // ---- Field of view ----
+    // Sprinting widens the FOV for a feeling of speed; the value eases
+    // per frame (render parameter, not sim state) toward the mode's target.
+    static constexpr float BASE_FOV = 70.0f;
+    static constexpr float SPRINT_FOV = 77.0f; // +10%, the classic sprint cue
+    static constexpr float FOV_EASE_SECONDS = 0.1f;
+    float fovCurrent = BASE_FOV;
 
     // ---- Day/Night Cycle ----
     static constexpr uint64_t TICKS_PER_DAY = 24000; // 20 min at 20Hz
@@ -581,10 +590,17 @@ static EngineState* _engineGetState(Engine* engine) {
     InputState& input = state->inputManager->state();
 
     // Playtest hook: RYCRAFT_AUTOPILOT=walk holds W down so headless runs
-    // can verify the full input→tick→physics path end to end
+    // can verify the full input→tick→physics path end to end; =sprint also
+    // holds the sprint key so captures can show the FOV widening
     static const char* autopilot = std::getenv("RYCRAFT_AUTOPILOT");
-    if (autopilot && std::string(autopilot) == "walk") {
-        input.keysDown[Key::W] = true;
+    if (autopilot) {
+        const std::string_view mode{autopilot};
+        if (mode == "walk" || mode == "sprint") {
+            input.keysDown[Key::W] = true;
+        }
+        if (mode == "sprint") {
+            input.keysDown[Key::LeftControl] = true;
+        }
     }
 
     // 1. Advance world time (1 tick per game tick)
@@ -634,16 +650,28 @@ static EngineState* _engineGetState(Engine* engine) {
     state->camera.update(state->deltaTime, input, bindings, eyePosition);
     input.clearMouseDelta();
 
-    // 5. Sync player yaw from camera so WASD uses the correct direction
+    // 4. Sync player yaw/pitch from camera so WASD uses the correct
+    // direction and swimming can follow the look direction
     state->player.yaw = state->camera.yaw();
+    state->player.pitch = state->camera.pitch();
 
-    // 6. Player physics tick. Sprint reads the bound key (LeftShift) rather
-    // than a hardcoded LeftControl, which is actually the sneak binding — so
-    // sprint used to fire on the sneak key.
-    bool sprinting = input.isDown(bindings.sprint.key);
-    state->player.tick(*state->world, input, sprinting);
+    // 5. Player physics tick. All movement keys are decoded through the
+    // bindings here (sprint once read a hardcoded key and fired on sneak);
+    // Player itself never touches the input layer.
+    PlayerInput playerInput;
+    playerInput.forward = input.isDown(bindings.forward.key);
+    playerInput.backward = input.isDown(bindings.backward.key);
+    playerInput.left = input.isDown(bindings.left.key);
+    playerInput.right = input.isDown(bindings.right.key);
+    playerInput.jumpHeld = input.isDown(bindings.jump.key);
+    playerInput.jumpPressed = input.isPressedForTick(bindings.jump.key);
+    playerInput.sprintHeld = input.isDown(bindings.sprint.key);
+    playerInput.descendHeld = input.isDown(bindings.sneak.key);
+    playerInput.doubleTapForward = input.isDoubleTappedForTick(bindings.forward.key);
+    playerInput.doubleTapJump = input.isDoubleTappedForTick(bindings.jump.key);
+    state->player.tick(*state->world, playerInput);
 
-    // 6b. Footsteps: one thud roughly every two blocks walked on the ground
+    // 5b. Footsteps: one thud roughly every two blocks walked on the ground
     if (state->audio) {
         Vec3 moved = state->player.position - state->lastFootstepPos;
         moved.y = 0.f;
@@ -659,14 +687,14 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 7. Update loaded chunks around player
+    // 6. Update loaded chunks around player
     // updatePlayerPosition takes WORLD coordinates (it converts to chunk
     // coords itself) — passing pre-converted chunk coords made streaming
     // track chunk/16, so the world unloaded under the player ~200 blocks out
     state->world->updatePlayerPosition(static_cast<int>(std::floor(state->player.position.x)),
                                        static_cast<int>(std::floor(state->player.position.z)));
 
-    // 7b. Animals: initial population once the spawn area streamed in, then
+    // 6b. Animals: initial population once the spawn area streamed in, then
     // per-tick AI steering + physics for every living entity
     if (state->spawner) {
         if (!state->populationSpawned && state->world->getPendingChunkCount() == 0) {
@@ -737,17 +765,12 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 8. Player jump on space
-    if (input.isPressedForTick(Key::Space)) {
-        state->player.jump();
-    }
-
-    // 9. Update weather particles
+    // 7. Update weather particles
     if (_renderPipeline) {
         _renderPipeline->tickParticles(state->deltaTime, *state->world, state->player.position);
     }
 
-    // 11. Single raycast for block interaction + highlight
+    // 8. Single raycast for block interaction + highlight
     Vec3 cameraPos = state->camera.position();
     Vec3 forward = state->camera.forward();
     auto rayHit = VoxelTraversal::traceRayWithNormal(cameraPos, forward, *state->world, 6.0f);
@@ -843,15 +866,24 @@ static EngineState* _engineGetState(Engine* engine) {
 - (void)render {
     EngineState* state = _state.get();
 
+    // Ease the FOV toward the movement mode's target (dt-correct exponential,
+    // so the zoom speed doesn't depend on frame rate) and hand it to the
+    // camera — the cloud shader reads camera.FOV(), so routing the projection
+    // through the same value keeps clouds registered with the world mid-zoom.
+    float targetFov = state->player.sprinting ? EngineState::SPRINT_FOV : EngineState::BASE_FOV;
+    state->fovCurrent +=
+        (targetFov - state->fovCurrent) *
+        (1.0f - std::exp(-static_cast<float>(state->deltaTime) / EngineState::FOV_EASE_SECONDS));
+    state->camera.setFOV(state->fovCurrent);
+
     // Update projection matrix from current drawable size
     CGSize currentSize = _view.drawableSize;
     if (currentSize.width > 0 && currentSize.height > 0) {
         state->drawableSize = currentSize;
         float aspect =
             static_cast<float>(currentSize.width) / static_cast<float>(currentSize.height);
-        state->projectionMatrix =
-            Mat4::perspective(70.0f * (static_cast<float>(M_PI) / 180.0f), // 70° FOV in radians
-                              aspect, 0.1f, 1000.0f);
+        state->projectionMatrix = Mat4::perspective(
+            state->camera.FOV() * (static_cast<float>(M_PI) / 180.0f), aspect, 0.1f, 1000.0f);
     }
 
     id<CAMetalDrawable> drawable = _view.currentDrawable;

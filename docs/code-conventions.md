@@ -14,8 +14,9 @@ A concept gets exactly one definition, in one header, and everyone imports it. C
 | GPU-shared struct layouts | `render/shader_types.hpp` |
 | Block-face → texture layer mapping | `render/block_textures.hpp` |
 | Menu geometry (drawn AND hit-tested) | `render/ui_menu.hpp` |
+| Yaw/pitch → look direction | `common/math.hpp` (`directionFromYawPitch`) |
 
-**Why:** this codebase once had four `isSolid` definitions (glass rendered solid, entities fell through it), three chunk-key schemes (one allocating strings per block access), six RNG implementations (one seeded from `random_device` in a deterministic game), and five copies of GPU structs (all drifted). Duplicated definitions don't stay in sync; they diverge and each divergence is a bug.
+**Why:** this codebase once had four `isSolid` definitions (glass rendered solid, entities fell through it), three chunk-key schemes (one allocating strings per block access), six RNG implementations (one seeded from `random_device` in a deterministic game), five copies of GPU structs (all drifted), and a hand-copied camera basis whose inverted signs walked W backwards. Duplicated definitions don't stay in sync; they diverge and each divergence is a bug.
 
 ## Naming
 

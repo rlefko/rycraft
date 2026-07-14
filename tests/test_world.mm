@@ -1381,8 +1381,8 @@ TEST_CASE("Water physics: reduced gravity when submerged", "[phase6][water]") {
     player.position = Vec3{0.f, 100.f, 0.f};
     player.velocity = Vec3::zero();
 
-    InputState input;
-    player.tick(*world, input, false);
+    PlayerInput input;
+    player.tick(*world, input);
 
     // In water: gravity *= 0.3, so effective gravity = -0.08 * 0.3 = -0.024
     // After drag: -0.024 * 0.98 = -0.02352
@@ -1411,9 +1411,9 @@ TEST_CASE("Water physics: increased horizontal drag in water", "[phase6][water]"
     player.yaw = 0.f;
 
     // Press W to move forward
-    InputState input;
-    input.keysDown[Key::W] = true;
-    player.tick(*world, input, false);
+    PlayerInput input;
+    input.forward = true;
+    player.tick(*world, input);
 
     // Water halves the walking pace (0.216 → 0.108 blocks/tick)
     float totalHorizontalSpeed =
@@ -1438,8 +1438,8 @@ TEST_CASE("Water physics: buoyancy pushes player upward", "[phase6][water]") {
     player.position = Vec3{0.f, 100.f, 0.f};
     player.velocity = Vec3{0.f, -0.1f, 0.f}; // Moving downward
 
-    InputState input;
-    player.tick(*world, input, false);
+    PlayerInput input;
+    player.tick(*world, input);
 
     // Buoyancy should reduce downward velocity
     // Without buoyancy: velocity.y ≈ -0.1 * 0.98 + (-0.024) = -0.122

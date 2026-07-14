@@ -26,8 +26,11 @@ struct InputBindings {
     ActionBinding left = {Key::A, "Left"};
     ActionBinding right = {Key::D, "Right"};
     ActionBinding jump = {Key::Space, "Jump"};
-    ActionBinding sprint = {Key::LeftShift, "Sprint"};
-    ActionBinding sneak = {Key::LeftControl, "Sneak"};
+    // Minecraft layout: Ctrl sprints, Shift sneaks (and descends in flight).
+    // Sprint sat on LeftShift for a while, colliding with fly-descend and
+    // contradicting the README.
+    ActionBinding sprint = {Key::LeftControl, "Sprint"};
+    ActionBinding sneak = {Key::LeftShift, "Sneak"};
     ActionBinding inventory = {Key::E, "Inventory"};
     ActionBinding drop = {Key::Q, "Drop"};
     std::array<ActionBinding, 9> hotbar = {{

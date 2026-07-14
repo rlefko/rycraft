@@ -25,9 +25,13 @@ bool PhysicsEngine::isInWater(World& world, const AABB& entityAABB) {
     int maxY = static_cast<int>(std::ceil(entityAABB.max.y));
     int maxZ = static_cast<int>(std::ceil(entityAABB.max.z));
 
-    for (int x = minX; x <= maxX; ++x) {
-        for (int y = minY; y <= maxY; ++y) {
-            for (int z = minZ; z <= maxZ; ++z) {
+    // Exclusive upper bounds: cell k spans [k, k+1), so the last cell the box
+    // reaches is ceil(max)-1. The old inclusive <= scanned a full block past
+    // the AABB on +X/+Y/+Z, reporting "in water" while merely standing beside
+    // a pond — which would flick sprint into swim mode along every shoreline.
+    for (int x = minX; x < maxX; ++x) {
+        for (int y = minY; y < maxY; ++y) {
+            for (int z = minZ; z < maxZ; ++z) {
                 if (isLiquid(world.getBlock(x, y, z))) {
                     return true;
                 }
