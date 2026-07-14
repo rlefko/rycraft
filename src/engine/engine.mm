@@ -155,8 +155,11 @@ static EngineState* _engineGetState(Engine* engine) {
             _state->worldTime = meta->worldTime;
         }
 
-        // View distance 12 keeps the full-detail mesh set comfortably inside
-        // the 128 MB mega-buffer (25×25 chunks ≈ 60 MB of vertex data).
+        // Default view distance 12; the mega-buffer grows with the setting
+        // (see renderChunks). Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..32>.
+        if (const char* vdEnv = std::getenv("RYCRAFT_VIEW_DISTANCE")) {
+            _state->settings.viewDistance = std::clamp(std::atoi(vdEnv), 4, 32);
+        }
         _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
         // Chunks load from disk before regenerating, so block edits persist
         _state->world->setSaveManager(_state->saveManager.get());
@@ -858,14 +861,20 @@ static EngineState* _engineGetState(Engine* engine) {
     if (!_renderPipeline || !state->world)
         return;
 
-    // Log render diagnostics every 60 frames
+    // Log render + streaming diagnostics every 60 frames (the same numbers
+    // the F3 HUD shows, so headless playtests can measure against budgets)
     if (state->frameCount % 60 == 1) {
         auto chunks = state->world->getLoadedChunks();
-        char pos[64];
-        snprintf(pos, sizeof(pos), " player (%.1f, %.1f, %.1f)", state->player.position.x,
-                 state->player.position.y, state->player.position.z);
-        RY_LOG_INFO(std::string("Render: ") + std::to_string(chunks.size()) +
-                    " loaded chunks, frame " + std::to_string(state->frameCount) + pos);
+        auto chunkStats = _renderPipeline->chunkRenderStats();
+        char line[224];
+        snprintf(line, sizeof(line),
+                 "Render: %zu loaded chunks, frame %llu player (%.1f, %.1f, %.1f) | %.2f ms/frame "
+                 "gen %.2f ms mesh %.2f ms pending %zu vram %.0f/%.0f MB",
+                 chunks.size(), static_cast<unsigned long long>(state->frameCount),
+                 state->player.position.x, state->player.position.y, state->player.position.z,
+                 state->smoothedFrameMs, state->world->averageGenMs(), chunkStats.meshMsAvg,
+                 state->world->getPendingChunkCount(), chunkStats.megaUsedMB, chunkStats.megaCapMB);
+        RY_LOG_INFO(line);
     }
 
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk

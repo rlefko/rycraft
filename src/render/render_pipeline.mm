@@ -837,6 +837,27 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         _meshScheduler = std::make_unique<MeshScheduler>(world, 2);
     }
 
+    // ---- MegaBuffer sized to the view distance ----
+    // Full-detail chunks average ~100 KB of vertices; 128 KB × visible
+    // chunks + 30% headroom keeps the free-list from thrashing. Growing
+    // recreates the buffers and drops every mesh — a settings-screen event,
+    // after which everything re-streams through the workers.
+    {
+        uint64_t visibleChunks = static_cast<uint64_t>(2 * renderRadius + 1) *
+                                 static_cast<uint64_t>(2 * renderRadius + 1);
+        uint64_t requiredVertexBytes =
+            std::max<uint64_t>(128ull * 1024 * 1024, visibleChunks * 128ull * 1024 * 13 / 10);
+        if (requiredVertexBytes > _megaBuffer->vertexCapacity()) {
+            RY_LOG_INFO((std::string("Growing mega-buffer for view distance ") +
+                         std::to_string(renderRadius) + ": " +
+                         std::to_string(requiredVertexBytes / (1024 * 1024)) + " MB vertices")
+                            .c_str());
+            _megaBuffer =
+                std::make_unique<MegaBuffer>(_device, requiredVertexBytes, requiredVertexBytes / 2);
+            _chunkMeshes.clear(); // allocations died with the old buffers
+        }
+    }
+
     // Upload one finished mesh into the registry. Returns false on a
     // transient MegaBuffer-full failure (builtVersion stays 0, so the chunk
     // re-requests once space frees up).
