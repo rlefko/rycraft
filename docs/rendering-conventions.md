@@ -50,6 +50,34 @@ Water renders **after the scene pass resolves**, in its own single-sample color-
 - **Capture and look at a frame** with `RYCRAFT_CAPTURE=/tmp/frame.png` (writes a PNG from inside the frame — no screen-recording permission needed). `RYCRAFT_CAPTURE_FRAME`, `RYCRAFT_BLOOM`, and `RYCRAFT_START_SCREEN` narrow a repro. The `playtest` skill runs this end to end.
 - **A rendering claim without a frame to show for it is unverified.** Twelve bugs coexisted precisely because the pipeline was never watched while it ran.
 
+## 6. The HDR pipeline and the one tonemap
+
+The scene renders in linear HDR and is graded exactly once.
+
+- **The scene target is `RGBA16Float`** (`_colorMSAA`, 4x memoryless → resolve `_colorResolve`); depth resolves `min` into `_depthResolve`. **Why:** an LDR forward scene clamped the sun disc and emissive lava to white *before* bloom or tonemap could see the over-range energy, so nothing bloomed and the grade had no highlights to roll off.
+- **The final composite always runs** — it is the single linear-HDR→display conversion: exposure → Uchimura tonemap → vibrance/contrast → lens-flare ghosts → optional CAS sharpen → dither. **Why:** the pre-HDR pipeline blitted the scene raw whenever bloom was off, so that path was never tonemapped; one always-on composite means the frame is graded identically with bloom on or off. Toggled-off effects bind a static 4×4 fallback (black for bloom) so the composite PSO never forks.
+- **Auto-exposure is GPU-resident, zero-readback.** A compute reduction writes the log-luminance result into a persistent `ExposureState` device buffer that the composite reads the next frame. **Why:** reading GPU luminance back to the CPU to pick an exposure stalls the frame on a full round-trip; the exposure eases on the GPU and the CPU never sees it.
+
+## 7. Shadows, AO, and cutout geometry
+
+- **Cascades are texel-snapped**: each frame the ortho projection is quantized to whole shadow-map texels. **Why:** an unsnapped cascade crawled along every straight shadow edge as the camera moved.
+- **Depth bias is slope-scaled with a per-cascade clamp, and the near cascade's clamp is tiny** (cascade 0 = 0.0005 vs 0.005 for the rest). **Why:** a uniform 0.005 clamp slid thin vertical flora ~0.7 blocks along the light ray, detaching grass and flower shadows from their own stems (peter-panning); only the near cascade resolves stems, and it needs a far smaller floor.
+- **Shadow casters render cull-None with a cutout-aware fragment** (sample the block array, `discard` α < 0.5). **Why:** greedy meshes are visible-face-only, not closed solids, so a front/back-face cull would drop caster faces; the alpha discard is what gives leaves and flora correctly shaped shadows.
+- **Cross-quad flora is shaded two-sided** in the scene fragment (a facing-independent light term). **Why:** a single-sided N·L left the entire sun-averted side of every flower flat and unshaded.
+- **Baked corner AO rides the vertex `faceAttr`**, and the greedy-merge key includes the four 2-bit corner values; a quad splits along its brighter diagonal when the corners aren't planar. **Why:** merging across differing AO stretched one corner's occlusion over a whole run, and splitting the wrong diagonal kinked the AO gradient.
+- **SSAO tests each sample against the receiver's tangent plane** (`dot(occluder − origin, normal) > bias`), never a raw depth delta. **Why:** a plain depth-range test banded into horizontal scanlines at grazing angles, where the sample hemisphere skims just above the ground.
+
+## 8. Half-resolution effects dither in space, not time
+
+- **SSAO and volumetric light march at half resolution, volumetric clouds at quarter**; each jitters its samples with interleaved-gradient noise and upsamples through a depth-aware bilateral filter. **Why (standing design rule):** the renderer keeps 4x memoryless MSAA rather than TAA (near-free on TBDR, and MSAA is best-case for hard voxel edges), so there is no temporal history to hide half-res noise under — deterministic blue-noise dither + bilateral upsample is the sanctioned substitute, and a temporal accumulator would have to be bolted on wholesale and would fight MSAA.
+- **Volumetric passes reconstruct world position from `_depthResolve` and march the shadow cascades.** **Why:** the fixed screen-space god-ray band they replaced had no relation to the sun direction or the occluders, so it read as a painted-on gradient.
+
+## 9. Per-frame and persistent GPU state
+
+- **Every per-frame uniform rides the frame ring** (3 slots, gated by a `dispatch_semaphore` holding three frames in flight); one draw's slice is never rewritten before the GPU reads it, and the MegaBuffer frees ranges through a deferred queue drained once the GPU *completes the frame the range was freed in* (`completedFrame >= N`; frames finish in order, so that single wait covers every still-in-flight command buffer that could reference the range). **Why:** the GPU consumes buffers at execution time, not encode time — a single reused uniform buffer renders every frame with the last frame's constants, and recycling a vertex range the GPU is still reading corrupts geometry.
+- **Persistent GPU-only state lives in a `Shared` device buffer, seeded once and eased on the GPU** (`ExposureState`, `FlareState`): a compute pass writes it and a later render pass reads it on the same command buffer, relying on default hazard tracking to order the write before the read. **Why:** easing exposure or flare visibility on the CPU needs a readback; keeping the state GPU-side lets Metal insert the compute-write→fragment-read dependency for free, and it is the same pattern for both.
+- **An MSL helper used by more than one shader stage lives in `shader_types.hpp` under `#ifdef __METAL_VERSION__`** (e.g. `applySway`, `interleavedGradientNoise`) and both stages call it. **Why:** waving foliage that swayed in the scene vertex function but not the shadow vertex function detached every shadow from its blade; the vertex animation must be one function both passes call — the same never-drift rule as the shared fog helper.
+
 ## Review checklist
 
 For any diff touching `src/render/`, `shaders/`, or Metal API calls, check in order:
@@ -62,4 +90,7 @@ For any diff touching `src/render/`, `shaders/`, or Metal API calls, check in or
 6. Matrix or coordinate math: consistent with column-vector/[0,1]-depth conventions, and covered by the math tests if a factory changed?
 7. New geometry with sub-block offsets: multiples of 0.125 in chunk-local fp16?
 8. New translucent or post-resolve geometry: encoded in the right pass relative to water (behind → scene pass, above → after), and verified with an over-water and underwater capture?
-9. Was the game actually run with validation on, and a captured frame inspected? Say so in the PR.
+9. New HDR or post work: does it flow through the one always-on composite, and is any persistent GPU state eased on the GPU (hazard-tracked, no CPU readback) rather than round-tripped?
+10. New half-res effect: dithered with interleaved-gradient noise and bilateral-upsampled — not leaning on a temporal history that MSAA doesn't keep?
+11. New animated or shadow-casting geometry: do the scene pass and shadow pass apply the *identical* vertex transform (one shared MSL helper), and do casters render cull-None cutout-aware?
+12. Was the game actually run with validation on, and a captured frame inspected? Say so in the PR.
