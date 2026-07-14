@@ -975,6 +975,27 @@ TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]")
     REQUIRE(alignof(Uniforms) == 16);
 }
 
+TEST_CASE("Shader types: ShadowUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(ShadowPassUniforms) == 64);
+    REQUIRE(sizeof(ShadowUniforms) == 224);
+    REQUIRE(offsetof(ShadowUniforms, cascadeSplitDist) == 192);
+    REQUIRE(offsetof(ShadowUniforms, shadowParams) == 208);
+    REQUIRE(SHADOW_CASCADE_COUNT == 3);
+}
+
+TEST_CASE("Mat4 orthographic maps near->0 and far->1 (Metal depth)", "[common][math]") {
+    Mat4 ortho = Mat4::orthographic(-10.f, 10.f, -10.f, 10.f, 0.f, 100.f);
+    // A point at view-space z = -near (0) maps to NDC z = 0
+    Vec3 nearPt = ortho.transformVec3({0.f, 0.f, 0.f});
+    REQUIRE(nearPt.z == Catch::Approx(0.f).margin(1e-5));
+    // A point at view-space z = -far maps to NDC z = 1
+    Vec3 farPt = ortho.transformVec3({0.f, 0.f, -100.f});
+    REQUIRE(farPt.z == Catch::Approx(1.f).margin(1e-5));
+    // x/y map the ortho extents to [-1, 1]
+    REQUIRE(ortho.transformVec3({10.f, 0.f, -1.f}).x == Catch::Approx(1.f).margin(1e-5));
+    REQUIRE(ortho.transformVec3({-10.f, 0.f, -1.f}).x == Catch::Approx(-1.f).margin(1e-5));
+}
+
 TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types]") {
     REQUIRE(sizeof(SkyUniforms) == 144);
     REQUIRE(offsetof(SkyUniforms, sunDirection) == 48);

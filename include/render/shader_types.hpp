@@ -26,6 +26,28 @@ struct ChunkOrigin {
     simd_float4 origin;
 };
 
+// One cascade's light view-projection, bound at buffer(1) via setVertexBytes
+// in the depth-only shadow pass (shadow.metal).
+struct ShadowPassUniforms {
+    simd_float4x4 lightViewProj;
+};
+
+// A macro, not a constexpr int: MSL rejects a program-scope constant outside
+// the constant address space, and both languages accept an array bound here.
+#define SHADOW_CASCADE_COUNT 3
+
+// Cascaded shadow-map sampling data for the scene passes (chunks, entities),
+// bound at buffer(4). The fragment picks a cascade by camera distance, projects
+// the world position into it, and PCF-samples the depth array at texture(1).
+struct ShadowUniforms {
+    simd_float4x4 cascadeViewProj[3]; // 0 / 64 / 128
+    simd_float4 cascadeSplitDist;     // 192: x,y,z = far world distance of each cascade
+    // 208: x = penumbra texel radius, y = normal offset (world units),
+    // z = strength (0 disables sampling so the pass can be skipped),
+    // w = fade-start distance
+    simd_float4 shadowParams;
+};
+
 // Bound at buffer(3) in the water shaders (vertex: wave time; fragment:
 // refraction/reflection/caustics). The water pass composites its own pixels
 // from the resolved opaque scene, so it needs the full camera inverse and
@@ -173,6 +195,12 @@ static_assert(offsetof(WaterUniforms, resolution) == 160);
 static_assert(offsetof(WaterUniforms, fogDensity) == 168);
 static_assert(offsetof(WaterUniforms, time) == 172);
 static_assert(offsetof(WaterUniforms, cameraUnderwater) == 176);
+
+static_assert(sizeof(ShadowPassUniforms) == 64);
+
+static_assert(sizeof(ShadowUniforms) == 224);
+static_assert(offsetof(ShadowUniforms, cascadeSplitDist) == 192);
+static_assert(offsetof(ShadowUniforms, shadowParams) == 208);
 
 static_assert(sizeof(SkyUniforms) == 144);
 static_assert(offsetof(SkyUniforms, moonDirection) == 64);

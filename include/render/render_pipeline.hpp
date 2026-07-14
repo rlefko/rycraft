@@ -33,6 +33,7 @@ class Camera;
 class UIOverlay;
 class Bloom;
 class PostStack;
+class ShadowMap;
 class ParticleSystem;
 
 // GPU-side per-chunk mesh allocation tracking. opaqueIndexCount splits the
@@ -194,6 +195,14 @@ private:
     // Final composite: exposure, tonemap, grade, sharpen (always runs)
     std::unique_ptr<PostStack> _postStack;
 
+    // Cascaded sun/moon shadow maps (skipped when shadowQuality is 0)
+    std::unique_ptr<ShadowMap> _shadowMap;
+
+    // The shadow sampling block the scene pass binds each frame — the
+    // computed cascades when shadows are on, or a zeroed (strength 0) block
+    // when off/faded so the chunk fragment reads full sun without branching.
+    ShadowUniforms _sceneShadowUniforms{};
+
     // Weather particle system (rain/snow)
     std::unique_ptr<ParticleSystem> _particles;
 
@@ -255,18 +264,34 @@ private:
     std::vector<MeshResult> _pendingResults;
     std::vector<std::pair<float, const Chunk*>> _meshCandidates;
 
-    // ---- Day/Night Cycle (Task 6.4-6.5) ----
+    // ---- Day/Night Cycle ----
+    // sunDirection/sunColor come out as the ACTIVE directional light — the sun
+    // by day, the moon (dim cool light) by night — so terrain shading and
+    // shadows share one light. The sky keeps the real sun/moon positions for
+    // its discs. shadowStrength is the cascade term's weight (0 at the horizon
+    // crossing so the sun→moon swap never pops).
     void computeDayNightUniforms(uint64_t worldTime, float sunDirection[3], float sunColor[3],
-                                 float ambientColor[3], SkyUniforms& skyUniforms);
+                                 float ambientColor[3], SkyUniforms& skyUniforms,
+                                 float& shadowStrength);
 
     // ---- Scene pass stages (all encode into the single MSAA scene encoder) ----
     void renderSky(id<MTLRenderCommandEncoder> encoder, const FrameRing::Alloc& skyUniforms);
 
     void renderChunks(id<MTLRenderCommandEncoder> encoder, const World& world,
+                      const std::vector<std::shared_ptr<Chunk>>& loadedChunks,
                       const Mat4& viewMatrix, const Mat4& projectionMatrix,
                       const Vec3& cameraPosition, const float sunDirection[3],
                       const float sunColor[3], const float ambientColor[3],
                       const float fogColor[3]);
+
+    // Encode the cascade depth passes before the scene pass (no-op when
+    // shadowQuality is 0 or strength is 0). lightDirection is the active
+    // directional light (sun by day, moon by night). Fills
+    // _sceneShadowUniforms for the chunk fragment; reuses loadedChunks so the
+    // locked chunk-list copy happens once per frame.
+    void renderShadows(id<MTLCommandBuffer> commandBuffer,
+                       const std::vector<std::shared_ptr<Chunk>>& loadedChunks,
+                       const Camera& camera, const float lightDirection[3], float strength);
 
     void renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, const Vec3& blockPos,
                               const Mat4& viewMatrix, const Mat4& projectionMatrix);

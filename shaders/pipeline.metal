@@ -51,29 +51,33 @@ static float3 applyFog(float3 color, float3 worldPos, float3 cameraPos, float de
 // ---------------------------------------------------------------------------
 float3 getFaceNormal(uint index) {
     switch (index) {
-        case 0: return float3( 1.0,  0.0,  0.0); // +X
-        case 1: return float3(-1.0,  0.0,  0.0); // -X
-        case 2: return float3( 0.0,  0.0,  1.0); // +Z
-        case 3: return float3( 0.0,  0.0, -1.0); // -Z
-        case 4: return float3( 0.0,  1.0,  0.0); // +Y
-        case 5: return float3( 0.0, -1.0,  0.0); // -Y
-        default: return float3(0.0, 1.0, 0.0);    // Fallback: +Y
+        case 0:
+            return float3(1.0, 0.0, 0.0); // +X
+        case 1:
+            return float3(-1.0, 0.0, 0.0); // -X
+        case 2:
+            return float3(0.0, 0.0, 1.0); // +Z
+        case 3:
+            return float3(0.0, 0.0, -1.0); // -Z
+        case 4:
+            return float3(0.0, 1.0, 0.0); // +Y
+        case 5:
+            return float3(0.0, -1.0, 0.0); // -Y
+        default:
+            return float3(0.0, 1.0, 0.0); // Fallback: +Y
     }
 }
 
 // ---------------------------------------------------------------------------
 // Vertex shader — passes world position for fog calculation
 // ---------------------------------------------------------------------------
-vertex VertexOutput vertexMain(
-    VertexInput in [[stage_in]],
-    constant Uniforms &uniforms [[buffer(1)]],
-    constant ChunkOrigin &chunkOrigin [[buffer(2)]]
-) {
+vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
+                               constant Uniforms& uniforms [[buffer(1)]],
+                               constant ChunkOrigin& chunkOrigin [[buffer(2)]]) {
     VertexOutput out;
 
     // Restore world space from the chunk-local position, then run MVP
-    float4 worldPos =
-        uniforms.modelMatrix * float4(in.position + chunkOrigin.origin.xyz, 1.0);
+    float4 worldPos = uniforms.modelMatrix * float4(in.position + chunkOrigin.origin.xyz, 1.0);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
 
@@ -93,9 +97,7 @@ vertex VertexOutput vertexMain(
         return out;
     }
     float3 normal = getFaceNormal(normalIdx);
-    out.vNormal = normalize(
-        (uniforms.modelMatrix * float4(normal, 0.0)).xyz
-    );
+    out.vNormal = normalize((uniforms.modelMatrix * float4(normal, 0.0)).xyz);
 
     // Per-vertex diffuse lighting
     float ndotl = dot(out.vNormal, uniforms.sunDirection);
@@ -105,14 +107,72 @@ vertex VertexOutput vertexMain(
 }
 
 // ---------------------------------------------------------------------------
-// Fragment shader — with distance fog (Phase 8)
+// Cascaded shadow sampling — one definition so terrain and entities can't
+// drift. Returns a 0..1 lit factor (1 = fully lit) that scales the direct
+// sun/moon contribution only; ambient stays so shadows never go pure black.
+// Picks a cascade by camera distance, normal-offsets to fight acne, and
+// PCF-samples the depth array with a small kernel for a soft edge.
 // ---------------------------------------------------------------------------
-fragment float4 fragmentMain(
-    VertexOutput in [[stage_in]],
-    texture2d_array<float> blockTextures [[texture(0)]],
-    sampler blockSampler [[sampler(0)]],
-    constant Uniforms &uniforms [[buffer(1)]]
-) {
+static float sampleShadow(float3 worldPos, float3 normal, float3 cameraPos,
+                          depth2d_array<float> shadowMap, sampler shadowSampler,
+                          constant ShadowUniforms& shadow) {
+    float strength = shadow.shadowParams.z;
+    if (strength <= 0.001f) {
+        return 1.0f; // shadows disabled — fully lit
+    }
+
+    float dist = distance(worldPos, cameraPos);
+
+    // Fade the whole term out near the shadow distance so the cascade edge
+    // dissolves into the baked skylight instead of popping.
+    float fade = 1.0f - saturate((dist - shadow.shadowParams.w) /
+                                 max(shadow.cascadeSplitDist.z - shadow.shadowParams.w, 1.0f));
+    if (fade <= 0.0f) {
+        return 1.0f;
+    }
+
+    int cascade = SHADOW_CASCADE_COUNT - 1;
+    for (int i = 0; i < SHADOW_CASCADE_COUNT; ++i) {
+        if (dist < shadow.cascadeSplitDist[i]) {
+            cascade = i;
+            break;
+        }
+    }
+
+    float3 offsetPos = worldPos + normal * shadow.shadowParams.y;
+    float4 lightClip = shadow.cascadeViewProj[cascade] * float4(offsetPos, 1.0f);
+    float3 ndc = lightClip.xyz / lightClip.w;
+    float2 uv = ndc.xy * 0.5f + 0.5f;
+    uv.y = 1.0f - uv.y; // Metal texture v runs down
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f || ndc.z > 1.0f) {
+        return 1.0f; // outside this cascade → treat as lit
+    }
+
+    float depthRef = ndc.z - 0.0015f; // constant slope-independent depth bias
+    float radius = shadow.shadowParams.x / float(shadowMap.get_width());
+    float lit = 0.0f;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            float2 tap = uv + float2(dx, dy) * radius;
+            lit += shadowMap.sample_compare(shadowSampler, tap, cascade, depthRef);
+        }
+    }
+    lit /= 9.0f;
+
+    // Blend toward fully lit at the fade edge, and scale by strength.
+    return mix(1.0f, mix(1.0f, lit, fade), strength);
+}
+
+// ---------------------------------------------------------------------------
+// Fragment shader — sun/moon shadows + skylight + distance fog
+// ---------------------------------------------------------------------------
+fragment float4 fragmentMain(VertexOutput in [[stage_in]],
+                             texture2d_array<float> blockTextures [[texture(0)]],
+                             sampler blockSampler [[sampler(0)]],
+                             depth2d_array<float> shadowMap [[texture(1)]],
+                             sampler shadowSampler [[sampler(1)]],
+                             constant Uniforms& uniforms [[buffer(1)]],
+                             constant ShadowUniforms& shadow [[buffer(4)]]) {
     // The bound sampler uses repeat addressing + nearest filtering: UVs span
     // the quad extent in blocks, so each block gets one full texture tile.
     float4 texColor = blockTextures.sample(blockSampler, in.vUV, in.vTextureLayer);
@@ -123,11 +183,24 @@ fragment float4 fragmentMain(
         discard_fragment();
     }
 
-    // Combine directional sun light with ambient, both attenuated by the
-    // column skylight so covered ground and caves sit in shadow
-    float sky = 0.25f + 0.75f * in.vSkyLight;
-    float3 litColor =
-        texColor.rgb * (uniforms.sunColor * in.vLight * sky + uniforms.ambientColor * sky);
+    // Direct sun occlusion. With real cascade shadows on, they own the
+    // directional term entirely — the baked per-column skylight is NOT folded
+    // in, or its blocky under-cover darkening would double up with the smooth
+    // cast shadow. When shadows are off (strength 0) the skylight is the
+    // fallback fake shadow so covered ground still reads as shaded.
+    float directOcclusion;
+    if (shadow.shadowParams.z > 0.001f) {
+        directOcclusion = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition,
+                                       shadowMap, shadowSampler, shadow);
+    } else {
+        directOcclusion = 0.25f + 0.75f * in.vSkyLight;
+    }
+
+    // Ambient is modulated by sky access (how much open sky the point sees) so
+    // caves and deep overhangs — which the cascades may not reach — stay dark.
+    float ambientAccess = 0.3f + 0.7f * in.vSkyLight;
+    float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight * directOcclusion +
+                                      uniforms.ambientColor * ambientAccess);
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);
@@ -147,19 +220,17 @@ struct WaterVertexOutput {
     float vSkyLight;
 };
 
-vertex WaterVertexOutput waterVertexMain(
-    VertexInput in [[stage_in]],
-    constant Uniforms &uniforms [[buffer(1)]],
-    constant ChunkOrigin &chunkOrigin [[buffer(2)]],
-    constant WaterUniforms &water [[buffer(3)]]
-) {
+vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
+                                         constant Uniforms& uniforms [[buffer(1)]],
+                                         constant ChunkOrigin& chunkOrigin [[buffer(2)]],
+                                         constant WaterUniforms& water [[buffer(3)]]) {
     float3 pos = in.position + chunkOrigin.origin.xyz;
     uint normalIdx = in.faceAttr & 7u;
     if (normalIdx == FACE_PLUS_Y) {
         // Top surfaces bob gently; world-space input keeps waves continuous
         // across chunk borders
-        pos.y += sin(pos.x * 0.55f + water.time * 1.4f) *
-                 cos(pos.z * 0.45f + water.time * 1.1f) * 0.04f;
+        pos.y +=
+            sin(pos.x * 0.55f + water.time * 1.4f) * cos(pos.z * 0.45f + water.time * 1.1f) * 0.04f;
     }
 
     WaterVertexOutput out;
@@ -190,14 +261,11 @@ static float causticPattern(float2 p, float t) {
     return pow(saturate(1.0f - abs(c)), 6.0f);
 }
 
-fragment float4 waterFragmentMain(
-    WaterVertexOutput in [[stage_in]],
-    texture2d<float> sceneColor [[texture(0)]],
-    depth2d<float> sceneDepth [[texture(1)]],
-    constant WaterUniforms &water [[buffer(3)]]
-) {
-    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear,
-                                    address::clamp_to_edge);
+fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
+                                  texture2d<float> sceneColor [[texture(0)]],
+                                  depth2d<float> sceneDepth [[texture(1)]],
+                                  constant WaterUniforms& water [[buffer(3)]]) {
+    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float2 screenUV = in.clipPosition.xy / water.resolution;
 
     // Manual depth test against the resolved opaque scene
@@ -230,16 +298,15 @@ fragment float4 waterFragmentMain(
     float3 refracted = sceneColor.sample(screenSampler, refractUV).rgb;
 
     // World position of the refracted floor sample (caustics + absorption)
-    float4 rclip =
-        float4(refractUV.x * 2.0f - 1.0f, 1.0f - refractUV.y * 2.0f, refractDepth, 1.0f);
+    float4 rclip = float4(refractUV.x * 2.0f - 1.0f, 1.0f - refractUV.y * 2.0f, refractDepth, 1.0f);
     float4 rworldH = water.invViewProjection * rclip;
     float3 rworld = rworldH.xyz / rworldH.w;
     float depthBelow = max(in.vWorldPosition.y - rworld.y, 0.0f);
 
     // ---- Caustics: bright ripple filaments on the shallow floor
     float caustic = causticPattern(rworld.xz * 0.6f, water.time) * exp(-depthBelow * 0.22f);
-    refracted += water.sunColor * caustic * 0.4f * in.vSkyLight *
-                 saturate(water.sunDirection.y * 2.0f);
+    refracted +=
+        water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
 
     // ---- Absorption: the water column filters toward deep blue
     float3 deepColor = float3(0.02f, 0.12f, 0.25f);
@@ -262,8 +329,8 @@ fragment float4 waterFragmentMain(
     float3 color = mix(body, skyReflection, fresnel * in.vSkyLight);
     color += water.sunColor * sparkle * in.vSkyLight;
 
-    color = applyFog(color, in.vWorldPosition, water.cameraPosition, water.fogDensity,
-                     water.fogColor);
+    color =
+        applyFog(color, in.vWorldPosition, water.cameraPosition, water.fogDensity, water.fogColor);
 
     // Hairline shorelines dissolve into the shore instead of aliasing
     color = mix(refracted, color, saturate(waterDepth * 3.0f));
@@ -288,11 +355,9 @@ vertex OverlayVertexOutput underwaterOverlayVertex(uint vertexID [[vertex_id]]) 
     return out;
 }
 
-fragment float4 underwaterOverlayFragment(
-    OverlayVertexOutput in [[stage_in]],
-    depth2d<float> sceneDepth [[texture(1)]],
-    constant WaterUniforms &water [[buffer(3)]]
-) {
+fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
+                                          depth2d<float> sceneDepth [[texture(1)]],
+                                          constant WaterUniforms& water [[buffer(3)]]) {
     // Slanted shafts of light, banded and animated, fading with depth on
     // screen (light enters from the surface above)
     float slant = in.uv.x * 1.4f + in.uv.y * 0.6f;
@@ -307,8 +372,7 @@ fragment float4 underwaterOverlayFragment(
     // pass only shades pixels behind a surface quad, so without this the
     // floor at the player's feet had none. Reconstruct the opaque world
     // position and project the same caustic field onto up-facing geometry.
-    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear,
-                                    address::clamp_to_edge);
+    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float depth = sceneDepth.sample(screenSampler, in.uv);
     float4 clip = float4(in.uv.x * 2.0f - 1.0f, 1.0f - in.uv.y * 2.0f, depth, 1.0f);
     float4 worldH = water.invViewProjection * clip;
@@ -320,8 +384,8 @@ fragment float4 underwaterOverlayFragment(
     // at 63.875, so shore blocks at y >= 64 must not catch caustics
     float submerged = step(world.y, 63.9f);
     float dist = distance(world, water.cameraPosition);
-    float caustic = causticPattern(world.xz * 0.85f, t) *
-                    exp(-max(64.0f - world.y, 0.0f) * 0.10f) * exp(-dist * 0.03f);
+    float caustic = causticPattern(world.xz * 0.85f, t) * exp(-max(64.0f - world.y, 0.0f) * 0.10f) *
+                    exp(-dist * 0.03f);
     float3 causticColor = water.sunColor * caustic * upFacing * submerged * sunUp * 2.4f;
 
     float3 veil = float3(0.05f, 0.18f, 0.32f);
@@ -338,12 +402,10 @@ struct EntityVertexOutput {
     float3 vWorldPosition;
 };
 
-vertex EntityVertexOutput entityVertexMain(
-    device const EntityVertex* vertices [[buffer(0)]],
-    constant Uniforms &uniforms [[buffer(1)]],
-    constant EntityModel &entityModel [[buffer(2)]],
-    uint vertexID [[vertex_id]]
-) {
+vertex EntityVertexOutput entityVertexMain(device const EntityVertex* vertices [[buffer(0)]],
+                                           constant Uniforms& uniforms [[buffer(1)]],
+                                           constant EntityModel& entityModel [[buffer(2)]],
+                                           uint vertexID [[vertex_id]]) {
     device const EntityVertex& v = vertices[vertexID];
 
     EntityVertexOutput out;
@@ -355,10 +417,8 @@ vertex EntityVertexOutput entityVertexMain(
     return out;
 }
 
-fragment float4 entityFragmentMain(
-    EntityVertexOutput in [[stage_in]],
-    constant Uniforms &uniforms [[buffer(1)]]
-) {
+fragment float4 entityFragmentMain(EntityVertexOutput in [[stage_in]],
+                                   constant Uniforms& uniforms [[buffer(1)]]) {
     float light = max(dot(in.vNormal, uniforms.sunDirection), 0.0f);
     float3 litColor = in.vColor * (uniforms.sunColor * light + uniforms.ambientColor);
 
