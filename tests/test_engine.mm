@@ -19,6 +19,7 @@
 #include <entity/voxel_traversal.hpp>
 #include <render/block_texture_array.hpp>
 #include <render/block_textures.hpp>
+#include <render/graphics_settings.hpp>
 #include <render/lod_mesher.hpp>
 #include <render/mega_buffer.hpp>
 #include <render/shader_types.hpp>
@@ -36,6 +37,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <thread>
 
 // ============================================================================
@@ -188,6 +191,131 @@ TEST_CASE("GameFlow: ESC toggles pause and backs out of settings", "[ui][flow]")
     REQUIRE(flow.screen == GameScreen::PAUSED);
 }
 
+TEST_CASE("Settings save/load round-trips values and video settings", "[engine][settings]") {
+    TempDir dir("settings");
+    std::string path = dir.path() + "/settings.json";
+
+    SettingsValues values;
+    values.viewDistance = 16;
+    values.fogLevel = 7;
+    values.sensitivityLevel = 9;
+    values.volumeLevel = 2;
+    GraphicsSettings gfx;
+    gfx.shadowQuality = 1;
+    gfx.volumetricLight = false;
+    gfx.cloudMode = 0;
+    gfx.ssao = false;
+    gfx.waterReflections = false;
+    gfx.wavingFoliage = false;
+    gfx.lensFlare = false;
+    gfx.bloomLevel = 8;
+    gfx.vibrance = 3;
+    gfx.sharpening = 6;
+
+    REQUIRE(saveSettings(path, values, gfx));
+    LoadedSettings loaded = loadSettings(path);
+
+    REQUIRE(loaded.values.viewDistance == 16);
+    REQUIRE(loaded.values.fogLevel == 7);
+    REQUIRE(loaded.values.sensitivityLevel == 9);
+    REQUIRE(loaded.values.volumeLevel == 2);
+    REQUIRE(loaded.gfx.shadowQuality == 1);
+    REQUIRE(loaded.gfx.volumetricLight == false);
+    REQUIRE(loaded.gfx.cloudMode == 0);
+    REQUIRE(loaded.gfx.ssao == false);
+    REQUIRE(loaded.gfx.waterReflections == false);
+    REQUIRE(loaded.gfx.wavingFoliage == false);
+    REQUIRE(loaded.gfx.lensFlare == false);
+    REQUIRE(loaded.gfx.bloomLevel == 8);
+    REQUIRE(loaded.gfx.vibrance == 3);
+    REQUIRE(loaded.gfx.sharpening == 6);
+}
+
+TEST_CASE("Settings load: missing file and out-of-range values fall back", "[engine][settings]") {
+    TempDir dir("settings");
+
+    // Missing file → the max-preset defaults
+    LoadedSettings missing = loadSettings(dir.path() + "/nope.json");
+    REQUIRE(missing.values.viewDistance == 12);
+    REQUIRE(missing.gfx.shadowQuality == 2);
+    REQUIRE(missing.gfx.volumetricLight);
+    REQUIRE(missing.gfx.cloudMode == 2);
+    REQUIRE(missing.gfx.bloomLevel == 5);
+    REQUIRE(missing.gfx.sharpening == 0);
+
+    // Hand-edited garbage clamps instead of exploding
+    std::string path = dir.path() + "/settings.json";
+    std::filesystem::create_directories(dir.path());
+    {
+        std::ofstream file(path);
+        file << "{ \"viewDistance\": 999, \"shadowQuality\": -3, \"vibrance\": 42 }";
+    }
+    LoadedSettings clamped = loadSettings(path);
+    REQUIRE(clamped.values.viewDistance == 32);
+    REQUIRE(clamped.gfx.shadowQuality == 0);
+    REQUIRE(clamped.gfx.vibrance == 10);
+    // Keys the file omits keep their defaults
+    REQUIRE(clamped.gfx.cloudMode == 2);
+}
+
+TEST_CASE("GraphicsSettings env overrides map onto the fields", "[engine][settings]") {
+    setenv("RYCRAFT_SHADOWS", "1", 1);
+    setenv("RYCRAFT_VL", "0", 1);
+    setenv("RYCRAFT_CLOUDS", "1", 1);
+    setenv("RYCRAFT_SSR", "0", 1);
+    setenv("RYCRAFT_BLOOM", "0", 1); // legacy intensity form: 0 disables
+
+    GraphicsSettings gfx;
+    REQUIRE(gfx.applyEnvOverrides()); // reports that overrides fired
+    REQUIRE(gfx.shadowQuality == 1);
+    REQUIRE(gfx.volumetricLight == false);
+    REQUIRE(gfx.cloudMode == 1);
+    REQUIRE(gfx.waterReflections == false);
+    REQUIRE(gfx.bloomLevel == 0);
+    // Untouched fields keep defaults
+    REQUIRE(gfx.ssao);
+    REQUIRE(gfx.wavingFoliage);
+
+    unsetenv("RYCRAFT_SHADOWS");
+    unsetenv("RYCRAFT_VL");
+    unsetenv("RYCRAFT_CLOUDS");
+    unsetenv("RYCRAFT_SSR");
+    unsetenv("RYCRAFT_BLOOM");
+
+    // With no RYCRAFT_* set it reports false, so the engine keeps saving
+    GraphicsSettings clean;
+    REQUIRE(!clean.applyEnvOverrides());
+}
+
+TEST_CASE("GameFlow: video settings nest under settings", "[ui][flow]") {
+    GameFlow flow;
+    flow.onMenuAction(MenuAction::PLAY);
+    flow.onEscape(); // pause
+    flow.onMenuAction(MenuAction::OPEN_SETTINGS);
+
+    // OPEN_VIDEO_SETTINGS only works from the settings screen
+    flow.onMenuAction(MenuAction::OPEN_VIDEO_SETTINGS);
+    REQUIRE(flow.screen == GameScreen::VIDEO_SETTINGS);
+
+    // BACK returns to settings, ESC does the same
+    flow.onMenuAction(MenuAction::CLOSE_VIDEO_SETTINGS);
+    REQUIRE(flow.screen == GameScreen::SETTINGS);
+    flow.onMenuAction(MenuAction::OPEN_VIDEO_SETTINGS);
+    flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::SETTINGS);
+
+    // Video screen freezes the sim like every other menu
+    flow.onMenuAction(MenuAction::OPEN_VIDEO_SETTINGS);
+    REQUIRE(flow.inMenu());
+
+    // OPEN from a non-settings screen is inert
+    GameFlow paused;
+    paused.onMenuAction(MenuAction::PLAY);
+    paused.onEscape();
+    paused.onMenuAction(MenuAction::OPEN_VIDEO_SETTINGS);
+    REQUIRE(paused.screen == GameScreen::PAUSED);
+}
+
 TEST_CASE("GameFlow: resume and quit actions", "[ui][flow]") {
     GameFlow flow;
     flow.onMenuAction(MenuAction::PLAY);
@@ -221,9 +349,11 @@ TEST_CASE("GameFlow: focus loss force-pauses gameplay only", "[ui][flow]") {
 
 TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][menu]") {
     SettingsValues values;
+    GraphicsSettings gfx;
     for (auto [w, h] : {std::pair{1024.f, 768.f}, {2048.f, 1536.f}, {3456.f, 2234.f}}) {
-        for (GameScreen screen : {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS}) {
-            MenuLayout layout = buildMenuLayout(screen, w, h, values);
+        for (GameScreen screen : {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS,
+                                  GameScreen::VIDEO_SETTINGS}) {
+            MenuLayout layout = buildMenuLayout(screen, w, h, values, gfx);
             REQUIRE(!layout.buttons.empty());
 
             for (const auto& button : layout.buttons) {
@@ -251,12 +381,13 @@ TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][me
         }
     }
 
-    REQUIRE(buildMenuLayout(GameScreen::PLAYING, 1024.f, 768.f, values).buttons.empty());
+    REQUIRE(buildMenuLayout(GameScreen::PLAYING, 1024.f, 768.f, values, gfx).buttons.empty());
 }
 
 TEST_CASE("Menu hit test: button centers hit, gaps miss", "[ui][menu]") {
     SettingsValues values;
-    MenuLayout layout = buildMenuLayout(GameScreen::PAUSED, 1024.f, 768.f, values);
+    GraphicsSettings gfx;
+    MenuLayout layout = buildMenuLayout(GameScreen::PAUSED, 1024.f, 768.f, values, gfx);
 
     for (size_t i = 0; i < layout.buttons.size(); ++i) {
         const UIRect& rect = layout.buttons[i].rect;
@@ -269,9 +400,11 @@ TEST_CASE("Menu hit test: button centers hit, gaps miss", "[ui][menu]") {
 
 TEST_CASE("Font covers every character the menus draw", "[ui][font]") {
     SettingsValues values;
+    GraphicsSettings gfx;
     std::string needed = "0123456789.:/-+ ";
-    for (GameScreen screen : {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS}) {
-        MenuLayout layout = buildMenuLayout(screen, 1024.f, 768.f, values);
+    for (GameScreen screen : {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS,
+                              GameScreen::VIDEO_SETTINGS}) {
+        MenuLayout layout = buildMenuLayout(screen, 1024.f, 768.f, values, gfx);
         for (const auto& text : layout.texts)
             needed += text.text;
         for (const auto& button : layout.buttons)

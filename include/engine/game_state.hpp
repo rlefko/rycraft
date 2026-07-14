@@ -10,10 +10,11 @@
 // ---------------------------------------------------------------------------
 
 enum class GameScreen {
-    TITLE,    // launch screen: PLAY / QUIT, world visible behind
-    PLAYING,  // normal gameplay, cursor captured
-    PAUSED,   // ESC menu: RESUME / SETTINGS / QUIT
-    SETTINGS, // settings panel, reached from PAUSED
+    TITLE,          // launch screen: PLAY / QUIT, world visible behind
+    PLAYING,        // normal gameplay, cursor captured
+    PAUSED,         // ESC menu: RESUME / SETTINGS / QUIT
+    SETTINGS,       // settings panel, reached from PAUSED
+    VIDEO_SETTINGS, // per-effect video options, reached from SETTINGS
 };
 
 enum class MenuAction {
@@ -22,6 +23,8 @@ enum class MenuAction {
     RESUME,
     OPEN_SETTINGS,
     CLOSE_SETTINGS,
+    OPEN_VIDEO_SETTINGS,
+    CLOSE_VIDEO_SETTINGS,
     QUIT,
     // Settings value steppers (handled by the engine; no screen change)
     VIEW_DISTANCE_DOWN,
@@ -32,6 +35,22 @@ enum class MenuAction {
     SENSITIVITY_UP,
     VOLUME_DOWN,
     VOLUME_UP,
+    // Video settings steppers/toggles (both arrows of a toggle row flip it)
+    SHADOWS_DOWN,
+    SHADOWS_UP,
+    VL_TOGGLE,
+    CLOUDS_DOWN,
+    CLOUDS_UP,
+    SSAO_TOGGLE,
+    SSR_TOGGLE,
+    WAVING_TOGGLE,
+    LENS_FLARE_TOGGLE,
+    BLOOM_DOWN,
+    BLOOM_UP,
+    VIBRANCE_DOWN,
+    VIBRANCE_UP,
+    SHARPEN_DOWN,
+    SHARPEN_UP,
 };
 
 // What the engine must do after a transition.
@@ -60,6 +79,9 @@ struct GameFlow {
             case GameScreen::SETTINGS:
                 screen = GameScreen::PAUSED;
                 return {};
+            case GameScreen::VIDEO_SETTINGS:
+                screen = GameScreen::SETTINGS;
+                return {};
             case GameScreen::TITLE:
                 return {};
         }
@@ -85,6 +107,12 @@ struct GameFlow {
                 return {};
             case MenuAction::CLOSE_SETTINGS:
                 if (screen == GameScreen::SETTINGS) screen = GameScreen::PAUSED;
+                return {};
+            case MenuAction::OPEN_VIDEO_SETTINGS:
+                if (screen == GameScreen::SETTINGS) screen = GameScreen::VIDEO_SETTINGS;
+                return {};
+            case MenuAction::CLOSE_VIDEO_SETTINGS:
+                if (screen == GameScreen::VIDEO_SETTINGS) screen = GameScreen::SETTINGS;
                 return {};
             case MenuAction::QUIT:
                 if (screen == GameScreen::TITLE || screen == GameScreen::PAUSED) {

@@ -1,5 +1,7 @@
 #include "render/ui_menu.hpp"
 
+#include "render/graphics_settings.hpp"
+
 #include <array>
 
 // Font metrics mirrored from UIOverlay (8×8 glyphs, 1px advance gap)
@@ -82,29 +84,82 @@ MenuLayout buildPauseLayout(const LayoutContext& ctx) {
 MenuLayout buildSettingsLayout(const LayoutContext& ctx, const SettingsValues& values) {
     MenuLayout layout;
     layout.dimAlpha = 0.45f;
-    layout.panel = UIRect{0.5f - ctx.px(300.f), 0.5f - ctx.py(210.f), ctx.px(600.f), ctx.py(420.f)};
+    layout.panel = UIRect{0.5f - ctx.px(300.f), 0.5f - ctx.py(235.f), ctx.px(600.f), ctx.py(470.f)};
 
-    addCenteredText(layout, ctx, "SETTINGS", 0.5f + ctx.py(160.f), 3.0f);
+    addCenteredText(layout, ctx, "SETTINGS", 0.5f + ctx.py(185.f), 3.0f);
 
     addSettingsRow(layout, ctx, "RENDER DIST", std::to_string(values.viewDistance),
                    MenuAction::VIEW_DISTANCE_DOWN, MenuAction::VIEW_DISTANCE_UP,
-                   0.5f + ctx.py(84.f));
+                   0.5f + ctx.py(108.f));
     addSettingsRow(layout, ctx, "FOG", std::to_string(values.fogLevel), MenuAction::FOG_DOWN,
-                   MenuAction::FOG_UP, 0.5f + ctx.py(28.f));
+                   MenuAction::FOG_UP, 0.5f + ctx.py(52.f));
     addSettingsRow(layout, ctx, "SENSITIVITY", std::to_string(values.sensitivityLevel),
-                   MenuAction::SENSITIVITY_DOWN, MenuAction::SENSITIVITY_UP, 0.5f - ctx.py(28.f));
+                   MenuAction::SENSITIVITY_DOWN, MenuAction::SENSITIVITY_UP, 0.5f - ctx.py(4.f));
     addSettingsRow(layout, ctx, "VOLUME", std::to_string(values.volumeLevel),
-                   MenuAction::VOLUME_DOWN, MenuAction::VOLUME_UP, 0.5f - ctx.py(84.f));
+                   MenuAction::VOLUME_DOWN, MenuAction::VOLUME_UP, 0.5f - ctx.py(60.f));
 
-    addButton(layout, ctx, "BACK", MenuAction::CLOSE_SETTINGS, 0.5f, 0.5f - ctx.py(160.f), 320.f,
+    addButton(layout, ctx, "VIDEO...", MenuAction::OPEN_VIDEO_SETTINGS, 0.5f, 0.5f - ctx.py(124.f),
+              320.f, 44.f);
+    addButton(layout, ctx, "BACK", MenuAction::CLOSE_SETTINGS, 0.5f, 0.5f - ctx.py(184.f), 320.f,
               44.f);
+    return layout;
+}
+
+// The video screen's ten per-effect rows. Toggle rows reuse the stepper
+// widget with both arrows bound to the same TOGGLE action — no new widget,
+// no second hit-test path.
+MenuLayout buildVideoSettingsLayout(const LayoutContext& ctx, const GraphicsSettings& gfx) {
+    MenuLayout layout;
+    layout.dimAlpha = 0.45f;
+    layout.panel = UIRect{0.5f - ctx.px(320.f), 0.5f - ctx.py(320.f), ctx.px(640.f), ctx.py(640.f)};
+
+    addCenteredText(layout, ctx, "VIDEO", 0.5f + ctx.py(276.f), 3.0f);
+
+    auto onOff = [](bool on) { return std::string(on ? "ON" : "OFF"); };
+    static constexpr const char* SHADOW_NAMES[] = {"OFF", "MEDIUM", "HIGH"};
+    static constexpr const char* CLOUD_NAMES[] = {"OFF", "FLAT", "VOLUM"};
+
+    float y = 0.5f + ctx.py(216.f);
+    const float pitch = ctx.py(48.f);
+    addSettingsRow(layout, ctx, "SHADOWS", SHADOW_NAMES[gfx.shadowQuality],
+                   MenuAction::SHADOWS_DOWN, MenuAction::SHADOWS_UP, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "VOLUM LIGHT", onOff(gfx.volumetricLight), MenuAction::VL_TOGGLE,
+                   MenuAction::VL_TOGGLE, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "CLOUDS", CLOUD_NAMES[gfx.cloudMode], MenuAction::CLOUDS_DOWN,
+                   MenuAction::CLOUDS_UP, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "AMBIENT OCCL", onOff(gfx.ssao), MenuAction::SSAO_TOGGLE,
+                   MenuAction::SSAO_TOGGLE, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "REFLECTIONS", onOff(gfx.waterReflections), MenuAction::SSR_TOGGLE,
+                   MenuAction::SSR_TOGGLE, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "WAVING", onOff(gfx.wavingFoliage), MenuAction::WAVING_TOGGLE,
+                   MenuAction::WAVING_TOGGLE, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "LENS FLARE", onOff(gfx.lensFlare), MenuAction::LENS_FLARE_TOGGLE,
+                   MenuAction::LENS_FLARE_TOGGLE, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "BLOOM", std::to_string(gfx.bloomLevel), MenuAction::BLOOM_DOWN,
+                   MenuAction::BLOOM_UP, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "VIBRANCE", std::to_string(gfx.vibrance), MenuAction::VIBRANCE_DOWN,
+                   MenuAction::VIBRANCE_UP, y);
+    y -= pitch;
+    addSettingsRow(layout, ctx, "SHARPEN", std::to_string(gfx.sharpening), MenuAction::SHARPEN_DOWN,
+                   MenuAction::SHARPEN_UP, y);
+
+    addButton(layout, ctx, "BACK", MenuAction::CLOSE_VIDEO_SETTINGS, 0.5f, 0.5f - ctx.py(280.f),
+              320.f, 44.f);
     return layout;
 }
 
 } // namespace
 
 MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeight,
-                           const SettingsValues& values) {
+                           const SettingsValues& values, const GraphicsSettings& gfx) {
     if (pixelWidth <= 0.f || pixelHeight <= 0.f) return {};
     LayoutContext ctx{pixelWidth, pixelHeight, pixelHeight / 768.0f};
 
@@ -115,6 +170,8 @@ MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeigh
             return buildPauseLayout(ctx);
         case GameScreen::SETTINGS:
             return buildSettingsLayout(ctx, values);
+        case GameScreen::VIDEO_SETTINGS:
+            return buildVideoSettingsLayout(ctx, gfx);
         case GameScreen::PLAYING:
             return {};
     }

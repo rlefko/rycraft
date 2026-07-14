@@ -513,7 +513,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         _particles->render(encoder, _frameRing, viewMatrix, projectionMatrix, camera.getPosition());
     }
 
-    renderClouds(encoder, camera, worldTime, sunDirection);
+    if (_gfx.cloudMode != 0) {
+        renderClouds(encoder, camera, worldTime, sunDirection);
+    }
 
     [encoder endEncoding];
 
@@ -1235,6 +1237,15 @@ void RenderPipeline::setBloomIntensity(float intensity) {
     if (_bloom) {
         _bloom->setIntensity(intensity);
     }
+}
+
+// ---------------------------------------------------------------------------
+// setGraphicsSettings — the engine pushes a copy on init and on every video
+// settings change; passes read the copy each frame and skip when disabled.
+// ---------------------------------------------------------------------------
+void RenderPipeline::setGraphicsSettings(const GraphicsSettings& gfx) {
+    _gfx = gfx;
+    setBloomIntensity(gfx.bloomIntensity()); // level 5 = stock 1.0; 0 skips
 }
 
 // ---------------------------------------------------------------------------

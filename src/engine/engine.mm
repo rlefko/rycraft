@@ -15,6 +15,7 @@
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
+#include <render/graphics_settings.hpp>
 #include <render/render_pipeline.hpp>
 #include <render/ui_menu.hpp>
 #include <world/save_manager.hpp>
@@ -70,10 +71,12 @@ struct EngineState {
     bool hasHighlightedBlock = false;
 
     // ---- Game flow & UI ----
-    GameFlow flow;               // Title → Playing ⇄ Paused ⇄ Settings
-    bool spawnValidated = false; // player unstuck from stale-save terrain
-    SettingsValues settings;     // live values shown in the settings menu
-    MenuLayout menuLayout;       // rebuilt each frame while a menu is open
+    GameFlow flow;                   // Title → Playing ⇄ Paused ⇄ Settings
+    bool spawnValidated = false;     // player unstuck from stale-save terrain
+    SettingsValues settings;         // live values shown in the settings menu
+    GraphicsSettings gfx;            // video screen values (persisted with settings)
+    bool envOverridesActive = false; // RYCRAFT_* session: never save settings
+    MenuLayout menuLayout;           // rebuilt each frame while a menu is open
     int hoveredButton = -1;
     bool showDebugHud = false;
 
@@ -164,10 +167,18 @@ static EngineState* _engineGetState(Engine* engine) {
             _state->worldTime = meta->worldTime;
         }
 
-        // Default view distance 12; the mega-buffer grows with the setting
-        // (see renderChunks). Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..32>.
+        // Persisted settings load before the World exists (view distance
+        // feeds its constructor); env overrides win over the file for
+        // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..32>.
+        // An env-overridden session never saves settings — a playtest run
+        // must not rewrite the user's file with its overrides.
+        LoadedSettings loaded = loadSettings(settingsPath());
+        _state->settings = loaded.values;
+        _state->gfx = loaded.gfx;
+        _state->envOverridesActive = _state->gfx.applyEnvOverrides();
         if (const char* vdEnv = std::getenv("RYCRAFT_VIEW_DISTANCE")) {
             _state->settings.viewDistance = std::clamp(std::atoi(vdEnv), 4, 32);
+            _state->envOverridesActive = true;
         }
         _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
         // Chunks load from disk before regenerating, so block edits persist
@@ -263,12 +274,15 @@ static EngineState* _engineGetState(Engine* engine) {
         _device, library, static_cast<uint32_t>(_view.bounds.size.width),
         static_cast<uint32_t>(_view.bounds.size.height));
 
-    // Playtest/diagnostic override: RYCRAFT_BLOOM=<0..1> scales or disables bloom
-    if (const char* bloomEnv = std::getenv("RYCRAFT_BLOOM")) {
-        _renderPipeline->setBloomIntensity(static_cast<float>(std::atof(bloomEnv)));
-    }
+    // Apply the persisted settings to the live systems (world view distance
+    // was already applied through the World constructor; RYCRAFT_BLOOM rides
+    // GraphicsSettings::applyEnvOverrides now).
+    _renderPipeline->setGraphicsSettings(_state->gfx);
+    _renderPipeline->setFogDensity(fogDensityForLevel(_state->settings.fogLevel));
+    _state->camera.setMouseSensitivity(mouseSensitivityForLevel(_state->settings.sensitivityLevel));
 
-    // Playtest override: start on a specific screen (title|playing|paused|settings)
+    // Playtest override: start on a specific screen
+    // (title|playing|paused|settings|video)
     if (const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN")) {
         std::string name = screenEnv;
         if (name == "playing") {
@@ -278,6 +292,8 @@ static EngineState* _engineGetState(Engine* engine) {
             _state->flow.screen = GameScreen::PAUSED;
         } else if (name == "settings") {
             _state->flow.screen = GameScreen::SETTINGS;
+        } else if (name == "video") {
+            _state->flow.screen = GameScreen::VIDEO_SETTINGS;
         }
     }
 
@@ -455,27 +471,82 @@ static EngineState* _engineGetState(Engine* engine) {
             int step = (action == MenuAction::FOG_UP) ? 1 : -1;
             settings.fogLevel = std::clamp(settings.fogLevel + step, 0, 10);
             if (_renderPipeline) {
-                _renderPipeline->setFogDensity(static_cast<float>(settings.fogLevel) * 0.0001f);
+                _renderPipeline->setFogDensity(fogDensityForLevel(settings.fogLevel));
             }
-            break;
+            return;
         }
         case MenuAction::SENSITIVITY_DOWN:
         case MenuAction::SENSITIVITY_UP: {
             int step = (action == MenuAction::SENSITIVITY_UP) ? 1 : -1;
             settings.sensitivityLevel = std::clamp(settings.sensitivityLevel + step, 1, 10);
-            state->camera.setMouseSensitivity(static_cast<float>(settings.sensitivityLevel) *
-                                              0.0005f);
-            break;
+            state->camera.setMouseSensitivity(mouseSensitivityForLevel(settings.sensitivityLevel));
+            return;
         }
         case MenuAction::VOLUME_DOWN:
         case MenuAction::VOLUME_UP: {
             int step = (action == MenuAction::VOLUME_UP) ? 1 : -1;
             settings.volumeLevel = std::clamp(settings.volumeLevel + step, 0, 10);
             [self syncAudioVolume];
+            return;
+        }
+        case MenuAction::SHADOWS_DOWN:
+        case MenuAction::SHADOWS_UP: {
+            int step = (action == MenuAction::SHADOWS_UP) ? 1 : -1;
+            state->gfx.shadowQuality = std::clamp(state->gfx.shadowQuality + step, 0,
+                                                  GraphicsSettings::SHADOW_QUALITY_MAX);
+            break;
+        }
+        case MenuAction::VL_TOGGLE:
+            state->gfx.volumetricLight = !state->gfx.volumetricLight;
+            break;
+        case MenuAction::CLOUDS_DOWN:
+        case MenuAction::CLOUDS_UP: {
+            int step = (action == MenuAction::CLOUDS_UP) ? 1 : -1;
+            state->gfx.cloudMode =
+                std::clamp(state->gfx.cloudMode + step, 0, GraphicsSettings::CLOUD_MODE_MAX);
+            break;
+        }
+        case MenuAction::SSAO_TOGGLE:
+            state->gfx.ssao = !state->gfx.ssao;
+            break;
+        case MenuAction::SSR_TOGGLE:
+            state->gfx.waterReflections = !state->gfx.waterReflections;
+            break;
+        case MenuAction::WAVING_TOGGLE:
+            state->gfx.wavingFoliage = !state->gfx.wavingFoliage;
+            break;
+        case MenuAction::LENS_FLARE_TOGGLE:
+            state->gfx.lensFlare = !state->gfx.lensFlare;
+            break;
+        case MenuAction::BLOOM_DOWN:
+        case MenuAction::BLOOM_UP: {
+            int step = (action == MenuAction::BLOOM_UP) ? 1 : -1;
+            state->gfx.bloomLevel =
+                std::clamp(state->gfx.bloomLevel + step, 0, GraphicsSettings::LEVEL_MAX);
+            break;
+        }
+        case MenuAction::VIBRANCE_DOWN:
+        case MenuAction::VIBRANCE_UP: {
+            int step = (action == MenuAction::VIBRANCE_UP) ? 1 : -1;
+            state->gfx.vibrance =
+                std::clamp(state->gfx.vibrance + step, 0, GraphicsSettings::LEVEL_MAX);
+            break;
+        }
+        case MenuAction::SHARPEN_DOWN:
+        case MenuAction::SHARPEN_UP: {
+            int step = (action == MenuAction::SHARPEN_UP) ? 1 : -1;
+            state->gfx.sharpening =
+                std::clamp(state->gfx.sharpening + step, 0, GraphicsSettings::LEVEL_MAX);
             break;
         }
         default:
-            break;
+            return; // not a settings action
+    }
+
+    // Only the video cases fall through: push the changed copy so the
+    // renderer picks it up next frame.
+    if (_renderPipeline) {
+        _renderPipeline->setGraphicsSettings(state->gfx);
     }
 }
 
@@ -486,7 +557,14 @@ static EngineState* _engineGetState(Engine* engine) {
     InputState& input = state->inputManager->state();
 
     if (input.isJustPressed(Key::Escape)) {
+        // Leaving a settings screen persists the values (not per click —
+        // no disk I/O while stepping)
+        bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
+                               state->flow.screen == GameScreen::VIDEO_SETTINGS;
         [self applyFlowEffects:state->flow.onEscape()];
+        if (leavingSettings && !state->envOverridesActive) {
+            saveSettings(settingsPath(), state->settings, state->gfx);
+        }
     }
     if (input.isJustPressed(Key::F3)) {
         state->showDebugHud = !state->showDebugHud;
@@ -497,7 +575,8 @@ static EngineState* _engineGetState(Engine* engine) {
         // hit-test in window points — the same normalized space it's drawn in
         float boundsW = static_cast<float>(_view.bounds.size.width);
         float boundsH = static_cast<float>(_view.bounds.size.height);
-        state->menuLayout = buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings);
+        state->menuLayout =
+            buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings, state->gfx);
 
         Vec2 mouse = input.mousePosition;
         state->hoveredButton = menuHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
@@ -507,6 +586,11 @@ static EngineState* _engineGetState(Engine* engine) {
                 state->menuLayout.buttons[static_cast<size_t>(state->hoveredButton)].action;
             [self applySettingAction:action];
             [self applyFlowEffects:state->flow.onMenuAction(action)];
+            if ((action == MenuAction::CLOSE_SETTINGS ||
+                 action == MenuAction::CLOSE_VIDEO_SETTINGS) &&
+                !state->envOverridesActive) {
+                saveSettings(settingsPath(), state->settings, state->gfx);
+            }
         }
     } else {
         state->hoveredButton = -1;
@@ -545,6 +629,13 @@ static EngineState* _engineGetState(Engine* engine) {
                                          state->worldTime);
         state->saveManager->flush();
         RY_LOG_INFO("World state saved");
+    }
+
+    // Settings share the quit path so mid-session tweaks survive a close
+    // that never revisited the settings screen. Env-overridden playtest
+    // sessions never save — their overrides must not become the file.
+    if (!state->envOverridesActive) {
+        saveSettings(settingsPath(), state->settings, state->gfx);
     }
 }
 

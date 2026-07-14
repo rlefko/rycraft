@@ -15,6 +15,7 @@
 #include "render/block_texture_array.hpp"
 #include "render/frame_ring.hpp"
 #include "render/gpu_timer.hpp"
+#include "render/graphics_settings.hpp"
 #include "render/lod_mesher.hpp"
 #include "render/mega_buffer.hpp"
 #include "render/mesh_scheduler.hpp"
@@ -92,6 +93,10 @@ public:
     // When zero, the bloom pass is skipped entirely (saves 13 render passes).
     void setBloomIntensity(float intensity);
     float getBloomIntensity() const { return _bloomIntensity; }
+
+    // Push the current video settings; disabled effects skip their passes
+    // wholesale on the next frame. Called at init and on every change.
+    void setGraphicsSettings(const GraphicsSettings& gfx);
 
     // Update particle system physics (call each game tick).
     void tickParticles(float dt, const World& world, const Vec3& playerPosition);
@@ -196,6 +201,9 @@ private:
 
     // Bloom intensity multiplier (0.0 = disabled, 1.0 = full strength).
     float _bloomIntensity;
+
+    // Video settings copy, pushed by the engine (render thread only)
+    GraphicsSettings _gfx;
 
     // Exponential fog density per block
     float _fogDensity = 0.0003f;

@@ -1,7 +1,7 @@
 render_sources = files('lod_mesher.cpp', 'mesh_scheduler.cpp', 'block_texture_array.mm',
                        'mega_buffer.mm', 'render_pipeline.mm', 'ui_overlay.mm', 'ui_menu.cpp',
                        'ui_hud.mm', 'entity_renderer.mm', 'bloom.mm', 'particles.mm',
-                       'gpu_timer.mm')
+                       'gpu_timer.mm', 'graphics_settings.cpp')
 
     librender = static_library('render', render_sources, include_directories : inc,
                                dependencies : [appleframeworks], )
