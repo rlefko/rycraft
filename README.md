@@ -18,7 +18,7 @@ ninja -C build
 
 Run the tests with `ninja -C build test`.
 
-**Controls:** WASD to move, mouse to look, Space to jump, Ctrl to sprint, left/right click to break/place blocks, 1–9 or scroll for the hotbar, F3 for the debug HUD, ESC to pause (and to resume). The window opens on a title screen; click PLAY to capture the mouse.
+**Controls:** WASD to move, mouse to look, Space to jump (hold it to keep hopping), double-tap W or hold Ctrl to sprint, left/right click to break/place blocks, 1–9 or scroll for the hotbar, F3 for the debug HUD, ESC to pause (and to resume). In water, hold Space to float up or double-tap W to swim wherever you're looking. Double-tap Space to toggle flying — Space rises, Shift sinks, and landing with Shift (or another double-tap) ends the flight. The window opens on a title screen; click PLAY to capture the mouse.
 
 ## What's in the game
 
