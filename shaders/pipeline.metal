@@ -529,10 +529,13 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     refracted +=
         water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
 
-    // ---- Absorption: the water column filters toward deep blue
-    float3 deepColor = float3(0.02f, 0.12f, 0.25f);
+    // ---- Absorption: shallow water reads turquoise and filters toward deep
+    // blue with depth (red light dies first), the floor showing through shallows
+    float3 shallowTint = float3(0.10f, 0.42f, 0.48f);
+    float3 deepTint = float3(0.02f, 0.10f, 0.22f);
+    float3 waterColor = mix(shallowTint, deepTint, saturate(waterDepth * 0.12f));
     float absorb = 1.0f - exp(-waterDepth * 0.16f);
-    float3 body = mix(refracted * float3(0.85f, 0.95f, 1.0f), deepColor, absorb);
+    float3 body = mix(refracted * float3(0.75f, 0.92f, 0.96f), waterColor, absorb);
 
     // ---- Fresnel sky reflection + sun sparkle (skylight gates both, so
     // flooded caves reflect darkness rather than open sky)
@@ -564,6 +567,16 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
 
     // Hairline shorelines dissolve into the shore instead of aliasing
     color = mix(refracted, color, saturate(waterDepth * 3.0f));
+
+    // Shoreline foam: a bright animated band just off the shallow edge, gated
+    // by skylight so flooded caves stay dark. Reuses the caustic web to break
+    // the band into moving flecks rather than a hard rim.
+    float foamBand =
+        smoothstep(0.05f, 0.4f, waterDepth) * (1.0f - smoothstep(0.4f, 1.4f, waterDepth));
+    float foam =
+        foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz * 0.5f, water.time));
+    color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * in.vSkyLight);
+
     return float4(color, 1.0f);
 }
 
