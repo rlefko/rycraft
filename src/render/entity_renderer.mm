@@ -1,6 +1,7 @@
 #include "render/entity_renderer.hpp"
 
 #include "common/error.hpp"
+#include "render/pixel_formats.hpp"
 
 #include <array>
 
@@ -74,8 +75,8 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     auto pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    pipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+    pipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
     // Entities draw inside the 4x MSAA scene pass
     pipelineDesc.rasterSampleCount = 4;
 

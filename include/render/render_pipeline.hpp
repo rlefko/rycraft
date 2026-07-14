@@ -32,6 +32,7 @@ class World;
 class Camera;
 class UIOverlay;
 class Bloom;
+class PostStack;
 class ParticleSystem;
 
 // GPU-side per-chunk mesh allocation tracking. opaqueIndexCount splits the
@@ -187,8 +188,11 @@ private:
     // UI overlay for HUD rendering (crosshair, hotbar, menus).
     std::unique_ptr<UIOverlay> _uiOverlay;
 
-    // Bloom post-processing (Phase 8)
+    // Bloom post-processing (HDR extract + blur)
     std::unique_ptr<Bloom> _bloom;
+
+    // Final composite: exposure, tonemap, grade, sharpen (always runs)
+    std::unique_ptr<PostStack> _postStack;
 
     // Weather particle system (rain/snow)
     std::unique_ptr<ParticleSystem> _particles;

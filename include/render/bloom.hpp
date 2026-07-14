@@ -6,17 +6,15 @@
 #include <memory>
 
 // ---------------------------------------------------------------------------
-// Bloom — Post-processing bloom effect with ACES tone mapping.
+// Bloom — HDR bright-pass + Kawase blur pyramid.
 //
-// Pipeline:
-//   1. Extract pass — threshold bright pixels (luminance > 1.0)
-//   2. Kawase blur — 4-level mip pyramid, separable 8-tap blur
-//   3. Composite pass — additive blend bloom + ACES tone mapping
-//
-// Responsibilities:
-//   • Allocate MRT textures for extract and blur pyramid
-//   • Create blur and composite pipeline states
-//   • Execute full bloom pipeline per frame
+// Pipeline (all RG11B10Float, half-resolution and below):
+//   1. Extract pass — soft-threshold the HDR scene (radiance above ~1.0)
+//   2. Kawase blur — 4-level pyramid, separable 8-tap blur
+// The blurred result is exposed through `bloomTexture()`; the final
+// composite in post.metal owns exposure, the bloom add, and tonemapping.
+// Per-pass constants ride setFragmentBytes (no shared per-frame buffer, so
+// no ring-buffering needed — the pass runs to completion within one encode).
 // ---------------------------------------------------------------------------
 class Bloom {
 public:
@@ -24,11 +22,14 @@ public:
 
     ~Bloom();
 
-    // Execute the bloom post-processing pipeline.
-    // sceneTexture: the resolved MSAA scene color
-    // outputTexture: the final display texture (BGRA8, e.g. the drawable)
-    void renderBloom(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture,
-                     id<MTLTexture> outputTexture);
+    // Run extract + blur from the HDR scene into the pyramid. The bloom
+    // result is bloomTexture(); a no-op when intensity is zero (the caller
+    // binds the black fallback instead).
+    void renderBloom(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture);
+
+    // The finest pyramid level holding the accumulated bloom, for the
+    // composite to sample. Valid after renderBloom.
+    id<MTLTexture> bloomTexture() const { return _blurPyramid[0][0]; }
 
     // Reallocate textures for new resolution.
     void resize(uint32_t width, uint32_t height);
@@ -44,19 +45,15 @@ private:
     // ---- Pipeline states ----
     id<MTLRenderPipelineState> _extractPipelineState;
     id<MTLRenderPipelineState> _blurPipelineState;
-    id<MTLRenderPipelineState> _compositePipelineState;
 
-    // ---- Extract pass texture ----
+    // ---- Extract pass texture (half-res) ----
     id<MTLTexture> _extractTexture;
 
     // ---- Blur pyramid (4 mip levels, half-resolution each step) ----
     static constexpr int PYRAMID_LEVELS = 4;
     id<MTLTexture> _blurPyramid[PYRAMID_LEVELS][2]; // [level][ping/pong]
 
-    // ---- Uniform buffers ----
-    id<MTLBuffer> _uniformsBuffer;
-
-    // ---- Sampler state (linear for blur/composite) ----
+    // ---- Sampler state (linear for blur) ----
     id<MTLSamplerState> _linearSampler;
 
     uint32_t _width;
@@ -74,11 +71,4 @@ private:
 
     void renderBlurPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> source,
                         id<MTLTexture> destination, float blurRadius);
-
-    void renderCompositePass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture,
-                             id<MTLTexture> bloomTexture, id<MTLTexture> outputTexture);
-
-    // Upload bloom uniforms
-    void uploadUniforms(float resolution[2], float texelSize[2], float threshold, float intensity,
-                        float blurRadius);
 };

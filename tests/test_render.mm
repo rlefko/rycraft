@@ -730,29 +730,60 @@ TEST_CASE("Day/night cycle: sun elevation drives ambient brightness", "[phase6][
 
 // ---- Bloom Tests ----
 
-TEST_CASE("Bloom: ACES tone mapping formula", "[phase8][bloom]") {
-    // ACES: color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14)
-    auto acesToneMap = [](float c) -> float {
-        float a = c * (2.51f * c + 0.03f);
-        float b = c * (2.43f * c + 0.59f) + 0.14f;
-        return a / b;
+// Uchimura "Gran Turismo" tonemap replicated from post.metal (the composite
+// owns tonemapping now — ACES lived in the deleted bloom composite). Pins the
+// curve's contract: black stays black, a linear mid section preserves the
+// vibrant look, highlights compress, and it never decreases.
+static float uchimuraToneMap(float x) {
+    const float P = 1.0f, a = 1.0f, m = 0.22f, l = 0.4f, c = 1.33f, b = 0.0f;
+    const float l0 = ((P - m) * l) / a;
+    const float S0 = m + l0;
+    const float S1 = m + a * l0;
+    const float C2 = (a * P) / (P - S1);
+    const float CP = -C2 / P;
+    float w0 =
+        1.0f - (x <= 0.0f ? 0.0f : (x >= m ? 1.0f : (x / m) * (x / m) * (3.0f - 2.0f * x / m)));
+    float w2 = (x >= m + l0) ? 1.0f : 0.0f;
+    float w1 = 1.0f - w0 - w2;
+    float T = m * std::pow(x / m, c) + b;
+    float L = m + a * (x - m);
+    float S = P - (P - S1) * std::exp(CP * (x - S0));
+    return T * w0 + L * w1 + S * w2;
+}
+
+TEST_CASE("Post: Uchimura tone mapping curve", "[hdr][post]") {
+    // Black in, black out
+    REQUIRE(uchimuraToneMap(0.0f) == Catch::Approx(0.0f).margin(0.001f));
+
+    // The linear mid keeps mid-tones near identity (the vibrant look)
+    float atMid = uchimuraToneMap(0.5f);
+    REQUIRE(atMid > 0.35f);
+    REQUIRE(atMid < 0.65f);
+
+    // HDR highlights compress below the display max
+    REQUIRE(uchimuraToneMap(4.0f) < 1.0f);
+    REQUIRE(uchimuraToneMap(8.0f) < 1.0f);
+
+    // Monotonically increasing across the range
+    REQUIRE(uchimuraToneMap(0.2f) < uchimuraToneMap(0.5f));
+    REQUIRE(uchimuraToneMap(0.5f) < uchimuraToneMap(1.0f));
+    REQUIRE(uchimuraToneMap(1.0f) < uchimuraToneMap(2.0f));
+}
+
+TEST_CASE("Post: vibrance boosts low-saturation colors more than saturated ones", "[hdr][post]") {
+    auto luma = [](float r, float g, float b) { return 0.2126f * r + 0.7152f * g + 0.0722f * b; };
+    // Vibrance boost factor from post.metal: vibrance * (1 - saturation)
+    auto satBoost = [](float mx, float mn, float vibrance) {
+        return vibrance * (1.0f - std::clamp(mx - mn, 0.0f, 1.0f));
     };
-
-    // Identity at 0
-    REQUIRE(acesToneMap(0.0f) == Catch::Approx(0.0f).epsilon(0.0001f));
-
-    // Near-identity at 1.0 (slight compression)
-    float at1 = acesToneMap(1.0f);
-    REQUIRE(at1 > 0.8f);
-    REQUIRE(at1 < 1.2f);
-
-    // Compresses high values
-    float at2 = acesToneMap(2.0f);
-    REQUIRE(at2 < 2.0f); // Compression
-
-    // Monotonically increasing
-    REQUIRE(acesToneMap(0.5f) < acesToneMap(1.0f));
-    REQUIRE(acesToneMap(1.0f) < acesToneMap(1.5f));
+    const float vibrance = 0.5f;
+    // A near-gray pixel (low saturation) gets a larger boost than a vivid one
+    float grayBoost = satBoost(0.55f, 0.45f, vibrance); // sat 0.1
+    float vividBoost = satBoost(0.9f, 0.1f, vibrance);  // sat 0.8
+    REQUIRE(grayBoost > vividBoost);
+    // Fully saturated → no boost
+    REQUIRE(satBoost(1.0f, 0.0f, vibrance) == Catch::Approx(0.0f));
+    (void)luma;
 }
 
 TEST_CASE("Bloom: extract threshold — bright pixels pass, dark pixels blocked", "[phase8][bloom]") {
@@ -983,4 +1014,14 @@ TEST_CASE("Shader types: BloomUniforms layout matches MSL", "[render][shader-typ
     REQUIRE(offsetof(BloomUniforms, texelSize) == 8);
     REQUIRE(offsetof(BloomUniforms, threshold) == 16);
     REQUIRE(offsetof(BloomUniforms, blurRadius) == 24);
+}
+
+TEST_CASE("Shader types: PostUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(PostUniforms) == 32);
+    REQUIRE(offsetof(PostUniforms, resolution) == 0);
+    REQUIRE(offsetof(PostUniforms, exposure) == 8);
+    REQUIRE(offsetof(PostUniforms, bloomIntensity) == 12);
+    REQUIRE(offsetof(PostUniforms, vibrance) == 16);
+    REQUIRE(offsetof(PostUniforms, sharpening) == 20);
+    REQUIRE(offsetof(PostUniforms, frameIndex) == 24);
 }

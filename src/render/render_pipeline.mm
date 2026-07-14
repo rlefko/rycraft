@@ -5,6 +5,8 @@
 #include "render/bloom.hpp"
 #include "render/entity_renderer.hpp"
 #include "render/lod_mesher.hpp"
+#include "render/pixel_formats.hpp"
+#include "render/post_stack.hpp"
 
 #include "engine/camera.hpp"
 #include "engine/hotbar.hpp"
@@ -77,8 +79,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     pipelineDesc.fragmentFunction = fragmentFunc;
     pipelineDesc.vertexDescriptor = vertexDesc;
 
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    pipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+    pipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
     pipelineDesc.rasterSampleCount = 4;
 
     NSError* error = nil;
@@ -121,8 +123,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     auto skyPipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     skyPipelineDesc.vertexFunction = skyVertexFunc;
     skyPipelineDesc.fragmentFunction = skyFragmentFunc;
-    skyPipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    skyPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    skyPipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+    skyPipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
     skyPipelineDesc.rasterSampleCount = 4;
 
     _skyPipelineState = [_device newRenderPipelineStateWithDescriptor:skyPipelineDesc error:&error];
@@ -149,7 +151,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     highlightPipelineDesc.vertexFunction = highlightVertexFunc;
     highlightPipelineDesc.fragmentFunction = highlightFragmentFunc;
     highlightPipelineDesc.vertexDescriptor = vertexDesc;
-    highlightPipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    highlightPipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
     highlightPipelineDesc.colorAttachments[0].blendingEnabled = true;
     highlightPipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
     highlightPipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
@@ -159,7 +161,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         MTLBlendFactorOneMinusSourceAlpha;
     highlightPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
         MTLBlendFactorOneMinusSourceAlpha;
-    highlightPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    highlightPipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
     highlightPipelineDesc.rasterSampleCount = 4;
 
     _highlightPipelineState = [_device newRenderPipelineStateWithDescriptor:highlightPipelineDesc
@@ -236,7 +238,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         waterDesc.vertexFunction = waterVertexFunc;
         waterDesc.fragmentFunction = waterFragmentFunc;
         waterDesc.vertexDescriptor = vertexDesc;
-        waterDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        waterDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
         waterDesc.rasterSampleCount = 1;
         _waterPipelineState = [_device newRenderPipelineStateWithDescriptor:waterDesc error:&error];
         if (!_waterPipelineState) {
@@ -255,7 +257,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         auto overlayDesc = [[MTLRenderPipelineDescriptor alloc] init];
         overlayDesc.vertexFunction = overlayVertexFunc;
         overlayDesc.fragmentFunction = overlayFragmentFunc;
-        overlayDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        overlayDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
         overlayDesc.colorAttachments[0].blendingEnabled = true;
         overlayDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
         overlayDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
@@ -293,7 +295,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         auto cloudPipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
         cloudPipelineDesc.vertexFunction = cloudVertexFunc;
         cloudPipelineDesc.fragmentFunction = cloudFragmentFunc;
-        cloudPipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        cloudPipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
         cloudPipelineDesc.colorAttachments[0].blendingEnabled = true;
         cloudPipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
         cloudPipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
@@ -303,7 +305,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
             MTLBlendFactorOneMinusSourceAlpha;
         cloudPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
             MTLBlendFactorOneMinusSourceAlpha;
-        cloudPipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        cloudPipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
         cloudPipelineDesc.rasterSampleCount = 4;
 
         _cloudPipelineState = [_device newRenderPipelineStateWithDescriptor:cloudPipelineDesc
@@ -316,9 +318,12 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     cloudDepthDesc.depthWriteEnabled = false;
     _cloudDepthState = [_device newDepthStencilStateWithDescriptor:cloudDepthDesc];
 
-    // ---- Bloom post-processing (Phase 8) ----
+    // ---- Bloom post-processing (HDR extract + blur) ----
     _bloom = std::make_unique<Bloom>(_device, shaderLibrary, _displayWidth, _displayHeight);
     _bloom->setIntensity(_bloomIntensity);
+
+    // ---- Final composite (tonemap + grade + sharpen) ----
+    _postStack = std::make_unique<PostStack>(_device, shaderLibrary);
 
     // ---- Weather Particle System ----
     _particles = std::make_unique<ParticleSystem>(_device, shaderLibrary);
@@ -341,7 +346,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 void RenderPipeline::allocateSceneTargets() {
     auto colorMSAADesc = [[MTLTextureDescriptor alloc] init];
     colorMSAADesc.textureType = MTLTextureType2DMultisample;
-    colorMSAADesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    colorMSAADesc.pixelFormat = PixelFormats::SCENE_HDR;
     colorMSAADesc.width = _displayWidth;
     colorMSAADesc.height = _displayHeight;
     colorMSAADesc.sampleCount = 4;
@@ -354,7 +359,7 @@ void RenderPipeline::allocateSceneTargets() {
 
     auto depthMSAADesc = [[MTLTextureDescriptor alloc] init];
     depthMSAADesc.textureType = MTLTextureType2DMultisample;
-    depthMSAADesc.pixelFormat = MTLPixelFormatDepth32Float;
+    depthMSAADesc.pixelFormat = PixelFormats::SCENE_DEPTH;
     depthMSAADesc.width = _displayWidth;
     depthMSAADesc.height = _displayHeight;
     depthMSAADesc.sampleCount = 4;
@@ -366,7 +371,7 @@ void RenderPipeline::allocateSceneTargets() {
     }
 
     auto colorResolveDesc =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:PixelFormats::SCENE_HDR
                                                            width:_displayWidth
                                                           height:_displayHeight
                                                        mipmapped:false];
@@ -380,7 +385,7 @@ void RenderPipeline::allocateSceneTargets() {
     // The scene depth resolves here (min filter: nearest sample wins) so the
     // water shader can depth-test and reconstruct the world behind pixels.
     auto depthResolveDesc =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:PixelFormats::SCENE_DEPTH
                                                            width:_displayWidth
                                                           height:_displayHeight
                                                        mipmapped:false];
@@ -394,7 +399,7 @@ void RenderPipeline::allocateSceneTargets() {
     // Refraction samples a copy of the resolved color (a render target
     // cannot sample itself)
     auto sceneCopyDesc =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:PixelFormats::SCENE_HDR
                                                            width:_displayWidth
                                                           height:_displayHeight
                                                        mipmapped:false];
@@ -524,26 +529,20 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                 skyUniforms, fogColor, worldTime);
     _fogDensity = savedFogDensity;
 
-    // ---- Bloom (extract/blur, then composite into the drawable) ----
-    // With zero intensity the bloom pipeline is skipped and the resolved
-    // scene is blitted to the drawable unchanged (same dimensions).
-    if (_bloom && _bloomIntensity > 0.0f) {
-        _bloom->renderBloom(commandBuffer, _colorResolve, drawable.texture);
-    } else {
-        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
-        if (blit) {
-            [blit copyFromTexture:_colorResolve
-                      sourceSlice:0
-                      sourceLevel:0
-                     sourceOrigin:MTLOriginMake(0, 0, 0)
-                       sourceSize:MTLSizeMake(_colorResolve.width, _colorResolve.height, 1)
-                        toTexture:drawable.texture
-                 destinationSlice:0
-                 destinationLevel:0
-                destinationOrigin:MTLOriginMake(0, 0, 0)];
-            [blit endEncoding];
-        }
+    // ---- Bloom (HDR extract + blur; result feeds the composite) ----
+    // At zero intensity renderBloom early-outs and the composite binds a
+    // black fallback, so no bloom texture is produced.
+    const bool bloomOn = _bloom && _bloomIntensity > 0.0f;
+    if (bloomOn) {
+        _bloom->renderBloom(commandBuffer, _colorResolve);
     }
+
+    // ---- Final composite (always runs: tonemap + grade + sharpen) ----
+    // This is the one linear-HDR → display conversion; the pre-HDR pipeline
+    // blitted raw when bloom was off, so that path was never tonemapped.
+    _postStack->encodeComposite(commandBuffer, _colorResolve,
+                                bloomOn ? _bloom->bloomTexture() : nil, drawable.texture, _gfx,
+                                static_cast<uint32_t>(_frameRing.frameIndex()));
 
     // ---- UI Overlay Pass (screen-space HUD at display resolution) ----
     auto uiPassDesc = [[MTLRenderPassDescriptor alloc] init];

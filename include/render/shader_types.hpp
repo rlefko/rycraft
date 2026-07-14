@@ -98,13 +98,27 @@ struct ParticleUniforms {
     simd_float3 cameraPosition;
 };
 
-// Bound at buffer(0) in all three bloom passes.
+// Bound at buffer(0) in the bloom extract/blur passes (via setFragmentBytes
+// — 32 bytes of per-pass state, not a real buffer).
 struct BloomUniforms {
     simd_float2 resolution; // output texture width, height
     simd_float2 texelSize;  // 1/width, 1/height
     float threshold;        // extract luminance threshold
     float intensity;        // bloom strength multiplier
     float blurRadius;       // Kawase blur radius in texels
+};
+
+// Bound at buffer(0) in the final composite (post.metal): the one pass that
+// converts the linear HDR scene to the display — exposure, bloom add,
+// Uchimura tonemap, vibrance grade, optional CAS sharpen, dither. It always
+// runs, so the frame is tonemapped even with bloom off.
+struct PostUniforms {
+    simd_float2 resolution; // drawable size in pixels
+    float exposure;         // linear pre-tonemap multiplier
+    float bloomIntensity;   // 0 = bloom texture is the black fallback
+    float vibrance;         // 0..2 saturation-aware boost; 1 = stock look
+    float sharpening;       // 0..1 CAS strength; 0 = skip
+    uint32_t frameIndex;    // deterministic dither phase
 };
 
 #ifndef __METAL_VERSION__
@@ -145,4 +159,8 @@ static_assert(offsetof(ParticleUniforms, cameraPosition) == 128);
 
 static_assert(sizeof(BloomUniforms) == 32);
 static_assert(offsetof(BloomUniforms, threshold) == 16);
+
+static_assert(sizeof(PostUniforms) == 32);
+static_assert(offsetof(PostUniforms, exposure) == 8);
+static_assert(offsetof(PostUniforms, frameIndex) == 24);
 #endif

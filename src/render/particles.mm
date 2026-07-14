@@ -1,6 +1,7 @@
 #import "render/particles.hpp"
 
 #include "common/error.hpp"
+#include "render/pixel_formats.hpp"
 #include "world/world.hpp"
 
 #include "common/random.hpp"
@@ -33,7 +34,7 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
 
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
     pipelineDesc.colorAttachments[0].blendingEnabled = true;
     pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
     pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
@@ -42,7 +43,7 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
         MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    pipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
     // Particles draw inside the 4x MSAA scene pass
     pipelineDesc.rasterSampleCount = 4;
 
