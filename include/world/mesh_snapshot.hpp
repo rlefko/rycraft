@@ -5,8 +5,10 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// MeshSnapshot — a chunk plus a one-block wall from each face neighbor,
-// copied under chunksMutex_ in one bounded memcpy (~83 KB, microseconds).
+// MeshSnapshot — a chunk plus a one-block ring from all eight neighbors (four
+// face walls + four diagonal corner columns), copied under chunksMutex_ in one
+// bounded memcpy (~83 KB, microseconds — the corner columns are four extra
+// byte-writes per layer into the ring that resize() already allocated).
 //
 // Meshing reads it lock-free afterwards: block data only mutates before a
 // chunk is inserted into the world or under chunksMutex_, so the copy is
@@ -15,9 +17,10 @@
 // treating the neighbor as air produced both hidden interior walls between
 // solid chunks and holes/light seams at borders.
 //
-// x and z accept [-1, CHUNK_WIDTH] / [-1, CHUNK_DEPTH]; the corner columns
-// are never written or read (face passes and skylight only ever step one
-// cell along a single axis).
+// x and z accept [-1, CHUNK_WIDTH] / [-1, CHUNK_DEPTH], corner columns
+// included: baked corner AO samples the diagonal neighbor of each face vertex,
+// so leaving the four corners as air would put a bright AO seam along every
+// chunk edge wherever a corner occluder straddles the border.
 // ---------------------------------------------------------------------------
 struct MeshSnapshot {
     static constexpr int PADDED_WIDTH = CHUNK_WIDTH + 2;

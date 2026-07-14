@@ -58,13 +58,17 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
     }
 }
 
-// Pack a face normal, texture layer, and sky-light level into the vertex
-// faceAttr field: face in bits 0-2, layer in bits 3-10, light in bits 11-14.
-// Light 15 = open sky; lower values darken faces under cover (the column
-// skylight that gives trees and overhangs their cast shadows).
-constexpr uint32_t packFaceAttr(FaceNormal face, uint8_t layer, uint8_t skyLight = 15) {
+// Pack a face normal, texture layer, sky-light level, and baked corner
+// ambient-occlusion into the vertex faceAttr field: face in bits 0-2, layer in
+// bits 3-10, light in bits 11-14, corner AO in bits 15-16. Light 15 = open sky;
+// lower values darken faces under cover (the column skylight that gives trees
+// and overhangs their cast shadows). Corner AO 3 = fully open (no darkening),
+// 0 = a fully enclosed voxel corner — the classic per-vertex crease shading.
+constexpr uint32_t packFaceAttr(FaceNormal face, uint8_t layer, uint8_t skyLight = 15,
+                                uint8_t cornerAO = 3) {
     return static_cast<uint32_t>(face) | (static_cast<uint32_t>(layer) << 3) |
-           (static_cast<uint32_t>(skyLight & 15u) << 11);
+           (static_cast<uint32_t>(skyLight & 15u) << 11) |
+           (static_cast<uint32_t>(cornerAO & 3u) << 15);
 }
 
 constexpr FaceNormal unpackFace(uint32_t faceAttr) {
@@ -77,4 +81,8 @@ constexpr uint8_t unpackTextureLayer(uint32_t faceAttr) {
 
 constexpr uint8_t unpackSkyLight(uint32_t faceAttr) {
     return static_cast<uint8_t>((faceAttr >> 11) & 15u);
+}
+
+constexpr uint8_t unpackCornerAO(uint32_t faceAttr) {
+    return static_cast<uint8_t>((faceAttr >> 15) & 3u);
 }

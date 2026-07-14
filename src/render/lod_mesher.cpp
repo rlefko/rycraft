@@ -53,15 +53,45 @@ struct QuadCorner {
     float u, v;
 };
 
-// Append one greedy quad (4 vertices + 6 indices). Corners arrive in the
-// same winding the face's caller always used.
+// Classic voxel corner AO: 0 (fully enclosed) .. 3 (open). side1/side2 are the
+// two edge-adjacent occluders one step along the outward normal, corner the
+// diagonal one; two solid sides bury the vertex regardless of the corner.
+inline static uint8_t aoVertex(bool side1, bool side2, bool corner) {
+    if (side1 && side2) {
+        return 0;
+    }
+    return static_cast<uint8_t>(3 - (int(side1) + int(side2) + int(corner)));
+}
+
+// Pack/unpack four 2-bit corner-AO values (emit-corner order) in one byte.
+// AO_ALL_OPEN is the "no occlusion, all four corners open" sentinel.
+inline static uint8_t packAO(uint8_t a0, uint8_t a1, uint8_t a2, uint8_t a3) {
+    return static_cast<uint8_t>(a0 | (a1 << 2) | (a2 << 4) | (a3 << 6));
+}
+inline static uint8_t cornerAOAt(uint8_t packed, int corner) {
+    return static_cast<uint8_t>((packed >> (corner * 2)) & 3u);
+}
+constexpr uint8_t AO_ALL_OPEN = 0xFF; // packAO(3, 3, 3, 3)
+
+// Append one greedy quad (4 vertices + 6 indices). Corners arrive in the same
+// winding the face's caller always used; packedAO carries the per-vertex AO in
+// that same emit order (see packAO). When the two diagonals carry unequal AO
+// the quad is rotated one vertex so the triangulation splits along the BRIGHTER
+// diagonal — that isolates a single occluded corner in one triangle instead of
+// letting its darkness interpolate across the whole quad along the diagonal.
 static void pushQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs, FaceNormal face,
-                     BlockType bt, uint8_t skyLight, const QuadCorner (&corners)[4]) {
-    const uint32_t attr = packFaceAttr(face, textureLayerFor(bt, face), skyLight);
-    for (const QuadCorner& c : corners) {
-        verts.push_back(Vertex{attr, static_cast<float16_t>(c.x), static_cast<float16_t>(c.y),
-                               static_cast<float16_t>(c.z), static_cast<float16_t>(c.u),
-                               static_cast<float16_t>(c.v)});
+                     BlockType bt, uint8_t skyLight, const QuadCorner (&corners)[4],
+                     uint8_t packedAO) {
+    const bool flip = (cornerAOAt(packedAO, 0) + cornerAOAt(packedAO, 2)) <
+                      (cornerAOAt(packedAO, 1) + cornerAOAt(packedAO, 3));
+    const uint8_t layer = textureLayerFor(bt, face);
+    for (int k = 0; k < 4; ++k) {
+        const int c = flip ? (k + 1) & 3 : k;
+        const QuadCorner& corner = corners[c];
+        const uint32_t attr = packFaceAttr(face, layer, skyLight, cornerAOAt(packedAO, c));
+        verts.push_back(Vertex{attr, static_cast<float16_t>(corner.x),
+                               static_cast<float16_t>(corner.y), static_cast<float16_t>(corner.z),
+                               static_cast<float16_t>(corner.u), static_cast<float16_t>(corner.v)});
     }
     uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
     idxs.push_back(bi);
@@ -82,7 +112,8 @@ static void pushQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs, Fa
 // width and matching block type. Each merged rectangle becomes 1 quad.
 static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<bool>& faceMask,
                             const std::vector<BlockType>& blockTypes,
-                            const std::vector<uint8_t>& cellLight, std::vector<bool>& merged,
+                            const std::vector<uint8_t>& cellLight,
+                            const std::vector<uint8_t>& cellAO, std::vector<bool>& merged,
                             FaceNormal face, std::vector<Vertex>& vertices,
                             std::vector<uint32_t>& indices, const auto& emitQuadFn) {
     merged.assign(faceHeight * faceWidth, false);
@@ -96,25 +127,28 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
 
             BlockType leadType = blockTypes[i];
             uint8_t leadLight = cellLight[i];
+            uint8_t leadAO = cellAO[i];
 
-            // Extend right (horizontal) while type AND light match — a quad
-            // carries one light value, so shading boundaries end the merge
+            // Extend right (horizontal) while type, light AND corner AO match —
+            // a quad carries one light value and one four-corner AO tuple, so a
+            // shading or occlusion boundary ends the merge (else AO smears).
             int width = 1;
             while (col + width < faceWidth && faceMask[idx(row, col + width, faceWidth)] &&
                    !merged[idx(row, col + width, faceWidth)] &&
                    blockTypes[idx(row, col + width, faceWidth)] == leadType &&
-                   cellLight[idx(row, col + width, faceWidth)] == leadLight) {
+                   cellLight[idx(row, col + width, faceWidth)] == leadLight &&
+                   cellAO[idx(row, col + width, faceWidth)] == leadAO) {
                 ++width;
             }
 
-            // Extend down (vertical) as far as possible with same width, type, light
+            // Extend down (vertical) as far as possible with same width, type, light, AO
             int height = 1;
             while (row + height < faceHeight) {
                 bool rowValid = true;
                 for (int w = 0; w < width; ++w) {
                     int j = idx(row + height, col + w, faceWidth);
                     if (!faceMask[j] || merged[j] || blockTypes[j] != leadType ||
-                        cellLight[j] != leadLight) {
+                        cellLight[j] != leadLight || cellAO[j] != leadAO) {
                         rowValid = false;
                         break;
                     }
@@ -131,7 +165,8 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
             }
 
             // Emit quad via callback
-            emitQuadFn(col, row, width, height, face, leadType, leadLight, vertices, indices);
+            emitQuadFn(col, row, width, height, face, leadType, leadLight, leadAO, vertices,
+                       indices);
         }
     }
 }
@@ -142,11 +177,12 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
 template <typename Access, typename Visible>
 static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBlock,
                             const Visible& visible, const auto& lightAt, float topDrop, bool padded,
-                            MeshScratch& scratch, std::vector<Vertex>& outVertices,
+                            bool bakeAO, MeshScratch& scratch, std::vector<Vertex>& outVertices,
                             std::vector<uint32_t>& outIndices) {
     std::vector<bool>& faceMask = scratch.faceMask;
     std::vector<BlockType>& blockTypes = scratch.blockTypes;
     std::vector<uint8_t>& cellLight = scratch.cellLight;
+    std::vector<uint8_t>& cellAO = scratch.cellAO;
     std::vector<bool>& merged = scratch.merged;
 
     // Padded builds know their +X/+Z neighbor walls, so the boundary layer
@@ -154,6 +190,53 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
     // there would paint a wall inside the neighbor).
     const int xEnd = padded ? gridW : gridW - 1;
     const int zEnd = padded ? gridD : gridD - 1;
+
+    // Baked corner AO reads the eight occluders in the plane one step along
+    // each face's outward normal (isOpaque, so leaves don't cast AO — the same
+    // rule as skylight). Each helper folds them into the four quad corners in
+    // that face's emit order; unexposed cells and the water pass stay
+    // AO_ALL_OPEN (no darkening).
+    auto occ = [&](int gx, int gy, int gz) { return isOpaque(getBlock(gx, gy, gz)); };
+    auto aoXZ = [&](int cx, int py, int cz) -> uint8_t { // +Y / -Y, outward plane py
+        bool xm = occ(cx - 1, py, cz), xp = occ(cx + 1, py, cz);
+        bool zm = occ(cx, py, cz - 1), zp = occ(cx, py, cz + 1);
+        bool mm = occ(cx - 1, py, cz - 1), pm = occ(cx + 1, py, cz - 1);
+        bool pp = occ(cx + 1, py, cz + 1), mp = occ(cx - 1, py, cz + 1);
+        return packAO(aoVertex(xm, zm, mm), aoVertex(xp, zm, pm), aoVertex(xp, zp, pp),
+                      aoVertex(xm, zp, mp));
+    };
+    auto aoPlusX = [&](int px, int cy, int cz) -> uint8_t { // +X, outward plane px
+        bool ym = occ(px, cy - 1, cz), yp = occ(px, cy + 1, cz);
+        bool zm = occ(px, cy, cz - 1), zp = occ(px, cy, cz + 1);
+        bool mm = occ(px, cy - 1, cz - 1), pm = occ(px, cy + 1, cz - 1);
+        bool pp = occ(px, cy + 1, cz + 1), mp = occ(px, cy - 1, cz + 1);
+        return packAO(aoVertex(ym, zm, mm), aoVertex(yp, zm, pm), aoVertex(yp, zp, pp),
+                      aoVertex(ym, zp, mp));
+    };
+    auto aoMinusX = [&](int px, int cy, int cz) -> uint8_t { // -X, outward plane px
+        bool ym = occ(px, cy - 1, cz), yp = occ(px, cy + 1, cz);
+        bool zm = occ(px, cy, cz - 1), zp = occ(px, cy, cz + 1);
+        bool mm = occ(px, cy - 1, cz - 1), pm = occ(px, cy + 1, cz - 1);
+        bool pp = occ(px, cy + 1, cz + 1), mp = occ(px, cy - 1, cz + 1);
+        return packAO(aoVertex(ym, zm, mm), aoVertex(ym, zp, mp), aoVertex(yp, zp, pp),
+                      aoVertex(yp, zm, pm));
+    };
+    auto aoPlusZ = [&](int cx, int cy, int pz) -> uint8_t { // +Z, outward plane pz
+        bool xm = occ(cx - 1, cy, pz), xp = occ(cx + 1, cy, pz);
+        bool ym = occ(cx, cy - 1, pz), yp = occ(cx, cy + 1, pz);
+        bool mm = occ(cx - 1, cy - 1, pz), pm = occ(cx + 1, cy - 1, pz);
+        bool pp = occ(cx + 1, cy + 1, pz), mp = occ(cx - 1, cy + 1, pz);
+        return packAO(aoVertex(xm, ym, mm), aoVertex(xm, yp, mp), aoVertex(xp, yp, pp),
+                      aoVertex(xp, ym, pm));
+    };
+    auto aoMinusZ = [&](int cx, int cy, int pz) -> uint8_t { // -Z, outward plane pz
+        bool xm = occ(cx - 1, cy, pz), xp = occ(cx + 1, cy, pz);
+        bool ym = occ(cx, cy - 1, pz), yp = occ(cx, cy + 1, pz);
+        bool mm = occ(cx - 1, cy - 1, pz), pm = occ(cx + 1, cy - 1, pz);
+        bool pp = occ(cx + 1, cy + 1, pz), mp = occ(cx - 1, cy + 1, pz);
+        return packAO(aoVertex(xm, ym, mm), aoVertex(xp, ym, pm), aoVertex(xp, yp, pp),
+                      aoVertex(xm, yp, mp));
+    };
 
     // ======================================================================
     // Face: +Y (top) — visible when the block above doesn't hide it
@@ -163,6 +246,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         faceMask.assign(gridD * gridW, false);
         blockTypes.assign(gridD * gridW, BlockType::AIR);
         cellLight.assign(gridD * gridW, 15);
+        cellAO.assign(gridD * gridW, AO_ALL_OPEN);
 
         bool anyExposed = false;
         for (int z = 0; z < gridD; ++z) {
@@ -172,6 +256,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                     faceMask[idx(z, x, gridW)] = true;
                     blockTypes[idx(z, x, gridW)] = cur;
                     cellLight[idx(z, x, gridW)] = lightAt(x, ly + 1, z);
+                    if (bakeAO) cellAO[idx(z, x, gridW)] = aoXZ(x, ly + 1, z);
                     anyExposed = true;
                 }
             }
@@ -179,8 +264,8 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         if (!anyExposed) continue;
 
         auto emitQuad = [ly, topDrop](int col, int row, int width, int height, FaceNormal face,
-                                      BlockType bt, uint8_t skyLight, std::vector<Vertex>& verts,
-                                      std::vector<uint32_t>& idxs) {
+                                      BlockType bt, uint8_t skyLight, uint8_t ao,
+                                      std::vector<Vertex>& verts, std::vector<uint32_t>& idxs) {
             // +Y face: y = ly+1 (minus the water-surface drop), CCW from above
             const float fw = static_cast<float>(width);
             const float fh = static_cast<float>(height);
@@ -191,11 +276,11 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                 {static_cast<float>(col + width), y, static_cast<float>(row + height), fw, fh},
                 {static_cast<float>(col), y, static_cast<float>(row + height), 0.f, fh},
             };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners, ao);
         };
 
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_Y,
-                        outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, cellAO, merged,
+                        FaceNormal::PLUS_Y, outVertices, outIndices, emitQuad);
     }
 
     // ======================================================================
@@ -205,6 +290,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         faceMask.assign(gridD * gridW, false);
         blockTypes.assign(gridD * gridW, BlockType::AIR);
         cellLight.assign(gridD * gridW, 15);
+        cellAO.assign(gridD * gridW, AO_ALL_OPEN);
 
         bool anyExposed = false;
         for (int z = 0; z < gridD; ++z) {
@@ -214,6 +300,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                     faceMask[idx(z, x, gridW)] = true;
                     blockTypes[idx(z, x, gridW)] = cur;
                     cellLight[idx(z, x, gridW)] = lightAt(x, ly - 1, z);
+                    if (bakeAO) cellAO[idx(z, x, gridW)] = aoXZ(x, ly - 1, z);
                     anyExposed = true;
                 }
             }
@@ -221,7 +308,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         if (!anyExposed) continue;
 
         auto emitQuad = [ly](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             uint8_t skyLight, uint8_t ao, std::vector<Vertex>& verts,
                              std::vector<uint32_t>& idxs) {
             // -Y face: y = ly, CCW from below
             const float fw = static_cast<float>(width);
@@ -236,11 +323,11 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                 {static_cast<float>(col), static_cast<float>(ly), static_cast<float>(row + height),
                  0.f, fh},
             };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners, ao);
         };
 
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_Y,
-                        outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, cellAO, merged,
+                        FaceNormal::MINUS_Y, outVertices, outIndices, emitQuad);
     }
 
     // ======================================================================
@@ -250,6 +337,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         faceMask.assign(gridH * gridD, false);
         blockTypes.assign(gridH * gridD, BlockType::AIR);
         cellLight.assign(gridH * gridD, 15);
+        cellAO.assign(gridH * gridD, AO_ALL_OPEN);
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
@@ -258,12 +346,13 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                     faceMask[idx(y, z, gridD)] = true;
                     blockTypes[idx(y, z, gridD)] = cur;
                     cellLight[idx(y, z, gridD)] = lightAt(lx + 1, y, z);
+                    if (bakeAO) cellAO[idx(y, z, gridD)] = aoPlusX(lx + 1, y, z);
                 }
             }
         }
 
         auto emitQuad = [lx](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             uint8_t skyLight, uint8_t ao, std::vector<Vertex>& verts,
                              std::vector<uint32_t>& idxs) {
             // +X face: x = lx+1, CCW from +X (rows are Y, cols are Z).
             // Texture v runs downward in Metal, so the TOP of the face
@@ -281,11 +370,11 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                 {static_cast<float>(lx + 1), static_cast<float>(row),
                  static_cast<float>(col + width), fw, fh},
             };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners, ao);
         };
 
-        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_X,
-                        outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, cellAO, merged,
+                        FaceNormal::PLUS_X, outVertices, outIndices, emitQuad);
     }
 
     // ======================================================================
@@ -295,6 +384,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         faceMask.assign(gridH * gridD, false);
         blockTypes.assign(gridH * gridD, BlockType::AIR);
         cellLight.assign(gridH * gridD, 15);
+        cellAO.assign(gridH * gridD, AO_ALL_OPEN);
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
@@ -303,12 +393,13 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                     faceMask[idx(y, z, gridD)] = true;
                     blockTypes[idx(y, z, gridD)] = cur;
                     cellLight[idx(y, z, gridD)] = lightAt(lx - 1, y, z);
+                    if (bakeAO) cellAO[idx(y, z, gridD)] = aoMinusX(lx - 1, y, z);
                 }
             }
         }
 
         auto emitQuad = [lx](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             uint8_t skyLight, uint8_t ao, std::vector<Vertex>& verts,
                              std::vector<uint32_t>& idxs) {
             // -X face: the face plane of block lx is x = lx (the old code
             // emitted at lx-1, one unit inside the neighbor)
@@ -323,11 +414,11 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                 {static_cast<float>(lx), static_cast<float>(row + height), static_cast<float>(col),
                  0.f, 0.f},
             };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners, ao);
         };
 
-        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_X,
-                        outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, cellAO, merged,
+                        FaceNormal::MINUS_X, outVertices, outIndices, emitQuad);
     }
 
     // ======================================================================
@@ -337,6 +428,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         faceMask.assign(gridH * gridW, false);
         blockTypes.assign(gridH * gridW, BlockType::AIR);
         cellLight.assign(gridH * gridW, 15);
+        cellAO.assign(gridH * gridW, AO_ALL_OPEN);
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
@@ -345,12 +437,13 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                     faceMask[idx(y, x, gridW)] = true;
                     blockTypes[idx(y, x, gridW)] = cur;
                     cellLight[idx(y, x, gridW)] = lightAt(x, y, lz + 1);
+                    if (bakeAO) cellAO[idx(y, x, gridW)] = aoPlusZ(x, y, lz + 1);
                 }
             }
         }
 
         auto emitQuad = [lz](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             uint8_t skyLight, uint8_t ao, std::vector<Vertex>& verts,
                              std::vector<uint32_t>& idxs) {
             // +Z face: z = lz+1 (the old code emitted at lz, coplanar with
             // the block interior)
@@ -366,11 +459,11 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                 {static_cast<float>(col + width), static_cast<float>(row),
                  static_cast<float>(lz + 1), fw, fh},
             };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners, ao);
         };
 
-        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::PLUS_Z,
-                        outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, cellAO, merged,
+                        FaceNormal::PLUS_Z, outVertices, outIndices, emitQuad);
     }
 
     // ======================================================================
@@ -380,6 +473,7 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         faceMask.assign(gridH * gridW, false);
         blockTypes.assign(gridH * gridW, BlockType::AIR);
         cellLight.assign(gridH * gridW, 15);
+        cellAO.assign(gridH * gridW, AO_ALL_OPEN);
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
@@ -388,12 +482,13 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                     faceMask[idx(y, x, gridW)] = true;
                     blockTypes[idx(y, x, gridW)] = cur;
                     cellLight[idx(y, x, gridW)] = lightAt(x, y, lz - 1);
+                    if (bakeAO) cellAO[idx(y, x, gridW)] = aoMinusZ(x, y, lz - 1);
                 }
             }
         }
 
         auto emitQuad = [lz](int col, int row, int width, int height, FaceNormal face, BlockType bt,
-                             uint8_t skyLight, std::vector<Vertex>& verts,
+                             uint8_t skyLight, uint8_t ao, std::vector<Vertex>& verts,
                              std::vector<uint32_t>& idxs) {
             // -Z face: the face plane of block lz is z = lz (the old code
             // emitted at lz-1, one unit inside the neighbor)
@@ -408,11 +503,11 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                 {static_cast<float>(col), static_cast<float>(row + height), static_cast<float>(lz),
                  0.f, 0.f},
             };
-            pushQuad(verts, idxs, face, bt, skyLight, corners);
+            pushQuad(verts, idxs, face, bt, skyLight, corners, ao);
         };
 
-        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, merged, FaceNormal::MINUS_Z,
-                        outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, cellAO, merged,
+                        FaceNormal::MINUS_Z, outVertices, outIndices, emitQuad);
     }
 }
 
@@ -442,8 +537,10 @@ static void emitFloraCross(int x, int y, int z, BlockType bt, uint8_t skyLight,
         {x1, y1, z0, 1.f, 0.f},
         {x0, y1, z1, 0.f, 0.f},
     };
-    pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalA);
-    pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalB);
+    // Flora is unshaded by AO (cross-quads have no face plane to occlude, and
+    // the shader gives CROSS a fixed light); pass fully-open corners.
+    pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalA, AO_ALL_OPEN);
+    pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalB, AO_ALL_OPEN);
 }
 
 template <typename Access>
@@ -486,9 +583,9 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
         return static_cast<uint8_t>(std::max(12 - depth, 4));
     };
 
-    // ---- Opaque section: cubes, then flora crosses (full LOD only) ----
-    runGreedyPasses(gridW, gridH, gridD, getBlock, cubeFaceVisible, lightAt, 0.f, padded, scratch,
-                    output.vertices, output.indices);
+    // ---- Opaque section: cubes (with baked corner AO), then flora crosses ----
+    runGreedyPasses(gridW, gridH, gridD, getBlock, cubeFaceVisible, lightAt, 0.f, padded,
+                    /*bakeAO=*/true, scratch, output.vertices, output.indices);
 
     if (emitFlora) {
         for (int z = 0; z < gridD; ++z) {
@@ -511,14 +608,14 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
     output.opaqueIndexCount = static_cast<uint32_t>(output.indices.size());
     if (padded) {
         runGreedyPasses(gridW, gridH, gridD, getBlock, waterFaceVisible, lightAt, 0.125f, padded,
-                        scratch, output.vertices, output.indices);
+                        /*bakeAO=*/false, scratch, output.vertices, output.indices);
     } else {
         auto waterEdgeBlock = [&getBlock, gridW, gridD](int x, int y, int z) -> BlockType {
             if (x < 0 || x >= gridW || z < 0 || z >= gridD) return BlockType::WATER;
             return getBlock(x, y, z);
         };
         runGreedyPasses(gridW, gridH, gridD, waterEdgeBlock, waterFaceVisible, lightAt, 0.125f,
-                        padded, scratch, output.vertices, output.indices);
+                        padded, /*bakeAO=*/false, scratch, output.vertices, output.indices);
     }
 
     return output;

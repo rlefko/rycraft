@@ -215,10 +215,16 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
     if (self == chunks_.end() || !self->second->generated) {
         return false;
     }
-    const Chunk* neighbors[4] = {nullptr, nullptr, nullptr, nullptr};
-    const ChunkPos neighborPos[4] = {
-        {pos.x - 1, pos.z}, {pos.x + 1, pos.z}, {pos.x, pos.z - 1}, {pos.x, pos.z + 1}};
-    for (int i = 0; i < 4; ++i) {
+    // Eight neighbors: four face walls (0-3) plus four diagonal corner
+    // columns (4-7) that baked corner AO needs at chunk borders. Generation
+    // reaches viewDistance+1 as a full square, so every render-radius chunk
+    // has all eight generated (no extra meshing stall vs the old four).
+    const Chunk* neighbors[8] = {};
+    const ChunkPos neighborPos[8] = {{pos.x - 1, pos.z},     {pos.x + 1, pos.z},
+                                     {pos.x, pos.z - 1},     {pos.x, pos.z + 1},
+                                     {pos.x - 1, pos.z - 1}, {pos.x + 1, pos.z - 1},
+                                     {pos.x - 1, pos.z + 1}, {pos.x + 1, pos.z + 1}};
+    for (int i = 0; i < 8; ++i) {
         auto it = chunks_.find(neighborPos[i]);
         if (it == chunks_.end() || !it->second->generated) {
             return false;
@@ -248,6 +254,15 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
                 neighbors[2]->getBlock(x, y, CHUNK_DEPTH - 1);
             out.blocks[MeshSnapshot::index(x, y, CHUNK_DEPTH)] = neighbors[3]->getBlock(x, y, 0);
         }
+        // Four diagonal corner columns (the block nearest this chunk's corner)
+        out.blocks[MeshSnapshot::index(-1, y, -1)] =
+            neighbors[4]->getBlock(CHUNK_WIDTH - 1, y, CHUNK_DEPTH - 1);
+        out.blocks[MeshSnapshot::index(CHUNK_WIDTH, y, -1)] =
+            neighbors[5]->getBlock(0, y, CHUNK_DEPTH - 1);
+        out.blocks[MeshSnapshot::index(-1, y, CHUNK_DEPTH)] =
+            neighbors[6]->getBlock(CHUNK_WIDTH - 1, y, 0);
+        out.blocks[MeshSnapshot::index(CHUNK_WIDTH, y, CHUNK_DEPTH)] =
+            neighbors[7]->getBlock(0, y, 0);
     }
     return true;
 }

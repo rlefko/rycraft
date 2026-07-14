@@ -376,17 +376,32 @@ TEST_CASE("World snapshotForMeshing requires generated neighbors", "[world][mesh
     world.getChunk(1, 0);
     REQUIRE(!world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
 
+    // All four face neighbors present but still no diagonals — baked corner AO
+    // reads the corner columns, so meshing now waits for all eight neighbors.
     world.getChunk(-1, 0);
     world.getChunk(0, 1);
     world.getChunk(0, -1);
+    REQUIRE(!world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
+
+    // Generate the four diagonals; the snapshot completes
+    world.getChunk(1, 1);
+    world.getChunk(-1, 1);
+    world.getChunk(1, -1);
+    world.getChunk(-1, -1);
     REQUIRE(world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
 
-    // The padded walls carry the neighbors' real border blocks
+    // The padded walls carry the face neighbors' real border blocks
     auto neighbor = world.getChunk(1, 0);
     for (int y = 0; y < CHUNK_HEIGHT; y += 13) {
         for (int z = 0; z < CHUNK_DEPTH; ++z) {
             REQUIRE(snapshot.at(CHUNK_WIDTH, y, z) == neighbor->getBlock(0, y, z));
         }
+    }
+
+    // The corner column carries the diagonal neighbor's nearest block
+    auto diagonal = world.getChunk(1, 1);
+    for (int y = 0; y < CHUNK_HEIGHT; y += 13) {
+        REQUIRE(snapshot.at(CHUNK_WIDTH, y, CHUNK_DEPTH) == diagonal->getBlock(0, y, 0));
     }
 }
 
@@ -526,13 +541,56 @@ TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][texture
         for (uint8_t layer :
              {uint8_t{0}, uint8_t{7}, TEXTURE_LAYER_GRASS_SIDE, TEXTURE_LAYER_WHITE}) {
             for (uint8_t light : {uint8_t{0}, uint8_t{4}, uint8_t{15}}) {
-                uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer, light);
-                REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
-                REQUIRE(unpackTextureLayer(attr) == layer);
-                REQUIRE(unpackSkyLight(attr) == light);
+                for (uint8_t ao : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{3}}) {
+                    uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer, light, ao);
+                    REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
+                    REQUIRE(unpackTextureLayer(attr) == layer);
+                    REQUIRE(unpackSkyLight(attr) == light);
+                    REQUIRE(unpackCornerAO(attr) == ao);
+                }
             }
         }
     }
+}
+
+TEST_CASE("Mesher: baked corner AO darkens enclosed voxel corners", "[render][mesher][ao]") {
+    // An L-shaped nook: a floor with two walls meeting at a corner. The floor
+    // vertex tucked into the inner corner sees occluders on both sides and the
+    // diagonal, so its baked AO is the lowest; a vertex out on the open floor
+    // stays fully open (AO 3).
+    Chunk chunk(0, 0);
+    for (int x = 4; x <= 9; ++x)
+        for (int z = 4; z <= 9; ++z)
+            chunk.setBlock(x, 64, z, BlockType::STONE); // floor slab
+    for (int z = 4; z <= 9; ++z)
+        chunk.setBlock(4, 65, z, BlockType::STONE); // wall along -X edge
+    for (int x = 4; x <= 9; ++x)
+        chunk.setBlock(x, 65, 4, BlockType::STONE); // wall along -Z edge
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    uint8_t innerCornerAO = 3;
+    uint8_t maxFloorAO = 0;
+    bool foundInner = false;
+    for (const Vertex& v : output.vertices) {
+        if (unpackFace(v.faceAttr) != FaceNormal::PLUS_Y)
+            continue;
+        float x = static_cast<float>(v.px);
+        float y = static_cast<float>(v.py);
+        float z = static_cast<float>(v.pz);
+        if (y < 64.5f || y > 65.5f)
+            continue; // only the floor top at y = 65
+        maxFloorAO = std::max(maxFloorAO, unpackCornerAO(v.faceAttr));
+        // The concave corner vertex sits where the two walls meet (5,65,5)
+        if (x > 4.9f && x < 5.1f && z > 4.9f && z < 5.1f) {
+            innerCornerAO = std::min(innerCornerAO, unpackCornerAO(v.faceAttr));
+            foundInner = true;
+        }
+    }
+    REQUIRE(foundInner);
+    REQUIRE(maxFloorAO == 3);    // open floor away from the walls stays lit
+    REQUIRE(innerCornerAO == 0); // two walls + diagonal bury the tucked corner
 }
 
 TEST_CASE("Mesher: opaque cover reduces skylight; non-opaque leaves do not", "[render][mesher]") {

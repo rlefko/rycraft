@@ -38,6 +38,7 @@ struct MeshScratch {
     std::vector<bool> faceMask;
     std::vector<BlockType> blockTypes;
     std::vector<uint8_t> cellLight;
+    std::vector<uint8_t> cellAO; // four 2-bit corner-AO values per exposed face cell
     std::vector<bool> merged;
     std::vector<int> skyHeight;
 };

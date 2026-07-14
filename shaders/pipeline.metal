@@ -29,6 +29,7 @@ struct VertexOutput {
     float2 vUV;
     float vLight;
     float vSkyLight;       // column skylight 0-1 (cast shade, cave darkness)
+    float vAO;             // baked corner AO 0.5-1 (per-vertex crease shading)
     float3 vWorldPosition; // World-space position for fog calculation
     uint vTextureLayer [[flat]];
 };
@@ -84,16 +85,20 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     // Pass through UV
     out.vUV = in.uv;
 
-    // Unpack face normal (bits 0-2), texture layer (bits 3-10), and
-    // column skylight (bits 11-14)
+    // Unpack face normal (bits 0-2), texture layer (bits 3-10), column
+    // skylight (bits 11-14), and baked corner AO (bits 15-16). The AO level
+    // 0..3 maps to 0.5..1.0 — a fully enclosed voxel corner keeps half its
+    // light, an open corner none removed.
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
+    out.vAO = 0.5f + float((in.faceAttr >> 15) & 3u) * (1.0f / 6.0f);
     uint normalIdx = in.faceAttr & 7u;
     if (normalIdx == FACE_CROSS) {
         // Flora cross-quads: orientation-free lighting tracking the sun's
         // elevation, so the two diagonal quads never shade differently
         out.vNormal = float3(0.0, 1.0, 0.0);
         out.vLight = max(uniforms.sunDirection.y, 0.0f) * 0.9f;
+        out.vAO = 1.0f;
         return out;
     }
     float3 normal = getFaceNormal(normalIdx);
@@ -128,7 +133,7 @@ constant float2 POISSON_DISK[16] = {
 // as a smooth penumbra.
 // ---------------------------------------------------------------------------
 // Penumbra tuning (multiples of shadowParams.x, the base texel radius).
-constant float SHADOW_SEARCH_SCALE = 3.0f;  // blocker-search radius
+constant float SHADOW_SEARCH_SCALE = 3.0f;     // blocker-search radius
 constant float SHADOW_MAX_FILTER_SCALE = 4.0f; // widest PCF radius (soft edge)
 constant float SHADOW_PENUMBRA_GAIN = 40.0f;   // depth gap → penumbra fraction
 
@@ -204,7 +209,8 @@ static float sampleShadow(float3 worldPos, float3 normal, float3 cameraPos, floa
 
     // ---- Penumbra width from the blocker/receiver depth gap ----
     // Contact (tiny gap) → tight kernel; occluder high above → wide, soft.
-    float penumbra = saturate((depthRef - avgBlocker) / max(avgBlocker, 1e-4f) * SHADOW_PENUMBRA_GAIN);
+    float penumbra =
+        saturate((depthRef - avgBlocker) / max(avgBlocker, 1e-4f) * SHADOW_PENUMBRA_GAIN);
     float filterRadius =
         mix(1.0f, shadow.shadowParams.x * SHADOW_MAX_FILTER_SCALE, penumbra) * texel;
 
@@ -253,8 +259,11 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     float lit = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition,
                              in.clipPosition.xy, shadowMap, shadowSampler, shadow);
 
-    float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight * sky * lit +
-                                      uniforms.ambientColor * sky);
+    // Baked corner AO darkens ambient and direct alike — the crease shading
+    // reads as contact occlusion the same way vanilla applies it. The half-res
+    // SSAO pass layers the broader mid-scale occlusion on top in screen space.
+    float3 litColor = texColor.rgb * in.vAO *
+                      (uniforms.sunColor * in.vLight * sky * lit + uniforms.ambientColor * sky);
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);
