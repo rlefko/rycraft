@@ -28,10 +28,15 @@
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
+// One frame's constants (chunk/sky/water/highlight/cloud uniform blocks plus
+// the particle instance array) sub-allocate from this ring slot; the particle
+// array dominates at 192 KB.
+static constexpr uint64_t FRAME_RING_SLOT_BYTES = 256 * 1024;
+
 RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
                                uint32_t height)
-    : _device(device), _bloomIntensity(1.0f), _displayWidth(width), _displayHeight(height),
-      _frustumPlanes{} {
+    : _device(device), _frameRing(device, FRAME_RING_SLOT_BYTES), _bloomIntensity(1.0f),
+      _displayWidth(width), _displayHeight(height), _frustumPlanes{} {
     // ---- Load main chunk shader functions ----
     id<MTLFunction> vertexFunc = [shaderLibrary newFunctionWithName:@"vertexMain"];
     if (!vertexFunc) {
@@ -136,13 +141,6 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         RY_LOG_FATAL("Failed to create sky depth stencil state");
     }
 
-    // Sky uniforms buffer
-    _skyUniformsBuffer = [_device newBufferWithLength:sizeof(SkyUniforms)
-                                              options:MTLResourceStorageModeShared];
-    if (!_skyUniformsBuffer) {
-        RY_LOG_FATAL("Failed to allocate sky uniforms buffer");
-    }
-
     // ---- Block highlight pipeline state (lines) ----
     id<MTLFunction> highlightVertexFunc = [shaderLibrary newFunctionWithName:@"vertexMain"];
     id<MTLFunction> highlightFragmentFunc = [shaderLibrary newFunctionWithName:@"fragmentMain"];
@@ -221,28 +219,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         RY_LOG_FATAL("Failed to allocate highlight vertex buffer");
     }
 
-    // Highlight uniforms buffer (same layout as Uniforms)
-    _highlightUniformsBuffer = [_device newBufferWithLength:sizeof(Uniforms)
-                                                    options:MTLResourceStorageModeShared];
-    if (!_highlightUniformsBuffer) {
-        RY_LOG_FATAL("Failed to allocate highlight uniforms buffer");
-    }
-
     // ---- Scene render targets (native resolution) ----
     allocateSceneTargets();
-
-    // ---- Uniforms buffer ----
-    _uniformsBuffer = [_device newBufferWithLength:sizeof(Uniforms)
-                                           options:MTLResourceStorageModeShared];
-    if (!_uniformsBuffer) {
-        RY_LOG_FATAL("Failed to allocate uniforms buffer");
-    }
-
-    _waterUniformsBuffer = [_device newBufferWithLength:sizeof(WaterUniforms)
-                                                options:MTLResourceStorageModeShared];
-    if (!_waterUniformsBuffer) {
-        RY_LOG_FATAL("Failed to allocate water uniforms buffer");
-    }
 
     // ---- Water pipeline states ----
     // Water composites its own pixels from the resolved scene: single
@@ -337,10 +315,6 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     cloudDepthDesc.depthCompareFunction = MTLCompareFunctionLess;
     cloudDepthDesc.depthWriteEnabled = false;
     _cloudDepthState = [_device newDepthStencilStateWithDescriptor:cloudDepthDesc];
-
-    // Cloud uniforms buffer
-    _cloudUniformsBuffer = [_device newBufferWithLength:sizeof(CloudUniforms)
-                                                options:MTLResourceStorageModeShared];
 
     // ---- Bloom post-processing (Phase 8) ----
     _bloom = std::make_unique<Bloom>(_device, shaderLibrary, _displayWidth, _displayHeight);
@@ -478,8 +452,10 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
 
     _gpuTimer->beginFrame();
 
-    // Upload sky uniforms
-    std::memcpy((void*)_skyUniformsBuffer.contents, &skyUniforms, sizeof(SkyUniforms));
+    // Claim a frames-in-flight slot: every per-frame uniform block below
+    // sub-allocates from it, so the CPU never rewrites data the GPU reads.
+    _frameRing.waitAndBegin();
+    FrameRing::Alloc skyAlloc = _frameRing.push(&skyUniforms, sizeof(SkyUniforms));
 
     // ---- Scene pass: sky → chunks → highlight → particles → clouds ----
     // Everything renders into the 4x MSAA target and resolves once into
@@ -504,10 +480,12 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
-    if (!encoder)
+    if (!encoder) {
+        _frameRing.cancelFrame(); // nothing encoded references the slot
         return;
+    }
 
-    renderSky(encoder);
+    renderSky(encoder, skyAlloc);
 
     // Underwater the whole scene sinks into a dense blue veil (light
     // attenuation); the water pass adds the god-ray overlay on top.
@@ -523,7 +501,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                  sunColor, ambientColor, fogColor);
 
     if (entities && _entityRenderer) {
-        _entityRenderer->render(encoder, _uniformsBuffer, *entities,
+        _entityRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset, *entities,
                                 [this](const AABB& aabb) { return isChunkInFrustum(aabb); });
     }
 
@@ -532,7 +510,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     }
 
     if (_particles) {
-        _particles->render(encoder, viewMatrix, projectionMatrix, camera.getPosition());
+        _particles->render(encoder, _frameRing, viewMatrix, projectionMatrix, camera.getPosition());
     }
 
     renderClouds(encoder, camera, worldTime, sunDirection);
@@ -585,6 +563,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     }
 
     _gpuTimer->endFrame(commandBuffer);
+    _frameRing.signalOnCompletion(commandBuffer);
 
     // Present and commit
     [commandBuffer presentDrawable:drawable];
@@ -751,11 +730,12 @@ void RenderPipeline::computeDayNightUniforms(uint64_t worldTime, float sunDirect
 // ---------------------------------------------------------------------------
 // renderSky — fullscreen gradient drawn first in the scene pass
 // ---------------------------------------------------------------------------
-void RenderPipeline::renderSky(id<MTLRenderCommandEncoder> encoder) {
+void RenderPipeline::renderSky(id<MTLRenderCommandEncoder> encoder,
+                               const FrameRing::Alloc& skyUniforms) {
     [encoder setRenderPipelineState:_skyPipelineState];
     [encoder setDepthStencilState:_skyDepthState];
-    [encoder setVertexBuffer:_skyUniformsBuffer offset:0 atIndex:1];
-    [encoder setFragmentBuffer:_skyUniformsBuffer offset:0 atIndex:1];
+    [encoder setVertexBuffer:skyUniforms.buffer offset:skyUniforms.offset atIndex:1];
+    [encoder setFragmentBuffer:skyUniforms.buffer offset:skyUniforms.offset atIndex:1];
 
     // Draw fullscreen quad (6 vertices, no index buffer)
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
@@ -800,12 +780,12 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Camera position for fog distance calculation
     uniforms.cameraPosition = simd_make_float3(camX, camY, camZ);
 
-    // Upload to GPU
-    std::memcpy((void*)_uniformsBuffer.contents, &uniforms, sizeof(Uniforms));
+    // Upload to GPU (kept for the entity renderer + water vertex stage too)
+    _frameUniforms = _frameRing.push(&uniforms, sizeof(Uniforms));
 
     // Bind the shared atlas + uniforms once; every chunk draw reuses them
-    [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
-    [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
+    [encoder setVertexBuffer:_frameUniforms.buffer offset:_frameUniforms.offset atIndex:1];
+    [encoder setFragmentBuffer:_frameUniforms.buffer offset:_frameUniforms.offset atIndex:1];
     [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
     [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
 
@@ -821,8 +801,10 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
 
     auto loadedChunks = world.getLoadedChunks();
 
-    // Sweep mesh allocations of chunks the world has since unloaded BEFORE
-    // building, so the freed mega-buffer space serves this frame's builds
+    // Recycle regions whose last GPU reader has finished, then sweep mesh
+    // allocations of chunks the world has since unloaded — freed space can
+    // serve this frame's builds once its deferral window closes.
+    _megaBuffer->drainDeferredFrees(_frameRing.completedFrame());
     _liveChunkKeys.clear();
     for (const auto& chunk : loadedChunks) {
         if (chunk) {
@@ -832,7 +814,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     for (auto it = _chunkMeshes.begin(); it != _chunkMeshes.end();) {
         if (_liveChunkKeys.count(it->first) == 0) {
             if (it->second.uploaded) {
-                _megaBuffer->free(it->second.alloc);
+                _megaBuffer->deferFree(it->second.alloc, _frameRing.frameIndex());
             }
             it = _chunkMeshes.erase(it);
         } else {
@@ -873,7 +855,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     auto applyMesh = [&](uint64_t key, const MeshOutput& mesh, uint32_t builtVersion) -> bool {
         ChunkMeshState& state = _chunkMeshes[key];
         if (state.uploaded) {
-            _megaBuffer->free(state.alloc);
+            // In-flight frames may still draw the old mesh; recycle later
+            _megaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
             state.uploaded = false;
         }
         state.requestedVersion = 0;
@@ -1115,7 +1098,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     // 20 Hz world time → seconds (the same stepping the clouds animate with)
     wu.time = static_cast<float>(worldTime % 24000) * 0.05f;
     wu.cameraUnderwater = cameraUnderwater ? 1.f : 0.f;
-    std::memcpy((void*)_waterUniformsBuffer.contents, &wu, sizeof(WaterUniforms));
+    FrameRing::Alloc waterAlloc = _frameRing.push(&wu, sizeof(WaterUniforms));
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];
     passDesc.colorAttachments[0].texture = _colorResolve;
@@ -1135,9 +1118,9 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
 
         [encoder setRenderPipelineState:_waterPipelineState];
         [encoder setCullMode:MTLCullModeNone]; // surface visible from below
-        [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
-        [encoder setVertexBuffer:_waterUniformsBuffer offset:0 atIndex:3];
-        [encoder setFragmentBuffer:_waterUniformsBuffer offset:0 atIndex:3];
+        [encoder setVertexBuffer:_frameUniforms.buffer offset:_frameUniforms.offset atIndex:1];
+        [encoder setVertexBuffer:waterAlloc.buffer offset:waterAlloc.offset atIndex:3];
+        [encoder setFragmentBuffer:waterAlloc.buffer offset:waterAlloc.offset atIndex:3];
         [encoder setFragmentTexture:_sceneColorCopy atIndex:0];
         [encoder setFragmentTexture:_depthResolve atIndex:1];
 
@@ -1155,7 +1138,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
 
     if (cameraUnderwater) {
         [encoder setRenderPipelineState:_underwaterOverlayState];
-        [encoder setFragmentBuffer:_waterUniformsBuffer offset:0 atIndex:3];
+        [encoder setFragmentBuffer:waterAlloc.buffer offset:waterAlloc.offset atIndex:3];
         [encoder setFragmentTexture:_depthResolve atIndex:1];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
@@ -1186,14 +1169,14 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, c
     uniforms.sunColor = simd_make_float3(1.0f, 1.0f, 0.0f);
     uniforms.ambientColor = simd_make_float3(0.0f, 0.0f, 0.0f);
 
-    std::memcpy((void*)_highlightUniformsBuffer.contents, &uniforms, sizeof(Uniforms));
+    FrameRing::Alloc highlightAlloc = _frameRing.push(&uniforms, sizeof(Uniforms));
 
     [encoder setRenderPipelineState:_highlightPipelineState];
     [encoder setDepthStencilState:_noDepthWriteState];
 
     [encoder setVertexBuffer:_highlightVertexBuffer offset:0 atIndex:0];
-    [encoder setVertexBuffer:_highlightUniformsBuffer offset:0 atIndex:1];
-    [encoder setFragmentBuffer:_highlightUniformsBuffer offset:0 atIndex:1];
+    [encoder setVertexBuffer:highlightAlloc.buffer offset:highlightAlloc.offset atIndex:1];
+    [encoder setFragmentBuffer:highlightAlloc.buffer offset:highlightAlloc.offset atIndex:1];
 
     // Highlight vertices carry their translation in the model matrix
     ChunkOrigin zeroOrigin{};
@@ -1352,12 +1335,12 @@ void RenderPipeline::renderClouds(id<MTLRenderCommandEncoder> encoder, const Cam
     cloudUniforms.noiseFrequency = 0.005f;
     cloudUniforms.cloudThreshold = 0.55f;
 
-    std::memcpy((void*)_cloudUniformsBuffer.contents, &cloudUniforms, sizeof(cloudUniforms));
+    FrameRing::Alloc cloudAlloc = _frameRing.push(&cloudUniforms, sizeof(cloudUniforms));
 
     [encoder setRenderPipelineState:_cloudPipelineState];
     [encoder setDepthStencilState:_cloudDepthState];
-    [encoder setVertexBuffer:_cloudUniformsBuffer offset:0 atIndex:0];
-    [encoder setFragmentBuffer:_cloudUniformsBuffer offset:0 atIndex:0];
+    [encoder setVertexBuffer:cloudAlloc.buffer offset:cloudAlloc.offset atIndex:0];
+    [encoder setFragmentBuffer:cloudAlloc.buffer offset:cloudAlloc.offset atIndex:0];
 
     // Draw fullscreen quad (6 vertices)
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];

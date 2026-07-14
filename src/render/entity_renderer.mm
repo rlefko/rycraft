@@ -92,14 +92,15 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 }
 
 void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
+                            uint64_t uniformsOffset,
                             const std::vector<std::shared_ptr<Entity>>& entities,
                             const std::function<bool(const AABB&)>& isVisible) {
     if (entities.empty())
         return;
 
     [encoder setRenderPipelineState:_pipelineState];
-    [encoder setVertexBuffer:uniformsBuffer offset:0 atIndex:1];
-    [encoder setFragmentBuffer:uniformsBuffer offset:0 atIndex:1];
+    [encoder setVertexBuffer:uniformsBuffer offset:uniformsOffset atIndex:1];
+    [encoder setFragmentBuffer:uniformsBuffer offset:uniformsOffset atIndex:1];
 
     for (const auto& entity : entities) {
         if (!entity || !entity->alive)

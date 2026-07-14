@@ -11,8 +11,7 @@
 // Constructor
 // ---------------------------------------------------------------------------
 ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrary)
-    : _device(device), _pipelineState(nil), _depthState(nil), _particleBuffer(nil),
-      _uniformsBuffer(nil) {
+    : _device(device), _pipelineState(nil), _depthState(nil) {
     // Zero-initialize all particles
     std::memset(particles_, 0, sizeof(particles_));
 
@@ -63,20 +62,6 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     if (!_depthState) {
         RY_LOG_FATAL("Failed to create particle depth stencil state");
     }
-
-    // ---- GPU particle buffer ----
-    _particleBuffer = [_device newBufferWithLength:sizeof(GPUParticle) * MAX_PARTICLES
-                                           options:MTLResourceStorageModeShared];
-    if (!_particleBuffer) {
-        RY_LOG_FATAL("Failed to allocate particle GPU buffer");
-    }
-
-    // ---- Uniform buffer ----
-    _uniformsBuffer = [_device newBufferWithLength:sizeof(ParticleUniforms)
-                                           options:MTLResourceStorageModeShared];
-    if (!_uniformsBuffer) {
-        RY_LOG_FATAL("Failed to allocate particle uniforms buffer");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -86,8 +71,6 @@ ParticleSystem::~ParticleSystem() {
     // Metal objects released via ARC (nil assignment)
     _pipelineState = nil;
     _depthState = nil;
-    _particleBuffer = nil;
-    _uniformsBuffer = nil;
 }
 
 // ---------------------------------------------------------------------------
@@ -245,13 +228,15 @@ bool ParticleSystem::isSnowBiome(const World& world, int x, int z) const {
 // ---------------------------------------------------------------------------
 // render — Draw active particles as billboards
 // ---------------------------------------------------------------------------
-void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, const Mat4& viewMatrix,
-                            const Mat4& projectionMatrix, const Vec3& cameraPosition) {
+void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, FrameRing& frameRing,
+                            const Mat4& viewMatrix, const Mat4& projectionMatrix,
+                            const Vec3& cameraPosition) {
     if (!encoder || !_pipelineState)
         return;
 
-    // ---- Upload particle data to GPU ----
-    GPUParticle* gpuParticles = reinterpret_cast<GPUParticle*>(_particleBuffer.contents);
+    // ---- Upload particle data into this frame's ring slot ----
+    FrameRing::Alloc instances = frameRing.alloc(sizeof(GPUParticle) * MAX_PARTICLES);
+    GPUParticle* gpuParticles = static_cast<GPUParticle*>(instances.ptr);
     size_t activeCount = 0;
 
     for (size_t i = 0; i < MAX_PARTICLES; ++i) {
@@ -278,15 +263,15 @@ void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, const Mat4& vie
                 sizeof(uniforms.projectionMatrix));
     uniforms.cameraPosition =
         simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
-    std::memcpy((void*)_uniformsBuffer.contents, &uniforms, sizeof(uniforms));
+    FrameRing::Alloc uniformsAlloc = frameRing.push(&uniforms, sizeof(uniforms));
 
     // ---- Bind and draw ----
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setDepthStencilState:_depthState];
 
-    [encoder setVertexBuffer:_particleBuffer offset:0 atIndex:0];
-    [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
-    [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
+    [encoder setVertexBuffer:instances.buffer offset:instances.offset atIndex:0];
+    [encoder setVertexBuffer:uniformsAlloc.buffer offset:uniformsAlloc.offset atIndex:1];
+    [encoder setFragmentBuffer:uniformsAlloc.buffer offset:uniformsAlloc.offset atIndex:1];
 
     // Draw as point primitives (one point per particle)
     [encoder drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:activeCount];

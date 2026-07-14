@@ -13,6 +13,7 @@
 #include "common/math.hpp"
 #include "engine/hotbar.hpp"
 #include "render/block_texture_array.hpp"
+#include "render/frame_ring.hpp"
 #include "render/gpu_timer.hpp"
 #include "render/lod_mesher.hpp"
 #include "render/mega_buffer.hpp"
@@ -133,7 +134,6 @@ private:
     // Sky pipeline state (drawn first in the scene pass, behind everything)
     id<MTLRenderPipelineState> _skyPipelineState;
     id<MTLDepthStencilState> _skyDepthState;
-    id<MTLBuffer> _skyUniformsBuffer;
 
     // Depth-tested but non-writing state (block highlight)
     id<MTLDepthStencilState> _noDepthWriteState;
@@ -141,18 +141,15 @@ private:
     // Block highlight pipeline state (wireframe lines)
     id<MTLRenderPipelineState> _highlightPipelineState;
     id<MTLBuffer> _highlightVertexBuffer;
-    id<MTLBuffer> _highlightUniformsBuffer;
 
     // Cloud pipeline state (Phase 8)
     id<MTLRenderPipelineState> _cloudPipelineState;
     id<MTLDepthStencilState> _cloudDepthState;
-    id<MTLBuffer> _cloudUniformsBuffer;
 
     // Water pass (refraction/reflection/caustics) — no depth attachment;
     // the fragment shader depth-tests against the resolved scene depth
     id<MTLRenderPipelineState> _waterPipelineState;
     id<MTLRenderPipelineState> _underwaterOverlayState;
-    id<MTLBuffer> _waterUniformsBuffer;
     std::vector<WaterDraw> _waterDraws; // reused each frame
 
     // MSAA render targets (memoryless — resolved or discarded at pass end)
@@ -168,8 +165,13 @@ private:
     id<MTLTexture> _depthResolve;
     id<MTLTexture> _sceneColorCopy;
 
-    // Uniform buffer (512 bytes with fog + camera position).
-    id<MTLBuffer> _uniformsBuffer;
+    // Frames-in-flight gate + per-frame constants arena: every uniform block
+    // the CPU rewrites per frame sub-allocates from the current slot.
+    FrameRing _frameRing;
+
+    // The frame's chunk Uniforms allocation — filled by renderChunks, also
+    // bound by the entity renderer and the water pass vertex stage.
+    FrameRing::Alloc _frameUniforms;
 
     // MegaBuffer for centralized GPU memory management.
     std::unique_ptr<MegaBuffer> _megaBuffer;
@@ -246,7 +248,7 @@ private:
                                  float ambientColor[3], SkyUniforms& skyUniforms);
 
     // ---- Scene pass stages (all encode into the single MSAA scene encoder) ----
-    void renderSky(id<MTLRenderCommandEncoder> encoder);
+    void renderSky(id<MTLRenderCommandEncoder> encoder, const FrameRing::Alloc& skyUniforms);
 
     void renderChunks(id<MTLRenderCommandEncoder> encoder, const World& world,
                       const Mat4& viewMatrix, const Mat4& projectionMatrix,

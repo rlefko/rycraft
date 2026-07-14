@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "common/math.hpp"
+#include "render/frame_ring.hpp"
 #include "render/shader_types.hpp"
 #include "world/chunk.hpp"
 
@@ -59,7 +60,9 @@ public:
     void tick(float dt, const World& world, const Vec3& playerPosition);
 
     // Render active particles as billboards (call during main render pass).
-    void render(id<MTLRenderCommandEncoder> encoder, const Mat4& viewMatrix,
+    // Instance data + uniforms sub-allocate from the caller's frame ring so
+    // the per-frame rewrite never races frames the GPU still reads.
+    void render(id<MTLRenderCommandEncoder> encoder, FrameRing& frameRing, const Mat4& viewMatrix,
                 const Mat4& projectionMatrix, const Vec3& cameraPosition);
 
 private:
@@ -70,12 +73,6 @@ private:
     id<MTLDevice> _device;
     id<MTLRenderPipelineState> _pipelineState;
     id<MTLDepthStencilState> _depthState;
-
-    // GPU particle buffer (uploaded every frame)
-    id<MTLBuffer> _particleBuffer;
-
-    // Uniform buffer (view/projection/camera)
-    id<MTLBuffer> _uniformsBuffer;
 
     // ---- Spawn helpers ----
     void spawnRainParticle(Particle& p, const Vec3& playerPos, float spawnRadius);

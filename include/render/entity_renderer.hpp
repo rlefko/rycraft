@@ -22,8 +22,9 @@ public:
     EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrary);
 
     // Draw every visible entity. `isVisible` is the caller's frustum test.
+    // The uniforms live in the caller's frame ring, hence buffer + offset.
     void render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
-                const std::vector<std::shared_ptr<Entity>>& entities,
+                uint64_t uniformsOffset, const std::vector<std::shared_ptr<Entity>>& entities,
                 const std::function<bool(const AABB&)>& isVisible);
 
 private:

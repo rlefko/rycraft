@@ -164,7 +164,32 @@ void MegaBuffer::coalesceFreeList(std::vector<std::pair<uint64_t, uint64_t>>& fr
 
 void MegaBuffer::free(ChunkAllocation& alloc) {
     std::lock_guard lock(_mutex);
+    freeLocked(alloc);
+}
 
+void MegaBuffer::deferFree(ChunkAllocation& alloc, uint64_t frame) {
+    std::lock_guard lock(_mutex);
+    _deferredFrees.push_back({alloc, frame});
+    alloc.vertexBuffer = nil;
+    alloc.indexBuffer = nil;
+    alloc.vertexOffset = 0;
+    alloc.indexOffset = 0;
+    alloc.vertexCount = 0;
+    alloc.indexCount = 0;
+}
+
+void MegaBuffer::drainDeferredFrees(uint64_t completedFrame) {
+    std::lock_guard lock(_mutex);
+    std::erase_if(_deferredFrees, [&](DeferredFree& deferred) {
+        if (deferred.frame > completedFrame) {
+            return false;
+        }
+        freeLocked(deferred.alloc);
+        return true;
+    });
+}
+
+void MegaBuffer::freeLocked(ChunkAllocation& alloc) {
     if (alloc.vertexCount > 0) {
         uint64_t vertexBytes = alignUp(alloc.vertexCount * sizeof(Vertex));
         _vertexFreeList.push_back({alloc.vertexOffset, vertexBytes});
