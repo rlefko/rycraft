@@ -50,6 +50,11 @@ public:
     // generation or disk.
     BlockType getBlockIfLoaded(int x, int y, int z) const;
 
+    // Non-generating surface lookup (the heightMap top of the column), or
+    // nullopt while the chunk isn't loaded. Weather uses it to keep rain
+    // from spawning inside caves and under overhangs.
+    std::optional<int> surfaceHeightIfLoaded(int x, int z) const;
+
     // Set block at world position (thread-safe, marks chunk dirty)
     void setBlock(int x, int y, int z, BlockType type);
 

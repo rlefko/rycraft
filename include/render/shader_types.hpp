@@ -58,6 +58,7 @@ struct Uniforms {
     simd_float3 cameraPosition; // for fog distance
     float time;                 // seconds; drives foliage sway
     float swayStrength;         // 0 = waving setting off, 1 = full sway
+    float wetness;              // 0 dry .. 1 soaked (rain darkening + sheen)
 };
 
 // Per-chunk world offset, bound at buffer(2) via setVertexBytes. Vertices are
@@ -271,6 +272,7 @@ static_assert(offsetof(Uniforms, fogDensity) == 256);
 static_assert(offsetof(Uniforms, cameraPosition) == 272);
 static_assert(offsetof(Uniforms, time) == 288);
 static_assert(offsetof(Uniforms, swayStrength) == 292);
+static_assert(offsetof(Uniforms, wetness) == 296);
 
 static_assert(sizeof(WaterUniforms) == 256);
 static_assert(offsetof(WaterUniforms, viewProjection) == 64);

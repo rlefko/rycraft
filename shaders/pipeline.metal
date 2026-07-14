@@ -32,7 +32,8 @@ struct VertexOutput {
     float vAO;             // baked corner AO 0.5-1 (per-vertex crease shading)
     float vBlockLight;     // lava block light 0-1 (warm cave glow)
     float vEmissive;       // 1 = self-lit block (lava), 0 = normally lit
-    float vCross;          // 1 = flora cross-quad (two-sided sun shading)
+    float vFoliage;        // shading class: 0 solid, 1 = cross-quad flora
+                           // (two-sided facing + SSS), 2 = leaf cube (SSS only)
     float3 vWorldPosition; // World-space position for fog calculation
     uint vTextureLayer [[flat]];
 };
@@ -83,8 +84,8 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     // Restore world space from the chunk-local position, sway foliage in the
     // wind (bits 22-23; the shadow pass applies the same displacement), then MVP
     float4 worldPos = uniforms.modelMatrix * float4(in.position + chunkOrigin.origin.xyz, 1.0);
-    worldPos.xyz = applySway(worldPos.xyz, (in.faceAttr >> 22) & 3u, in.uv.y, uniforms.time,
-                             uniforms.swayStrength);
+    uint sway = (in.faceAttr >> 22) & 3u;
+    worldPos.xyz = applySway(worldPos.xyz, sway, in.uv.y, uniforms.time, uniforms.swayStrength);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
 
@@ -102,7 +103,9 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     out.vBlockLight = float((in.faceAttr >> 17) & 15u) / 15.0f;
     out.vEmissive = float((in.faceAttr >> 21) & 1u);
     uint normalIdx = in.faceAttr & 7u;
-    out.vCross = normalIdx == FACE_CROSS ? 1.0f : 0.0f;
+    // Shading class: every cross quad (grass, flowers, reeds, mushrooms)
+    // gets the fragment facing term; swaying leaf cubes get SSS only.
+    out.vFoliage = normalIdx == FACE_CROSS ? 1.0f : (sway == 2u ? 2.0f : 0.0f);
     if (normalIdx == FACE_CROSS) {
         // Flora cross-quads: elevation-tracked base light; the fragment stage
         // adds the two-sided facing term (it needs per-pixel derivatives).
@@ -269,6 +272,10 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
                       1.0f);
     }
 
+    // Rain-soaked surfaces darken (water fills the surface pores) — scaled
+    // by sky access so caves and covered builds stay dry during surface rain.
+    texColor.rgb *= 1.0f - 0.22f * uniforms.wetness * in.vSkyLight;
+
     // Sky access from the baked per-column skylight. Because the mesher now
     // treats only OPAQUE blocks as sky-blockers, a tree canopy (non-opaque
     // leaves) no longer casts a fake column shadow on the ground below — that
@@ -289,10 +296,10 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     // as the sun climbs: vertical blades are edge-on to a high sun, so at noon
     // BOTH sides of every blade scored ~0.4 and all flora went uniformly dark
     // — the facing contrast only means something at low sun angles.
+    float3 toCamera = normalize(uniforms.cameraPosition - in.vWorldPosition);
     float direct = in.vLight;
-    if (in.vCross > 0.5f) {
+    if (in.vFoliage > 0.5f && in.vFoliage < 1.5f) {
         float3 blade = normalize(cross(dfdx(in.vWorldPosition), dfdy(in.vWorldPosition)));
-        float3 toCamera = normalize(uniforms.cameraPosition - in.vWorldPosition);
         blade = dot(blade, toCamera) < 0.0f ? -blade : blade;
         float facing = 0.4f + 0.6f * saturate(dot(blade, uniforms.sunDirection));
         direct *= mix(facing, 1.0f, 0.7f * saturate(uniforms.sunDirection.y));
@@ -311,6 +318,21 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     float3 litColor =
         texColor.rgb * in.vAO *
         (uniforms.sunColor * direct * sky * lit + uniforms.ambientColor * sky + blockLight);
+
+    // Rain-wet sheen: up-facing surfaces catch a moving sun gloss while wet.
+    if (uniforms.wetness > 0.001f) {
+        float3 sheenDir = reflect(-uniforms.sunDirection, in.vNormal);
+        litColor += uniforms.sunColor * pow(saturate(dot(sheenDir, toCamera)), 32.0f) *
+                    (0.45f * uniforms.wetness * lit * saturate(in.vNormal.y) * sky);
+    }
+
+    // Translucent foliage: the sun behind a leaf or blade glows through it
+    // toward the camera (cheap subsurface term, shadow-gated so shaded
+    // canopies don't self-illuminate).
+    if (in.vFoliage > 0.5f) {
+        float sss = pow(saturate(dot(-toCamera, uniforms.sunDirection)), 6.0f);
+        litColor += texColor.rgb * uniforms.sunColor * (sss * 0.55f * lit * in.vSkyLight);
+    }
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);

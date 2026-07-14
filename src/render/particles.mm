@@ -77,7 +77,7 @@ ParticleSystem::~ParticleSystem() {
 // ---------------------------------------------------------------------------
 // tick — Update particle physics each game tick
 // ---------------------------------------------------------------------------
-void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPosition) {
+void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPosition, bool raining) {
     if (dt <= 0.f)
         return;
 
@@ -128,9 +128,10 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
     }
 
     // ---- Spawn new particles to fill pool ----
-    // Target: keep ~70% of pool active
-    constexpr size_t TARGET_ACTIVE = static_cast<size_t>(MAX_PARTICLES * 0.7);
-    size_t toSpawn = (activeCount < TARGET_ACTIVE) ? (TARGET_ACTIVE - activeCount) : 0;
+    // Target: keep ~70% of the pool active while it rains, none when clear
+    // (live drops finish their fall so weather fades instead of popping off)
+    const size_t targetActive = raining ? static_cast<size_t>(MAX_PARTICLES * 0.7) : 0;
+    size_t toSpawn = (activeCount < targetActive) ? (targetActive - activeCount) : 0;
 
     // Limit spawn rate per tick to prevent sudden bursts
     constexpr size_t MAX_SPAWN_PER_TICK = 256;
@@ -159,9 +160,9 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
         int spawnZ = static_cast<int>(playerPosition.z);
 
         if (isSnowBiome(world, spawnX, spawnZ)) {
-            spawnSnowParticle(p, playerPosition, SPAWN_RADIUS);
+            spawnSnowParticle(p, world, playerPosition, SPAWN_RADIUS);
         } else {
-            spawnRainParticle(p, playerPosition, SPAWN_RADIUS);
+            spawnRainParticle(p, world, playerPosition, SPAWN_RADIUS);
         }
     }
 }
@@ -169,17 +170,29 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
 // ---------------------------------------------------------------------------
 // spawnRainParticle
 // ---------------------------------------------------------------------------
-void ParticleSystem::spawnRainParticle(Particle& p, const Vec3& playerPos, float spawnRadius) {
+bool ParticleSystem::spawnRainParticle(Particle& p, const World& world, const Vec3& playerPos,
+                                       float spawnRadius) {
     // Deterministic weather: the same seed always rains the same way
     static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
 
     float angle = rng.nextFloat() * 2.f * static_cast<float>(M_PI);
     float radius = rng.nextFloat() * spawnRadius;
 
-    // Spawn above player at high altitude
+    // Spawn in a band just above the camera: at 10 blocks/s a drop lives
+    // long enough to fall PAST eye level and below the feet — the old
+    // +128-block spawn with a 2 s lifetime died ~110 blocks up, so rain was
+    // simulated but never once visible on screen.
     p.position[0] = playerPos.x + std::cos(angle) * radius;
-    p.position[1] = playerPos.y + 128.f + rng.nextFloat() * 32.f;
+    p.position[1] = playerPos.y + 12.f + rng.nextFloat() * 32.f;
     p.position[2] = playerPos.z + std::sin(angle) * radius;
+
+    // Only sky-exposed columns rain: a spawn point at or below the column's
+    // surface is inside terrain (cave, overhang) and would rain indoors.
+    auto surface = world.surfaceHeightIfLoaded(static_cast<int>(p.position[0]),
+                                               static_cast<int>(p.position[2]));
+    if (!surface || p.position[1] <= static_cast<float>(*surface + 1)) {
+        return false;
+    }
 
     // Fall speed ~10 blocks/s with slight wind drift
     p.velocity[0] = (rng.nextFloat() - 0.5f) * 1.0f;
@@ -187,25 +200,35 @@ void ParticleSystem::spawnRainParticle(Particle& p, const Vec3& playerPos, float
     p.velocity[2] = (rng.nextFloat() - 0.5f) * 1.0f;
 
     p.lifetime = 0.f;
-    p.maxLifetime = 2.0f;
+    p.maxLifetime = 5.0f;
     p.type = ParticleType::RAIN;
     p.active = true;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // spawnSnowParticle
 // ---------------------------------------------------------------------------
-void ParticleSystem::spawnSnowParticle(Particle& p, const Vec3& playerPos, float spawnRadius) {
+bool ParticleSystem::spawnSnowParticle(Particle& p, const World& world, const Vec3& playerPos,
+                                       float spawnRadius) {
     // Deterministic weather: the same seed always rains the same way
     static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
 
     float angle = rng.nextFloat() * 2.f * static_cast<float>(M_PI);
     float radius = rng.nextFloat() * spawnRadius;
 
-    // Spawn above player
+    // Spawn just above the camera (see the rain comment: a high spawn band
+    // with a short lifetime kept every flake far above the screen).
     p.position[0] = playerPos.x + std::cos(angle) * radius;
-    p.position[1] = playerPos.y + 96.f + rng.nextFloat() * 32.f;
+    p.position[1] = playerPos.y + 8.f + rng.nextFloat() * 20.f;
     p.position[2] = playerPos.z + std::sin(angle) * radius;
+
+    // Same sky-exposure gate as rain (see spawnRainParticle).
+    auto surface = world.surfaceHeightIfLoaded(static_cast<int>(p.position[0]),
+                                               static_cast<int>(p.position[2]));
+    if (!surface || p.position[1] <= static_cast<float>(*surface + 1)) {
+        return false;
+    }
 
     // Fall speed ~3 blocks/s with gentle initial drift
     p.velocity[0] = (rng.nextFloat() - 0.5f) * 0.5f;
@@ -213,9 +236,10 @@ void ParticleSystem::spawnSnowParticle(Particle& p, const Vec3& playerPos, float
     p.velocity[2] = (rng.nextFloat() - 0.5f) * 0.5f;
 
     p.lifetime = 0.f;
-    p.maxLifetime = 5.0f;
+    p.maxLifetime = 10.0f;
     p.type = ParticleType::SNOW;
     p.active = true;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

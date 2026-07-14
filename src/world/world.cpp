@@ -182,6 +182,20 @@ BlockType World::getBlockIfLoaded(int x, int y, int z) const {
     return it->second->getBlockWorld(x, y, z);
 }
 
+std::optional<int> World::surfaceHeightIfLoaded(int x, int z) const {
+    int cx = Chunk::worldToChunk(x);
+    int cz = Chunk::worldToChunk(z);
+
+    std::lock_guard<std::mutex> lock(chunksMutex_);
+    auto it = chunks_.find(ChunkPos{cx, cz});
+    if (it == chunks_.end() || !it->second->generated) {
+        return std::nullopt;
+    }
+    int lx = x - cx * CHUNK_WIDTH;
+    int lz = z - cz * CHUNK_DEPTH;
+    return it->second->heightMap[lx + lz * CHUNK_WIDTH];
+}
+
 void World::setBlock(int x, int y, int z, BlockType type) {
     int cx = Chunk::worldToChunk(x);
     int cz = Chunk::worldToChunk(z);

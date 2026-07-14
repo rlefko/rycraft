@@ -103,10 +103,14 @@ public:
     void setGraphicsSettings(const GraphicsSettings& gfx);
 
     // Update particle system physics (call each game tick).
-    void tickParticles(float dt, const World& world, const Vec3& playerPosition);
+    void tickParticles(float dt, const World& world, const Vec3& playerPosition, bool raining);
 
     // Exponential fog density per block (settings menu).
     void setFogDensity(float density) { _fogDensity = density; }
+
+    // Rain wetness 0-1 from the engine's weather state (darkens albedo and
+    // adds a sun sheen in the chunk shader).
+    void setWetness(float wetness) { _wetness = wetness; }
 
     // Write the next presented frame to `path` as a PNG (async, off the
     // render thread). Used by the playtest workflow for headless visual
@@ -228,6 +232,7 @@ private:
 
     // Exponential fog density per block
     float _fogDensity = 0.0003f;
+    float _wetness = 0.0f;
 
     // Frame animation clock (worldTime -> seconds, wraps daily) driving the
     // foliage sway in the scene AND shadow passes — one value per frame so

@@ -61,9 +61,16 @@ struct EngineState {
     static constexpr float FOV_EASE_SECONDS = 0.1f;
     float fovCurrent = BASE_FOV;
 
-    // ---- Day/Night Cycle ----
+    // ---- Day/Night Cycle & Weather ----
     static constexpr uint64_t TICKS_PER_DAY = 24000; // 20 min at 20Hz
     uint64_t worldTime = 0;
+    bool raining = false; // deterministic per-day schedule (seeded)
+    float wetness = 0.0f; // 0 dry .. 1 soaked; ramps with the rain
+    // Weather tuning: how many days rain (percent), and how fast surfaces
+    // soak under rain / dry out after it stops.
+    static constexpr uint32_t RAIN_DAYS_PERCENT = 40;
+    static constexpr float SOAK_SECONDS = 15.0f;
+    static constexpr float DRY_SECONDS = 45.0f;
 
     // ---- Block Interaction ----
     Hotbar hotbar;
@@ -930,9 +937,38 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 7. Update weather particles
+    // 7. Weather: a deterministic schedule from the world seed (convention:
+    // seeded randomness only) — each in-game day hashes to a maybe-rain
+    // window, so playtests reproduce exactly. Playtest hook:
+    // RYCRAFT_WEATHER=rain|clear pins the state.
+    {
+        // hash64 is the engine's one seeded-hash home (common/random.hpp)
+        uint64_t day = state->worldTime / EngineState::TICKS_PER_DAY;
+        uint64_t h = hash64(day ^ (static_cast<uint64_t>(state->world->getSeed()) << 32));
+        uint32_t tod = static_cast<uint32_t>(state->worldTime % EngineState::TICKS_PER_DAY);
+        uint32_t start = 3000u + static_cast<uint32_t>((h >> 8) % 12000u);
+        uint32_t length = 2000u + static_cast<uint32_t>((h >> 4) % 4000u);
+        state->raining =
+            (h % 100u) < EngineState::RAIN_DAYS_PERCENT && tod >= start && tod < start + length;
+        static const char* weatherEnv = std::getenv("RYCRAFT_WEATHER");
+        if (weatherEnv) {
+            // Playtest override skips the soak ramp so captures are stable.
+            state->raining = std::strcmp(weatherEnv, "rain") == 0;
+            state->wetness = state->raining ? 1.0f : 0.0f;
+        } else {
+            // Fixed-step tick logic uses the tick dt, not the frame delta.
+            const float dt = static_cast<float>(EngineState::TICK_DT);
+            state->wetness = state->raining
+                                 ? std::min(1.0f, state->wetness + dt / EngineState::SOAK_SECONDS)
+                                 : std::max(0.0f, state->wetness - dt / EngineState::DRY_SECONDS);
+        }
+    }
     if (_renderPipeline) {
-        _renderPipeline->tickParticles(state->deltaTime, *state->world, state->player.position);
+        // Particles integrate per fixed tick too — the frame delta here made
+        // rainfall speed depend on the frame rate (1/3 speed at 60 FPS).
+        _renderPipeline->tickParticles(static_cast<float>(EngineState::TICK_DT), *state->world,
+                                       state->player.position, state->raining);
+        _renderPipeline->setWetness(state->wetness);
     }
 
     // 8. Single raycast for block interaction + highlight

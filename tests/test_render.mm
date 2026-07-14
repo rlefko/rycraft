@@ -1101,6 +1101,7 @@ TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]")
     REQUIRE(offsetof(Uniforms, cameraPosition) == 272);
     REQUIRE(offsetof(Uniforms, time) == 288);
     REQUIRE(offsetof(Uniforms, swayStrength) == 292);
+    REQUIRE(offsetof(Uniforms, wetness) == 296);
     REQUIRE(alignof(Uniforms) == 16);
 }
 

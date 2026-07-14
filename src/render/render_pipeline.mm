@@ -30,6 +30,10 @@
 #include <stdexcept>
 #include <vector>
 
+// One in-game day in 20 Hz ticks — shared by the animation clock, the
+// morning-fog window, and the day/night cycle so they can never drift.
+constexpr uint64_t TICKS_PER_DAY = 24000;
+
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
@@ -459,7 +463,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                             shadowStrength);
 
     // 20 Hz world time -> seconds (the same stepping the water pass animates with)
-    _animTime = static_cast<float>(worldTime % 24000) * 0.05f;
+    _animTime = static_cast<float>(worldTime % TICKS_PER_DAY) * 0.05f;
 
     // Normalize sun direction
     float sunLen = std::sqrt(sunDirection[0] * sunDirection[0] + sunDirection[1] * sunDirection[1] +
@@ -541,6 +545,14 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                                cameraUnderwater ? 0.15f : skyUniforms.horizonColor.y,
                                cameraUnderwater ? 0.32f : skyUniforms.horizonColor.z};
     const float savedFogDensity = _fogDensity;
+    {
+        // Morning fog: a dawn haze that thickens fog and burns off by
+        // mid-morning (worldTime 0 is sunrise; peak just after, gone ~2500).
+        float t = static_cast<float>(worldTime % TICKS_PER_DAY);
+        float fromDawn = std::min(std::abs(t - 700.0f), 24000.0f - std::abs(t - 700.0f));
+        float morning = std::max(0.0f, 1.0f - fromDawn / 1800.0f);
+        _fogDensity *= 1.0f + 5.0f * morning * morning;
+    }
     if (cameraUnderwater) {
         _fogDensity = std::max(_fogDensity, 0.035f);
     }
@@ -744,7 +756,6 @@ void RenderPipeline::computeDayNightUniforms(uint64_t worldTime, float sunDirect
                                              float sunColor[3], float ambientColor[3],
                                              SkyUniforms& skyUniforms, float& shadowStrength) {
     // Full day = 24000 ticks (20 minutes real time at 20Hz)
-    static constexpr uint64_t TICKS_PER_DAY = 24000;
 
     // Orbital angle: 0 = dawn, PI/2 = noon, PI = dusk, 3PI/2 = midnight
     float dayFraction =
@@ -973,6 +984,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Foliage sway clock + the waving toggle (0 freezes blades at rest)
     uniforms.time = _animTime;
     uniforms.swayStrength = _gfx.wavingFoliage ? 1.0f : 0.0f;
+    uniforms.wetness = _wetness;
 
     // Upload to GPU (kept for the entity renderer + water vertex stage too)
     _frameUniforms = _frameRing.push(&uniforms, sizeof(Uniforms));
@@ -1464,10 +1476,11 @@ void RenderPipeline::setGraphicsSettings(const GraphicsSettings& gfx) {
 // ---------------------------------------------------------------------------
 // tickParticles — Update weather particle physics each game tick
 // ---------------------------------------------------------------------------
-void RenderPipeline::tickParticles(float dt, const World& world, const Vec3& playerPosition) {
+void RenderPipeline::tickParticles(float dt, const World& world, const Vec3& playerPosition,
+                                   bool raining) {
     if (!_particles)
         return;
-    _particles->tick(dt, world, playerPosition);
+    _particles->tick(dt, world, playerPosition, raining);
 }
 
 // ---------------------------------------------------------------------------
