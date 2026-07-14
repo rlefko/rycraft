@@ -106,14 +106,33 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     return out;
 }
 
+// A 16-point Poisson disk — even angular coverage with no axis-aligned
+// banding, reused for both the PCSS blocker search and the PCF filter.
+constant float2 POISSON_DISK[16] = {
+    float2(-0.613f, 0.617f),  float2(0.170f, -0.040f),  float2(-0.299f, -0.791f),
+    float2(0.645f, 0.493f),   float2(-0.651f, -0.378f), float2(0.918f, -0.126f),
+    float2(0.344f, 0.294f),   float2(-0.108f, 0.987f),  float2(-0.920f, 0.078f),
+    float2(0.542f, -0.782f),  float2(0.098f, -0.967f),  float2(-0.379f, 0.278f),
+    float2(0.895f, 0.373f),   float2(-0.759f, -0.727f), float2(0.269f, 0.766f),
+    float2(-0.288f, -0.303f),
+};
+
 // ---------------------------------------------------------------------------
-// Cascaded shadow sampling — one definition so terrain and entities can't
-// drift. Returns a 0..1 lit factor (1 = fully lit) that scales the direct
-// sun/moon contribution only; ambient stays so shadows never go pure black.
-// Picks a cascade by camera distance, normal-offsets to fight acne, and
-// PCF-samples the depth array with a small kernel for a soft edge.
+// Cascaded shadow sampling with PCSS-style variable penumbra — one definition
+// so terrain and entities can't drift. Returns a 0..1 lit factor (1 = fully
+// lit) that scales the direct sun/moon contribution only; ambient stays so
+// shadows never go pure black. A blocker search estimates how far occluders
+// float above the receiver, so contact points stay crisp while shadows soften
+// with distance from their caster — the Sildur soft-shadow look. The Poisson
+// disk is rotated per pixel to trade banding for dithered noise the eye reads
+// as a smooth penumbra.
 // ---------------------------------------------------------------------------
-static float sampleShadow(float3 worldPos, float3 normal, float3 cameraPos,
+// Penumbra tuning (multiples of shadowParams.x, the base texel radius).
+constant float SHADOW_SEARCH_SCALE = 3.0f;  // blocker-search radius
+constant float SHADOW_MAX_FILTER_SCALE = 4.0f; // widest PCF radius (soft edge)
+constant float SHADOW_PENUMBRA_GAIN = 40.0f;   // depth gap → penumbra fraction
+
+static float sampleShadow(float3 worldPos, float3 normal, float3 cameraPos, float2 screenPos,
                           depth2d_array<float> shadowMap, sampler shadowSampler,
                           constant ShadowUniforms& shadow) {
     float strength = shadow.shadowParams.z;
@@ -149,15 +168,53 @@ static float sampleShadow(float3 worldPos, float3 normal, float3 cameraPos,
     }
 
     float depthRef = ndc.z - 0.0015f; // constant slope-independent depth bias
-    float radius = shadow.shadowParams.x / float(shadowMap.get_width());
-    float lit = 0.0f;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            float2 tap = uv + float2(dx, dy) * radius;
-            lit += shadowMap.sample_compare(shadowSampler, tap, cascade, depthRef);
+    float texel = 1.0f / float(shadowMap.get_width());
+
+    // Per-pixel Poisson rotation from an interleaved-gradient-noise hash of
+    // the SCREEN pixel — bounded coordinates keep float precision (world-space
+    // coords reach the thousands and collapse the hash), deterministic and
+    // static so the penumbra dither never crawls (convention 9).
+    float ign = fract(52.9829189f * fract(dot(screenPos, float2(0.06711056f, 0.00583715f))));
+    float ang = ign * 6.2831853f;
+    float2 rc = float2(cos(ang), sin(ang));
+    float2x2 rot = float2x2(rc.x, -rc.y, rc.y, rc.x);
+
+    // Point sampler for the raw blocker depth: Depth32Float is not linearly
+    // filterable off Apple GPUs, and averaging depths across caster edges
+    // would fabricate blocker distances anyway.
+    constexpr sampler depthSampler(mag_filter::nearest, min_filter::nearest,
+                                   address::clamp_to_edge);
+
+    // ---- Blocker search: average depth of occluders in a search radius ----
+    float searchRadius = shadow.shadowParams.x * SHADOW_SEARCH_SCALE * texel;
+    float blockerSum = 0.0f;
+    float blockerCount = 0.0f;
+    for (int k = 0; k < 16; ++k) {
+        float2 tap = uv + (rot * POISSON_DISK[k]) * searchRadius;
+        float d = shadowMap.sample(depthSampler, tap, cascade);
+        if (d < depthRef) {
+            blockerSum += d;
+            blockerCount += 1.0f;
         }
     }
-    lit /= 9.0f;
+    if (blockerCount < 0.5f) {
+        return 1.0f; // no occluder in the search radius → fully lit
+    }
+    float avgBlocker = blockerSum / blockerCount;
+
+    // ---- Penumbra width from the blocker/receiver depth gap ----
+    // Contact (tiny gap) → tight kernel; occluder high above → wide, soft.
+    float penumbra = saturate((depthRef - avgBlocker) / max(avgBlocker, 1e-4f) * SHADOW_PENUMBRA_GAIN);
+    float filterRadius =
+        mix(1.0f, shadow.shadowParams.x * SHADOW_MAX_FILTER_SCALE, penumbra) * texel;
+
+    // ---- PCF over the same rotated disk at the penumbra-scaled radius ----
+    float lit = 0.0f;
+    for (int k = 0; k < 16; ++k) {
+        float2 tap = uv + (rot * POISSON_DISK[k]) * filterRadius;
+        lit += shadowMap.sample_compare(shadowSampler, tap, cascade, depthRef);
+    }
+    lit /= 16.0f;
 
     // Blend toward fully lit at the fade edge, and scale by strength.
     return mix(1.0f, mix(1.0f, lit, fade), strength);
@@ -193,8 +250,8 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     // The real cascade shadow gates the direct sun; sampleShadow returns 1.0
     // when shadows are disabled, so the term falls back to the sky access
     // alone (the old fake shadow) with no branch and no doubling.
-    float lit = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition, shadowMap,
-                             shadowSampler, shadow);
+    float lit = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition,
+                             in.clipPosition.xy, shadowMap, shadowSampler, shadow);
 
     float3 litColor = texColor.rgb * (uniforms.sunColor * in.vLight * sky * lit +
                                       uniforms.ambientColor * sky);
