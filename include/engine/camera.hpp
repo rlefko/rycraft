@@ -26,6 +26,7 @@ public:
     Vec3 position() const;
     Vec3 forward() const;
     float yaw() const;
+    float pitch() const;
     Vec3 right() const;
     Vec3 up() const;
 

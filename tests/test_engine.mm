@@ -68,6 +68,89 @@ TEST_CASE("InputBindings load returns defaults for a missing file", "[engine][bi
     REQUIRE(loaded->forward.key == Key::W);
 }
 
+TEST_CASE("InputBindings defaults: Ctrl sprints, Shift sneaks", "[engine][bindings]") {
+    // Minecraft layout, and what the README documents. Sprint once sat on
+    // LeftShift, which fly-descend now needs.
+    InputBindings defaults;
+    REQUIRE(defaults.sprint.key == Key::LeftControl);
+    REQUIRE(defaults.sneak.key == Key::LeftShift);
+
+    TempDir dir("bindings_sprint_sneak");
+    std::string path = dir.path() + "/bindings.json";
+    REQUIRE(defaults.save(path));
+    auto loaded = InputBindings::load(path);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->sprint.key == Key::LeftControl);
+    REQUIRE(loaded->sneak.key == Key::LeftShift);
+}
+
+// ============================================================================
+// Double-tap detection (sprint on W, fly toggle on Space)
+// ============================================================================
+
+TEST_CASE("Double-tap: two presses inside the window latch for the tick", "[engine][input]") {
+    InputState input;
+
+    input.recordPress(Key::W, 1.0);
+    REQUIRE(!input.isDoubleTappedForTick(Key::W));
+    REQUIRE(input.isPressedForTick(Key::W));
+    REQUIRE(input.isDown(Key::W));
+
+    input.recordPress(Key::W, 1.0 + InputState::DOUBLE_TAP_WINDOW * 0.5);
+    REQUIRE(input.isDoubleTappedForTick(Key::W));
+
+    // Consumed at tick end, exactly like keysPressedForTick
+    input.clearTickPresses();
+    REQUIRE(!input.isDoubleTappedForTick(Key::W));
+    REQUIRE(!input.isPressedForTick(Key::W));
+}
+
+TEST_CASE("Double-tap: a slow second press does not latch", "[engine][input]") {
+    InputState input;
+    input.recordPress(Key::W, 1.0);
+    input.recordPress(Key::W, 1.0 + InputState::DOUBLE_TAP_WINDOW + 0.05);
+    REQUIRE(!input.isDoubleTappedForTick(Key::W));
+
+    // ...but that second press starts a fresh window
+    input.recordPress(Key::W, 1.0 + InputState::DOUBLE_TAP_WINDOW + 0.15);
+    REQUIRE(input.isDoubleTappedForTick(Key::W));
+}
+
+TEST_CASE("Double-tap: a triple-tap fires exactly one gesture", "[engine][input]") {
+    InputState input;
+    input.recordPress(Key::Space, 1.0);
+    input.recordPress(Key::Space, 1.1); // fires and consumes the history
+    REQUIRE(input.isDoubleTappedForTick(Key::Space));
+    input.clearTickPresses();
+
+    input.recordPress(Key::Space, 1.2); // pairs with nothing — history was consumed
+    REQUIRE(!input.isDoubleTappedForTick(Key::Space));
+}
+
+TEST_CASE("Double-tap: keys are tracked independently", "[engine][input]") {
+    InputState input;
+    input.recordPress(Key::W, 1.0);
+    input.recordPress(Key::Space, 1.1);
+    REQUIRE(!input.isDoubleTappedForTick(Key::W));
+    REQUIRE(!input.isDoubleTappedForTick(Key::Space));
+
+    input.recordPress(Key::W, 1.2);
+    REQUIRE(input.isDoubleTappedForTick(Key::W));
+    REQUIRE(!input.isDoubleTappedForTick(Key::Space));
+}
+
+TEST_CASE("Double-tap: latch survives per-frame update() until a tick consumes it",
+          "[engine][input]") {
+    InputState input;
+    input.recordPress(Key::W, 1.0);
+    input.recordPress(Key::W, 1.1);
+
+    // Several tickless frames pass — the gesture must not be dropped
+    input.update();
+    input.update();
+    REQUIRE(input.isDoubleTappedForTick(Key::W));
+}
+
 // ============================================================================
 // Game flow + menu layout tests (pure C++, no Metal)
 // ============================================================================
