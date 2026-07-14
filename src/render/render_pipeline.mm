@@ -355,8 +355,9 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
 // ---------------------------------------------------------------------------
 // allocateSceneTargets — (re)create the MSAA + resolve textures at the
-// current drawable size. MSAA targets are memoryless: their contents never
-// leave tile memory (color is resolved, depth is discarded at pass end).
+// current drawable size. MSAA targets are memoryless: their tile contents
+// are resolved at pass end (color into _colorResolve, depth into
+// _depthResolve for the water pass) and never loaded or stored.
 // ---------------------------------------------------------------------------
 void RenderPipeline::allocateSceneTargets() {
     auto colorMSAADesc = [[MTLTextureDescriptor alloc] init];
@@ -791,10 +792,6 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Upload to GPU
     std::memcpy((void*)_uniformsBuffer.contents, &uniforms, sizeof(Uniforms));
 
-    // Bind uniforms buffer at index 1
-    [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
-    [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
-
     // Bind the shared atlas + uniforms once; every chunk draw reuses them
     [encoder setVertexBuffer:_uniformsBuffer offset:0 atIndex:1];
     [encoder setFragmentBuffer:_uniformsBuffer offset:0 atIndex:1];
@@ -1008,8 +1005,6 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             continue;
 
         const auto& meshState = cached->second;
-        if (meshState.alloc.indexCount == 0)
-            continue;
 
         // Mesh vertices are chunk-local; this restores world space (and keeps
         // fp16 positions exact regardless of how far the chunk is from origin)

@@ -21,6 +21,8 @@
 // min() combine and the interpolation stay well-behaved.
 // ---------------------------------------------------------------------------
 
+// Lattice spacing must stay a power of two: latticeFloor masks with
+// (LATTICE_XZ - 1) to floor negative coordinates.
 inline constexpr int LATTICE_XZ = 4;
 inline constexpr int LATTICE_Y = 4;
 inline constexpr double DENSITY_CAP = 32.0;

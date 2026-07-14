@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/ema.hpp"
 #include "render/lod_mesher.hpp"
 #include "world/chunk_pos.hpp"
 #include "world/mesh_snapshot.hpp"
@@ -70,8 +71,7 @@ private:
 
     std::atomic<bool> running_{true};
     std::atomic<size_t> inFlight_{0}; // queued + building
-    std::atomic<uint32_t> meshMsEmaBits_{0};
+    AtomicEmaMs meshMs_;
 
     void workerLoop();
-    void recordMeshMs(float ms);
 };

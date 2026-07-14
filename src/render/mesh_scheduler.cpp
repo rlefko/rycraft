@@ -89,7 +89,7 @@ void MeshScheduler::workerLoop() {
             result.builtVersion = snapshot.version;
             auto start = std::chrono::steady_clock::now();
             result.mesh = LODMesher::buildMesh(snapshot, scratch);
-            recordMeshMs(
+            meshMs_.record(
                 std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start)
                     .count());
         }
@@ -102,18 +102,6 @@ void MeshScheduler::workerLoop() {
     }
 }
 
-void MeshScheduler::recordMeshMs(float ms) {
-    uint32_t oldBits = meshMsEmaBits_.load(std::memory_order_relaxed);
-    for (;;) {
-        float oldEma = std::bit_cast<float>(oldBits);
-        float newEma = oldEma == 0.f ? ms : oldEma * 0.9f + ms * 0.1f;
-        if (meshMsEmaBits_.compare_exchange_weak(oldBits, std::bit_cast<uint32_t>(newEma),
-                                                 std::memory_order_relaxed)) {
-            return;
-        }
-    }
-}
-
 float MeshScheduler::meshMsAvg() const {
-    return std::bit_cast<float>(meshMsEmaBits_.load(std::memory_order_relaxed));
+    return meshMs_.value();
 }

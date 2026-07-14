@@ -1,5 +1,6 @@
 #include "world/chunk_generator.hpp"
 
+#include "world/chunk_pos.hpp"
 #include "world/gen_seeds.hpp"
 
 #include <algorithm>
@@ -7,16 +8,14 @@
 
 namespace {
 
-constexpr int SEA_LEVEL = 64;
 constexpr int LAVA_LEVEL = 10;     // sealed cave air at or below becomes lava
-constexpr int SNOW_LINE = 108;     // any surface this high gets a snow top
 constexpr int WORLD_AIR_CAP = 250; // top of the world stays open
 constexpr int LATTICE_LEVELS = CHUNK_HEIGHT / LATTICE_Y + 1;
 
-// Lattice columns are keyed by their packed world coordinates.
+// Lattice columns are keyed by their packed world coordinates — through
+// ChunkPos::packed(), THE bit layout for xz keys.
 uint64_t latticeKey(int lx, int lz) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(lx)) << 32) |
-           static_cast<uint64_t>(static_cast<uint32_t>(lz));
+    return ChunkPos{lx, lz}.packed();
 }
 
 // Floor to the containing lattice column (works for negatives: two's

@@ -862,15 +862,16 @@ static EngineState* _engineGetState(Engine* engine) {
         return;
 
     // Log render + streaming diagnostics every 60 frames (the same numbers
-    // the F3 HUD shows, so headless playtests can measure against budgets)
+    // the F3 HUD shows, so headless playtests can measure against budgets;
+    // the chunk count reuses the HUD's 30-frame sample instead of copying
+    // the whole chunk vector)
     if (state->frameCount % 60 == 1) {
-        auto chunks = state->world->getLoadedChunks();
         auto chunkStats = _renderPipeline->chunkRenderStats();
         char line[224];
         snprintf(line, sizeof(line),
-                 "Render: %zu loaded chunks, frame %llu player (%.1f, %.1f, %.1f) | %.2f ms/frame "
+                 "Render: %u loaded chunks, frame %llu player (%.1f, %.1f, %.1f) | %.2f ms/frame "
                  "gen %.2f ms mesh %.2f ms pending %zu vram %.0f/%.0f MB",
-                 chunks.size(), static_cast<unsigned long long>(state->frameCount),
+                 state->cachedChunkCount, static_cast<unsigned long long>(state->frameCount),
                  state->player.position.x, state->player.position.y, state->player.position.z,
                  state->smoothedFrameMs, state->world->averageGenMs(), chunkStats.meshMsAvg,
                  state->world->getPendingChunkCount(), chunkStats.megaUsedMB, chunkStats.megaCapMB);
@@ -907,13 +908,13 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.hoveredButton = state->hoveredButton;
     uiFrame.showDebugHud = state->showDebugHud;
     // Underwater view (veil, god rays, dense fog): the camera cell is water.
-    // The camera chunk is always loaded, so this getBlock never generates.
+    // Non-generating read — a streaming lag must never stall the frame.
     {
         Vec3 camPos = state->camera.getPosition();
         uiFrame.cameraUnderwater =
-            state->world->getBlock(static_cast<int>(std::floor(camPos.x)),
-                                   static_cast<int>(std::floor(camPos.y)),
-                                   static_cast<int>(std::floor(camPos.z))) == BlockType::WATER;
+            state->world->getBlockIfLoaded(
+                static_cast<int>(std::floor(camPos.x)), static_cast<int>(std::floor(camPos.y)),
+                static_cast<int>(std::floor(camPos.z))) == BlockType::WATER;
     }
     uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
     uiFrame.stats.fps = state->smoothedFrameMs > 0.f ? 1000.0f / state->smoothedFrameMs : 0.f;

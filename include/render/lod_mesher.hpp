@@ -23,13 +23,6 @@ struct MeshOutput {
     MeshOutput& operator=(MeshOutput&&) = default;
 };
 
-// Distance thresholds (in blocks, not chunk units).
-// A chunk is 16 blocks wide, so 8 chunks = 128 blocks.
-static constexpr int LOD0_MAX_DISTANCE = 128; // 0-8 chunks: full detail
-static constexpr int LOD1_MAX_DISTANCE = 256; // 8-16 chunks: 2x coarse
-static constexpr int LOD2_MAX_DISTANCE = 512; // 16-32 chunks: 4x coarse
-// Beyond 512 blocks (32 chunks): no rendering
-
 // Level of Detail enum for chunk meshing.
 enum class ChunkLOD : int {
     FULL = 0,   // 16x16x256, full greedy meshing
@@ -77,8 +70,4 @@ public:
     // Neighbor-aware full-detail build — the game's meshing path. Pure CPU
     // (no Metal), safe to run on any thread with a per-thread scratch.
     static MeshOutput buildMesh(const MeshSnapshot& snapshot, MeshScratch& scratch);
-
-    // Determine LOD level from distance (in blocks) to chunk center.
-    // Returns ChunkLOD::COUNT when chunk is beyond render distance.
-    static int computeLODLevel(int distanceBlocks);
 };

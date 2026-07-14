@@ -1,6 +1,7 @@
 #include "world/structures.hpp"
 
 #include "world/chunk_generator.hpp"
+#include "world/chunk_pos.hpp"
 #include "world/gen_seeds.hpp"
 
 #include <algorithm>
@@ -13,8 +14,7 @@ int floorDiv(int a, int b) {
 }
 
 uint64_t regionKey(int regionX, int regionZ) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(regionX)) << 32) |
-           static_cast<uint64_t>(static_cast<uint32_t>(regionZ));
+    return ChunkPos{regionX, regionZ}.packed(); // THE xz key bit layout
 }
 
 // Rotate footprint-local (u, v) by quarter turns around the anchor.
@@ -98,7 +98,10 @@ const StructurePlacement& StructurePlacer::regionPlacement(int regionX, int regi
 
     SeededRng rng(hashCoords(regionX, regionZ, genseed::subSeed(seed_, genseed::STRUCTURES)));
 
-    // Fixed draw order (see the ores placer for why)
+    // Fixed draw order (see the ores placer for why). The anchor margins
+    // (chunk offset 1..6 in the region, block offset 2..13 in the chunk)
+    // bound footprint spill to under one chunk — the guarantee that lets a
+    // radius-1 chunk neighborhood see every structure that can reach it.
     int anchorChunkX = regionX * STRUCTURE_REGION_CHUNKS + rng.nextInt(1, 6);
     int anchorChunkZ = regionZ * STRUCTURE_REGION_CHUNKS + rng.nextInt(1, 6);
     int anchorLocalX = rng.nextInt(2, 13);
@@ -136,7 +139,9 @@ const StructurePlacement& StructurePlacer::regionPlacement(int regionX, int regi
     int maxSpread = placement.kind == StructureKind::RUIN ? 5 : 2;
 
     placement.floorY = probes[2]; // median
-    placement.valid = spread <= maxSpread && probes[0] >= 64 && placement.floorY < 180 &&
+    // Dry land (above sea level), and not on extreme peaks where the
+    // foundation cap can't bridge the terrain
+    placement.valid = spread <= maxSpread && probes[0] >= SEA_LEVEL && placement.floorY < 180 &&
                       isLandBiome(gen.biomeAt(placement.anchorX, placement.anchorZ, scratch));
 
     return scratch.structurePlacements.emplace(key, placement).first->second;

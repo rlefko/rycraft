@@ -33,6 +33,19 @@ struct VertexOutput {
     uint vTextureLayer [[flat]];
 };
 
+// Face indices — must match FaceNormal in include/render/vertex.hpp
+constant uint FACE_PLUS_Y = 4u;
+constant uint FACE_CROSS = 6u;
+
+// Shared exponential distance fog — one definition so the terrain, water,
+// and entity passes can never drift apart.
+static float3 applyFog(float3 color, float3 worldPos, float3 cameraPos, float density,
+                       float3 fogColor) {
+    float dist = distance(worldPos, cameraPos);
+    float fogFactor = clamp(1.0f - exp(-density * dist), 0.0f, 1.0f);
+    return mix(color, fogColor, fogFactor);
+}
+
 // ---------------------------------------------------------------------------
 // Face normal lookup — indices match FaceNormal enum (0=+X … 5=-Y)
 // ---------------------------------------------------------------------------
@@ -72,7 +85,7 @@ vertex VertexOutput vertexMain(
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
     uint normalIdx = in.faceAttr & 7u;
-    if (normalIdx == 6u) {
+    if (normalIdx == FACE_CROSS) {
         // Flora cross-quads: orientation-free lighting tracking the sun's
         // elevation, so the two diagonal quads never shade differently
         out.vNormal = float3(0.0, 1.0, 0.0);
@@ -116,17 +129,8 @@ fragment float4 fragmentMain(
     float3 litColor =
         texColor.rgb * (uniforms.sunColor * in.vLight * sky + uniforms.ambientColor * sky);
 
-    // ---- Distance fog (Phase 8) ----
-    // Use world position passed from vertex shader
-    float distanceToFrag = distance(in.vWorldPosition, uniforms.cameraPosition);
-
-    // Exponential fog: fogFactor = 1.0 - exp(-density * distance)
-    float fogFactor = 1.0f - exp(-uniforms.fogDensity * distanceToFrag);
-    fogFactor = clamp(fogFactor, 0.0f, 1.0f);
-
-    // Blend between fog color and lit color
-    float3 finalColor = mix(litColor, uniforms.fogColor, fogFactor);
-
+    float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
+                                 uniforms.fogDensity, uniforms.fogColor);
     return float4(finalColor, 1.0);
 }
 
@@ -151,7 +155,7 @@ vertex WaterVertexOutput waterVertexMain(
 ) {
     float3 pos = in.position + chunkOrigin.origin.xyz;
     uint normalIdx = in.faceAttr & 7u;
-    if (normalIdx == 4u) {
+    if (normalIdx == FACE_PLUS_Y) {
         // Top surfaces bob gently; world-space input keeps waves continuous
         // across chunk borders
         pos.y += sin(pos.x * 0.55f + water.time * 1.4f) *
@@ -258,10 +262,8 @@ fragment float4 waterFragmentMain(
     float3 color = mix(body, skyReflection, fresnel * in.vSkyLight);
     color += water.sunColor * sparkle * in.vSkyLight;
 
-    // ---- Distance fog, matching the terrain shader
-    float dist = distance(in.vWorldPosition, water.cameraPosition);
-    float fogFactor = clamp(1.0f - exp(-water.fogDensity * dist), 0.0f, 1.0f);
-    color = mix(color, water.fogColor, fogFactor);
+    color = applyFog(color, in.vWorldPosition, water.cameraPosition, water.fogDensity,
+                     water.fogColor);
 
     // Hairline shorelines dissolve into the shore instead of aliasing
     color = mix(refracted, color, saturate(waterDepth * 3.0f));
@@ -314,7 +316,9 @@ fragment float4 underwaterOverlayFragment(
     // Screen-space derivatives give the surface normal: walls get none
     float3 surfaceNormal = normalize(cross(dfdx(world), dfdy(world)));
     float upFacing = saturate(abs(surfaceNormal.y));
-    float submerged = step(world.y, 63.9f); // sea level; dry land gets none
+    // SEA_LEVEL (64, chunk.hpp) minus an epsilon: the water surface renders
+    // at 63.875, so shore blocks at y >= 64 must not catch caustics
+    float submerged = step(world.y, 63.9f);
     float dist = distance(world, water.cameraPosition);
     float caustic = causticPattern(world.xz * 0.85f, t) *
                     exp(-max(64.0f - world.y, 0.0f) * 0.10f) * exp(-dist * 0.03f);
@@ -358,7 +362,7 @@ fragment float4 entityFragmentMain(
     float light = max(dot(in.vNormal, uniforms.sunDirection), 0.0f);
     float3 litColor = in.vColor * (uniforms.sunColor * light + uniforms.ambientColor);
 
-    float distanceToFrag = distance(in.vWorldPosition, uniforms.cameraPosition);
-    float fogFactor = clamp(1.0f - exp(-uniforms.fogDensity * distanceToFrag), 0.0f, 1.0f);
-    return float4(mix(litColor, uniforms.fogColor, fogFactor), 1.0);
+    return float4(applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
+                           uniforms.fogDensity, uniforms.fogColor),
+                  1.0);
 }

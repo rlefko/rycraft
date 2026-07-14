@@ -111,7 +111,7 @@ std::shared_ptr<Chunk> World::loadOrGenerateChunk(int chunkX, int chunkZ) {
         auto chunk = std::make_shared<Chunk>(chunkX, chunkZ);
         auto start = std::chrono::steady_clock::now();
         generateChunk(chunk);
-        recordGenMs(
+        genMs_.record(
             std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start)
                 .count());
         return chunk;
@@ -156,6 +156,18 @@ BlockType World::getBlock(int x, int y, int z) {
 
     std::shared_ptr<Chunk> chunk = getChunk(cx, cz);
     return chunk->getBlockWorld(x, y, z);
+}
+
+BlockType World::getBlockIfLoaded(int x, int y, int z) const {
+    int cx = Chunk::worldToChunk(x);
+    int cz = Chunk::worldToChunk(z);
+
+    std::lock_guard<std::mutex> lock(chunksMutex_);
+    auto it = chunks_.find(ChunkPos{cx, cz});
+    if (it == chunks_.end()) {
+        return BlockType::AIR;
+    }
+    return it->second->getBlockWorld(x, y, z);
 }
 
 void World::setBlock(int x, int y, int z, BlockType type) {
@@ -443,21 +455,8 @@ void World::pumpGeneration() {
     }
 }
 
-void World::recordGenMs(float ms) {
-    // CAS loop: several gen workers may finish simultaneously
-    uint32_t oldBits = genMsEmaBits_.load(std::memory_order_relaxed);
-    for (;;) {
-        float oldEma = std::bit_cast<float>(oldBits);
-        float newEma = oldEma == 0.f ? ms : oldEma * 0.9f + ms * 0.1f;
-        if (genMsEmaBits_.compare_exchange_weak(oldBits, std::bit_cast<uint32_t>(newEma),
-                                                std::memory_order_relaxed)) {
-            return;
-        }
-    }
-}
-
 float World::averageGenMs() const {
-    return std::bit_cast<float>(genMsEmaBits_.load(std::memory_order_relaxed));
+    return genMs_.value();
 }
 
 size_t World::getPendingChunkCount() const {

@@ -73,6 +73,13 @@ constexpr bool isLiquid(BlockType type) {
     return type == BlockType::WATER || type == BlockType::LAVA;
 }
 
+// Leaf variants: alpha-cutout canopy blocks that tree emission may
+// overwrite with logs.
+constexpr bool isLeafBlock(BlockType type) {
+    return type == BlockType::LEAVES || type == BlockType::BIRCH_LEAVES ||
+           type == BlockType::SPRUCE_LEAVES;
+}
+
 // Collision: blocks entities cannot pass through. Liquids are swimmable,
 // flora is walk-through; glass and ice ARE solid.
 constexpr bool isSolid(BlockType type) {

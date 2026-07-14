@@ -9,8 +9,7 @@
 namespace {
 
 constexpr int TREE_ATTEMPTS_PER_CHUNK = 12;
-constexpr int TREE_MIN_BASE = 64;   // no trees under water
-constexpr int TREE_SNOW_LINE = 108; // or on snow caps
+
 
 enum class TreeKind : uint8_t { OAK, LARGE_OAK, BIRCH, SPRUCE };
 
@@ -68,9 +67,7 @@ struct TreeWriter {
             y >= CHUNK_HEIGHT)
             return;
         BlockType current = chunk.getBlock(lx, y, lz);
-        if (current == BlockType::AIR || current == BlockType::LEAVES ||
-            current == BlockType::BIRCH_LEAVES || current == BlockType::SPRUCE_LEAVES ||
-            isFlora(current)) {
+        if (current == BlockType::AIR || isLeafBlock(current) || isFlora(current)) {
             chunk.setBlock(lx, y, lz, logBlock);
         }
     }
@@ -211,7 +208,7 @@ void FeaturePlacer::placeTrees(Chunk& chunk, const ChunkGenerator& gen,
                 if (acceptRoll >= profile.density) continue;
 
                 int surfaceY = gen.surfaceYAt(x, z, scratch);
-                if (surfaceY < TREE_MIN_BASE || surfaceY >= TREE_SNOW_LINE) continue;
+                if (surfaceY < SEA_LEVEL || surfaceY >= SNOW_LINE) continue;
                 if (structures.insideStructure(x, z, chunk.chunkX, chunk.chunkZ, gen, scratch, 1))
                     continue;
 

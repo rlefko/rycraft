@@ -627,9 +627,3 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
     }
 }
 
-int LODMesher::computeLODLevel(int distanceBlocks) {
-    if (distanceBlocks < LOD0_MAX_DISTANCE) return static_cast<int>(ChunkLOD::FULL);
-    if (distanceBlocks < LOD1_MAX_DISTANCE) return static_cast<int>(ChunkLOD::MEDIUM);
-    if (distanceBlocks < LOD2_MAX_DISTANCE) return static_cast<int>(ChunkLOD::COARSE);
-    return static_cast<int>(ChunkLOD::COUNT); // Beyond render distance
-}

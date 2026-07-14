@@ -1,4 +1,5 @@
 #pragma once
+#include "common/ema.hpp"
 #include "common/thread_pool.hpp"
 #include "world/chunk.hpp"
 #include "world/chunk_generator.hpp"
@@ -39,8 +40,14 @@ public:
     // Get or generate a chunk (thread-safe)
     std::shared_ptr<Chunk> getChunk(int chunkX, int chunkZ);
 
-    // Get block at world position (thread-safe)
+    // Get block at world position (thread-safe; generates the chunk on a
+    // miss — never call from the render path)
     BlockType getBlock(int x, int y, int z);
+
+    // Non-generating read: a missing chunk reads as air. For per-frame
+    // queries (e.g. is-the-camera-underwater) that must never stall on
+    // generation or disk.
+    BlockType getBlockIfLoaded(int x, int y, int z) const;
 
     // Set block at world position (thread-safe, marks chunk dirty)
     void setBlock(int x, int y, int z, BlockType type);
@@ -132,9 +139,8 @@ private:
     std::atomic<bool> shuttingDown_{false};
     mutable std::mutex pendingMutex_;
 
-    // Generation-time EMA as float bits: workers CAS-update, HUD reads
-    std::atomic<uint32_t> genMsEmaBits_{0};
-    void recordGenMs(float ms);
+    // Generation-time EMA: workers record, the HUD reads
+    AtomicEmaMs genMs_;
 
     // Generate a single chunk (synchronous)
     void generateChunk(std::shared_ptr<Chunk> chunk);

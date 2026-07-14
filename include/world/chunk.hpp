@@ -15,6 +15,15 @@ constexpr int CHUNK_DEPTH = 16;
 constexpr int CHUNK_HEIGHT = 256;
 constexpr int CHUNK_VOLUME = CHUNK_WIDTH * CHUNK_DEPTH * CHUNK_HEIGHT;
 
+// Open-to-sky air below this floods with water during generation. The one
+// definition every producer/consumer shares (the shaders repeat the value
+// as a literal — MSL can't include this header).
+constexpr int SEA_LEVEL = 64;
+
+// Any surface at or above this gets a snow top, and trees stop growing —
+// the two rules must agree, so they share the constant.
+constexpr int SNOW_LINE = 108;
+
 enum class Biome : uint8_t {
     DEEP_OCEAN = 0,
     OCEAN = 1,

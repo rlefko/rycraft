@@ -30,6 +30,14 @@ double smoothstep(double edge0, double edge1, double v) {
     return t * t * (3.0 - 2.0 * t);
 }
 
+// Peaks-and-valleys fold of the ridge field, remapped to [0,1]: |R| = 2/3
+// is a ridge line (1), |R| = 0 a valley floor (0). One definition — terrain
+// height and biome selection must agree on where the peaks are.
+double peaksAndValleys01(double ridges) {
+    double pv = 1.0 - std::abs(3.0 * std::abs(ridges) - 2.0);
+    return (pv + 1.0) * 0.5;
+}
+
 // Base height from continentalness: deep ocean → coast → inland plateau.
 constexpr SplinePoint BASE_HEIGHT[] = {
     {-1.00, 38.0}, {-0.45, 50.0}, {-0.19, 61.0}, {-0.10, 64.0},
@@ -61,11 +69,9 @@ ColumnShape ClimateSampler::shapeColumn(double x, double z) const {
     c.temperature = temperature_.octave2D(x / 1400.0, z / 1400.0, 3);
     c.humidity = humidity_.octave2D(x / 1000.0, z / 1000.0, 3);
 
-    // Peaks-and-valleys fold: |R| = 2/3 is a ridge line, |R| = 0 a valley
-    // floor. Remapped to [0,1] so it only ever ADDS height — valley floors
-    // sit at the continental base, which keeps them above sea level inland.
-    double pv = 1.0 - std::abs(3.0 * std::abs(c.ridges) - 2.0);
-    double pv01 = (pv + 1.0) * 0.5;
+    // The fold only ever ADDS height — valley floors sit at the continental
+    // base, which keeps them above sea level inland.
+    double pv01 = peaksAndValleys01(c.ridges);
 
     double base = spline(BASE_HEIGHT, c.continentalness);
     double landFactor = smoothstep(-0.15, 0.10, c.continentalness);
@@ -118,10 +124,9 @@ Biome ClimateSampler::selectBiome(const ColumnShape& shape) {
     if (h < 62.0) return Biome::OCEAN;
     if (h < 65.0 && c.continentalness < 0.0 && c.temperature > -0.35) return Biome::BEACH;
 
-    double pv01 = (1.0 - std::abs(3.0 * std::abs(c.ridges) - 2.0) + 1.0) * 0.5;
-    if (h > 102.0 && pv01 > 0.55) return Biome::EXTREME_HILLS;
+    if (h > 102.0 && peaksAndValleys01(c.ridges) > 0.55) return Biome::EXTREME_HILLS;
 
-    if (c.temperature < -0.45) return c.humidity < -0.1 ? Biome::ICE_SPIKES : Biome::TAIGA;
+    if (isFrozen(shape)) return c.humidity < -0.1 ? Biome::ICE_SPIKES : Biome::TAIGA;
     if (c.temperature > 0.4 && c.humidity < -0.15) return Biome::DESERT;
     if (c.humidity > 0.55 && h < 70.0) return Biome::SWAMP;
     if (c.humidity > 0.30) return c.temperature < -0.05 ? Biome::BIRCH_FOREST : Biome::FOREST;

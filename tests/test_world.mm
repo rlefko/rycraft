@@ -457,9 +457,7 @@ TEST_CASE("ChunkGenerator: chunks are generation-order independent", "[worldgen]
 // ============================================================================
 
 namespace {
-bool isLeafBlock(BlockType b) {
-    return b == BlockType::LEAVES || b == BlockType::BIRCH_LEAVES || b == BlockType::SPRUCE_LEAVES;
-}
+// isLeafBlock comes from block_properties.hpp (the single property table)
 bool isLogBlock(BlockType b) {
     return b == BlockType::LOG || b == BlockType::BIRCH_LOG || b == BlockType::SPRUCE_LOG;
 }

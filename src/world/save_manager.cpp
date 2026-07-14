@@ -1,5 +1,7 @@
 #include "world/save_manager.hpp"
 
+#include "world/chunk_pos.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -316,8 +318,7 @@ int SaveManager::getRegionCoord(int chunkCoord) {
 }
 
 uint64_t SaveManager::packChunkKey(int chunkX, int chunkZ) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(chunkX)) << 32) |
-           static_cast<uint64_t>(static_cast<uint32_t>(chunkZ));
+    return ChunkPos{chunkX, chunkZ}.packed(); // THE xz key bit layout
 }
 
 bool SaveManager::ensureDirectory(const std::string& path) const {
