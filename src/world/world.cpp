@@ -1,6 +1,7 @@
 #include "world/world.hpp"
 
 #include "common/error.hpp"
+#include "world/light_engine.hpp"
 #include "world/save_manager.hpp"
 
 #include <algorithm>
@@ -85,6 +86,9 @@ void World::generateChunkAsync(int chunkX, int chunkZ) {
             // the race, keep its chunk — it may already hold player edits.
             chunks_.try_emplace(key, std::move(chunk));
         }
+        // Pull cross-chunk lava light in now that this chunk (and maybe its
+        // neighbors) exist; the reconcile runs on the tick thread.
+        queueLightReconcileWithNeighbors(key);
         // A freed window slot pulls the next-nearest backlog chunk in, so
         // streaming continues without waiting for the next tick
         pumpGeneration();
@@ -103,7 +107,11 @@ void World::generateChunkAsync(int chunkX, int chunkZ) {
 std::shared_ptr<Chunk> World::loadOrGenerateChunk(int chunkX, int chunkZ) {
     if (saveManager_) {
         if (auto loaded = saveManager_->loadChunk(chunkX, chunkZ)) {
-            return std::make_shared<Chunk>(std::move(*loaded));
+            auto chunk = std::make_shared<Chunk>(std::move(*loaded));
+            // Block light is derived, not saved — recompute self light before
+            // the chunk goes live (cross-chunk spill is added by reconcile).
+            LightEngine::computeSelfLight(*chunk);
+            return chunk;
         }
     }
 
@@ -114,6 +122,7 @@ std::shared_ptr<Chunk> World::loadOrGenerateChunk(int chunkX, int chunkZ) {
         genMs_.record(
             std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start)
                 .count());
+        LightEngine::computeSelfLight(*chunk);
         return chunk;
     } catch (const std::exception& e) {
         RY_LOG_ERROR(
@@ -147,6 +156,9 @@ std::shared_ptr<Chunk> World::getChunk(int chunkX, int chunkZ) {
 
     std::lock_guard<std::mutex> lock(chunksMutex_);
     auto [it, inserted] = chunks_.try_emplace(key, std::move(chunk));
+    if (inserted) {
+        queueLightReconcileWithNeighbors(key);
+    }
     return it->second;
 }
 
@@ -168,6 +180,20 @@ BlockType World::getBlockIfLoaded(int x, int y, int z) const {
         return BlockType::AIR;
     }
     return it->second->getBlockWorld(x, y, z);
+}
+
+std::optional<int> World::surfaceHeightIfLoaded(int x, int z) const {
+    int cx = Chunk::worldToChunk(x);
+    int cz = Chunk::worldToChunk(z);
+
+    std::lock_guard<std::mutex> lock(chunksMutex_);
+    auto it = chunks_.find(ChunkPos{cx, cz});
+    if (it == chunks_.end() || !it->second->generated) {
+        return std::nullopt;
+    }
+    int lx = x - cx * CHUNK_WIDTH;
+    int lz = z - cz * CHUNK_DEPTH;
+    return it->second->heightMap[lx + lz * CHUNK_WIDTH];
 }
 
 void World::setBlock(int x, int y, int z, BlockType type) {
@@ -200,6 +226,89 @@ void World::setBlock(int x, int y, int z, BlockType type) {
     if (lx == CHUNK_WIDTH - 1) markNeighbor(cx + 1, cz);
     if (lz == 0) markNeighbor(cx, cz - 1);
     if (lz == CHUNK_DEPTH - 1) markNeighbor(cx, cz + 1);
+
+    // Re-derive block light around the edit: adding or removing a lava source
+    // (or opening/sealing a wall) changes the flood. Queue the 3×3 chunk block
+    // so the tick-thread reconcile re-floods it; the flood then cascades to
+    // farther chunks if the border light reaches them.
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            queueLightReconcile({cx + dx, cz + dz});
+        }
+    }
+}
+
+void World::queueLightReconcile(ChunkPos pos) {
+    std::lock_guard<std::mutex> lock(lightMutex_);
+    if (lightQueued_.insert(pos).second) {
+        lightQueue_.push_back(pos);
+    }
+}
+
+void World::queueFaceNeighbors(ChunkPos pos) {
+    queueLightReconcile({pos.x - 1, pos.z});
+    queueLightReconcile({pos.x + 1, pos.z});
+    queueLightReconcile({pos.x, pos.z - 1});
+    queueLightReconcile({pos.x, pos.z + 1});
+}
+
+void World::queueLightReconcileWithNeighbors(ChunkPos pos) {
+    queueLightReconcile(pos);
+    queueFaceNeighbors(pos);
+}
+
+void World::reconcileLight(int budgetChunks) {
+    for (int processed = 0; processed < budgetChunks; ++processed) {
+        ChunkPos pos;
+        {
+            std::lock_guard<std::mutex> lock(lightMutex_);
+            if (lightQueue_.empty()) {
+                return;
+            }
+            pos = lightQueue_.back();
+            lightQueue_.pop_back();
+            lightQueued_.erase(pos);
+        }
+
+        std::lock_guard<std::mutex> lock(chunksMutex_);
+        auto it = chunks_.find(pos);
+        if (it == chunks_.end() || !it->second->generated) {
+            continue;
+        }
+        auto neighborPtr = [&](int ncx, int ncz) -> Chunk* {
+            auto n = chunks_.find(ChunkPos{ncx, ncz});
+            return (n != chunks_.end() && n->second->generated) ? n->second.get() : nullptr;
+        };
+        Chunk* faces[4] = {neighborPtr(pos.x - 1, pos.z), neighborPtr(pos.x + 1, pos.z),
+                           neighborPtr(pos.x, pos.z - 1), neighborPtr(pos.x, pos.z + 1)};
+
+        // O(1) skip for the common lava-free region: with no stored light here
+        // and none in any neighbor, floodChunk can only reproduce darkness, so
+        // there is nothing to do — avoids a 65 KB full-volume scan under the
+        // lock for every streamed chunk that never sees lava.
+        auto dark = [](const Chunk* c) { return !c || c->blockLight.empty(); };
+        if (it->second->blockLight.empty() && dark(faces[0]) && dark(faces[1]) && dark(faces[2]) &&
+            dark(faces[3])) {
+            continue;
+        }
+
+        LightEngine::FaceNeighbors neighbors = {faces[0], faces[1], faces[2], faces[3]};
+        if (LightEngine::floodChunk(*it->second, neighbors)) {
+            it->second->needsMeshUpdate = true;
+            it->second->version.fetch_add(1, std::memory_order_relaxed);
+            // This chunk's border light moved: each face-neighbor both SAMPLES
+            // that border (so its border faces must re-mesh even if its own
+            // stored light is unchanged — e.g. a solid wall at the seam) and
+            // may pull in more light (so it must re-reconcile).
+            for (Chunk* n : faces) {
+                if (n) {
+                    n->needsMeshUpdate = true;
+                    n->version.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            queueFaceNeighbors(pos);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,10 +324,16 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
     if (self == chunks_.end() || !self->second->generated) {
         return false;
     }
-    const Chunk* neighbors[4] = {nullptr, nullptr, nullptr, nullptr};
-    const ChunkPos neighborPos[4] = {
-        {pos.x - 1, pos.z}, {pos.x + 1, pos.z}, {pos.x, pos.z - 1}, {pos.x, pos.z + 1}};
-    for (int i = 0; i < 4; ++i) {
+    // Eight neighbors: four face walls (0-3) plus four diagonal corner
+    // columns (4-7) that baked corner AO needs at chunk borders. Generation
+    // reaches viewDistance+1 as a full square, so every render-radius chunk
+    // has all eight generated (no extra meshing stall vs the old four).
+    const Chunk* neighbors[8] = {};
+    const ChunkPos neighborPos[8] = {{pos.x - 1, pos.z},     {pos.x + 1, pos.z},
+                                     {pos.x, pos.z - 1},     {pos.x, pos.z + 1},
+                                     {pos.x - 1, pos.z - 1}, {pos.x + 1, pos.z - 1},
+                                     {pos.x - 1, pos.z + 1}, {pos.x + 1, pos.z + 1}};
+    for (int i = 0; i < 8; ++i) {
         auto it = chunks_.find(neighborPos[i]);
         if (it == chunks_.end() || !it->second->generated) {
             return false;
@@ -231,23 +346,55 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
     out.version = self->second->version.load(std::memory_order_relaxed);
     out.resize();
     const Chunk& chunk = *self->second;
+    // resize() zeroed the light ring; a lava-free chunk keeps blockLight empty
+    // and so skips the interior light memcpy entirely.
+    const bool selfHasLight = !chunk.blockLight.empty();
     for (int y = 0; y < CHUNK_HEIGHT; ++y) {
         for (int z = 0; z < CHUNK_DEPTH; ++z) {
-            // Interior row: 16 contiguous blocks in both layouts
-            std::memcpy(&out.blocks[MeshSnapshot::index(0, y, z)],
-                        &chunk.blocks[z * CHUNK_WIDTH + y * CHUNK_WIDTH * CHUNK_DEPTH],
+            // Interior row: 16 contiguous blocks (and light) in both layouts
+            const int srcRow = z * CHUNK_WIDTH + y * CHUNK_WIDTH * CHUNK_DEPTH;
+            std::memcpy(&out.blocks[MeshSnapshot::index(0, y, z)], &chunk.blocks[srcRow],
                         CHUNK_WIDTH * sizeof(BlockType));
+            if (selfHasLight) {
+                std::memcpy(&out.blockLight[MeshSnapshot::index(0, y, z)],
+                            &chunk.blockLight[srcRow], CHUNK_WIDTH * sizeof(uint8_t));
+            }
             // ±X neighbor walls
             out.blocks[MeshSnapshot::index(-1, y, z)] =
                 neighbors[0]->getBlock(CHUNK_WIDTH - 1, y, z);
             out.blocks[MeshSnapshot::index(CHUNK_WIDTH, y, z)] = neighbors[1]->getBlock(0, y, z);
+            out.blockLight[MeshSnapshot::index(-1, y, z)] =
+                neighbors[0]->getBlockLight(CHUNK_WIDTH - 1, y, z);
+            out.blockLight[MeshSnapshot::index(CHUNK_WIDTH, y, z)] =
+                neighbors[1]->getBlockLight(0, y, z);
         }
         // ±Z neighbor walls
         for (int x = 0; x < CHUNK_WIDTH; ++x) {
             out.blocks[MeshSnapshot::index(x, y, -1)] =
                 neighbors[2]->getBlock(x, y, CHUNK_DEPTH - 1);
             out.blocks[MeshSnapshot::index(x, y, CHUNK_DEPTH)] = neighbors[3]->getBlock(x, y, 0);
+            out.blockLight[MeshSnapshot::index(x, y, -1)] =
+                neighbors[2]->getBlockLight(x, y, CHUNK_DEPTH - 1);
+            out.blockLight[MeshSnapshot::index(x, y, CHUNK_DEPTH)] =
+                neighbors[3]->getBlockLight(x, y, 0);
         }
+        // Four diagonal corner columns (the block nearest this chunk's corner)
+        out.blocks[MeshSnapshot::index(-1, y, -1)] =
+            neighbors[4]->getBlock(CHUNK_WIDTH - 1, y, CHUNK_DEPTH - 1);
+        out.blocks[MeshSnapshot::index(CHUNK_WIDTH, y, -1)] =
+            neighbors[5]->getBlock(0, y, CHUNK_DEPTH - 1);
+        out.blocks[MeshSnapshot::index(-1, y, CHUNK_DEPTH)] =
+            neighbors[6]->getBlock(CHUNK_WIDTH - 1, y, 0);
+        out.blocks[MeshSnapshot::index(CHUNK_WIDTH, y, CHUNK_DEPTH)] =
+            neighbors[7]->getBlock(0, y, 0);
+        out.blockLight[MeshSnapshot::index(-1, y, -1)] =
+            neighbors[4]->getBlockLight(CHUNK_WIDTH - 1, y, CHUNK_DEPTH - 1);
+        out.blockLight[MeshSnapshot::index(CHUNK_WIDTH, y, -1)] =
+            neighbors[5]->getBlockLight(0, y, CHUNK_DEPTH - 1);
+        out.blockLight[MeshSnapshot::index(-1, y, CHUNK_DEPTH)] =
+            neighbors[6]->getBlockLight(CHUNK_WIDTH - 1, y, 0);
+        out.blockLight[MeshSnapshot::index(CHUNK_WIDTH, y, CHUNK_DEPTH)] =
+            neighbors[7]->getBlockLight(0, y, 0);
     }
     return true;
 }
@@ -313,6 +460,10 @@ void World::setViewDistance(int distance) {
 void World::updatePlayerPosition(int playerX, int playerZ) {
     int newPlayerChunkX = Chunk::worldToChunk(playerX);
     int newPlayerChunkZ = Chunk::worldToChunk(playerZ);
+
+    // Drain the lava-light reconcile queue a few chunks per tick so cross-chunk
+    // glow fills in as chunks stream, without ever stalling the tick.
+    reconcileLight(16);
 
     if (hasPlayerChunk_ && newPlayerChunkX == playerChunkX_ && newPlayerChunkZ == playerChunkZ_) {
         // Same chunk: keep the submission window full anyway

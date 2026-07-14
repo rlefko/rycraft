@@ -29,6 +29,13 @@ public:
 
     void free(ChunkAllocation& alloc);
 
+    // Frames-in-flight variant of free(): the region stays allocated until
+    // drainDeferredFrees learns the GPU finished every frame that could
+    // still read it. A region freed while encoding frame N was last drawn
+    // in an earlier frame, so it recycles once completedFrame >= N.
+    void deferFree(ChunkAllocation& alloc, uint64_t frame);
+    void drainDeferredFrees(uint64_t completedFrame);
+
     uint64_t vertexUsed() const;
     uint64_t indexUsed() const;
     uint64_t vertexCapacity() const { return _vertexSize; }
@@ -52,7 +59,15 @@ private:
     uint64_t _indexPtr;
     std::vector<std::pair<uint64_t, uint64_t>> _vertexFreeList;
     std::vector<std::pair<uint64_t, uint64_t>> _indexFreeList;
+    struct DeferredFree {
+        ChunkAllocation alloc;
+        uint64_t frame; // render frame during which the region was freed
+    };
+    std::vector<DeferredFree> _deferredFrees;
     mutable std::mutex _mutex;
+
+    // free() body without the lock, shared by free() and the deferred drain.
+    void freeLocked(ChunkAllocation& alloc);
 
     bool tryBumpAllocate(uint64_t& outOffset, uint64_t alignedSize, uint64_t bufferSize,
                          uint64_t& bumpPtr) const;

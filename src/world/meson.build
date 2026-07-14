@@ -8,6 +8,7 @@ world_sources = files(
   'structures.cpp',
   'features.cpp',
   'chunk.cpp',
+  'light_engine.cpp',
   'serialization.cpp',
   'save_manager.cpp',
 )

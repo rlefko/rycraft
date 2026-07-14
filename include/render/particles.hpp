@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "common/math.hpp"
+#include "render/frame_ring.hpp"
 #include "render/shader_types.hpp"
 #include "world/chunk.hpp"
 
@@ -45,8 +46,9 @@ struct alignas(16) Particle {
 // Pool-based with fixed 4096 particle capacity. Biome-aware: rain in most
 // biomes, snow in cold biomes (IceSpikes, Taiga).
 //
-// Rain: fall ~10 blocks/s, slight wind drift, lifetime ~2s
-// Snow: fall ~3 blocks/s, sinusoidal horizontal drift, lifetime ~5s
+// Rain: fall ~10 blocks/s, slight wind drift, lifetime 5s (spawned just
+// above the camera so drops sweep past eye level before dying)
+// Snow: fall ~3 blocks/s, sinusoidal horizontal drift, lifetime 10s
 // ---------------------------------------------------------------------------
 class ParticleSystem {
 public:
@@ -55,11 +57,14 @@ public:
     ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrary);
     ~ParticleSystem();
 
-    // Update particle physics (call each game tick).
-    void tick(float dt, const World& world, const Vec3& playerPosition);
+    // Update particle physics (call each game tick). When it isn't raining
+    // no new particles spawn; live ones die out within their lifetime.
+    void tick(float dt, const World& world, const Vec3& playerPosition, bool raining);
 
     // Render active particles as billboards (call during main render pass).
-    void render(id<MTLRenderCommandEncoder> encoder, const Mat4& viewMatrix,
+    // Instance data + uniforms sub-allocate from the caller's frame ring so
+    // the per-frame rewrite never races frames the GPU still reads.
+    void render(id<MTLRenderCommandEncoder> encoder, FrameRing& frameRing, const Mat4& viewMatrix,
                 const Mat4& projectionMatrix, const Vec3& cameraPosition);
 
 private:
@@ -71,15 +76,11 @@ private:
     id<MTLRenderPipelineState> _pipelineState;
     id<MTLDepthStencilState> _depthState;
 
-    // GPU particle buffer (uploaded every frame)
-    id<MTLBuffer> _particleBuffer;
-
-    // Uniform buffer (view/projection/camera)
-    id<MTLBuffer> _uniformsBuffer;
-
-    // ---- Spawn helpers ----
-    void spawnRainParticle(Particle& p, const Vec3& playerPos, float spawnRadius);
-    void spawnSnowParticle(Particle& p, const Vec3& playerPos, float spawnRadius);
+    // ---- Spawn helpers (false = column not sky-exposed; nothing spawned) ----
+    bool spawnRainParticle(Particle& p, const World& world, const Vec3& playerPos,
+                           float spawnRadius);
+    bool spawnSnowParticle(Particle& p, const World& world, const Vec3& playerPos,
+                           float spawnRadius);
 
     // Check if biome at position should produce snow
     bool isSnowBiome(const World& world, int x, int z) const;

@@ -1,6 +1,7 @@
 #include "render/entity_renderer.hpp"
 
 #include "common/error.hpp"
+#include "render/pixel_formats.hpp"
 
 #include <array>
 
@@ -74,8 +75,8 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     auto pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    pipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+    pipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
     // Entities draw inside the 4x MSAA scene pass
     pipelineDesc.rasterSampleCount = 4;
 
@@ -92,14 +93,15 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 }
 
 void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
+                            uint64_t uniformsOffset,
                             const std::vector<std::shared_ptr<Entity>>& entities,
                             const std::function<bool(const AABB&)>& isVisible) {
     if (entities.empty())
         return;
 
     [encoder setRenderPipelineState:_pipelineState];
-    [encoder setVertexBuffer:uniformsBuffer offset:0 atIndex:1];
-    [encoder setFragmentBuffer:uniformsBuffer offset:0 atIndex:1];
+    [encoder setVertexBuffer:uniformsBuffer offset:uniformsOffset atIndex:1];
+    [encoder setFragmentBuffer:uniformsBuffer offset:uniformsOffset atIndex:1];
 
     for (const auto& entity : entities) {
         if (!entity || !entity->alive)

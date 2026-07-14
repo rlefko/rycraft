@@ -15,6 +15,7 @@
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
+#include <render/graphics_settings.hpp>
 #include <render/render_pipeline.hpp>
 #include <render/ui_menu.hpp>
 #include <world/save_manager.hpp>
@@ -60,9 +61,16 @@ struct EngineState {
     static constexpr float FOV_EASE_SECONDS = 0.1f;
     float fovCurrent = BASE_FOV;
 
-    // ---- Day/Night Cycle ----
+    // ---- Day/Night Cycle & Weather ----
     static constexpr uint64_t TICKS_PER_DAY = 24000; // 20 min at 20Hz
     uint64_t worldTime = 0;
+    bool raining = false; // deterministic per-day schedule (seeded)
+    float wetness = 0.0f; // 0 dry .. 1 soaked; ramps with the rain
+    // Weather tuning: how many days rain (percent), and how fast surfaces
+    // soak under rain / dry out after it stops.
+    static constexpr uint32_t RAIN_DAYS_PERCENT = 40;
+    static constexpr float SOAK_SECONDS = 15.0f;
+    static constexpr float DRY_SECONDS = 45.0f;
 
     // ---- Block Interaction ----
     Hotbar hotbar;
@@ -70,10 +78,12 @@ struct EngineState {
     bool hasHighlightedBlock = false;
 
     // ---- Game flow & UI ----
-    GameFlow flow;               // Title → Playing ⇄ Paused ⇄ Settings
-    bool spawnValidated = false; // player unstuck from stale-save terrain
-    SettingsValues settings;     // live values shown in the settings menu
-    MenuLayout menuLayout;       // rebuilt each frame while a menu is open
+    GameFlow flow;                   // Title → Playing ⇄ Paused ⇄ Settings
+    bool spawnValidated = false;     // player unstuck from stale-save terrain
+    SettingsValues settings;         // live values shown in the settings menu
+    GraphicsSettings gfx;            // video screen values (persisted with settings)
+    bool envOverridesActive = false; // RYCRAFT_* session: never save settings
+    MenuLayout menuLayout;           // rebuilt each frame while a menu is open
     int hoveredButton = -1;
     bool showDebugHud = false;
 
@@ -163,11 +173,23 @@ static EngineState* _engineGetState(Engine* engine) {
             spawnPos = meta->spawnPos;
             _state->worldTime = meta->worldTime;
         }
+        // Playtest hook: pin the time of day (0..23999; 6000 = noon).
+        if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
+            _state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
+        }
 
-        // Default view distance 12; the mega-buffer grows with the setting
-        // (see renderChunks). Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..32>.
+        // Persisted settings load before the World exists (view distance
+        // feeds its constructor); env overrides win over the file for
+        // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..32>.
+        // An env-overridden session never saves settings — a playtest run
+        // must not rewrite the user's file with its overrides.
+        LoadedSettings loaded = loadSettings(settingsPath());
+        _state->settings = loaded.values;
+        _state->gfx = loaded.gfx;
+        _state->envOverridesActive = _state->gfx.applyEnvOverrides();
         if (const char* vdEnv = std::getenv("RYCRAFT_VIEW_DISTANCE")) {
             _state->settings.viewDistance = std::clamp(std::atoi(vdEnv), 4, 32);
+            _state->envOverridesActive = true;
         }
         _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
         // Chunks load from disk before regenerating, so block edits persist
@@ -263,12 +285,15 @@ static EngineState* _engineGetState(Engine* engine) {
         _device, library, static_cast<uint32_t>(_view.bounds.size.width),
         static_cast<uint32_t>(_view.bounds.size.height));
 
-    // Playtest/diagnostic override: RYCRAFT_BLOOM=<0..1> scales or disables bloom
-    if (const char* bloomEnv = std::getenv("RYCRAFT_BLOOM")) {
-        _renderPipeline->setBloomIntensity(static_cast<float>(std::atof(bloomEnv)));
-    }
+    // Apply the persisted settings to the live systems (world view distance
+    // was already applied through the World constructor; RYCRAFT_BLOOM rides
+    // GraphicsSettings::applyEnvOverrides now).
+    _renderPipeline->setGraphicsSettings(_state->gfx);
+    _renderPipeline->setFogDensity(fogDensityForLevel(_state->settings.fogLevel));
+    _state->camera.setMouseSensitivity(mouseSensitivityForLevel(_state->settings.sensitivityLevel));
 
-    // Playtest override: start on a specific screen (title|playing|paused|settings)
+    // Playtest override: start on a specific screen
+    // (title|playing|paused|settings|video)
     if (const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN")) {
         std::string name = screenEnv;
         if (name == "playing") {
@@ -278,6 +303,8 @@ static EngineState* _engineGetState(Engine* engine) {
             _state->flow.screen = GameScreen::PAUSED;
         } else if (name == "settings") {
             _state->flow.screen = GameScreen::SETTINGS;
+        } else if (name == "video") {
+            _state->flow.screen = GameScreen::VIDEO_SETTINGS;
         }
     }
 
@@ -455,27 +482,82 @@ static EngineState* _engineGetState(Engine* engine) {
             int step = (action == MenuAction::FOG_UP) ? 1 : -1;
             settings.fogLevel = std::clamp(settings.fogLevel + step, 0, 10);
             if (_renderPipeline) {
-                _renderPipeline->setFogDensity(static_cast<float>(settings.fogLevel) * 0.0001f);
+                _renderPipeline->setFogDensity(fogDensityForLevel(settings.fogLevel));
             }
-            break;
+            return;
         }
         case MenuAction::SENSITIVITY_DOWN:
         case MenuAction::SENSITIVITY_UP: {
             int step = (action == MenuAction::SENSITIVITY_UP) ? 1 : -1;
             settings.sensitivityLevel = std::clamp(settings.sensitivityLevel + step, 1, 10);
-            state->camera.setMouseSensitivity(static_cast<float>(settings.sensitivityLevel) *
-                                              0.0005f);
-            break;
+            state->camera.setMouseSensitivity(mouseSensitivityForLevel(settings.sensitivityLevel));
+            return;
         }
         case MenuAction::VOLUME_DOWN:
         case MenuAction::VOLUME_UP: {
             int step = (action == MenuAction::VOLUME_UP) ? 1 : -1;
             settings.volumeLevel = std::clamp(settings.volumeLevel + step, 0, 10);
             [self syncAudioVolume];
+            return;
+        }
+        case MenuAction::SHADOWS_DOWN:
+        case MenuAction::SHADOWS_UP: {
+            int step = (action == MenuAction::SHADOWS_UP) ? 1 : -1;
+            state->gfx.shadowQuality = std::clamp(state->gfx.shadowQuality + step, 0,
+                                                  GraphicsSettings::SHADOW_QUALITY_MAX);
+            break;
+        }
+        case MenuAction::VL_TOGGLE:
+            state->gfx.volumetricLight = !state->gfx.volumetricLight;
+            break;
+        case MenuAction::CLOUDS_DOWN:
+        case MenuAction::CLOUDS_UP: {
+            int step = (action == MenuAction::CLOUDS_UP) ? 1 : -1;
+            state->gfx.cloudMode =
+                std::clamp(state->gfx.cloudMode + step, 0, GraphicsSettings::CLOUD_MODE_MAX);
+            break;
+        }
+        case MenuAction::SSAO_TOGGLE:
+            state->gfx.ssao = !state->gfx.ssao;
+            break;
+        case MenuAction::SSR_TOGGLE:
+            state->gfx.waterReflections = !state->gfx.waterReflections;
+            break;
+        case MenuAction::WAVING_TOGGLE:
+            state->gfx.wavingFoliage = !state->gfx.wavingFoliage;
+            break;
+        case MenuAction::LENS_FLARE_TOGGLE:
+            state->gfx.lensFlare = !state->gfx.lensFlare;
+            break;
+        case MenuAction::BLOOM_DOWN:
+        case MenuAction::BLOOM_UP: {
+            int step = (action == MenuAction::BLOOM_UP) ? 1 : -1;
+            state->gfx.bloomLevel =
+                std::clamp(state->gfx.bloomLevel + step, 0, GraphicsSettings::LEVEL_MAX);
+            break;
+        }
+        case MenuAction::VIBRANCE_DOWN:
+        case MenuAction::VIBRANCE_UP: {
+            int step = (action == MenuAction::VIBRANCE_UP) ? 1 : -1;
+            state->gfx.vibrance =
+                std::clamp(state->gfx.vibrance + step, 0, GraphicsSettings::LEVEL_MAX);
+            break;
+        }
+        case MenuAction::SHARPEN_DOWN:
+        case MenuAction::SHARPEN_UP: {
+            int step = (action == MenuAction::SHARPEN_UP) ? 1 : -1;
+            state->gfx.sharpening =
+                std::clamp(state->gfx.sharpening + step, 0, GraphicsSettings::LEVEL_MAX);
             break;
         }
         default:
-            break;
+            return; // not a settings action
+    }
+
+    // Only the video cases fall through: push the changed copy so the
+    // renderer picks it up next frame.
+    if (_renderPipeline) {
+        _renderPipeline->setGraphicsSettings(state->gfx);
     }
 }
 
@@ -486,7 +568,14 @@ static EngineState* _engineGetState(Engine* engine) {
     InputState& input = state->inputManager->state();
 
     if (input.isJustPressed(Key::Escape)) {
+        // Leaving a settings screen persists the values (not per click —
+        // no disk I/O while stepping)
+        bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
+                               state->flow.screen == GameScreen::VIDEO_SETTINGS;
         [self applyFlowEffects:state->flow.onEscape()];
+        if (leavingSettings && !state->envOverridesActive) {
+            saveSettings(settingsPath(), state->settings, state->gfx);
+        }
     }
     if (input.isJustPressed(Key::F3)) {
         state->showDebugHud = !state->showDebugHud;
@@ -497,7 +586,8 @@ static EngineState* _engineGetState(Engine* engine) {
         // hit-test in window points — the same normalized space it's drawn in
         float boundsW = static_cast<float>(_view.bounds.size.width);
         float boundsH = static_cast<float>(_view.bounds.size.height);
-        state->menuLayout = buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings);
+        state->menuLayout =
+            buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings, state->gfx);
 
         Vec2 mouse = input.mousePosition;
         state->hoveredButton = menuHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
@@ -507,6 +597,11 @@ static EngineState* _engineGetState(Engine* engine) {
                 state->menuLayout.buttons[static_cast<size_t>(state->hoveredButton)].action;
             [self applySettingAction:action];
             [self applyFlowEffects:state->flow.onMenuAction(action)];
+            if ((action == MenuAction::CLOSE_SETTINGS ||
+                 action == MenuAction::CLOSE_VIDEO_SETTINGS) &&
+                !state->envOverridesActive) {
+                saveSettings(settingsPath(), state->settings, state->gfx);
+            }
         }
     } else {
         state->hoveredButton = -1;
@@ -529,6 +624,13 @@ static EngineState* _engineGetState(Engine* engine) {
 - (void)saveWorldState {
     if (_savedWorld)
         return;
+    // Capture runs are throwaway playtests: their spawned test blocks
+    // (RYCRAFT_SPAWN_*) and drifted player position must not overwrite the
+    // real save, and reproducible captures depend on the world not moving.
+    if (std::getenv("RYCRAFT_CAPTURE")) {
+        _savedWorld = true;
+        return;
+    }
     _savedWorld = true;
 
     // Mesh workers reference the World — stop them before anything else
@@ -545,6 +647,13 @@ static EngineState* _engineGetState(Engine* engine) {
                                          state->worldTime);
         state->saveManager->flush();
         RY_LOG_INFO("World state saved");
+    }
+
+    // Settings share the quit path so mid-session tweaks survive a close
+    // that never revisited the settings screen. Env-overridden playtest
+    // sessions never save — their overrides must not become the file.
+    if (!state->envOverridesActive) {
+        saveSettings(settingsPath(), state->settings, state->gfx);
     }
 }
 
@@ -603,8 +712,17 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 1. Advance world time (1 tick per game tick)
-    state->worldTime++;
+    // 1. Advance world time (1 tick per game tick). Playtest hooks:
+    // RYCRAFT_TIME=<0..23999> pins the time of day at launch and
+    // RYCRAFT_TIME_FREEZE=1 stops it advancing, so captures at noon /
+    // sunset / midnight don't depend on hand-editing the save.
+    static const bool freezeTime = [] {
+        const char* f = std::getenv("RYCRAFT_TIME_FREEZE");
+        return f && *f && std::strcmp(f, "0") != 0;
+    }();
+    if (!freezeTime) {
+        state->worldTime++;
+    }
 
     // 1b. Unstick a stale spawn: a resumed save can place the player inside
     // terrain when world generation has changed shape since the save was
@@ -628,6 +746,71 @@ static EngineState* _engineGetState(Engine* engine) {
                     }
                 }
             }
+
+            // Playtest hook: RYCRAFT_SPAWN_LAVA=1 carves a small surface lava
+            // pool a few blocks from spawn so headless captures can show the
+            // block-light glow (natural lava only forms in deep caves). Best
+            // paired with a night RYCRAFT_TIME so the orange spill stands out.
+            static const bool spawnLava = [] {
+                const char* v = std::getenv("RYCRAFT_SPAWN_LAVA");
+                return v && *v && std::strcmp(v, "0") != 0;
+            }();
+            if (spawnLava) {
+                for (int dz = -2; dz <= 2; ++dz) {
+                    for (int dx = -2; dx <= 2; ++dx) {
+                        int wx = px + dx, wz = pz + 6 + dz; // ahead (+Z) at spawn
+                        for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
+                            if (isSolid(state->world->getBlock(wx, y, wz))) {
+                                state->world->setBlock(wx, y, wz, BlockType::LAVA);
+                                state->world->setBlock(wx, y + 1, wz, BlockType::AIR);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Playtest hook: RYCRAFT_SPAWN_WATER=1 sinks a broad pool ahead of
+            // spawn (between the camera and the tree line) so headless captures
+            // can show the water reflections/refraction at a grazing angle.
+            static const bool spawnWater = [] {
+                const char* v = std::getenv("RYCRAFT_SPAWN_WATER");
+                return v && *v && std::strcmp(v, "0") != 0;
+            }();
+            if (spawnWater) {
+                auto isTrunk = [](BlockType b) {
+                    return b == BlockType::LOG || b == BlockType::BIRCH_LOG ||
+                           b == BlockType::SPRUCE_LOG;
+                };
+                for (int dz = 3; dz <= 22; ++dz) {
+                    for (int dx = -10; dx <= 10; ++dx) {
+                        int wx = px + dx, wz = pz + dz;
+                        // Scan down to the terrain surface, past any tree trunk,
+                        // so the pool sits at ground level (no floating water).
+                        for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
+                            BlockType b = state->world->getBlock(wx, y, wz);
+                            if (isSolid(b) && !isTrunk(b)) {
+                                state->world->setBlock(wx, y, wz, BlockType::WATER);
+                                state->world->setBlock(wx, y - 1, wz, BlockType::WATER);
+                                state->world->setBlock(wx, y + 1, wz, BlockType::AIR);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Playtest hook: RYCRAFT_YAW / RYCRAFT_PITCH (degrees) point the
+            // camera for captures — e.g. face the afternoon sun for the lens
+            // flare. Yaw 0 looks +Z; -90 looks -X.
+            static const char* yawEnv = std::getenv("RYCRAFT_YAW");
+            static const char* pitchEnv = std::getenv("RYCRAFT_PITCH");
+            if (yawEnv || pitchEnv) {
+                constexpr float DEG = static_cast<float>(M_PI) / 180.0f;
+                state->camera.setLook(yawEnv ? std::atof(yawEnv) * DEG : 0.0f,
+                                      pitchEnv ? std::atof(pitchEnv) * DEG : 0.0f);
+            }
+
             state->spawnValidated = true;
         }
     }
@@ -765,9 +948,38 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 7. Update weather particles
+    // 7. Weather: a deterministic schedule from the world seed (convention:
+    // seeded randomness only) — each in-game day hashes to a maybe-rain
+    // window, so playtests reproduce exactly. Playtest hook:
+    // RYCRAFT_WEATHER=rain|clear pins the state.
+    {
+        // hash64 is the engine's one seeded-hash home (common/random.hpp)
+        uint64_t day = state->worldTime / EngineState::TICKS_PER_DAY;
+        uint64_t h = hash64(day ^ (static_cast<uint64_t>(state->world->getSeed()) << 32));
+        uint32_t tod = static_cast<uint32_t>(state->worldTime % EngineState::TICKS_PER_DAY);
+        uint32_t start = 3000u + static_cast<uint32_t>((h >> 8) % 12000u);
+        uint32_t length = 2000u + static_cast<uint32_t>((h >> 4) % 4000u);
+        state->raining =
+            (h % 100u) < EngineState::RAIN_DAYS_PERCENT && tod >= start && tod < start + length;
+        static const char* weatherEnv = std::getenv("RYCRAFT_WEATHER");
+        if (weatherEnv) {
+            // Playtest override skips the soak ramp so captures are stable.
+            state->raining = std::strcmp(weatherEnv, "rain") == 0;
+            state->wetness = state->raining ? 1.0f : 0.0f;
+        } else {
+            // Fixed-step tick logic uses the tick dt, not the frame delta.
+            const float dt = static_cast<float>(EngineState::TICK_DT);
+            state->wetness = state->raining
+                                 ? std::min(1.0f, state->wetness + dt / EngineState::SOAK_SECONDS)
+                                 : std::max(0.0f, state->wetness - dt / EngineState::DRY_SECONDS);
+        }
+    }
     if (_renderPipeline) {
-        _renderPipeline->tickParticles(state->deltaTime, *state->world, state->player.position);
+        // Particles integrate per fixed tick too — the frame delta here made
+        // rainfall speed depend on the frame rate (1/3 speed at 60 FPS).
+        _renderPipeline->tickParticles(static_cast<float>(EngineState::TICK_DT), *state->world,
+                                       state->player.position, state->raining);
+        _renderPipeline->setWetness(state->wetness);
     }
 
     // 8. Single raycast for block interaction + highlight
@@ -899,19 +1111,29 @@ static EngineState* _engineGetState(Engine* engine) {
     // the whole chunk vector)
     if (state->frameCount % 60 == 1) {
         auto chunkStats = _renderPipeline->chunkRenderStats();
-        char line[224];
+        char line[288];
         snprintf(line, sizeof(line),
                  "Render: %u loaded chunks, frame %llu player (%.1f, %.1f, %.1f) | %.2f ms/frame "
-                 "gen %.2f ms mesh %.2f ms pending %zu vram %.0f/%.0f MB",
+                 "gpu %.2f ms gen %.2f ms mesh %.2f ms pending %zu vram %.0f/%.0f MB",
                  state->cachedChunkCount, static_cast<unsigned long long>(state->frameCount),
                  state->player.position.x, state->player.position.y, state->player.position.z,
-                 state->smoothedFrameMs, state->world->averageGenMs(), chunkStats.meshMsAvg,
+                 state->smoothedFrameMs, _renderPipeline->gpuFrameMs(),
+                 state->world->averageGenMs(), chunkStats.meshMsAvg,
                  state->world->getPendingChunkCount(), chunkStats.megaUsedMB, chunkStats.megaCapMB);
         RY_LOG_INFO(line);
+        // Per-pass GPU breakdown (RYCRAFT_GPU_COUNTERS=1) mirrors to the log
+        // so headless runs can attribute frame cost to individual passes.
+        std::string passes = _renderPipeline->gpuPassBreakdown();
+        if (!passes.empty()) {
+            RY_LOG_INFO(("GPU passes (ms): " + passes).c_str());
+        }
     }
 
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
-    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered.
+    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered, then
+    // quits ~1s later (the PNG write is async). A capture run is headless
+    // tooling — leaving it running leaked a full game instance per capture
+    // until concurrent playtests exhausted system memory.
     static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
     if (capturePath && *capturePath) {
         static const uint64_t captureFrame = [] {
@@ -920,6 +1142,9 @@ static EngineState* _engineGetState(Engine* engine) {
         }();
         if (state->frameCount == captureFrame) {
             _renderPipeline->requestFrameCapture(capturePath);
+        }
+        if (state->frameCount == captureFrame + 60) {
+            [self requestQuit];
         }
     }
 
@@ -949,6 +1174,7 @@ static EngineState* _engineGetState(Engine* engine) {
                 static_cast<int>(std::floor(camPos.z))) == BlockType::WATER;
     }
     uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
+    uiFrame.stats.gpuFrameMs = _renderPipeline->gpuFrameMs();
     uiFrame.stats.fps = state->smoothedFrameMs > 0.f ? 1000.0f / state->smoothedFrameMs : 0.f;
     uiFrame.stats.chunkCount = state->cachedChunkCount;
     uiFrame.stats.entityCount =

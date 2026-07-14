@@ -5,11 +5,11 @@ using namespace metal;
 // ---------------------------------------------------------------------------
 // Bloom Post-Processing Shaders
 //
-// Pipeline:
-//   1. Extract pass — threshold bright pixels (above 1.0 luminance)
+// Pipeline (all HDR, half-resolution and below):
+//   1. Extract pass — soft-threshold bright pixels from the HDR scene
 //   2. Kawase blur — 4-level pyramid, separable 8-tap blur
-//   3. Composite pass — additive blend bloom onto original scene
-//   4. ACES tone mapping applied during composite
+// The result feeds the final composite in post.metal, which owns exposure,
+// tonemapping, and the bloom add.
 // ---------------------------------------------------------------------------
 
 // ---- Fullscreen quad vertex output ----
@@ -124,46 +124,5 @@ fragment float4 bloomBlurFragment(
     return float4(sum / weightSum, 1.0);
 }
 
-// ============================================================================
-// 3. Composite Pass — Additive blend + ACES tone mapping
-// ============================================================================
-
-vertex BloomVertexOut bloomCompositeVertex(uint vertexID [[vertex_id]]) {
-    const float2 positions[6] = {
-        float2(-1.0f, -1.0f),
-        float2( 1.0f, -1.0f),
-        float2( 1.0f,  1.0f),
-        float2(-1.0f, -1.0f),
-        float2( 1.0f,  1.0f),
-        float2(-1.0f,  1.0f)
-    };
-    BloomVertexOut out;
-    out.clipPosition = float4(positions[vertexID], 0.0, 1.0);
-    // Texture v runs downward in Metal while NDC y runs up; flip v so
-    // every sampling pass preserves the image orientation.
-    out.vUV = float2(positions[vertexID].x * 0.5f + 0.5f,
-                     0.5f - positions[vertexID].y * 0.5f);
-    return out;
-}
-
-fragment float4 bloomCompositeFragment(
-    BloomVertexOut in [[stage_in]],
-    texture2d<float> sceneTexture [[texture(0)]],
-    texture2d<float> bloomTexture [[texture(1)]],
-    constant BloomUniforms &uniforms [[buffer(0)]]
-) {
-    constexpr sampler linearSampler(mag_filter::linear, min_filter::linear);
-
-    float3 sceneColor = sceneTexture.sample(linearSampler, in.vUV).rgb;
-    float3 bloomColor = bloomTexture.sample(linearSampler, in.vUV).rgb;
-
-    // Additive blend bloom onto scene
-    float3 combined = sceneColor + bloomColor * uniforms.intensity;
-
-    // ACES tone mapping: color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14)
-    float3 a = combined * (2.51f * combined + 0.03f);
-    float3 b = combined * (2.43f * combined + 0.59f) + 0.14f;
-    float3 toneMapped = a / b;
-
-    return float4(toneMapped, 1.0);
-}
+// The composite lives in post.metal now: it owns exposure, the bloom add,
+// tonemapping, grading, and sharpening in a single always-on pass.

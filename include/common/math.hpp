@@ -334,6 +334,21 @@ struct alignas(16) Mat4 {
         return m;
     }
 
+    // Right-handed orthographic projection with Metal's [0, 1] NDC depth
+    // (view looks down -Z: z = -near maps to 0, z = -far maps to 1). Used to
+    // build the shadow cascades' light-space projection.
+    static constexpr Mat4 orthographic(float left, float right, float bottom, float top, float near,
+                                       float far) {
+        Mat4 m = Mat4::identity();
+        m(0, 0) = 2.f / (right - left);
+        m(1, 1) = 2.f / (top - bottom);
+        m(2, 2) = -1.f / (far - near);
+        m(0, 3) = -(right + left) / (right - left);
+        m(1, 3) = -(top + bottom) / (top - bottom);
+        m(2, 3) = -near / (far - near);
+        return m;
+    }
+
     static constexpr Mat4 translation(float x, float y, float z) {
         Mat4 m = Mat4::identity();
         m(0, 3) = x;

@@ -48,10 +48,19 @@ struct MenuLayout {
 // Live values the settings screen displays.
 struct SettingsValues {
     int viewDistance = 12;    // chunks
-    int fogLevel = 3;         // 0-10 (density = level * 0.0001 per block)
-    int sensitivityLevel = 4; // 1-10 (sensitivity = level * 0.0005)
+    int fogLevel = 3;         // 0-10
+    int sensitivityLevel = 4; // 1-10
     int volumeLevel = 8;      // 0-10
 };
+
+// Level → physical-unit conversions, defined once for the engine's init
+// path and the stepper handlers (two independent copies once drifted).
+constexpr float fogDensityForLevel(int level) {
+    return static_cast<float>(level) * 0.0001f;
+}
+constexpr float mouseSensitivityForLevel(int level) {
+    return static_cast<float>(level) * 0.0005f;
+}
 
 // Performance HUD data (F3), filled by the engine with real measurements.
 struct PerformanceStats {
@@ -59,6 +68,7 @@ struct PerformanceStats {
     uint32_t chunkCount = 0;
     uint32_t entityCount = 0;
     float frameTimeMs = 0.f;
+    float gpuFrameMs = 0.f;     // EMA of command-buffer GPUEndTime − GPUStartTime
     uint32_t pendingChunks = 0; // generation backlog + in-flight
     float genMsAvg = 0.f;       // EMA of per-chunk generation time
     float meshMsAvg = 0.f;      // EMA of per-chunk mesh build time
@@ -81,9 +91,11 @@ struct UIFrameState {
 // 1px advance, matching UIOverlay's font metrics).
 float menuTextWidth(const std::string& text, float scale, float pixelWidth);
 
+struct GraphicsSettings; // render/graphics_settings.hpp (video screen values)
+
 // Build the layout for the current screen (Playing returns an empty layout).
 MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeight,
-                           const SettingsValues& values);
+                           const SettingsValues& values, const GraphicsSettings& gfx);
 
 // Index of the button under the (normalized) mouse position, or -1.
 int menuHitTest(const MenuLayout& layout, float mouseX, float mouseY);

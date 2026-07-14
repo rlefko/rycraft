@@ -25,10 +25,12 @@
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
 #include <render/vertex.hpp>
+#include <world/block_properties.hpp>
 #include <world/chunk.hpp>
 #include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/climate.hpp>
+#include <world/light_engine.hpp>
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
@@ -1460,4 +1462,100 @@ TEST_CASE("isInWater: detects player in water block", "[phase6][water]") {
     // Player not in water
     AABB playerBox2{Vec3{10.f, 200.f, 10.f}, Vec3{10.6f, 201.8f, 10.6f}};
     REQUIRE(PhysicsEngine::isInWater(*world, playerBox2) == false);
+}
+
+// ===========================================================================
+// LightEngine: block-light propagation from lava
+// ===========================================================================
+
+TEST_CASE("Block properties: lava emits light, nothing else does", "[world][light]") {
+    REQUIRE(blockLightEmission(BlockType::LAVA) == 15);
+    REQUIRE(blockLightEmission(BlockType::STONE) == 0);
+    REQUIRE(blockLightEmission(BlockType::AIR) == 0);
+    REQUIRE(isEmissive(BlockType::LAVA));
+    REQUIRE_FALSE(isEmissive(BlockType::STONE));
+    REQUIRE_FALSE(isEmissive(BlockType::GLASS));
+}
+
+TEST_CASE("LightEngine: lava light falls off one level per block", "[world][light]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::LAVA); // one source in open air
+
+    REQUIRE(LightEngine::computeSelfLight(chunk));
+
+    REQUIRE(chunk.getBlockLight(8, 64, 8) == 15); // the source itself
+    REQUIRE(chunk.getBlockLight(9, 64, 8) == 14); // one block away
+    REQUIRE(chunk.getBlockLight(10, 64, 8) == 13);
+    REQUIRE(chunk.getBlockLight(8, 67, 8) == 12); // three up
+    REQUIRE(chunk.getBlockLight(15, 64, 8) == 8); // seven away
+    // A cell 15+ blocks away (across two axes) is dark again.
+    REQUIRE(chunk.getBlockLight(0, 64, 0) == 0);
+}
+
+TEST_CASE("LightEngine: opaque blocks do not receive light", "[world][light]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::LAVA);
+    chunk.setBlock(9, 64, 8, BlockType::STONE); // opaque neighbor
+
+    LightEngine::computeSelfLight(chunk);
+
+    // The stone cell stays dark (light never enters an opaque cell), but light
+    // still routes around it through the open air above.
+    REQUIRE(chunk.getBlockLight(9, 64, 8) == 0);
+    REQUIRE(chunk.getBlockLight(8, 65, 8) == 14); // air above the source
+}
+
+TEST_CASE("LightEngine: a lava-free chunk allocates no light", "[world][light]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::STONE);
+    REQUIRE_FALSE(LightEngine::computeSelfLight(chunk)); // nothing changed
+    REQUIRE(chunk.blockLight.empty());                   // stays unallocated
+    REQUIRE(chunk.getBlockLight(8, 64, 8) == 0);
+}
+
+TEST_CASE("LightEngine: flood is a pure function of chunk contents", "[world][light]") {
+    // Same blocks → bit-identical light, so the fixed point is order-independent.
+    Chunk a(0, 0), b(0, 0);
+    for (Chunk* c : {&a, &b}) {
+        c->setBlock(4, 40, 4, BlockType::LAVA);
+        c->setBlock(11, 40, 11, BlockType::LAVA);
+        c->setBlock(7, 40, 7, BlockType::STONE);
+    }
+    LightEngine::computeSelfLight(a);
+    LightEngine::computeSelfLight(b);
+    REQUIRE(a.blockLight == b.blockLight);
+}
+
+TEST_CASE("LightEngine: light spills across a chunk border", "[world][light]") {
+    // A neighbor's border light seeds this chunk's edge (minus one), then floods
+    // inward — the cross-chunk reconcile relies on exactly this.
+    Chunk neighbor(-1, 0);
+    neighbor.setBlockLight(CHUNK_WIDTH - 1, 64, 8, 10); // its +X wall glows
+
+    Chunk self(0, 0); // all air, no own source
+    LightEngine::FaceNeighbors faces{&neighbor, nullptr, nullptr, nullptr};
+    REQUIRE(LightEngine::floodChunk(self, faces));
+
+    REQUIRE(self.getBlockLight(0, 64, 8) == 9); // border pulls neighbor - 1
+    REQUIRE(self.getBlockLight(1, 64, 8) == 8); // then floods inward
+}
+
+TEST_CASE("LightEngine: block light is derived, never serialized", "[world][light]") {
+    Chunk original(2, -1);
+    original.setBlock(8, 64, 8, BlockType::LAVA);
+    LightEngine::computeSelfLight(original);
+    REQUIRE_FALSE(original.blockLight.empty());
+
+    // The save size accounts only for blocks/biomes/height — not light.
+    size_t before = ChunkSerializer::serializedSize(original);
+    auto data = ChunkSerializer::serialize(original);
+    REQUIRE(data.size() == before);
+
+    auto restored = ChunkSerializer::deserialize(data);
+    REQUIRE(restored.has_value());
+    REQUIRE(restored->getBlock(8, 64, 8) == BlockType::LAVA);
+    REQUIRE(restored->blockLight.empty()); // not carried through the save
+    // ...but recomputable from the blocks alone.
+    LightEngine::computeSelfLight(*restored);
+    REQUIRE(restored->getBlockLight(9, 64, 8) == 14);
 }

@@ -30,6 +30,7 @@
 #include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/climate.hpp>
+#include <world/light_engine.hpp>
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
@@ -376,17 +377,32 @@ TEST_CASE("World snapshotForMeshing requires generated neighbors", "[world][mesh
     world.getChunk(1, 0);
     REQUIRE(!world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
 
+    // All four face neighbors present but still no diagonals — baked corner AO
+    // reads the corner columns, so meshing now waits for all eight neighbors.
     world.getChunk(-1, 0);
     world.getChunk(0, 1);
     world.getChunk(0, -1);
+    REQUIRE(!world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
+
+    // Generate the four diagonals; the snapshot completes
+    world.getChunk(1, 1);
+    world.getChunk(-1, 1);
+    world.getChunk(1, -1);
+    world.getChunk(-1, -1);
     REQUIRE(world.snapshotForMeshing(ChunkPos{0, 0}, snapshot));
 
-    // The padded walls carry the neighbors' real border blocks
+    // The padded walls carry the face neighbors' real border blocks
     auto neighbor = world.getChunk(1, 0);
     for (int y = 0; y < CHUNK_HEIGHT; y += 13) {
         for (int z = 0; z < CHUNK_DEPTH; ++z) {
             REQUIRE(snapshot.at(CHUNK_WIDTH, y, z) == neighbor->getBlock(0, y, z));
         }
+    }
+
+    // The corner column carries the diagonal neighbor's nearest block
+    auto diagonal = world.getChunk(1, 1);
+    for (int y = 0; y < CHUNK_HEIGHT; y += 13) {
+        REQUIRE(snapshot.at(CHUNK_WIDTH, y, CHUNK_DEPTH) == diagonal->getBlock(0, y, 0));
     }
 }
 
@@ -526,43 +542,154 @@ TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][texture
         for (uint8_t layer :
              {uint8_t{0}, uint8_t{7}, TEXTURE_LAYER_GRASS_SIDE, TEXTURE_LAYER_WHITE}) {
             for (uint8_t light : {uint8_t{0}, uint8_t{4}, uint8_t{15}}) {
-                uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer, light);
-                REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
-                REQUIRE(unpackTextureLayer(attr) == layer);
-                REQUIRE(unpackSkyLight(attr) == light);
+                for (uint8_t ao : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{3}}) {
+                    for (uint8_t blockLight : {uint8_t{0}, uint8_t{9}, uint8_t{15}}) {
+                        for (bool emissive : {false, true}) {
+                            for (uint8_t sway : {uint8_t{0}, uint8_t{1}, uint8_t{2}}) {
+                                uint32_t attr = packFaceAttr(static_cast<FaceNormal>(f), layer,
+                                                             light, ao, blockLight, emissive, sway);
+                                REQUIRE(unpackFace(attr) == static_cast<FaceNormal>(f));
+                                REQUIRE(unpackTextureLayer(attr) == layer);
+                                REQUIRE(unpackSkyLight(attr) == light);
+                                REQUIRE(unpackCornerAO(attr) == ao);
+                                REQUIRE(unpackBlockLight(attr) == blockLight);
+                                REQUIRE(unpackEmissive(attr) == emissive);
+                                REQUIRE(unpackSway(attr) == sway);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-TEST_CASE("Mesher: faces under cover carry reduced skylight", "[render][mesher]") {
+TEST_CASE("Mesher: tags sway class for flora and leaves", "[render][mesher][sway]") {
     Chunk chunk(0, 0);
-    // Ground block with a "canopy" three blocks above it
-    chunk.setBlock(8, 64, 8, BlockType::STONE);
-    chunk.setBlock(8, 68, 8, BlockType::LEAVES);
+    chunk.setBlock(4, 64, 4, BlockType::STONE);
+    chunk.setBlock(4, 65, 4, BlockType::TALL_GRASS);
+    chunk.setBlock(8, 64, 8, BlockType::LEAVES);
 
     LODMesher mesher;
     MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
-    bool foundShadedTop = false;
-    bool foundLitCanopyTop = false;
+    bool sawFlora = false, sawLeaves = false, sawStatic = false;
+    for (const Vertex& v : output.vertices) {
+        uint8_t layer = unpackTextureLayer(v.faceAttr);
+        if (unpackFace(v.faceAttr) == FaceNormal::CROSS) {
+            REQUIRE(unpackSway(v.faceAttr) == 1); // flora bends from the root
+            sawFlora = true;
+        } else if (layer == static_cast<uint8_t>(BlockType::LEAVES)) {
+            REQUIRE(unpackSway(v.faceAttr) == 2); // canopy drifts whole-block
+            sawLeaves = true;
+        } else if (layer == static_cast<uint8_t>(BlockType::STONE)) {
+            REQUIRE(unpackSway(v.faceAttr) == 0); // terrain never sways
+            sawStatic = true;
+        }
+    }
+    REQUIRE(sawFlora);
+    REQUIRE(sawLeaves);
+    REQUIRE(sawStatic);
+}
+
+TEST_CASE("Mesher: bakes lava block light and the emissive flag", "[render][mesher][light]") {
+    Chunk chunk(0, 0);
+    chunk.setBlock(8, 64, 8, BlockType::LAVA);   // light source
+    chunk.setBlock(10, 64, 8, BlockType::STONE); // a wall two blocks away
+    LightEngine::computeSelfLight(chunk);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    bool foundLitStoneFace = false;
+    bool foundEmissiveLava = false;
+    for (const Vertex& v : output.vertices) {
+        FaceNormal face = unpackFace(v.faceAttr);
+        float x = static_cast<float>(v.px);
+        // The stone's -X face (plane x = 10) samples the lit air at x = 9.
+        if (face == FaceNormal::MINUS_X && x > 9.9f && x < 10.1f) {
+            REQUIRE(unpackBlockLight(v.faceAttr) > 0);
+            foundLitStoneFace = true;
+        }
+        if (unpackEmissive(v.faceAttr)) {
+            foundEmissiveLava = true; // only lava sets the emissive bit
+        }
+    }
+    REQUIRE(foundLitStoneFace);
+    REQUIRE(foundEmissiveLava);
+}
+
+TEST_CASE("Mesher: baked corner AO darkens enclosed voxel corners", "[render][mesher][ao]") {
+    // An L-shaped nook: a floor with two walls meeting at a corner. The floor
+    // vertex tucked into the inner corner sees occluders on both sides and the
+    // diagonal, so its baked AO is the lowest; a vertex out on the open floor
+    // stays fully open (AO 3).
+    Chunk chunk(0, 0);
+    for (int x = 4; x <= 9; ++x)
+        for (int z = 4; z <= 9; ++z)
+            chunk.setBlock(x, 64, z, BlockType::STONE); // floor slab
+    for (int z = 4; z <= 9; ++z)
+        chunk.setBlock(4, 65, z, BlockType::STONE); // wall along -X edge
+    for (int x = 4; x <= 9; ++x)
+        chunk.setBlock(x, 65, 4, BlockType::STONE); // wall along -Z edge
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    uint8_t innerCornerAO = 3;
+    uint8_t maxFloorAO = 0;
+    bool foundInner = false;
     for (const Vertex& v : output.vertices) {
         if (unpackFace(v.faceAttr) != FaceNormal::PLUS_Y)
             continue;
+        float x = static_cast<float>(v.px);
         float y = static_cast<float>(v.py);
-        if (y > 64.5f && y < 65.5f) {
-            // The ground's top face sits under the canopy → shaded
-            REQUIRE(unpackSkyLight(v.faceAttr) < 15);
-            foundShadedTop = true;
-        }
-        if (y > 68.5f && y < 69.5f) {
-            // The canopy's own top face sees open sky
-            REQUIRE(unpackSkyLight(v.faceAttr) == 15);
-            foundLitCanopyTop = true;
+        float z = static_cast<float>(v.pz);
+        if (y < 64.5f || y > 65.5f)
+            continue; // only the floor top at y = 65
+        maxFloorAO = std::max(maxFloorAO, unpackCornerAO(v.faceAttr));
+        // The concave corner vertex sits where the two walls meet (5,65,5)
+        if (x > 4.9f && x < 5.1f && z > 4.9f && z < 5.1f) {
+            innerCornerAO = std::min(innerCornerAO, unpackCornerAO(v.faceAttr));
+            foundInner = true;
         }
     }
-    REQUIRE(foundShadedTop);
-    REQUIRE(foundLitCanopyTop);
+    REQUIRE(foundInner);
+    REQUIRE(maxFloorAO == 3);    // open floor away from the walls stays lit
+    REQUIRE(innerCornerAO == 0); // two walls + diagonal bury the tucked corner
+}
+
+TEST_CASE("Mesher: opaque cover reduces skylight; non-opaque leaves do not", "[render][mesher]") {
+    // Only OPAQUE blocks block the sky. A stone slab overhead shades the
+    // ground below; a leaf canopy does not (its real cast shadow handles that,
+    // and a column skylight shadow would double up under every tree).
+    Chunk chunk(0, 0);
+    chunk.setBlock(4, 64, 8, BlockType::STONE);  // ground under stone cover
+    chunk.setBlock(4, 68, 8, BlockType::STONE);  // opaque cover
+    chunk.setBlock(12, 64, 8, BlockType::STONE); // ground under a leaf canopy
+    chunk.setBlock(12, 68, 8, BlockType::LEAVES);
+
+    LODMesher mesher;
+    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+
+    bool foundShadedUnderStone = false;
+    bool foundLitUnderLeaves = false;
+    for (const Vertex& v : output.vertices) {
+        if (unpackFace(v.faceAttr) != FaceNormal::PLUS_Y)
+            continue;
+        float x = static_cast<float>(v.px);
+        float y = static_cast<float>(v.py);
+        if (y > 64.5f && y < 65.5f && x > 4.4f && x < 5.6f) {
+            REQUIRE(unpackSkyLight(v.faceAttr) < 15); // under opaque stone → shaded
+            foundShadedUnderStone = true;
+        }
+        if (y > 64.5f && y < 65.5f && x > 12.4f && x < 13.6f) {
+            REQUIRE(unpackSkyLight(v.faceAttr) == 15); // under leaves → still open
+            foundLitUnderLeaves = true;
+        }
+    }
+    REQUIRE(foundShadedUnderStone);
+    REQUIRE(foundLitUnderLeaves);
 }
 
 TEST_CASE("Block textures: extra layers extend past the block types", "[render][textures]") {
@@ -730,29 +857,60 @@ TEST_CASE("Day/night cycle: sun elevation drives ambient brightness", "[phase6][
 
 // ---- Bloom Tests ----
 
-TEST_CASE("Bloom: ACES tone mapping formula", "[phase8][bloom]") {
-    // ACES: color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14)
-    auto acesToneMap = [](float c) -> float {
-        float a = c * (2.51f * c + 0.03f);
-        float b = c * (2.43f * c + 0.59f) + 0.14f;
-        return a / b;
+// Uchimura "Gran Turismo" tonemap replicated from post.metal (the composite
+// owns tonemapping now — ACES lived in the deleted bloom composite). Pins the
+// curve's contract: black stays black, a linear mid section preserves the
+// vibrant look, highlights compress, and it never decreases.
+static float uchimuraToneMap(float x) {
+    const float P = 1.0f, a = 1.0f, m = 0.22f, l = 0.4f, c = 1.33f, b = 0.0f;
+    const float l0 = ((P - m) * l) / a;
+    const float S0 = m + l0;
+    const float S1 = m + a * l0;
+    const float C2 = (a * P) / (P - S1);
+    const float CP = -C2 / P;
+    float w0 =
+        1.0f - (x <= 0.0f ? 0.0f : (x >= m ? 1.0f : (x / m) * (x / m) * (3.0f - 2.0f * x / m)));
+    float w2 = (x >= m + l0) ? 1.0f : 0.0f;
+    float w1 = 1.0f - w0 - w2;
+    float T = m * std::pow(x / m, c) + b;
+    float L = m + a * (x - m);
+    float S = P - (P - S1) * std::exp(CP * (x - S0));
+    return T * w0 + L * w1 + S * w2;
+}
+
+TEST_CASE("Post: Uchimura tone mapping curve", "[hdr][post]") {
+    // Black in, black out
+    REQUIRE(uchimuraToneMap(0.0f) == Catch::Approx(0.0f).margin(0.001f));
+
+    // The linear mid keeps mid-tones near identity (the vibrant look)
+    float atMid = uchimuraToneMap(0.5f);
+    REQUIRE(atMid > 0.35f);
+    REQUIRE(atMid < 0.65f);
+
+    // HDR highlights compress below the display max
+    REQUIRE(uchimuraToneMap(4.0f) < 1.0f);
+    REQUIRE(uchimuraToneMap(8.0f) < 1.0f);
+
+    // Monotonically increasing across the range
+    REQUIRE(uchimuraToneMap(0.2f) < uchimuraToneMap(0.5f));
+    REQUIRE(uchimuraToneMap(0.5f) < uchimuraToneMap(1.0f));
+    REQUIRE(uchimuraToneMap(1.0f) < uchimuraToneMap(2.0f));
+}
+
+TEST_CASE("Post: vibrance boosts low-saturation colors more than saturated ones", "[hdr][post]") {
+    auto luma = [](float r, float g, float b) { return 0.2126f * r + 0.7152f * g + 0.0722f * b; };
+    // Vibrance boost factor from post.metal: vibrance * (1 - saturation)
+    auto satBoost = [](float mx, float mn, float vibrance) {
+        return vibrance * (1.0f - std::clamp(mx - mn, 0.0f, 1.0f));
     };
-
-    // Identity at 0
-    REQUIRE(acesToneMap(0.0f) == Catch::Approx(0.0f).epsilon(0.0001f));
-
-    // Near-identity at 1.0 (slight compression)
-    float at1 = acesToneMap(1.0f);
-    REQUIRE(at1 > 0.8f);
-    REQUIRE(at1 < 1.2f);
-
-    // Compresses high values
-    float at2 = acesToneMap(2.0f);
-    REQUIRE(at2 < 2.0f); // Compression
-
-    // Monotonically increasing
-    REQUIRE(acesToneMap(0.5f) < acesToneMap(1.0f));
-    REQUIRE(acesToneMap(1.0f) < acesToneMap(1.5f));
+    const float vibrance = 0.5f;
+    // A near-gray pixel (low saturation) gets a larger boost than a vivid one
+    float grayBoost = satBoost(0.55f, 0.45f, vibrance); // sat 0.1
+    float vividBoost = satBoost(0.9f, 0.1f, vibrance);  // sat 0.8
+    REQUIRE(grayBoost > vividBoost);
+    // Fully saturated → no boost
+    REQUIRE(satBoost(1.0f, 0.0f, vibrance) == Catch::Approx(0.0f));
+    (void)luma;
 }
 
 TEST_CASE("Bloom: extract threshold — bright pixels pass, dark pixels blocked", "[phase8][bloom]") {
@@ -936,27 +1094,59 @@ TEST_CASE("Clouds: cloud altitude constant", "[phase8][clouds]") {
 // position, sky colors, and particle data.
 
 TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(Uniforms) == 288);
+    REQUIRE(sizeof(Uniforms) == 304);
     REQUIRE(offsetof(Uniforms, sunDirection) == 192);
     REQUIRE(offsetof(Uniforms, fogColor) == 240);
     REQUIRE(offsetof(Uniforms, fogDensity) == 256);
     REQUIRE(offsetof(Uniforms, cameraPosition) == 272);
+    REQUIRE(offsetof(Uniforms, time) == 288);
+    REQUIRE(offsetof(Uniforms, swayStrength) == 292);
+    REQUIRE(offsetof(Uniforms, wetness) == 296);
     REQUIRE(alignof(Uniforms) == 16);
 }
 
+TEST_CASE("Shader types: ShadowUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(ShadowPassUniforms) == 80);
+    REQUIRE(offsetof(ShadowPassUniforms, time) == 64);
+    REQUIRE(offsetof(ShadowPassUniforms, swayStrength) == 68);
+    REQUIRE(sizeof(ShadowUniforms) == 224);
+    REQUIRE(offsetof(ShadowUniforms, cascadeSplitDist) == 192);
+    REQUIRE(offsetof(ShadowUniforms, shadowParams) == 208);
+    REQUIRE(SHADOW_CASCADE_COUNT == 3);
+}
+
+TEST_CASE("Mat4 orthographic maps near->0 and far->1 (Metal depth)", "[common][math]") {
+    Mat4 ortho = Mat4::orthographic(-10.f, 10.f, -10.f, 10.f, 0.f, 100.f);
+    // A point at view-space z = -near (0) maps to NDC z = 0
+    Vec3 nearPt = ortho.transformVec3({0.f, 0.f, 0.f});
+    REQUIRE(nearPt.z == Catch::Approx(0.f).margin(1e-5));
+    // A point at view-space z = -far maps to NDC z = 1
+    Vec3 farPt = ortho.transformVec3({0.f, 0.f, -100.f});
+    REQUIRE(farPt.z == Catch::Approx(1.f).margin(1e-5));
+    // x/y map the ortho extents to [-1, 1]
+    REQUIRE(ortho.transformVec3({10.f, 0.f, -1.f}).x == Catch::Approx(1.f).margin(1e-5));
+    REQUIRE(ortho.transformVec3({-10.f, 0.f, -1.f}).x == Catch::Approx(-1.f).margin(1e-5));
+}
+
 TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(SkyUniforms) == 80);
-    REQUIRE(offsetof(SkyUniforms, horizonColor) == 16);
-    REQUIRE(offsetof(SkyUniforms, sunIntensity) == 64);
+    REQUIRE(sizeof(SkyUniforms) == 144);
+    REQUIRE(offsetof(SkyUniforms, sunDirection) == 48);
+    REQUIRE(offsetof(SkyUniforms, moonDirection) == 64);
+    REQUIRE(offsetof(SkyUniforms, zenithColor) == 96);
+    REQUIRE(offsetof(SkyUniforms, tanHalfFov) == 128);
+    REQUIRE(offsetof(SkyUniforms, sunIntensity) == 136);
+    REQUIRE(offsetof(SkyUniforms, starStrength) == 140);
 }
 
 TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(WaterUniforms) == 192);
-    REQUIRE(offsetof(WaterUniforms, zenithColor) == 64);
-    REQUIRE(offsetof(WaterUniforms, resolution) == 160);
-    REQUIRE(offsetof(WaterUniforms, fogDensity) == 168);
-    REQUIRE(offsetof(WaterUniforms, time) == 172);
-    REQUIRE(offsetof(WaterUniforms, cameraUnderwater) == 176);
+    REQUIRE(sizeof(WaterUniforms) == 256);
+    REQUIRE(offsetof(WaterUniforms, viewProjection) == 64);
+    REQUIRE(offsetof(WaterUniforms, zenithColor) == 128);
+    REQUIRE(offsetof(WaterUniforms, resolution) == 224);
+    REQUIRE(offsetof(WaterUniforms, fogDensity) == 232);
+    REQUIRE(offsetof(WaterUniforms, time) == 236);
+    REQUIRE(offsetof(WaterUniforms, cameraUnderwater) == 240);
+    REQUIRE(offsetof(WaterUniforms, ssrStrength) == 244);
 }
 
 TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-types]") {
@@ -964,6 +1154,8 @@ TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-typ
     REQUIRE(offsetof(CloudUniforms, sunDirection) == 64);
     REQUIRE(offsetof(CloudUniforms, tanHalfFov) == 80);
     REQUIRE(offsetof(CloudUniforms, cloudThreshold) == 100);
+    REQUIRE(offsetof(CloudUniforms, volumetric) == 104);
+    REQUIRE(offsetof(CloudUniforms, sunElevation) == 108);
 }
 
 TEST_CASE("Shader types: GPUParticle layout matches MSL", "[render][shader-types]") {
@@ -983,4 +1175,53 @@ TEST_CASE("Shader types: BloomUniforms layout matches MSL", "[render][shader-typ
     REQUIRE(offsetof(BloomUniforms, texelSize) == 8);
     REQUIRE(offsetof(BloomUniforms, threshold) == 16);
     REQUIRE(offsetof(BloomUniforms, blurRadius) == 24);
+}
+
+TEST_CASE("Shader types: PostUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(PostUniforms) == 40);
+    REQUIRE(offsetof(PostUniforms, resolution) == 0);
+    REQUIRE(offsetof(PostUniforms, exposure) == 8);
+    REQUIRE(offsetof(PostUniforms, bloomIntensity) == 12);
+    REQUIRE(offsetof(PostUniforms, vibrance) == 16);
+    REQUIRE(offsetof(PostUniforms, sharpening) == 20);
+    REQUIRE(offsetof(PostUniforms, frameIndex) == 24);
+    REQUIRE(offsetof(PostUniforms, flareStrength) == 28);
+    REQUIRE(offsetof(PostUniforms, sunScreenUV) == 32);
+    REQUIRE(sizeof(FlareState) == 4);
+}
+
+TEST_CASE("Shader types: SsaoUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(SsaoUniforms) == 160);
+    REQUIRE(offsetof(SsaoUniforms, invProjection) == 64);
+    REQUIRE(offsetof(SsaoUniforms, resolution) == 128);
+    REQUIRE(offsetof(SsaoUniforms, radius) == 136);
+    REQUIRE(offsetof(SsaoUniforms, strength) == 140);
+    REQUIRE(offsetof(SsaoUniforms, bias) == 144);
+    REQUIRE(offsetof(SsaoUniforms, frameIndex) == 148);
+}
+
+TEST_CASE("Shader types: VolumetricUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(VolumetricUniforms) == 144);
+    REQUIRE(offsetof(VolumetricUniforms, cameraPosition) == 64);
+    REQUIRE(offsetof(VolumetricUniforms, sunDirection) == 80);
+    REQUIRE(offsetof(VolumetricUniforms, sunColor) == 96);
+    REQUIRE(offsetof(VolumetricUniforms, stepCount) == 112);
+    REQUIRE(offsetof(VolumetricUniforms, underwater) == 128);
+    REQUIRE(offsetof(VolumetricUniforms, frameIndex) == 132);
+}
+
+TEST_CASE("Shader types: ExposureState + ExposureParams layout match MSL",
+          "[render][shader-types]") {
+    REQUIRE(sizeof(ExposureState) == 8);
+    REQUIRE(offsetof(ExposureState, smoothedLogLum) == 0);
+    REQUIRE(offsetof(ExposureState, exposure) == 4);
+
+    REQUIRE(sizeof(ExposureParams) == 32);
+    REQUIRE(offsetof(ExposureParams, keyValue) == 0);
+    REQUIRE(offsetof(ExposureParams, adaptationRate) == 4);
+    REQUIRE(offsetof(ExposureParams, minLogLum) == 8);
+    REQUIRE(offsetof(ExposureParams, maxLogLum) == 12);
+    REQUIRE(offsetof(ExposureParams, sampleGrid) == 16);
+    REQUIRE(offsetof(ExposureParams, minExposure) == 24);
+    REQUIRE(offsetof(ExposureParams, maxExposure) == 28);
 }

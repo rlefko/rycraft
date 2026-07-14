@@ -5,8 +5,10 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// MeshSnapshot — a chunk plus a one-block wall from each face neighbor,
-// copied under chunksMutex_ in one bounded memcpy (~83 KB, microseconds).
+// MeshSnapshot — a chunk plus a one-block ring from all eight neighbors (four
+// face walls + four diagonal corner columns), copied under chunksMutex_ in one
+// bounded memcpy (~83 KB, microseconds — the corner columns are four extra
+// byte-writes per layer into the ring that resize() already allocated).
 //
 // Meshing reads it lock-free afterwards: block data only mutates before a
 // chunk is inserted into the world or under chunksMutex_, so the copy is
@@ -15,9 +17,10 @@
 // treating the neighbor as air produced both hidden interior walls between
 // solid chunks and holes/light seams at borders.
 //
-// x and z accept [-1, CHUNK_WIDTH] / [-1, CHUNK_DEPTH]; the corner columns
-// are never written or read (face passes and skylight only ever step one
-// cell along a single axis).
+// x and z accept [-1, CHUNK_WIDTH] / [-1, CHUNK_DEPTH], corner columns
+// included: baked corner AO samples the diagonal neighbor of each face vertex,
+// so leaving the four corners as air would put a bright AO seam along every
+// chunk edge wherever a corner occluder straddles the border.
 // ---------------------------------------------------------------------------
 struct MeshSnapshot {
     static constexpr int PADDED_WIDTH = CHUNK_WIDTH + 2;
@@ -25,10 +28,14 @@ struct MeshSnapshot {
 
     int chunkX = 0;
     int chunkZ = 0;
-    uint32_t version = 0;          // chunk revision captured with the blocks
-    std::vector<BlockType> blocks; // PADDED_WIDTH × PADDED_DEPTH × CHUNK_HEIGHT
+    uint32_t version = 0;            // chunk revision captured with the blocks
+    std::vector<BlockType> blocks;   // PADDED_WIDTH × PADDED_DEPTH × CHUNK_HEIGHT
+    std::vector<uint8_t> blockLight; // parallel ring of derived block light (0-15)
 
-    void resize() { blocks.assign(PADDED_WIDTH * PADDED_DEPTH * CHUNK_HEIGHT, BlockType::AIR); }
+    void resize() {
+        blocks.assign(PADDED_WIDTH * PADDED_DEPTH * CHUNK_HEIGHT, BlockType::AIR);
+        blockLight.assign(PADDED_WIDTH * PADDED_DEPTH * CHUNK_HEIGHT, 0);
+    }
 
     static int index(int x, int y, int z) {
         return (x + 1) + (z + 1) * PADDED_WIDTH + y * PADDED_WIDTH * PADDED_DEPTH;
@@ -38,5 +45,11 @@ struct MeshSnapshot {
         if (y < 0 || y >= CHUNK_HEIGHT || x < -1 || x > CHUNK_WIDTH || z < -1 || z > CHUNK_DEPTH)
             return BlockType::AIR;
         return blocks[index(x, y, z)];
+    }
+
+    uint8_t lightAt(int x, int y, int z) const {
+        if (y < 0 || y >= CHUNK_HEIGHT || x < -1 || x > CHUNK_WIDTH || z < -1 || z > CHUNK_DEPTH)
+            return 0;
+        return blockLight[index(x, y, z)];
     }
 };
