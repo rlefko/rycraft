@@ -7,8 +7,8 @@ using namespace metal;
 //
 // Generate (half-res): reconstruct each pixel's view-space position and a
 // normal from depth derivatives, sample a hemisphere of points rotated per
-// pixel by interleaved-gradient noise, and count how many are occluded by
-// nearer geometry — the classic SSAO estimator. Apply (full-res): box-upsample
+// pixel by interleaved-gradient noise, and count how many find geometry
+// standing above the receiver's tangent plane. Apply (full-res): box-upsample
 // the half-res AO with a 4-tap bilinear average and multiply it onto the HDR
 // scene so creases, block corners, and cave interiors darken smoothly.
 // Multiply blending means the apply pass never samples the scene it writes.
@@ -100,11 +100,17 @@ fragment float4 ssaoGenerateFragment(SsaoVertexOut in [[stage_in]],
         float sampleDepth = sceneDepth.sample(depthSampler, sampleUV);
         float3 occluderView = viewPosFromDepth(sampleUV, sampleDepth, s);
 
-        // Occluded if real geometry sits closer to the eye than the sample,
-        // range-checked so distant background doesn't over-darken.
-        float rangeCheck =
-            smoothstep(0.0f, 1.0f, s.radius / max(abs(origin.z - occluderView.z), 1e-4f));
-        if (occluderView.z > samplePos.z + s.bias) {
+        // Occluded when the visible geometry at the sample rises above the
+        // receiver's tangent plane by more than the bias. A raw view-z compare
+        // broke down at grazing angles: one texel of flat ground spans a large
+        // depth range, so quantization made the ground occlude itself in
+        // horizontal bands. Measured perpendicular to the surface instead,
+        // that same error lies IN the plane and cancels, while real occluders
+        // (a block face above the ground) still stand proud of it.
+        float3 toOccluder = occluderView - origin;
+        float planeDist = dot(toOccluder, normal);
+        float rangeCheck = smoothstep(0.0f, 1.0f, s.radius / max(length(toOccluder), 1e-4f));
+        if (planeDist > s.bias) {
             occlusion += rangeCheck;
         }
     }

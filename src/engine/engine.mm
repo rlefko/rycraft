@@ -617,6 +617,13 @@ static EngineState* _engineGetState(Engine* engine) {
 - (void)saveWorldState {
     if (_savedWorld)
         return;
+    // Capture runs are throwaway playtests: their spawned test blocks
+    // (RYCRAFT_SPAWN_*) and drifted player position must not overwrite the
+    // real save, and reproducible captures depend on the world not moving.
+    if (std::getenv("RYCRAFT_CAPTURE")) {
+        _savedWorld = true;
+        return;
+    }
     _savedWorld = true;
 
     // Mesh workers reference the World — stop them before anything else
@@ -1076,7 +1083,10 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
-    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered.
+    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered, then
+    // quits ~1s later (the PNG write is async). A capture run is headless
+    // tooling — leaving it running leaked a full game instance per capture
+    // until concurrent playtests exhausted system memory.
     static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
     if (capturePath && *capturePath) {
         static const uint64_t captureFrame = [] {
@@ -1085,6 +1095,9 @@ static EngineState* _engineGetState(Engine* engine) {
         }();
         if (state->frameCount == captureFrame) {
             _renderPipeline->requestFrameCapture(capturePath);
+        }
+        if (state->frameCount == captureFrame + 60) {
+            [self requestQuit];
         }
     }
 
