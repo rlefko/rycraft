@@ -33,6 +33,10 @@ public:
     void setPosition(const Vec3& pos);
     const Vec3& getPosition() const;
 
+    // Point the camera directly (radians). Playtest hooks use this to frame
+    // captures; normal play only steers through update().
+    void setLook(float yaw, float pitch);
+
     // Head bobbing — sine wave offset proportional to horizontal speed
     Vec3 getBobOffset() const;
 

@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "render/graphics_settings.hpp"
+#include <simd/simd.h>
 
 // ---------------------------------------------------------------------------
 // PostStack — the terminal display pass.
@@ -27,18 +28,29 @@ public:
     // the composite reads the exposure.
     void encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR);
 
+    // Probe the sun's occlusion for the lens flare: 16 depth taps around
+    // sunScreenUV ease the persistent visibility. Skip the call entirely
+    // when the flare is off (visibility simply keeps its last value).
+    void encodeFlareProbe(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneDepth,
+                          simd_float2 sunScreenUV);
+
     // Encode the composite from sceneHDR (+ bloom) into outputTexture.
     // Pass a nil bloomTexture to composite with no bloom (the black
     // fallback is substituted). `frameIndex` drives the deterministic dither.
+    // flareStrength 0 disables the lens-flare overlay (setting off, night,
+    // or the sun behind the camera); sunScreenUV is its screen anchor.
     void encodeComposite(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR,
                          id<MTLTexture> bloomTexture, id<MTLTexture> outputTexture,
-                         const GraphicsSettings& gfx, uint32_t frameIndex);
+                         const GraphicsSettings& gfx, uint32_t frameIndex, float flareStrength,
+                         simd_float2 sunScreenUV);
 
 private:
     id<MTLDevice> _device;
     id<MTLRenderPipelineState> _compositePipelineState;
     id<MTLComputePipelineState> _exposurePipelineState;
+    id<MTLComputePipelineState> _flarePipelineState;
     id<MTLBuffer> _exposureBuffer; // persistent ExposureState, GPU-only
+    id<MTLBuffer> _flareBuffer;    // persistent FlareState (sun visibility)
     id<MTLTexture> _blackFallback; // 4×4, bound when bloom is off
     id<MTLSamplerState> _linearSampler;
 };

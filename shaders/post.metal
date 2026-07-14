@@ -88,11 +88,71 @@ static float interleavedGradientNoise(float2 px, uint frame) {
     return interleavedGradientNoise(px + float2(frame % 64u) * 5.588238f);
 }
 
+// ---------------------------------------------------------------------------
+// Lens flare — occlusion probe + procedural ghosts.
+//
+// The probe kernel (one thread, 16 depth taps in a small grid around the
+// sun's screen position) eases FlareState.visibility toward the fraction of
+// taps that see sky, so the flare dims smoothly as terrain slides across the
+// sun. The composite then draws four chromatic ghosts marching along the
+// sun→center line plus a soft halo, all scaled by visibility × strength.
+// ---------------------------------------------------------------------------
+kernel void flareProbe(depth2d<float> sceneDepth [[texture(0)]],
+                       device FlareState& flare [[buffer(0)]],
+                       constant PostUniforms& post [[buffer(1)]]) {
+    constexpr sampler depthPoint(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
+    float visible = 0.0f;
+    // 4x4 tap grid, ~1.5% of the screen across
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            float2 offset = (float2(float(x), float(y)) - 1.5f) * 0.005f;
+            float2 uv = post.sunScreenUV + offset;
+            if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+                continue; // off-screen taps count as occluded
+            }
+            if (sceneDepth.sample(depthPoint, uv) >= 1.0f) {
+                visible += 1.0f / 16.0f;
+            }
+        }
+    }
+    // Ease so the flare fades over ~10 frames instead of popping
+    flare.visibility = mix(flare.visibility, visible, 0.15f);
+}
+
+// Four ghosts + a halo along the sun→center axis (classic flare chain).
+static float3 lensFlareGhosts(float2 uv, constant PostUniforms& post) {
+    const float aspect = post.resolution.x / max(post.resolution.y, 1.0f);
+    const float2 sun = post.sunScreenUV;
+    const float2 axis = float2(0.5f) - sun; // toward the screen center
+
+    const float offsets[4] = {0.6f, 1.1f, 1.7f, 2.3f};
+    const float sizes[4] = {0.050f, 0.032f, 0.075f, 0.045f};
+    const float3 tints[4] = {float3(1.0f, 0.75f, 0.45f), float3(0.5f, 0.8f, 1.0f),
+                             float3(1.0f, 0.55f, 0.35f), float3(0.7f, 1.0f, 0.75f)};
+
+    // Per-ghost and halo brightness are kept deliberately low (0.14 / 0.05) so
+    // the flare hints at the sun rather than washing the frame; the composite
+    // scales them again by sun intensity × occlusion.
+    float3 result = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        float2 pos = sun + axis * offsets[i];
+        float2 d = (uv - pos) * float2(aspect, 1.0f);
+        float g = pow(saturate(1.0f - length(d) / sizes[i]), 2.5f);
+        result += tints[i] * (g * 0.14f);
+    }
+    // Soft halo hugging the sun itself
+    float2 dSun = (uv - sun) * float2(aspect, 1.0f);
+    result +=
+        float3(1.0f, 0.85f, 0.6f) * (pow(saturate(1.0f - length(dSun) / 0.22f), 3.0f) * 0.05f);
+    return result;
+}
+
 fragment float4 postCompositeFragment(PostVertexOut in [[stage_in]],
                                       texture2d<float> sceneTexture [[texture(0)]],
                                       texture2d<float> bloomTexture [[texture(1)]],
                                       constant PostUniforms& post [[buffer(0)]],
-                                      constant ExposureState& exposureState [[buffer(1)]]) {
+                                      constant ExposureState& exposureState [[buffer(1)]],
+                                      constant FlareState& flare [[buffer(2)]]) {
     constexpr sampler linearSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float exposure = exposureState.exposure;
 
@@ -116,6 +176,13 @@ fragment float4 postCompositeFragment(PostVertexOut in [[stage_in]],
         float3 amp = sqrt(saturate(min(minC, 1.0f - maxC) / max(maxC, 1e-4f)));
         float3 weight = amp * -0.2f * post.sharpening;
         color = saturate((color + (n + s + w + e) * weight) / (1.0f + 4.0f * weight));
+    }
+
+    // Lens flare ghosts, gated by the occlusion probe (post-tonemap so the
+    // overlay's brightness doesn't ride the auto-exposure).
+    float flareGate = post.flareStrength * flare.visibility;
+    if (flareGate > 0.001f) {
+        color += lensFlareGhosts(in.vUV, post) * flareGate;
     }
 
     // Sub-LSB dither before the 8-bit quantization

@@ -135,6 +135,12 @@ float Camera::mouseSensitivity() const {
     return mouseSensitivity_;
 }
 
+void Camera::setLook(float yaw, float pitch) {
+    yaw_ = yaw;
+    pitch_ = std::clamp(pitch, -1.55f, 1.55f);
+    updateFront();
+}
+
 void Camera::updateFront() {
     front_ = directionFromYawPitch(yaw_, pitch_);
 }

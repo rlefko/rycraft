@@ -800,6 +800,17 @@ static EngineState* _engineGetState(Engine* engine) {
                 }
             }
 
+            // Playtest hook: RYCRAFT_YAW / RYCRAFT_PITCH (degrees) point the
+            // camera for captures — e.g. face the afternoon sun for the lens
+            // flare. Yaw 0 looks +Z; -90 looks -X.
+            static const char* yawEnv = std::getenv("RYCRAFT_YAW");
+            static const char* pitchEnv = std::getenv("RYCRAFT_PITCH");
+            if (yawEnv || pitchEnv) {
+                constexpr float DEG = static_cast<float>(M_PI) / 180.0f;
+                state->camera.setLook(yawEnv ? std::atof(yawEnv) * DEG : 0.0f,
+                                      pitchEnv ? std::atof(pitchEnv) * DEG : 0.0f);
+            }
+
             state->spawnValidated = true;
         }
     }

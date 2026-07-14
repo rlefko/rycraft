@@ -633,12 +633,36 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         _bloom->renderBloom(commandBuffer, _colorResolve);
     }
 
+    // ---- Lens flare: project the sun to screen and probe its occlusion ----
+    float flareStrength = 0.0f;
+    simd_float2 sunUV = simd_make_float2(0.5f, 0.5f);
+    if (_gfx.lensFlare) {
+        // A direction (w=0) projects to the point at infinity where the sun disc
+        // sits; transformVec4 is the same column-major M*v the shaders use.
+        Vec4 sunClip =
+            vpMatrix.transformVec4({skyUniforms.sunDirection.x, skyUniforms.sunDirection.y,
+                                    skyUniforms.sunDirection.z, 0.0f});
+        if (sunClip.w > 1e-4f) { // sun in front of the camera
+            sunUV = simd_make_float2((sunClip.x / sunClip.w) * 0.5f + 0.5f,
+                                     0.5f - (sunClip.y / sunClip.w) * 0.5f);
+            // Fade out as the sun crosses the screen edge — the probe has no
+            // depth data outside the frame, and a hard cut would pop.
+            float edge =
+                std::min(std::min(sunUV.x, 1.0f - sunUV.x), std::min(sunUV.y, 1.0f - sunUV.y));
+            float fade = std::clamp((edge + 0.1f) / 0.2f, 0.0f, 1.0f);
+            flareStrength = skyUniforms.sunIntensity * fade;
+        }
+    }
+    if (flareStrength > 0.0f) {
+        _postStack->encodeFlareProbe(commandBuffer, _depthResolve, sunUV);
+    }
+
     // ---- Final composite (always runs: tonemap + grade + sharpen) ----
     // This is the one linear-HDR → display conversion; the pre-HDR pipeline
     // blitted raw when bloom was off, so that path was never tonemapped.
-    _postStack->encodeComposite(commandBuffer, _colorResolve,
-                                bloomOn ? _bloom->bloomTexture() : nil, drawable.texture, _gfx,
-                                static_cast<uint32_t>(_frameRing.frameIndex()));
+    _postStack->encodeComposite(
+        commandBuffer, _colorResolve, bloomOn ? _bloom->bloomTexture() : nil, drawable.texture,
+        _gfx, static_cast<uint32_t>(_frameRing.frameIndex()), flareStrength, sunUV);
 
     // ---- UI Overlay Pass (screen-space HUD at display resolution) ----
     auto uiPassDesc = [[MTLRenderPassDescriptor alloc] init];

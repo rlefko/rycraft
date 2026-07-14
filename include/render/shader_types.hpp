@@ -254,12 +254,23 @@ struct ExposureParams {
 // Uchimura tonemap, vibrance grade, optional CAS sharpen, dither. It always
 // runs, so the frame is tonemapped even with bloom off.
 struct PostUniforms {
-    simd_float2 resolution; // drawable size in pixels
-    float exposure;         // linear pre-tonemap multiplier
-    float bloomIntensity;   // 0 = bloom texture is the black fallback
-    float vibrance;         // 0..2 saturation-aware boost; 1 = stock look
-    float sharpening;       // 0..1 CAS strength; 0 = skip
-    uint32_t frameIndex;    // deterministic dither phase
+    simd_float2 resolution;  // drawable size in pixels
+    float exposure;          // linear pre-tonemap multiplier
+    float bloomIntensity;    // 0 = bloom texture is the black fallback
+    float vibrance;          // 0..2 saturation-aware boost; 1 = stock look
+    float sharpening;        // 0..1 CAS strength; 0 = skip
+    uint32_t frameIndex;     // deterministic dither phase
+    float flareStrength;     // 0 = flare off (setting off / sun behind camera)
+    simd_float2 sunScreenUV; // sun position in composite UV space
+};
+
+// Persistent lens-flare occlusion (device buffer, survives across frames).
+// The probe kernel eases visibility toward the fraction of sky depth taps
+// around the sun, so the flare fades smoothly behind terrain instead of
+// popping at silhouette edges. Bound at buffer(0) by the flareProbe kernel;
+// read at buffer(2) by the composite (post.metal).
+struct FlareState {
+    float visibility; // 0 sun fully occluded .. 1 fully visible
 };
 
 #ifndef __METAL_VERSION__
@@ -320,9 +331,12 @@ static_assert(offsetof(ParticleUniforms, cameraPosition) == 128);
 static_assert(sizeof(BloomUniforms) == 32);
 static_assert(offsetof(BloomUniforms, threshold) == 16);
 
-static_assert(sizeof(PostUniforms) == 32);
+static_assert(sizeof(PostUniforms) == 40);
 static_assert(offsetof(PostUniforms, exposure) == 8);
 static_assert(offsetof(PostUniforms, frameIndex) == 24);
+static_assert(offsetof(PostUniforms, flareStrength) == 28);
+static_assert(offsetof(PostUniforms, sunScreenUV) == 32);
+static_assert(sizeof(FlareState) == 4);
 
 static_assert(sizeof(SsaoUniforms) == 160);
 static_assert(offsetof(SsaoUniforms, invProjection) == 64);

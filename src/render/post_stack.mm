@@ -80,6 +80,44 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
     if (!_exposureBuffer) {
         RY_LOG_FATAL("Failed to allocate exposure state buffer");
     }
+
+    // ---- Lens-flare occlusion probe + persistent visibility ----
+    id<MTLFunction> flareFunc = [shaderLibrary newFunctionWithName:@"flareProbe"];
+    if (!flareFunc) {
+        RY_LOG_FATAL("Failed to load flareProbe compute function");
+    }
+    _flarePipelineState = [_device newComputePipelineStateWithFunction:flareFunc error:&error];
+    if (!_flarePipelineState) {
+        RY_LOG_FATAL("Failed to create flare probe pipeline state");
+    }
+    FlareState flareSeed{};
+    _flareBuffer = [_device newBufferWithBytes:&flareSeed
+                                        length:sizeof(FlareState)
+                                       options:MTLResourceStorageModeShared];
+    if (!_flareBuffer) {
+        RY_LOG_FATAL("Failed to allocate flare state buffer");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// encodeFlareProbe — one compute thread taps the depth around the sun and
+// eases the persistent visibility (see post.metal).
+// ---------------------------------------------------------------------------
+void PostStack::encodeFlareProbe(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneDepth,
+                                 simd_float2 sunScreenUV) {
+    if (!commandBuffer || !sceneDepth)
+        return;
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (!encoder)
+        return;
+    PostUniforms uniforms{};
+    uniforms.sunScreenUV = sunScreenUV;
+    [encoder setComputePipelineState:_flarePipelineState];
+    [encoder setTexture:sceneDepth atIndex:0];
+    [encoder setBuffer:_flareBuffer offset:0 atIndex:0];
+    [encoder setBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+    [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [encoder endEncoding];
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +158,8 @@ void PostStack::encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture
 // ---------------------------------------------------------------------------
 void PostStack::encodeComposite(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR,
                                 id<MTLTexture> bloomTexture, id<MTLTexture> outputTexture,
-                                const GraphicsSettings& gfx, uint32_t frameIndex) {
+                                const GraphicsSettings& gfx, uint32_t frameIndex,
+                                float flareStrength, simd_float2 sunScreenUV) {
     if (!commandBuffer || !sceneHDR || !outputTexture)
         return;
 
@@ -146,6 +185,8 @@ void PostStack::encodeComposite(id<MTLCommandBuffer> commandBuffer, id<MTLTextur
     uniforms.vibrance = static_cast<float>(gfx.vibrance) * 0.2f;
     uniforms.sharpening = static_cast<float>(gfx.sharpening) * 0.1f;
     uniforms.frameIndex = frameIndex;
+    uniforms.flareStrength = flareStrength;
+    uniforms.sunScreenUV = sunScreenUV;
 
     [encoder setRenderPipelineState:_compositePipelineState];
     [encoder setFragmentTexture:sceneHDR atIndex:0];
@@ -153,6 +194,7 @@ void PostStack::encodeComposite(id<MTLCommandBuffer> commandBuffer, id<MTLTextur
     [encoder setFragmentSamplerState:_linearSampler atIndex:0];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
     [encoder setFragmentBuffer:_exposureBuffer offset:0 atIndex:1];
+    [encoder setFragmentBuffer:_flareBuffer offset:0 atIndex:2];
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];

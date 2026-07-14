@@ -1178,13 +1178,16 @@ TEST_CASE("Shader types: BloomUniforms layout matches MSL", "[render][shader-typ
 }
 
 TEST_CASE("Shader types: PostUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(PostUniforms) == 32);
+    REQUIRE(sizeof(PostUniforms) == 40);
     REQUIRE(offsetof(PostUniforms, resolution) == 0);
     REQUIRE(offsetof(PostUniforms, exposure) == 8);
     REQUIRE(offsetof(PostUniforms, bloomIntensity) == 12);
     REQUIRE(offsetof(PostUniforms, vibrance) == 16);
     REQUIRE(offsetof(PostUniforms, sharpening) == 20);
     REQUIRE(offsetof(PostUniforms, frameIndex) == 24);
+    REQUIRE(offsetof(PostUniforms, flareStrength) == 28);
+    REQUIRE(offsetof(PostUniforms, sunScreenUV) == 32);
+    REQUIRE(sizeof(FlareState) == 4);
 }
 
 TEST_CASE("Shader types: SsaoUniforms layout matches MSL", "[render][shader-types]") {
