@@ -1,7 +1,7 @@
 # Metal shader compilation pipeline: each .metal -> .air, then all .air -> one .metallib
 
 shader_names = ['pipeline', 'ui_overlay', 'sky', 'bloom', 'clouds', 'particles', 'post', 'exposure',
-                'shadow', 'volumetrics']
+                'shadow', 'volumetrics', 'ssao']
 
 air_targets = []
 foreach name : shader_names

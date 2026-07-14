@@ -1054,6 +1054,16 @@ TEST_CASE("Shader types: PostUniforms layout matches MSL", "[render][shader-type
     REQUIRE(offsetof(PostUniforms, frameIndex) == 24);
 }
 
+TEST_CASE("Shader types: SsaoUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(SsaoUniforms) == 160);
+    REQUIRE(offsetof(SsaoUniforms, invProjection) == 64);
+    REQUIRE(offsetof(SsaoUniforms, resolution) == 128);
+    REQUIRE(offsetof(SsaoUniforms, radius) == 136);
+    REQUIRE(offsetof(SsaoUniforms, strength) == 140);
+    REQUIRE(offsetof(SsaoUniforms, bias) == 144);
+    REQUIRE(offsetof(SsaoUniforms, frameIndex) == 148);
+}
+
 TEST_CASE("Shader types: VolumetricUniforms layout matches MSL", "[render][shader-types]") {
     REQUIRE(sizeof(VolumetricUniforms) == 144);
     REQUIRE(offsetof(VolumetricUniforms, cameraPosition) == 64);

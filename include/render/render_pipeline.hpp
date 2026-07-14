@@ -35,6 +35,7 @@ class Bloom;
 class PostStack;
 class ShadowMap;
 class Volumetrics;
+class Ssao;
 class ParticleSystem;
 
 // GPU-side per-chunk mesh allocation tracking. opaqueIndexCount splits the
@@ -201,6 +202,9 @@ private:
 
     // Ray-marched volumetric light shafts (skipped when the setting is off)
     std::unique_ptr<Volumetrics> _volumetrics;
+
+    // Screen-space ambient occlusion (skipped when the setting is off)
+    std::unique_ptr<Ssao> _ssao;
 
     // The shadow sampling block the scene pass binds each frame — the
     // computed cascades when shadows are on, or a zeroed (strength 0) block

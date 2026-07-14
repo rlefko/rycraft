@@ -8,6 +8,7 @@
 #include "render/pixel_formats.hpp"
 #include "render/post_stack.hpp"
 #include "render/shadow_map.hpp"
+#include "render/ssao.hpp"
 #include "render/volumetrics.hpp"
 
 #include "engine/camera.hpp"
@@ -334,6 +335,9 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     _volumetrics =
         std::make_unique<Volumetrics>(_device, shaderLibrary, _displayWidth, _displayHeight);
 
+    // ---- Screen-space ambient occlusion ----
+    _ssao = std::make_unique<Ssao>(_device, shaderLibrary, _displayWidth, _displayHeight);
+
     // ---- Weather Particle System ----
     _particles = std::make_unique<ParticleSystem>(_device, shaderLibrary);
 
@@ -558,6 +562,23 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     }
 
     [encoder endEncoding];
+
+    // ---- Screen-space ambient occlusion (darkens creases/caves) ----
+    // Applied to the resolved opaque scene *before* water and volumetrics so it
+    // only darkens opaque ambient — never the translucent water surface or the
+    // additive light shafts, which AO (an opaque-ambient term) must not touch.
+    if (_gfx.ssao) {
+        SsaoUniforms su{};
+        std::memcpy(&su.projection, projectionMatrix.data.data(), sizeof(su.projection));
+        su.invProjection = simd_inverse(su.projection);
+        su.resolution = _ssao->resolution();
+        su.radius = 0.5f;
+        su.strength = 0.6f;
+        su.bias = 0.06f; // grazing ground has a steep depth slope; a bigger
+                         // bias keeps flat surfaces from self-occluding (streaks)
+        su.frameIndex = static_cast<uint32_t>(_frameRing.frameIndex());
+        _ssao->encode(commandBuffer, _colorResolve, _depthResolve, su);
+    }
 
     // ---- Water pass (refraction/reflection/caustics over the resolved scene) ----
     renderWater(commandBuffer, viewMatrix, projectionMatrix, camera.getPosition(), cameraUnderwater,
@@ -1394,6 +1415,9 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
     }
     if (_volumetrics) {
         _volumetrics->resize(_displayWidth, _displayHeight);
+    }
+    if (_ssao) {
+        _ssao->resize(_displayWidth, _displayHeight);
     }
 }
 

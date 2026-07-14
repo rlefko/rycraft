@@ -141,6 +141,21 @@ struct BloomUniforms {
     float blurRadius;       // Kawase blur radius in texels
 };
 
+// Screen-space ambient occlusion, bound at buffer(0) in ssao.metal. The
+// half-res generate pass reconstructs view-space position + a depth-derivative
+// normal from the resolved depth, samples a rotated hemisphere, and writes an
+// occlusion factor; the apply pass multiplies it (4-tap box upsampled) onto
+// the HDR scene to darken creases, corners, and enclosed spaces smoothly.
+struct SsaoUniforms {
+    simd_float4x4 projection;    // 0: view → clip, to project samples to screen
+    simd_float4x4 invProjection; // 64: clip → view, to reconstruct view pos
+    simd_float2 resolution;      // 128: half-res target size
+    float radius;                // 136: hemisphere radius in view units
+    float strength;              // 140: occlusion darkening
+    float bias;                  // 144: self-occlusion guard
+    uint32_t frameIndex;         // 148: deterministic rotation
+};
+
 // Volumetric light march, bound at buffer(0) in volumetrics.metal. The
 // half-res pass reconstructs each pixel's world ray from the resolved depth,
 // marches camera→scene sampling the shadow cascades, and accumulates sun
@@ -250,6 +265,12 @@ static_assert(offsetof(BloomUniforms, threshold) == 16);
 static_assert(sizeof(PostUniforms) == 32);
 static_assert(offsetof(PostUniforms, exposure) == 8);
 static_assert(offsetof(PostUniforms, frameIndex) == 24);
+
+static_assert(sizeof(SsaoUniforms) == 160);
+static_assert(offsetof(SsaoUniforms, invProjection) == 64);
+static_assert(offsetof(SsaoUniforms, resolution) == 128);
+static_assert(offsetof(SsaoUniforms, radius) == 136);
+static_assert(offsetof(SsaoUniforms, frameIndex) == 148);
 
 static_assert(sizeof(VolumetricUniforms) == 144);
 static_assert(offsetof(VolumetricUniforms, cameraPosition) == 64);
