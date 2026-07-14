@@ -297,6 +297,36 @@ TEST_CASE("Snapshot mesher: -X border wall culled against a solid neighbor",
     }
 }
 
+TEST_CASE("MegaBuffer free-list coalescing is bounds-safe and lossless", "[render][megabuffer]") {
+    using Region = std::pair<uint64_t, uint64_t>;
+
+    // Regression: a single-entry list made the old compaction write one
+    // element past the vector's end — slow heap corruption that surfaced as
+    // buzzing audio and malloc traps minutes into a session.
+    std::vector<Region> single = {{256, 512}};
+    MegaBuffer::coalesceFreeList(single);
+    REQUIRE(single == std::vector<Region>{{256, 512}});
+
+    // Adjacent regions merge (any input order)…
+    std::vector<Region> adjacent = {{768, 256}, {256, 512}};
+    MegaBuffer::coalesceFreeList(adjacent);
+    REQUIRE(adjacent == std::vector<Region>{{256, 768}});
+
+    // …gaps survive, and the LAST region is kept (the old code erased it)
+    std::vector<Region> gapped = {{0, 256}, {512, 256}, {2048, 256}};
+    MegaBuffer::coalesceFreeList(gapped);
+    REQUIRE(gapped == std::vector<Region>{{0, 256}, {512, 256}, {2048, 256}});
+
+    // Chain of three merges into one
+    std::vector<Region> chain = {{512, 256}, {0, 512}, {768, 1024}};
+    MegaBuffer::coalesceFreeList(chain);
+    REQUIRE(chain == std::vector<Region>{{0, 1792}});
+
+    std::vector<Region> empty;
+    MegaBuffer::coalesceFreeList(empty);
+    REQUIRE(empty.empty());
+}
+
 TEST_CASE("MeshScheduler: builds off-thread with version stamps", "[render][scheduler]") {
     World world(42, 2);
     for (int dz = -1; dz <= 1; ++dz)

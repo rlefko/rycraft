@@ -144,39 +144,37 @@ void MegaBuffer::uploadIndices(const void* data, size_t size, uint64_t offset) {
     std::memcpy(static_cast<uint8_t*>([_indexBuffer contents]) + offset, data, size);
 }
 
+void MegaBuffer::coalesceFreeList(std::vector<std::pair<uint64_t, uint64_t>>& freeList) {
+    if (freeList.empty()) {
+        return;
+    }
+    std::sort(freeList.begin(), freeList.end());
+    // Canonical compaction: the first element is both the first read and
+    // the first write slot; writeIt always points at the last kept region.
+    auto writeIt = freeList.begin();
+    for (auto readIt = std::next(freeList.begin()); readIt != freeList.end(); ++readIt) {
+        if (writeIt->first + writeIt->second == readIt->first) {
+            writeIt->second += readIt->second;
+        } else {
+            *(++writeIt) = *readIt;
+        }
+    }
+    freeList.erase(std::next(writeIt), freeList.end());
+}
+
 void MegaBuffer::free(ChunkAllocation& alloc) {
     std::lock_guard lock(_mutex);
 
     if (alloc.vertexCount > 0) {
         uint64_t vertexBytes = alignUp(alloc.vertexCount * sizeof(Vertex));
         _vertexFreeList.push_back({alloc.vertexOffset, vertexBytes});
-        // Merge adjacent regions
-        std::sort(_vertexFreeList.begin(), _vertexFreeList.end());
-        auto writeIt = _vertexFreeList.begin();
-        for (auto readIt = _vertexFreeList.begin(); readIt != _vertexFreeList.end(); ++readIt) {
-            if (readIt != writeIt && (*writeIt).first + (*writeIt).second == readIt->first) {
-                (*writeIt).second += readIt->second;
-            } else {
-                *(++writeIt) = *readIt;
-            }
-        }
-        _vertexFreeList.erase(writeIt, _vertexFreeList.end());
+        coalesceFreeList(_vertexFreeList);
     }
 
     if (alloc.indexCount > 0) {
         uint64_t indexBytes = alignUp(alloc.indexCount * sizeof(uint32_t));
         _indexFreeList.push_back({alloc.indexOffset, indexBytes});
-        // Merge adjacent regions
-        std::sort(_indexFreeList.begin(), _indexFreeList.end());
-        auto writeIt = _indexFreeList.begin();
-        for (auto readIt = _indexFreeList.begin(); readIt != _indexFreeList.end(); ++readIt) {
-            if (readIt != writeIt && (*writeIt).first + (*writeIt).second == readIt->first) {
-                (*writeIt).second += readIt->second;
-            } else {
-                *(++writeIt) = *readIt;
-            }
-        }
-        _indexFreeList.erase(writeIt, _indexFreeList.end());
+        coalesceFreeList(_indexFreeList);
     }
 
     alloc.vertexBuffer = nil;
