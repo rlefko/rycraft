@@ -141,6 +141,24 @@ struct BloomUniforms {
     float blurRadius;       // Kawase blur radius in texels
 };
 
+// Volumetric light march, bound at buffer(0) in volumetrics.metal. The
+// half-res pass reconstructs each pixel's world ray from the resolved depth,
+// marches camera→scene sampling the shadow cascades, and accumulates sun
+// in-scatter (Henyey-Greenstein phase). Composited additively onto the HDR
+// scene. The shadow cascade data rides the shared ShadowUniforms at buffer(1).
+struct VolumetricUniforms {
+    simd_float4x4 invViewProjection; // 0: clip → world, to place the scene hit
+    simd_float3 cameraPosition;      // 64
+    simd_float3 sunDirection;        // 80: active light (sun or moon)
+    simd_float3 sunColor;            // 96
+    float stepCount;                 // 112
+    float density;                   // 116: in-scatter per world unit
+    float anisotropy;                // 120: HG g (forward scatter toward the sun)
+    float maxDistance;               // 124: march cap in world units
+    float underwater;                // 128: 1 when the camera is submerged
+    uint32_t frameIndex;             // 132: deterministic dither offset
+};
+
 // Persistent auto-exposure state (device buffer, survives across frames).
 // The reduction kernel blends each frame's average scene luminance into
 // smoothedLogLum and derives the exposure the composite multiplies by; the
@@ -232,6 +250,12 @@ static_assert(offsetof(BloomUniforms, threshold) == 16);
 static_assert(sizeof(PostUniforms) == 32);
 static_assert(offsetof(PostUniforms, exposure) == 8);
 static_assert(offsetof(PostUniforms, frameIndex) == 24);
+
+static_assert(sizeof(VolumetricUniforms) == 144);
+static_assert(offsetof(VolumetricUniforms, cameraPosition) == 64);
+static_assert(offsetof(VolumetricUniforms, stepCount) == 112);
+static_assert(offsetof(VolumetricUniforms, underwater) == 128);
+static_assert(offsetof(VolumetricUniforms, frameIndex) == 132);
 
 static_assert(sizeof(ExposureState) == 8);
 static_assert(offsetof(ExposureState, exposure) == 4);

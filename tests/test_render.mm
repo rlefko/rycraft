@@ -1054,6 +1054,16 @@ TEST_CASE("Shader types: PostUniforms layout matches MSL", "[render][shader-type
     REQUIRE(offsetof(PostUniforms, frameIndex) == 24);
 }
 
+TEST_CASE("Shader types: VolumetricUniforms layout matches MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(VolumetricUniforms) == 144);
+    REQUIRE(offsetof(VolumetricUniforms, cameraPosition) == 64);
+    REQUIRE(offsetof(VolumetricUniforms, sunDirection) == 80);
+    REQUIRE(offsetof(VolumetricUniforms, sunColor) == 96);
+    REQUIRE(offsetof(VolumetricUniforms, stepCount) == 112);
+    REQUIRE(offsetof(VolumetricUniforms, underwater) == 128);
+    REQUIRE(offsetof(VolumetricUniforms, frameIndex) == 132);
+}
+
 TEST_CASE("Shader types: ExposureState + ExposureParams layout match MSL",
           "[render][shader-types]") {
     REQUIRE(sizeof(ExposureState) == 8);

@@ -8,6 +8,7 @@
 #include "render/pixel_formats.hpp"
 #include "render/post_stack.hpp"
 #include "render/shadow_map.hpp"
+#include "render/volumetrics.hpp"
 
 #include "engine/camera.hpp"
 #include "engine/hotbar.hpp"
@@ -329,6 +330,10 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     // ---- Cascaded shadow maps (share the chunk vertex layout) ----
     _shadowMap = std::make_unique<ShadowMap>(_device, shaderLibrary, vertexDesc);
 
+    // ---- Volumetric light shafts ----
+    _volumetrics =
+        std::make_unique<Volumetrics>(_device, shaderLibrary, _displayWidth, _displayHeight);
+
     // ---- Weather Particle System ----
     _particles = std::make_unique<ParticleSystem>(_device, shaderLibrary);
 
@@ -558,6 +563,28 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderWater(commandBuffer, viewMatrix, projectionMatrix, camera.getPosition(), cameraUnderwater,
                 skyUniforms, fogColor, worldTime);
     _fogDensity = savedFogDensity;
+
+    // ---- Volumetric light shafts (over the resolved opaque + water) ----
+    // Needs the shadow cascades: when shadows are off their matrices are zero
+    // and the march would divide by zero, so gate on shadowQuality too.
+    if (_gfx.volumetricLight && _gfx.shadowQuality > 0 && shadowStrength > 0.001f) {
+        VolumetricUniforms vu{};
+        std::memcpy(&vu.invViewProjection, &vpMatrix, sizeof(vu.invViewProjection));
+        vu.invViewProjection = simd_inverse(vu.invViewProjection);
+        Vec3 camPos = camera.getPosition();
+        vu.cameraPosition = simd_make_float3(camPos.x, camPos.y, camPos.z);
+        vu.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
+        vu.sunColor = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
+        vu.stepCount = 24.0f;
+        vu.density = 0.055f;
+        vu.anisotropy = 0.6f; // forward scatter → bright halo toward the light
+        vu.maxDistance = 96.0f;
+        vu.underwater = cameraUnderwater ? 1.0f : 0.0f;
+        vu.frameIndex = static_cast<uint32_t>(_frameRing.frameIndex());
+        _volumetrics->encode(commandBuffer, _colorResolve, _depthResolve,
+                             _shadowMap->depthTexture(), _shadowMap->comparisonSampler(), vu,
+                             _sceneShadowUniforms);
+    }
 
     // ---- Auto-exposure (measure the finished HDR scene, ease adaptation) ----
     _postStack->encodeExposure(commandBuffer, _colorResolve);
@@ -1364,6 +1391,9 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
 
     if (_bloom) {
         _bloom->resize(_displayWidth, _displayHeight);
+    }
+    if (_volumetrics) {
+        _volumetrics->resize(_displayWidth, _displayHeight);
     }
 }
 

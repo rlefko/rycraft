@@ -392,8 +392,10 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// Underwater overlay — fullscreen veil + god rays when the camera is
-// submerged, drawn after the water surfaces with alpha blending.
+// Underwater overlay — fullscreen veil + floor caustics when the camera is
+// submerged, drawn after the water surfaces with alpha blending. The light
+// shafts are now the real ray-marched volumetric pass (volumetrics.metal),
+// which replaced the old fake banded screen-space rays here.
 // ---------------------------------------------------------------------------
 struct OverlayVertexOutput {
     float4 clipPosition [[position]];
@@ -412,15 +414,8 @@ vertex OverlayVertexOutput underwaterOverlayVertex(uint vertexID [[vertex_id]]) 
 fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
                                           depth2d<float> sceneDepth [[texture(1)]],
                                           constant WaterUniforms& water [[buffer(3)]]) {
-    // Slanted shafts of light, banded and animated, fading with depth on
-    // screen (light enters from the surface above)
-    float slant = in.uv.x * 1.4f + in.uv.y * 0.6f;
     float t = water.time;
-    float rays = pow(max(sin(slant * 9.0f - t * 0.7f) * 0.5f + 0.5f, 0.0f), 3.0f) * 0.5f +
-                 pow(max(sin(slant * 17.0f + t * 0.45f + 1.7f) * 0.5f + 0.5f, 0.0f), 4.0f) * 0.35f;
-    float topFade = pow(saturate(1.0f - in.uv.y), 1.5f);
     float sunUp = saturate(water.sunDirection.y);
-    float3 rayColor = water.sunColor * rays * topFade * sunUp * 0.9f;
 
     // Caustics on every submerged surface around the camera — the water
     // pass only shades pixels behind a surface quad, so without this the
@@ -443,7 +438,7 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     float3 causticColor = water.sunColor * caustic * upFacing * submerged * sunUp * 2.4f;
 
     float3 veil = float3(0.05f, 0.18f, 0.32f);
-    return float4(veil + rayColor + causticColor, 0.35f);
+    return float4(veil + causticColor, 0.35f);
 }
 
 // ---------------------------------------------------------------------------

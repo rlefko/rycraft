@@ -34,6 +34,7 @@ class UIOverlay;
 class Bloom;
 class PostStack;
 class ShadowMap;
+class Volumetrics;
 class ParticleSystem;
 
 // GPU-side per-chunk mesh allocation tracking. opaqueIndexCount splits the
@@ -197,6 +198,9 @@ private:
 
     // Cascaded sun/moon shadow maps (skipped when shadowQuality is 0)
     std::unique_ptr<ShadowMap> _shadowMap;
+
+    // Ray-marched volumetric light shafts (skipped when the setting is off)
+    std::unique_ptr<Volumetrics> _volumetrics;
 
     // The shadow sampling block the scene pass binds each frame — the
     // computed cascades when shadows are on, or a zeroed (strength 0) block
