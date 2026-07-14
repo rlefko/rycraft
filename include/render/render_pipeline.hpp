@@ -87,8 +87,8 @@ public:
     void render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable, const Mat4& viewMatrix,
                 const Mat4& projectionMatrix, const World& world, const Camera& camera,
                 uint64_t worldTime = 0, double deltaSeconds = 0.0,
-                std::optional<Vec3> highlightedBlock = std::nullopt, const Hotbar& hotbar = Hotbar(),
-                const UIFrameState& uiFrame = UIFrameState{},
+                std::optional<Vec3> highlightedBlock = std::nullopt,
+                const Hotbar& hotbar = Hotbar(), const UIFrameState& uiFrame = UIFrameState{},
                 const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
 
     // Reallocate MSAA and resolve textures for new viewport size.

@@ -320,10 +320,12 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
                     const BlockType bt = blockTypes[idx(z, x, gridW)];
                     const uint8_t sky = cellLight[idx(z, x, gridW)];
                     const uint8_t bl = cellBlockLight[idx(z, x, gridW)];
+                    const float fx = static_cast<float>(x);
+                    const float fz = static_cast<float>(z);
                     for (int sz = 0; sz < sub; ++sz) {
                         for (int sx = 0; sx < sub; ++sx) {
-                            const float x0 = static_cast<float>(x) + static_cast<float>(sx) * topTessStep;
-                            const float z0 = static_cast<float>(z) + static_cast<float>(sz) * topTessStep;
+                            const float x0 = fx + static_cast<float>(sx) * topTessStep;
+                            const float z0 = fz + static_cast<float>(sz) * topTessStep;
                             const float x1 = x0 + topTessStep;
                             const float z1 = z0 + topTessStep;
                             // CCW from above, matching the greedy +Y winding
