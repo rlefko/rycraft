@@ -47,6 +47,13 @@ constant float3 SSAO_KERNEL[12] = {
     float3(0.24f, 0.52f, 0.48f),   float3(-0.44f, 0.40f, 0.66f), float3(0.10f, 0.08f, 0.78f),
 };
 
+// How much the self-occlusion guard grows with the surface's per-texel depth
+// span. Grazing far ground spans several world units per half-res texel, so a
+// fixed bias can't cover the depth-quantization error there and the ground
+// bands; scaling by the local span keeps flat grazing ground quiet while
+// face-on ground (small span) still darkens creases at the fixed base bias.
+constant float SSAO_SLOPE_BIAS = 4.0f;
+
 fragment float4 ssaoGenerateFragment(SsaoVertexOut in [[stage_in]],
                                      depth2d<float> sceneDepth [[texture(0)]],
                                      constant SsaoUniforms& s [[buffer(0)]]) {
@@ -59,21 +66,41 @@ fragment float4 ssaoGenerateFragment(SsaoVertexOut in [[stage_in]],
 
     float3 origin = viewPosFromDepth(in.vUV, depth, s);
 
-    // Normal from view-space depth derivatives (flat voxel faces → near exact).
+    // View-space neighbours on BOTH sides, then reconstruct the normal from the
+    // side with the smaller depth step. A one-sided derivative straddles a
+    // crease (reading a normal halfway into a wall) and — the cause of the
+    // reported scanlines — turns the depth-quantized far ground into a wobbling
+    // normal, so flat grazing ground self-occluded in horizontal bands. The
+    // best-of-both-sides pick reads the continuous surface in either case.
     float2 texel = 1.0f / s.resolution;
-    float3 px =
+    float3 posL =
+        viewPosFromDepth(in.vUV - float2(texel.x, 0.0f),
+                         sceneDepth.sample(depthSampler, in.vUV - float2(texel.x, 0.0f)), s);
+    float3 posR =
         viewPosFromDepth(in.vUV + float2(texel.x, 0.0f),
                          sceneDepth.sample(depthSampler, in.vUV + float2(texel.x, 0.0f)), s);
-    float3 py =
+    float3 posD =
+        viewPosFromDepth(in.vUV - float2(0.0f, texel.y),
+                         sceneDepth.sample(depthSampler, in.vUV - float2(0.0f, texel.y)), s);
+    float3 posU =
         viewPosFromDepth(in.vUV + float2(0.0f, texel.y),
                          sceneDepth.sample(depthSampler, in.vUV + float2(0.0f, texel.y)), s);
-    float3 normal = normalize(cross(px - origin, py - origin));
+    float3 ddx =
+        (abs(posR.z - origin.z) < abs(origin.z - posL.z)) ? (posR - origin) : (origin - posL);
+    float3 ddy =
+        (abs(posU.z - origin.z) < abs(origin.z - posD.z)) ? (posU - origin) : (origin - posD);
+    float3 normal = normalize(cross(ddx, ddy));
     // Force it to face the camera (view +Z): the derivative winding can point
     // it into the surface, which would aim the hemisphere INTO the geometry
     // and read every pixel as fully occluded (near ground went black).
     if (normal.z < 0.0f) {
         normal = -normal;
     }
+
+    // Depth span of one texel along the surface (measured on the continuous
+    // side, so a crease keeps a tight guard). Grazing far ground has a large
+    // span; the self-occlusion bias grows with it so the ground stops banding.
+    float adaptiveBias = s.bias + (abs(ddx.z) + abs(ddy.z)) * SSAO_SLOPE_BIAS;
 
     // Per-pixel rotation angle (IGN) to decorrelate the fixed kernel.
     float2 fragPx = in.clipPosition.xy + float2(s.frameIndex % 4u) * 7.13f;
@@ -101,16 +128,15 @@ fragment float4 ssaoGenerateFragment(SsaoVertexOut in [[stage_in]],
         float3 occluderView = viewPosFromDepth(sampleUV, sampleDepth, s);
 
         // Occluded when the visible geometry at the sample rises above the
-        // receiver's tangent plane by more than the bias. A raw view-z compare
-        // broke down at grazing angles: one texel of flat ground spans a large
-        // depth range, so quantization made the ground occlude itself in
-        // horizontal bands. Measured perpendicular to the surface instead,
-        // that same error lies IN the plane and cancels, while real occluders
-        // (a block face above the ground) still stand proud of it.
+        // receiver's tangent plane by more than the bias. Measuring the rise
+        // perpendicular to the surface (not a raw view-z compare) keeps the
+        // grazing-ground quantization error IN the plane where it cancels; the
+        // depth-span-scaled adaptiveBias then absorbs what's left, while real
+        // occluders (a block face above the ground) still stand proud of it.
         float3 toOccluder = occluderView - origin;
         float planeDist = dot(toOccluder, normal);
         float rangeCheck = smoothstep(0.0f, 1.0f, s.radius / max(length(toOccluder), 1e-4f));
-        if (planeDist > s.bias) {
+        if (planeDist > adaptiveBias) {
             occlusion += rangeCheck;
         }
     }
