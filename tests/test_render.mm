@@ -230,6 +230,37 @@ TEST_CASE("Mesher: interior water-water faces are culled", "[render][mesher][wat
     REQUIRE(waterIndexCount == 30);
 }
 
+TEST_CASE("Snapshot mesher: water top tessellates into a seamless sub-grid",
+          "[render][mesher][water]") {
+    // The game (padded snapshot) path emits the water top as a uniform
+    // half-block grid instead of a single greedy quad, so the wave-displaced
+    // surface stays seamless across chunk borders (coincident border vertices
+    // displace identically). A single water block on stone: the top cell
+    // becomes a 2x2 sub-grid, the four sides stay greedy, the bottom is hidden.
+    MeshSnapshot snapshot;
+    snapshot.resize();
+    snapshot.blocks[MeshSnapshot::index(8, 60, 8)] = BlockType::STONE;
+    snapshot.blocks[MeshSnapshot::index(8, 61, 8)] = BlockType::WATER;
+
+    MeshScratch scratch;
+    MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+
+    // Top: 1 cell / 0.5 step = 2x2 = 4 sub-quads. Sides: 4 greedy quads.
+    const int sub = 2; // 1.0 / WATER_TESS_STEP(0.5)
+    const uint32_t expectedWaterIndices = static_cast<uint32_t>((sub * sub + 4) * 6);
+    uint32_t waterIndexCount =
+        static_cast<uint32_t>(output.indices.size()) - output.opaqueIndexCount;
+    REQUIRE(waterIndexCount == expectedWaterIndices);
+
+    // The tessellated top still sits at the fp16-exact 0.125 drop (61.875)
+    bool foundDroppedTop = false;
+    for (const Vertex& v : output.vertices) {
+        if (static_cast<float>(v.py) == 61.875f)
+            foundDroppedTop = true;
+    }
+    REQUIRE(foundDroppedTop);
+}
+
 TEST_CASE("Mesher: lava renders as an opaque cube section", "[render][mesher][water]") {
     Chunk chunk(0, 0);
     chunk.setBlock(8, 8, 8, BlockType::LAVA);

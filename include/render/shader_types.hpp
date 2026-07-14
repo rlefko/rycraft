@@ -43,6 +43,49 @@ static inline metal::float3 applySway(metal::float3 worldPos, uint sway, float v
     }
     return worldPos;
 }
+
+// Water surface waves. The three directional waves live in ONE table so the
+// vertex displacement (waterWaveHeight) and the fragment normal
+// (waterSurfaceNormal) can never drift apart — editing the sea updates both
+// (the same never-drift rule as applySway). A gentle sea, not chop, in world
+// space so it stays continuous across chunk borders: coincident border
+// vertices from the uniform water tessellation displace identically.
+struct WaterWave {
+    metal::float2 dir; // travel direction (unit-ish)
+    float freq;        // spatial frequency (radians per block)
+    float amp;         // crest height in blocks
+    float speed;       // temporal frequency (radians per second)
+};
+constant WaterWave WATER_WAVES[3] = {
+    {metal::float2(0.80f, 0.60f), 0.52f, 0.060f, 1.1f},
+    {metal::float2(-0.50f, 0.87f), 0.80f, 0.035f, 1.5f},
+    {metal::float2(0.20f, -0.98f), 1.05f, 0.020f, 2.1f},
+};
+
+static inline float waterWaveHeight(metal::float2 p, float t) {
+    float h = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        WaterWave w = WATER_WAVES[i];
+        h += w.amp * metal::sin(metal::dot(p, w.dir) * w.freq + t * w.speed);
+    }
+    return h;
+}
+
+// Analytic normal of the same wave field (the gradient of waterWaveHeight,
+// d/dp of A*sin(dot(p,D)*K + t*S) = A*D*K*cos(...)) plus a faint fine ripple
+// for specular sparkle. The slope scale keeps the surface glassy.
+static inline metal::float3 waterSurfaceNormal(metal::float2 p, float t) {
+    metal::float2 g = metal::float2(0.0f, 0.0f);
+    for (int i = 0; i < 3; ++i) {
+        WaterWave w = WATER_WAVES[i];
+        g += w.amp * w.freq * w.dir * metal::cos(metal::dot(p, w.dir) * w.freq + t * w.speed);
+    }
+    // Faint fine ripple, shading only (not displaced), for sparkle
+    g += 0.008f *
+         metal::float2(metal::cos(p.x * 1.9f + t * 2.3f), metal::cos(p.y * 2.2f - t * 2.0f));
+    const float slope = 1.5f;
+    return metal::normalize(metal::float3(-g.x * slope, 1.0f, -g.y * slope));
+}
 #endif
 
 // Bound at buffer(1) in the main chunk/highlight shaders.

@@ -46,6 +46,17 @@ inline static bool waterFaceVisible(BlockType cur, BlockType neighbor) {
     return cur == BlockType::WATER && neighbor != BlockType::WATER && !isOpaque(neighbor);
 }
 
+// Water-top tessellation step (world blocks). The near water surface is emitted
+// as a uniform grid at this step instead of greedy-merged quads: the vertex
+// shader displaces the surface by a world-space wave, and greedy merging let
+// each chunk choose its own quad edges, so a straight border edge on one side
+// met a displaced interior vertex on the other and opened a shimmering
+// T-junction crack. A fixed step shared by every chunk keeps border vertices
+// coincident, so the same world-space displacement seals the seam. 0.5 is a
+// multiple of 0.125 (fp16-exact in chunk-local space) and divides a block
+// evenly, so adjacent chunks share the exact edge vertices.
+inline static constexpr float WATER_TESS_STEP = 0.5f;
+
 // One vertex of a quad corner: position + UV (UVs span the quad extent in
 // blocks so the repeat sampler tiles the texture per block).
 struct QuadCorner {
@@ -190,8 +201,8 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
 template <typename Access, typename LightAccess, typename Visible>
 static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBlock,
                             const LightAccess& getBlockLight, const Visible& visible,
-                            const auto& lightAt, float topDrop, bool padded, bool bakeAO,
-                            MeshScratch& scratch, std::vector<Vertex>& outVertices,
+                            const auto& lightAt, float topDrop, float topTessStep, bool padded,
+                            bool bakeAO, MeshScratch& scratch, std::vector<Vertex>& outVertices,
                             std::vector<uint32_t>& outIndices) {
     std::vector<bool>& faceMask = scratch.faceMask;
     std::vector<BlockType>& blockTypes = scratch.blockTypes;
@@ -297,8 +308,41 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
             pushQuad(verts, idxs, face, bt, skyLight, corners, ao, blockLight);
         };
 
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, cellBlockLight, cellAO,
-                        merged, FaceNormal::PLUS_Y, outVertices, outIndices, emitQuad);
+        if (topTessStep > 0.0f) {
+            // Water top: emit a uniform sub-grid instead of greedy quads so the
+            // wave-displaced surface stays seamless across chunk borders (see
+            // WATER_TESS_STEP). Water carries no baked AO, so cellAO is unused.
+            const int sub = static_cast<int>(1.0f / topTessStep + 0.5f);
+            const float y = static_cast<float>(ly + 1) - topDrop;
+            for (int z = 0; z < gridD; ++z) {
+                for (int x = 0; x < gridW; ++x) {
+                    if (!faceMask[idx(z, x, gridW)]) continue;
+                    const BlockType bt = blockTypes[idx(z, x, gridW)];
+                    const uint8_t sky = cellLight[idx(z, x, gridW)];
+                    const uint8_t bl = cellBlockLight[idx(z, x, gridW)];
+                    for (int sz = 0; sz < sub; ++sz) {
+                        for (int sx = 0; sx < sub; ++sx) {
+                            const float x0 = static_cast<float>(x) + static_cast<float>(sx) * topTessStep;
+                            const float z0 = static_cast<float>(z) + static_cast<float>(sz) * topTessStep;
+                            const float x1 = x0 + topTessStep;
+                            const float z1 = z0 + topTessStep;
+                            // CCW from above, matching the greedy +Y winding
+                            const QuadCorner corners[4] = {
+                                {x0, y, z0, 0.f, 0.f},
+                                {x1, y, z0, 1.f, 0.f},
+                                {x1, y, z1, 1.f, 1.f},
+                                {x0, y, z1, 0.f, 1.f},
+                            };
+                            pushQuad(outVertices, outIndices, FaceNormal::PLUS_Y, bt, sky, corners,
+                                     AO_ALL_OPEN, bl);
+                        }
+                    }
+                }
+            }
+        } else {
+            meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, cellBlockLight, cellAO,
+                            merged, FaceNormal::PLUS_Y, outVertices, outIndices, emitQuad);
+        }
     }
 
     // ======================================================================
@@ -580,8 +624,8 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
 
     // Typical full chunks mesh to a few thousand vertices; growth beyond
     // this is amortized (the old code reserved 1.5 MB per build)
-    output.vertices.reserve(8192);
-    output.indices.reserve(12288);
+    output.vertices.reserve(12288);
+    output.indices.reserve(18432);
 
     // ---- Column skylight ----
     // The first open Y above the topmost OPAQUE block per column, computed
@@ -615,7 +659,8 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
 
     // ---- Opaque section: cubes (with baked corner AO), then flora crosses ----
     runGreedyPasses(gridW, gridH, gridD, getBlock, getBlockLight, cubeFaceVisible, lightAt, 0.f,
-                    padded, /*bakeAO=*/true, scratch, output.vertices, output.indices);
+                    /*topTessStep=*/0.f, padded, /*bakeAO=*/true, scratch, output.vertices,
+                    output.indices);
 
     if (emitFlora) {
         for (int z = 0; z < gridD; ++z) {
@@ -638,15 +683,16 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
     output.opaqueIndexCount = static_cast<uint32_t>(output.indices.size());
     if (padded) {
         runGreedyPasses(gridW, gridH, gridD, getBlock, getBlockLight, waterFaceVisible, lightAt,
-                        0.125f, padded, /*bakeAO=*/false, scratch, output.vertices, output.indices);
+                        0.125f, WATER_TESS_STEP, padded, /*bakeAO=*/false, scratch, output.vertices,
+                        output.indices);
     } else {
         auto waterEdgeBlock = [&getBlock, gridW, gridD](int x, int y, int z) -> BlockType {
             if (x < 0 || x >= gridW || z < 0 || z >= gridD) return BlockType::WATER;
             return getBlock(x, y, z);
         };
         runGreedyPasses(gridW, gridH, gridD, waterEdgeBlock, getBlockLight, waterFaceVisible,
-                        lightAt, 0.125f, padded, /*bakeAO=*/false, scratch, output.vertices,
-                        output.indices);
+                        lightAt, 0.125f, /*topTessStep=*/0.f, padded, /*bakeAO=*/false, scratch,
+                        output.vertices, output.indices);
     }
 
     return output;

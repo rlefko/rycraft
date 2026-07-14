@@ -359,10 +359,10 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
     float3 pos = in.position + chunkOrigin.origin.xyz;
     uint normalIdx = in.faceAttr & 7u;
     if (normalIdx == FACE_PLUS_Y) {
-        // Top surfaces bob gently; world-space input keeps waves continuous
-        // across chunk borders
-        pos.y +=
-            sin(pos.x * 0.55f + water.time * 1.4f) * cos(pos.z * 0.45f + water.time * 1.1f) * 0.04f;
+        // Top surfaces ride the shared wave field; world-space input keeps the
+        // waves continuous across chunk borders (the uniform tessellation emits
+        // coincident border vertices, so both chunks displace them identically)
+        pos.y += waterWaveHeight(pos.xz, water.time);
     }
 
     WaterVertexOutput out;
@@ -373,24 +373,43 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
     return out;
 }
 
-// Analytic normal of the same wave field the vertex stage displaces with,
-// plus a faint finer ripple set for sparkle. The slope scale keeps the
-// surface glassy — pushing it higher reads as chop.
-static float3 waterWaveNormal(float2 p, float t) {
-    float ddx = 0.55f * cos(p.x * 0.55f + t * 1.4f) * cos(p.y * 0.45f + t * 1.1f) * 0.04f +
-                cos(p.x * 1.9f + t * 2.3f) * 0.9f * 0.008f;
-    float ddz = -0.45f * sin(p.x * 0.55f + t * 1.4f) * sin(p.y * 0.45f + t * 1.1f) * 0.04f +
-                cos(p.y * 2.2f - t * 2.0f) * 1.1f * 0.008f;
-    return normalize(float3(-ddx * 2.5f, 1.0f, -ddz * 2.5f));
+// Cheap 2D value hash -> point in [0,1]^2, for the Voronoi caustic cells.
+static float2 causticHash(float2 c) {
+    float2 p = float2(dot(c, float2(127.1f, 311.7f)), dot(c, float2(269.5f, 183.3f)));
+    return fract(sin(p) * 43758.5453f);
 }
 
-// Interfering sine bands sharpened into bright filaments — the classic
-// cheap caustic, projected on the floor's world xz.
+// Animated Voronoi caustic web. Each grid cell owns a feature point that
+// drifts on a circle over time; the bright filaments sit where two cells are
+// nearly equidistant (F2 - F1 small), which reads as refracted-sunlight
+// caustics rather than the axis-aligned grid the old summed sines produced.
+// Two octaves at different scale and drift keep it organic.
 static float causticPattern(float2 p, float t) {
-    float c1 = sin(p.x * 0.9f + t * 1.7f) + sin(p.y * 1.1f - t * 1.3f);
-    float c2 = sin((p.x + p.y) * 0.7f + t * 2.1f) + sin((p.x - p.y) * 0.8f + t * 1.1f);
-    float c = (c1 + c2) * 0.25f;
-    return pow(saturate(1.0f - abs(c)), 6.0f);
+    float web = 0.0f;
+    float amp = 1.0f;
+    for (int layer = 0; layer < 2; ++layer) {
+        float2 sp = p * (1.0f + 0.9f * float(layer)) + float2(3.7f * float(layer));
+        float2 cell = floor(sp);
+        float2 f = fract(sp);
+        float f1 = 8.0f, f2 = 8.0f;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                float2 g = float2(dx, dy);
+                float2 o = causticHash(cell + g);
+                o = 0.5f + 0.5f * sin(t * (0.9f + 0.3f * float(layer)) + 6.2831853f * o);
+                float d = length(g + o - f);
+                if (d < f1) {
+                    f2 = f1;
+                    f1 = d;
+                } else if (d < f2) {
+                    f2 = d;
+                }
+            }
+        }
+        web += amp * smoothstep(0.16f, 0.0f, f2 - f1); // bright where cells meet
+        amp *= 0.55f;
+    }
+    return pow(saturate(web), 1.4f);
 }
 
 // World position of a screen UV + its stored depth, via the camera inverse.
@@ -481,7 +500,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     }
 
     float3 V = normalize(water.cameraPosition - in.vWorldPosition);
-    float3 N = waterWaveNormal(in.vWorldPosition.xz, water.time);
+    float3 N = waterSurfaceNormal(in.vWorldPosition.xz, water.time);
     bool fromBelow = water.cameraUnderwater > 0.5f;
 
     // Reconstruct the opaque world position behind this fragment
@@ -505,8 +524,8 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     float3 rworld = reconstructWorld(refractUV, refractDepth, water);
     float depthBelow = max(in.vWorldPosition.y - rworld.y, 0.0f);
 
-    // ---- Caustics: bright ripple filaments on the shallow floor
-    float caustic = causticPattern(rworld.xz * 0.6f, water.time) * exp(-depthBelow * 0.22f);
+    // ---- Caustics: refracted-light web on the shallow floor (~3.5 block cells)
+    float caustic = causticPattern(rworld.xz * 0.28f, water.time) * exp(-depthBelow * 0.22f);
     refracted +=
         water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
 
