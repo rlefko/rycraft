@@ -465,10 +465,15 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
 static float causticPattern(float2 worldXZ, float t) {
     // Warp the lookup by the wave gradient (unscaled world xz, so it uses the
     // real per-block wave frequencies) so the caustics ride the same waves the
-    // surface shows; the caustic cell scale is baked in (~6.7 block tiles).
-    const float scale = 0.15f;
+    // surface shows; the caustic cell scale is baked in (~2.2 block tiles —
+    // wider cells put the viewer inside one bright web arm and washed the
+    // near floor solid white).
+    const float scale = 0.45f;
     float3 wn = waterSurfaceNormal(worldXZ, t);
-    float2 p = fmod(worldXZ * (scale * 6.28318f) + wn.xz, 6.28318f) - 250.0f;
+    float2 wp = worldXZ * (scale * 6.28318f) + wn.xz;
+    // GLSL-style positive wrap: MSL fmod follows the dividend's sign, which
+    // would flip the pattern's anchor across the world origin.
+    float2 p = wp - 6.28318f * floor(wp / 6.28318f) - 250.0f;
     float2 i = p;
     float c = 1.0f;
     const float inten = 0.005f;
@@ -479,7 +484,9 @@ static float causticPattern(float2 worldXZ, float t) {
     }
     c /= 5.0f;
     c = 1.17f - pow(c, 1.4f);
-    return pow(abs(c), 8.0f);
+    // Saturate: the web centers overshoot 1, and an unclamped HDR caustic times
+    // its gain crossed the bloom threshold across whole floors (white-out).
+    return saturate(pow(abs(c), 8.0f));
 }
 
 // Camera-relative world position of a screen UV + its stored depth. Keeping
@@ -714,7 +721,7 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     // murk. This owns the whole underwater tint now (the scene passes apply no
     // fog below the surface), so it must fog every pixel including the sky seen
     // through the surface (depth 1 reconstructs far away -> full murk).
-    const float UW_FOG_DENSITY = 0.045f;
+    const float UW_FOG_DENSITY = 0.075f;
     float fogFactor = 1.0f - exp(-dist * UW_FOG_DENSITY);
 
     // Inscattered light: overhead sun lifts a brighter blue-green; sinking
@@ -734,16 +741,42 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     // water, so the local surface sits above the eye): shore terrain higher
     // than eye + 2 must not catch caustics — a sea-level constant would light
     // the wrong blocks around lakes and rivers hydrology places at any height.
-    float3 surfaceNormal = normalize(cross(dfdx(world), dfdy(world)));
-    // Caustics land on up-facing floors (walls, normal.y ~ 0, stay dark). The
-    // depth falloff is gentle (0.03/block) so the pool floor several blocks
-    // down still catches a bright web instead of only the near-surface cells.
+    // Caustics land on up-facing floors (walls stay dark). The normal comes
+    // from best-of-both-sides depth taps, not raw screen derivatives: a
+    // one-sided derivative straddles block silhouettes and lit dashed lines
+    // along every oblique edge (the same defect ssao.metal documents), while
+    // picking the continuous side per axis reads the true surface at edges.
+    float2 texel = 1.0f / water.resolution;
+    float3 pL = reconstructCameraRelative(
+        in.uv - float2(texel.x, 0.0f),
+        sceneDepth.sample(screenSampler, in.uv - float2(texel.x, 0.0f)), water);
+    float3 pR = reconstructCameraRelative(
+        in.uv + float2(texel.x, 0.0f),
+        sceneDepth.sample(screenSampler, in.uv + float2(texel.x, 0.0f)), water);
+    float3 pD = reconstructCameraRelative(
+        in.uv - float2(0.0f, texel.y),
+        sceneDepth.sample(screenSampler, in.uv - float2(0.0f, texel.y)), water);
+    float3 pU = reconstructCameraRelative(
+        in.uv + float2(0.0f, texel.y),
+        sceneDepth.sample(screenSampler, in.uv + float2(0.0f, texel.y)), water);
+    float spanL = abs(dist - length(pL)), spanR = abs(length(pR) - dist);
+    float spanD = abs(dist - length(pD)), spanU = abs(length(pU) - dist);
+    float3 ddxv = (spanR < spanL) ? (pR - relative) : (relative - pL);
+    float3 ddyv = (spanU < spanD) ? (pU - relative) : (relative - pD);
+    float3 surfaceNormal = normalize(cross(ddxv, ddyv));
+    // The depth falloff is gentle (0.03/block) so the pool floor several
+    // blocks down still catches a bright web, not only the near-surface cells.
     float upFacing = saturate(abs(surfaceNormal.y));
+    // Feather true silhouettes: when even the continuous side jumps more than
+    // a surface at this distance could, the pixel straddles two surfaces and
+    // neither normal is trustworthy — fade rather than sparkle the block edge.
+    float edgeSpan = max(min(spanL, spanR), min(spanD, spanU));
+    upFacing *= 1.0f - smoothstep(dist * 0.04f + 0.15f, dist * 0.08f + 0.5f, edgeSpan);
     float eyeY = water.cameraPosition.y;
     float submerged = step(world.y, eyeY + 2.0f);
     float caustic = causticPattern(world.xz, t) * exp(-max(eyeY + 1.0f - world.y, 0.0f) * 0.03f) *
                     exp(-dist * 0.03f);
-    float3 causticGlow = water.sunColor * caustic * upFacing * submerged * sunUp * 2.6f;
+    float3 causticGlow = water.sunColor * caustic * upFacing * submerged * sunUp * 0.9f;
 
     // Premultiplied: fog lerps the scene toward murk, caustics add on top
     return float4(murk * fogFactor + causticGlow, fogFactor);
