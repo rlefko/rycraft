@@ -2,6 +2,9 @@ world_sources = files(
   'world.cpp',
   'noise.cpp',
   'climate.cpp',
+  'macro_generation.cpp',
+  'basin_solver.cpp',
+  'column_plan.cpp',
   'density_field.cpp',
   'chunk_generator.cpp',
   'ores.cpp',
@@ -9,6 +12,7 @@ world_sources = files(
   'features.cpp',
   'chunk.cpp',
   'light_engine.cpp',
+  'fluid.cpp',
   'serialization.cpp',
   'save_manager.cpp',
 )
