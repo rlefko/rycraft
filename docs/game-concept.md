@@ -1,41 +1,57 @@
-# rycraft — Game Concept
+# rycraft Game Concept
 
-rycraft is a from-scratch Minecraft-like voxel game for Apple Silicon Macs. No engine, no external assets: direct Metal rendering, Cocoa windowing, Core Audio sound, and procedurally generated everything — terrain, textures, and sound effects alike.
+rycraft is a from-scratch Minecraft-like voxel game for Apple Silicon Macs. It uses direct Metal rendering, Cocoa windowing, Core Audio, and procedural terrain, textures, models, and sound effects without a conventional game engine or external art assets.
 
 ## Vision
 
-A complete, native, self-contained voxel sandbox that demonstrates what a modern Mac can do with a few thousand lines of C++23. Every system is built here and understandable end to end: you can read the whole renderer in an afternoon.
+Build a native voxel sandbox whose systems remain readable end to end while supporting long exploration, deep vertical terrain, persistent building, responsive movement, and a world whose geology, water, climate, and ecology reinforce one another.
+
+The world is not a simulated planet. It is an infinite horizontal procedural field made from bounded, deterministic local solutions. That tradeoff keeps random access fast and makes the same seed stable regardless of streaming order.
 
 ## Pillars
 
-1. **Native-fast.** 60 FPS sustained at native resolution with 4x MSAA. The renderer is one MSAA scene pass plus bloom; the simulation is a fixed 20 Hz tick. Performance budgets live in [performance-conventions.md](performance-conventions.md).
-2. **Procedural everything.** No asset files ship with the game. Block textures are painted at startup ([`block_texture_array.mm`](../src/render/block_texture_array.mm)), terrain flows from seeded simplex noise, and sound effects are synthesized PCM ([`sfx.cpp`](../src/audio/sfx.cpp)).
-3. **Deterministic worlds.** The same seed always produces the same world — trees, ores, structures, weather, and animal spawns included. All randomness derives from the seed through `common/random.hpp`; `std::random_device` does not appear in gameplay code.
-4. **Honest simulation.** What renders is what exists: a block that looks solid collides ([`block_properties.hpp`](../include/world/block_properties.hpp)), edits persist across sessions, and menus genuinely freeze the world.
+1. **Native performance.** Target a lowest sustained one-second rate of at least 60 FPS at native resolution with 4x MSAA and a 256-chunk visible horizon on an Apple M4 Max, within 64 GB of total unified memory. Exact editable cubic simulation remains inside radius 32. A two-block far-terrain sampling tier uses exact emitted density heights immediately outside that boundary. Depth-backed far opaque tops cover cold exact residency, while a 16-block dither hands water and canopies between representations. Adaptive four-, eight-, and sixteen-block tiers farther out use distance, immutable slope and hydrology complexity, asymmetric hysteresis, fog-hidden topology changes, finer-to-coarser skirt ownership, frustum culling, back-face culling, conservative terrain-horizon occlusion, greedy meshing, worker pools, and bounded queues to make the longer view practical without expanding simulation to four kilometers.
+2. **Procedural content.** Block textures, terrain, caves, water bodies, plants, voxel fauna, weather, and sound are synthesized from code.
+3. **Deterministic worlds.** The same seed and coordinates produce the same geology, terrain, water, blocks, feature anchors, and wild territory IDs. Discrete stochastic choices use counter-addressed streams, while continuous Simplex fields use an immutable seed-derived permutation. Neither depends on mutable query-order state.
+4. **Honest simulation boundaries.** A visible solid block collides, edits persist, missing collision cubes stay closed, and raycasts cannot cross unloaded space. Aboveground loading fronts follow a lit generated terrain silhouette; unresolved underground openings stay dark. Generated water is already settled, and Java-style flow begins only after a gameplay edit disturbs it.
+5. **Research-informed shape.** Plate relationships, drainage, orographic moisture, and climate suitability guide the generator, while documentation states where the bounded procedural approximation differs from the cited research.
 
-## The core loop
+## Core loop
 
-Explore an infinite terrain of ten biomes; mine blocks; place blocks; build. Day cycles into night over twenty minutes. Animals wander the surface, flee when startled, and call out nearby. The world streams around you and saves behind you.
+Explore a horizontally unbounded world from Y=-128 through Y=511. Cross oceans, plains, forests, deserts, wetlands, mountains, volcanic ground, river valleys, and cold highlands. Descend through cubic caves, mine depth-dependent ores, build with persistent block edits, disturb water, and encounter wildlife selected from local habitat.
+
+Day cycles into night over twenty minutes. Weather, procedural sound, animals, water, and the live world continue behind the normal playing view. Pause menus stop simulation.
+
+## World character
+
+- **Terrain:** domain-warped plate regions, convergent uplift, divergent rifts, transform faults, hotspot chains, volcanic arcs, overhangs, cliffs, eroded Strahler channels, lakes, waterfalls, distributary deltas, islands, calderas, validated irregular crater-lake rims, conduits, lava tubes, aquifers, and caves.
+- **Climate:** synthetic pressure and insolation fields, bounded upwind moisture, coastal moderation, elevation cooling, soil moisture, fertility, 33 continuously blended biomes, and land representatives for all 14 terrestrial biome classes shared by the One Earth and World Wildlife Fund frameworks.
+- **Ecology:** append-only terrain and plant materials, ten climate-selected rooted tree forms plus fallen logs, moisture- and ecotope-driven flora, and habitat territories for sheep, cows, pigs, chickens, deer, goats, rabbits, frogs, and fish.
+- **Water:** generated oceans, rivers, lakes, and waterfalls are stable at creation. Every standing voxel from the supported floor through the surface is an implicit source. Canonical lake occupancy keeps shallow shore water supported, and endorheic crater lakes retain a complete irregular dry rim with freeboard. A separate receiver-centered outlet fall can connect an elevated routed lake to lower water without discarding the lake or raising the receiving body. Stable water emits top geometry only, while explicit falling columns supply waterfall sides. Edited water follows delayed source, falling, and level rules without loading unavailable cubes.
+- **Scale:** exact caves, buildings, fluids, and wildlife occupy the near 32-chunk radius. Coarse immutable surface and water tiles continue through radius 256 so mountain chains, drainage, coasts, islands, and biome-scale relief can be read from a distance. Visual canopy impostors use exact accepted tree anchors in the two- and four-block tiers. The eight- and sixteen-block tiers use globally anchored aggregate forest clusters, preserving canopy mass without paying the exact-anchor query cost across the four-kilometer horizon.
+
+The implementation boundary for each item is documented in [world-generation.md](world-generation.md). Feature labels describe procedural cues, not a claim of geological or ecological simulation.
 
 ## Feel
 
-- **Look:** classic blocky voxels with per-face procedural textures, column-skylight shadows under trees and inside caves, alpha-cutout foliage, drifting procedural clouds, and dawn-to-dusk sky colors.
-- **Sound:** understated procedural audio — soft footsteps, block thunks, ambient wind, and the occasional animal call. Menus mute the world because a paused world is silent.
-- **Input:** pointer-locked mouse look that never lets the cursor escape mid-play, WASD aligned exactly with the camera, ESC always one keypress away from the pause menu. Movement reads like Minecraft: double-tap W (or hold Ctrl) to sprint with a subtle FOV widening, hold Space to keep hopping or to float up in water, double-tap W in water to swim along the look direction, double-tap Space for creative-style flight (Space/Shift rise/sink; landing with Shift ends it).
-- **Menus:** bitmap-font panels in the game's own 8×8 pixel face, rendered by the same UI batcher as the HUD. Title → Play; ESC → Paused → Settings.
+- **Look:** blocky procedural textures with a complete alpha-aware mip chain, varied geology, cubic cliffs and caves, alpha-cutout leaves and flora, partial-height water, a granular adaptive terrain horizon, texel-snapped shadows, ambient occlusion, volumetric clouds and light, weather response, and one linear-HDR grade.
+- **Sound:** generated footsteps, block impacts, ambient wind, and animal calls mixed through Core Audio.
+- **Movement:** pointer-locked mouse look, camera-aligned WASD, sprinting, repeated jumping, swimming, and creative-style flight. Flying and the larger vertical range make aerial and subterranean exploration first-class.
+- **Wildlife:** herds and schools use local movement modes, flee and flock behavior, deterministic territory anchors, and strict population bounds.
+- **Menus:** the title, pause, settings, hotbar, and debug HUD use the game's bitmap UI over the live world.
 
 ## Screens
 
 | Screen | Purpose |
-|--------|---------|
-| Title | PLAY / QUIT over a live view of the world |
-| Playing | The game: captured cursor, crosshair, hotbar |
-| Paused (ESC) | RESUME / SETTINGS / QUIT; the simulation freezes |
-| Settings | Render distance, fog, mouse sensitivity, volume |
-| Debug HUD (F3) | Real FPS, frame time, chunk and entity counts |
+|---|---|
+| Title | Play or quit over a live world view |
+| Playing | Captured cursor, crosshair, hotbar, world, and entities |
+| Paused | Resume, settings, or quit while simulation is frozen |
+| Settings | View distance through 256, graphics quality, controls, sensitivity, and volume |
+| Debug HUD | Frame, exact cube, far tile, culling, queue, cache, fluid, fauna, and world-generation diagnostics |
 
 ## Current scope
 
-Shipping: infinite terrain (10 biomes, caves, ores, trees, structures), block breaking/placing with persistence, day/night, weather particles, animals with state-machine AI and flocking, sprint/swim/fly movement with auto-jump, procedural audio, bloom + fog + clouds, the full menu suite.
+Shipping systems include sparse 16 by 16 by 16 chunks, the finite vertical range, deterministic macro geology, smoothly exaggerated tectonic relief, bounded Priority-Flood and D-infinity-inspired basin erosion with curved high-gradient guides, climate-driven biome suitability with multiscale dithered transitions, elevation ecotopes, density caves, aquifers and volcanic interiors, structures, procedural materials and models, cubic v4 saves, generated and runtime water, nine fauna types, hard-priority underground streaming with closed dark missing boundaries, 256-block far tiles with a two-block exact-density topology tier, depth-backed opaque fallback, a 16-block water and canopy handoff, adaptive four-, eight-, and sixteen-block tiers, exact and aggregate canopy impostors, frustum and terrain-horizon visibility, complete block-texture mipmaps, day and night, weather, audio, HDR shadows, SSAO, volumetrics, water reflections, bloom, grading, and the complete menu flow.
 
-Deliberately not yet built: water rendering (blocks exist, the transparent pass does not), chunk LOD (the mesher supports it; the renderer draws full detail — see the note in [`lod_mesher.hpp`](../include/render/lod_mesher.hpp)), crafting/inventory, and multiplayer.
+Deliberately outside this version are a dynamic planet, moving plates, erosion after generation, seasons, climate change, eruptions, lava propagation and mixing, predators, food webs, migration, multiplayer, crafting, far-terrain caves or structures, hierarchical Z-buffer occlusion, indirect command buffers, and GPU-driven draw submission. The implemented tectonics, basin erosion, climate, and volcanoes synthesize a static world. The far renderer uses adaptive immutable tile tiers, not a literal geometry clipmap.
