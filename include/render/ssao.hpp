@@ -7,12 +7,14 @@
 // ---------------------------------------------------------------------------
 // Ssao — screen-space ambient occlusion.
 //
-// Owns a half-resolution R8 occlusion target and two pipelines: generate
-// (hemisphere sampling from the resolved depth) and apply (multiply-blends the
-// box-upsampled AO onto the HDR scene). Runs on the resolved opaque scene
-// before the water and volumetric passes so it darkens only opaque ambient,
-// never translucent water or additive light shafts. Skipped when the SSAO
-// setting is off.
+// Owns two half-resolution R8 occlusion targets and three pipelines: generate
+// (hemisphere sampling from the resolved depth), a depth-aware bilateral blur
+// (the generate pass dithers its kernel rotation with IGN and MSAA keeps no
+// temporal history to hide that under, so unblurred AO printed diagonal scan
+// lines on grazing surfaces), and apply (multiply-blends the blurred AO onto
+// the HDR scene). Runs on the resolved opaque scene before the water and
+// volumetric passes so it darkens only opaque ambient, never translucent
+// water or additive light shafts. Skipped when the SSAO setting is off.
 // ---------------------------------------------------------------------------
 class Ssao {
 public:
@@ -32,8 +34,10 @@ public:
 private:
     id<MTLDevice> _device;
     id<MTLRenderPipelineState> _generatePipeline;
+    id<MTLRenderPipelineState> _blurPipeline;
     id<MTLRenderPipelineState> _applyPipeline;
-    id<MTLTexture> _aoTex; // half-res R8
+    id<MTLTexture> _aoTex;     // half-res R8, raw generate output
+    id<MTLTexture> _aoBlurTex; // half-res R8, bilateral-blurred
     uint32_t _halfWidth;
     uint32_t _halfHeight;
 

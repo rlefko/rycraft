@@ -140,8 +140,54 @@ fragment float4 ssaoGenerateFragment(SsaoVertexOut in [[stage_in]],
             occlusion += rangeCheck;
         }
     }
-    float ao = 1.0f - (occlusion / 12.0f) * s.strength;
+    // Fade AO as the surface turns edge-on to the view: the depth-derived
+    // normal is least reliable at grazing angles (ceilings near the top of
+    // the frame), where residual noise reads as banding rather than shading.
+    float grazeFade = smoothstep(0.15f, 0.40f, abs(normal.z));
+    float ao = 1.0f - (occlusion / 12.0f) * s.strength * grazeFade;
     return float4(saturate(ao));
+}
+
+// ---------------------------------------------------------------------------
+// Depth-aware bilateral blur of the half-res AO, run between generate and
+// apply. The generate pass rotates its kernel with per-pixel IGN and has no
+// temporal accumulation to hide that noise under (the renderer keeps MSAA,
+// not TAA), so without a blur the diagonal rotation field printed through as
+// scan lines on grazing surfaces. The depth weight keeps the blur from
+// bleeding AO across block silhouettes — every voxel edge is a depth edge.
+// ---------------------------------------------------------------------------
+fragment float4 ssaoBlurFragment(SsaoVertexOut in [[stage_in]],
+                                 texture2d<float> aoTex [[texture(0)]],
+                                 depth2d<float> sceneDepth [[texture(1)]],
+                                 constant SsaoUniforms& s [[buffer(0)]]) {
+    constexpr sampler pointSampler(mag_filter::nearest, min_filter::nearest,
+                                   address::clamp_to_edge);
+    float centerDepth = sceneDepth.sample(pointSampler, in.vUV);
+    if (centerDepth >= 1.0f) {
+        return float4(1.0f); // sky
+    }
+    float centerZ = viewPosFromDepth(in.vUV, centerDepth, s).z;
+
+    // 5x5 spans ~4 half-res texels — wider than the IGN period — with a
+    // gaussian falloff (sigmaS ~1.6 texels, sigmaZ ~0.5 view units).
+    float2 texel = 1.0f / s.resolution;
+    float sum = 0.0f;
+    float wsum = 0.0f;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            float2 uv = in.vUV + float2(dx, dy) * texel;
+            float d = sceneDepth.sample(pointSampler, uv);
+            float z = viewPosFromDepth(uv, d, s).z;
+            float wS = exp(-float(dx * dx + dy * dy) / (2.0f * 1.6f * 1.6f));
+            float dz = z - centerZ;
+            float wZ = exp(-(dz * dz) / (2.0f * 0.5f * 0.5f));
+            float w = wS * wZ;
+            sum += aoTex.sample(pointSampler, uv).r * w;
+            wsum += w;
+        }
+    }
+    float ao = sum / max(wsum, 1e-4f);
+    return float4(ao, ao, ao, 1.0f);
 }
 
 vertex SsaoVertexOut ssaoApplyVertex(uint vertexID [[vertex_id]]) {
