@@ -5,6 +5,10 @@
 
 #include <cstdint>
 
+namespace worldgen {
+struct GeologySample;
+}
+
 // ---------------------------------------------------------------------------
 // The density function — the 3D half of world generation.
 //
@@ -40,12 +44,32 @@ inline double bilerpDensity(double d00, double d10, double d01, double d11, doub
     return lerpDensity(lerpDensity(d00, d10, fx), lerpDensity(d01, d11, fx), fz);
 }
 
+struct DensityColumnContext {
+    double karstRegionStrength = 0.0;
+    double faultStrength = 0.0;
+};
+
 class DensityField {
 public:
     explicit DensityField(uint32_t worldSeed);
 
-    // Density at a lattice point, given that column's shape (pure).
-    double density(double x, double y, double z, const ColumnShape& col) const;
+    // Precomputes the geology fields that are constant through one vertical
+    // lattice column. This keeps limestone generation from repeating its
+    // regional noise octaves at every Y sample.
+    DensityColumnContext columnContext(double x, double z,
+                                       const worldgen::GeologySample& geology) const;
+
+    // Density at a lattice point, given that column's shape and immutable
+    // geology sample. Every carve field is globally aligned and bounded, so
+    // geology cannot introduce a cube-order dependency.
+    double density(double x, double y, double z, const ColumnShape& col,
+                   const DensityColumnContext& context) const;
+
+    // Coarse column diagnostic shared by public surface sampling. A true
+    // value means the same karst or transform-fault fields used by density
+    // have a plausible cave intersection below this surface.
+    bool supportsCaveEcotope(double x, double z, double terrainHeight,
+                             const worldgen::GeologySample& geology) const;
 
 private:
     SimplexNoise detail_;

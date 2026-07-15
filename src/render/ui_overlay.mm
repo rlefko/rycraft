@@ -2,8 +2,11 @@
 
 #include "common/error.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -340,108 +343,193 @@ void UIOverlay::intToString(int value, char* buf, size_t bufSize) {
 }
 
 void UIOverlay::floatToString(float value, char* buf, size_t bufSize) {
-    if (bufSize < 2)
+    if (bufSize == 0)
         return;
-    // Simple float formatting: one decimal place
-    int intPart = static_cast<int>(std::floor(value));
-    int fracPart = static_cast<int>((value - std::floor(value)) * 10);
-
-    char tmp[20];
-    intToString(intPart, tmp, sizeof(tmp));
-    size_t len = std::strlen(tmp);
-    if (len + 3 < bufSize) {
-        std::memcpy(buf, tmp, len);
-        buf[len] = '.';
-        buf[len + 1] = '0' + fracPart;
-        buf[len + 2] = '\0';
-    } else {
-        std::memcpy(buf, tmp, len < bufSize - 1 ? len : bufSize - 1);
-        buf[len < bufSize - 1 ? len : bufSize - 1] = '\0';
-    }
+    std::snprintf(buf, bufSize, "%.1f", static_cast<double>(value));
 }
 
 void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
-    // HUD position: top-left corner
-    float hudX = 8.0f / static_cast<float>(_width);
-    float hudY = 1.0f - 8.0f / static_cast<float>(_height); // Top of screen
+    constexpr const char* biomeNames[] = {
+        "Deep Ocean",
+        "Ocean",
+        "Plains",
+        "Forest",
+        "Taiga",
+        "Desert",
+        "Hills",
+        "Swamp",
+        "Mushroom",
+        "Ice Spikes",
+        "Beach",
+        "River",
+        "Birch Forest",
+        "Flower Field",
+        "Savanna",
+        "Tropical Rainforest",
+        "Temperate Rainforest",
+        "Shrubland",
+        "Steppe",
+        "Cold Desert",
+        "Badlands",
+        "Tundra",
+        "Alpine",
+        "Mangrove",
+        "Frozen Ocean",
+        "Volcanic Barren",
+        "Glacier",
+        "Montane Grassland",
+        "Flooded Grassland",
+        "Mediterranean Woodland",
+        "Temperate Conifer Forest",
+        "Tropical Conifer Forest",
+        "Tropical Dry Forest",
+    };
+    constexpr const char* boundaryNames[] = {"None", "Convergent", "Divergent", "Transform"};
+    static_assert(static_cast<size_t>(Biome::COUNT) == std::size(biomeNames));
+    static_assert(std::size(boundaryNames) == 4);
+    const float hudX = 8.0f / static_cast<float>(_width);
+    const float hudY = 1.0f - 8.0f / static_cast<float>(_height);
+    const float bgWidth = 440.0f / static_cast<float>(_width);
+    const float bgHeight = 208.0f / static_cast<float>(_height);
+    const float lineHeight = (FONT_HEIGHT + 2) / static_cast<float>(_height);
+    float textY = hudY - lineHeight;
+    drawQuad(hudX - 4.0f / _width, hudY - bgHeight, bgWidth, bgHeight, 0.0f, 0.0f, 0.0f, 0.72f);
 
-    // Background: semi-transparent dark rectangle
-    float bgWidth = 220.0f / static_cast<float>(_width);
-    float bgHeight = 152.0f / static_cast<float>(_height);
-    drawQuad(hudX - 4.0f / _width, hudY - bgHeight, bgWidth, bgHeight, 0.0f, 0.0f, 0.0f, 0.6f);
+    auto integerText = [&](int64_t value, char* buffer, size_t size) {
+        std::snprintf(buffer, size, "%lld", static_cast<long long>(value));
+        return buffer;
+    };
+    auto unsignedText = [&](uint64_t value, char* buffer, size_t size) {
+        std::snprintf(buffer, size, "%llu", static_cast<unsigned long long>(value));
+        return buffer;
+    };
+    char a[24], b[24], c[24];
+    auto nextLine = [&] { textY -= lineHeight; };
 
-    // Line height (including spacing)
-    float lineHeight = (FONT_HEIGHT + 2) / static_cast<float>(_height);
-    float textX = hudX;
-    float textY = hudY - bgHeight + 2.0f / _height;
+    drawString("FPS", hudX, textY, 1.0f, 1.0f, 1.0f, 0.3f);
+    floatToString(stats.fps, a, sizeof(a));
+    drawString(a, hudX + 40.0f / _width, textY, 1.0f, 1.0f, 1.0f, 0.3f);
+    drawString("Frame", hudX + 120.0f / _width, textY, 1.0f, 1.0f, 0.8f, 0.4f);
+    floatToString(stats.frameTimeMs, b, sizeof(b));
+    drawString(b, hudX + 176.0f / _width, textY, 1.0f, 1.0f, 0.8f, 0.4f);
+    drawString("GPU", hudX + 248.0f / _width, textY, 1.0f, 1.0f, 0.6f, 0.6f);
+    floatToString(stats.gpuFrameMs, c, sizeof(c));
+    drawString(c, hudX + 288.0f / _width, textY, 1.0f, 1.0f, 0.6f, 0.6f);
+    nextLine();
 
-    // FPS
-    char fpsBuf[16];
-    floatToString(stats.fps, fpsBuf, sizeof(fpsBuf));
-    drawString("FPS: ", textX, textY, 1.0f, 1.0f, 1.0f, 0.2f);
-    drawString(fpsBuf, textX + 40.0f / _width, textY, 1.0f, 1.0f, 1.0f, 0.2f);
-    textY -= lineHeight;
+    drawString("Cubes loaded/meshed", hudX, textY, 1.0f, 0.3f, 1.0f, 0.8f);
+    drawString(integerText(static_cast<int>(stats.chunkCount), a, sizeof(a)),
+               hudX + 184.0f / _width, textY, 1.0f, 0.3f, 1.0f, 0.8f);
+    drawString("/", hudX + 240.0f / _width, textY, 1.0f, 0.3f, 1.0f, 0.8f);
+    drawString(integerText(static_cast<int>(stats.meshedCubeCount), b, sizeof(b)),
+               hudX + 252.0f / _width, textY, 1.0f, 0.3f, 1.0f, 0.8f);
+    drawString("Entities", hudX + 304.0f / _width, textY, 1.0f, 1.0f, 0.7f, 0.4f);
+    drawString(integerText(stats.entityCount, c, sizeof(c)), hudX + 384.0f / _width, textY, 1.0f,
+               1.0f, 0.7f, 0.4f);
+    nextLine();
 
-    // Chunks
-    char chunkBuf[16];
-    intToString(static_cast<int>(stats.chunkCount), chunkBuf, sizeof(chunkBuf));
-    drawString("Chunks: ", textX, textY, 1.0f, 0.2f, 1.0f, 0.8f);
-    drawString(chunkBuf, textX + 72.0f / _width, textY, 1.0f, 0.2f, 1.0f, 0.8f);
-    textY -= lineHeight;
+    drawString("Cube XYZ", hudX, textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    drawString(integerText(stats.cubeX, a, sizeof(a)), hudX + 80.0f / _width, textY, 1.0f, 0.7f,
+               0.9f, 1.0f);
+    drawString(integerText(stats.cubeY, b, sizeof(b)), hudX + 152.0f / _width, textY, 1.0f, 0.7f,
+               0.9f, 1.0f);
+    drawString(integerText(stats.cubeZ, c, sizeof(c)), hudX + 224.0f / _width, textY, 1.0f, 0.7f,
+               0.9f, 1.0f);
+    nextLine();
 
-    // Entities
-    char entityBuf[16];
-    intToString(static_cast<int>(stats.entityCount), entityBuf, sizeof(entityBuf));
-    drawString("Entities: ", textX, textY, 1.0f, 0.8f, 0.4f, 1.0f);
-    drawString(entityBuf, textX + 88.0f / _width, textY, 1.0f, 0.8f, 0.4f, 1.0f);
-    textY -= lineHeight;
+    drawString("Gen pending/ms", hudX, textY, 1.0f, 0.5f, 0.9f, 1.0f);
+    drawString(integerText(static_cast<int>(stats.pendingChunks), a, sizeof(a)),
+               hudX + 128.0f / _width, textY, 1.0f, 0.5f, 0.9f, 1.0f);
+    floatToString(stats.genMsAvg, b, sizeof(b));
+    drawString(b, hudX + 192.0f / _width, textY, 1.0f, 0.5f, 0.9f, 1.0f);
+    drawString("Mesh", hudX + 264.0f / _width, textY, 1.0f, 0.4f, 0.9f, 0.6f);
+    floatToString(stats.meshMsAvg, c, sizeof(c));
+    drawString(c, hudX + 312.0f / _width, textY, 1.0f, 0.4f, 0.9f, 0.6f);
+    drawString(integerText(stats.meshBuildsFrame, a, sizeof(a)), hudX + 368.0f / _width, textY,
+               1.0f, 0.4f, 0.9f, 0.6f);
+    nextLine();
 
-    // Frame time
-    char ftBuf[16];
-    floatToString(stats.frameTimeMs, ftBuf, sizeof(ftBuf));
-    drawString("Frame: ", textX, textY, 1.0f, 1.0f, 0.8f, 0.4f);
-    drawString(ftBuf, textX + 60.0f / _width, textY, 1.0f, 1.0f, 0.8f, 0.4f);
-    textY -= lineHeight;
+    drawString("Plate", hudX, textY, 1.0f, 0.9f, 0.6f, 0.3f);
+    drawString(unsignedText(stats.plateId, a, sizeof(a)), hudX + 48.0f / _width, textY, 1.0f, 0.9f,
+               0.6f, 0.3f);
+    const size_t boundaryIndex =
+        std::min(static_cast<size_t>(stats.boundary), std::size(boundaryNames) - 1);
+    drawString(boundaryNames[boundaryIndex], hudX + 160.0f / _width, textY, 1.0f, 0.9f, 0.6f, 0.3f);
+    nextLine();
 
-    // GPU frame time (real, from completed command buffers)
-    char gpuBuf[16];
-    floatToString(stats.gpuFrameMs, gpuBuf, sizeof(gpuBuf));
-    drawString("GPU: ", textX, textY, 1.0f, 1.0f, 0.6f, 0.6f);
-    drawString(gpuBuf, textX + 44.0f / _width, textY, 1.0f, 1.0f, 0.6f, 0.6f);
-    drawString("ms", textX + 100.0f / _width, textY, 1.0f, 1.0f, 0.6f, 0.6f);
-    textY -= lineHeight;
+    drawString("Temp C / rain mm", hudX, textY, 1.0f, 0.4f, 0.8f, 1.0f);
+    floatToString(stats.temperatureC, a, sizeof(a));
+    floatToString(stats.precipitationMm, b, sizeof(b));
+    drawString(a, hudX + 152.0f / _width, textY, 1.0f, 0.4f, 0.8f, 1.0f);
+    drawString(b, hudX + 224.0f / _width, textY, 1.0f, 0.4f, 0.8f, 1.0f);
+    nextLine();
 
-    // Chunk generation: pending count + per-chunk ms
-    char genBuf[32];
-    char genMsBuf[16];
-    intToString(static_cast<int>(stats.pendingChunks), genBuf, sizeof(genBuf));
-    floatToString(stats.genMsAvg, genMsBuf, sizeof(genMsBuf));
-    drawString("Gen: ", textX, textY, 1.0f, 0.5f, 0.9f, 1.0f);
-    drawString(genBuf, textX + 40.0f / _width, textY, 1.0f, 0.5f, 0.9f, 1.0f);
-    drawString(genMsBuf, textX + 96.0f / _width, textY, 1.0f, 0.5f, 0.9f, 1.0f);
-    drawString("ms", textX + 152.0f / _width, textY, 1.0f, 0.5f, 0.9f, 1.0f);
-    textY -= lineHeight;
+    drawString("Biome", hudX, textY, 1.0f, 0.5f, 1.0f, 0.5f);
+    const size_t primaryBiome =
+        std::min(static_cast<size_t>(stats.primaryBiome), std::size(biomeNames) - 1);
+    const size_t secondaryBiome =
+        std::min(static_cast<size_t>(stats.secondaryBiome), std::size(biomeNames) - 1);
+    drawString(biomeNames[primaryBiome], hudX + 56.0f / _width, textY, 1.0f, 0.5f, 1.0f, 0.5f);
+    nextLine();
+    drawString("Blend", hudX, textY, 1.0f, 0.5f, 1.0f, 0.5f);
+    drawString(biomeNames[secondaryBiome], hudX + 56.0f / _width, textY, 1.0f, 0.5f, 1.0f, 0.5f);
+    floatToString(stats.biomeTransition, a, sizeof(a));
+    drawString(a, hudX + 280.0f / _width, textY, 1.0f, 0.5f, 1.0f, 0.5f);
+    nextLine();
 
-    // Mesh builds: count last frame + per-build ms
-    char meshBuf[16];
-    char meshMsBuf[16];
-    intToString(static_cast<int>(stats.meshBuildsFrame), meshBuf, sizeof(meshBuf));
-    floatToString(stats.meshMsAvg, meshMsBuf, sizeof(meshMsBuf));
-    drawString("Mesh: ", textX, textY, 1.0f, 0.4f, 0.9f, 0.6f);
-    drawString(meshBuf, textX + 48.0f / _width, textY, 1.0f, 0.4f, 0.9f, 0.6f);
-    drawString(meshMsBuf, textX + 96.0f / _width, textY, 1.0f, 0.4f, 0.9f, 0.6f);
-    drawString("ms", textX + 152.0f / _width, textY, 1.0f, 0.4f, 0.9f, 0.6f);
-    textY -= lineHeight;
+    drawString("River order", hudX, textY, 1.0f, 0.3f, 0.8f, 1.0f);
+    drawString(integerText(stats.riverOrder, a, sizeof(a)), hudX + 112.0f / _width, textY, 1.0f,
+               0.3f, 0.8f, 1.0f);
+    drawString("Cache", hudX + 176.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    drawString(integerText(static_cast<int>(stats.macroCacheEntries), b, sizeof(b)),
+               hudX + 232.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    floatToString(stats.macroCacheMB, b, sizeof(b));
+    drawString(b, hudX + 272.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    drawString("Fluid", hudX + 320.0f / _width, textY, 1.0f, 0.2f, 0.7f, 1.0f);
+    drawString(integerText(static_cast<int>(stats.pendingFluids), c, sizeof(c)),
+               hudX + 368.0f / _width, textY, 1.0f, 0.2f, 0.7f, 1.0f);
+    nextLine();
 
-    // Mega-buffer vertex usage
-    char usedBuf[16];
-    char capBuf[16];
-    intToString(static_cast<int>(stats.megaUsedMB), usedBuf, sizeof(usedBuf));
-    intToString(static_cast<int>(stats.megaCapMB), capBuf, sizeof(capBuf));
-    drawString("VRAM: ", textX, textY, 1.0f, 0.9f, 0.9f, 0.5f);
-    drawString(usedBuf, textX + 48.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
-    drawString("/", textX + 96.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
-    drawString(capBuf, textX + 108.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
-    drawString("MB", textX + 156.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
-    (void)textY; // Suppress unused variable warning
+    drawString("Fluid drops U/F", hudX, textY, 1.0f, 0.4f, 0.7f, 1.0f);
+    drawString(unsignedText(stats.droppedFluidUpdates, a, sizeof(a)), hudX + 144.0f / _width, textY,
+               1.0f, 0.4f, 0.7f, 1.0f);
+    drawString("/", hudX + 240.0f / _width, textY, 1.0f, 0.4f, 0.7f, 1.0f);
+    drawString(unsignedText(stats.droppedFluidFrontiers, b, sizeof(b)), hudX + 256.0f / _width,
+               textY, 1.0f, 0.4f, 0.7f, 1.0f);
+    nextLine();
+
+    drawString("Exact mesh MB", hudX, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    floatToString(stats.megaUsedMB, a, sizeof(a));
+    floatToString(stats.megaCapMB, b, sizeof(b));
+    drawString(a, hudX + 120.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    drawString("/", hudX + 176.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    drawString(b, hudX + 192.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
+    nextLine();
+
+    drawString("Far W/R/D", hudX, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farWantedTiles, a, sizeof(a)), hudX + 88.0f / _width, textY, 1.0f,
+               0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 128.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farResidentTiles, b, sizeof(b)), hudX + 144.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 184.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farDrawnTiles, c, sizeof(c)), hudX + 200.0f / _width, textY, 1.0f,
+               0.7f, 0.8f, 1.0f);
+    drawString("F/O", hudX + 248.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farFrustumCulledTiles, a, sizeof(a)), hudX + 288.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 336.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farOcclusionCulledTiles, b, sizeof(b)), hudX + 352.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    nextLine();
+
+    drawString("Far pending", hudX, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farPendingTiles, a, sizeof(a)), hudX + 96.0f / _width, textY, 1.0f,
+               0.7f, 0.8f, 1.0f);
+    drawString("Cache MB", hudX + 144.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    floatToString(stats.farCacheMB, b, sizeof(b));
+    drawString(b, hudX + 216.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("Arena MB", hudX + 280.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    floatToString(stats.farMeshMB, c, sizeof(c));
+    drawString(c, hudX + 360.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
 }

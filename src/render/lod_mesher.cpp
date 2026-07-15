@@ -1,12 +1,14 @@
 #include "render/lod_mesher.hpp"
 
+#include "common/random.hpp"
 #include "render/block_textures.hpp"
 #include "world/chunk.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstddef>
-#include <unordered_map>
+#include <cstring>
 
 // ==========================================================================
 // Generic greedy mesher — works with any grid dimensions.
@@ -18,10 +20,9 @@
 // once for water surfaces (drawn by the dedicated water pass).
 //
 // `padded` builds (MeshSnapshot) read one real neighbor block beyond every
-// XZ edge: boundary faces emit exactly when the neighbor doesn't hide them
-// — the same rule as interior faces. Unpadded builds (coarse LODs, unit
-// tests) treat out-of-grid as air and skip the +X/+Z boundary layer, which
-// over-draws interior walls but can't read neighbors it doesn't have.
+// XZ edge: boundary faces emit exactly when the neighbor doesn't hide them,
+// using the same rule as interior faces. Unpadded builds (coarse LODs and
+// unit tests) treat out-of-grid cells as air and emit all six boundaries.
 //
 // Flat 1D arrays used throughout to avoid vector<vector<T>> allocation
 // overhead. Indexing: idx(row, col, width) = row * width + col.
@@ -79,28 +80,39 @@ inline static uint8_t noBlockLight(int, int, int) {
     return 0;
 }
 
-// Append one greedy quad (4 vertices + 6 indices). Corners arrive in the same
-// winding the face's caller always used; packedAO carries the per-vertex AO in
-// that same emit order (see packAO). When the two diagonals carry unequal AO
-// the quad is rotated one vertex so the triangulation splits along the BRIGHTER
-// diagonal — that isolates a single occluded corner in one triangle instead of
-// letting its darkness interpolate across the whole quad along the diagonal.
+static Vertex makeVertex(uint32_t faceAttr, const QuadCorner& corner) {
+    Vertex vertex;
+    std::memset(&vertex, 0, sizeof(vertex));
+    vertex.faceAttr = faceAttr;
+    vertex.px = static_cast<float16_t>(corner.x);
+    vertex.py = static_cast<float16_t>(corner.y);
+    vertex.pz = static_cast<float16_t>(corner.z);
+    vertex.u = static_cast<float16_t>(corner.u);
+    vertex.v = static_cast<float16_t>(corner.v);
+    return vertex;
+}
+
+static void reserveInitialMeshStorage(std::vector<Vertex>& vertices,
+                                      std::vector<uint32_t>& indices) {
+    if (vertices.capacity() == 0) vertices.reserve(4608);
+    if (indices.capacity() == 0) indices.reserve(6912);
+}
+
+// Append one outward-wound greedy quad. packedAO follows the corner order.
+// When the diagonals differ, rotate the quad cyclically so triangulation uses
+// the brighter diagonal without changing its winding.
 static void pushQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs, FaceNormal face,
                      BlockType bt, uint8_t skyLight, const QuadCorner (&corners)[4],
                      uint8_t packedAO, uint8_t blockLight) {
+    reserveInitialMeshStorage(verts, idxs);
     const bool flip = (cornerAOAt(packedAO, 0) + cornerAOAt(packedAO, 2)) <
                       (cornerAOAt(packedAO, 1) + cornerAOAt(packedAO, 3));
     const uint8_t layer = textureLayerFor(bt, face);
-    const bool emissive = isEmissive(bt); // constant per quad — bt is a merge key
-    const uint8_t sway = swayClass(bt);   // likewise derived from the merge key
-    for (int k = 0; k < 4; ++k) {
-        const int c = flip ? (k + 1) & 3 : k;
-        const QuadCorner& corner = corners[c];
-        const uint32_t attr = packFaceAttr(face, layer, skyLight, cornerAOAt(packedAO, c),
-                                           blockLight, emissive, sway);
-        verts.push_back(Vertex{attr, static_cast<float16_t>(corner.x),
-                               static_cast<float16_t>(corner.y), static_cast<float16_t>(corner.z),
-                               static_cast<float16_t>(corner.u), static_cast<float16_t>(corner.v)});
+    for (int index = 0; index < 4; ++index) {
+        const int cornerIndex = flip ? (index + 1) & 3 : index;
+        const uint32_t attr = packFaceAttr(face, layer, skyLight, cornerAOAt(packedAO, cornerIndex),
+                                           blockLight, isEmissive(bt), swayClass(bt));
+        verts.push_back(makeVertex(attr, corners[cornerIndex]));
     }
     uint32_t bi = static_cast<uint32_t>(verts.size()) - 4;
     idxs.push_back(bi);
@@ -111,57 +123,80 @@ static void pushQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs, Fa
     idxs.push_back(bi + 3);
 }
 
+static void pushDoubleSidedQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs,
+                                FaceNormal face, BlockType bt, uint8_t skyLight,
+                                const QuadCorner (&corners)[4], uint8_t packedAO,
+                                uint8_t blockLight) {
+    pushQuad(verts, idxs, face, bt, skyLight, corners, packedAO, blockLight);
+    const uint32_t base = static_cast<uint32_t>(verts.size()) - 4;
+    idxs.push_back(base);
+    idxs.push_back(base + 2);
+    idxs.push_back(base + 1);
+    idxs.push_back(base);
+    idxs.push_back(base + 3);
+    idxs.push_back(base + 2);
+}
+
+static void pushFluidQuad(std::vector<Vertex>& verts, std::vector<uint32_t>& idxs, FaceNormal face,
+                          uint8_t skyLight, uint8_t blockLight, uint8_t flowDirection, bool falling,
+                          const QuadCorner (&corners)[4]) {
+    reserveInitialMeshStorage(verts, idxs);
+    const uint32_t attr = packFluidFaceAttr(face, skyLight, flowDirection, falling, blockLight);
+    for (const QuadCorner& corner : corners)
+        verts.push_back(makeVertex(attr, corner));
+    const uint32_t base = static_cast<uint32_t>(verts.size()) - 4;
+    idxs.insert(idxs.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+}
+
 // Greedy merge on a face plane of arbitrary dimensions.
 //
-// faceMask[row*faceWidth + col] == true means that face cell is exposed.
-// blockTypes[row*faceWidth + col] stores the block type at each exposed face cell.
-//
-// For each unmerged exposed cell, extend right as far as possible with
-// matching block type, then extend down as far as possible with the same
-// width and matching block type. Each merged rectangle becomes 1 quad.
-static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<bool>& faceMask,
-                            const std::vector<BlockType>& blockTypes,
-                            const std::vector<uint8_t>& cellLight,
-                            const std::vector<uint8_t>& cellBlockLight,
-                            const std::vector<uint8_t>& cellAO, std::vector<bool>& merged,
-                            FaceNormal face, std::vector<Vertex>& vertices,
-                            std::vector<uint32_t>& indices, const auto& emitQuadFn) {
-    merged.assign(faceHeight * faceWidth, false);
+// A nonzero key combines every property that must remain constant across a
+// greedy quad. Consumed rectangles are cleared in place.
+static uint32_t packFaceKey(BlockType block, uint8_t skyLight, uint8_t blockLight,
+                            uint8_t packedAO) {
+    return (static_cast<uint32_t>(block) + 1U) | (static_cast<uint32_t>(skyLight & 0x0FU) << 8U) |
+           (static_cast<uint32_t>(blockLight & 0x0FU) << 12U) |
+           (static_cast<uint32_t>(packedAO) << 16U);
+}
 
+static BlockType faceKeyBlock(uint32_t key) {
+    return static_cast<BlockType>((key & 0xFFU) - 1U);
+}
+
+static uint8_t faceKeySkyLight(uint32_t key) {
+    return static_cast<uint8_t>((key >> 8U) & 0x0FU);
+}
+
+static uint8_t faceKeyBlockLight(uint32_t key) {
+    return static_cast<uint8_t>((key >> 12U) & 0x0FU);
+}
+
+static uint8_t faceKeyAO(uint32_t key) {
+    return static_cast<uint8_t>((key >> 16U) & 0xFFU);
+}
+
+static_assert(BLOCK_TYPE_COUNT <= 255);
+
+static void meshFaceGeneric(int faceHeight, int faceWidth, uint32_t* faceKeys, FaceNormal face,
+                            std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+                            const auto& emitQuadFn) {
     for (int row = 0; row < faceHeight; ++row) {
         for (int col = 0; col < faceWidth; ++col) {
-            int i = idx(row, col, faceWidth);
-            if (!faceMask[i] || merged[i]) {
-                continue;
-            }
+            const int i = idx(row, col, faceWidth);
+            const uint32_t leadKey = faceKeys[i];
+            if (leadKey == 0) continue;
 
-            BlockType leadType = blockTypes[i];
-            uint8_t leadLight = cellLight[i];
-            uint8_t leadBlockLight = cellBlockLight[i];
-            uint8_t leadAO = cellAO[i];
-
-            // Extend right (horizontal) while type, sky light, block light AND
-            // corner AO all match — a quad carries one value of each, so any
-            // shading/occlusion boundary ends the merge (else the light smears).
             int width = 1;
-            while (col + width < faceWidth && faceMask[idx(row, col + width, faceWidth)] &&
-                   !merged[idx(row, col + width, faceWidth)] &&
-                   blockTypes[idx(row, col + width, faceWidth)] == leadType &&
-                   cellLight[idx(row, col + width, faceWidth)] == leadLight &&
-                   cellBlockLight[idx(row, col + width, faceWidth)] == leadBlockLight &&
-                   cellAO[idx(row, col + width, faceWidth)] == leadAO) {
+            while (col + width < faceWidth &&
+                   faceKeys[idx(row, col + width, faceWidth)] == leadKey) {
                 ++width;
             }
 
-            // Extend down (vertical) with same width, type, light, block light, AO
             int height = 1;
             while (row + height < faceHeight) {
                 bool rowValid = true;
                 for (int w = 0; w < width; ++w) {
-                    int j = idx(row + height, col + w, faceWidth);
-                    if (!faceMask[j] || merged[j] || blockTypes[j] != leadType ||
-                        cellLight[j] != leadLight || cellBlockLight[j] != leadBlockLight ||
-                        cellAO[j] != leadAO) {
+                    if (faceKeys[idx(row + height, col + w, faceWidth)] != leadKey) {
                         rowValid = false;
                         break;
                     }
@@ -170,15 +205,12 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
                 ++height;
             }
 
-            // Mark merged
             for (int dr = 0; dr < height; ++dr) {
-                for (int dc = 0; dc < width; ++dc) {
-                    merged[idx(row + dr, col + dc, faceWidth)] = true;
-                }
+                std::fill_n(faceKeys + idx(row + dr, col, faceWidth), width, uint32_t{0});
             }
 
-            // Emit quad via callback
-            emitQuadFn(col, row, width, height, face, leadType, leadLight, leadBlockLight, leadAO,
+            emitQuadFn(col, row, width, height, face, faceKeyBlock(leadKey),
+                       faceKeySkyLight(leadKey), faceKeyBlockLight(leadKey), faceKeyAO(leadKey),
                        vertices, indices);
         }
     }
@@ -190,21 +222,12 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, const std::vector<boo
 template <typename Access, typename LightAccess, typename Visible>
 static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBlock,
                             const LightAccess& getBlockLight, const Visible& visible,
-                            const auto& lightAt, float topDrop, bool padded, bool bakeAO,
-                            MeshScratch& scratch, std::vector<Vertex>& outVertices,
-                            std::vector<uint32_t>& outIndices) {
-    std::vector<bool>& faceMask = scratch.faceMask;
-    std::vector<BlockType>& blockTypes = scratch.blockTypes;
-    std::vector<uint8_t>& cellLight = scratch.cellLight;
-    std::vector<uint8_t>& cellBlockLight = scratch.cellBlockLight;
-    std::vector<uint8_t>& cellAO = scratch.cellAO;
-    std::vector<bool>& merged = scratch.merged;
-
-    // Padded builds know their +X/+Z neighbor walls, so the boundary layer
-    // meshes like any other; unpadded builds must skip it (assuming air
-    // there would paint a wall inside the neighbor).
-    const int xEnd = padded ? gridW : gridW - 1;
-    const int zEnd = padded ? gridD : gridD - 1;
+                            const auto& lightAt, float topDrop, bool bakeAO, MeshScratch& scratch,
+                            std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices) {
+    uint32_t* faceKeys = scratch.faceKeys.data();
+    assert(gridW * gridD <= static_cast<int>(scratch.faceKeys.size()));
+    assert(gridH * gridD <= static_cast<int>(scratch.faceKeys.size()));
+    assert(gridH * gridW <= static_cast<int>(scratch.faceKeys.size()));
 
     // Baked corner AO reads the eight occluders in the plane one step along
     // each face's outward normal (isOpaque, so leaves don't cast AO — the same
@@ -212,7 +235,15 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
     // that face's emit order; unexposed cells and the water pass stay
     // AO_ALL_OPEN (no darkening).
     auto occ = [&](int gx, int gy, int gz) { return isOpaque(getBlock(gx, gy, gz)); };
-    auto aoXZ = [&](int cx, int py, int cz) -> uint8_t { // +Y / -Y, outward plane py
+    auto aoPlusY = [&](int cx, int py, int cz) -> uint8_t {
+        bool xm = occ(cx - 1, py, cz), xp = occ(cx + 1, py, cz);
+        bool zm = occ(cx, py, cz - 1), zp = occ(cx, py, cz + 1);
+        bool mm = occ(cx - 1, py, cz - 1), pm = occ(cx + 1, py, cz - 1);
+        bool pp = occ(cx + 1, py, cz + 1), mp = occ(cx - 1, py, cz + 1);
+        return packAO(aoVertex(xm, zm, mm), aoVertex(xm, zp, mp), aoVertex(xp, zp, pp),
+                      aoVertex(xp, zm, pm));
+    };
+    auto aoMinusY = [&](int cx, int py, int cz) -> uint8_t {
         bool xm = occ(cx - 1, py, cz), xp = occ(cx + 1, py, cz);
         bool zm = occ(cx, py, cz - 1), zp = occ(cx, py, cz + 1);
         bool mm = occ(cx - 1, py, cz - 1), pm = occ(cx + 1, py, cz - 1);
@@ -241,16 +272,16 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         bool ym = occ(cx, cy - 1, pz), yp = occ(cx, cy + 1, pz);
         bool mm = occ(cx - 1, cy - 1, pz), pm = occ(cx + 1, cy - 1, pz);
         bool pp = occ(cx + 1, cy + 1, pz), mp = occ(cx - 1, cy + 1, pz);
-        return packAO(aoVertex(xm, ym, mm), aoVertex(xm, yp, mp), aoVertex(xp, yp, pp),
-                      aoVertex(xp, ym, pm));
+        return packAO(aoVertex(xm, ym, mm), aoVertex(xp, ym, pm), aoVertex(xp, yp, pp),
+                      aoVertex(xm, yp, mp));
     };
     auto aoMinusZ = [&](int cx, int cy, int pz) -> uint8_t { // -Z, outward plane pz
         bool xm = occ(cx - 1, cy, pz), xp = occ(cx + 1, cy, pz);
         bool ym = occ(cx, cy - 1, pz), yp = occ(cx, cy + 1, pz);
         bool mm = occ(cx - 1, cy - 1, pz), pm = occ(cx + 1, cy - 1, pz);
         bool pp = occ(cx + 1, cy + 1, pz), mp = occ(cx - 1, cy + 1, pz);
-        return packAO(aoVertex(xm, ym, mm), aoVertex(xp, ym, pm), aoVertex(xp, yp, pp),
-                      aoVertex(xm, yp, mp));
+        return packAO(aoVertex(xm, ym, mm), aoVertex(xm, yp, mp), aoVertex(xp, yp, pp),
+                      aoVertex(xp, ym, pm));
     };
 
     // ======================================================================
@@ -258,22 +289,16 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
     // (the world's top layer reads air above and gets a lid)
     // ======================================================================
     for (int ly = 0; ly < gridH; ++ly) {
-        faceMask.assign(gridD * gridW, false);
-        blockTypes.assign(gridD * gridW, BlockType::AIR);
-        cellLight.assign(gridD * gridW, 15);
-        cellBlockLight.assign(gridD * gridW, 0);
-        cellAO.assign(gridD * gridW, AO_ALL_OPEN);
+        std::fill_n(faceKeys, gridD * gridW, uint32_t{0});
 
         bool anyExposed = false;
         for (int z = 0; z < gridD; ++z) {
             for (int x = 0; x < gridW; ++x) {
                 BlockType cur = getBlock(x, ly, z);
                 if (visible(cur, getBlock(x, ly + 1, z))) {
-                    faceMask[idx(z, x, gridW)] = true;
-                    blockTypes[idx(z, x, gridW)] = cur;
-                    cellLight[idx(z, x, gridW)] = lightAt(x, ly + 1, z);
-                    cellBlockLight[idx(z, x, gridW)] = getBlockLight(x, ly + 1, z);
-                    if (bakeAO) cellAO[idx(z, x, gridW)] = aoXZ(x, ly + 1, z);
+                    faceKeys[idx(z, x, gridW)] =
+                        packFaceKey(cur, lightAt(x, ly + 1, z), getBlockLight(x, ly + 1, z),
+                                    bakeAO ? aoPlusY(x, ly + 1, z) : AO_ALL_OPEN);
                     anyExposed = true;
                 }
             }
@@ -290,37 +315,31 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
             const float y = static_cast<float>(ly + 1) - topDrop;
             const QuadCorner corners[4] = {
                 {static_cast<float>(col), y, static_cast<float>(row), 0.f, 0.f},
-                {static_cast<float>(col + width), y, static_cast<float>(row), fw, 0.f},
-                {static_cast<float>(col + width), y, static_cast<float>(row + height), fw, fh},
                 {static_cast<float>(col), y, static_cast<float>(row + height), 0.f, fh},
+                {static_cast<float>(col + width), y, static_cast<float>(row + height), fw, fh},
+                {static_cast<float>(col + width), y, static_cast<float>(row), fw, 0.f},
             };
             pushQuad(verts, idxs, face, bt, skyLight, corners, ao, blockLight);
         };
 
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, cellBlockLight, cellAO,
-                        merged, FaceNormal::PLUS_Y, outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridD, gridW, faceKeys, FaceNormal::PLUS_Y, outVertices, outIndices,
+                        emitQuad);
     }
 
     // ======================================================================
     // Face: -Y (bottom) — visible when the block below doesn't hide it
     // ======================================================================
-    for (int ly = 1; ly < gridH; ++ly) {
-        faceMask.assign(gridD * gridW, false);
-        blockTypes.assign(gridD * gridW, BlockType::AIR);
-        cellLight.assign(gridD * gridW, 15);
-        cellBlockLight.assign(gridD * gridW, 0);
-        cellAO.assign(gridD * gridW, AO_ALL_OPEN);
+    for (int ly = 0; ly < gridH; ++ly) {
+        std::fill_n(faceKeys, gridD * gridW, uint32_t{0});
 
         bool anyExposed = false;
         for (int z = 0; z < gridD; ++z) {
             for (int x = 0; x < gridW; ++x) {
                 BlockType cur = getBlock(x, ly, z);
                 if (visible(cur, getBlock(x, ly - 1, z))) {
-                    faceMask[idx(z, x, gridW)] = true;
-                    blockTypes[idx(z, x, gridW)] = cur;
-                    cellLight[idx(z, x, gridW)] = lightAt(x, ly - 1, z);
-                    cellBlockLight[idx(z, x, gridW)] = getBlockLight(x, ly - 1, z);
-                    if (bakeAO) cellAO[idx(z, x, gridW)] = aoXZ(x, ly - 1, z);
+                    faceKeys[idx(z, x, gridW)] =
+                        packFaceKey(cur, lightAt(x, ly - 1, z), getBlockLight(x, ly - 1, z),
+                                    bakeAO ? aoMinusY(x, ly - 1, z) : AO_ALL_OPEN);
                     anyExposed = true;
                 }
             }
@@ -346,29 +365,23 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
             pushQuad(verts, idxs, face, bt, skyLight, corners, ao, blockLight);
         };
 
-        meshFaceGeneric(gridD, gridW, faceMask, blockTypes, cellLight, cellBlockLight, cellAO,
-                        merged, FaceNormal::MINUS_Y, outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridD, gridW, faceKeys, FaceNormal::MINUS_Y, outVertices, outIndices,
+                        emitQuad);
     }
 
     // ======================================================================
     // Face: +X (right) — exposed when visible toward the +X neighbor
     // ======================================================================
-    for (int lx = 0; lx < xEnd; ++lx) {
-        faceMask.assign(gridH * gridD, false);
-        blockTypes.assign(gridH * gridD, BlockType::AIR);
-        cellLight.assign(gridH * gridD, 15);
-        cellBlockLight.assign(gridH * gridD, 0);
-        cellAO.assign(gridH * gridD, AO_ALL_OPEN);
+    for (int lx = 0; lx < gridW; ++lx) {
+        std::fill_n(faceKeys, gridH * gridD, uint32_t{0});
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
                 BlockType cur = getBlock(lx, y, z);
                 if (visible(cur, getBlock(lx + 1, y, z))) {
-                    faceMask[idx(y, z, gridD)] = true;
-                    blockTypes[idx(y, z, gridD)] = cur;
-                    cellLight[idx(y, z, gridD)] = lightAt(lx + 1, y, z);
-                    cellBlockLight[idx(y, z, gridD)] = getBlockLight(lx + 1, y, z);
-                    if (bakeAO) cellAO[idx(y, z, gridD)] = aoPlusX(lx + 1, y, z);
+                    faceKeys[idx(y, z, gridD)] =
+                        packFaceKey(cur, lightAt(lx + 1, y, z), getBlockLight(lx + 1, y, z),
+                                    bakeAO ? aoPlusX(lx + 1, y, z) : AO_ALL_OPEN);
                 }
             }
         }
@@ -395,29 +408,23 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
             pushQuad(verts, idxs, face, bt, skyLight, corners, ao, blockLight);
         };
 
-        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, cellBlockLight, cellAO,
-                        merged, FaceNormal::PLUS_X, outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridH, gridD, faceKeys, FaceNormal::PLUS_X, outVertices, outIndices,
+                        emitQuad);
     }
 
     // ======================================================================
     // Face: -X (left) — exposed when visible toward the -X neighbor
     // ======================================================================
     for (int lx = 0; lx < gridW; ++lx) {
-        faceMask.assign(gridH * gridD, false);
-        blockTypes.assign(gridH * gridD, BlockType::AIR);
-        cellLight.assign(gridH * gridD, 15);
-        cellBlockLight.assign(gridH * gridD, 0);
-        cellAO.assign(gridH * gridD, AO_ALL_OPEN);
+        std::fill_n(faceKeys, gridH * gridD, uint32_t{0});
 
         for (int y = 0; y < gridH; ++y) {
             for (int z = 0; z < gridD; ++z) {
                 BlockType cur = getBlock(lx, y, z);
                 if (visible(cur, getBlock(lx - 1, y, z))) {
-                    faceMask[idx(y, z, gridD)] = true;
-                    blockTypes[idx(y, z, gridD)] = cur;
-                    cellLight[idx(y, z, gridD)] = lightAt(lx - 1, y, z);
-                    cellBlockLight[idx(y, z, gridD)] = getBlockLight(lx - 1, y, z);
-                    if (bakeAO) cellAO[idx(y, z, gridD)] = aoMinusX(lx - 1, y, z);
+                    faceKeys[idx(y, z, gridD)] =
+                        packFaceKey(cur, lightAt(lx - 1, y, z), getBlockLight(lx - 1, y, z),
+                                    bakeAO ? aoMinusX(lx - 1, y, z) : AO_ALL_OPEN);
                 }
             }
         }
@@ -441,29 +448,23 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
             pushQuad(verts, idxs, face, bt, skyLight, corners, ao, blockLight);
         };
 
-        meshFaceGeneric(gridH, gridD, faceMask, blockTypes, cellLight, cellBlockLight, cellAO,
-                        merged, FaceNormal::MINUS_X, outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridH, gridD, faceKeys, FaceNormal::MINUS_X, outVertices, outIndices,
+                        emitQuad);
     }
 
     // ======================================================================
     // Face: +Z (front) — exposed when visible toward the +Z neighbor
     // ======================================================================
-    for (int lz = 0; lz < zEnd; ++lz) {
-        faceMask.assign(gridH * gridW, false);
-        blockTypes.assign(gridH * gridW, BlockType::AIR);
-        cellLight.assign(gridH * gridW, 15);
-        cellBlockLight.assign(gridH * gridW, 0);
-        cellAO.assign(gridH * gridW, AO_ALL_OPEN);
+    for (int lz = 0; lz < gridD; ++lz) {
+        std::fill_n(faceKeys, gridH * gridW, uint32_t{0});
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
                 BlockType cur = getBlock(x, y, lz);
                 if (visible(cur, getBlock(x, y, lz + 1))) {
-                    faceMask[idx(y, x, gridW)] = true;
-                    blockTypes[idx(y, x, gridW)] = cur;
-                    cellLight[idx(y, x, gridW)] = lightAt(x, y, lz + 1);
-                    cellBlockLight[idx(y, x, gridW)] = getBlockLight(x, y, lz + 1);
-                    if (bakeAO) cellAO[idx(y, x, gridW)] = aoPlusZ(x, y, lz + 1);
+                    faceKeys[idx(y, x, gridW)] =
+                        packFaceKey(cur, lightAt(x, y, lz + 1), getBlockLight(x, y, lz + 1),
+                                    bakeAO ? aoPlusZ(x, y, lz + 1) : AO_ALL_OPEN);
                 }
             }
         }
@@ -478,39 +479,33 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
             const QuadCorner corners[4] = {
                 {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz + 1), 0.f,
                  fh},
-                {static_cast<float>(col), static_cast<float>(row + height),
-                 static_cast<float>(lz + 1), 0.f, 0.f},
-                {static_cast<float>(col + width), static_cast<float>(row + height),
-                 static_cast<float>(lz + 1), fw, 0.f},
                 {static_cast<float>(col + width), static_cast<float>(row),
                  static_cast<float>(lz + 1), fw, fh},
+                {static_cast<float>(col + width), static_cast<float>(row + height),
+                 static_cast<float>(lz + 1), fw, 0.f},
+                {static_cast<float>(col), static_cast<float>(row + height),
+                 static_cast<float>(lz + 1), 0.f, 0.f},
             };
             pushQuad(verts, idxs, face, bt, skyLight, corners, ao, blockLight);
         };
 
-        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, cellBlockLight, cellAO,
-                        merged, FaceNormal::PLUS_Z, outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridH, gridW, faceKeys, FaceNormal::PLUS_Z, outVertices, outIndices,
+                        emitQuad);
     }
 
     // ======================================================================
     // Face: -Z (back) — exposed when visible toward the -Z neighbor
     // ======================================================================
     for (int lz = 0; lz < gridD; ++lz) {
-        faceMask.assign(gridH * gridW, false);
-        blockTypes.assign(gridH * gridW, BlockType::AIR);
-        cellLight.assign(gridH * gridW, 15);
-        cellBlockLight.assign(gridH * gridW, 0);
-        cellAO.assign(gridH * gridW, AO_ALL_OPEN);
+        std::fill_n(faceKeys, gridH * gridW, uint32_t{0});
 
         for (int x = 0; x < gridW; ++x) {
             for (int y = 0; y < gridH; ++y) {
                 BlockType cur = getBlock(x, y, lz);
                 if (visible(cur, getBlock(x, y, lz - 1))) {
-                    faceMask[idx(y, x, gridW)] = true;
-                    blockTypes[idx(y, x, gridW)] = cur;
-                    cellLight[idx(y, x, gridW)] = lightAt(x, y, lz - 1);
-                    cellBlockLight[idx(y, x, gridW)] = getBlockLight(x, y, lz - 1);
-                    if (bakeAO) cellAO[idx(y, x, gridW)] = aoMinusZ(x, y, lz - 1);
+                    faceKeys[idx(y, x, gridW)] =
+                        packFaceKey(cur, lightAt(x, y, lz - 1), getBlockLight(x, y, lz - 1),
+                                    bakeAO ? aoMinusZ(x, y, lz - 1) : AO_ALL_OPEN);
                 }
             }
         }
@@ -524,64 +519,348 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
             const float fh = static_cast<float>(height);
             const QuadCorner corners[4] = {
                 {static_cast<float>(col), static_cast<float>(row), static_cast<float>(lz), 0.f, fh},
-                {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz),
-                 fw, fh},
-                {static_cast<float>(col + width), static_cast<float>(row + height),
-                 static_cast<float>(lz), fw, 0.f},
                 {static_cast<float>(col), static_cast<float>(row + height), static_cast<float>(lz),
                  0.f, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(row + height),
+                 static_cast<float>(lz), fw, 0.f},
+                {static_cast<float>(col + width), static_cast<float>(row), static_cast<float>(lz),
+                 fw, fh},
             };
             pushQuad(verts, idxs, face, bt, skyLight, corners, ao, blockLight);
         };
 
-        meshFaceGeneric(gridH, gridW, faceMask, blockTypes, cellLight, cellBlockLight, cellAO,
-                        merged, FaceNormal::MINUS_Z, outVertices, outIndices, emitQuad);
+        meshFaceGeneric(gridH, gridW, faceKeys, FaceNormal::MINUS_Z, outVertices, outIndices,
+                        emitQuad);
     }
 }
 
-// Flora cross-quads: two diagonal quads spanning the cell, inset 0.125 from
-// the walls (0.125 is exactly representable in fp16 at every chunk-local
-// magnitude, so the X stays crack-free). Single winding per quad — the
-// scene pass renders with cull mode None, which makes them double-sided.
-static void emitFloraCross(int x, int y, int z, BlockType bt, uint8_t skyLight, uint8_t blockLight,
-                           std::vector<Vertex>& verts, std::vector<uint32_t>& idxs) {
-    const float x0 = static_cast<float>(x) + 0.125f;
-    const float x1 = static_cast<float>(x) + 0.875f;
-    const float z0 = static_cast<float>(z) + 0.125f;
-    const float z1 = static_cast<float>(z) + 0.875f;
+// Dense flora exposed a regular planting-row artifact because every accepted
+// plant used the same two diagonals at the exact center of its block. Vary the
+// visual pose from global coordinates without moving the generated anchor or
+// consuming mutable randomness. Every value is a multiple of 1/32 so the
+// resulting chunk-local positions stay exact in fp16.
+struct FloraPose {
+    float centerX;
+    float centerZ;
+    float axisX;
+    float axisZ;
+};
+
+static FloraPose floraPose(int x, int z, int64_t worldX, int64_t worldZ, BlockType block) {
+    constexpr uint64_t FLORA_POSE_SALT = 0x464C4F5241504F53ULL;
+    constexpr std::array<std::array<int8_t, 2>, 4> AXES = {
+        {{{5, 0}}, {{5, 3}}, {{5, 5}}, {{3, 5}}}};
+    constexpr std::array<float, 4> JITTER = {-0.1875F, -0.0625F, 0.0625F, 0.1875F};
+
+    const uint64_t poseHash =
+        hash64(hash64(static_cast<uint64_t>(worldX) ^ FLORA_POSE_SALT) ^
+               hash64(static_cast<uint64_t>(worldZ)) ^ (static_cast<uint64_t>(block) << 48U));
+    const auto& axis = AXES[poseHash & 3U];
+    return {
+        .centerX = static_cast<float>(x) + 0.5F + JITTER[(poseHash >> 8U) & 3U],
+        .centerZ = static_cast<float>(z) + 0.5F + JITTER[(poseHash >> 16U) & 3U],
+        .axisX = static_cast<float>(axis[0]) * 0.0625F,
+        .axisZ = static_cast<float>(axis[1]) * 0.0625F,
+    };
+}
+
+// Two perpendicular vertical quads share one coordinate-hashed pose. Explicit
+// reverse winding keeps every plant visible with back-face culling enabled.
+static void emitFloraCross(int x, int y, int z, int64_t worldX, int64_t worldZ, BlockType bt,
+                           uint8_t skyLight, uint8_t blockLight, std::vector<Vertex>& verts,
+                           std::vector<uint32_t>& idxs) {
+    const FloraPose pose = floraPose(x, z, worldX, worldZ, bt);
     const float y0 = static_cast<float>(y);
     const float y1 = static_cast<float>(y + 1);
 
-    // v = 0 at the TOP (Metal v runs downward — see the +X face comment)
+    // v = 0 at the top because Metal texture coordinates run downward.
     const QuadCorner diagonalA[4] = {
-        {x0, y0, z0, 0.f, 1.f},
-        {x1, y0, z1, 1.f, 1.f},
-        {x1, y1, z1, 1.f, 0.f},
-        {x0, y1, z0, 0.f, 0.f},
+        {pose.centerX - pose.axisX, y0, pose.centerZ - pose.axisZ, 0.f, 1.f},
+        {pose.centerX + pose.axisX, y0, pose.centerZ + pose.axisZ, 1.f, 1.f},
+        {pose.centerX + pose.axisX, y1, pose.centerZ + pose.axisZ, 1.f, 0.f},
+        {pose.centerX - pose.axisX, y1, pose.centerZ - pose.axisZ, 0.f, 0.f},
     };
     const QuadCorner diagonalB[4] = {
-        {x0, y0, z1, 0.f, 1.f},
-        {x1, y0, z0, 1.f, 1.f},
-        {x1, y1, z0, 1.f, 0.f},
-        {x0, y1, z1, 0.f, 0.f},
+        {pose.centerX + pose.axisZ, y0, pose.centerZ - pose.axisX, 0.f, 1.f},
+        {pose.centerX - pose.axisZ, y0, pose.centerZ + pose.axisX, 1.f, 1.f},
+        {pose.centerX - pose.axisZ, y1, pose.centerZ + pose.axisX, 1.f, 0.f},
+        {pose.centerX + pose.axisZ, y1, pose.centerZ - pose.axisX, 0.f, 0.f},
     };
     // Flora is unshaded by AO (cross-quads have no face plane to occlude, and
     // the shader gives CROSS a fixed light); pass fully-open corners. Block
     // light still tints it so grass near lava glows.
-    pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalA, AO_ALL_OPEN, blockLight);
-    pushQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalB, AO_ALL_OPEN, blockLight);
+    pushDoubleSidedQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalA, AO_ALL_OPEN,
+                        blockLight);
+    pushDoubleSidedQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalB, AO_ALL_OPEN,
+                        blockLight);
 }
 
-template <typename Access, typename LightAccess>
-static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access& getBlock,
-                                   const LightAccess& getBlockLight, bool padded, bool emitFlora,
-                                   MeshScratch& scratch) {
-    MeshOutput output;
+static void emitFlatFlora(int x, int y, int z, BlockType bt, uint8_t skyLight, uint8_t blockLight,
+                          std::vector<Vertex>& verts, std::vector<uint32_t>& idxs) {
+    const float surface = static_cast<float>(y) + 0.125f;
+    const QuadCorner corners[4] = {
+        {static_cast<float>(x), surface, static_cast<float>(z), 0.f, 0.f},
+        {static_cast<float>(x), surface, static_cast<float>(z + 1), 0.f, 1.f},
+        {static_cast<float>(x + 1), surface, static_cast<float>(z + 1), 1.f, 1.f},
+        {static_cast<float>(x + 1), surface, static_cast<float>(z), 1.f, 0.f},
+    };
+    pushDoubleSidedQuad(verts, idxs, FaceNormal::PLUS_Y, bt, skyLight, corners, AO_ALL_OPEN,
+                        blockLight);
+}
 
-    // Typical full chunks mesh to a few thousand vertices; growth beyond
-    // this is amortized (the old code reserved 1.5 MB per build)
-    output.vertices.reserve(8192);
-    output.indices.reserve(12288);
+static void emitMissingNeighborCaps(const MeshSnapshot& snapshot, MeshOutput& output) {
+    constexpr float edge = static_cast<float>(CHUNK_EDGE);
+    const int32_t cubeBaseY = snapshot.pos.y * CHUNK_EDGE;
+    auto emit = [&](uint8_t mask, FaceNormal inwardFace, BlockType current, int32_t worldY,
+                    int selfX, int selfZ, int neighborX, int neighborZ,
+                    const QuadCorner(&corners)[4]) {
+        if ((snapshot.missingNeighborFaces & mask) == 0 || isOpaque(current)) return;
+        const int32_t neighborCutoff = snapshot.generatedSurfaceCutoffAt(neighborX, neighborZ);
+        const bool neighborIsPlannedSolid =
+            neighborCutoff == MeshSnapshot::SKY_CUTOFF_UNKNOWN || worldY < neighborCutoff;
+        if (!neighborIsPlannedSolid) return;
+
+        const int32_t selfCutoff = snapshot.generatedSurfaceCutoffAt(selfX, selfZ);
+        const bool surfaceOpening =
+            selfCutoff != MeshSnapshot::SKY_CUTOFF_UNKNOWN && worldY >= selfCutoff &&
+            (inwardFace == FaceNormal::MINUS_X || inwardFace == FaceNormal::PLUS_X ||
+             inwardFace == FaceNormal::MINUS_Z || inwardFace == FaceNormal::PLUS_Z);
+        BlockType material = surfaceOpening
+                                 ? snapshot.generatedSurfaceMaterialAt(neighborX, neighborZ)
+                                 : BlockType::BEDROCK;
+        if (!rendersAsCube(material) || material == BlockType::WATER) material = BlockType::STONE;
+        const uint8_t skyLight = surfaceOpening ? 15 : 0;
+        const uint8_t occlusion = surfaceOpening ? AO_ALL_OPEN : 0;
+        const uint8_t blockLight =
+            surfaceOpening ? snapshot.lightAt(selfX, worldY - cubeBaseY, selfZ) : 0;
+        pushQuad(output.vertices, output.indices, inwardFace, material, skyLight, corners,
+                 occlusion, blockLight);
+    };
+
+    for (int y = 0; y < CHUNK_EDGE; ++y) {
+        const float y0 = static_cast<float>(y);
+        const float y1 = static_cast<float>(y + 1);
+        const int32_t worldY = cubeBaseY + y;
+        for (int coordinate = 0; coordinate < CHUNK_EDGE; ++coordinate) {
+            const float c0 = static_cast<float>(coordinate);
+            const float c1 = static_cast<float>(coordinate + 1);
+            const QuadCorner plusX[4] = {
+                {edge, y0, c0, 0.f, 1.f},
+                {edge, y0, c1, 1.f, 1.f},
+                {edge, y1, c1, 1.f, 0.f},
+                {edge, y1, c0, 0.f, 0.f},
+            };
+            emit(MeshSnapshot::MISSING_PLUS_X, FaceNormal::MINUS_X,
+                 snapshot.at(CHUNK_EDGE - 1, y, coordinate), worldY, CHUNK_EDGE - 1, coordinate,
+                 CHUNK_EDGE, coordinate, plusX);
+
+            const QuadCorner minusX[4] = {
+                {0.f, y0, c0, 0.f, 1.f},
+                {0.f, y1, c0, 0.f, 0.f},
+                {0.f, y1, c1, 1.f, 0.f},
+                {0.f, y0, c1, 1.f, 1.f},
+            };
+            emit(MeshSnapshot::MISSING_MINUS_X, FaceNormal::PLUS_X, snapshot.at(0, y, coordinate),
+                 worldY, 0, coordinate, -1, coordinate, minusX);
+
+            const QuadCorner plusZ[4] = {
+                {c0, y0, edge, 0.f, 1.f},
+                {c0, y1, edge, 0.f, 0.f},
+                {c1, y1, edge, 1.f, 0.f},
+                {c1, y0, edge, 1.f, 1.f},
+            };
+            emit(MeshSnapshot::MISSING_PLUS_Z, FaceNormal::MINUS_Z,
+                 snapshot.at(coordinate, y, CHUNK_EDGE - 1), worldY, coordinate, CHUNK_EDGE - 1,
+                 coordinate, CHUNK_EDGE, plusZ);
+
+            const QuadCorner minusZ[4] = {
+                {c0, y0, 0.f, 0.f, 1.f},
+                {c1, y0, 0.f, 1.f, 1.f},
+                {c1, y1, 0.f, 1.f, 0.f},
+                {c0, y1, 0.f, 0.f, 0.f},
+            };
+            emit(MeshSnapshot::MISSING_MINUS_Z, FaceNormal::PLUS_Z, snapshot.at(coordinate, y, 0),
+                 worldY, coordinate, 0, coordinate, -1, minusZ);
+        }
+    }
+
+    for (int z = 0; z < CHUNK_EDGE; ++z) {
+        const float z0 = static_cast<float>(z);
+        const float z1 = static_cast<float>(z + 1);
+        for (int x = 0; x < CHUNK_EDGE; ++x) {
+            const float x0 = static_cast<float>(x);
+            const float x1 = static_cast<float>(x + 1);
+            const QuadCorner plusY[4] = {
+                {x0, edge, z0, 0.f, 0.f},
+                {x1, edge, z0, 1.f, 0.f},
+                {x1, edge, z1, 1.f, 1.f},
+                {x0, edge, z1, 0.f, 1.f},
+            };
+            emit(MeshSnapshot::MISSING_PLUS_Y, FaceNormal::MINUS_Y,
+                 snapshot.at(x, CHUNK_EDGE - 1, z), cubeBaseY + CHUNK_EDGE, x, z, x, z, plusY);
+
+            const QuadCorner minusY[4] = {
+                {x0, 0.f, z0, 0.f, 0.f},
+                {x0, 0.f, z1, 0.f, 1.f},
+                {x1, 0.f, z1, 1.f, 1.f},
+                {x1, 0.f, z0, 1.f, 0.f},
+            };
+            emit(MeshSnapshot::MISSING_MINUS_Y, FaceNormal::PLUS_Y, snapshot.at(x, 0, z),
+                 cubeBaseY - 1, x, z, x, z, minusY);
+        }
+    }
+}
+
+static float snapshotFluidHeight(const MeshSnapshot& snapshot, int x, int y, int z) {
+    if (snapshot.at(x, y, z) != BlockType::WATER) return 0.0f;
+    if (snapshot.at(x, y + 1, z) == BlockType::WATER) return 1.0f;
+    return fluidSurfaceHeight(snapshot.fluidAt(x, y, z));
+}
+
+static float cornerFluidHeight(const MeshSnapshot& snapshot, int x, int y, int z, int cornerX,
+                               int cornerZ) {
+    const int cornerWorldX = x + cornerX;
+    const int cornerWorldZ = z + cornerZ;
+    float total = 0.0f;
+    int samples = 0;
+    for (int offsetZ = -1; offsetZ <= 0; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 0; ++offsetX) {
+            const int sampleX = cornerWorldX + offsetX;
+            const int sampleZ = cornerWorldZ + offsetZ;
+            if (snapshot.at(sampleX, y, sampleZ) != BlockType::WATER) continue;
+            if (snapshot.at(sampleX, y + 1, sampleZ) == BlockType::WATER) return 1.0f;
+            total += snapshotFluidHeight(snapshot, sampleX, y, sampleZ);
+            ++samples;
+        }
+    }
+    return samples == 0 ? snapshotFluidHeight(snapshot, x, y, z)
+                        : total / static_cast<float>(samples);
+}
+
+static uint8_t fluidFlowDirection(const MeshSnapshot& snapshot, int x, int y, int z) {
+    const FluidState state = snapshot.fluidAt(x, y, z);
+    if (state.isFalling()) return 0;
+    const float center = snapshotFluidHeight(snapshot, x, y, z);
+    constexpr std::array<std::array<int, 2>, 4> offsets{{
+        {{-1, 0}},
+        {{1, 0}},
+        {{0, -1}},
+        {{0, 1}},
+    }};
+    float lowest = center;
+    uint8_t direction = 0;
+    for (uint8_t i = 0; i < offsets.size(); ++i) {
+        const int nx = x + offsets[i][0];
+        const int nz = z + offsets[i][1];
+        const float neighbor = snapshotFluidHeight(snapshot, nx, y, nz);
+        if (neighbor > 0.0f && neighbor + 0.001f < lowest) {
+            lowest = neighbor;
+            direction = static_cast<uint8_t>(i + 1);
+        }
+    }
+    return direction;
+}
+
+template <typename SkyAccess, typename LightAccess>
+static void emitPartialWater(const MeshSnapshot& snapshot, MeshOutput& output,
+                             const SkyAccess& skyLightAt, const LightAccess& blockLightAt) {
+    for (int y = 0; y < CHUNK_EDGE; ++y) {
+        for (int z = 0; z < CHUNK_EDGE; ++z) {
+            for (int x = 0; x < CHUNK_EDGE; ++x) {
+                if (snapshot.at(x, y, z) != BlockType::WATER) continue;
+                const FluidState state = snapshot.fluidAt(x, y, z);
+                const uint8_t flow = fluidFlowDirection(snapshot, x, y, z);
+                const float h00 = cornerFluidHeight(snapshot, x, y, z, 0, 0);
+                const float h10 = cornerFluidHeight(snapshot, x, y, z, 1, 0);
+                const float h11 = cornerFluidHeight(snapshot, x, y, z, 1, 1);
+                const float h01 = cornerFluidHeight(snapshot, x, y, z, 0, 1);
+                const float baseY = static_cast<float>(y);
+
+                if (snapshot.at(x, y + 1, z) != BlockType::WATER) {
+                    const QuadCorner top[4] = {
+                        {static_cast<float>(x), baseY + h00, static_cast<float>(z), 0.f, 0.f},
+                        {static_cast<float>(x), baseY + h01, static_cast<float>(z + 1), 0.f, 1.f},
+                        {static_cast<float>(x + 1), baseY + h11, static_cast<float>(z + 1), 1.f,
+                         1.f},
+                        {static_cast<float>(x + 1), baseY + h10, static_cast<float>(z), 1.f, 0.f},
+                    };
+                    pushFluidQuad(output.vertices, output.indices, FaceNormal::PLUS_Y,
+                                  skyLightAt(x, y + 1, z), blockLightAt(x, y + 1, z), flow,
+                                  state.isFalling(), top);
+                }
+
+                auto emitSide = [&](FaceNormal face, int neighborX, int neighborY, int neighborZ,
+                                    const QuadCorner(&corners)[4]) {
+                    const BlockType neighbor = snapshot.at(neighborX, neighborY, neighborZ);
+                    if (neighbor == BlockType::WATER || isOpaque(neighbor)) return;
+                    pushFluidQuad(output.vertices, output.indices, face,
+                                  skyLightAt(neighborX, neighborY, neighborZ),
+                                  blockLightAt(neighborX, neighborY, neighborZ), flow,
+                                  state.isFalling(), corners);
+                };
+                // Stable source and horizontal-flow surfaces end at the bank;
+                // their analytical terrain owns the shoreline. Full-height
+                // side sheets are reserved for explicit falling columns, so
+                // lake, river, ocean, cube, and LOD edges cannot become walls
+                // of water when the adjacent ground is lower.
+                if (state.isFalling()) {
+                    const QuadCorner west[4] = {
+                        {static_cast<float>(x), baseY, static_cast<float>(z), 0.f, 1.f},
+                        {static_cast<float>(x), baseY, static_cast<float>(z + 1), 1.f, 1.f},
+                        {static_cast<float>(x), baseY + h01, static_cast<float>(z + 1), 1.f, 0.f},
+                        {static_cast<float>(x), baseY + h00, static_cast<float>(z), 0.f, 0.f},
+                    };
+                    emitSide(FaceNormal::MINUS_X, x - 1, y, z, west);
+                    const QuadCorner east[4] = {
+                        {static_cast<float>(x + 1), baseY, static_cast<float>(z + 1), 0.f, 1.f},
+                        {static_cast<float>(x + 1), baseY, static_cast<float>(z), 1.f, 1.f},
+                        {static_cast<float>(x + 1), baseY + h10, static_cast<float>(z), 1.f, 0.f},
+                        {static_cast<float>(x + 1), baseY + h11, static_cast<float>(z + 1), 0.f,
+                         0.f},
+                    };
+                    emitSide(FaceNormal::PLUS_X, x + 1, y, z, east);
+                    const QuadCorner north[4] = {
+                        {static_cast<float>(x + 1), baseY, static_cast<float>(z), 0.f, 1.f},
+                        {static_cast<float>(x), baseY, static_cast<float>(z), 1.f, 1.f},
+                        {static_cast<float>(x), baseY + h00, static_cast<float>(z), 1.f, 0.f},
+                        {static_cast<float>(x + 1), baseY + h10, static_cast<float>(z), 0.f, 0.f},
+                    };
+                    emitSide(FaceNormal::MINUS_Z, x, y, z - 1, north);
+                    const QuadCorner south[4] = {
+                        {static_cast<float>(x), baseY, static_cast<float>(z + 1), 0.f, 1.f},
+                        {static_cast<float>(x + 1), baseY, static_cast<float>(z + 1), 1.f, 1.f},
+                        {static_cast<float>(x + 1), baseY + h11, static_cast<float>(z + 1), 1.f,
+                         0.f},
+                        {static_cast<float>(x), baseY + h01, static_cast<float>(z + 1), 0.f, 0.f},
+                    };
+                    emitSide(FaceNormal::PLUS_Z, x, y, z + 1, south);
+                }
+
+                if (snapshot.at(x, y - 1, z) != BlockType::WATER &&
+                    !isOpaque(snapshot.at(x, y - 1, z))) {
+                    const QuadCorner bottom[4] = {
+                        {static_cast<float>(x), baseY, static_cast<float>(z), 0.f, 0.f},
+                        {static_cast<float>(x + 1), baseY, static_cast<float>(z), 1.f, 0.f},
+                        {static_cast<float>(x + 1), baseY, static_cast<float>(z + 1), 1.f, 1.f},
+                        {static_cast<float>(x), baseY, static_cast<float>(z + 1), 0.f, 1.f},
+                    };
+                    pushFluidQuad(output.vertices, output.indices, FaceNormal::MINUS_Y,
+                                  skyLightAt(x, y - 1, z), blockLightAt(x, y - 1, z), flow,
+                                  state.isFalling(), bottom);
+                }
+            }
+        }
+    }
+}
+
+template <typename Access, typename LightAccess, typename SkyCutoffAccess>
+static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access& getBlock,
+                                   const LightAccess& getBlockLight,
+                                   const SkyCutoffAccess& getSkyCutoff, int64_t worldBaseX,
+                                   int32_t sectionBaseY, int64_t worldBaseZ, bool padded,
+                                   bool emitFlora, bool emitGreedyWater,
+                                   const MeshSnapshot* partialWater, MeshScratch& scratch) {
+    MeshOutput output;
 
     // ---- Column skylight ----
     // The first open Y above the topmost OPAQUE block per column, computed
@@ -591,65 +870,104 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
     // canopy is non-opaque leaves, so it must NOT darken the ground below with
     // a fake column shadow — the real cascade shadow does that, and doubling
     // them put a second shadow directly under every tree. Genuine cover
-    // (opaque stone/dirt: caves, overhangs) still steps skylight down toward
-    // its floor of 4; open sky is 15.
+    // (opaque stone/dirt: caves, overhangs) blocks direct skylight; open sky
+    // is 15. Horizontal sky propagation is not synthesized through missing
+    // cubes, so unavailable cover stays conservatively dark.
     const int ringW = gridW + 2;
     const int ringD = gridD + 2;
-    std::vector<int>& skyHeight = scratch.skyHeight;
-    skyHeight.assign(ringW * ringD, 0);
+    assert(ringW * ringD <= static_cast<int>(scratch.skyHeight.size()));
+    int32_t* skyHeight = scratch.skyHeight.data();
+    std::fill_n(skyHeight, ringW * ringD, int32_t{0});
     for (int z = -1; z <= gridD; ++z) {
         for (int x = -1; x <= gridW; ++x) {
-            for (int y = gridH - 1; y >= 0; --y) {
-                if (isOpaque(getBlock(x, y, z))) {
-                    skyHeight[idx(z + 1, x + 1, ringW)] = y + 1;
-                    break;
+            int32_t cutoffY = getSkyCutoff(x, z);
+            if (cutoffY == MeshSnapshot::SKY_CUTOFF_UNKNOWN) {
+                cutoffY = sectionBaseY;
+                for (int y = gridH; y >= 0; --y) {
+                    if (isOpaque(getBlock(x, y, z))) {
+                        cutoffY = sectionBaseY + y + 1;
+                        break;
+                    }
                 }
             }
+            skyHeight[idx(z + 1, x + 1, ringW)] = cutoffY - sectionBaseY;
         }
     }
     auto lightAt = [&](int x, int y, int z) -> uint8_t {
-        int depth = skyHeight[idx(z + 1, x + 1, ringW)] - y;
-        if (depth <= 0) return 15;
-        return static_cast<uint8_t>(std::max(12 - depth, 4));
+        const int32_t depth = skyHeight[idx(z + 1, x + 1, ringW)] - y;
+        return depth <= 0 ? 15 : 0;
     };
 
     // ---- Opaque section: cubes (with baked corner AO), then flora crosses ----
     runGreedyPasses(gridW, gridH, gridD, getBlock, getBlockLight, cubeFaceVisible, lightAt, 0.f,
-                    padded, /*bakeAO=*/true, scratch, output.vertices, output.indices);
+                    /*bakeAO=*/true, scratch, output.vertices, output.indices);
 
     if (emitFlora) {
         for (int z = 0; z < gridD; ++z) {
             for (int x = 0; x < gridW; ++x) {
                 for (int y = 0; y < gridH; ++y) {
                     BlockType bt = getBlock(x, y, z);
-                    if (isFlora(bt)) {
-                        emitFloraCross(x, y, z, bt, lightAt(x, y, z), getBlockLight(x, y, z),
-                                       output.vertices, output.indices);
+                    if (blockDefinition(bt).renderShape == BlockRenderShape::CROSS) {
+                        emitFloraCross(x, y, z, worldBaseX + x, worldBaseZ + z, bt,
+                                       lightAt(x, y, z), getBlockLight(x, y, z), output.vertices,
+                                       output.indices);
+                    } else if (blockDefinition(bt).renderShape == BlockRenderShape::FLAT) {
+                        emitFlatFlora(x, y, z, bt, lightAt(x, y, z), getBlockLight(x, y, z),
+                                      output.vertices, output.indices);
                     }
                 }
             }
         }
     }
+    if (partialWater != nullptr) emitMissingNeighborCaps(*partialWater, output);
 
     // ---- Water section: everything after this index draws in the water
     // pass. Padded builds read real neighbor water; unpadded builds assume
     // water continues past the edge (oceans virtually always do, and a wall
     // there painted phantom stripes along every chunk border).
     output.opaqueIndexCount = static_cast<uint32_t>(output.indices.size());
+    if (partialWater != nullptr) {
+        emitPartialWater(*partialWater, output, lightAt, getBlockLight);
+        return output;
+    }
+    if (!emitGreedyWater) return output;
     if (padded) {
         runGreedyPasses(gridW, gridH, gridD, getBlock, getBlockLight, waterFaceVisible, lightAt,
-                        0.125f, padded, /*bakeAO=*/false, scratch, output.vertices, output.indices);
+                        0.125f, /*bakeAO=*/false, scratch, output.vertices, output.indices);
     } else {
         auto waterEdgeBlock = [&getBlock, gridW, gridD](int x, int y, int z) -> BlockType {
             if (x < 0 || x >= gridW || z < 0 || z >= gridD) return BlockType::WATER;
             return getBlock(x, y, z);
         };
         runGreedyPasses(gridW, gridH, gridD, waterEdgeBlock, getBlockLight, waterFaceVisible,
-                        lightAt, 0.125f, padded, /*bakeAO=*/false, scratch, output.vertices,
+                        lightAt, 0.125f, /*bakeAO=*/false, scratch, output.vertices,
                         output.indices);
     }
 
     return output;
+}
+
+template <int SCALE>
+static BlockType dominantDownsampledBlock(const Chunk& chunk, int cellX, int cellY, int cellZ) {
+    std::array<uint8_t, BLOCK_TYPE_COUNT> counts{};
+    const int baseX = cellX * SCALE;
+    const int baseY = cellY * SCALE;
+    const int baseZ = cellZ * SCALE;
+    for (int dz = 0; dz < SCALE; ++dz) {
+        for (int dy = 0; dy < SCALE; ++dy) {
+            for (int dx = 0; dx < SCALE; ++dx) {
+                BlockType block = chunk.getBlock(baseX + dx, baseY + dy, baseZ + dz);
+                if (isFlora(block)) block = BlockType::AIR;
+                ++counts[static_cast<size_t>(block)];
+            }
+        }
+    }
+
+    size_t dominantIndex = 0;
+    for (size_t index = 1; index < counts.size(); ++index) {
+        if (counts[index] > counts[dominantIndex]) dominantIndex = index;
+    }
+    return static_cast<BlockType>(dominantIndex);
 }
 
 // ==========================================================================
@@ -661,9 +979,11 @@ MeshOutput LODMesher::buildMesh(const MeshSnapshot& snapshot, MeshScratch& scrat
     auto lightFn = [&snapshot](int x, int y, int z) -> uint8_t {
         return snapshot.lightAt(x, y, z);
     };
-    return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn, lightFn,
-                            /*padded=*/true,
-                            /*emitFlora=*/true, scratch);
+    auto skyFn = [&snapshot](int x, int z) -> int32_t { return snapshot.skyCutoffAt(x, z); };
+    return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn, lightFn, skyFn,
+                            snapshot.pos.x * CHUNK_EDGE, snapshot.pos.y * CHUNK_EDGE,
+                            snapshot.pos.z * CHUNK_EDGE, /*padded=*/true,
+                            /*emitFlora=*/true, /*emitGreedyWater=*/false, &snapshot, scratch);
 }
 
 MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
@@ -673,10 +993,11 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
     }
 
     thread_local MeshScratch scratch;
+    const auto noSkyCutoff = [](int, int) -> int32_t { return MeshSnapshot::SKY_CUTOFF_UNKNOWN; };
 
     switch (static_cast<ChunkLOD>(lodLevel)) {
         case ChunkLOD::FULL: {
-            // LOD 0: Full resolution greedy meshing (16×16×256),
+            // LOD 0: Full resolution greedy meshing (16x16x16),
             // neighbor-blind (tests and tools; the game uses the
             // MeshSnapshot overload)
             auto blockFn = [&chunk](int x, int y, int z) -> BlockType {
@@ -686,78 +1007,33 @@ MeshOutput LODMesher::buildMesh(const Chunk& chunk, int lodLevel) {
                 return chunk.getBlockLight(x, y, z);
             };
             return buildGenericMesh(CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH, blockFn, lightFn,
-                                    /*padded=*/false, /*emitFlora=*/true, scratch);
+                                    noSkyCutoff, chunk.chunkX * CHUNK_EDGE,
+                                    chunk.chunkY * CHUNK_EDGE, chunk.chunkZ * CHUNK_EDGE,
+                                    /*padded=*/false, /*emitFlora=*/true,
+                                    /*emitGreedyWater=*/true, nullptr, scratch);
         }
 
         case ChunkLOD::MEDIUM: {
-            // LOD 1: 2× downsampling (8×8×128)
-            // Each coarse block represents a 2×2×2 group of original blocks.
-            // Coarse block is solid if majority of group is solid.
+            // LOD 1: 2x downsampling. Flora does not contribute to the
+            // dominant block in a coarse cell.
             auto blockFn = [&chunk](int cx, int cy, int cz) -> BlockType {
-                int gx = cx * 2;
-                int gy = cy * 2;
-                int gz = cz * 2;
-
-                std::unordered_map<BlockType, int> typeCounts;
-                for (int dz = 0; dz < 2; ++dz) {
-                    for (int dy = 0; dy < 2; ++dy) {
-                        for (int dx = 0; dx < 2; ++dx) {
-                            BlockType bt = chunk.getBlock(gx + dx, gy + dy, gz + dz);
-                            // Flora is skipped at coarse LODs — a meadow must
-                            // not majority-pick into phantom solid cells
-                            if (isFlora(bt)) bt = BlockType::AIR;
-                            typeCounts[bt]++;
-                        }
-                    }
-                }
-
-                // Return the most common block type in the group
-                BlockType dominant = BlockType::AIR;
-                int maxCount = 0;
-                for (auto& [bt, count] : typeCounts) {
-                    if (count > maxCount) {
-                        maxCount = count;
-                        dominant = bt;
-                    }
-                }
-                return dominant;
+                return dominantDownsampledBlock<2>(chunk, cx, cy, cz);
             };
-            return buildGenericMesh(8, 128, 8, blockFn, noBlockLight, /*padded=*/false,
-                                    /*emitFlora=*/false, scratch);
+            return buildGenericMesh(
+                8, 8, 8, blockFn, noBlockLight, noSkyCutoff, chunk.chunkX * CHUNK_EDGE,
+                chunk.chunkY * CHUNK_EDGE, chunk.chunkZ * CHUNK_EDGE, /*padded=*/false,
+                /*emitFlora=*/false, /*emitGreedyWater=*/true, nullptr, scratch);
         }
 
         case ChunkLOD::COARSE: {
-            // LOD 2: 4× downsampling (4×4×64)
-            // Each coarse block represents a 4×4×4 group of original blocks.
+            // LOD 2: 4x downsampling.
             auto blockFn = [&chunk](int cx, int cy, int cz) -> BlockType {
-                int gx = cx * 4;
-                int gy = cy * 4;
-                int gz = cz * 4;
-
-                std::unordered_map<BlockType, int> typeCounts;
-                for (int dz = 0; dz < 4; ++dz) {
-                    for (int dy = 0; dy < 4; ++dy) {
-                        for (int dx = 0; dx < 4; ++dx) {
-                            BlockType bt = chunk.getBlock(gx + dx, gy + dy, gz + dz);
-                            if (isFlora(bt)) bt = BlockType::AIR;
-                            typeCounts[bt]++;
-                        }
-                    }
-                }
-
-                // Return the most common block type in the group
-                BlockType dominant = BlockType::AIR;
-                int maxCount = 0;
-                for (auto& [bt, count] : typeCounts) {
-                    if (count > maxCount) {
-                        maxCount = count;
-                        dominant = bt;
-                    }
-                }
-                return dominant;
+                return dominantDownsampledBlock<4>(chunk, cx, cy, cz);
             };
-            return buildGenericMesh(4, 64, 4, blockFn, noBlockLight, /*padded=*/false,
-                                    /*emitFlora=*/false, scratch);
+            return buildGenericMesh(
+                4, 4, 4, blockFn, noBlockLight, noSkyCutoff, chunk.chunkX * CHUNK_EDGE,
+                chunk.chunkY * CHUNK_EDGE, chunk.chunkZ * CHUNK_EDGE, /*padded=*/false,
+                /*emitFlora=*/false, /*emitGreedyWater=*/true, nullptr, scratch);
         }
 
         default:

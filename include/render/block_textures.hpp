@@ -42,6 +42,11 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
                 return TEXTURE_LAYER_BIRCH_LOG_TOP;
             return static_cast<uint8_t>(type);
         case BlockType::SPRUCE_LOG: // dark bark shares the oak end-grain rings
+        case BlockType::ACACIA_LOG:
+        case BlockType::JUNGLE_LOG:
+        case BlockType::MANGROVE_LOG:
+        case BlockType::PALM_LOG:
+        case BlockType::WILLOW_LOG:
             if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
                 return TEXTURE_LAYER_LOG_TOP;
             return static_cast<uint8_t>(type);
@@ -103,4 +108,23 @@ constexpr bool unpackEmissive(uint32_t faceAttr) {
 
 constexpr uint8_t unpackSway(uint32_t faceAttr) {
     return static_cast<uint8_t>((faceAttr >> 22) & 3u);
+}
+
+// Water uses reserved high bits without changing the 16-byte vertex layout.
+// Values 0 through 4 encode still, west, east, north, and south flow in bits
+// 24-26. Bit 27 identifies a falling column. Bits 0-23 retain the shared
+// face, texture, sky, AO, block-light, emissive, and sway semantics.
+constexpr uint32_t packFluidFaceAttr(FaceNormal face, uint8_t skyLight, uint8_t flowDirection,
+                                     bool falling, uint8_t blockLight = 0) {
+    return packFaceAttr(face, static_cast<uint8_t>(BlockType::WATER), skyLight, 3, blockLight) |
+           (static_cast<uint32_t>(flowDirection & 7u) << 24) |
+           (static_cast<uint32_t>(falling) << 27);
+}
+
+constexpr uint8_t unpackFluidDirection(uint32_t faceAttr) {
+    return static_cast<uint8_t>((faceAttr >> 24) & 7u);
+}
+
+constexpr bool unpackFluidFalling(uint32_t faceAttr) {
+    return ((faceAttr >> 27) & 1u) != 0;
 }

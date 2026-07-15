@@ -28,3 +28,11 @@ rycraft_exe = executable('rycraft',
   dependencies : [appleframeworks],
   build_by_default : true,
 )
+
+worldgen_inspect_exe = executable('rycraft_worldgen_inspect',
+  'worldgen_inspect.cpp',
+  include_directories : inc,
+  link_with : [libcommon, libworld, librender],
+  dependencies : [appleframeworks, lz4_dep],
+  build_by_default : true,
+)

@@ -28,6 +28,13 @@ jobs:
       - name: Install dependencies
         run: brew install meson ninja ccache
 
+      - name: Ensure Metal toolchain
+        run: |
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+
       - name: Cache ccache
         uses: actions/cache@v4
         with:
@@ -97,29 +104,53 @@ jobs:
       contents: read
       security-events: write
     steps:
+      # CodeQL is licensed for public repositories and private repositories
+      # with GitHub Code Security. Set RYCRAFT_CODEQL_ENABLED to true if Code
+      # Security is enabled for this private repository.
+      - name: Report CodeQL availability
+        if: github.event.repository.private && vars.RYCRAFT_CODEQL_ENABLED != 'true'
+        run: echo "CodeQL requires GitHub Code Security for private repositories"
+
       - uses: actions/checkout@v4
+        if: github.event.repository.private == false || vars.RYCRAFT_CODEQL_ENABLED == 'true'
 
       - name: Install dependencies
+        if: github.event.repository.private == false || vars.RYCRAFT_CODEQL_ENABLED == 'true'
         run: brew install meson ninja
 
       - name: Cache wrap downloads
+        if: github.event.repository.private == false || vars.RYCRAFT_CODEQL_ENABLED == 'true'
         uses: actions/cache@v4
         with:
           path: subprojects/packagecache
           key: wraps-${{ hashFiles('subprojects/*.wrap') }}
 
       - name: Initialize CodeQL
+        if: github.event.repository.private == false || vars.RYCRAFT_CODEQL_ENABLED == 'true'
         uses: github/codeql-action/init@v3
         with:
           languages: cpp
 
       - name: Setup build
+        if: github.event.repository.private == false || vars.RYCRAFT_CODEQL_ENABLED == 'true'
         run: meson setup build
 
       - name: Compile
-        run: ninja -C build
+        if: github.event.repository.private == false || vars.RYCRAFT_CODEQL_ENABLED == 'true'
+        # CodeQL analyzes native C++ and Objective-C++ sources, not Metal
+        # shading language. Static targets cover every production library
+        # without linking CodeQL's traced objects to native-only dependencies.
+        run: |
+          ninja -C build \
+            src/common/libcommon.a \
+            src/engine/libengine.a \
+            src/render/librender.a \
+            src/world/libworld.a \
+            src/entity/libentity.a \
+            src/audio/libaudio.a
 
       - name: Perform CodeQL Analysis
+        if: github.event.repository.private == false || vars.RYCRAFT_CODEQL_ENABLED == 'true'
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:cpp"

@@ -2,19 +2,22 @@
 
 #include "world/chunk_generator.hpp"
 #include "world/chunk_pos.hpp"
-#include "world/gen_seeds.hpp"
 
 #include <algorithm>
 #include <array>
 
 namespace {
 
-int floorDiv(int a, int b) {
-    return (a >= 0) ? a / b : -((-a + b - 1) / b);
-}
+constexpr uint64_t STRUCTURE_ANCHOR_CHUNK_X_STREAM = 0x5354525F43484E58ULL;
+constexpr uint64_t STRUCTURE_ANCHOR_CHUNK_Z_STREAM = 0x5354525F43484E5AULL;
+constexpr uint64_t STRUCTURE_ANCHOR_LOCAL_X_STREAM = 0x5354525F4C4F4358ULL;
+constexpr uint64_t STRUCTURE_ANCHOR_LOCAL_Z_STREAM = 0x5354525F4C4F435AULL;
+constexpr uint64_t STRUCTURE_KIND_STREAM = 0x5354525F4B494E44ULL;
+constexpr uint64_t STRUCTURE_ROTATION_STREAM = 0x5354525F524F544EULL;
+constexpr uint64_t RUIN_DECAY_STREAM = 0x5354525F44454359ULL;
 
-uint64_t regionKey(int regionX, int regionZ) {
-    return ChunkPos{regionX, regionZ}.packed(); // THE xz key bit layout
+int64_t floorDiv(int64_t a, int64_t b) {
+    return world_coord::floorDiv(a, b);
 }
 
 // Rotate footprint-local (u, v) by quarter turns around the anchor.
@@ -58,56 +61,55 @@ void kindExtents(StructureKind kind, int& halfU, int& halfV) {
 }
 
 bool isLandBiome(Biome biome) {
-    switch (biome) {
-        case Biome::OCEAN:
-        case Biome::DEEP_OCEAN:
-        case Biome::RIVER:
-            return false;
-        default:
-            return true;
-    }
+    return biome != Biome::OCEAN && biome != Biome::DEEP_OCEAN && biome != Biome::FROZEN_OCEAN &&
+           biome != Biome::RIVER && biome != Biome::COUNT;
 }
 
 // A per-chunk writer that silently drops blocks outside the chunk — the
 // filter that makes footprints span borders safely.
 struct ChunkWriter {
     Chunk& chunk;
-    int baseX;
-    int baseZ;
+    int64_t baseX;
+    int baseY;
+    int64_t baseZ;
 
-    void force(int x, int y, int z, BlockType block) const {
-        int lx = x - baseX;
-        int lz = z - baseZ;
-        if (lx >= 0 && lx < CHUNK_WIDTH && lz >= 0 && lz < CHUNK_DEPTH && y >= 0 &&
-            y < CHUNK_HEIGHT) {
-            chunk.setBlock(lx, y, lz, block);
+    void force(int64_t x, int y, int64_t z, BlockType block) const {
+        int lx = static_cast<int>(x - baseX);
+        int ly = y - baseY;
+        int lz = static_cast<int>(z - baseZ);
+        if (lx >= 0 && lx < CHUNK_WIDTH && ly >= 0 && ly < CHUNK_HEIGHT && lz >= 0 &&
+            lz < CHUNK_DEPTH) {
+            chunk.setBlock(lx, ly, lz, block);
         }
     }
 };
 
 } // namespace
 
-StructurePlacer::StructurePlacer(uint32_t worldSeed) : seed_(worldSeed) {}
+StructurePlacer::StructurePlacer(uint32_t worldSeed) : random_(worldSeed) {}
 
-const StructurePlacement& StructurePlacer::regionPlacement(int regionX, int regionZ,
+const StructurePlacement& StructurePlacer::regionPlacement(int64_t regionX, int64_t regionZ,
                                                            const ChunkGenerator& gen,
                                                            GenScratch& scratch) const {
-    uint64_t key = regionKey(regionX, regionZ);
+    const ColumnPos key{regionX, regionZ};
     auto it = scratch.structurePlacements.find(key);
     if (it != scratch.structurePlacements.end()) return it->second;
 
-    SeededRng rng(hashCoords(regionX, regionZ, genseed::subSeed(seed_, genseed::STRUCTURES)));
-
-    // Fixed draw order (see the ores placer for why). The anchor margins
-    // (chunk offset 1..6 in the region, block offset 2..13 in the chunk)
-    // bound footprint spill to under one chunk — the guarantee that lets a
+    // The anchor margins (chunk offset 1..6 in the region, block offset
+    // 2..13 in the chunk) bound footprint spill to under one chunk, which lets a
     // radius-1 chunk neighborhood see every structure that can reach it.
-    int anchorChunkX = regionX * STRUCTURE_REGION_CHUNKS + rng.nextInt(1, 6);
-    int anchorChunkZ = regionZ * STRUCTURE_REGION_CHUNKS + rng.nextInt(1, 6);
-    int anchorLocalX = rng.nextInt(2, 13);
-    int anchorLocalZ = rng.nextInt(2, 13);
-    float kindRoll = rng.nextFloat();
-    int rotation = rng.nextInt(0, 3);
+    int64_t anchorChunkX =
+        regionX * STRUCTURE_REGION_CHUNKS +
+        random_.uniformInt(STRUCTURE_ANCHOR_CHUNK_X_STREAM, regionX, 0, regionZ, 0, 1, 6);
+    int64_t anchorChunkZ =
+        regionZ * STRUCTURE_REGION_CHUNKS +
+        random_.uniformInt(STRUCTURE_ANCHOR_CHUNK_Z_STREAM, regionX, 0, regionZ, 0, 1, 6);
+    int anchorLocalX =
+        random_.uniformInt(STRUCTURE_ANCHOR_LOCAL_X_STREAM, regionX, 0, regionZ, 0, 2, 13);
+    int anchorLocalZ =
+        random_.uniformInt(STRUCTURE_ANCHOR_LOCAL_Z_STREAM, regionX, 0, regionZ, 0, 2, 13);
+    double kindRoll = random_.uniform01(STRUCTURE_KIND_STREAM, regionX, 0, regionZ);
+    int rotation = random_.uniformInt(STRUCTURE_ROTATION_STREAM, regionX, 0, regionZ, 0, 0, 3);
 
     StructurePlacement placement;
     placement.kind = kindRoll < 0.4f   ? StructureKind::RUIN
@@ -147,15 +149,15 @@ const StructurePlacement& StructurePlacer::regionPlacement(int regionX, int regi
     return scratch.structurePlacements.emplace(key, placement).first->second;
 }
 
-bool StructurePlacer::insideStructure(int x, int z, int chunkX, int chunkZ,
+bool StructurePlacer::insideStructure(int64_t x, int64_t z, int64_t chunkX, int64_t chunkZ,
                                       const ChunkGenerator& gen, GenScratch& scratch,
                                       int margin) const {
-    int minRegionX = floorDiv(chunkX - 1, STRUCTURE_REGION_CHUNKS);
-    int maxRegionX = floorDiv(chunkX + 1, STRUCTURE_REGION_CHUNKS);
-    int minRegionZ = floorDiv(chunkZ - 1, STRUCTURE_REGION_CHUNKS);
-    int maxRegionZ = floorDiv(chunkZ + 1, STRUCTURE_REGION_CHUNKS);
-    for (int rz = minRegionZ; rz <= maxRegionZ; ++rz) {
-        for (int rx = minRegionX; rx <= maxRegionX; ++rx) {
+    int64_t minRegionX = floorDiv(chunkX - 1, STRUCTURE_REGION_CHUNKS);
+    int64_t maxRegionX = floorDiv(chunkX + 1, STRUCTURE_REGION_CHUNKS);
+    int64_t minRegionZ = floorDiv(chunkZ - 1, STRUCTURE_REGION_CHUNKS);
+    int64_t maxRegionZ = floorDiv(chunkZ + 1, STRUCTURE_REGION_CHUNKS);
+    for (int64_t rz = minRegionZ; rz <= maxRegionZ; ++rz) {
+        for (int64_t rx = minRegionX; rx <= maxRegionX; ++rx) {
             const StructurePlacement& p = regionPlacement(rx, rz, gen, scratch);
             if (!p.valid) continue;
             if (std::abs(x - p.anchorX) <= p.halfX + margin &&
@@ -168,15 +170,16 @@ bool StructurePlacer::insideStructure(int x, int z, int chunkX, int chunkZ,
 }
 
 void StructurePlacer::place(Chunk& chunk, const ChunkGenerator& gen, GenScratch& scratch) const {
-    ChunkWriter out{chunk, chunk.chunkX * CHUNK_WIDTH, chunk.chunkZ * CHUNK_DEPTH};
+    ChunkWriter out{chunk, chunk.chunkX * CHUNK_WIDTH, chunk.chunkY * CHUNK_HEIGHT,
+                    chunk.chunkZ * CHUNK_DEPTH};
 
-    int minRegionX = floorDiv(chunk.chunkX - 1, STRUCTURE_REGION_CHUNKS);
-    int maxRegionX = floorDiv(chunk.chunkX + 1, STRUCTURE_REGION_CHUNKS);
-    int minRegionZ = floorDiv(chunk.chunkZ - 1, STRUCTURE_REGION_CHUNKS);
-    int maxRegionZ = floorDiv(chunk.chunkZ + 1, STRUCTURE_REGION_CHUNKS);
+    int64_t minRegionX = floorDiv(chunk.chunkX - 1, STRUCTURE_REGION_CHUNKS);
+    int64_t maxRegionX = floorDiv(chunk.chunkX + 1, STRUCTURE_REGION_CHUNKS);
+    int64_t minRegionZ = floorDiv(chunk.chunkZ - 1, STRUCTURE_REGION_CHUNKS);
+    int64_t maxRegionZ = floorDiv(chunk.chunkZ + 1, STRUCTURE_REGION_CHUNKS);
 
-    for (int rz = minRegionZ; rz <= maxRegionZ; ++rz) {
-        for (int rx = minRegionX; rx <= maxRegionX; ++rx) {
+    for (int64_t rz = minRegionZ; rz <= maxRegionZ; ++rz) {
+        for (int64_t rx = minRegionX; rx <= maxRegionX; ++rx) {
             const StructurePlacement& p = regionPlacement(rx, rz, gen, scratch);
             if (!p.valid) continue;
             // Skip footprints that cannot touch this chunk
@@ -201,8 +204,8 @@ void StructurePlacer::place(Chunk& chunk, const ChunkGenerator& gen, GenScratch&
                 for (int u = -halfU; u <= halfU; ++u) {
                     int dx = 0, dz = 0;
                     rotate(u, v, p.rotation, dx, dz);
-                    int x = p.anchorX + dx;
-                    int z = p.anchorZ + dz;
+                    int64_t x = p.anchorX + dx;
+                    int64_t z = p.anchorZ + dz;
                     int ground = gen.surfaceYAt(x, z, scratch);
                     for (int y = p.floorY - 1; y > ground && y > p.floorY - 9; --y) {
                         out.force(x, y, z, stoneBlock);
@@ -210,17 +213,14 @@ void StructurePlacer::place(Chunk& chunk, const ChunkGenerator& gen, GenScratch&
                 }
             }
 
-            uint64_t decaySeed =
-                hashCoords(p.anchorX, p.anchorZ, genseed::subSeed(seed_, genseed::STRUCTURES));
-
             switch (p.kind) {
                 case StructureKind::HOUSE: {
                     for (int v = -3; v <= 3; ++v) {
                         for (int u = -3; u <= 3; ++u) {
                             int dx = 0, dz = 0;
                             rotate(u, v, p.rotation, dx, dz);
-                            int x = p.anchorX + dx;
-                            int z = p.anchorZ + dz;
+                            int64_t x = p.anchorX + dx;
+                            int64_t z = p.anchorZ + dz;
 
                             out.force(x, p.floorY, z, BlockType::PLANKS);
 
@@ -256,8 +256,8 @@ void StructurePlacer::place(Chunk& chunk, const ChunkGenerator& gen, GenScratch&
                         for (int u = -2; u <= 2; ++u) {
                             int dx = 0, dz = 0;
                             rotate(u, v, p.rotation, dx, dz);
-                            int x = p.anchorX + dx;
-                            int z = p.anchorZ + dz;
+                            int64_t x = p.anchorX + dx;
+                            int64_t z = p.anchorZ + dz;
 
                             if (u == 0 && v == 0) {
                                 // Water shaft with a stone bottom
@@ -289,9 +289,10 @@ void StructurePlacer::place(Chunk& chunk, const ChunkGenerator& gen, GenScratch&
                         for (int u = -3; u <= 3; ++u) {
                             int dx = 0, dz = 0;
                             rotate(u, v, p.rotation, dx, dz);
-                            int x = p.anchorX + dx;
-                            int z = p.anchorZ + dz;
-                            uint64_t cell = hashCoords(x, z, static_cast<uint32_t>(decaySeed));
+                            int64_t x = p.anchorX + dx;
+                            int64_t z = p.anchorZ + dz;
+                            uint64_t cell = random_.u64(RUIN_DECAY_STREAM, x, p.floorY, z,
+                                                        static_cast<uint32_t>(p.rotation));
 
                             if (cell % 10 < 6)
                                 out.force(x, p.floorY, z,

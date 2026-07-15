@@ -1,9 +1,8 @@
 #include "test_helpers.hpp"
 
-#include <audio/audio_engine.hpp>
-#include <audio/sfx.hpp>
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <common/counter_rng.hpp>
 #include <common/math.hpp>
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
@@ -30,224 +29,232 @@
 #include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/climate.hpp>
+#include <world/fluid.hpp>
 #include <world/light_engine.hpp>
 #include <world/noise.hpp>
+#include <world/ores.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
+#include <world/structures.hpp>
 #include <world/world.hpp>
 
-#include <chrono>
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
+#include <future>
 #include <memory>
+#include <numbers>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
-// ============================================================================
-// Vec3 Tests
-// ============================================================================
 // ===========================================================================
-// World: chunks, generation, biomes, persistence
+// Coordinate and math tests
 // ===========================================================================
 
-// ============================================================================
-// Existing Tests
-// ============================================================================
-
-TEST_CASE("Chunk coordinates are multiples of CHUNK_SIZE", "[chunk]") {
-    REQUIRE(0 % CHUNK_SIZE == 0);
-    REQUIRE(16 % CHUNK_SIZE == 0);
-    REQUIRE(32 % CHUNK_SIZE == 0);
-    REQUIRE((-16) % CHUNK_SIZE == 0);
+TEST_CASE("Cubic world constants describe the supported vertical range", "[chunk][coords]") {
+    STATIC_REQUIRE(CHUNK_EDGE == 16);
+    STATIC_REQUIRE(CHUNK_VOLUME == 4096);
+    STATIC_REQUIRE(WORLD_MIN_Y == -128);
+    STATIC_REQUIRE(WORLD_MAX_Y == 511);
+    STATIC_REQUIRE(WORLD_MIN_CHUNK_Y == -8);
+    STATIC_REQUIRE(WORLD_MAX_CHUNK_Y == 31);
+    STATIC_REQUIRE(WORLD_VERTICAL_CHUNKS == 40);
+    STATIC_REQUIRE(SEA_LEVEL == 64);
 }
 
-TEST_CASE("BlockType enum values are as expected", "[block]") {
-    // Saves store raw enum bytes: existing values must never renumber
+TEST_CASE("Floor division and local coordinates are canonical for negatives", "[chunk][coords]") {
+    const std::array<int64_t, 10> world = {-33, -32, -17, -16, -1, 0, 15, 16, 31, 32};
+    const std::array<int64_t, 10> chunks = {-3, -2, -2, -1, -1, 0, 0, 1, 1, 2};
+    const std::array<int32_t, 10> locals = {15, 0, 15, 0, 15, 0, 15, 0, 15, 0};
+
+    for (size_t i = 0; i < world.size(); ++i) {
+        REQUIRE(Chunk::worldToChunk(world[i]) == chunks[i]);
+        REQUIRE(Chunk::worldToLocal(world[i]) == locals[i]);
+    }
+
+    REQUIRE(Chunk::worldToChunkY(WORLD_MIN_Y) == WORLD_MIN_CHUNK_Y);
+    REQUIRE(Chunk::worldToChunkY(-1) == -1);
+    REQUIRE(Chunk::worldToChunkY(0) == 0);
+    REQUIRE(Chunk::worldToChunkY(WORLD_MAX_Y) == WORLD_MAX_CHUNK_Y);
+    REQUIRE(Chunk::worldToLocalY(-1) == 15);
+    REQUIRE(Chunk::worldToLocalY(WORLD_MAX_Y) == 15);
+}
+
+TEST_CASE("Three dimensional positions compare and hash distinctly", "[chunk][coords]") {
+    std::unordered_map<ChunkPos, int> cubes;
+    cubes[{5, -3, 7}] = 1;
+    cubes[{5, -2, 7}] = 2;
+    cubes[{-5, -3, 7}] = 3;
+    cubes[{5, -3, -7}] = 4;
+
+    REQUIRE(cubes.size() == 4);
+    REQUIRE(cubes.at({5, -3, 7}) == 1);
+    REQUIRE(cubes.at({5, -2, 7}) == 2);
+    REQUIRE(ChunkPos{5, -3, 7} != ChunkPos{5, 7, -3});
+
+    std::unordered_set<ColumnPos> columns{{5, 7}, {5, -7}, {-5, 7}};
+    REQUIRE(columns.size() == 3);
+    REQUIRE(columns.contains({5, 7}));
+
+    std::unordered_set<BlockPos> blocks{{-1, -1, -1}, {-1, 0, -1}, {0, -1, -1}};
+    REQUIRE(blocks.size() == 3);
+}
+
+TEST_CASE("CounterRng addresses full-width coordinates and candidate indices",
+          "[counter-rng][random]") {
+    constexpr CounterRng random(0x123456789ABCDEF0ULL);
+    constexpr uint64_t stream = 0x4F52455F54455354ULL;
+    constexpr int64_t aliasDistance = int64_t{1} << 32;
+
+    const CounterRng::Block origin = random.block(stream, -17, -3, 29, 7);
+    REQUIRE(origin == random.block(stream, -17, -3, 29, 7));
+    REQUIRE(origin != random.block(stream, -17 + aliasDistance, -3, 29, 7));
+    REQUIRE(origin != random.block(stream, -17, -3, 29 + aliasDistance, 7));
+    REQUIRE(origin != random.block(stream + 1, -17, -3, 29, 7));
+    REQUIRE(origin != random.block(stream, -17, -3, 29, 8));
+
+    const uint32_t later = random.u32(stream, -17, -3, 29, 99);
+    REQUIRE(random.u32(stream, -17, -3, 29, 7) == origin[0]);
+    REQUIRE(random.u32(stream, -17, -3, 29, 99) == later);
+}
+
+TEST_CASE("Vec3 arithmetic and AABB intersection remain stable", "[math]") {
+    Vec3 a{1.f, 2.f, 3.f};
+    Vec3 b{-2.f, 4.f, 1.f};
+    REQUIRE(a + b == Vec3{-1.f, 6.f, 4.f});
+    REQUIRE(a.dot(b) == Catch::Approx(9.f));
+    REQUIRE(a.cross(b) == Vec3{-10.f, -7.f, 8.f});
+    REQUIRE(a.normalize().length() == Catch::Approx(1.f));
+
+    AABB first{{0.f, 0.f, 0.f}, {1.f, 1.f, 1.f}};
+    AABB overlap{{0.5f, 0.5f, 0.5f}, {2.f, 2.f, 2.f}};
+    AABB separate{{2.f, 2.f, 2.f}, {3.f, 3.f, 3.f}};
+    REQUIRE(first.intersects(overlap));
+    REQUIRE_FALSE(first.intersects(separate));
+}
+
+// ===========================================================================
+// Block, noise, and climate tests
+// ===========================================================================
+
+TEST_CASE("Persisted block identifiers retain their original values", "[block]") {
     REQUIRE(static_cast<int>(BlockType::AIR) == 0);
     REQUIRE(static_cast<int>(BlockType::STONE) == 1);
-    REQUIRE(static_cast<int>(BlockType::GRASS) == 2);
-    REQUIRE(static_cast<int>(BlockType::DIRT) == 3);
-    REQUIRE(static_cast<int>(BlockType::SAND) == 4);
+    REQUIRE(static_cast<int>(BlockType::WATER) == 6);
     REQUIRE(static_cast<int>(BlockType::BEDROCK) == 7);
-    REQUIRE(static_cast<int>(BlockType::LOG) == 8);
-    REQUIRE(static_cast<int>(BlockType::LEAVES) == 9);
     REQUIRE(static_cast<int>(BlockType::GLASS) == 16);
     REQUIRE(static_cast<int>(BlockType::COBBLESTONE) == 17);
-    REQUIRE(static_cast<int>(BlockType::REED) == 31);
     REQUIRE(static_cast<int>(BlockType::ICE) == 33);
-    REQUIRE(static_cast<int>(BlockType::COUNT) == 34);
+    REQUIRE(static_cast<int>(BlockType::MUD) == 34);
+    REQUIRE(static_cast<int>(BlockType::OBSIDIAN) == 40);
+    REQUIRE(static_cast<int>(BlockType::ACACIA_LOG) == 41);
+    REQUIRE(static_cast<int>(BlockType::FERN) == 51);
+    REQUIRE(static_cast<int>(BlockType::ANDESITE) == 57);
+    REQUIRE(static_cast<int>(BlockType::COUNT) == 58);
 }
 
-TEST_CASE("Block properties: flora, liquid, and targetable sets", "[block]") {
-    // Flora: cross-quad plants — non-solid, non-opaque, but targetable
-    for (BlockType bt : {BlockType::DEAD_BUSH, BlockType::TALL_GRASS, BlockType::FLOWER_YELLOW,
-                         BlockType::FLOWER_RED, BlockType::MUSHROOM_BROWN, BlockType::MUSHROOM_RED,
-                         BlockType::REED}) {
-        REQUIRE(isFlora(bt));
-        REQUIRE(!isSolid(bt));
-        REQUIRE(!isOpaque(bt));
-        REQUIRE(isTargetable(bt));
+TEST_CASE("Block properties distinguish flora liquids and cubes", "[block]") {
+    for (size_t index = 0; index < BLOCK_TYPE_COUNT; ++index) {
+        const auto& definition = blockDefinition(static_cast<BlockType>(index));
+        REQUIRE(definition.sound != BlockSound::UNDEFINED);
+        REQUIRE(definition.material != BlockMaterial::UNDEFINED);
     }
-    REQUIRE(!isFlora(BlockType::CACTUS)); // cactus is a full cube
 
-    // Liquids: swimmable, non-solid, click-through. Water renders in the
-    // water pass (non-opaque); lava draws as an emissive opaque cube.
-    for (BlockType bt : {BlockType::WATER, BlockType::LAVA}) {
-        REQUIRE(isLiquid(bt));
-        REQUIRE(!isSolid(bt));
-        REQUIRE(!isTargetable(bt));
+    for (BlockType block : {BlockType::DEAD_BUSH, BlockType::TALL_GRASS, BlockType::FLOWER_YELLOW,
+                            BlockType::FLOWER_RED, BlockType::MUSHROOM_BROWN,
+                            BlockType::MUSHROOM_RED, BlockType::REED}) {
+        REQUIRE(isFlora(block));
+        REQUIRE_FALSE(isSolid(block));
+        REQUIRE_FALSE(isOpaque(block));
+        REQUIRE(isTargetable(block));
     }
-    REQUIRE(!isOpaque(BlockType::WATER));
+
+    for (BlockType block : {BlockType::WATER, BlockType::LAVA}) {
+        REQUIRE(isLiquid(block));
+        REQUIRE_FALSE(isSolid(block));
+        REQUIRE_FALSE(isTargetable(block));
+    }
+    REQUIRE_FALSE(isOpaque(BlockType::WATER));
     REQUIRE(isOpaque(BlockType::LAVA));
     REQUIRE(rendersAsCube(BlockType::LAVA));
-    REQUIRE(!rendersAsCube(BlockType::WATER));
+    REQUIRE_FALSE(rendersAsCube(BlockType::WATER));
 
-    // Cube blocks added by the worldgen overhaul stay solid + opaque
-    for (BlockType bt :
-         {BlockType::COBBLESTONE, BlockType::MOSSY_COBBLESTONE, BlockType::SANDSTONE,
-          BlockType::BIRCH_LOG, BlockType::SPRUCE_LOG, BlockType::CACTUS, BlockType::ICE}) {
-        REQUIRE(isSolid(bt));
-        REQUIRE(isOpaque(bt));
+    for (BlockType block : {BlockType::FERN, BlockType::SHRUB, BlockType::CATTAIL,
+                            BlockType::FLOWER_BLUE, BlockType::SUCCULENT, BlockType::LILY_PAD}) {
+        REQUIRE(isFlora(block));
+        REQUIRE_FALSE(isSolid(block));
     }
-
-    // Leaf variants cut out like oak leaves
-    for (BlockType bt : {BlockType::BIRCH_LEAVES, BlockType::SPRUCE_LEAVES}) {
-        REQUIRE(isSolid(bt));
-        REQUIRE(!isOpaque(bt));
-    }
+    REQUIRE(blockDefinition(BlockType::LILY_PAD).renderShape == BlockRenderShape::FLAT);
+    REQUIRE(isLeafBlock(BlockType::MANGROVE_LEAVES));
+    REQUIRE(isSolid(BlockType::BASALT));
+    REQUIRE(isOpaque(BlockType::BASALT));
 }
 
-// ============================================================================
-// Simplex Noise Tests
-// ============================================================================
+TEST_CASE("Simplex noise is deterministic and seed dependent", "[noise]") {
+    SimplexNoise first(42);
+    SimplexNoise same(42);
+    SimplexNoise different(43);
 
-TEST_CASE("SimplexNoise deterministic output for same seed", "[noise]") {
-    SimplexNoise noise1(42);
-    SimplexNoise noise2(42);
-
-    double v1 = noise1.noise2D(1.0, 2.0);
-    double v2 = noise2.noise2D(1.0, 2.0);
-    REQUIRE(v1 == v2);
-
-    double v3 = noise1.noise3D(1.0, 2.0, 3.0);
-    double v4 = noise2.noise3D(1.0, 2.0, 3.0);
-    REQUIRE(v3 == v4);
+    bool foundSeedDifference = false;
+    for (int x = -20; x <= 20; ++x) {
+        const double nx = static_cast<double>(x) * 0.37;
+        const double a = first.noise2D(nx, 7.25);
+        const double b = same.noise2D(nx, 7.25);
+        const double c = different.noise2D(nx, 7.25);
+        REQUIRE(a == b);
+        REQUIRE(a >= -1.0);
+        REQUIRE(a <= 1.0);
+        foundSeedDifference = foundSeedDifference || a != c;
+    }
+    REQUIRE(foundSeedDifference);
 }
 
-TEST_CASE("SimplexNoise same input gives same output", "[noise]") {
+TEST_CASE("Simplex three dimensional and octave samples stay bounded", "[noise]") {
     SimplexNoise noise(123);
-
-    double a = noise(10.0, 20.0);
-    double b = noise(10.0, 20.0);
-    REQUIRE(a == b);
-
-    double c = noise.noise3D(5.0, 5.0, 5.0);
-    double d = noise.noise3D(5.0, 5.0, 5.0);
-    REQUIRE(c == d);
-}
-
-TEST_CASE("SimplexNoise output range within [-1, 1]", "[noise]") {
-    SimplexNoise noise(99);
-
-    // Sample a grid of points
-    for (int ix = -10; ix <= 10; ++ix) {
-        for (int iy = -10; iy <= 10; ++iy) {
-            double v2d = noise.noise2D(static_cast<double>(ix), static_cast<double>(iy));
-            REQUIRE(v2d >= -1.0);
-            REQUIRE(v2d <= 1.0);
-        }
-    }
-
-    for (int ix = -5; ix <= 5; ++ix) {
-        for (int iy = -5; iy <= 5; ++iy) {
-            for (int iz = -5; iz <= 5; ++iz) {
-                double v3d = noise.noise3D(static_cast<double>(ix), static_cast<double>(iy),
-                                           static_cast<double>(iz));
-                REQUIRE(v3d >= -1.0);
-                REQUIRE(v3d <= 1.0);
+    for (int z = -3; z <= 3; ++z) {
+        for (int y = -3; y <= 3; ++y) {
+            for (int x = -3; x <= 3; ++x) {
+                const double value = noise.noise3D(x * 0.3, y * 0.3, z * 0.3);
+                REQUIRE(value >= -1.0);
+                REQUIRE(value <= 1.0);
+                REQUIRE(value == noise.noise3D(x * 0.3, y * 0.3, z * 0.3));
             }
         }
     }
-}
 
-TEST_CASE("SimplexNoise different seeds give different outputs", "[noise]") {
-    SimplexNoise noiseA(1);
-    SimplexNoise noiseB(2);
-
-    // Different seeds should produce different noise fields
-    bool different = false;
-    for (int i = 0; i < 20; ++i) {
-        double a = noiseA.noise2D(static_cast<double>(i), static_cast<double>(i));
-        double b = noiseB.noise2D(static_cast<double>(i), static_cast<double>(i));
-        if (a != b) {
-            different = true;
-            break;
-        }
-    }
-    REQUIRE(different == true);
-}
-
-TEST_CASE("SimplexNoise octave2D is deterministic", "[noise]") {
-    SimplexNoise noise(77);
-    double a = noise.octave2D(10.0, 20.0, 4, 0.5, 2.0);
-    double b = noise.octave2D(10.0, 20.0, 4, 0.5, 2.0);
-    REQUIRE(a == b);
-}
-
-TEST_CASE("SimplexNoise octave output range within [-1, 1]", "[noise]") {
-    SimplexNoise noise(42);
-
-    for (int i = 0; i < 20; ++i) {
-        double v =
-            noise.octave2D(static_cast<double>(i) * 0.1, static_cast<double>(i) * 0.1, 6, 0.5, 2.0);
-        REQUIRE(v >= -1.0);
-        REQUIRE(v <= 1.0);
+    for (int i = 0; i < 30; ++i) {
+        const double octave = noise.octave2D(i * 0.17, i * -0.11, 6, 0.5, 2.0);
+        const double ridged = noise.ridged2D(i * 0.17, i * -0.11, 4, 0.5, 2.0);
+        REQUIRE(octave >= -1.0);
+        REQUIRE(octave <= 1.0);
+        REQUIRE(ridged >= 0.0);
+        REQUIRE(ridged <= 1.0);
     }
 }
 
-TEST_CASE("SimplexNoise ridged noise is deterministic", "[noise]") {
-    SimplexNoise noise(55);
-    double a = noise.ridged2D(10.0, 20.0, 4, 0.5, 2.0);
-    double b = noise.ridged2D(10.0, 20.0, 4, 0.5, 2.0);
-    REQUIRE(a == b);
-}
-
-TEST_CASE("SimplexNoise ridged output range within [0, 1]", "[noise]") {
-    SimplexNoise noise(42);
-
-    for (int i = 0; i < 20; ++i) {
-        double v =
-            noise.ridged2D(static_cast<double>(i) * 0.1, static_cast<double>(i) * 0.1, 4, 0.5, 2.0);
-        REQUIRE(v >= 0.0);
-        REQUIRE(v <= 1.0);
-    }
-}
-
-TEST_CASE("SimplexNoise operator() equals noise2D", "[noise]") {
-    SimplexNoise noise(42);
-    REQUIRE(noise(1.0, 2.0) == noise.noise2D(1.0, 2.0));
-    REQUIRE(noise(10.5, -3.7) == noise.noise2D(10.5, -3.7));
-}
-
-// ============================================================================
-// Climate / terrain shaping tests
-// ============================================================================
-
-TEST_CASE("ClimateSampler shapeColumn is deterministic and sane", "[climate]") {
-    ClimateSampler c1(123);
-    ClimateSampler c2(123);
+TEST_CASE("Climate columns are deterministic continuous samples", "[climate]") {
+    ClimateSampler first(123);
+    ClimateSampler same(123);
     for (int i = -50; i <= 50; i += 7) {
-        ColumnShape a = c1.shapeColumn(i * 31.0, i * 17.0);
-        ColumnShape b = c2.shapeColumn(i * 31.0, i * 17.0);
+        const ColumnShape a = first.shapeColumn(i * 31.0, i * 17.0);
+        const ColumnShape b = same.shapeColumn(i * 31.0, i * 17.0);
         REQUIRE(a.height == b.height);
         REQUIRE(a.climate.temperature == b.climate.temperature);
-        REQUIRE(a.height >= 20.0);
-        REQUIRE(a.height <= 240.0);
+        REQUIRE(a.climate.humidity == b.climate.humidity);
+        REQUIRE(std::isfinite(a.height));
+        REQUIRE(a.height >= WORLD_MIN_Y + 2);
+        REQUIRE(a.height <= WORLD_MAX_Y);
         REQUIRE(a.detailAmp >= 0.0);
         REQUIRE(a.ravineEdge >= 0.0);
         REQUIRE(a.ravineEdge <= 1.0);
     }
 }
 
-TEST_CASE("selectBiome: ordered rules on the climate fields", "[climate]") {
+TEST_CASE("Biome selection responds to climate and terrain", "[climate][biome]") {
     ColumnShape shape;
     shape.height = 40.0;
     REQUIRE(ClimateSampler::selectBiome(shape) == Biome::DEEP_OCEAN);
@@ -268,1200 +275,1543 @@ TEST_CASE("selectBiome: ordered rules on the climate fields", "[climate]") {
     shape.climate.temperature = 0.3;
     shape.climate.humidity = 0.4;
     REQUIRE(ClimateSampler::selectBiome(shape) == Biome::FOREST);
-    shape.climate.temperature = -0.2;
-    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::BIRCH_FOREST);
-
-    shape.climate.humidity = 0.6;
-    shape.height = 66.0;
-    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::SWAMP);
-
-    shape.climate.humidity = 0.1;
-    shape.climate.temperature = 0.4;
-    shape.height = 80.0;
-    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::FLOWER_FIELD);
-
-    shape.climate.humidity = -0.1;
-    shape.climate.temperature = 0.1;
-    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::PLAINS);
-
-    shape.riverCut = 4.0;
-    shape.height = 60.0;
-    shape.climate.continentalness = 0.3;
-    REQUIRE(ClimateSampler::selectBiome(shape) == Biome::RIVER);
 }
 
-TEST_CASE("Terrain height is continuous — no biome cliffs", "[climate][worldgen]") {
-    // The old design added per-biome height offsets after a discrete biome
-    // pick, which produced 15-block-in-one-step walls at biome borders.
-    // Height now reads continuous splines only. The steepest legitimate
-    // slope is a river gorge bank through a high plateau (~7 blocks per
-    // column); a discrete-biome cliff would blow well past this bound.
-    ChunkGenerator gen(4242);
+TEST_CASE("Terrain height remains finite across climate transitions", "[climate][worldgen]") {
+    ChunkGenerator generator(4242);
     GenScratch scratch;
-    scratch.reset(&gen);
-    double prev = gen.baseHeightAt(-256, 100, scratch);
-    for (int x = -255; x <= 256; ++x) {
-        double h = gen.baseHeightAt(x, 100, scratch);
-        REQUIRE(std::abs(h - prev) <= 8.0);
-        prev = h;
+    scratch.reset(&generator);
+    constexpr std::array<int, 5> coordinates{{-256, -97, 0, 113, 256}};
+    for (int x : coordinates) {
+        const double height = generator.baseHeightAt(x, 100, scratch);
+        REQUIRE(std::isfinite(height));
+        REQUIRE(height >= WORLD_MIN_Y + 2);
+        REQUIRE(height <= WORLD_MAX_Y);
     }
 }
 
-// ============================================================================
-// ChunkGenerator tests
-// ============================================================================
+// ===========================================================================
+// Sparse cubic chunks and deterministic generation
+// ===========================================================================
+
+TEST_CASE("A new cube uses uniform air storage", "[chunk][storage]") {
+    Chunk cube(ChunkPos{5, -3, 7});
+    REQUIRE(cube.pos() == ChunkPos{5, -3, 7});
+    REQUIRE(cube.isUniform());
+    REQUIRE(cube.uniformBlock() == BlockType::AIR);
+    REQUIRE(cube.denseBlocks().empty());
+    REQUIRE(cube.copyBlocks().size() == static_cast<size_t>(CHUNK_VOLUME));
+    REQUIRE(cube.getBlock(0, 0, 0) == BlockType::AIR);
+    REQUIRE(cube.getBlock(15, 15, 15) == BlockType::AIR);
+}
+
+TEST_CASE("Editing a uniform cube materializes and can compact it", "[chunk][storage]") {
+    Chunk cube(ChunkPos{1, 4, -2});
+    cube.fill(BlockType::STONE);
+    REQUIRE(cube.isUniform());
+    REQUIRE(cube.uniformBlock() == BlockType::STONE);
+
+    cube.setBlock(8, 9, 10, BlockType::DIRT);
+    REQUIRE_FALSE(cube.isUniform());
+    REQUIRE(cube.denseBlocks().size() == static_cast<size_t>(CHUNK_VOLUME));
+    REQUIRE(cube.getBlock(8, 9, 10) == BlockType::DIRT);
+    REQUIRE(cube.getBlock(0, 0, 0) == BlockType::STONE);
+
+    cube.setBlock(8, 9, 10, BlockType::STONE);
+    cube.compactStorage();
+    REQUIRE(cube.isUniform());
+    REQUIRE(cube.uniformBlock() == BlockType::STONE);
+}
+
+TEST_CASE("Cube access rejects local coordinates outside all six faces", "[chunk]") {
+    Chunk cube(ChunkPos{0, 0, 0});
+    cube.setBlock(8, 8, 8, BlockType::STONE);
+    REQUIRE(cube.getBlock(8, 8, 8) == BlockType::STONE);
+    REQUIRE(cube.getBlock(-1, 8, 8) == BlockType::AIR);
+    REQUIRE(cube.getBlock(16, 8, 8) == BlockType::AIR);
+    REQUIRE(cube.getBlock(8, -1, 8) == BlockType::AIR);
+    REQUIRE(cube.getBlock(8, 16, 8) == BlockType::AIR);
+    REQUIRE(cube.getBlock(8, 8, -1) == BlockType::AIR);
+    REQUIRE(cube.getBlock(8, 8, 16) == BlockType::AIR);
+}
+
+TEST_CASE("Cube world access maps negative coordinates into local cells", "[chunk][coords]") {
+    Chunk cube(ChunkPos{-2, -1, 3});
+    cube.setBlockWorld(-17, -1, 63, BlockType::GRASS);
+    REQUIRE(cube.getBlock(15, 15, 15) == BlockType::GRASS);
+    REQUIRE(cube.getBlockWorld(-17, -1, 63) == BlockType::GRASS);
+}
+
+TEST_CASE("Cube position and bounds include the vertical section", "[chunk]") {
+    Chunk cube(ChunkPos{1, -3, -1});
+    const Vec3 position = cube.getWorldPosition();
+    REQUIRE(position.x == Catch::Approx(16.f));
+    REQUIRE(position.y == Catch::Approx(-48.f));
+    REQUIRE(position.z == Catch::Approx(-16.f));
+
+    const AABB bounds = cube.getAABB();
+    REQUIRE(bounds.min == Vec3{16.f, -48.f, -16.f});
+    REQUIRE(bounds.max == Vec3{32.f, -32.f, 0.f});
+}
+
+TEST_CASE("Fluid states remain implicit until a flowing cell is written", "[chunk][fluid]") {
+    Chunk cube(ChunkPos{0, 4, 0});
+    cube.setBlock(2, 3, 4, BlockType::WATER);
+    REQUIRE(cube.getFluidState(2, 3, 4).isSource());
+    REQUIRE_FALSE(cube.hasExplicitFluidStates());
+
+    cube.setFluidState(2, 3, 4, FluidState::flowing(5));
+    REQUIRE(cube.hasExplicitFluidStates());
+    REQUIRE(cube.explicitFluidStates().size() == static_cast<size_t>(CHUNK_VOLUME));
+    REQUIRE(cube.getFluidState(2, 3, 4) == FluidState::flowing(5));
+    REQUIRE(cube.getFluidState(1, 3, 4).isSource());
+}
 
 namespace {
-// Blocks the terrain fill + surface pass produce — decorations (trees,
-// structures, flora, ice caps) may legitimately rise above the height map,
-// raw terrain must not.
-bool isTerrainBlock(BlockType b) {
-    switch (b) {
-        case BlockType::STONE:
-        case BlockType::DIRT:
-        case BlockType::GRASS:
-        case BlockType::SAND:
-        case BlockType::GRAVEL:
-        case BlockType::SNOW:
-        case BlockType::BEDROCK:
-        case BlockType::COAL_ORE:
-        case BlockType::IRON_ORE:
-        case BlockType::GOLD_ORE:
-        case BlockType::DIAMOND_ORE:
-            return true;
-        default:
-            return false;
-    }
+
+size_t oreCount(const Chunk& cube) {
+    const std::vector<BlockType> blocks = cube.copyBlocks();
+    return static_cast<size_t>(std::count_if(blocks.begin(), blocks.end(), [](BlockType block) {
+        return block == BlockType::COAL_ORE || block == BlockType::IRON_ORE ||
+               block == BlockType::GOLD_ORE || block == BlockType::DIAMOND_ORE;
+    }));
 }
 
-// Column-level invariants every generated chunk must satisfy.
-void checkChunkInvariants(const Chunk& chunk) {
-    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
-        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
-            // Bedrock floor
-            REQUIRE(chunk.getBlock(lx, 0, lz) == BlockType::BEDROCK);
-            REQUIRE(chunk.getBlock(lx, 1, lz) == BlockType::BEDROCK);
-
-            // heightMap records the raw terrain surface; structures may
-            // later carve or pave that exact cell, so only the "no terrain
-            // above it" direction is asserted.
-            int top = chunk.heightMap[lx + lz * CHUNK_WIDTH];
-            REQUIRE(top >= 2);
-
-            for (int y = 0; y < CHUNK_HEIGHT; ++y) {
-                BlockType b = chunk.getBlock(lx, y, lz);
-                // No raw terrain above the height map (the old carver's
-                // floating-surface bug); decorations are allowed there
-                if (y > top) {
-                    REQUIRE(!isTerrainBlock(b));
-                }
-                // Water never rests directly on air; lava only pools at
-                // the very bottom (well shafts sit above ground level)
-                if (b == BlockType::WATER && y < 64) {
-                    REQUIRE(chunk.getBlock(lx, y - 1, lz) != BlockType::AIR);
-                }
-                if (b == BlockType::LAVA) {
-                    REQUIRE(y <= 10);
-                }
-                if (b == BlockType::ICE) {
-                    REQUIRE(y == 63);
-                }
-            }
-        }
-    }
-}
-} // namespace
-
-TEST_CASE("ChunkGenerator: same seed → bit-identical chunk, different seed differs", "[worldgen]") {
-    ChunkGenerator g1(777);
-    ChunkGenerator g2(777);
-    ChunkGenerator g3(778);
-    Chunk a(5, -3), b(5, -3), c(5, -3);
-    g1.generate(a);
-    g2.generate(b);
-    g3.generate(c);
-    REQUIRE(a.blocks == b.blocks);
-    REQUIRE(a.biomes == b.biomes);
-    REQUIRE(a.heightMap == b.heightMap);
-    REQUIRE(a.blocks != c.blocks);
-}
-
-TEST_CASE("ChunkGenerator: column invariants hold across varied chunks", "[worldgen]") {
-    ChunkGenerator gen(1234);
-    for (auto [cx, cz] : {std::pair{0, 0}, {5, 7}, {-3, 2}, {40, -25}}) {
-        Chunk chunk(cx, cz);
-        gen.generate(chunk);
-        checkChunkInvariants(chunk);
-    }
-}
-
-TEST_CASE("ChunkGenerator: underground carve fraction is sane", "[worldgen][caves]") {
-    // The old carver's inverted threshold hollowed out ~99% of the
-    // underground (the bug this overhaul fixes). Keep the carved fraction
-    // in a believable band across several chunks.
-    ChunkGenerator gen(31337);
-    int air = 0, total = 0;
-    for (auto [cx, cz] : {std::pair{0, 0}, {3, 1}, {-2, -4}, {10, 6}}) {
-        Chunk chunk(cx, cz);
-        gen.generate(chunk);
-        for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
-            for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
-                int top = chunk.heightMap[lx + lz * CHUNK_WIDTH];
-                for (int y = 8; y < top - 10; ++y) {
-                    ++total;
-                    BlockType b = chunk.getBlock(lx, y, lz);
-                    if (b == BlockType::AIR || b == BlockType::LAVA)
-                        ++air;
-                }
-            }
-        }
-    }
-    REQUIRE(total > 0);
-    double fraction = static_cast<double>(air) / static_cast<double>(total);
-    REQUIRE(fraction >= 0.01);
-    REQUIRE(fraction <= 0.30);
-}
-
-TEST_CASE("ChunkGenerator: surfaceYAt matches the generated height map", "[worldgen]") {
-    ChunkGenerator gen(9999);
-    GenScratch scratch;
-    scratch.reset(&gen);
-    Chunk chunk(2, -7);
-    gen.generate(chunk);
-    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
-        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
-            int wx = chunk.chunkX * CHUNK_WIDTH + lx;
-            int wz = chunk.chunkZ * CHUNK_DEPTH + lz;
-            REQUIRE(gen.surfaceYAt(wx, wz, scratch) == chunk.heightMap[lx + lz * CHUNK_WIDTH]);
-        }
-    }
-}
-
-TEST_CASE("ChunkGenerator: chunks are generation-order independent", "[worldgen]") {
-    // Generate the same 2x1 area in both orders across separate generators;
-    // every block must agree (the purity contract for infinite worlds).
-    ChunkGenerator g1(5150);
-    ChunkGenerator g2(5150);
-    Chunk a0(0, 0), a1(1, 0);
-    g1.generate(a0);
-    g1.generate(a1);
-    Chunk b1(1, 0), b0(0, 0);
-    g2.generate(b1);
-    g2.generate(b0);
-    REQUIRE(a0.blocks == b0.blocks);
-    REQUIRE(a1.blocks == b1.blocks);
-    REQUIRE(a0.biomes == b0.biomes);
-    REQUIRE(a1.biomes == b1.biomes);
-}
-
-// ============================================================================
-// Feature / decoration tests
-// ============================================================================
-
-namespace {
-// isLeafBlock comes from block_properties.hpp (the single property table)
-bool isLogBlock(BlockType b) {
-    return b == BlockType::LOG || b == BlockType::BIRCH_LOG || b == BlockType::SPRUCE_LOG;
-}
-} // namespace
-
-TEST_CASE("Trees span chunk borders and no canopy is orphaned", "[worldgen][trees]") {
-    // Generate a 3x3 area and inspect the center chunk: every leaf must have
-    // a trunk within canopy range in the combined area (a clipped border
-    // canopy would orphan leaves), and at least one border column must carry
-    // leaves whose trunk lives in the neighbor chunk.
-    ChunkGenerator gen(2024);
-    std::vector<std::unique_ptr<Chunk>> area;
-    auto blockAt = [&](int wx, int y, int wz) -> BlockType {
-        for (auto& c : area) {
-            int lx = wx - c->chunkX * CHUNK_WIDTH;
-            int lz = wz - c->chunkZ * CHUNK_DEPTH;
-            if (lx >= 0 && lx < CHUNK_WIDTH && lz >= 0 && lz < CHUNK_DEPTH)
-                return c->getBlock(lx, y, lz);
-        }
-        return BlockType::AIR;
+std::array<int64_t, 6> structureRandomSignature(const StructurePlacement& placement,
+                                                int64_t regionX, int64_t regionZ) {
+    const int64_t anchorChunkX = Chunk::worldToChunk(placement.anchorX);
+    const int64_t anchorChunkZ = Chunk::worldToChunk(placement.anchorZ);
+    return {
+        anchorChunkX - regionX * STRUCTURE_REGION_CHUNKS,
+        anchorChunkZ - regionZ * STRUCTURE_REGION_CHUNKS,
+        Chunk::worldToLocal(placement.anchorX),
+        Chunk::worldToLocal(placement.anchorZ),
+        static_cast<int64_t>(placement.kind),
+        placement.rotation,
     };
-    // Pick a center chunk in forest-ish terrain by scanning for one with
-    // plenty of leaves.
-    int bestCX = 0, bestCZ = 0, bestLeaves = -1;
-    for (int cz = -6; cz <= 6; cz += 3) {
-        for (int cx = -6; cx <= 6; cx += 3) {
-            Chunk probe(cx, cz);
-            gen.generate(probe);
-            int leaves = 0;
-            for (BlockType b : probe.blocks)
-                if (isLeafBlock(b))
-                    ++leaves;
-            if (leaves > bestLeaves) {
-                bestLeaves = leaves;
-                bestCX = cx;
-                bestCZ = cz;
+}
+
+bool samePlacement(const StructurePlacement& left, const StructurePlacement& right) {
+    return left.valid == right.valid && left.kind == right.kind &&
+           left.rotation == right.rotation && left.anchorX == right.anchorX &&
+           left.anchorZ == right.anchorZ && left.floorY == right.floorY &&
+           left.halfX == right.halfX && left.halfZ == right.halfZ;
+}
+
+} // namespace
+
+TEST_CASE("Ore anchors use full-width coordinates and are order independent",
+          "[ore-rng][worldgen]") {
+    constexpr int64_t aliasDistance = int64_t{1} << 32;
+    constexpr ChunkPos nearPosition{-13, -3, 21};
+    constexpr ChunkPos farPosition{nearPosition.x + aliasDistance, nearPosition.y,
+                                   nearPosition.z + aliasDistance};
+
+    OrePlacer forwardPlacer(808);
+    Chunk nearForward(nearPosition);
+    Chunk farForward(farPosition);
+    nearForward.fill(BlockType::STONE);
+    farForward.fill(BlockType::STONE);
+    forwardPlacer.place(nearForward);
+    forwardPlacer.place(farForward);
+
+    OrePlacer reversePlacer(808);
+    Chunk nearReverse(nearPosition);
+    Chunk farReverse(farPosition);
+    nearReverse.fill(BlockType::STONE);
+    farReverse.fill(BlockType::STONE);
+    reversePlacer.place(farReverse);
+    reversePlacer.place(nearReverse);
+
+    REQUIRE(nearForward.copyBlocks() == nearReverse.copyBlocks());
+    REQUIRE(farForward.copyBlocks() == farReverse.copyBlocks());
+    REQUIRE(oreCount(nearForward) > 0);
+    REQUIRE(oreCount(farForward) > 0);
+    REQUIRE(nearForward.copyBlocks() != farForward.copyBlocks());
+
+    OrePlacer differentSeed(809);
+    Chunk changed(nearPosition);
+    changed.fill(BlockType::STONE);
+    differentSeed.place(changed);
+    REQUIRE(changed.copyBlocks() != nearForward.copyBlocks());
+}
+
+TEST_CASE("Structure candidates use full-width region coordinates and stable order",
+          "[structure-rng][worldgen]") {
+    constexpr int64_t aliasDistance = int64_t{1} << 32;
+    constexpr ColumnPos nearRegion{-7, 11};
+    constexpr ColumnPos farRegion{nearRegion.x + aliasDistance, nearRegion.z + aliasDistance};
+    ChunkGenerator generator(112233);
+    StructurePlacer structures(112233);
+
+    GenScratch forwardScratch;
+    forwardScratch.reset(&generator);
+    const StructurePlacement nearForward =
+        structures.regionPlacement(nearRegion.x, nearRegion.z, generator, forwardScratch);
+    const StructurePlacement farForward =
+        structures.regionPlacement(farRegion.x, farRegion.z, generator, forwardScratch);
+
+    GenScratch reverseScratch;
+    reverseScratch.reset(&generator);
+    const StructurePlacement farReverse =
+        structures.regionPlacement(farRegion.x, farRegion.z, generator, reverseScratch);
+    const StructurePlacement nearReverse =
+        structures.regionPlacement(nearRegion.x, nearRegion.z, generator, reverseScratch);
+
+    REQUIRE(samePlacement(nearForward, nearReverse));
+    REQUIRE(samePlacement(farForward, farReverse));
+    REQUIRE(structureRandomSignature(nearForward, nearRegion.x, nearRegion.z) !=
+            structureRandomSignature(farForward, farRegion.x, farRegion.z));
+
+    for (const auto& [placement, region] :
+         {std::pair{nearForward, nearRegion}, std::pair{farForward, farRegion}}) {
+        const auto signature = structureRandomSignature(placement, region.x, region.z);
+        REQUIRE(signature[0] >= 1);
+        REQUIRE(signature[0] <= 6);
+        REQUIRE(signature[1] >= 1);
+        REQUIRE(signature[1] <= 6);
+        REQUIRE(signature[2] >= 2);
+        REQUIRE(signature[2] <= 13);
+        REQUIRE(signature[3] >= 2);
+        REQUIRE(signature[3] <= 13);
+        REQUIRE(signature[5] >= 0);
+        REQUIRE(signature[5] <= 3);
+    }
+}
+
+TEST_CASE("Generator handles cubes beyond supported vertical bounds", "[worldgen][bounds]") {
+    ChunkGenerator generator(9876);
+    Chunk below(ChunkPos{0, WORLD_MIN_CHUNK_Y - 1, 0});
+    Chunk above(ChunkPos{0, WORLD_MAX_CHUNK_Y + 1, 0});
+    generator.generateCube(below);
+    generator.generateCube(above);
+
+    REQUIRE(below.isUniform());
+    REQUIRE(below.uniformBlock() == BlockType::BEDROCK);
+    REQUIRE(above.isUniform());
+    REQUIRE(above.uniformBlock() == BlockType::AIR);
+}
+
+TEST_CASE("Generator seals the floor and leaves headroom at the ceiling", "[worldgen][bounds]") {
+    ChunkGenerator generator(9876);
+    Chunk bottom(ChunkPos{0, WORLD_MIN_CHUNK_Y, 0});
+    Chunk top(ChunkPos{0, WORLD_MAX_CHUNK_Y, 0});
+    generator.generateCube(bottom);
+    generator.generateCube(top);
+
+    for (int z = 0; z < CHUNK_EDGE; ++z) {
+        for (int x = 0; x < CHUNK_EDGE; ++x) {
+            REQUIRE(bottom.getBlock(x, 0, z) == BlockType::BEDROCK);
+            REQUIRE(bottom.getBlock(x, 1, z) == BlockType::BEDROCK);
+        }
+    }
+    REQUIRE(top.isUniform());
+    REQUIRE(top.uniformBlock() == BlockType::AIR);
+}
+
+TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen][volcano]") {
+    constexpr int64_t x = 23'029;
+    constexpr int64_t z = -111'486;
+    ChunkGenerator generator(764891);
+    const int64_t chunkX = Chunk::worldToChunk(x);
+    const int64_t chunkZ = Chunk::worldToChunk(z);
+    const int localX = Chunk::worldToLocal(x);
+    const int localZ = Chunk::worldToLocal(z);
+    const worldgen::SurfaceSample surface = generator.sampleSurface(x, z);
+    const int surfaceY = generator.surfaceYAt(x, z);
+    const int conduitY = surfaceY - 24;
+    const int waterTopY = static_cast<int>(std::ceil(surface.waterSurface)) - 1;
+
+    REQUIRE(surface.hydrology.lake);
+    REQUIRE(surface.hydrology.endorheic);
+    REQUIRE(surface.waterSurface > surface.terrainHeight);
+    REQUIRE(waterTopY > surfaceY);
+
+    Chunk conduit(ChunkPos{chunkX, Chunk::worldToChunkY(conduitY), chunkZ});
+    Chunk craterFloor(ChunkPos{chunkX, Chunk::worldToChunkY(surfaceY), chunkZ});
+    Chunk craterLake(ChunkPos{chunkX, Chunk::worldToChunkY(waterTopY), chunkZ});
+    generator.generateCube(conduit);
+    generator.generateCube(craterFloor);
+    generator.generateCube(craterLake);
+
+    REQUIRE(conduit.getBlock(localX, Chunk::worldToLocalY(conduitY), localZ) == BlockType::LAVA);
+    REQUIRE(craterFloor.getBlock(localX, Chunk::worldToLocalY(surfaceY), localZ) ==
+            BlockType::BASALT);
+    REQUIRE(craterFloor.getBlock(localX, Chunk::worldToLocalY(surfaceY + 1), localZ) ==
+            BlockType::WATER);
+    REQUIRE(craterLake.getBlock(localX, Chunk::worldToLocalY(waterTopY), localZ) ==
+            BlockType::WATER);
+    REQUIRE(craterLake.getBlock(localX, Chunk::worldToLocalY(waterTopY + 1), localZ) ==
+            BlockType::AIR);
+    REQUIRE_FALSE(craterFloor.hasExplicitFluidStates());
+    REQUIRE_FALSE(craterLake.hasExplicitFluidStates());
+
+    const std::vector<VolcanoPrimitive> volcanoes = generator.hotspotVolcanoesForCell(1, -7);
+    const auto primitive = std::ranges::find_if(volcanoes, [](const VolcanoPrimitive& volcano) {
+        return volcano.craterLake && std::abs(volcano.centerX - 23'029.177516) < 0.01 &&
+               std::abs(volcano.centerZ + 111'485.810195) < 0.01;
+    });
+    REQUIRE(primitive != volcanoes.end());
+    REQUIRE(primitive->craterLakeRadius > 2.0);
+    REQUIRE(primitive->craterLakeRadius < primitive->craterRadius - 1.0);
+    REQUIRE(primitive->craterLakeSurface <= primitive->craterRimElevation - 1.0);
+    REQUIRE(primitive->craterRimWidth >= 12.0);
+
+    struct RingTransition {
+        int64_t wetX = 0;
+        int64_t wetZ = 0;
+        int64_t dryX = 0;
+        int64_t dryZ = 0;
+        int radius = 0;
+        double wetFarTerrain = 0.0;
+        double dryFarTerrain = 0.0;
+        double wetExactTerrain = 0.0;
+        double dryExactTerrain = 0.0;
+        double waterSurface = 0.0;
+        bool dryBank = false;
+
+        bool operator==(const RingTransition&) const = default;
+    };
+
+    constexpr int RING_DIRECTIONS = 96;
+    const int64_t centerX = static_cast<int64_t>(std::llround(primitive->centerX - 0.5));
+    const int64_t centerZ = static_cast<int64_t>(std::llround(primitive->centerZ - 0.5));
+    const int scanRadius = static_cast<int>(std::ceil(primitive->craterRadius * 1.25));
+    auto scanDirection = [&](int direction) {
+        const double angle =
+            static_cast<double>(direction) / RING_DIRECTIONS * 2.0 * std::numbers::pi;
+        int64_t wetX = centerX;
+        int64_t wetZ = centerZ;
+        bool sawWet = false;
+        bool foundTransition = false;
+        RingTransition transition;
+        double priorHeight = generator.sampleFarGeometrySurface(centerX, centerZ).terrainHeight;
+        int64_t priorX = centerX;
+        int64_t priorZ = centerZ;
+        double maximumStep = 0.0;
+        for (int radius = 1; radius <= scanRadius; ++radius) {
+            const int64_t sampleX =
+                static_cast<int64_t>(std::llround(centerX + std::cos(angle) * radius));
+            const int64_t sampleZ =
+                static_cast<int64_t>(std::llround(centerZ + std::sin(angle) * radius));
+            const worldgen::SurfaceSample far =
+                generator.sampleFarGeometrySurface(sampleX, sampleZ);
+            if (sampleX != priorX || sampleZ != priorZ) {
+                maximumStep = std::max(maximumStep, std::abs(far.terrainHeight - priorHeight));
+                priorHeight = far.terrainHeight;
+                priorX = sampleX;
+                priorZ = sampleZ;
             }
-        }
-    }
-    REQUIRE(bestLeaves > 0); // some forest exists near spawn scale
-
-    for (int dz = -1; dz <= 1; ++dz) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            auto chunk = std::make_unique<Chunk>(bestCX + dx, bestCZ + dz);
-            gen.generate(*chunk);
-            area.push_back(std::move(chunk));
-        }
-    }
-
-    const Chunk& center = *area[4]; // dz=0, dx=0 (row-major -1..1)
-    bool foundBorderLeaf = false;
-    for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
-        for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
-            for (int y = 60; y < 140; ++y) {
-                if (!isLeafBlock(center.getBlock(lx, y, lz)))
-                    continue;
-                int wx = center.chunkX * CHUNK_WIDTH + lx;
-                int wz = center.chunkZ * CHUNK_DEPTH + lz;
-                // A trunk must exist within canopy range in the 3x3 area
-                bool hasTrunk = false;
-                bool trunkInNeighbor = false;
-                for (int tz = -3; tz <= 3 && !hasTrunk; ++tz) {
-                    for (int tx = -3; tx <= 3 && !hasTrunk; ++tx) {
-                        for (int ty = -4; ty <= 2 && !hasTrunk; ++ty) {
-                            if (isLogBlock(blockAt(wx + tx, y + ty, wz + tz))) {
-                                hasTrunk = true;
-                                int trunkLX = wx + tx - center.chunkX * CHUNK_WIDTH;
-                                int trunkLZ = wz + tz - center.chunkZ * CHUNK_DEPTH;
-                                trunkInNeighbor = trunkLX < 0 || trunkLX >= CHUNK_WIDTH ||
-                                                  trunkLZ < 0 || trunkLZ >= CHUNK_DEPTH;
-                            }
-                        }
-                    }
-                }
-                REQUIRE(hasTrunk);
-                if (trunkInNeighbor)
-                    foundBorderLeaf = true;
+            const bool craterWater =
+                far.hydrology.lake &&
+                std::abs(far.waterSurface - primitive->craterLakeSurface) < 1.0e-9;
+            if (craterWater) {
+                REQUIRE_FALSE(foundTransition);
+                sawWet = true;
+                wetX = sampleX;
+                wetZ = sampleZ;
+                continue;
             }
+            if (!sawWet || foundTransition)
+                continue;
+
+            foundTransition = true;
+            const worldgen::SurfaceSample wetFar = generator.sampleFarGeometrySurface(wetX, wetZ);
+            const worldgen::SurfaceSample wetExact =
+                generator.sampleExactGeometrySurface(wetX, wetZ);
+            const worldgen::SurfaceSample dryExact =
+                generator.sampleExactGeometrySurface(sampleX, sampleZ);
+            REQUIRE(wetFar.hydrology.lake);
+            REQUIRE(wetFar.hydrology.lakeShoreDistance > 0.0);
+            REQUIRE(wetFar.hydrology.lakeDepth <= 2.0);
+            REQUIRE(wetExact.hydrology.lake);
+            REQUIRE_FALSE(dryExact.hydrology.lake);
+            REQUIRE(dryExact.hydrology.lakeBank);
+            REQUIRE(dryExact.hydrology.lakeShoreDistance <= 0.0);
+            REQUIRE(dryExact.hydrology.shoreWaterSurface == primitive->craterLakeSurface);
+            REQUIRE(dryExact.terrainHeight >= std::ceil(primitive->craterLakeSurface));
+            REQUIRE(std::abs(wetExact.terrainHeight - wetFar.terrainHeight) <= 1.0);
+            REQUIRE(std::abs(dryExact.terrainHeight - far.terrainHeight) <= 1.0);
+            transition = {
+                .wetX = wetX,
+                .wetZ = wetZ,
+                .dryX = sampleX,
+                .dryZ = sampleZ,
+                .radius = radius,
+                .wetFarTerrain = wetFar.terrainHeight,
+                .dryFarTerrain = far.terrainHeight,
+                .wetExactTerrain = wetExact.terrainHeight,
+                .dryExactTerrain = dryExact.terrainHeight,
+                .waterSurface = wetFar.waterSurface,
+                .dryBank = dryExact.hydrology.lakeBank,
+            };
         }
-    }
-    // With ~6 trees per forest chunk, a 16-wide chunk essentially always has
-    // at least one canopy reaching across its border.
-    REQUIRE(foundBorderLeaf);
-}
+        REQUIRE(sawWet);
+        REQUIRE(foundTransition);
+        REQUIRE(maximumStep <= 2.0);
+        return transition;
+    };
 
-TEST_CASE("Ores stay in their depth bands and replace only stone", "[worldgen][ores]") {
-    ChunkGenerator gen(808);
-    for (auto [cx, cz] : {std::pair{0, 0}, {7, -3}, {-11, 5}}) {
-        Chunk chunk(cx, cz);
-        gen.generate(chunk);
-        for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
-            for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
-                for (int y = 0; y < CHUNK_HEIGHT; ++y) {
-                    switch (chunk.getBlock(lx, y, lz)) {
-                        case BlockType::DIAMOND_ORE:
-                            REQUIRE(y >= 2);
-                            REQUIRE(y <= 17);
-                            break;
-                        case BlockType::GOLD_ORE:
-                            REQUIRE(y >= 4);
-                            REQUIRE(y <= 35);
-                            break;
-                        case BlockType::IRON_ORE:
-                            REQUIRE(y >= 8);
-                            REQUIRE(y <= 71);
-                            break;
-                        case BlockType::COAL_ORE:
-                            REQUIRE(y >= 48);
-                            REQUIRE(y <= 131);
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            }
+    std::vector<RingTransition> forwardRing(static_cast<size_t>(RING_DIRECTIONS));
+    int minimumShoreRadius = scanRadius;
+    int maximumShoreRadius = 0;
+    std::unordered_set<int> shoreRadii;
+    for (int direction = 0; direction < RING_DIRECTIONS; ++direction) {
+        RingTransition transition = scanDirection(direction);
+        minimumShoreRadius = std::min(minimumShoreRadius, transition.radius);
+        maximumShoreRadius = std::max(maximumShoreRadius, transition.radius);
+        shoreRadii.insert(transition.radius);
+        forwardRing[static_cast<size_t>(direction)] = transition;
+    }
+    REQUIRE(maximumShoreRadius - minimumShoreRadius >= 6);
+    REQUIRE(shoreRadii.size() >= 6);
+
+    std::unordered_map<ChunkPos, std::unique_ptr<Chunk>> emittedCubes;
+    auto emittedCube = [&](int64_t worldX, int worldY, int64_t worldZ) -> Chunk& {
+        const ChunkPos position{Chunk::worldToChunk(worldX), Chunk::worldToChunkY(worldY),
+                                Chunk::worldToChunk(worldZ)};
+        auto found = emittedCubes.find(position);
+        if (found == emittedCubes.end()) {
+            auto cube = std::make_unique<Chunk>(position);
+            generator.generateCube(*cube);
+            found = emittedCubes.emplace(position, std::move(cube)).first;
         }
-    }
-}
-
-TEST_CASE("Flora sits on valid ground", "[worldgen][flora]") {
-    ChunkGenerator gen(606);
-    int floraSeen = 0;
-    for (int cz = -4; cz <= 4; cz += 2) {
-        for (int cx = -4; cx <= 4; cx += 2) {
-            Chunk chunk(cx, cz);
-            gen.generate(chunk);
-            for (int lz = 0; lz < CHUNK_DEPTH; ++lz) {
-                for (int lx = 0; lx < CHUNK_WIDTH; ++lx) {
-                    for (int y = 3; y < CHUNK_HEIGHT - 1; ++y) {
-                        BlockType b = chunk.getBlock(lx, y, lz);
-                        BlockType below = chunk.getBlock(lx, y - 1, lz);
-                        if (b == BlockType::CACTUS && below != BlockType::CACTUS) {
-                            REQUIRE(below == BlockType::SAND);
-                            ++floraSeen;
-                        } else if (b == BlockType::REED && below != BlockType::REED) {
-                            REQUIRE((below == BlockType::GRASS || below == BlockType::SAND ||
-                                     below == BlockType::DIRT));
-                            ++floraSeen;
-                        } else if (isFlora(b) && b != BlockType::REED) {
-                            if (b != BlockType::CACTUS && b != BlockType::DEAD_BUSH) {
-                                REQUIRE(below == BlockType::GRASS);
-                            }
-                            ++floraSeen;
-                        }
-                    }
-                }
-            }
+        return *found->second;
+    };
+    auto requireSourceColumn = [&](int64_t worldX, int64_t worldZ) {
+        const int floorY = generator.surfaceYAt(worldX, worldZ);
+        REQUIRE(floorY < waterTopY);
+        for (int worldY = floorY + 1; worldY <= waterTopY; ++worldY) {
+            CAPTURE(worldX, worldY, worldZ, floorY, waterTopY);
+            Chunk& cube = emittedCube(worldX, worldY, worldZ);
+            const int localX = Chunk::worldToLocal(worldX);
+            const int localY = Chunk::worldToLocalY(worldY);
+            const int localZ = Chunk::worldToLocal(worldZ);
+            REQUIRE(cube.getBlock(localX, localY, localZ) == BlockType::WATER);
+            REQUIRE(cube.getFluidState(localX, localY, localZ).isSource());
         }
+    };
+
+    requireSourceColumn(centerX, centerZ);
+    const int64_t crossCubeWaterX = centerX + CHUNK_EDGE;
+    REQUIRE(Chunk::worldToChunk(crossCubeWaterX) != Chunk::worldToChunk(centerX));
+    REQUIRE(generator.sampleExactGeometrySurface(crossCubeWaterX, centerZ).hydrology.lake);
+    requireSourceColumn(crossCubeWaterX, centerZ);
+    for (const RingTransition& transition : forwardRing) {
+        Chunk& dryCube = emittedCube(transition.dryX, waterTopY, transition.dryZ);
+        REQUIRE(isSolid(dryCube.getBlock(Chunk::worldToLocal(transition.dryX),
+                                         Chunk::worldToLocalY(waterTopY),
+                                         Chunk::worldToLocal(transition.dryZ))));
     }
-    REQUIRE(floraSeen > 0);
+    for (const auto& [position, cube] : emittedCubes) {
+        CAPTURE(position.x, position.y, position.z);
+        REQUIRE_FALSE(cube->hasExplicitFluidStates());
+    }
+
+    generator.clearMacroCaches();
+    std::vector<RingTransition> rebuiltRing(static_cast<size_t>(RING_DIRECTIONS));
+    for (int direction = RING_DIRECTIONS - 1; direction >= 0; --direction) {
+        rebuiltRing[static_cast<size_t>(direction)] = scanDirection(direction);
+    }
+    REQUIRE(rebuiltRing == forwardRing);
 }
 
-TEST_CASE("Structures are deterministic and land on validated ground", "[worldgen][structures]") {
-    ChunkGenerator g1(112233);
-    ChunkGenerator g2(112233);
-    GenScratch s1, s2;
-    s1.reset(&g1);
-    s2.reset(&g2);
-    StructurePlacer placer(112233);
+TEST_CASE("Aquifers stay inside deterministic sealed pockets", "[worldgen][aquifer]") {
+    constexpr int64_t x = -1443;
+    constexpr int y = -84;
+    constexpr int64_t z = -1500;
+    ChunkGenerator generator(764891);
+    Chunk aquifer(
+        ChunkPos{Chunk::worldToChunk(x), Chunk::worldToChunkY(y), Chunk::worldToChunk(z)});
+    generator.generateCube(aquifer);
 
-    int validCount = 0;
-    for (int rz = -6; rz <= 6; ++rz) {
-        for (int rx = -6; rx <= 6; ++rx) {
-            const StructurePlacement& a = placer.regionPlacement(rx, rz, g1, s1);
-            const StructurePlacement& b = placer.regionPlacement(rx, rz, g2, s2);
-            REQUIRE(a.valid == b.valid);
-            REQUIRE(a.anchorX == b.anchorX);
-            REQUIRE(a.anchorZ == b.anchorZ);
-            REQUIRE(a.floorY == b.floorY);
-            if (a.valid) {
-                ++validCount;
-                REQUIRE(a.floorY >= 64);
-            }
+    const int localX = Chunk::worldToLocal(x);
+    const int localY = Chunk::worldToLocalY(y);
+    const int localZ = Chunk::worldToLocal(z);
+    REQUIRE(aquifer.getBlock(localX, localY, localZ) == BlockType::WATER);
+    REQUIRE(isSolid(aquifer.getBlock(localX, localY, localZ + 7)));
+    REQUIRE(aquifer.getBlock(localX, localY, localZ + 9) != BlockType::WATER);
+    REQUIRE_FALSE(aquifer.hasExplicitFluidStates());
+}
+
+TEST_CASE("Cubic generation is seed deterministic", "[worldgen][determinism]") {
+    const std::array<ChunkPos, 1> positions{{
+        {0, 4, 0},
+    }};
+    ChunkGenerator first(777);
+    ChunkGenerator same(777);
+    ChunkGenerator different(778);
+    bool foundSeedDifference = false;
+
+    for (ChunkPos position : positions) {
+        Chunk a(position);
+        Chunk b(position);
+        Chunk c(position);
+        first.generateCube(a);
+        same.generateCube(b);
+        different.generateCube(c);
+        REQUIRE(a.copyBlocks() == b.copyBlocks());
+        REQUIRE(a.generated);
+        REQUIRE(b.generated);
+        foundSeedDifference = foundSeedDifference || a.copyBlocks() != c.copyBlocks();
+    }
+    REQUIRE(foundSeedDifference);
+}
+
+TEST_CASE("Cubic generation is independent of request order", "[worldgen][determinism]") {
+    const std::array<ChunkPos, 4> positions{{
+        {0, 3, 0},
+        {0, 4, 0},
+        {1, 4, 0},
+        {0, 4, 1},
+    }};
+    ChunkGenerator forwardGenerator(5150);
+    ChunkGenerator reverseGenerator(5150);
+    std::unordered_map<ChunkPos, std::vector<BlockType>> forward;
+    std::unordered_map<ChunkPos, std::vector<BlockType>> reverse;
+
+    for (ChunkPos position : positions) {
+        Chunk cube(position);
+        forwardGenerator.generateCube(cube);
+        forward.emplace(position, cube.copyBlocks());
+    }
+    for (auto iterator = positions.rbegin(); iterator != positions.rend(); ++iterator) {
+        Chunk cube(*iterator);
+        reverseGenerator.generateCube(cube);
+        reverse.emplace(*iterator, cube.copyBlocks());
+    }
+
+    REQUIRE(forward == reverse);
+}
+
+TEST_CASE("Surface queries agree across scratch instances", "[worldgen][determinism]") {
+    ChunkGenerator generator(9999);
+    GenScratch first;
+    GenScratch second;
+    first.reset(&generator);
+    second.reset(&generator);
+    constexpr std::array<ColumnPos, 2> samples{{
+        {-80, -80},
+        {80, 17},
+    }};
+    for (ColumnPos sample : samples) {
+        REQUIRE(generator.surfaceYAt(sample.x, sample.z, first) ==
+                generator.surfaceYAt(sample.x, sample.z, second));
+        REQUIRE(generator.biomeAt(sample.x, sample.z, first) ==
+                generator.biomeAt(sample.x, sample.z, second));
+    }
+}
+
+TEST_CASE("Thread-local generation scratch does not survive generator address reuse",
+          "[worldgen][determinism][scratch]") {
+    alignas(ChunkGenerator) std::array<std::byte, sizeof(ChunkGenerator)> storage{};
+    auto* first = std::construct_at(reinterpret_cast<ChunkGenerator*>(storage.data()), 111);
+    const worldgen::SurfaceSample firstSample = first->sampleSurface(1234, -5678);
+    std::destroy_at(first);
+
+    auto* reused = std::construct_at(reinterpret_cast<ChunkGenerator*>(storage.data()), 222);
+    const worldgen::SurfaceSample reusedSample = reused->sampleSurface(1234, -5678);
+    ChunkGenerator control(222);
+    const worldgen::SurfaceSample controlSample = control.sampleSurface(1234, -5678);
+    std::destroy_at(reused);
+
+    REQUIRE(firstSample.terrainHeight != Catch::Approx(controlSample.terrainHeight));
+    REQUIRE(reusedSample.terrainHeight == Catch::Approx(controlSample.terrainHeight));
+    REQUIRE(reusedSample.biome.primary == controlSample.biome.primary);
+    REQUIRE(reusedSample.hydrology.surfaceElevation ==
+            Catch::Approx(controlSample.hydrology.surfaceElevation));
+}
+
+TEST_CASE("Column plans cache immutable cubic surface data", "[worldgen][column-plan]") {
+    ChunkGenerator generator(2468);
+    constexpr ColumnPos column{-2, 3};
+    auto first = generator.getColumnPlan(column);
+    auto cached = generator.getColumnPlan(column);
+    REQUIRE(first == cached);
+    REQUIRE(first->chunkColumn() == column);
+    REQUIRE_FALSE(first->exposedSections().empty());
+    REQUIRE(std::is_sorted(first->exposedSections().begin(), first->exposedSections().end()));
+    for (int32_t section : first->exposedSections()) {
+        REQUIRE(section >= WORLD_MIN_CHUNK_Y);
+        REQUIRE(section <= WORLD_MAX_CHUNK_Y);
+        REQUIRE(first->exposesSection(section));
+    }
+
+    constexpr int localX = 8;
+    constexpr int localZ = 12;
+    const int64_t worldX = column.x * CHUNK_EDGE + localX;
+    const int64_t worldZ = column.z * CHUNK_EDGE + localZ;
+    const worldgen::SurfaceSample planned = first->sample(localX, localZ);
+    const worldgen::SurfaceSample direct = generator.sampleSurface(worldX, worldZ);
+    REQUIRE(planned.terrainHeight == Catch::Approx(direct.terrainHeight));
+    REQUIRE(planned.waterSurface == Catch::Approx(direct.waterSurface));
+    REQUIRE(planned.biome.primary == direct.biome.primary);
+    REQUIRE(std::isfinite(planned.climate.temperatureC));
+    REQUIRE(std::isfinite(planned.climate.annualPrecipitationMm));
+    REQUIRE(planned.soil.moisture >= 0.0);
+    REQUIRE(planned.soil.moisture <= 1.0);
+}
+
+TEST_CASE("Column plans expose tree reach from every neighboring face",
+          "[worldgen][column-plan][flora]") {
+    constexpr ColumnPos column{-3, 2};
+    constexpr int64_t baseX = column.x * CHUNK_EDGE;
+    constexpr int64_t baseZ = column.z * CHUNK_EDGE;
+    constexpr std::array<ColumnPos, 4> directions{{
+        {-1, 0},
+        {1, 0},
+        {0, -1},
+        {0, 1},
+    }};
+
+    for (const ColumnPos direction : directions) {
+        size_t surfaceSamples = 0;
+        size_t heightSamples = 0;
+        auto heightAt = [&](int64_t x, int64_t z) {
+            REQUIRE(x >= baseX - COLUMN_PLAN_LATTICE_SPACING);
+            REQUIRE(x <= baseX + CHUNK_EDGE + COLUMN_PLAN_LATTICE_SPACING);
+            REQUIRE(z >= baseZ - COLUMN_PLAN_LATTICE_SPACING);
+            REQUIRE(z <= baseZ + CHUNK_EDGE + COLUMN_PLAN_LATTICE_SPACING);
+
+            const bool neighboringCliff =
+                (direction.x < 0 && x < baseX) || (direction.x > 0 && x > baseX + CHUNK_EDGE) ||
+                (direction.z < 0 && z < baseZ) || (direction.z > 0 && z > baseZ + CHUNK_EDGE);
+            return neighboringCliff ? 180.0 : 40.0;
+        };
+        ColumnPlan plan(
+            column,
+            [&](int64_t x, int64_t z) {
+                ++surfaceSamples;
+                const double height = heightAt(x, z);
+                const bool neighboringCliff = height > 100.0;
+                worldgen::SurfaceSample result;
+                result.terrainHeight = height;
+                result.hydrology.surfaceElevation = result.terrainHeight;
+                result.hydrology.ocean = !neighboringCliff;
+                result.hydrology.waterSurface = neighboringCliff ? result.terrainHeight : SEA_LEVEL;
+                result.waterSurface = result.hydrology.waterSurface;
+                result.biome.primary = neighboringCliff ? Biome::FOREST : Biome::OCEAN;
+                result.biome.secondary = result.biome.primary;
+                return result;
+            },
+            [&](int64_t x, int64_t z) {
+                ++heightSamples;
+                return heightAt(x, z);
+            },
+            [](const ColumnPlan&) {
+                ColumnPlanSurfaceGrid surfaces{};
+                surfaces.fill(40);
+                return surfaces;
+            });
+
+        REQUIRE(surfaceSamples == 9);
+        REQUIRE(heightSamples == 16);
+        const int minimumTreeY = 40 - feature_generation::TREE_MAXIMUM_SURFACE_DEVIATION + 1 +
+                                 feature_generation::TREE_MINIMUM_VERTICAL_OFFSET;
+        const int maximumTreeY = 180 + feature_generation::TREE_MAXIMUM_SURFACE_DEVIATION + 1 +
+                                 feature_generation::TREE_MAXIMUM_VERTICAL_OFFSET;
+        REQUIRE(plan.minimumSurfaceY() == minimumTreeY);
+        REQUIRE(plan.maximumSurfaceY() == maximumTreeY);
+        for (int y = minimumTreeY; y <= maximumTreeY; y += CHUNK_EDGE) {
+            REQUIRE(plan.exposesSection(Chunk::worldToChunkY(y)));
         }
+        REQUIRE(plan.exposesSection(Chunk::worldToChunkY(maximumTreeY)));
     }
-    // 13x13 regions of mixed terrain: some sites must validate
-    REQUIRE(validCount > 0);
 }
 
-// ============================================================================
-// Chunk Tests
-// ============================================================================
+TEST_CASE("Column plans expose the exact density surface below macro relief",
+          "[worldgen][column-plan][density]") {
+    ChunkGenerator generator(42);
+    constexpr int64_t worldX = 16;
+    constexpr int64_t worldZ = 84;
+    const ColumnPos column{Chunk::worldToChunk(worldX), Chunk::worldToChunk(worldZ)};
+    const auto plan = generator.getColumnPlan(column);
+    const int localX = Chunk::worldToLocal(worldX);
+    const int localZ = Chunk::worldToLocal(worldZ);
+    const int exactSurface = generator.surfaceYAt(worldX, worldZ);
 
-TEST_CASE("Chunk creation initializes to air", "[chunk]") {
-    Chunk chunk(0, 0);
-    REQUIRE(chunk.chunkX == 0);
-    REQUIRE(chunk.chunkZ == 0);
-    REQUIRE(chunk.blocks.size() == static_cast<size_t>(CHUNK_VOLUME));
-    REQUIRE(chunk.getBlock(0, 0, 0) == BlockType::AIR);
-    REQUIRE(chunk.getBlock(7, 127, 7) == BlockType::AIR);
+    REQUIRE(exactSurface == 41);
+    REQUIRE(plan->surfaceY(localX, localZ) == exactSurface);
+    REQUIRE(exactSurface <
+            static_cast<int>(std::floor(plan->sample(localX, localZ).terrainHeight)));
+    REQUIRE(plan->exposesSection(Chunk::worldToChunkY(exactSurface)));
 }
 
-TEST_CASE("Chunk setBlock and getBlock", "[chunk]") {
-    Chunk chunk(5, -3);
-    chunk.setBlock(8, 64, 8, BlockType::STONE);
-    REQUIRE(chunk.getBlock(8, 64, 8) == BlockType::STONE);
+TEST_CASE("Bounded basins expose stable river canyon waterfall and delta features",
+          "[worldgen][hydrology]") {
+    worldgen::MacroGenerationSampler sampler(42);
+    const worldgen::SurfaceSample lakeLip = sampler.sampleSurface(-8235.0, 2976.0);
+    REQUIRE(lakeLip.hydrology.lake);
+    REQUIRE_FALSE(lakeLip.hydrology.endorheic);
+    REQUIRE(lakeLip.waterSurface > lakeLip.terrainHeight);
 
-    chunk.setBlock(0, 0, 0, BlockType::GRASS);
-    REQUIRE(chunk.getBlock(0, 0, 0) == BlockType::GRASS);
+    for (const double z : {2653.0, 2654.0}) {
+        const worldgen::SurfaceSample riverLeft = sampler.sampleSurface(-12289.0, z);
+        const worldgen::SurfaceSample riverRight = sampler.sampleSurface(-12288.0, z);
+        for (const worldgen::SurfaceSample* river : {&riverLeft, &riverRight}) {
+            REQUIRE(river->hydrology.river);
+            REQUIRE_FALSE(river->hydrology.lake);
+            REQUIRE_FALSE(river->hydrology.waterfall);
+            REQUIRE(worldgen::hasEcotope(river->ecotopes, worldgen::Ecotope::RIVERBANK));
+            REQUIRE(river->hydrology.streamOrder >= 2);
+            REQUIRE(river->hydrology.discharge > 0.0);
+            REQUIRE(river->hydrology.erosionDepth > 4.5);
+        }
+        REQUIRE(std::abs(riverLeft.waterSurface - riverRight.waterSurface) < 0.05);
+    }
+
+    const worldgen::SurfaceSample canyon = sampler.sampleSurface(-23904.0, 0.0);
+    REQUIRE(worldgen::hasEcotope(canyon.ecotopes, worldgen::Ecotope::CANYON));
+    REQUIRE(canyon.hydrology.streamOrder >= 2);
+    REQUIRE(canyon.hydrology.discharge > 0.0);
+    REQUIRE(canyon.hydrology.erosionDepth > 4.5);
+    REQUIRE(canyon.hydrology.channelGradient > 0.012);
+
+    const worldgen::SurfaceSample waterfall = sampler.sampleSurface(-8256.0, 3072.0);
+    REQUIRE(waterfall.hydrology.waterfall);
+    REQUIRE(waterfall.hydrology.waterfallAnchor);
+    REQUIRE(waterfall.hydrology.waterfallTop >= waterfall.hydrology.waterfallBottom + 2.5);
+
+    const worldgen::SurfaceSample delta = sampler.sampleSurface(-23904.0, 0.0);
+    REQUIRE(delta.hydrology.delta);
+    REQUIRE(worldgen::hasEcotope(delta.ecotopes, worldgen::Ecotope::DELTA));
+    REQUIRE(delta.hydrology.distributaryCount >= 2);
+    REQUIRE(delta.hydrology.distributaryCount <= 4);
+    REQUIRE(delta.hydrology.sediment > 0.0);
+
+    ChunkGenerator generator(42);
+    const worldgen::SurfaceSample emittedDelta = generator.sampleFarSurface(-23904, 0);
+    REQUIRE(emittedDelta.hydrology.ocean);
+    REQUIRE(emittedDelta.hydrology.delta);
+    REQUIRE(emittedDelta.hydrology.distributaryCount == delta.hydrology.distributaryCount);
+    REQUIRE(worldgen::hasEcotope(emittedDelta.ecotopes, worldgen::Ecotope::DELTA));
 }
 
-TEST_CASE("Chunk setBlock marks chunk dirty", "[chunk]") {
-    Chunk chunk(0, 0);
-    REQUIRE(chunk.needsMeshUpdate == false);
-    chunk.setBlock(8, 64, 8, BlockType::STONE);
-    REQUIRE(chunk.needsMeshUpdate == true);
+TEST_CASE("Eroded macro relief exposes cliff ecotopes", "[worldgen][terrain]") {
+    worldgen::MacroGenerationSampler sampler(42);
+    const worldgen::SurfaceSample cliff = sampler.sampleSurface(-23904.0, 0.0);
+    REQUIRE(cliff.slope > 0.75);
+    REQUIRE(worldgen::hasEcotope(cliff.ecotopes, worldgen::Ecotope::CLIFF));
 }
 
-TEST_CASE("Chunk out-of-bounds returns air", "[chunk]") {
-    Chunk chunk(0, 0);
-    REQUIRE(chunk.getBlock(-1, 64, 8) == BlockType::AIR);
-    REQUIRE(chunk.getBlock(16, 64, 8) == BlockType::AIR);
-    REQUIRE(chunk.getBlock(8, -1, 8) == BlockType::AIR);
-    REQUIRE(chunk.getBlock(8, 256, 8) == BlockType::AIR);
-    REQUIRE(chunk.getBlock(8, 64, -1) == BlockType::AIR);
-    REQUIRE(chunk.getBlock(8, 64, 16) == BlockType::AIR);
+TEST_CASE("Basin cache is single flight bounded and eviction deterministic",
+          "[worldgen][hydrology][concurrency]") {
+    worldgen::MacroGenerationSampler sampler(42);
+    sampler.clearBasinCache();
+    std::array<std::future<worldgen::HydrologySample>, 8> requests;
+    for (auto& request : requests) {
+        request = std::async(std::launch::async,
+                             [&sampler] { return sampler.sampleHydrology(-8235.0, 2976.0); });
+    }
+    std::array<worldgen::HydrologySample, 8> samples;
+    for (size_t index = 0; index < requests.size(); ++index)
+        samples[index] = requests[index].get();
+    for (const auto& sample : samples) {
+        REQUIRE(sample.surfaceElevation == samples.front().surfaceElevation);
+        REQUIRE(sample.waterSurface == samples.front().waterSurface);
+        REQUIRE(sample.discharge == samples.front().discharge);
+        REQUIRE(sample.streamOrder == samples.front().streamOrder);
+    }
+
+    const worldgen::BasinCacheMetrics warm = sampler.basinCacheMetrics();
+    REQUIRE(warm.builds == 1);
+    REQUIRE(warm.failures == 0);
+    REQUIRE(warm.entries == 1);
+    REQUIRE(warm.bytes > 0);
+    REQUIRE(warm.bytes <= worldgen::BASIN_CACHE_BYTE_BUDGET);
+
+    sampler.clearBasinCache();
+    const worldgen::HydrologySample rebuilt = sampler.sampleHydrology(-8235.0, 2976.0);
+    REQUIRE(rebuilt.surfaceElevation == samples.front().surfaceElevation);
+    REQUIRE(rebuilt.waterSurface == samples.front().waterSurface);
+    REQUIRE(rebuilt.discharge == samples.front().discharge);
+    const worldgen::BasinCacheMetrics afterEviction = sampler.basinCacheMetrics();
+    REQUIRE(afterEviction.failures == 0);
+    REQUIRE(afterEviction.builds == 2);
 }
 
-TEST_CASE("Chunk world coordinate conversion", "[chunk]") {
-    REQUIRE(Chunk::worldToChunk(0) == 0);
-    REQUIRE(Chunk::worldToChunk(15) == 0);
-    REQUIRE(Chunk::worldToChunk(16) == 1);
-    REQUIRE(Chunk::worldToChunk(31) == 1);
-    REQUIRE(Chunk::worldToChunk(32) == 2);
-    REQUIRE(Chunk::worldToChunk(-1) == -1);
-    REQUIRE(Chunk::worldToChunk(-16) == -1);
-    REQUIRE(Chunk::worldToChunk(-17) == -2);
-    REQUIRE(Chunk::worldToChunk(-32) == -2);
-}
+// ===========================================================================
+// RYCH v4 serialization and cubic persistence
+// ===========================================================================
 
-TEST_CASE("Chunk chunkToWorld conversion", "[chunk]") {
-    REQUIRE(Chunk::chunkToWorld(0, 0) == 0);
-    REQUIRE(Chunk::chunkToWorld(1, 0) == 16);
-    REQUIRE(Chunk::chunkToWorld(1, 15) == 31);
-    REQUIRE(Chunk::chunkToWorld(-1, 0) == -16);
-    REQUIRE(Chunk::chunkToWorld(-1, 15) == -1);
-}
-
-TEST_CASE("Chunk world block access", "[chunk]") {
-    Chunk chunk(2, -1);
-    chunk.setBlockWorld(32, 64, -8, BlockType::DIRT);
-    REQUIRE(chunk.getBlockWorld(32, 64, -8) == BlockType::DIRT);
-}
-
-TEST_CASE("Chunk getAABB", "[chunk]") {
-    Chunk chunk(1, -1);
-    AABB aabb = chunk.getAABB();
-    REQUIRE(aabb.min.x == Catch::Approx(16.f));
-    REQUIRE(aabb.min.y == Catch::Approx(0.f));
-    REQUIRE(aabb.min.z == Catch::Approx(-16.f));
-    REQUIRE(aabb.max.x == Catch::Approx(32.f));
-    REQUIRE(aabb.max.y == Catch::Approx(256.f));
-    REQUIRE(aabb.max.z == Catch::Approx(0.f));
-}
-
-TEST_CASE("Chunk getWorldPosition", "[chunk]") {
-    Chunk chunk(3, -2);
-    Vec3 pos = chunk.getWorldPosition();
-    REQUIRE(pos.x == Catch::Approx(48.f));
-    REQUIRE(pos.y == Catch::Approx(0.f));
-    REQUIRE(pos.z == Catch::Approx(-32.f));
-}
-
-TEST_CASE("Chunk markDirty", "[chunk]") {
-    Chunk chunk(0, 0);
-    chunk.needsMeshUpdate = false;
-    chunk.markDirty();
-    REQUIRE(chunk.needsMeshUpdate == true);
-}
-
-// ============================================================================
-// Serialization Tests
-// ============================================================================
-
-TEST_CASE("Serialization roundtrip", "[serialization]") {
-    Chunk original(5, -3);
-    original.setBlock(8, 64, 8, BlockType::STONE);
-    original.setBlock(0, 0, 0, BlockType::GRASS);
+TEST_CASE("RYCH v4 dense cube round-trips coordinates blocks and fluid", "[serialization]") {
+    Chunk original(ChunkPos{5, -3, -7});
+    original.setBlock(8, 9, 10, BlockType::STONE);
+    original.setBlock(0, 0, 0, BlockType::WATER);
+    original.setFluidState(0, 0, 0, FluidState::falling(4));
     original.generated = true;
-    original.biomes[0] = Biome::DESERT;
-    original.biomes[100] = Biome::FOREST;
-    original.heightMap[0] = 65;
-    original.heightMap[100] = 72;
 
-    auto data = ChunkSerializer::serialize(original);
-    auto restored = ChunkSerializer::deserialize(data);
+    const std::vector<uint8_t> bytes = ChunkSerializer::serialize(original);
+    REQUIRE(bytes.size() == HEADER_SIZE + CHUNK_VOLUME * 2);
+
+    ChunkSaveHeader header{};
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    REQUIRE(header.magic == CHUNK_MAGIC);
+    REQUIRE(header.version == 4);
+    REQUIRE(header.chunkX == 5);
+    REQUIRE(header.chunkY == -3);
+    REQUIRE(header.chunkZ == -7);
+    REQUIRE((header.flags & CHUNK_FLAG_UNIFORM) == 0);
+    REQUIRE((header.flags & CHUNK_FLAG_FLUID_STATES) != 0);
+
+    auto restored = ChunkSerializer::deserialize(bytes);
     REQUIRE(restored.has_value());
-    REQUIRE(restored->chunkX == original.chunkX);
-    REQUIRE(restored->chunkZ == original.chunkZ);
-    REQUIRE(restored->getBlock(8, 64, 8) == BlockType::STONE);
-    REQUIRE(restored->getBlock(0, 0, 0) == BlockType::GRASS);
-    REQUIRE(restored->biomes[0] == Biome::DESERT);
-    REQUIRE(restored->biomes[100] == Biome::FOREST);
-    REQUIRE(restored->heightMap[0] == 65);
-    REQUIRE(restored->heightMap[100] == 72);
+    REQUIRE(restored->pos() == original.pos());
+    REQUIRE(restored->copyBlocks() == original.copyBlocks());
+    REQUIRE(restored->getFluidState(0, 0, 0) == FluidState::falling(4));
+    REQUIRE(restored->generated);
 }
 
-TEST_CASE("Serialization: heights at 128 and above survive the roundtrip", "[serialization]") {
-    // Terrain reaches height 128, which overflowed the old int8 height field
-    // to -128 on load and corrupted tree/structure placement.
-    Chunk chunk(3, 4);
-    chunk.generated = true;
-    chunk.heightMap[0] = 127;
-    chunk.heightMap[1] = 128;
-    chunk.heightMap[2] = 255;
+TEST_CASE("RYCH v4 preserves compact uniform cubes", "[serialization][storage]") {
+    Chunk original(ChunkPos{-12, 31, 44});
+    original.fill(BlockType::STONE);
+    const std::vector<uint8_t> bytes = ChunkSerializer::serialize(original);
+    REQUIRE(bytes.size() == HEADER_SIZE + 1);
 
-    auto data = ChunkSerializer::serialize(chunk);
-    auto restored = ChunkSerializer::deserialize(data);
+    auto restored = ChunkSerializer::deserialize(bytes);
     REQUIRE(restored.has_value());
-    REQUIRE(restored->heightMap[0] == 127);
-    REQUIRE(restored->heightMap[1] == 128);
-    REQUIRE(restored->heightMap[2] == 255);
+    REQUIRE(restored->pos() == ChunkPos{-12, 31, 44});
+    REQUIRE(restored->isUniform());
+    REQUIRE(restored->uniformBlock() == BlockType::STONE);
 }
 
-TEST_CASE("Serialization: pre-v2 chunks are rejected so they regenerate", "[serialization]") {
-    Chunk chunk(0, 0);
-    chunk.generated = true;
-    auto data = ChunkSerializer::serialize(chunk);
+TEST_CASE("RYCH rejects legacy corrupt and out of range cube headers", "[serialization]") {
+    Chunk cube(ChunkPos{1, 2, 3});
+    std::vector<uint8_t> bytes = ChunkSerializer::serialize(cube);
 
-    // Rewrite the version field (offset 4) to the old v1
-    uint32_t oldVersion = 1;
-    std::memcpy(data.data() + 4, &oldVersion, sizeof(oldVersion));
-    REQUIRE(!ChunkSerializer::deserialize(data).has_value());
-}
-
-TEST_CASE("World loads saved chunks before generating", "[world][save]") {
-    TempDir tempDirGuard("load_before_generate");
-    const std::string& tempDir = tempDirGuard.path();
-
-    uint32_t seed = 777;
-    int editX = 8, editY = 200, editZ = 8;
-
-    {
-        // First session: edit a block and persist the chunk
-        SaveManager saver(tempDir);
-        auto world = std::make_shared<World>(seed);
-        world->setSaveManager(&saver);
-        auto chunk = world->getChunk(0, 0);
-        world->setBlock(editX, editY, editZ, BlockType::DIAMOND_ORE);
-        saver.saveChunk(*chunk);
-        saver.flush();
+    SECTION("legacy version") {
+        auto corrupt = bytes;
+        auto* header = reinterpret_cast<ChunkSaveHeader*>(corrupt.data());
+        header->version = 3;
+        REQUIRE_FALSE(ChunkSerializer::deserialize(corrupt).has_value());
     }
-
-    {
-        // Second session: the edit must come back from disk, not the generator
-        SaveManager saver(tempDir);
-        auto world = std::make_shared<World>(seed);
-        world->setSaveManager(&saver);
-        REQUIRE(world->getBlock(editX, editY, editZ) == BlockType::DIAMOND_ORE);
+    SECTION("wrong magic") {
+        auto corrupt = bytes;
+        auto* header = reinterpret_cast<ChunkSaveHeader*>(corrupt.data());
+        header->magic = 0;
+        REQUIRE_FALSE(ChunkSerializer::deserialize(corrupt).has_value());
     }
-}
-
-TEST_CASE("ChunkPos packs and hashes distinctly", "[world]") {
-    REQUIRE(ChunkPos{0, 0} == ChunkPos{0, 0});
-    REQUIRE(!(ChunkPos{1, 0} == ChunkPos{0, 1}));
-    REQUIRE(ChunkPos{1, 0}.packed() != ChunkPos{0, 1}.packed());
-    REQUIRE(ChunkPos{-1, -1}.packed() != ChunkPos{1, 1}.packed());
-
-    std::unordered_map<ChunkPos, int> map;
-    map[ChunkPos{5, -3}] = 42;
-    REQUIRE(map.at(ChunkPos{5, -3}) == 42);
-    REQUIRE(map.find(ChunkPos{-3, 5}) == map.end());
-}
-
-TEST_CASE("Serialization size is correct", "[serialization]") {
-    Chunk chunk(0, 0);
-    size_t expected = ChunkSerializer::serializedSize(chunk);
-    auto data = ChunkSerializer::serialize(chunk);
-    REQUIRE(data.size() == expected);
-}
-
-TEST_CASE("Serialization corrupt data returns nullopt", "[serialization]") {
-    std::vector<uint8_t> corruptData(100, 0xFF);
-    auto result = ChunkSerializer::deserialize(corruptData);
-    REQUIRE(result.has_value() == false);
-}
-
-TEST_CASE("Serialization empty data returns nullopt", "[serialization]") {
-    std::vector<uint8_t> emptyData;
-    auto result = ChunkSerializer::deserialize(emptyData);
-    REQUIRE(result.has_value() == false);
-}
-
-TEST_CASE("Serialization wrong magic returns nullopt", "[serialization]") {
-    Chunk chunk(0, 0);
-    auto data = ChunkSerializer::serialize(chunk);
-    data[0] = 0x00;
-    auto result = ChunkSerializer::deserialize(data);
-    REQUIRE(result.has_value() == false);
-}
-
-TEST_CASE("Serialization truncated data returns nullopt", "[serialization]") {
-    Chunk chunk(0, 0);
-    auto data = ChunkSerializer::serialize(chunk);
-    data.resize(HEADER_SIZE);
-    auto result = ChunkSerializer::deserialize(data);
-    REQUIRE(result.has_value() == false);
-}
-
-TEST_CASE("Serialization wrong block count returns nullopt", "[serialization]") {
-    Chunk chunk(0, 0);
-    auto data = ChunkSerializer::serialize(chunk);
-    data[16] = 0x00;
-    data[17] = 0x00;
-    data[18] = 0x00;
-    data[19] = 0x01;
-    auto result = ChunkSerializer::deserialize(data);
-    REQUIRE(result.has_value() == false);
-}
-
-TEST_CASE("Serialization multiple roundtrips consistent", "[serialization]") {
-    Chunk original(10, 10);
-    original.setBlock(4, 100, 4, BlockType::DIAMOND_ORE);
-    auto data1 = ChunkSerializer::serialize(original);
-    auto restored1 = ChunkSerializer::deserialize(data1);
-    REQUIRE(restored1.has_value());
-    auto data2 = ChunkSerializer::serialize(*restored1);
-    auto restored2 = ChunkSerializer::deserialize(data2);
-    REQUIRE(restored2.has_value());
-    REQUIRE(restored2->getBlock(4, 100, 4) == BlockType::DIAMOND_ORE);
-}
-
-// ============================================================================
-// World Tests
-// ============================================================================
-
-TEST_CASE("World creation", "[world]") {
-    auto world = std::make_shared<World>(42);
-    REQUIRE(world->getSeed() == 42);
-    REQUIRE(world->getViewDistance() == 32);
-}
-
-TEST_CASE("World getChunk generates chunk", "[world]") {
-    auto world = std::make_shared<World>(123);
-    auto chunk = world->getChunk(0, 0);
-    REQUIRE(chunk != nullptr);
-    REQUIRE(chunk->chunkX == 0);
-    REQUIRE(chunk->chunkZ == 0);
-    REQUIRE(chunk->generated == true);
-}
-
-TEST_CASE("World getChunk returns cached chunk", "[world]") {
-    auto world = std::make_shared<World>(42);
-    auto chunk1 = world->getChunk(5, -3);
-    auto chunk2 = world->getChunk(5, -3);
-    REQUIRE(chunk1 == chunk2);
-}
-
-TEST_CASE("World getBlock and setBlock", "[world]") {
-    auto world = std::make_shared<World>(42);
-    BlockType b = world->getBlock(100, 64, 100);
-    REQUIRE(static_cast<int>(b) >= 0);
-    world->setBlock(100, 64, 100, BlockType::DIAMOND_ORE);
-    BlockType after = world->getBlock(100, 64, 100);
-    REQUIRE(after == BlockType::DIAMOND_ORE);
-}
-
-TEST_CASE("World getLoadedChunks", "[world]") {
-    auto world = std::make_shared<World>(42);
-    world->getChunk(0, 0);
-    world->getChunk(1, 0);
-    world->getChunk(0, 1);
-    auto loaded = world->getLoadedChunks();
-    REQUIRE(loaded.size() == 3);
-}
-
-TEST_CASE("World getTerrainHeight", "[world]") {
-    auto world = std::make_shared<World>(42);
-    double h = world->getTerrainHeight(100, 200);
-    REQUIRE(h >= 0.0);
-}
-
-TEST_CASE("World getBiome", "[world]") {
-    auto world = std::make_shared<World>(42);
-    Biome b = world->getBiome(100, 200);
-    REQUIRE(static_cast<int>(b) >= 0);
-    REQUIRE(static_cast<int>(b) < static_cast<int>(Biome::COUNT));
-}
-
-TEST_CASE("World setViewDistance", "[world]") {
-    auto world = std::make_shared<World>(42);
-    world->setViewDistance(10);
-    REQUIRE(world->getViewDistance() == 10);
-    world->setViewDistance(0);
-    REQUIRE(world->getViewDistance() == 1);
-}
-
-TEST_CASE("World markChunkMeshed", "[world]") {
-    auto world = std::make_shared<World>(42);
-    auto chunk = world->getChunk(0, 0);
-    REQUIRE(chunk->needsMeshUpdate == true);
-    world->markChunkMeshed(0, 0);
-    REQUIRE(chunk->needsMeshUpdate == false);
-}
-
-TEST_CASE("World getDirtyChunks", "[world]") {
-    auto world = std::make_shared<World>(42);
-    world->getChunk(0, 0);
-    world->getChunk(1, 0);
-    auto dirty = world->getDirtyChunks();
-    REQUIRE(dirty.size() == 2);
-    world->markChunkMeshed(0, 0);
-    dirty = world->getDirtyChunks();
-    REQUIRE(dirty.size() == 1);
-}
-
-// ============================================================================
-// Async Generation Tests
-// ============================================================================
-
-TEST_CASE("World async generation pending count", "[world][async]") {
-    auto world = std::make_shared<World>(42);
-    REQUIRE(world->getPendingChunkCount() == 0);
-}
-
-TEST_CASE("World generateAroundPlayer submits chunks", "[world][async]") {
-    auto world = std::make_shared<World>(42);
-    world->setViewDistance(4);
-    world->generateAroundPlayer(0, 0);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    size_t pending = world->getPendingChunkCount();
-    REQUIRE(pending >= 0);
-}
-
-TEST_CASE("World generateAroundPlayer populates chunks", "[world][async]") {
-    auto world = std::make_shared<World>(42);
-    world->setViewDistance(2);
-    world->generateAroundPlayer(0, 0);
-    for (int attempts = 0; attempts < 50; ++attempts) {
-        if (world->getPendingChunkCount() == 0)
-            break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    SECTION("invalid vertical section") {
+        auto corrupt = bytes;
+        auto* header = reinterpret_cast<ChunkSaveHeader*>(corrupt.data());
+        header->chunkY = WORLD_MAX_CHUNK_Y + 1;
+        REQUIRE_FALSE(ChunkSerializer::deserialize(corrupt).has_value());
     }
-    auto chunks = world->getLoadedChunks();
-    REQUIRE(chunks.size() >= 0);
-}
-
-TEST_CASE("World updatePlayerPosition loads surrounding chunks", "[world]") {
-    auto world = std::make_shared<World>(42);
-    world->setViewDistance(2);
-    world->updatePlayerPosition(256, 256);
-
-    // Generation streams in on the worker pool; wait for it to settle.
-    // The self-sustaining pump must drain the whole backlog without any
-    // further updatePlayerPosition calls (workers refill the window).
-    for (int i = 0; i < 500 && world->getPendingChunkCount() > 0; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    SECTION("truncated payload") {
+        auto corrupt = bytes;
+        corrupt.pop_back();
+        REQUIRE_FALSE(ChunkSerializer::deserialize(corrupt).has_value());
     }
-
-    // Generation reaches one chunk past the render radius: (2·(vd+1)+1)²
-    auto chunks = world->getLoadedChunks();
-    REQUIRE(chunks.size() == 49);
-}
-
-TEST_CASE("World updatePlayerPosition streams the spawn area on first call", "[world]") {
-    auto world = std::make_shared<World>(42);
-    world->setViewDistance(1);
-
-    // The player spawns in chunk (0,0) — the very position the tracker starts
-    // at. The first call must still trigger streaming.
-    world->updatePlayerPosition(0, 0);
-    for (int i = 0; i < 500 && world->getPendingChunkCount() > 0; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    SECTION("invalid block byte") {
+        auto corrupt = bytes;
+        corrupt[HEADER_SIZE] = 0xFF;
+        REQUIRE_FALSE(ChunkSerializer::deserialize(corrupt).has_value());
     }
-
-    REQUIRE(world->getLoadedChunks().size() == 25);
-}
-
-TEST_CASE("sortChunksByDistance orders farthest-first for pop_back consumption",
-          "[world][priority]") {
-    std::vector<ChunkPos> chunks = {{10, 0}, {0, 0}, {3, 4}, {-1, 0}, {0, -7}};
-    sortChunksByDistance(chunks, 0, 0);
-    // Farthest first…
-    REQUIRE(chunks.front() == ChunkPos{10, 0});
-    // …so pop_back() yields the player's own chunk before anything else
-    REQUIRE(chunks.back() == ChunkPos{0, 0});
-    for (size_t i = 1; i < chunks.size(); ++i) {
-        auto d2 = [](const ChunkPos& p) { return p.x * p.x + p.z * p.z; };
-        REQUIRE(d2(chunks[i - 1]) >= d2(chunks[i]));
+    SECTION("unknown header flags") {
+        auto corrupt = bytes;
+        ChunkSaveHeader header{};
+        std::memcpy(&header, corrupt.data(), sizeof(header));
+        header.flags |= 1U << 31U;
+        std::memcpy(corrupt.data(), &header, sizeof(header));
+        REQUIRE_FALSE(ChunkSerializer::deserialize(corrupt).has_value());
     }
 }
 
-TEST_CASE("World generation window stays bounded", "[world][priority]") {
-    auto world = std::make_shared<World>(42);
-    world->setViewDistance(5); // gen radius 6 → 169 chunks, well over the window
-    world->updatePlayerPosition(0, 0);
+TEST_CASE("SaveManager keys cubes by full three dimensional position", "[save]") {
+    TempDir directory("cubic_save");
+    SaveManager saves(directory.path());
 
-    // Immediately after the first pump, at most MAX_INFLIGHT_GEN tasks may
-    // be in flight; the rest wait in the backlog (all still counted).
-    size_t pending = world->getPendingChunkCount();
-    size_t loaded = world->getLoadedChunks().size();
-    REQUIRE(pending + loaded >= 169 - MAX_INFLIGHT_GEN); // nothing lost
+    Chunk lower(ChunkPos{7, 4, -5});
+    lower.setBlock(1, 2, 3, BlockType::GOLD_ORE);
+    lower.generated = true;
+    Chunk upper(ChunkPos{7, 6, -5});
+    upper.setBlock(1, 2, 3, BlockType::DIAMOND_ORE);
+    upper.generated = true;
+    saves.saveChunk(lower);
+    saves.saveChunk(upper);
+    saves.flush();
 
-    for (int i = 0; i < 2000 && world->getPendingChunkCount() > 0; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    REQUIRE(world->getLoadedChunks().size() == 169);
+    auto loadedLower = saves.loadChunk({7, 4, -5});
+    auto loadedUpper = saves.loadChunk({7, 6, -5});
+    REQUIRE(loadedLower.has_value());
+    REQUIRE(loadedUpper.has_value());
+    REQUIRE(loadedLower->getBlock(1, 2, 3) == BlockType::GOLD_ORE);
+    REQUIRE(loadedUpper->getBlock(1, 2, 3) == BlockType::DIAMOND_ORE);
+    REQUIRE_FALSE(saves.loadChunk({7, 5, -5}).has_value());
+    REQUIRE(saves.savedSections({7, -5}) == std::vector<int32_t>{4, 6});
 }
 
-// ============================================================================
-// SaveManager Tests
-// ============================================================================
+TEST_CASE("SaveManager exposes queued cubic edits before disk write", "[save]") {
+    TempDir directory("cubic_save_shield");
+    SaveManager saves(directory.path());
+    auto cube = std::make_shared<Chunk>(ChunkPos{3, 9, 4});
+    cube->setBlock(2, 10, 2, BlockType::DIAMOND_ORE);
+    cube->generated = true;
+    saves.saveChunkAsync(cube);
 
-TEST_CASE("SaveManager creation", "[save]") {
-    TempDir dir("world_sm1");
-    SaveManager saver(dir.path());
-    REQUIRE(saver.getWorldPath().find("rycraft_test_") != std::string::npos);
-}
-
-TEST_CASE("SaveManager save/load chunk roundtrip", "[save]") {
-    TempDir tempDirGuard("save_roundtrip");
-    const std::string& tempDir = tempDirGuard.path();
-    {
-        SaveManager saver(tempDir);
-        Chunk original(7, -5);
-        original.setBlock(8, 100, 8, BlockType::IRON_ORE);
-        original.generated = true;
-        saver.saveChunk(original);
-        saver.flush();
-        auto loaded = saver.loadChunk(7, -5);
-        REQUIRE(loaded.has_value());
-        REQUIRE(loaded->chunkX == 7);
-        REQUIRE(loaded->chunkZ == -5);
-        REQUIRE(loaded->getBlock(8, 100, 8) == BlockType::IRON_ORE);
-    }
-}
-
-TEST_CASE("SaveManager: chunks in one region never clobber each other", "[save]") {
-    // Regression: the old packed-region format wrote ONE chunk per region
-    // file, so every chunk save silently destroyed its 1023 region-mates.
-    TempDir tempDirGuard("save_multi");
-    SaveManager saver(tempDirGuard.path());
-
-    // Same region (0,0), region border, and the next region over
-    const std::pair<int, int> coords[] = {{0, 0}, {1, 0}, {31, 31}, {32, 0}, {-1, -1}};
-    int marker = 1;
-    for (auto [cx, cz] : coords) {
-        Chunk chunk(cx, cz);
-        chunk.setBlock(1, 100 + marker, 1, BlockType::GOLD_ORE);
-        chunk.generated = true;
-        saver.saveChunk(chunk);
-        ++marker;
-    }
-    saver.flush();
-
-    marker = 1;
-    for (auto [cx, cz] : coords) {
-        auto loaded = saver.loadChunk(cx, cz);
-        REQUIRE(loaded.has_value());
-        REQUIRE(loaded->chunkX == cx);
-        REQUIRE(loaded->chunkZ == cz);
-        REQUIRE(loaded->getBlock(1, 100 + marker, 1) == BlockType::GOLD_ORE);
-        ++marker;
-    }
-}
-
-TEST_CASE("SaveManager: queued chunks are readable before the write lands", "[save]") {
-    // The load shield: unloading a chunk queues it; walking straight back
-    // must return the queued edits even if the file hasn't been written yet.
-    TempDir tempDirGuard("save_shield");
-    SaveManager saver(tempDirGuard.path());
-
-    auto chunk = std::make_shared<Chunk>(3, 4);
-    chunk->setBlock(2, 90, 2, BlockType::DIAMOND_ORE);
-    chunk->generated = true;
-    saver.saveChunkAsync(chunk);
-
-    // No flush: the job may or may not have been written yet — either way
-    // the loaded chunk must carry the edit.
-    auto loaded = saver.loadChunk(3, 4);
+    auto loaded = saves.loadChunk({3, 9, 4});
     REQUIRE(loaded.has_value());
-    REQUIRE(loaded->getBlock(2, 90, 2) == BlockType::DIAMOND_ORE);
-    saver.flush();
+    REQUIRE(loaded->getBlock(2, 10, 2) == BlockType::DIAMOND_ORE);
+    saves.flush();
 }
 
-TEST_CASE("World: edited chunks persist through unload-and-return", "[world][save]") {
-    TempDir tempDirGuard("save_unload");
-    SaveManager saver(tempDirGuard.path());
-    World world(4321, 1);
-    world.setSaveManager(&saver);
+TEST_CASE("SaveManager coalesces queued snapshots by cubic position", "[save][performance]") {
+    TempDir directory("cubic_save_coalescing");
+    const auto hooks = std::make_shared<SaveManager::TestHooks>();
+    hooks->pauseWrites.store(true, std::memory_order_release);
+    SaveManager saves(directory.path(), hooks);
+    constexpr ChunkPos POSITION{11, 7, -13};
 
-    world.getChunk(0, 0);
-    world.setBlock(5, 150, 5, BlockType::PLANKS);
+    Chunk initial(POSITION);
+    initial.setBlock(2, 3, 4, BlockType::STONE);
+    saves.saveChunk(initial);
+    for (int revision = 0; revision < 100; ++revision) {
+        Chunk replacement(POSITION);
+        replacement.setBlock(2, 3, 4,
+                             revision == 99 ? BlockType::OBSIDIAN : BlockType::DIAMOND_ORE);
+        saves.saveChunk(replacement);
+    }
 
-    // Walk far away: (0,0) leaves the radius and queues for saving…
-    world.updatePlayerPosition(10 * CHUNK_WIDTH, 10 * CHUNK_DEPTH);
-    // …then come back: the reloaded chunk must carry the edit
-    auto chunk = world.getChunk(0, 0);
-    REQUIRE(chunk->getBlock(5, 150, 5) == BlockType::PLANKS);
-    saver.flush();
+    REQUIRE(saves.pendingSaveCount() <= 2);
+    REQUIRE(saves.coalescedSaveCount() >= 99);
+    const auto pending = saves.loadChunk(POSITION);
+    REQUIRE(pending.has_value());
+    REQUIRE(pending->getBlock(2, 3, 4) == BlockType::OBSIDIAN);
+
+    hooks->pauseWrites.store(false, std::memory_order_release);
+    hooks->pauseWrites.notify_all();
+    REQUIRE(saves.flush());
+    const auto durable = saves.loadChunk(POSITION);
+    REQUIRE(durable.has_value());
+    REQUIRE(durable->getBlock(2, 3, 4) == BlockType::OBSIDIAN);
 }
 
-TEST_CASE("SaveManager load non-existent chunk returns nullopt", "[save]") {
-    TempDir tempDirGuard("save_missing");
-    const std::string& tempDir = tempDirGuard.path();
+TEST_CASE("SaveManager snapshots edited sections under one manifest lock", "[save][performance]") {
+    TempDir directory("manifest_bulk_lookup");
+    SaveManager saves(directory.path());
+    for (ChunkPos position : {ChunkPos{2, 4, -3}, ChunkPos{2, 8, -3}, ChunkPos{-5, 1, 7}}) {
+        Chunk cube(position);
+        cube.setBlock(1, 1, 1, BlockType::GOLD_ORE);
+        saves.saveChunk(cube);
+    }
+    REQUIRE(saves.flush());
+
+    const std::vector<ColumnPos> columns = {{2, -3}, {-5, 7}, {99, 99}, {2, -3}};
+    const auto sections = saves.savedSectionsForColumns(columns);
+    REQUIRE(sections.size() == 2);
+    REQUIRE(sections.at({2, -3}) == std::vector<int32_t>{4, 8});
+    REQUIRE(sections.at({-5, 7}) == std::vector<int32_t>{1});
+}
+
+TEST_CASE("SaveManager metadata records the cubic format version", "[save]") {
+    TempDir directory("cubic_metadata");
+    SaveManager saves(directory.path());
+    saves.saveMetadata(12345, Vec3{100.f, 80.f, -50.f}, 9876543210ULL);
+
+    auto metadata = saves.loadMetadata();
+    REQUIRE(metadata.has_value());
+    REQUIRE(metadata->seed == 12345);
+    REQUIRE(metadata->spawnPos == Vec3{100.f, 80.f, -50.f});
+    REQUIRE(metadata->worldTime == 9876543210ULL);
+    REQUIRE(metadata->chunkFormatVersion == CHUNK_VERSION);
+}
+
+TEST_CASE("SaveManager preserves non-chunk player metadata", "[save][metadata]") {
+    TempDir directory("rycraft_player_metadata");
+    SaveManager saves(directory.path());
+    SaveManager::PlayerMetadata player;
+    player.yaw = 127.5f;
+    player.pitch = -31.25f;
+    player.health = 13;
+    player.selectedSlot = 7;
+    player.inventory[0] = BlockType::BASALT;
+    player.inventory[7] = BlockType::LILY_PAD;
+
+    saves.saveMetadata(9191, Vec3{12.0f, 88.0f, -4.0f}, 123456, player);
+    const auto loaded = saves.loadMetadata();
+
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->seed == 9191);
+    REQUIRE(loaded->spawnPos == Vec3{12.0f, 88.0f, -4.0f});
+    REQUIRE(loaded->worldTime == 123456);
+    REQUIRE(loaded->player.yaw == Catch::Approx(127.5f));
+    REQUIRE(loaded->player.pitch == Catch::Approx(-31.25f));
+    REQUIRE(loaded->player.health == 13);
+    REQUIRE(loaded->player.selectedSlot == 7);
+    REQUIRE(loaded->player.inventory[0] == BlockType::BASALT);
+    REQUIRE(loaded->player.inventory[7] == BlockType::LILY_PAD);
+}
+
+TEST_CASE("SaveManager persists activated fluid frontiers across restart", "[save][fluid]") {
+    TempDir directory("fluid_frontiers");
+    const std::vector<FluidBoundaryFrontier> frontiers{
+        {{-1, -64, -17}, {-1, -64, -16}},
+        {{15, 64, 3}, {16, 64, 3}},
+    };
     {
-        SaveManager saver(tempDir);
-        auto loaded = saver.loadChunk(999, 999);
-        REQUIRE(loaded.has_value() == false);
+        SaveManager saves(directory.path());
+        saves.saveDeferredFluidFrontiers(frontiers);
+        REQUIRE(saves.loadDeferredFluidFrontiers() == frontiers);
     }
-}
-
-TEST_CASE("SaveManager save/load metadata roundtrip", "[save]") {
-    TempDir tempDirGuard("save_meta");
-    const std::string& tempDir = tempDirGuard.path();
     {
-        SaveManager saver(tempDir);
-        saver.saveMetadata(12345, Vec3{100.f, 80.f, -50.f}, 9876543210);
-        auto meta = saver.loadMetadata();
-        REQUIRE(meta.has_value());
-        REQUIRE(meta->seed == 12345);
-        REQUIRE(meta->spawnPos.x == Catch::Approx(100.f));
-        REQUIRE(meta->spawnPos.y == Catch::Approx(80.f));
-        REQUIRE(meta->spawnPos.z == Catch::Approx(-50.f));
-        REQUIRE(meta->worldTime == 9876543210);
+        SaveManager reopened(directory.path());
+        REQUIRE(reopened.loadDeferredFluidFrontiers() == frontiers);
     }
 }
 
-TEST_CASE("SaveManager load missing metadata returns nullopt", "[save]") {
-    TempDir tempDirGuard("save_nometa");
-    const std::string& tempDir = tempDirGuard.path();
-    {
-        SaveManager saver(tempDir);
-        auto meta = saver.loadMetadata();
-        REQUIRE(meta.has_value() == false);
+// ===========================================================================
+// Cubic world access and streaming contracts
+// ===========================================================================
+
+TEST_CASE("World returns boundary blocks without loading invalid cubes", "[world][bounds]") {
+    World world(42);
+    REQUIRE(world.getLoadedChunkCount() == 0);
+    REQUIRE(world.getBlock(0, WORLD_MIN_Y - 1, 0) == BlockType::BEDROCK);
+    REQUIRE(world.getBlock(0, WORLD_MAX_Y + 1, 0) == BlockType::AIR);
+    REQUIRE(world.getLoadedChunkCount() == 0);
+}
+
+TEST_CASE("World caches cubes by X Y and Z", "[world]") {
+    World world(42);
+    auto lower = world.getChunk({5, 3, -3});
+    auto lowerAgain = world.getChunk({5, 3, -3});
+    auto upper = world.getChunk({5, 4, -3});
+    REQUIRE(lower == lowerAgain);
+    REQUIRE(lower != upper);
+    REQUIRE(lower->pos() == ChunkPos{5, 3, -3});
+    REQUIRE(upper->pos() == ChunkPos{5, 4, -3});
+    REQUIRE(world.getLoadedChunkCount() == 2);
+}
+
+TEST_CASE("World edits address the correct vertical cube", "[world]") {
+    World world(42);
+    constexpr int32_t worldY = 200;
+    const ChunkPos position{0, Chunk::worldToChunkY(worldY), 0};
+    auto cube = world.getChunk(position);
+    cube->needsMeshUpdate = false;
+    world.setBlock(5, worldY, 6, BlockType::PLANKS);
+
+    REQUIRE(world.getBlockIfLoaded(5, worldY, 6) == BlockType::PLANKS);
+    REQUIRE(cube->getBlock(5, Chunk::worldToLocalY(worldY), 6) == BlockType::PLANKS);
+    REQUIRE(cube->needsMeshUpdate);
+    REQUIRE(cube->modifiedSinceSave);
+}
+
+TEST_CASE("Loaded world snapshots are reused until the cube set changes", "[world][snapshot]") {
+    World world(42);
+    world.getChunk({0, 4, 0});
+    world.publishLoadedSnapshot();
+    auto first = world.getLoadedSnapshot();
+    auto same = world.getLoadedSnapshot();
+    REQUIRE(first == same);
+    REQUIRE(first->size() == 1);
+
+    world.getChunk({0, 5, 0});
+    REQUIRE(world.getLoadedSnapshot() == first);
+    world.publishLoadedSnapshot();
+    auto changed = world.getLoadedSnapshot();
+    REQUIRE(changed != first);
+    REQUIRE(changed->size() == 2);
+}
+
+TEST_CASE("Chunk distance sorting includes vertical distance", "[world][priority]") {
+    std::vector<ChunkPos> cubes{{0, 4, 0}, {0, 10, 0}, {3, 4, 4}, {-1, 4, 0}};
+    sortChunksByDistance(cubes, 0, 4, 0);
+    REQUIRE(cubes.front() == ChunkPos{0, 10, 0});
+    REQUIRE(cubes.back() == ChunkPos{0, 4, 0});
+}
+
+TEST_CASE("World loads a saved cubic edit before generation", "[world][save]") {
+    TempDir directory("world_cubic_load");
+    SaveManager saves(directory.path());
+    Chunk saved(ChunkPos{2, 12, -1});
+    saved.setBlock(4, 8, 9, BlockType::DIAMOND_ORE);
+    saved.generated = true;
+    saves.saveChunk(saved);
+    saves.flush();
+
+    World world(42);
+    world.setSaveManager(&saves);
+    auto loaded = world.getChunk({2, 12, -1});
+    REQUIRE(loaded->getBlock(4, 8, 9) == BlockType::DIAMOND_ORE);
+}
+
+TEST_CASE("World streaming remains within the cubic loaded cap", "[world][async]") {
+    World world(42, 1);
+    world.updatePlayerPosition(0, SEA_LEVEL, 0);
+    for (int attempt = 0; attempt < 1000 && world.getPendingChunkCount() > 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+    REQUIRE(world.getLoadedChunkCount() <= MAX_LOADED_CUBES);
+    REQUIRE(world.getLoadedChunkCount() > 0);
 }
 
-TEST_CASE("SaveManager LZ4 compression produces smaller data", "[save]") {
-    TempDir tempDirGuard("save_compress");
-    const std::string& tempDir = tempDirGuard.path();
-    {
-        SaveManager saver(tempDir);
-        Chunk chunk(0, 0);
-        chunk.setBlock(8, 64, 8, BlockType::STONE);
-        chunk.generated = true;
-        saver.saveChunk(chunk);
-        saver.flush();
-        auto loaded = saver.loadChunk(0, 0);
-        REQUIRE(loaded.has_value());
+TEST_CASE("Column plan completions wake only registered cube dependencies",
+          "[world][streaming][performance]") {
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS);
+    world.updatePlayerPosition(0, SEA_LEVEL, 0);
+
+    StreamingWorkStats work;
+    for (int attempt = 0; attempt < 2000; ++attempt) {
+        work = world.getStreamingWorkStats();
+        if (work.completedColumnPlans >= COLUMN_PLAN_REBUILD_BATCH)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-}
 
-// ============================================================================
-// Phase 6: Block Interaction & Environment Tests
-// ============================================================================
+    INFO("apron centers=" << work.planApronCenters
+                          << " actual expansions=" << work.planApronExpansionAttempts
+                          << " per-cube equivalent=" << work.planApronCubeExpansionEquivalent);
+    INFO("completed plans=" << work.completedColumnPlans
+                            << " dependent checks=" << work.planDependentChecks
+                            << " full-scan equivalent=" << work.fullRetainedScanEquivalent
+                            << " rebuild notifications=" << work.activeSetRebuildNotifications);
+    REQUIRE(work.activeSetRebuilds == 1);
+    REQUIRE(work.planApronCenters > 0);
+    REQUIRE(work.planApronExpansionAttempts == work.planApronCenters * 25);
+    REQUIRE(work.planApronExpansionAttempts < work.planApronCubeExpansionEquivalent);
+    REQUIRE(work.completedColumnPlans >= COLUMN_PLAN_REBUILD_BATCH);
+    REQUIRE(work.planDependentChecks < work.fullRetainedScanEquivalent);
+    REQUIRE(work.activeSetRebuildNotifications <=
+            work.completedColumnPlans / COLUMN_PLAN_REBUILD_BATCH + 1);
 
-// ---- Block Breaking Tests (Task 6.1) ----
-
-TEST_CASE("Block breaking: raycast hits block and block becomes AIR", "[phase6][block]") {
-    auto world = std::make_shared<World>(42);
-    world->getChunk(0, 0);
-
-    // Place a stone block at (5, 200, 0) — high Y to avoid terrain
-    world->setBlock(5, 200, 0, BlockType::STONE);
-    REQUIRE(world->getBlock(5, 200, 0) == BlockType::STONE);
-
-    // Ray from (0, 200, 0) going +X toward the block
-    Vec3 origin{0.f, 200.f, 0.f};
-    Vec3 direction{1.f, 0.f, 0.f};
-
-    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
-    REQUIRE(hit.has_value());
-    REQUIRE(hit->first.x == Catch::Approx(5.f));
-    REQUIRE(hit->first.y == Catch::Approx(200.f));
-    REQUIRE(hit->first.z == Catch::Approx(0.f));
-
-    // "Break" the block: set to AIR
-    int hitX = static_cast<int>(std::floor(hit->first.x));
-    int hitY = static_cast<int>(std::floor(hit->first.y));
-    int hitZ = static_cast<int>(std::floor(hit->first.z));
-    world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
-
-    // Verify block is now AIR
-    REQUIRE(world->getBlock(5, 200, 0) == BlockType::AIR);
-}
-
-TEST_CASE("Block breaking: chunk marked dirty after block change", "[phase6][block]") {
-    auto world = std::make_shared<World>(42);
-    auto chunk = world->getChunk(0, 0);
-
-    // Reset dirty state
-    chunk->needsMeshUpdate = false;
-
-    // Place and break a block
-    world->setBlock(5, 200, 0, BlockType::STONE);
-    REQUIRE(chunk->needsMeshUpdate == true);
-
-    // Reset and break
-    chunk->needsMeshUpdate = false;
-    world->setBlock(5, 200, 0, BlockType::AIR);
-    REQUIRE(chunk->needsMeshUpdate == true);
-}
-
-TEST_CASE("Block breaking: bedrock cannot be broken", "[phase6][block]") {
-    auto world = std::make_shared<World>(42);
-    world->getChunk(0, 0);
-
-    world->setBlock(5, 200, 0, BlockType::BEDROCK);
-
-    Vec3 origin{0.f, 200.f, 0.f};
-    Vec3 direction{1.f, 0.f, 0.f};
-
-    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
-
-    // Ray should NOT hit bedrock (it's not solid for ray tracing purposes in some games)
-    // But in our implementation, bedrock IS solid for ray tracing
-    // The "cannot break" logic is in the engine, not the traversal
-    if (hit.has_value()) {
-        // Verify it's bedrock
-        REQUIRE(world->getBlock(5, 200, 0) == BlockType::BEDROCK);
+    const uint64_t rebuildsBeforeCooldown = work.activeSetRebuilds;
+    for (size_t tick = 0; tick < COLUMN_PLAN_REBUILD_COOLDOWN_TICKS; ++tick) {
+        world.updatePlayerPosition(0, SEA_LEVEL, 0);
+        REQUIRE(world.getStreamingWorkStats().activeSetRebuilds == rebuildsBeforeCooldown);
     }
-}
-
-// ---- Block Placing Tests (Task 6.2) ----
-
-TEST_CASE("Block placing: raycast finds face and block placed on face normal", "[phase6][block]") {
-    auto world = std::make_shared<World>(42);
-    world->getChunk(0, 0);
-
-    // Place a stone block at (5, 200, 0)
-    world->setBlock(5, 200, 0, BlockType::STONE);
-
-    // Ray from (2, 200, 0) going +X — hits the -X face of the block
-    Vec3 origin{2.f, 200.f, 0.f};
-    Vec3 direction{1.f, 0.f, 0.f};
-
-    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
-    REQUIRE(hit.has_value());
-
-    // Calculate placement position: hit block + face normal
-    int placeX = static_cast<int>(std::floor(hit->first.x)) + static_cast<int>(hit->second.x);
-    int placeY = static_cast<int>(std::floor(hit->first.y)) + static_cast<int>(hit->second.y);
-    int placeZ = static_cast<int>(std::floor(hit->first.z)) + static_cast<int>(hit->second.z);
-
-    // Normal should be -X, so placement should be at (4, 200, 0)
-    REQUIRE(placeX == 4);
-    REQUIRE(placeY == 200);
-    REQUIRE(placeZ == 0);
-
-    // Place block
-    world->setBlock(placeX, placeY, placeZ, BlockType::DIRT);
-    REQUIRE(world->getBlock(4, 200, 0) == BlockType::DIRT);
-}
-
-TEST_CASE("Block placing: no placement when overlapping player AABB", "[phase6][block]") {
-    auto world = std::make_shared<World>(42);
-    world->getChunk(0, 0);
-
-    // Place block at (10, 200, 10)
-    world->setBlock(10, 200, 10, BlockType::STONE);
-
-    // Player standing at (10, 200, 10) — inside the block we'd place on
-    Player player;
-    player.position = Vec3{10.f, 200.f, 10.f};
-
-    // Ray from (7, 200, 10) going +X
-    Vec3 origin{7.f, 200.f, 10.f};
-    Vec3 direction{1.f, 0.f, 0.f};
-
-    auto hit = VoxelTraversal::traceRayWithNormal(origin, direction, *world, 10.f);
-    REQUIRE(hit.has_value());
-
-    // Calculate placement position
-    int placeX = static_cast<int>(std::floor(hit->first.x)) + static_cast<int>(hit->second.x);
-    int placeY = static_cast<int>(std::floor(hit->first.y)) + static_cast<int>(hit->second.y);
-    int placeZ = static_cast<int>(std::floor(hit->first.z)) + static_cast<int>(hit->second.z);
-
-    // Check overlap
-    AABB placeBox{
-        Vec3{static_cast<float>(placeX), static_cast<float>(placeY), static_cast<float>(placeZ)},
-        Vec3{static_cast<float>(placeX + 1), static_cast<float>(placeY + 1),
-             static_cast<float>(placeZ + 1)}};
-
-    bool overlaps = placeBox.intersects(player.getAABB());
-    // If it overlaps, we should NOT place the block
-    if (overlaps) {
-        // This is the expected behavior — block should not be placed
-        REQUIRE(overlaps == true);
+    world.updatePlayerPosition(0, SEA_LEVEL, 0);
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        if (world.getStreamingWorkStats().activeSetRebuilds > rebuildsBeforeCooldown)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    const StreamingWorkStats rebuilt = world.getStreamingWorkStats();
+    REQUIRE(rebuilt.activeSetRebuilds == rebuildsBeforeCooldown + 1);
+    REQUIRE(rebuilt.activeSetRequests >= 2);
+    REQUIRE(rebuilt.activeSetBuildMs > 0.0F);
 }
 
-TEST_CASE("Block placing: adjacent chunks marked dirty at boundary", "[phase6][block]") {
-    auto world = std::make_shared<World>(42);
+TEST_CASE("Gameplay coalesces active-set movement away from the fixed tick",
+          "[world][streaming][performance][concurrency]") {
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS);
+    constexpr int REQUEST_COUNT = 12;
+    constexpr int64_t REQUEST_STRIDE = CHUNK_EDGE * 3;
+    for (int request = 0; request < REQUEST_COUNT; ++request) {
+        world.updatePlayerPosition(request * REQUEST_STRIDE, SEA_LEVEL, 0);
+    }
 
-    // Place block at chunk boundary: x=15 is last block in chunk 0, x=16 is first in chunk 1
-    world->getChunk(0, 0);
-    world->getChunk(1, 0);
+    const int64_t finalChunkX = (REQUEST_COUNT - 1) * 3;
+    const ChunkPos finalCameraCube{finalChunkX, Chunk::worldToChunkY(SEA_LEVEL), 0};
+    // Mesh-candidate publication precedes the final timing sample by a few
+    // instructions. Wait for both observables so this concurrency test does
+    // not race the diagnostics write on a fast worker.
+    for (int attempt = 0; attempt < 2000; ++attempt) {
+        const StreamingWorkStats current = world.getStreamingWorkStats();
+        if (world.shouldMeshChunk(finalCameraCube) && current.activeSetBuildMs > 0.0F) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 
-    auto chunk0 = world->getChunk(0, 0);
-    auto chunk1 = world->getChunk(1, 0);
-
-    chunk0->needsMeshUpdate = false;
-    chunk1->needsMeshUpdate = false;
-
-    // Place block at x=16 (first block of chunk 1)
-    world->setBlock(16, 200, 8, BlockType::STONE);
-
-    // Chunk 1 should be dirty
-    REQUIRE(chunk1->needsMeshUpdate == true);
+    const StreamingWorkStats work = world.getStreamingWorkStats();
+    REQUIRE(world.shouldMeshChunk(finalCameraCube));
+    REQUIRE(work.activeSetRequests == REQUEST_COUNT);
+    REQUIRE(work.activeSetRequestsCoalesced > 0);
+    REQUIRE(work.activeSetRebuilds < work.activeSetRequests);
+    REQUIRE(work.activeSetBuildMs > 0.0F);
 }
 
-// ---- Water Physics Tests (Task 6.7-6.8) ----
+TEST_CASE("Cubic streaming unload hysteresis does not add mesh candidates",
+          "[world][streaming][hysteresis]") {
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS);
+    constexpr int32_t INITIAL_BLOCK_Y = 400;
+    constexpr int32_t initialY = INITIAL_BLOCK_Y / CHUNK_EDGE;
+    constexpr ChunkPos horizontalEdge{-EXPLORATION_RADIUS_CHUNKS - 1, initialY, 0};
+    constexpr ChunkPos verticalEdge{0, initialY + EXPLORATION_VERTICAL_RADIUS_CUBES + 1, 0};
 
-TEST_CASE("Water physics: reduced gravity when submerged", "[phase6][water]") {
-    auto world = std::make_shared<World>(42);
-    // Ensure chunk exists before setting blocks (setBlock only modifies existing chunks)
-    world->getChunk(0, 0);
+    world.generateAroundPlayer(0, INITIAL_BLOCK_Y, 0);
+    REQUIRE(world.getChunk(horizontalEdge));
+    REQUIRE(world.getChunk(verticalEdge));
 
-    // Place floor far below so player falls freely
-    for (int x = -10; x <= 10; ++x) {
-        for (int z = -10; z <= 10; ++z) {
-            world->setBlock(x, 0, z, BlockType::STONE);
+    world.generateAroundPlayer(CHUNK_EDGE * HORIZONTAL_UNLOAD_HYSTERESIS_CHUNKS,
+                               INITIAL_BLOCK_Y - CHUNK_EDGE, 0);
+    world.unloadDistantChunks();
+    REQUIRE(world.isChunkLoaded(horizontalEdge));
+    REQUIRE(world.isChunkLoaded(verticalEdge));
+    REQUIRE_FALSE(world.shouldMeshChunk(horizontalEdge));
+    REQUIRE_FALSE(world.shouldMeshChunk(verticalEdge));
+    REQUIRE(world.getStreamingWorkStats().hysteresisRetainedCubes >= 2);
+
+    world.generateAroundPlayer(CHUNK_EDGE * 4, INITIAL_BLOCK_Y - CHUNK_EDGE * 4, 0);
+    world.unloadDistantChunks();
+    REQUIRE_FALSE(world.isChunkLoaded(horizontalEdge));
+    REQUIRE_FALSE(world.isChunkLoaded(verticalEdge));
+}
+
+TEST_CASE("The underground exploration band is a hard mesh and retention priority",
+          "[world][streaming][priority]") {
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS);
+    constexpr int32_t centerY = SEA_LEVEL / CHUNK_EDGE;
+    constexpr ChunkPos retainedEdge{EXPLORATION_RADIUS_CHUNKS, centerY, 0};
+    REQUIRE(world.getChunk(retainedEdge));
+
+    world.generateAroundPlayer(0, SEA_LEVEL, 0);
+    world.unloadDistantChunks();
+
+    REQUIRE(world.isChunkLoaded(retainedEdge));
+    for (int dz = -EXPLORATION_RADIUS_CHUNKS; dz <= EXPLORATION_RADIUS_CHUNKS; ++dz) {
+        for (int dx = -EXPLORATION_RADIUS_CHUNKS; dx <= EXPLORATION_RADIUS_CHUNKS; ++dx) {
+            if (dx * dx + dz * dz > EXPLORATION_RADIUS_CHUNKS * EXPLORATION_RADIUS_CHUNKS) {
+                continue;
+            }
+            for (int dy = -EXPLORATION_VERTICAL_RADIUS_CUBES;
+                 dy <= EXPLORATION_VERTICAL_RADIUS_CUBES; ++dy) {
+                REQUIRE(world.shouldMeshChunk({dx, centerY + dy, dz}));
+            }
         }
     }
-
-    // Place water block at player position
-    world->setBlock(0, 100, 0, BlockType::WATER);
-
-    Player player;
-    player.position = Vec3{0.f, 100.f, 0.f};
-    player.velocity = Vec3::zero();
-
-    PlayerInput input;
-    player.tick(*world, input);
-
-    // In water: gravity *= 0.3, so effective gravity = -0.08 * 0.3 = -0.024
-    // After drag: -0.024 * 0.98 = -0.02352
-    // Plus buoyancy: -0.02352 + 0.02 = -0.00352
-    // Velocity should be much smaller than in air (-0.0784)
-    REQUIRE(std::abs(player.velocity.y) < std::abs(-0.08f * 0.98f));
 }
 
-TEST_CASE("Water physics: increased horizontal drag in water", "[phase6][water]") {
-    auto world = std::make_shared<World>(42);
-    // Ensure chunk exists before setting blocks (setBlock only modifies existing chunks)
-    world->getChunk(0, 0);
+TEST_CASE("Visible distance does not expand exact cubic simulation beyond 32 chunks",
+          "[world][streaming][lod]") {
+    World world(42, MAX_RENDER_DISTANCE_CHUNKS);
+    REQUIRE(world.getViewDistance() == 256);
+    REQUIRE(world.getExactViewDistance() == 32);
 
-    for (int x = -10; x <= 10; ++x) {
-        for (int z = -10; z <= 10; ++z) {
-            world->setBlock(x, 0, z, BlockType::STONE);
-        }
+    world.setViewDistance(12);
+    REQUIRE(world.getViewDistance() == 12);
+    REQUIRE(world.getExactViewDistance() == 12);
+
+    world.setViewDistance(1000);
+    REQUIRE(world.getViewDistance() == MAX_RENDER_DISTANCE_CHUNKS);
+    REQUIRE(world.getExactViewDistance() == MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
+
+    world.setViewDistance(1);
+    REQUIRE(world.getViewDistance() == MIN_RENDER_DISTANCE_CHUNKS);
+    REQUIRE(world.getExactViewDistance() == MIN_RENDER_DISTANCE_CHUNKS);
+}
+
+// ===========================================================================
+// Java-style water rules and scheduler
+// ===========================================================================
+
+namespace {
+
+FluidCell loadedCell(BlockType block = BlockType::AIR, FluidState state = FluidState::source()) {
+    return {.loaded = true, .block = block, .state = state};
+}
+
+const FluidMutation* findMutation(const FluidRuleResult& result, FluidDirection direction,
+                                  FluidMutationType type) {
+    for (uint8_t index = 0; index < result.mutationCount; ++index) {
+        const FluidMutation& mutation = result.mutations[index];
+        if (mutation.direction == direction && mutation.type == type)
+            return &mutation;
+    }
+    return nullptr;
+}
+
+class TestFluidWorld final : public FluidWorldAccess {
+public:
+    explicit TestFluidWorld(FluidBounds bounds) : bounds_(bounds) {}
+
+    FluidCell readFluidCell(FluidPos position) const override {
+        if (!bounds_.contains(position))
+            return {};
+        auto iterator = cells_.find(position);
+        if (iterator != cells_.end())
+            return iterator->second;
+        return loadedCell();
     }
 
-    // Place water at player position
-    world->setBlock(0, 100, 0, BlockType::WATER);
-
-    Player player;
-    player.position = Vec3{0.f, 100.f, 0.f};
-    player.velocity = Vec3::zero();
-    player.yaw = 0.f;
-
-    // Press W to move forward
-    PlayerInput input;
-    input.forward = true;
-    player.tick(*world, input);
-
-    // Water halves the walking pace (0.216 → 0.108 blocks/tick)
-    float totalHorizontalSpeed =
-        std::sqrt(player.velocity.x * player.velocity.x + player.velocity.z * player.velocity.z);
-    REQUIRE(totalHorizontalSpeed == Catch::Approx(0.108f).epsilon(0.01f));
-}
-
-TEST_CASE("Water physics: buoyancy pushes player upward", "[phase6][water]") {
-    auto world = std::make_shared<World>(42);
-    // Ensure chunk exists before setting blocks (setBlock only modifies existing chunks)
-    world->getChunk(0, 0);
-
-    for (int x = -10; x <= 10; ++x) {
-        for (int z = -10; z <= 10; ++z) {
-            world->setBlock(x, 0, z, BlockType::STONE);
-        }
+    void writeWater(FluidPos position, FluidState state) override {
+        cells_[position] = loadedCell(BlockType::WATER, state);
+        ++writes;
     }
 
-    world->setBlock(0, 100, 0, BlockType::WATER);
+    void removeWater(FluidPos position) override {
+        cells_[position] = loadedCell();
+        ++removals;
+    }
 
-    Player player;
-    player.position = Vec3{0.f, 100.f, 0.f};
-    player.velocity = Vec3{0.f, -0.1f, 0.f}; // Moving downward
+    void setBlock(FluidPos position, BlockType block, FluidState state = FluidState::source()) {
+        cells_[position] = loadedCell(block, state);
+    }
 
-    PlayerInput input;
-    player.tick(*world, input);
+    FluidBounds bounds_;
+    std::unordered_map<FluidPos, FluidCell> cells_;
+    size_t writes = 0;
+    size_t removals = 0;
+};
 
-    // Buoyancy should reduce downward velocity
-    // Without buoyancy: velocity.y ≈ -0.1 * 0.98 + (-0.024) = -0.122
-    // With buoyancy: velocity.y ≈ -0.122 + 0.02 = -0.102
-    // The buoyancy force makes velocity.y less negative
-    REQUIRE(player.velocity.y > -0.13f);
+} // namespace
+
+TEST_CASE("FluidState packs source levels and falling flow", "[fluid]") {
+    STATIC_REQUIRE(sizeof(FluidState) == 1);
+    REQUIRE(FluidState::source().packed() == 0);
+    REQUIRE(FluidState::source().isSource());
+    REQUIRE(FluidState::flowing(0).level() == 1);
+    REQUIRE(FluidState::flowing(9).level() == 7);
+    REQUIRE(FluidState::falling(4).level() == 4);
+    REQUIRE(FluidState::falling(4).isFalling());
+    REQUIRE(fluidSurfaceHeight(FluidState::source()) == Catch::Approx(0.875f));
+    REQUIRE(fluidSurfaceHeight(FluidState::flowing(7)) == Catch::Approx(0.125f));
+    REQUIRE(fluidSurfaceHeight(FluidState::falling(4)) == Catch::Approx(1.0f));
+    REQUIRE(FluidState::isValidPacked(0x0F));
+    REQUIRE_FALSE(FluidState::isValidPacked(0x10));
 }
 
-TEST_CASE("isInWater: detects player in water block", "[phase6][water]") {
-    auto world = std::make_shared<World>(42);
-    world->getChunk(0, 0);
-    world->setBlock(5, 200, 5, BlockType::WATER);
+TEST_CASE("Water falls before spreading horizontally", "[fluid][rules]") {
+    FluidNeighborhood cells{
+        .center = loadedCell(BlockType::WATER),
+        .down = loadedCell(BlockType::AIR),
+        .up = loadedCell(),
+        .west = loadedCell(),
+        .east = loadedCell(),
+        .north = loadedCell(),
+        .south = loadedCell(),
+    };
+    const FluidRuleResult result = evaluateWaterRules(cells);
+    const FluidMutation* downward =
+        findMutation(result, FluidDirection::DOWN, FluidMutationType::SET_WATER);
+    REQUIRE(downward != nullptr);
+    REQUIRE(downward->state.isFalling());
+    REQUIRE(findMutation(result, FluidDirection::WEST, FluidMutationType::SET_WATER) == nullptr);
+}
 
-    // Player AABB overlapping water block
-    AABB playerBox{Vec3{4.5f, 199.5f, 4.5f}, Vec3{5.1f, 201.3f, 5.1f}};
-    REQUIRE(PhysicsEngine::isInWater(*world, playerBox) == true);
+TEST_CASE("Supported source water spreads at level one", "[fluid][rules]") {
+    FluidNeighborhood cells{
+        .center = loadedCell(BlockType::WATER),
+        .down = loadedCell(BlockType::STONE),
+        .up = loadedCell(),
+        .west = loadedCell(),
+        .east = loadedCell(),
+        .north = loadedCell(),
+        .south = loadedCell(),
+    };
+    const FluidRuleResult result = evaluateWaterRules(cells);
+    for (FluidDirection direction : {FluidDirection::WEST, FluidDirection::EAST,
+                                     FluidDirection::NORTH, FluidDirection::SOUTH}) {
+        const FluidMutation* spread = findMutation(result, direction, FluidMutationType::SET_WATER);
+        REQUIRE(spread != nullptr);
+        REQUIRE(spread->state == FluidState::flowing(1));
+    }
+}
 
-    // Player not in water
-    AABB playerBox2{Vec3{10.f, 200.f, 10.f}, Vec3{10.6f, 201.8f, 10.6f}};
-    REQUIRE(PhysicsEngine::isInWater(*world, playerBox2) == false);
+TEST_CASE("Two adjacent sources form a source over support", "[fluid][rules]") {
+    FluidNeighborhood cells{
+        .center = loadedCell(BlockType::WATER, FluidState::flowing(4)),
+        .down = loadedCell(BlockType::STONE),
+        .up = loadedCell(),
+        .west = loadedCell(BlockType::WATER),
+        .east = loadedCell(BlockType::WATER),
+        .north = loadedCell(),
+        .south = loadedCell(),
+    };
+    const FluidRuleResult result = evaluateWaterRules(cells);
+    const FluidMutation* center =
+        findMutation(result, FluidDirection::CENTER, FluidMutationType::SET_WATER);
+    REQUIRE(center != nullptr);
+    REQUIRE(center->state.isSource());
+}
+
+TEST_CASE("Unsupported flowing water is removed", "[fluid][rules]") {
+    FluidNeighborhood cells{
+        .center = loadedCell(BlockType::WATER, FluidState::flowing(4)),
+        .down = loadedCell(BlockType::STONE),
+        .up = loadedCell(),
+        .west = loadedCell(),
+        .east = loadedCell(),
+        .north = loadedCell(),
+        .south = loadedCell(),
+    };
+    const FluidRuleResult result = evaluateWaterRules(cells);
+    REQUIRE(findMutation(result, FluidDirection::CENTER, FluidMutationType::REMOVE_WATER) !=
+            nullptr);
+}
+
+TEST_CASE("Water rules defer unavailable face neighbors", "[fluid][rules]") {
+    FluidNeighborhood cells{
+        .center = loadedCell(BlockType::WATER),
+        .down = {},
+        .up = {},
+        .west = {},
+        .east = loadedCell(),
+        .north = loadedCell(),
+        .south = loadedCell(),
+    };
+    const FluidRuleResult result = evaluateWaterRules(cells);
+    REQUIRE(result.deferredCount == 1);
+    REQUIRE(std::find(result.deferred.begin(), result.deferred.begin() + result.deferredCount,
+                      FluidDirection::DOWN) != result.deferred.begin() + result.deferredCount);
+    REQUIRE(result.mutationCount == 0);
+}
+
+TEST_CASE("Fluid scheduler stays idle until a gameplay edit activates water",
+          "[fluid][scheduler]") {
+    TestFluidWorld world({-4, -2, -4, 4, 2, 4});
+    for (int64_t z = -4; z <= 4; ++z) {
+        for (int64_t x = -4; x <= 4; ++x) {
+            world.setBlock({x, -1, z}, BlockType::STONE);
+        }
+    }
+    world.setBlock({0, 0, 0}, BlockType::WATER);
+    FluidScheduler scheduler;
+
+    REQUIRE(scheduler.pendingCount() == 0);
+    REQUIRE(scheduler.tick(world) == 0);
+    REQUIRE(world.writes == 0);
+
+    REQUIRE(scheduler.activateBlockChange({0, 0, 0}) == 7);
+    for (uint32_t tick = 1; tick < WATER_UPDATE_DELAY_TICKS; ++tick) {
+        REQUIRE(scheduler.tick(world) == 0);
+    }
+    REQUIRE(scheduler.tick(world) > 0);
+    REQUIRE(world.writes > 0);
+}
+
+TEST_CASE("World generation and loading do not enqueue fluid ticks", "[fluid][worldgen]") {
+    World world(42);
+    REQUIRE(world.getPendingFluidCount() == 0);
+    world.getChunk({0, WORLD_MAX_CHUNK_Y, 0});
+    REQUIRE(world.getPendingFluidCount() == 0);
+
+    world.setBlock(8, WORLD_MAX_Y - 1, 8, BlockType::WATER);
+    REQUIRE(world.getPendingFluidCount() > 0);
+}
+
+TEST_CASE("Fluid scheduler enforces its per-tick work budget", "[fluid][scheduler]") {
+    TestFluidWorld world({-4, -2, -4, 4, 2, 4});
+    world.setBlock({0, 0, 0}, BlockType::WATER);
+    FluidScheduler scheduler({.updatesPerTick = 2});
+    scheduler.activateBlockChange({0, 0, 0});
+    for (uint32_t tick = 1; tick < WATER_UPDATE_DELAY_TICKS; ++tick) {
+        scheduler.tick(world);
+    }
+    REQUIRE(scheduler.tick(world) == 2);
+    REQUIRE(scheduler.pendingCount() > 0);
+}
+
+TEST_CASE("Fluid scheduler persists and resumes only activated boundaries", "[fluid][scheduler]") {
+    TestFluidWorld world({0, 0, 0, 0, 0, 0});
+    world.setBlock({0, 0, 0}, BlockType::WATER);
+    FluidScheduler scheduler;
+    REQUIRE(scheduler.resumeDeferredIn({-1, -1, -1, 1, 1, 1}) == 0);
+    scheduler.activateBlockChange({0, 0, 0});
+    for (uint32_t tick = 0; tick < WATER_UPDATE_DELAY_TICKS; ++tick) {
+        scheduler.tick(world);
+    }
+    const std::vector<FluidBoundaryFrontier> persisted = scheduler.deferredFrontiers();
+    REQUIRE_FALSE(persisted.empty());
+
+    FluidScheduler restored;
+    for (const FluidBoundaryFrontier& frontier : persisted) {
+        REQUIRE(restored.restoreDeferredFrontier(frontier));
+    }
+    REQUIRE(restored.deferredCount() == persisted.size());
+    REQUIRE(restored.resumeDeferredIn({-1, -1, -1, 1, 1, 1}) > 0);
+    REQUIRE(restored.pendingCount() > 0);
+}
+
+TEST_CASE("Fluid frontier resume is deterministic and bounded by unavailable cube",
+          "[fluid][scheduler][frontier]") {
+    const FluidBoundaryFrontier first{{-1, 1, 2}, {0, 1, 2}};
+    const FluidBoundaryFrontier second{{-1, 4, 2}, {0, 4, 2}};
+    const FluidBoundaryFrontier third{{-1, 7, 2}, {0, 7, 2}};
+    const FluidBoundaryFrontier unrelated{{15, 1, 2}, {16, 1, 2}};
+
+    FluidScheduler scheduler;
+    REQUIRE(scheduler.restoreDeferredFrontier(third));
+    REQUIRE(scheduler.restoreDeferredFrontier(unrelated));
+    REQUIRE(scheduler.restoreDeferredFrontier(first));
+    REQUIRE(scheduler.restoreDeferredFrontier(second));
+    REQUIRE(scheduler.restoreDeferredFrontier(second));
+    REQUIRE(scheduler.deferredCount() == 4);
+
+    const FluidBounds loadedCube{0, 0, 0, CHUNK_EDGE - 1, CHUNK_EDGE - 1, CHUNK_EDGE - 1};
+    const FluidBounds unrelatedCube{CHUNK_EDGE,    0, 0, CHUNK_EDGE * 2 - 1, CHUNK_EDGE - 1,
+                                    CHUNK_EDGE - 1};
+    REQUIRE(scheduler.deferredCountIn(loadedCube) == 3);
+    REQUIRE(scheduler.deferredCountIn(unrelatedCube) == 1);
+    REQUIRE(scheduler.resumeDeferredIn(loadedCube, 0) == 0);
+    REQUIRE(scheduler.resumeDeferredIn(loadedCube, 2) == 2);
+    REQUIRE(scheduler.deferredCountIn(loadedCube) == 1);
+    REQUIRE(scheduler.pendingCount() == 4);
+    REQUIRE(scheduler.deferredFrontiers() == std::vector<FluidBoundaryFrontier>{third, unrelated});
+
+    REQUIRE(scheduler.resumeDeferredIn(loadedCube, 1) == 1);
+    REQUIRE(scheduler.deferredCountIn(loadedCube) == 0);
+    REQUIRE(scheduler.deferredFrontiers() == std::vector<FluidBoundaryFrontier>{unrelated});
+}
+
+TEST_CASE("Fluid frontier resume budget bounds failed scheduling attempts",
+          "[fluid][scheduler][frontier]") {
+    FluidScheduler scheduler({.pendingUpdates = 7});
+    REQUIRE(scheduler.activateBlockChange({100, 100, 100}) == 7);
+    for (int32_t y = 1; y <= 3; ++y) {
+        REQUIRE(scheduler.restoreDeferredFrontier({{-1, y, 2}, {0, y, 2}}));
+    }
+
+    REQUIRE(scheduler.resumeDeferredIn({0, 0, 0, 15, 15, 15}, 2) == 0);
+    REQUIRE(scheduler.droppedUpdateCount() == 4);
+    REQUIRE(scheduler.deferredCount() == 3);
+}
+
+TEST_CASE("World resumes one loaded cube through bounded fluid batches",
+          "[fluid][world][performance][frontier]") {
+    TempDir directory("world_fluid_resume_budget");
+    SaveManager saves(directory.path());
+    std::vector<FluidBoundaryFrontier> frontiers;
+    for (int32_t y = 64; y <= 65; ++y) {
+        for (int64_t z = 0; z < 10; ++z) {
+            frontiers.push_back({{-1, y, z}, {0, y, z}});
+        }
+    }
+    REQUIRE(frontiers.size() > MAX_FLUID_FRONTIER_RESUMES_PER_CUBE);
+    REQUIRE(saves.saveDeferredFluidFrontiers(frontiers));
+
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS);
+    world.setSaveManager(&saves);
+    REQUIRE(world.getChunk({0, 4, 0}));
+
+    world.tickFluids(0.0);
+    REQUIRE(world.saveModifiedChunks());
+    REQUIRE(saves.loadDeferredFluidFrontiers().size() ==
+            frontiers.size() - MAX_FLUID_FRONTIER_RESUMES_PER_CUBE);
+
+    world.tickFluids(0.0);
+    REQUIRE(world.saveModifiedChunks());
+    REQUIRE(saves.loadDeferredFluidFrontiers().empty());
+    REQUIRE(world.getDroppedFluidUpdateCount() == 0);
+    REQUIRE(world.getDroppedFluidFrontierCount() == 0);
+}
+
+TEST_CASE("Fluid frontier clear and restore preserve ordering caps and index state",
+          "[fluid][scheduler][frontier]") {
+    const FluidBoundaryFrontier earlier{{-17, -1, 0}, {-16, -1, 0}};
+    const FluidBoundaryFrontier later{{15, 1, 0}, {16, 1, 0}};
+    const FluidBoundaryFrontier excess{{31, 1, 0}, {32, 1, 0}};
+    FluidScheduler scheduler({.deferredFrontiers = 2});
+
+    REQUIRE(scheduler.restoreDeferredFrontier(later));
+    REQUIRE(scheduler.restoreDeferredFrontier(earlier));
+    REQUIRE(scheduler.restoreDeferredFrontier(earlier));
+    REQUIRE_FALSE(scheduler.restoreDeferredFrontier(excess));
+    REQUIRE(scheduler.droppedFrontierCount() == 1);
+    REQUIRE(scheduler.deferredFrontiers() == std::vector<FluidBoundaryFrontier>{earlier, later});
+
+    scheduler.clear();
+    REQUIRE(scheduler.deferredCount() == 0);
+    REQUIRE(scheduler.pendingCount() == 0);
+    REQUIRE(scheduler.droppedFrontierCount() == 0);
+    REQUIRE(scheduler.deferredFrontiers().empty());
+
+    REQUIRE(scheduler.restoreDeferredFrontier(later));
+    REQUIRE(scheduler.restoreDeferredFrontier(earlier));
+    REQUIRE(scheduler.deferredFrontiers() == std::vector<FluidBoundaryFrontier>{earlier, later});
+    REQUIRE(scheduler.resumeDeferredIn({-16, -16, -16, -1, 15, 15}, 1) == 1);
+    REQUIRE(scheduler.deferredFrontiers() == std::vector<FluidBoundaryFrontier>{later});
 }
 
 // ===========================================================================
@@ -1478,84 +1828,124 @@ TEST_CASE("Block properties: lava emits light, nothing else does", "[world][ligh
 }
 
 TEST_CASE("LightEngine: lava light falls off one level per block", "[world][light]") {
-    Chunk chunk(0, 0);
-    chunk.setBlock(8, 64, 8, BlockType::LAVA); // one source in open air
+    Chunk chunk(ChunkPos{0, 4, 0});
+    chunk.setBlock(8, 8, 8, BlockType::LAVA); // one source in open air
 
     REQUIRE(LightEngine::computeSelfLight(chunk));
 
-    REQUIRE(chunk.getBlockLight(8, 64, 8) == 15); // the source itself
-    REQUIRE(chunk.getBlockLight(9, 64, 8) == 14); // one block away
-    REQUIRE(chunk.getBlockLight(10, 64, 8) == 13);
-    REQUIRE(chunk.getBlockLight(8, 67, 8) == 12); // three up
-    REQUIRE(chunk.getBlockLight(15, 64, 8) == 8); // seven away
+    REQUIRE(chunk.getBlockLight(8, 8, 8) == 15); // the source itself
+    REQUIRE(chunk.getBlockLight(9, 8, 8) == 14); // one block away
+    REQUIRE(chunk.getBlockLight(10, 8, 8) == 13);
+    REQUIRE(chunk.getBlockLight(8, 11, 8) == 12); // three up
+    REQUIRE(chunk.getBlockLight(15, 8, 8) == 8);  // seven away
     // A cell 15+ blocks away (across two axes) is dark again.
-    REQUIRE(chunk.getBlockLight(0, 64, 0) == 0);
+    REQUIRE(chunk.getBlockLight(0, 8, 0) == 0);
 }
 
 TEST_CASE("LightEngine: opaque blocks do not receive light", "[world][light]") {
-    Chunk chunk(0, 0);
-    chunk.setBlock(8, 64, 8, BlockType::LAVA);
-    chunk.setBlock(9, 64, 8, BlockType::STONE); // opaque neighbor
+    Chunk chunk(ChunkPos{0, 4, 0});
+    chunk.setBlock(8, 8, 8, BlockType::LAVA);
+    chunk.setBlock(9, 8, 8, BlockType::STONE); // opaque neighbor
 
     LightEngine::computeSelfLight(chunk);
 
     // The stone cell stays dark (light never enters an opaque cell), but light
     // still routes around it through the open air above.
-    REQUIRE(chunk.getBlockLight(9, 64, 8) == 0);
-    REQUIRE(chunk.getBlockLight(8, 65, 8) == 14); // air above the source
+    REQUIRE(chunk.getBlockLight(9, 8, 8) == 0);
+    REQUIRE(chunk.getBlockLight(8, 9, 8) == 14); // air above the source
 }
 
 TEST_CASE("LightEngine: a lava-free chunk allocates no light", "[world][light]") {
-    Chunk chunk(0, 0);
-    chunk.setBlock(8, 64, 8, BlockType::STONE);
+    Chunk chunk(ChunkPos{0, 4, 0});
+    chunk.setBlock(8, 8, 8, BlockType::STONE);
     REQUIRE_FALSE(LightEngine::computeSelfLight(chunk)); // nothing changed
-    REQUIRE(chunk.blockLight.empty());                   // stays unallocated
-    REQUIRE(chunk.getBlockLight(8, 64, 8) == 0);
+    REQUIRE_FALSE(chunk.hasBlockLight());                // stays unallocated
+    REQUIRE(chunk.getBlockLight(8, 8, 8) == 0);
 }
 
 TEST_CASE("LightEngine: flood is a pure function of chunk contents", "[world][light]") {
-    // Same blocks → bit-identical light, so the fixed point is order-independent.
-    Chunk a(0, 0), b(0, 0);
+    // The same blocks produce bit-identical light, so order cannot affect the fixed point.
+    Chunk a(ChunkPos{0, 4, 0}), b(ChunkPos{0, 4, 0});
     for (Chunk* c : {&a, &b}) {
-        c->setBlock(4, 40, 4, BlockType::LAVA);
-        c->setBlock(11, 40, 11, BlockType::LAVA);
-        c->setBlock(7, 40, 7, BlockType::STONE);
+        c->setBlock(4, 8, 4, BlockType::LAVA);
+        c->setBlock(11, 8, 11, BlockType::LAVA);
+        c->setBlock(7, 8, 7, BlockType::STONE);
     }
     LightEngine::computeSelfLight(a);
     LightEngine::computeSelfLight(b);
-    REQUIRE(a.blockLight == b.blockLight);
+    REQUIRE(a.blockLightData() == b.blockLightData());
 }
 
 TEST_CASE("LightEngine: light spills across a chunk border", "[world][light]") {
     // A neighbor's border light seeds this chunk's edge (minus one), then floods
-    // inward — the cross-chunk reconcile relies on exactly this.
-    Chunk neighbor(-1, 0);
-    neighbor.setBlockLight(CHUNK_WIDTH - 1, 64, 8, 10); // its +X wall glows
+    // inward. Cross-cube reconciliation relies on exactly this behavior.
+    Chunk neighbor(ChunkPos{-1, 4, 0});
+    neighbor.setBlockLight(CHUNK_WIDTH - 1, 8, 8, 10); // its +X wall glows
 
-    Chunk self(0, 0); // all air, no own source
-    LightEngine::FaceNeighbors faces{&neighbor, nullptr, nullptr, nullptr};
+    Chunk self(ChunkPos{0, 4, 0}); // all air, no own source
+    LightEngine::FaceNeighbors faces{&neighbor, nullptr, nullptr, nullptr, nullptr, nullptr};
     REQUIRE(LightEngine::floodChunk(self, faces));
 
-    REQUIRE(self.getBlockLight(0, 64, 8) == 9); // border pulls neighbor - 1
-    REQUIRE(self.getBlockLight(1, 64, 8) == 8); // then floods inward
+    REQUIRE(self.getBlockLight(0, 8, 8) == 9); // border pulls neighbor - 1
+    REQUIRE(self.getBlockLight(1, 8, 8) == 8); // then floods inward
+}
+
+TEST_CASE("LightEngine: light spills across a vertical cube border", "[world][light]") {
+    Chunk below(ChunkPos{0, 3, 0});
+    below.setBlockLight(8, CHUNK_EDGE - 1, 8, 10);
+
+    Chunk self(ChunkPos{0, 4, 0});
+    LightEngine::FaceNeighbors faces{nullptr, nullptr, nullptr, nullptr, &below, nullptr};
+    REQUIRE(LightEngine::floodChunk(self, faces));
+    REQUIRE(self.getBlockLight(8, 0, 8) == 9);
+    REQUIRE(self.getBlockLight(8, 1, 8) == 8);
+}
+
+TEST_CASE("World reconciles light across vertical cube borders", "[world][light]") {
+    World world(42);
+    auto lower = world.getChunk(ChunkPos{0, 4, 0});
+    auto upper = world.getChunk(ChunkPos{0, 5, 0});
+    lower->fill(BlockType::AIR);
+    upper->fill(BlockType::AIR);
+
+    world.setBlock(8, 79, 8, BlockType::LAVA);
+    for (int pass = 0; pass < 8; ++pass)
+        world.reconcileLight(64);
+
+    REQUIRE(lower->getBlockLight(8, CHUNK_EDGE - 1, 8) == 15);
+    REQUIRE(upper->getBlockLight(8, 0, 8) == 14);
+}
+
+TEST_CASE("World reports the highest opaque block in loaded cubic columns", "[world][weather]") {
+    World world(42);
+    REQUIRE_FALSE(world.surfaceHeightIfLoaded(-1, -1).has_value());
+
+    auto lower = world.getChunk(ChunkPos{-1, 4, -1});
+    auto upper = world.getChunk(ChunkPos{-1, 6, -1});
+    lower->fill(BlockType::AIR);
+    upper->fill(BlockType::AIR);
+    lower->setBlock(15, 11, 15, BlockType::STONE);
+    upper->setBlock(15, 4, 15, BlockType::STONE);
+
+    REQUIRE(world.surfaceHeightIfLoaded(-1, -1) == 100);
 }
 
 TEST_CASE("LightEngine: block light is derived, never serialized", "[world][light]") {
-    Chunk original(2, -1);
-    original.setBlock(8, 64, 8, BlockType::LAVA);
+    Chunk original(ChunkPos{2, 4, -1});
+    original.setBlock(8, 8, 8, BlockType::LAVA);
     LightEngine::computeSelfLight(original);
-    REQUIRE_FALSE(original.blockLight.empty());
+    REQUIRE(original.hasBlockLight());
 
-    // The save size accounts only for blocks/biomes/height — not light.
+    // The save size accounts for cubic block and fluid state, not light.
     size_t before = ChunkSerializer::serializedSize(original);
     auto data = ChunkSerializer::serialize(original);
     REQUIRE(data.size() == before);
 
     auto restored = ChunkSerializer::deserialize(data);
     REQUIRE(restored.has_value());
-    REQUIRE(restored->getBlock(8, 64, 8) == BlockType::LAVA);
-    REQUIRE(restored->blockLight.empty()); // not carried through the save
+    REQUIRE(restored->getBlock(8, 8, 8) == BlockType::LAVA);
+    REQUIRE_FALSE(restored->hasBlockLight()); // not carried through the save
     // ...but recomputable from the blocks alone.
     LightEngine::computeSelfLight(*restored);
-    REQUIRE(restored->getBlockLight(9, 64, 8) == 14);
+    REQUIRE(restored->getBlockLight(9, 8, 8) == 14);
 }

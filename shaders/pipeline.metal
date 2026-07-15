@@ -36,6 +36,12 @@ struct VertexOutput {
                            // (two-sided facing + SSS), 2 = leaf cube (SSS only)
     float3 vWorldPosition; // World-space position for fog calculation
     uint vTextureLayer [[flat]];
+    uint vFace [[flat]];
+    uint vFarCanopy [[flat]];
+    uint vFarSkirt [[flat]];
+    uint vFarSkirtMask [[flat]];
+    float vExactRadius [[flat]];
+    float4 vOverlayColor;
 };
 
 // Face indices — must match FaceNormal in include/render/vertex.hpp
@@ -49,6 +55,26 @@ static float3 applyFog(float3 color, float3 worldPos, float3 cameraPos, float de
     float dist = distance(worldPos, cameraPos);
     float fogFactor = clamp(1.0f - exp(-density * dist), 0.0f, 1.0f);
     return mix(color, fogColor, fogFactor);
+}
+
+// The far mesh deliberately overlaps the exact-radius boundary by whole
+// 256-block tiles. Water and canopy summaries use this stable world-space
+// handoff. Opaque terrain tops remain available as depth-tested fallback while
+// exact surface meshes stream in.
+static bool keepFarTerrainFragment(float3 worldPosition, float3 cameraPosition, float exactRadius) {
+    if (exactRadius <= 0.0f) {
+        return true;
+    }
+    const float horizontalDistance = distance(worldPosition.xz, cameraPosition.xz);
+    if (horizontalDistance <= exactRadius) {
+        return false;
+    }
+    if (horizontalDistance >= exactRadius + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS) {
+        return true;
+    }
+    const float2 ditherCell = metal::floor(worldPosition.xz * 2.0f);
+    const float dither = interleavedGradientNoise(ditherCell);
+    return farTerrainHandoffVisible(horizontalDistance, exactRadius, dither);
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +114,7 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     worldPos.xyz = applySway(worldPos.xyz, sway, in.uv.y, uniforms.time, uniforms.swayStrength);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
+    out.vOverlayColor = chunkOrigin.overlayColorAndStrength;
 
     // Pass through UV
     out.vUV = in.uv;
@@ -96,13 +123,18 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     // skylight (bits 11-14), and baked corner AO (bits 15-16). The AO level
     // 0..3 maps to 0.5..1.0 — a fully enclosed voxel corner keeps half its
     // light, an open corner none removed.
+    uint normalIdx = in.faceAttr & 7u;
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
+    out.vFace = normalIdx;
+    out.vFarCanopy = (in.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) != 0u;
+    out.vFarSkirt = (in.faceAttr & FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK) != 0u;
+    out.vFarSkirtMask = chunkOrigin.farMetadata.x;
+    out.vExactRadius = chunkOrigin.origin.w;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
     out.vAO = 0.5f + float((in.faceAttr >> 15) & 3u) * (1.0f / 6.0f);
     // Block light (bits 17-20) and the emissive flag (bit 21) — the lava glow.
     out.vBlockLight = float((in.faceAttr >> 17) & 15u) / 15.0f;
     out.vEmissive = float((in.faceAttr >> 21) & 1u);
-    uint normalIdx = in.faceAttr & 7u;
     // Shading class: every cross quad (grass, flowers, reeds, mushrooms)
     // gets the fragment facing term; swaying leaf cubes get SSS only.
     out.vFoliage = normalIdx == FACE_CROSS ? 1.0f : (sway == 2u ? 2.0f : 0.0f);
@@ -249,8 +281,21 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
                              sampler shadowSampler [[sampler(1)]],
                              constant Uniforms& uniforms [[buffer(1)]],
                              constant ShadowUniforms& shadow [[buffer(4)]]) {
-    // The bound sampler uses repeat addressing + nearest filtering: UVs span
-    // the quad extent in blocks, so each block gets one full texture tile.
+    if (in.vFarCanopy != 0u &&
+        !keepFarTerrainFragment(in.vWorldPosition, uniforms.cameraPosition, in.vExactRadius)) {
+        discard_fragment();
+    }
+    const float horizontalDistance = distance(in.vWorldPosition.xz, uniforms.cameraPosition.xz);
+    if (in.vFarSkirt != 0u) {
+        const uint edgeBit = 1u << in.vFace;
+        if ((in.vFarSkirtMask & edgeBit) == 0u ||
+            !farTerrainSkirtVisible(horizontalDistance, in.vExactRadius)) {
+            discard_fragment();
+        }
+    }
+    // The bound sampler repeats each tile, keeps nearest magnification, and
+    // applies trilinear anisotropic filtering during minification. UVs span the
+    // quad extent in blocks, so each block gets one full texture tile.
     float4 texColor = blockTextures.sample(blockSampler, in.vUV, in.vTextureLayer);
 
     // Alpha cutout for foliage/glass: transparent texels simply don't exist.
@@ -267,9 +312,10 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     constexpr float EMISSIVE_BOOST = 3.0f;
     if (in.vEmissive > 0.5f) {
         float3 glow = texColor.rgb * EMISSIVE_BOOST;
-        return float4(applyFog(glow, in.vWorldPosition, uniforms.cameraPosition,
-                               uniforms.fogDensity, uniforms.fogColor),
-                      1.0f);
+        glow = applyFog(glow, in.vWorldPosition, uniforms.cameraPosition, uniforms.fogDensity,
+                        uniforms.fogColor);
+        glow = mix(glow, in.vOverlayColor.rgb, saturate(in.vOverlayColor.a));
+        return float4(glow, 1.0f);
     }
 
     // Rain-soaked surfaces darken (water fills the surface pores) — scaled
@@ -336,6 +382,7 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);
+    finalColor = mix(finalColor, in.vOverlayColor.rgb, saturate(in.vOverlayColor.a));
     return float4(finalColor, 1.0);
 }
 
@@ -349,8 +396,32 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
 struct WaterVertexOutput {
     float4 clipPosition [[position]];
     float3 vWorldPosition;
+    float3 vCameraRelativePosition;
     float vSkyLight;
+    float4 vOverlayColor;
+    uint vFace [[flat]];
+    uint vFlow [[flat]];
+    uint vFalling [[flat]];
+    float vExactRadius [[flat]];
 };
+
+// Fluid direction values are packed by the mesher as still, west, east,
+// north, and south. Keeping the lookup here makes the wave phase follow the
+// actual simulated current without expanding the 16-byte vertex ABI.
+static float2 waterFlowVector(uint flow) {
+    switch (flow) {
+        case 1u:
+            return float2(-1.0f, 0.0f);
+        case 2u:
+            return float2(1.0f, 0.0f);
+        case 3u:
+            return float2(0.0f, -1.0f);
+        case 4u:
+            return float2(0.0f, 1.0f);
+        default:
+            return float2(0.0f);
+    }
+}
 
 vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
                                          constant Uniforms& uniforms [[buffer(1)]],
@@ -358,18 +429,28 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
                                          constant WaterUniforms& water [[buffer(3)]]) {
     float3 pos = in.position + chunkOrigin.origin.xyz;
     uint normalIdx = in.faceAttr & 7u;
+    uint flow = (in.faceAttr >> 24) & 7u;
+    uint falling = (in.faceAttr >> 27) & 1u;
     if (normalIdx == FACE_PLUS_Y) {
         // Top surfaces bob gently; world-space input keeps waves continuous
-        // across chunk borders
-        pos.y +=
-            sin(pos.x * 0.55f + water.time * 1.4f) * cos(pos.z * 0.45f + water.time * 1.1f) * 0.04f;
+        // across chunk borders. Flow advects the phase in its packed cardinal
+        // direction while still water retains the original interference.
+        float2 phase = pos.xz - waterFlowVector(flow) * water.time * 0.7f;
+        pos.y += sin(phase.x * 0.55f + water.time * 1.4f) *
+                 cos(phase.y * 0.45f + water.time * 1.1f) * 0.04f;
     }
 
     WaterVertexOutput out;
     float4 worldPos = uniforms.modelMatrix * float4(pos, 1.0);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
+    out.vCameraRelativePosition = worldPos.xyz - water.cameraPosition;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
+    out.vOverlayColor = chunkOrigin.overlayColorAndStrength;
+    out.vFace = normalIdx;
+    out.vFlow = flow;
+    out.vFalling = falling;
+    out.vExactRadius = chunkOrigin.origin.w;
     return out;
 }
 
@@ -393,20 +474,23 @@ static float causticPattern(float2 p, float t) {
     return pow(saturate(1.0f - abs(c)), 6.0f);
 }
 
-// World position of a screen UV + its stored depth, via the camera inverse.
-static float3 reconstructWorld(float2 uv, float depth, constant WaterUniforms& water) {
+// Camera-relative world position of a screen UV + its stored depth. Keeping
+// the camera translation out of the inverse avoids catastrophic precision
+// loss when water is rendered far from the world origin.
+static float3 reconstructCameraRelative(float2 uv, float depth, constant WaterUniforms& water) {
     float4 clip = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, depth, 1.0f);
-    float4 world = water.invViewProjection * clip;
-    return world.xyz / world.w;
+    float4 relative = water.invCameraRelativeViewProjection * clip;
+    return relative.xyz / relative.w;
 }
 
 // ---------------------------------------------------------------------------
-// Screen-space reflection for water. Marches the reflected ray through world
-// space, projecting each step to screen and comparing its device depth against
-// the resolved opaque depth, so the far shore, trees, and terrain mirror in
-// the surface. The forward projection already yields both the screen UV and
-// the ray's device z, so the crossing test needs no per-step world
-// reconstruction — only the final thickness reject reconstructs a world point.
+// Screen-space reflection for water. Marches the reflected ray through
+// camera-relative world space, projecting each step to screen and comparing
+// its device depth against the resolved opaque depth, so the far shore, trees,
+// and terrain mirror in the surface. The forward projection already yields
+// both the screen UV and the ray's device z, so the crossing test needs no
+// per-step reconstruction. Only the final thickness reject reconstructs a
+// camera-relative point.
 // Returns rgb + a confidence in .a (0 when the ray misses, leaves the screen,
 // or only finds sky); the caller falls back to the procedural-sky reflection.
 // Depth is point-sampled: linear across a depth edge reads a value between two
@@ -425,7 +509,7 @@ static float4 traceWaterSSR(float3 origin, float3 dir, depth2d<float> sceneDepth
         pos += dir * stride;
         stride *= 1.13f; // grow the step so distant reflections stay cheap
 
-        float4 clip = water.viewProjection * float4(pos, 1.0f);
+        float4 clip = water.cameraRelativeViewProjection * float4(pos, 1.0f);
         if (clip.w <= 0.0f) {
             break; // stepped behind the camera plane
         }
@@ -445,7 +529,7 @@ static float4 traceWaterSSR(float3 origin, float3 dir, depth2d<float> sceneDepth
         float3 lo = prev, hi = pos;
         for (int j = 0; j < 6; ++j) {
             float3 mid = (lo + hi) * 0.5f;
-            float4 mclip = water.viewProjection * float4(mid, 1.0f);
+            float4 mclip = water.cameraRelativeViewProjection * float4(mid, 1.0f);
             float2 muv = (mclip.xy / mclip.w) * float2(0.5f, -0.5f) + 0.5f;
             if (mclip.z / mclip.w > sceneDepth.sample(depthPoint, muv)) {
                 hi = mid;
@@ -453,11 +537,12 @@ static float4 traceWaterSSR(float3 origin, float3 dir, depth2d<float> sceneDepth
                 lo = mid;
             }
         }
-        float4 hclip = water.viewProjection * float4(hi, 1.0f);
+        float4 hclip = water.cameraRelativeViewProjection * float4(hi, 1.0f);
         float2 hitUV = (hclip.xy / hclip.w) * float2(0.5f, -0.5f) + 0.5f;
         // Reject a hit hiding far behind a thick occluder (a false crossing).
-        float3 hitWorld = reconstructWorld(hitUV, sceneDepth.sample(depthPoint, hitUV), water);
-        if (distance(water.cameraPosition, hi) - distance(water.cameraPosition, hitWorld) > 1.5f) {
+        float3 hitRelative =
+            reconstructCameraRelative(hitUV, sceneDepth.sample(depthPoint, hitUV), water);
+        if (length(hi) - length(hitRelative) > 1.5f) {
             break;
         }
         // Fade as the hit nears a screen edge (data runs out there).
@@ -471,6 +556,9 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
                                   texture2d<float> sceneColor [[texture(0)]],
                                   depth2d<float> sceneDepth [[texture(1)]],
                                   constant WaterUniforms& water [[buffer(3)]]) {
+    if (!keepFarTerrainFragment(in.vWorldPosition, water.cameraPosition, in.vExactRadius)) {
+        discard_fragment();
+    }
     constexpr sampler screenSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float2 screenUV = in.clipPosition.xy / water.resolution;
 
@@ -480,13 +568,27 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
         discard_fragment();
     }
 
-    float3 V = normalize(water.cameraPosition - in.vWorldPosition);
-    float3 N = waterWaveNormal(in.vWorldPosition.xz, water.time);
+    float3 V = normalize(-in.vCameraRelativePosition);
+    float2 flowOffset = waterFlowVector(in.vFlow) * water.time * 0.7f;
+    float3 N = in.vFace == FACE_PLUS_Y
+                   ? waterWaveNormal(in.vWorldPosition.xz - flowOffset, water.time)
+                   : getFaceNormal(in.vFace);
+    // Falling columns are the only water geometry allowed to expose vertical
+    // sides. Give those faces a subtle downward streak normal so waterfalls
+    // read as moving sheets while stable shorelines remain top surfaces only.
+    if (in.vFalling != 0u && in.vFace != FACE_PLUS_Y && in.vFace != 5u) {
+        float streak = sin(in.vWorldPosition.y * 5.5f - water.time * 8.0f +
+                           dot(in.vWorldPosition.xz, float2(1.7f, 2.1f))) *
+                       0.08f;
+        N = normalize(N + float3(0.0f, streak, 0.0f));
+    }
     bool fromBelow = water.cameraUnderwater > 0.5f;
 
-    // Reconstruct the opaque world position behind this fragment
-    float3 behind = reconstructWorld(screenUV, opaqueDepth, water);
-    float waterDepth = max(distance(behind, in.vWorldPosition), 0.0f);
+    // Reconstruct both points in the same camera-relative frame. Absolute
+    // inverse-view-projection matrices lose enough precision at large world
+    // coordinates to turn this thickness into a visible chunk grid.
+    float3 behindRelative = reconstructCameraRelative(screenUV, opaqueDepth, water);
+    float waterDepth = max(distance(behindRelative, in.vCameraRelativePosition), 0.0f);
 
     // ---- Refraction: wave-distorted resample of the scene, pinned at the
     // shoreline so shallow edges don't smear
@@ -501,12 +603,14 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     }
     float3 refracted = sceneColor.sample(screenSampler, refractUV).rgb;
 
-    // World position of the refracted floor sample (caustics + absorption)
-    float3 rworld = reconstructWorld(refractUV, refractDepth, water);
-    float depthBelow = max(in.vWorldPosition.y - rworld.y, 0.0f);
+    // Reconstruct the refracted floor camera-relatively. Add the camera only
+    // after depth math to anchor the low-frequency caustic pattern globally.
+    float3 refractedRelative = reconstructCameraRelative(refractUV, refractDepth, water);
+    float3 refractedWorld = refractedRelative + water.cameraPosition;
+    float depthBelow = max(in.vCameraRelativePosition.y - refractedRelative.y, 0.0f);
 
     // ---- Caustics: bright ripple filaments on the shallow floor
-    float caustic = causticPattern(rworld.xz * 0.6f, water.time) * exp(-depthBelow * 0.22f);
+    float caustic = causticPattern(refractedWorld.xz * 0.6f, water.time) * exp(-depthBelow * 0.22f);
     refracted +=
         water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
 
@@ -526,7 +630,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // reflected ray finds on-screen geometry (far shore, trees), mirror it;
     // elsewhere the sky term shows through. Skipped when looking up from below.
     if (water.ssrStrength > 0.0f && !fromBelow) {
-        float4 ssr = traceWaterSSR(in.vWorldPosition, R, sceneDepth, sceneColor, water);
+        float4 ssr = traceWaterSSR(in.vCameraRelativePosition, R, sceneDepth, sceneColor, water);
         skyReflection = mix(skyReflection, ssr.rgb, ssr.a * water.ssrStrength);
     }
 
@@ -545,6 +649,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
 
     // Hairline shorelines dissolve into the shore instead of aliasing
     color = mix(refracted, color, saturate(waterDepth * 3.0f));
+    color = mix(color, in.vOverlayColor.rgb, saturate(in.vOverlayColor.a));
     return float4(color, 1.0f);
 }
 
@@ -574,20 +679,21 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     float t = water.time;
     float sunUp = saturate(water.sunDirection.y);
 
-    // Caustics on every submerged surface around the camera — the water
+    // Caustics on every submerged surface around the camera. The water
     // pass only shades pixels behind a surface quad, so without this the
     // floor at the player's feet had none. Reconstruct the opaque world
     // position and project the same caustic field onto up-facing geometry.
     constexpr sampler screenSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float depth = sceneDepth.sample(screenSampler, in.uv);
-    float3 world = reconstructWorld(in.uv, depth, water);
+    float3 relative = reconstructCameraRelative(in.uv, depth, water);
+    float3 world = relative + water.cameraPosition;
     // Screen-space derivatives give the surface normal: walls get none
     float3 surfaceNormal = normalize(cross(dfdx(world), dfdy(world)));
     float upFacing = saturate(abs(surfaceNormal.y));
     // SEA_LEVEL (64, chunk.hpp) minus an epsilon: the water surface renders
     // at 63.875, so shore blocks at y >= 64 must not catch caustics
     float submerged = step(world.y, 63.9f);
-    float dist = distance(world, water.cameraPosition);
+    float dist = length(relative);
     float caustic = causticPattern(world.xz * 0.85f, t) * exp(-max(64.0f - world.y, 0.0f) * 0.10f) *
                     exp(-dist * 0.03f);
     float3 causticColor = water.sunColor * caustic * upFacing * submerged * sunUp * 2.4f;

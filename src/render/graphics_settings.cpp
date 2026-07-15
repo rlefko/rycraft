@@ -145,7 +145,8 @@ LoadedSettings loadSettings(const std::string& path) {
 
     int v = 0;
     if (parseIntField(content, "viewDistance", v)) {
-        loaded.values.viewDistance = clampInt(v, 4, 32);
+        loaded.values.viewDistance =
+            clampInt(v, SettingsValues::MIN_VIEW_DISTANCE, SettingsValues::MAX_VIEW_DISTANCE);
     }
     if (parseIntField(content, "fogLevel", v)) {
         loaded.values.fogLevel = clampInt(v, 0, 10);

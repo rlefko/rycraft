@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/thread_priority.hpp"
+
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -24,7 +26,7 @@
 // ---------------------------------------------------------------------------
 class ThreadPool {
 public:
-    explicit ThreadPool(size_t numWorkers);
+    explicit ThreadPool(size_t numWorkers, ThreadPriority priority = ThreadPriority::UTILITY);
     ~ThreadPool();
 
     // Delete copy/move
@@ -66,6 +68,7 @@ public:
     [[nodiscard]] size_t size() const { return workers_.size(); }
 
 private:
+    ThreadPriority priority_;
     std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
     std::mutex queueMutex_;

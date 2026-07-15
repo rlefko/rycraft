@@ -22,14 +22,23 @@ struct MeshResult {
     MeshOutput mesh;
 };
 
+struct MeshSchedulerStats {
+    size_t schedulerOwned = 0; // queued + building + completed
+    size_t consumerPending = 0;
+    size_t completed = 0;
+    size_t highWater = 0;
+    uint64_t coalesced = 0;
+    uint64_t droppedStale = 0;
+};
+
 // ---------------------------------------------------------------------------
 // MeshScheduler — chunk meshing off the render thread.
 //
 // A full chunk build costs ~0.5-2 ms of pure CPU; a streaming burst of 16
 // used to consume the whole frame budget on the render thread. Workers pull
-// jobs, snapshot through World::snapshotForMeshing (the only lock they
-// touch), mesh lock-free, and push results; the render thread's remaining
-// cost per mesh is a memcpy into the MegaBuffer.
+// jobs, read immutable column plans, copy one bounded cube halo, mesh
+// lock-free, and push results; the render thread's remaining cost per mesh is
+// a memcpy into the MegaBuffer.
 //
 // Owned by RenderPipeline. Not a ThreadPool: it needs a clearable queue and
 // version-stamped results. shutdown() MUST run before the World dies — the
@@ -37,9 +46,10 @@ struct MeshResult {
 // ---------------------------------------------------------------------------
 class MeshScheduler {
 public:
-    // Bounded in-flight jobs: tiny on purpose, so per-frame re-prioritization
-    // by camera distance needs no queue surgery.
-    static constexpr size_t MAX_INFLIGHT_MESH = 8;
+    // One frame of bounded work is enough to keep both workers saturated
+    // during a 32-chunk streaming burst while the next frame can still
+    // reprioritize everything that has not been submitted.
+    static constexpr size_t MAX_INFLIGHT_MESH = 64;
 
     MeshScheduler(const World& world, size_t workerCount);
     ~MeshScheduler();
@@ -52,10 +62,18 @@ public:
     // the scheduler is stopping.
     bool enqueue(ChunkPos pos);
 
-    // Swap out all finished results (no allocation on the steady path).
+    // Move finished results into the consumer's bounded pending vector. The
+    // consumer calls this once per frame, including when no new result is
+    // expected, so slots freed by uploads become available to enqueue().
+    // Results for the same cube coalesce to the newest captured revision.
     void drainCompleted(std::vector<MeshResult>& out);
 
+    // Report the consumer vector after uploads erase processed results. This
+    // releases their shared-budget slots before the next enqueue burst.
+    void acknowledgeConsumerPending(size_t count);
+
     size_t inFlight() const { return inFlight_.load(std::memory_order_relaxed); }
+    MeshSchedulerStats stats() const;
     float meshMsAvg() const;
 
 private:
@@ -70,8 +88,17 @@ private:
     mutable std::mutex completedMutex_;
 
     std::atomic<bool> running_{true};
-    std::atomic<size_t> inFlight_{0}; // queued + building
+    // inFlight_ owns every scheduler-side slot, including completed results.
+    // consumerPending_ mirrors the vector last passed to drainCompleted().
+    // Their sum never exceeds MAX_INFLIGHT_MESH during normal API use.
+    std::atomic<size_t> inFlight_{0};
+    std::atomic<size_t> consumerPending_{0};
+    std::atomic<size_t> highWater_{0};
+    std::atomic<uint64_t> coalesced_{0};
+    std::atomic<uint64_t> droppedStale_{0};
     AtomicEmaMs meshMs_;
 
+    bool reserveSlot();
+    void publishCompleted(MeshResult result);
     void workerLoop();
 };

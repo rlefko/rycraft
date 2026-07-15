@@ -22,9 +22,8 @@ bool MegaBuffer::tryBumpAllocate(uint64_t& outOffset, uint64_t alignedSize, uint
 bool MegaBuffer::tryFreeListAllocate(uint64_t& outOffset, uint64_t alignedSize,
                                      uint64_t /*bufferSize*/,
                                      std::vector<std::pair<uint64_t, uint64_t>>& freeList) {
-    // Sort free list by offset for deterministic first-fit
-    std::sort(freeList.begin(), freeList.end());
-
+    // The list stays sorted and coalesced when frees are published, so this is
+    // deterministic first-fit without an O(n log n) sort on every allocation.
     for (auto it = freeList.begin(); it != freeList.end(); ++it) {
         uint64_t regionStart = it->first;
         uint64_t regionSize = it->second;
@@ -50,7 +49,7 @@ bool MegaBuffer::tryFreeListAllocate(uint64_t& outOffset, uint64_t alignedSize,
         uint64_t leftoverStart = allocStart + alignedSize;
         uint64_t leftoverSize = regionStart + regionSize - leftoverStart;
         if (leftoverSize >= ALIGNMENT) {
-            freeList.push_back({leftoverStart, leftoverSize});
+            freeList.insert(it, {leftoverStart, leftoverSize});
         }
 
         return true;
@@ -89,9 +88,11 @@ MegaBuffer::ChunkAllocation MegaBuffer::allocate(uint32_t vertexCount, uint32_t 
 
     // Vertex allocation: try bump pointer first, then free list
     bool vertexAllocated = false;
+    bool vertexFromBump = false;
     if (vertexBytes > 0) {
         vertexAllocated = tryBumpAllocate(vertexOffset, vertexBytes, _vertexSize,
                                           const_cast<uint64_t&>(_vertexPtr));
+        vertexFromBump = vertexAllocated;
         if (!vertexAllocated) {
             vertexAllocated =
                 tryFreeListAllocate(vertexOffset, vertexBytes, _vertexSize, _vertexFreeList);
@@ -100,9 +101,11 @@ MegaBuffer::ChunkAllocation MegaBuffer::allocate(uint32_t vertexCount, uint32_t 
 
     // Index allocation: try bump pointer first, then free list
     bool indexAllocated = false;
+    bool indexFromBump = false;
     if (indexBytes > 0) {
         indexAllocated =
             tryBumpAllocate(indexOffset, indexBytes, _indexSize, const_cast<uint64_t&>(_indexPtr));
+        indexFromBump = indexAllocated;
         if (!indexAllocated) {
             indexAllocated =
                 tryFreeListAllocate(indexOffset, indexBytes, _indexSize, _indexFreeList);
@@ -110,8 +113,25 @@ MegaBuffer::ChunkAllocation MegaBuffer::allocate(uint32_t vertexCount, uint32_t 
     }
 
     if ((vertexBytes > 0 && !vertexAllocated) || (indexBytes > 0 && !indexAllocated)) {
+        const auto rollback = [](uint64_t offset, uint64_t size, bool fromBump, uint64_t& bumpPtr,
+                                 std::vector<std::pair<uint64_t, uint64_t>>& freeList) {
+            if (size == 0)
+                return;
+            if (fromBump && offset + size == bumpPtr) {
+                bumpPtr = offset;
+                return;
+            }
+            freeList.push_back({offset, size});
+            coalesceFreeList(freeList);
+        };
+        if (vertexAllocated) {
+            rollback(vertexOffset, vertexBytes, vertexFromBump, _vertexPtr, _vertexFreeList);
+        }
+        if (indexAllocated) {
+            rollback(indexOffset, indexBytes, indexFromBump, _indexPtr, _indexFreeList);
+        }
         throw std::runtime_error(
-            "mega buffer allocation failed — insufficient space in vertex or index buffer");
+            "mega buffer allocation failed: insufficient space in vertex or index buffer");
     }
 
     return ChunkAllocation{
@@ -164,7 +184,7 @@ void MegaBuffer::coalesceFreeList(std::vector<std::pair<uint64_t, uint64_t>>& fr
 
 void MegaBuffer::free(ChunkAllocation& alloc) {
     std::lock_guard lock(_mutex);
-    freeLocked(alloc);
+    freeLocked(alloc, true);
 }
 
 void MegaBuffer::deferFree(ChunkAllocation& alloc, uint64_t frame) {
@@ -180,25 +200,34 @@ void MegaBuffer::deferFree(ChunkAllocation& alloc, uint64_t frame) {
 
 void MegaBuffer::drainDeferredFrees(uint64_t completedFrame) {
     std::lock_guard lock(_mutex);
+    bool released = false;
     std::erase_if(_deferredFrees, [&](DeferredFree& deferred) {
         if (deferred.frame > completedFrame) {
             return false;
         }
-        freeLocked(deferred.alloc);
+        freeLocked(deferred.alloc, false);
+        released = true;
         return true;
     });
+    if (released) {
+        coalesceFreeList(_vertexFreeList);
+        coalesceFreeList(_indexFreeList);
+    }
 }
 
-void MegaBuffer::freeLocked(ChunkAllocation& alloc) {
+void MegaBuffer::freeLocked(ChunkAllocation& alloc, bool coalesce) {
     if (alloc.vertexCount > 0) {
         uint64_t vertexBytes = alignUp(alloc.vertexCount * sizeof(Vertex));
         _vertexFreeList.push_back({alloc.vertexOffset, vertexBytes});
-        coalesceFreeList(_vertexFreeList);
     }
 
     if (alloc.indexCount > 0) {
         uint64_t indexBytes = alignUp(alloc.indexCount * sizeof(uint32_t));
         _indexFreeList.push_back({alloc.indexOffset, indexBytes});
+    }
+
+    if (coalesce) {
+        coalesceFreeList(_vertexFreeList);
         coalesceFreeList(_indexFreeList);
     }
 
@@ -211,9 +240,21 @@ void MegaBuffer::freeLocked(ChunkAllocation& alloc) {
 }
 
 uint64_t MegaBuffer::vertexUsed() const {
-    return _vertexPtr;
+    std::lock_guard lock(_mutex);
+    uint64_t freeBytes = 0;
+    for (const auto& [offset, size] : _vertexFreeList) {
+        (void)offset;
+        freeBytes += size;
+    }
+    return _vertexPtr - freeBytes;
 }
 
 uint64_t MegaBuffer::indexUsed() const {
-    return _indexPtr;
+    std::lock_guard lock(_mutex);
+    uint64_t freeBytes = 0;
+    for (const auto& [offset, size] : _indexFreeList) {
+        (void)offset;
+        freeBytes += size;
+    }
+    return _indexPtr - freeBytes;
 }

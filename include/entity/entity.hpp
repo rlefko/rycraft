@@ -3,6 +3,7 @@
 #include <common/math.hpp>
 #include <world/chunk.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -18,6 +19,26 @@ enum class EntityType : uint8_t {
     COW,
     PIG,
     CHICKEN,
+    DEER,
+    GOAT,
+    RABBIT,
+    FROG,
+    FISH,
+    COUNT,
+};
+
+inline constexpr size_t ENTITY_TYPE_COUNT = static_cast<size_t>(EntityType::COUNT);
+static_assert(ENTITY_TYPE_COUNT == 9, "Entity tables must cover every entity type");
+
+// ---------------------------------------------------------------------------
+// MovementMode - Shared movement family used by physics and animal AI
+// ---------------------------------------------------------------------------
+enum class MovementMode : uint8_t {
+    WALK,
+    CLIMB,
+    HOP,
+    AMPHIBIOUS_HOP,
+    SWIM,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,6 +49,9 @@ struct EntityConfig {
     float height;
     float speed;
     Vec3 color;
+    MovementMode movementMode;
+    float jumpImpulse;
+    float stepHeight;
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +93,13 @@ public:
     bool isBaby = false;   // baby entities are smaller
     int babyTimer = 0;     // ticks remaining as baby (0 = adult)
     uint64_t parentId = 0; // parent entity ID (for babies)
+
+    // Wild animals stay near a deterministic territory. Manually spawned
+    // animals retain their spawn position as home but are not distance culled.
+    Vec3 homePosition;
+    bool isWild = false;
+    int64_t territoryX = 0;
+    int64_t territoryZ = 0;
 
     // Animation
     int eatAnimationTimer = 0; // ticks remaining for eat bob animation
@@ -118,6 +149,13 @@ private:
 
     // Apply gravity and drag modifiers
     void applyForces(bool inWater);
+
+    // Fish use neutral-buoyancy movement while submerged and regular gravity
+    // if stranded on land.
+    void tickAquatic(World& world);
+
+    // Update timers shared by terrestrial and aquatic physics paths.
+    void tickLifecycle();
 
     // Attempt step assist: climb up to STEP_ASSIST_HEIGHT blocks
     void tryStepAssist(World& world, float deltaY);

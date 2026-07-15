@@ -216,11 +216,25 @@ TEST_CASE("SFX: animal sounds generate non-empty buffers", "[phase8][sfx]") {
     auto cow = SoundEffect::generateCowMoo();
     auto pig = SoundEffect::generatePigOink();
     auto chicken = SoundEffect::generateChickenCluck();
+    auto deer = SoundEffect::generateDeerCall();
+    auto goat = SoundEffect::generateGoatBleat();
+    auto rabbit = SoundEffect::generateRabbitChirp();
+    auto frog = SoundEffect::generateFrogCroak();
+    auto fish = SoundEffect::generateFishSplash();
 
     REQUIRE(sheep.empty() == false);
     REQUIRE(cow.empty() == false);
     REQUIRE(pig.empty() == false);
     REQUIRE(chicken.empty() == false);
+    REQUIRE(deer.empty() == false);
+    REQUIRE(goat.empty() == false);
+    REQUIRE(rabbit.empty() == false);
+    REQUIRE(frog.empty() == false);
+    REQUIRE(fish.empty() == false);
+
+    for (size_t index = 0; index < ENTITY_TYPE_COUNT; ++index) {
+        REQUIRE(SoundEffect::generateAnimalCall(static_cast<EntityType>(index)).empty() == false);
+    }
 }
 
 TEST_CASE("SFX: sample values within [-1, 1] range", "[phase8][sfx]") {

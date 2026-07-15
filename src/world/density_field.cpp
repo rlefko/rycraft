@@ -1,9 +1,11 @@
 #include "world/density_field.hpp"
 
 #include "world/gen_seeds.hpp"
+#include "world/macro_generation.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 
 DensityField::DensityField(uint32_t worldSeed)
     : detail_(genseed::subSeed(worldSeed, genseed::DETAIL_3D))
@@ -13,7 +15,21 @@ DensityField::DensityField(uint32_t worldSeed)
     , noodle1_(genseed::subSeed(worldSeed, genseed::NOODLE_1))
     , noodle2_(genseed::subSeed(worldSeed, genseed::NOODLE_2)) {}
 
-double DensityField::density(double x, double y, double z, const ColumnShape& col) const {
+DensityColumnContext DensityField::columnContext(double x, double z,
+                                                 const worldgen::GeologySample& geology) const {
+    DensityColumnContext result;
+    if (geology.rock == worldgen::RockType::LIMESTONE) {
+        const double region = cheese_.octave2D(x / 310.0, z / 310.0, 2);
+        result.karstRegionStrength = std::clamp((region + 0.08) / 0.48, 0.0, 1.0);
+    }
+    if (geology.boundary == worldgen::PlateBoundary::TRANSFORM) {
+        result.faultStrength = std::clamp(geology.faultStrength, 0.0, 1.0);
+    }
+    return result;
+}
+
+double DensityField::density(double x, double y, double z, const ColumnShape& col,
+                             const DensityColumnContext& context) const {
     // ---- Terrain: signed distance below the column surface, distorted by
     // anisotropic 3D detail (wider than tall → ledges and overhangs).
     double d = col.height - y;
@@ -77,5 +93,76 @@ double DensityField::density(double x, double y, double z, const ColumnShape& co
                              -DENSITY_CAP, DENSITY_CAP);
     }
 
-    return std::min({d, dCheese, dSpaghetti, dNoodle, dRavine});
+    // ---- Limestone karst: broad solution cavities follow bedding planes,
+    // while slowly varying spaghetti fields form sink shafts. A regional
+    // gate keeps limestone from becoming uniformly hollow. Surface sealing
+    // still applies, including the stronger seal below generated water.
+    double dKarst = DENSITY_CAP;
+    if (context.karstRegionStrength > 0.0) {
+        const double karstSurfaceSeal = std::clamp((col.height - y - 6.0) / 10.0, 0.0, 1.0);
+        const double regionStrength = context.karstRegionStrength * std::min(s, karstSurfaceSeal);
+        if (regionStrength > 0.001) {
+            const double chamberA = std::abs(cheese_.noise3D(x / 78.0, y / 46.0, z / 78.0));
+            const double chamberB = std::abs(spaghetti1_.noise3D(x / 112.0, y / 68.0, z / 112.0));
+            const double chamberWidth = (0.075 + depthFrac * 0.045) * regionStrength;
+            const double chamber = (std::max(chamberA, chamberB * 0.74) - chamberWidth) * 185.0;
+
+            const double foldedY = y + cheese_.noise2D(x / 150.0, z / 150.0) * 7.0;
+            const double beddingWave = std::abs(std::sin(foldedY * std::numbers::pi / 13.0));
+            const double beddingBreak =
+                std::abs(spaghetti2_.noise3D(x / 96.0, y / 210.0, z / 96.0));
+            const double beddingWidth = (0.050 + depthFrac * 0.025) * regionStrength;
+            const double bedding =
+                (std::max(beddingWave, beddingBreak * 0.58) - beddingWidth) * 115.0;
+
+            const double shaftA = std::abs(spaghetti1_.noise3D(x / 58.0, y / 820.0, z / 58.0));
+            const double shaftB = std::abs(noodle1_.noise3D(x / 91.0, y / 690.0, z / 91.0));
+            const double shaftWidth = (0.030 + depthFrac * 0.024) * regionStrength;
+            const double shaft = (std::max(shaftA, shaftB) - shaftWidth) * 210.0;
+            dKarst = std::clamp(std::min({chamber, bedding, shaft}), -DENSITY_CAP, DENSITY_CAP);
+        }
+    }
+
+    // ---- Transform faults: a narrow, vertically coherent zero-isosurface
+    // produces deep fault caves. On dry ground the fissure can reach the
+    // surface as a ravine, while the ordinary water seal protects oceans and
+    // lakes from being drained by the fault field.
+    double dFault = DENSITY_CAP;
+    if (context.faultStrength > 0.001) {
+        const double seal = waterCovered ? s : 1.0;
+        const double nearSurface = std::clamp((y - (col.height - 34.0)) / 30.0, 0.0, 1.0);
+        const double width = context.faultStrength *
+                             (0.010 + context.faultStrength * 0.052 + nearSurface * 0.012) * seal;
+        const double trace = std::abs(spaghetti2_.noise3D(x / 168.0, y / 880.0, z / 168.0));
+        const double fracture = std::abs(noodle2_.noise3D(x / 74.0, y / 510.0, z / 74.0));
+        const double sheet = std::min(trace, fracture * 0.82);
+        dFault = std::clamp((sheet - width) * 190.0, -DENSITY_CAP, DENSITY_CAP);
+    }
+
+    return std::min({d, dCheese, dSpaghetti, dNoodle, dRavine, dKarst, dFault});
+}
+
+bool DensityField::supportsCaveEcotope(double x, double z, double terrainHeight,
+                                       const worldgen::GeologySample& geology) const {
+    const double probeY = terrainHeight - 26.0;
+    if (geology.rock == worldgen::RockType::LIMESTONE) {
+        const double region = cheese_.octave2D(x / 310.0, z / 310.0, 2);
+        if (region > -0.08) {
+            const double chamberA = std::abs(cheese_.noise3D(x / 78.0, probeY / 46.0, z / 78.0));
+            const double chamberB =
+                std::abs(spaghetti1_.noise3D(x / 112.0, probeY / 68.0, z / 112.0));
+            const double shaftA = std::abs(spaghetti1_.noise3D(x / 58.0, probeY / 820.0, z / 58.0));
+            const double shaftB = std::abs(noodle1_.noise3D(x / 91.0, probeY / 690.0, z / 91.0));
+            if (std::max(chamberA, chamberB * 0.74) < 0.16 || std::max(shaftA, shaftB) < 0.075) {
+                return true;
+            }
+        }
+    }
+
+    if (geology.boundary == worldgen::PlateBoundary::TRANSFORM && geology.faultStrength > 0.08) {
+        const double trace = std::abs(spaghetti2_.noise3D(x / 168.0, probeY / 880.0, z / 168.0));
+        const double fracture = std::abs(noodle2_.noise3D(x / 74.0, probeY / 510.0, z / 74.0));
+        return std::min(trace, fracture * 0.82) < 0.016 + geology.faultStrength * 0.052;
+    }
+    return false;
 }

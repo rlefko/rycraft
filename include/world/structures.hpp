@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/counter_rng.hpp"
 #include "world/chunk.hpp"
 
 #include <cstdint>
@@ -25,9 +26,9 @@ enum class StructureKind : uint8_t { RUIN = 0, WELL = 1, HOUSE = 2 };
 struct StructurePlacement {
     bool valid = false;
     StructureKind kind = StructureKind::RUIN;
-    int rotation = 0; // quarter turns
-    int anchorX = 0;  // world coords of the footprint center
-    int anchorZ = 0;
+    int rotation = 0;    // quarter turns
+    int64_t anchorX = 0; // world coords of the footprint center
+    int64_t anchorZ = 0;
     int floorY = 0;
     int halfX = 0; // rotated half-extents of the footprint
     int halfZ = 0;
@@ -41,14 +42,14 @@ public:
     void place(Chunk& chunk, const ChunkGenerator& gen, GenScratch& scratch) const;
 
     // Pure, cached placement for one region (used by tree rejection too).
-    const StructurePlacement& regionPlacement(int regionX, int regionZ, const ChunkGenerator& gen,
-                                              GenScratch& scratch) const;
+    const StructurePlacement& regionPlacement(int64_t regionX, int64_t regionZ,
+                                              const ChunkGenerator& gen, GenScratch& scratch) const;
 
     // True when (x, z) lies inside any structure footprint (plus margin)
     // that could reach the chunk neighborhood of (chunkX, chunkZ).
-    bool insideStructure(int x, int z, int chunkX, int chunkZ, const ChunkGenerator& gen,
-                         GenScratch& scratch, int margin) const;
+    bool insideStructure(int64_t x, int64_t z, int64_t chunkX, int64_t chunkZ,
+                         const ChunkGenerator& gen, GenScratch& scratch, int margin) const;
 
 private:
-    uint32_t seed_;
+    CounterRng random_;
 };

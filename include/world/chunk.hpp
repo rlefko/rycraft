@@ -1,28 +1,27 @@
 #pragma once
+
 #include "common/math.hpp"
 #include "world/block_properties.hpp"
-#include <array>
+#include "world/chunk_pos.hpp"
+#include "world/fluid.hpp"
+
 #include <atomic>
 #include <cstdint>
-#include <optional>
 #include <vector>
 
-// Backwards compatibility alias
-constexpr int CHUNK_SIZE = 16;
+inline constexpr int CHUNK_EDGE = 16;
+inline constexpr int CHUNK_SIZE = CHUNK_EDGE;
+inline constexpr int CHUNK_WIDTH = CHUNK_EDGE;
+inline constexpr int CHUNK_HEIGHT = CHUNK_EDGE;
+inline constexpr int CHUNK_DEPTH = CHUNK_EDGE;
+inline constexpr int CHUNK_VOLUME = CHUNK_EDGE * CHUNK_EDGE * CHUNK_EDGE;
 
-constexpr int CHUNK_WIDTH = 16;
-constexpr int CHUNK_DEPTH = 16;
-constexpr int CHUNK_HEIGHT = 256;
-constexpr int CHUNK_VOLUME = CHUNK_WIDTH * CHUNK_DEPTH * CHUNK_HEIGHT;
-
-// Open-to-sky air below this floods with water during generation. The one
-// definition every producer/consumer shares (the shaders repeat the value
-// as a literal — MSL can't include this header).
-constexpr int SEA_LEVEL = 64;
-
-// Any surface at or above this gets a snow top, and trees stop growing —
-// the two rules must agree, so they share the constant.
-constexpr int SNOW_LINE = 108;
+inline constexpr int WORLD_MIN_Y = -128;
+inline constexpr int WORLD_MAX_Y = 511;
+inline constexpr int WORLD_MIN_CHUNK_Y = WORLD_MIN_Y / CHUNK_EDGE;
+inline constexpr int WORLD_MAX_CHUNK_Y = WORLD_MAX_Y / CHUNK_EDGE;
+inline constexpr int WORLD_VERTICAL_CHUNKS = WORLD_MAX_CHUNK_Y - WORLD_MIN_CHUNK_Y + 1;
+inline constexpr int SEA_LEVEL = 64;
 
 enum class Biome : uint8_t {
     DEEP_OCEAN = 0,
@@ -35,83 +34,110 @@ enum class Biome : uint8_t {
     SWAMP = 7,
     MUSHROOM_ISLAND = 8,
     ICE_SPIKES = 9,
-    // Values are persisted in saves: only append, never renumber.
     BEACH = 10,
     RIVER = 11,
     BIRCH_FOREST = 12,
     FLOWER_FIELD = 13,
-    COUNT = 14
+    SAVANNA = 14,
+    TROPICAL_RAINFOREST = 15,
+    TEMPERATE_RAINFOREST = 16,
+    SHRUBLAND = 17,
+    STEPPE = 18,
+    COLD_DESERT = 19,
+    BADLANDS = 20,
+    TUNDRA = 21,
+    ALPINE = 22,
+    MANGROVE = 23,
+    FROZEN_OCEAN = 24,
+    VOLCANIC_BARREN = 25,
+    GLACIER = 26,
+    MONTANE_GRASSLAND = 27,
+    FLOODED_GRASSLAND = 28,
+    MEDITERRANEAN_WOODLAND = 29,
+    TEMPERATE_CONIFER_FOREST = 30,
+    TROPICAL_CONIFER_FOREST = 31,
+    TROPICAL_DRY_FOREST = 32,
+    COUNT = 33
 };
 
-struct Chunk {
-    // Chunk coordinates in world space
-    int chunkX;
-    int chunkZ;
+class Chunk {
+public:
+    int64_t chunkX = 0;
+    int32_t chunkY = 0;
+    int64_t chunkZ = 0;
 
-    // Block data — flat array for cache-friendly access
-    std::vector<BlockType> blocks;
-
-    // Block light (0-15) from lava and other emitters, derived by the
-    // LightEngine and never serialized (RYCH stays untouched). Lazily
-    // allocated: empty means every cell is dark, so the common lava-free
-    // chunk pays nothing. Same Y-major index layout as blocks.
-    std::vector<uint8_t> blockLight;
-
-    // Biome map — 16x16 per chunk
-    std::array<Biome, CHUNK_WIDTH * CHUNK_DEPTH> biomes;
-
-    // Height map — highest non-air block per xz position
-    std::array<int, CHUNK_WIDTH * CHUNK_DEPTH> heightMap;
-
-    // Meshing state
     bool needsMeshUpdate = false;
     bool meshed = false;
     bool generated = false;
-
-    // Player edits since the last save — only these chunks persist on
-    // unload/quit (regenerated chunks are pure functions of the seed)
     bool modifiedSinceSave = false;
-
-    // Content revision, bumped by every block edit (self + boundary
-    // neighbors). The async mesher stamps results with the version it
-    // snapshotted; a mismatch on arrival means "upload, then re-mesh" —
-    // a newer mesh always beats a hole.
     std::atomic<uint32_t> version{1};
 
-    Chunk(int cx, int cz);
-
-    // The atomic makes Chunk non-copyable by default; copies happen only on
-    // single-threaded paths (serialization, the save-queue shield).
+    explicit Chunk(ChunkPos pos);
+    Chunk(int64_t cx, int64_t cz) : Chunk(ChunkPos{cx, 0, cz}) {}
+    Chunk(int64_t cx, int32_t cy, int64_t cz) : Chunk(ChunkPos{cx, cy, cz}) {}
     Chunk(const Chunk& other);
     Chunk(Chunk&& other) noexcept;
     Chunk& operator=(const Chunk& other);
 
-    // Block access
+    ChunkPos pos() const { return {chunkX, chunkY, chunkZ}; }
+
     BlockType getBlock(int localX, int localY, int localZ) const;
     void setBlock(int localX, int localY, int localZ, BlockType type);
+    BlockType getBlockWorld(int64_t x, int32_t y, int64_t z) const;
+    void setBlockWorld(int64_t x, int32_t y, int64_t z, BlockType type);
 
-    // Block-light access (0 when unallocated or out of range). setBlockLight
-    // allocates on the first non-zero write.
+    bool isUniform() const { return blocks_.empty(); }
+    BlockType uniformBlock() const { return uniformBlock_; }
+    const std::vector<BlockType>& denseBlocks() const { return blocks_; }
+    std::vector<BlockType> copyBlocks() const;
+    void replaceBlocks(std::vector<BlockType> blocks);
+    void fill(BlockType type);
+    void compactStorage();
+
+    // Block light is derived and never serialized. A dark cube keeps this
+    // storage empty; the first nonzero write materializes one byte per cell.
     uint8_t getBlockLight(int localX, int localY, int localZ) const;
     void setBlockLight(int localX, int localY, int localZ, uint8_t level);
+    bool hasBlockLight() const { return !blockLight_.empty(); }
+    const std::vector<uint8_t>& blockLightData() const { return blockLight_; }
+    void replaceBlockLight(std::vector<uint8_t> light);
+    void clearBlockLight() { blockLight_.clear(); }
 
-    // World coordinate access
-    BlockType getBlockWorld(int x, int y, int z) const;
-    void setBlockWorld(int x, int y, int z, BlockType type);
+    FluidState getFluidState(int localX, int localY, int localZ) const;
+    void setFluidState(int localX, int localY, int localZ, FluidState state);
+    bool hasExplicitFluidStates() const { return !fluidStates_.empty(); }
+    const std::vector<uint8_t>& explicitFluidStates() const { return fluidStates_; }
+    void replaceFluidStates(std::vector<uint8_t> states);
 
-    // Chunk coordinate conversion
-    static int worldToChunk(int worldCoord);
-    static int chunkToWorld(int chunkCoord, int localCoord);
+    static constexpr int index(int x, int y, int z) {
+        return x + z * CHUNK_EDGE + y * CHUNK_EDGE * CHUNK_EDGE;
+    }
+    static int64_t worldToChunk(int64_t worldCoord) {
+        return world_coord::floorDiv(worldCoord, static_cast<int64_t>(CHUNK_EDGE));
+    }
+    static int32_t worldToChunkY(int32_t worldY) {
+        return world_coord::floorDiv(worldY, static_cast<int32_t>(CHUNK_EDGE));
+    }
+    static int32_t worldToLocal(int64_t worldCoord) {
+        return world_coord::floorMod(worldCoord, CHUNK_EDGE);
+    }
+    static int32_t worldToLocalY(int32_t worldY) {
+        return world_coord::floorMod(worldY, CHUNK_EDGE);
+    }
 
-    // Get world position of chunk corner
     Vec3 getWorldPosition() const;
-
-    // Mark for mesh rebuild
-    void markDirty();
-
-    // Mark chunk as meshed (clear dirty flag)
-    void setMeshed(bool value);
-
-    // Get AABB of this chunk in world space
+    void markDirty() { needsMeshUpdate = true; }
+    void setMeshed(bool value) {
+        meshed = value;
+        if (value) needsMeshUpdate = false;
+    }
     AABB getAABB() const;
+
+private:
+    BlockType uniformBlock_ = BlockType::AIR;
+    std::vector<BlockType> blocks_;
+    std::vector<uint8_t> fluidStates_;
+    std::vector<uint8_t> blockLight_;
+
+    void materialize();
 };

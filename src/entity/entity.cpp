@@ -1,9 +1,40 @@
 #include "entity/entity.hpp"
 #include "entity/physics.hpp"
+#include "world/world.hpp"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <utility>
+
+namespace {
+
+constexpr std::array<EntityConfig, ENTITY_TYPE_COUNT> ENTITY_CONFIGS = {{
+    {0.6f, 0.9f, 0.025f, Vec3{0.9f, 0.9f, 0.9f}, MovementMode::WALK, 0.0f, 1.0f},
+    {0.9f, 1.4f, 0.020f, Vec3{0.55f, 0.27f, 0.07f}, MovementMode::WALK, 0.0f, 1.0f},
+    {0.7f, 0.9f, 0.025f, Vec3{0.9f, 0.65f, 0.75f}, MovementMode::WALK, 0.0f, 1.0f},
+    {0.4f, 0.7f, 0.030f, Vec3{0.95f, 0.95f, 0.9f}, MovementMode::WALK, 0.0f, 1.0f},
+    {0.7f, 1.5f, 0.040f, Vec3{0.55f, 0.32f, 0.16f}, MovementMode::WALK, 0.0f, 1.0f},
+    {0.7f, 1.2f, 0.038f, Vec3{0.72f, 0.68f, 0.58f}, MovementMode::CLIMB, 0.22f, 1.25f},
+    {0.4f, 0.55f, 0.045f, Vec3{0.67f, 0.58f, 0.46f}, MovementMode::HOP, 0.24f, 0.6f},
+    {0.45f, 0.35f, 0.035f, Vec3{0.25f, 0.62f, 0.23f}, MovementMode::AMPHIBIOUS_HOP, 0.28f, 0.6f},
+    {0.55f, 0.45f, 0.035f, Vec3{0.28f, 0.58f, 0.78f}, MovementMode::SWIM, 0.0f, 0.0f},
+}};
+
+static_assert(ENTITY_CONFIGS.size() == ENTITY_TYPE_COUNT);
+
+bool isWaterAt(World& world, const Vec3& position, float height) {
+    const int x = static_cast<int>(std::floor(position.x));
+    const float sampleY = position.y + height * 0.5f;
+    const int y = static_cast<int>(std::floor(sampleY));
+    const int z = static_cast<int>(std::floor(position.z));
+    return world.getBlockIfLoaded(x, y, z) == BlockType::WATER &&
+           sampleY < static_cast<float>(y) + world.getFluidHeightIfLoaded(x, y, z);
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // nextId — Monotonically increasing entity UUID
@@ -18,18 +49,9 @@ uint64_t Entity::nextId() {
 // getConfig — Per-type entity configuration
 // ---------------------------------------------------------------------------
 EntityConfig Entity::getConfig(EntityType type) {
-    switch (type) {
-        case EntityType::SHEEP:
-            return {0.6f, 0.9f, 0.025f, Vec3{0.9f, 0.9f, 0.9f}};
-        case EntityType::COW:
-            return {0.9f, 1.4f, 0.02f, Vec3{0.55f, 0.27f, 0.07f}};
-        case EntityType::PIG:
-            return {0.7f, 0.9f, 0.025f, Vec3{0.9f, 0.65f, 0.75f}};
-        case EntityType::CHICKEN:
-            return {0.4f, 0.7f, 0.03f, Vec3{0.95f, 0.95f, 0.9f}};
-        default:
-            std::unreachable();
-    }
+    const auto index = static_cast<size_t>(type);
+    assert(index < ENTITY_CONFIGS.size());
+    return ENTITY_CONFIGS[index];
 }
 
 // ---------------------------------------------------------------------------
@@ -39,7 +61,8 @@ Entity::Entity(uint64_t entityId, EntityType entityType, const Vec3& spawnPos)
     : id(entityId)
     , type(entityType)
     , position(spawnPos)
-    , velocity(Vec3::zero()) {
+    , velocity(Vec3::zero())
+    , homePosition(spawnPos) {
     aabb = computeAABB();
 }
 
@@ -102,7 +125,8 @@ void Entity::resolveCollision(World& world, Vec3& movement) {
 void Entity::tryStepAssist(World& world, float deltaY) {
     // Only step up when falling and the fall distance is small
     if (deltaY >= 0.f) return;
-    if (std::abs(deltaY) > STEP_ASSIST_HEIGHT) return;
+    const float stepHeight = std::max(STEP_ASSIST_HEIGHT, getConfig(type).stepHeight);
+    if (std::abs(deltaY) > stepHeight) return;
 
     int stepX = static_cast<int>(std::floor(position.x));
     int stepZ = static_cast<int>(std::floor(position.z));
@@ -113,7 +137,7 @@ void Entity::tryStepAssist(World& world, float deltaY) {
     if (!PhysicsEngine::isSolid(world, stepX, groundY + 1, stepZ)) {
         if (PhysicsEngine::isSolid(world, stepX, groundY + 2, stepZ)) {
             // Step up
-            position.y += STEP_ASSIST_HEIGHT;
+            position.y += std::min(stepHeight, 1.0f);
             velocity.y = 0.f;
             onGround = true;
         }
@@ -123,9 +147,82 @@ void Entity::tryStepAssist(World& world, float deltaY) {
 // ---------------------------------------------------------------------------
 // tick — Full physics tick for the entity
 // ---------------------------------------------------------------------------
+void Entity::tickLifecycle() {
+    if (isBaby && babyTimer > 0) {
+        babyTimer--;
+        if (babyTimer <= 0) {
+            isBaby = false;
+            aabb = computeAABB();
+        }
+    }
+
+    if (eatAnimationTimer > 0) {
+        eatAnimationTimer--;
+    }
+
+    if (hungerTimer < 600) {
+        hungerTimer++;
+    }
+}
+
+void Entity::tickAquatic(World& world) {
+    const EntityConfig config = getConfig(type);
+    aabb = computeAABB();
+
+    if (!isWaterAt(world, position, config.height)) {
+        applyForces(false);
+        Vec3 movement = velocity;
+        resolveCollision(world, movement);
+        position += movement;
+        onGround = movement.y != velocity.y && velocity.y < 0.0f;
+        if (onGround) velocity.y = 0.0f;
+        aabb = computeAABB();
+        tickLifecycle();
+        return;
+    }
+
+    // Neutral buoyancy with strong damping keeps schools responsive without
+    // allowing accumulated steering to launch fish through the water surface.
+    velocity *= 0.86f;
+    Vec3 movement = velocity;
+    resolveCollision(world, movement);
+
+    Vec3 candidate = position + movement;
+    if (!isWaterAt(world, candidate, config.height)) {
+        Vec3 axisCandidate = position;
+        axisCandidate.x += movement.x;
+        if (!isWaterAt(world, axisCandidate, config.height)) {
+            movement.x = 0.0f;
+            velocity.x = 0.0f;
+        }
+        axisCandidate = position;
+        axisCandidate.y += movement.y;
+        if (!isWaterAt(world, axisCandidate, config.height)) {
+            movement.y = 0.0f;
+            velocity.y = 0.0f;
+        }
+        axisCandidate = position;
+        axisCandidate.z += movement.z;
+        if (!isWaterAt(world, axisCandidate, config.height)) {
+            movement.z = 0.0f;
+            velocity.z = 0.0f;
+        }
+    }
+
+    position += movement;
+    onGround = false;
+    aabb = computeAABB();
+    tickLifecycle();
+}
+
 void Entity::tick(World& world) {
     // Guard: dead entities don't tick
     if (!alive) return;
+
+    if (getConfig(type).movementMode == MovementMode::SWIM) {
+        tickAquatic(world);
+        return;
+    }
 
     // 0. Check water
     aabb = computeAABB();
@@ -164,24 +261,8 @@ void Entity::tick(World& world) {
     // 6. Update AABB
     aabb = computeAABB();
 
-    // 7. Tick baby timer
-    if (isBaby && babyTimer > 0) {
-        babyTimer--;
-        if (babyTimer <= 0) {
-            isBaby = false;
-            aabb = computeAABB();
-        }
-    }
-
-    // 8. Tick eat animation
-    if (eatAnimationTimer > 0) {
-        eatAnimationTimer--;
-    }
-
-    // 9. Tick hunger
-    if (hungerTimer < 600) {
-        hungerTimer++;
-    }
+    // 7. Tick lifecycle state
+    tickLifecycle();
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +371,110 @@ std::vector<VoxelBlock> Entity::getVoxelModel(EntityType type, bool isBaby) {
                 {{0.25f * scale, 0.35f * scale, 0.f}, scaled({0.08f, 0.2f, 0.1f}), bodyColor});
             break;
         }
+        case EntityType::DEER: {
+            const Vec3 coat{0.55f, 0.32f, 0.16f};
+            const Vec3 darkCoat{0.32f, 0.18f, 0.09f};
+            const Vec3 antler{0.72f, 0.61f, 0.43f};
+            blocks.push_back({{0.f, 0.72f * scale, 0.f}, scaled({0.65f, 0.62f, 0.9f}), coat});
+            blocks.push_back(
+                {{0.f, 1.1f * scale, -0.55f * scale}, scaled({0.38f, 0.4f, 0.4f}), coat});
+            blocks.push_back(
+                {{0.f, 0.85f * scale, -0.42f * scale}, scaled({0.18f, 0.45f, 0.18f}), coat});
+            for (int lx : {-1, 1}) {
+                for (int lz : {-1, 1}) {
+                    blocks.push_back({{lx * 0.2f * scale, 0.f, lz * 0.28f * scale},
+                                      scaled({0.09f, 0.65f, 0.09f}),
+                                      darkCoat});
+                }
+            }
+            if (!isBaby) {
+                for (int side : {-1, 1}) {
+                    blocks.push_back(
+                        {{side * 0.13f, 1.43f, -0.55f}, {0.05f, 0.34f, 0.05f}, antler});
+                    blocks.push_back({{side * 0.2f, 1.64f, -0.55f}, {0.18f, 0.05f, 0.05f}, antler});
+                }
+            }
+            break;
+        }
+        case EntityType::GOAT: {
+            const Vec3 coat{0.72f, 0.68f, 0.58f};
+            const Vec3 leg{0.38f, 0.34f, 0.29f};
+            const Vec3 horn{0.48f, 0.43f, 0.33f};
+            blocks.push_back({{0.f, 0.55f * scale, 0.f}, scaled({0.68f, 0.55f, 0.75f}), coat});
+            blocks.push_back(
+                {{0.f, 0.88f * scale, -0.45f * scale}, scaled({0.4f, 0.4f, 0.38f}), coat});
+            for (int lx : {-1, 1}) {
+                for (int lz : {-1, 1}) {
+                    blocks.push_back({{lx * 0.19f * scale, 0.f, lz * 0.22f * scale},
+                                      scaled({0.1f, 0.42f, 0.1f}),
+                                      leg});
+                }
+            }
+            blocks.push_back(
+                {{0.f, 0.78f * scale, -0.68f * scale}, scaled({0.15f, 0.18f, 0.12f}), leg});
+            if (!isBaby) {
+                blocks.push_back({{-0.12f, 1.17f, -0.45f}, {0.07f, 0.28f, 0.07f}, horn});
+                blocks.push_back({{0.12f, 1.17f, -0.45f}, {0.07f, 0.28f, 0.07f}, horn});
+            }
+            break;
+        }
+        case EntityType::RABBIT: {
+            const Vec3 fur{0.67f, 0.58f, 0.46f};
+            const Vec3 innerEar{0.82f, 0.56f, 0.58f};
+            blocks.push_back(
+                {{0.f, 0.18f * scale, 0.08f * scale}, scaled({0.4f, 0.3f, 0.5f}), fur});
+            blocks.push_back(
+                {{0.f, 0.32f * scale, -0.26f * scale}, scaled({0.3f, 0.3f, 0.28f}), fur});
+            blocks.push_back({{-0.09f * scale, 0.56f * scale, -0.25f * scale},
+                              scaled({0.08f, 0.3f, 0.08f}),
+                              innerEar});
+            blocks.push_back({{0.09f * scale, 0.56f * scale, -0.25f * scale},
+                              scaled({0.08f, 0.3f, 0.08f}),
+                              innerEar});
+            blocks.push_back({{0.f, 0.25f * scale, 0.37f * scale},
+                              scaled({0.16f, 0.16f, 0.16f}),
+                              Vec3{0.88f, 0.85f, 0.78f}});
+            blocks.push_back(
+                {{-0.14f * scale, 0.f, 0.16f * scale}, scaled({0.12f, 0.16f, 0.24f}), fur});
+            blocks.push_back(
+                {{0.14f * scale, 0.f, 0.16f * scale}, scaled({0.12f, 0.16f, 0.24f}), fur});
+            break;
+        }
+        case EntityType::FROG: {
+            const Vec3 green{0.25f, 0.62f, 0.23f};
+            const Vec3 lightGreen{0.48f, 0.75f, 0.34f};
+            blocks.push_back({{0.f, 0.1f * scale, 0.f}, scaled({0.45f, 0.22f, 0.38f}), green});
+            blocks.push_back(
+                {{0.f, 0.22f * scale, -0.2f * scale}, scaled({0.35f, 0.2f, 0.25f}), green});
+            blocks.push_back({{-0.12f * scale, 0.36f * scale, -0.22f * scale},
+                              scaled({0.11f, 0.11f, 0.11f}),
+                              lightGreen});
+            blocks.push_back({{0.12f * scale, 0.36f * scale, -0.22f * scale},
+                              scaled({0.11f, 0.11f, 0.11f}),
+                              lightGreen});
+            for (int side : {-1, 1}) {
+                blocks.push_back({{side * 0.24f * scale, 0.f, 0.1f * scale},
+                                  scaled({0.18f, 0.08f, 0.25f}),
+                                  green});
+            }
+            break;
+        }
+        case EntityType::FISH: {
+            const Vec3 body{0.28f, 0.58f, 0.78f};
+            const Vec3 fin{0.17f, 0.39f, 0.62f};
+            blocks.push_back({{0.f, 0.08f * scale, 0.f}, scaled({0.42f, 0.3f, 0.68f}), body});
+            blocks.push_back(
+                {{0.f, 0.12f * scale, -0.39f * scale}, scaled({0.3f, 0.25f, 0.2f}), body});
+            blocks.push_back(
+                {{0.f, 0.08f * scale, 0.44f * scale}, scaled({0.06f, 0.38f, 0.34f}), fin});
+            blocks.push_back(
+                {{-0.27f * scale, 0.02f * scale, 0.f}, scaled({0.16f, 0.05f, 0.22f}), fin});
+            blocks.push_back(
+                {{0.27f * scale, 0.02f * scale, 0.f}, scaled({0.16f, 0.05f, 0.22f}), fin});
+            break;
+        }
+        case EntityType::COUNT:
+            std::unreachable();
     }
 
     return blocks;

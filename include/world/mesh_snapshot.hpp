@@ -2,54 +2,121 @@
 
 #include "world/chunk.hpp"
 
-#include <vector>
+#include <array>
+#include <limits>
 
 // ---------------------------------------------------------------------------
-// MeshSnapshot — a chunk plus a one-block ring from all eight neighbors (four
-// face walls + four diagonal corner columns), copied under chunksMutex_ in one
-// bounded memcpy (~83 KB, microseconds — the corner columns are four extra
-// byte-writes per layer into the ring that resize() already allocated).
+// MeshSnapshot holds one 16x16x16 cube plus a one-block halo on every face,
+// edge, and corner. Meshing consumes the immutable 18x18x18 block, fluid, and
+// derived block-light fields without holding the world mutex.
 //
-// Meshing reads it lock-free afterwards: block data only mutates before a
-// chunk is inserted into the world or under chunksMutex_, so the copy is
-// always internally consistent. The padding ring is what lets the mesher
-// emit chunk-boundary faces symmetrically from REAL neighbor blocks —
-// treating the neighbor as air produced both hidden interior walls between
-// solid chunks and holes/light seams at borders.
-//
-// x and z accept [-1, CHUNK_WIDTH] / [-1, CHUNK_DEPTH], corner columns
-// included: baked corner AO samples the diagonal neighbor of each face vertex,
-// so leaving the four corners as air would put a bright AO seam along every
-// chunk edge wherever a corner occluder straddles the border.
+// Coordinates accept [-1, CHUNK_EDGE] on all axes. Loaded halo cells keep
+// face culling, corner AO, partial-fluid corners, and light continuous across
+// cubic chunk boundaries. Missing in-range cells below the planned terrain
+// silhouette are opaque placeholders. Cells above it remain air so surface
+// streaming cannot flash a full dark cube face. Cardinal cap bits let the
+// mesher close only genuine underground openings until their halo loads.
 // ---------------------------------------------------------------------------
 struct MeshSnapshot {
-    static constexpr int PADDED_WIDTH = CHUNK_WIDTH + 2;
-    static constexpr int PADDED_DEPTH = CHUNK_DEPTH + 2;
+    static constexpr int PADDED_EDGE = CHUNK_EDGE + 2;
+    static constexpr int PADDED_VOLUME = PADDED_EDGE * PADDED_EDGE * PADDED_EDGE;
+    static constexpr int SKY_COLUMNS = PADDED_EDGE * PADDED_EDGE;
+    static constexpr int32_t SKY_CUTOFF_UNKNOWN = std::numeric_limits<int32_t>::min();
 
-    int chunkX = 0;
-    int chunkZ = 0;
-    uint32_t version = 0;            // chunk revision captured with the blocks
-    std::vector<BlockType> blocks;   // PADDED_WIDTH × PADDED_DEPTH × CHUNK_HEIGHT
-    std::vector<uint8_t> blockLight; // parallel ring of derived block light (0-15)
+    enum MissingFace : uint8_t {
+        MISSING_PLUS_X = 1U << 0U,
+        MISSING_MINUS_X = 1U << 1U,
+        MISSING_PLUS_Z = 1U << 2U,
+        MISSING_MINUS_Z = 1U << 3U,
+        MISSING_PLUS_Y = 1U << 4U,
+        MISSING_MINUS_Y = 1U << 5U,
+    };
 
-    void resize() {
-        blocks.assign(PADDED_WIDTH * PADDED_DEPTH * CHUNK_HEIGHT, BlockType::AIR);
-        blockLight.assign(PADDED_WIDTH * PADDED_DEPTH * CHUNK_HEIGHT, 0);
+    ChunkPos pos{};
+    uint32_t version = 0;
+    // Cardinal in-range neighbors absent when the snapshot was published.
+    // The mesher seals underground openings and reconstructs a lit planned
+    // surface silhouette. A later neighbor load dirties this mesh and replaces
+    // the provisional boundary with the real shared face.
+    uint8_t missingNeighborFaces = 0;
+    std::array<BlockType, PADDED_VOLUME> blocks{};
+    std::array<uint8_t, PADDED_VOLUME> fluidStates{};
+    std::array<uint8_t, PADDED_VOLUME> blockLight{};
+
+    // Immutable generated-terrain cutoff and top material for each padded XZ
+    // column. Unlike skyCutoffY, this cutoff is never made conservative by an
+    // unloaded vertical section, so it can distinguish an aboveground loading
+    // frontier from a genuinely underground opening.
+    std::array<int32_t, SKY_COLUMNS> generatedSurfaceCutoffY{};
+    std::array<BlockType, SKY_COLUMNS> generatedSurfaceMaterial{};
+
+    // World-space Y of the first cell above the highest opaque block in each
+    // padded XZ column. This preserves full-column skylight across 16-high
+    // cubes. SKY_CUTOFF_UNKNOWN asks standalone tests/tools to derive a
+    // bounded cutoff from the blocks available in this snapshot.
+    std::array<int32_t, SKY_COLUMNS> skyCutoffY{};
+
+    MeshSnapshot() { clear(); }
+
+    void clear() {
+        blocks.fill(BlockType::AIR);
+        fluidStates.fill(FluidState::source().packed());
+        blockLight.fill(0);
+        generatedSurfaceCutoffY.fill(SKY_CUTOFF_UNKNOWN);
+        generatedSurfaceMaterial.fill(BlockType::STONE);
+        skyCutoffY.fill(SKY_CUTOFF_UNKNOWN);
+        missingNeighborFaces = 0;
+    }
+    void resize() { clear(); }
+
+    static constexpr int index(int x, int y, int z) {
+        return (x + 1) + (z + 1) * PADDED_EDGE + (y + 1) * PADDED_EDGE * PADDED_EDGE;
     }
 
-    static int index(int x, int y, int z) {
-        return (x + 1) + (z + 1) * PADDED_WIDTH + y * PADDED_WIDTH * PADDED_DEPTH;
+    static constexpr int skyIndex(int x, int z) { return (x + 1) + (z + 1) * PADDED_EDGE; }
+
+    int32_t skyCutoffAt(int x, int z) const {
+        if (x < -1 || x > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {
+            return SKY_CUTOFF_UNKNOWN;
+        }
+        return skyCutoffY[skyIndex(x, z)];
+    }
+
+    int32_t generatedSurfaceCutoffAt(int x, int z) const {
+        if (x < -1 || x > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {
+            return SKY_CUTOFF_UNKNOWN;
+        }
+        return generatedSurfaceCutoffY[skyIndex(x, z)];
+    }
+
+    BlockType generatedSurfaceMaterialAt(int x, int z) const {
+        if (x < -1 || x > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {
+            return BlockType::STONE;
+        }
+        return generatedSurfaceMaterial[skyIndex(x, z)];
     }
 
     BlockType at(int x, int y, int z) const {
-        if (y < 0 || y >= CHUNK_HEIGHT || x < -1 || x > CHUNK_WIDTH || z < -1 || z > CHUNK_DEPTH)
+        if (x < -1 || x > CHUNK_EDGE || y < -1 || y > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {
             return BlockType::AIR;
+        }
         return blocks[index(x, y, z)];
     }
 
     uint8_t lightAt(int x, int y, int z) const {
-        if (y < 0 || y >= CHUNK_HEIGHT || x < -1 || x > CHUNK_WIDTH || z < -1 || z > CHUNK_DEPTH)
+        if (x < -1 || x > CHUNK_EDGE || y < -1 || y > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {
             return 0;
+        }
         return blockLight[index(x, y, z)];
     }
+
+    FluidState fluidAt(int x, int y, int z) const {
+        if (x < -1 || x > CHUNK_EDGE || y < -1 || y > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {
+            return FluidState::source();
+        }
+        return FluidState::fromPacked(fluidStates[index(x, y, z)]);
+    }
 };
+
+static_assert(MeshSnapshot::PADDED_EDGE == 18);
+static_assert(MeshSnapshot::PADDED_VOLUME == 18 * 18 * 18);
