@@ -288,15 +288,14 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         overlayDesc.colorAttachments[0].blendingEnabled = true;
         overlayDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
         overlayDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-        // Premultiplied alpha: the fragment outputs murk*fogFactor + causticGlow
-        // with alpha = fogFactor, so distance-fog toward murk and the additive
-        // caustic glow composite in one pass.
+        // Dual-source blending: result = inscatter + scene * transmit. The
+        // fragment's color(0) index(0) is the inscattered light and index(1)
+        // the per-channel Beer-Lambert transmittance — a single alpha cannot
+        // express spectral absorption (red must die faster than blue).
         overlayDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
         overlayDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-        overlayDesc.colorAttachments[0].destinationRGBBlendFactor =
-            MTLBlendFactorOneMinusSourceAlpha;
-        overlayDesc.colorAttachments[0].destinationAlphaBlendFactor =
-            MTLBlendFactorOneMinusSourceAlpha;
+        overlayDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorSource1Color;
+        overlayDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
         overlayDesc.rasterSampleCount = 1;
         _underwaterOverlayState = [_device newRenderPipelineStateWithDescriptor:overlayDesc
                                                                           error:&error];

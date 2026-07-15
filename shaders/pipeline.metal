@@ -511,13 +511,23 @@ static float3 reconstructCameraRelative(float2 uv, float depth, constant WaterUn
 // Depth is point-sampled: linear across a depth edge reads a value between two
 // surfaces, so the crossing test would flicker.
 // ---------------------------------------------------------------------------
-static float4 traceWaterSSR(float3 origin, float3 dir, depth2d<float> sceneDepth,
-                            texture2d<float> sceneColor, constant WaterUniforms& water) {
+// Per-channel water absorption (per block): red dies within a few blocks,
+// green by ~15, blue last. ONE definition shared by the underwater overlay
+// and the reflected-path attenuation in the SSR, so the water can never
+// absorb differently along different ray types.
+constant float3 WATER_SIGMA_A = float3(0.16f, 0.05f, 0.028f);
+
+static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool underwater,
+                            depth2d<float> sceneDepth, texture2d<float> sceneColor,
+                            constant WaterUniforms& water) {
     constexpr sampler depthPoint(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
     constexpr sampler colorLinear(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
 
     const int STEPS = 24;
-    float stride = 1.5f;
+    // Jitter the first stride per pixel (the engine's IGN convention): a
+    // coherent march start turned the coarse steps into visible stair bands
+    // across every reflection.
+    float stride = 1.5f * (0.75f + 0.5f * interleavedGradientNoise(fragPx));
     float3 pos = origin;
     for (int i = 0; i < STEPS; ++i) {
         float3 prev = pos;
@@ -562,7 +572,15 @@ static float4 traceWaterSSR(float3 origin, float3 dir, depth2d<float> sceneDepth
         }
         // Fade as the hit nears a screen edge (data runs out there).
         float2 e = smoothstep(0.0f, 0.12f, hitUV) * smoothstep(0.0f, 0.12f, 1.0f - hitUV);
-        return float4(sceneColor.sample(colorLinear, hitUV).rgb, e.x * e.y);
+        float3 hit = sceneColor.sample(colorLinear, hitUV).rgb;
+        if (underwater) {
+            // The reflected ray also travels through water: absorb its path
+            // per channel, so distant mirrored geometry dims into the deep
+            // instead of reflecting crisp daylight colors (also hides the
+            // minification shimmer of far reflections).
+            hit *= exp(-WATER_SIGMA_A * distance(origin, hi));
+        }
+        return float4(hit, e.x * e.y);
     }
     return float4(0.0f);
 }
@@ -686,7 +704,8 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // ray finds on-screen geometry (far shore and trees from above, the floor
     // under total internal reflection from below), mirror it.
     if (water.ssrStrength > 0.0f) {
-        float4 ssr = traceWaterSSR(in.vCameraRelativePosition, R, sceneDepth, sceneColor, water);
+        float4 ssr = traceWaterSSR(in.vCameraRelativePosition, R, in.clipPosition.xy, fromBelow,
+                                   sceneDepth, sceneColor, water);
         reflection = mix(reflection, ssr.rgb, ssr.a * water.ssrStrength);
     }
 
@@ -737,9 +756,18 @@ vertex OverlayVertexOutput underwaterOverlayVertex(uint vertexID [[vertex_id]]) 
     return out;
 }
 
-fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
-                                          depth2d<float> sceneDepth [[texture(1)]],
-                                          constant WaterUniforms& water [[buffer(3)]]) {
+// Dual-source blending: the pipeline blends result = inscatter + scene *
+// transmit, so absorption can multiply the scene PER CHANNEL (Beer-Lambert)
+// while the scattered light adds — a single alpha cannot express both.
+struct UnderwaterOverlayOut {
+    float4 inscatter [[color(0), index(0)]];
+    float4 transmit [[color(0), index(1)]];
+};
+
+fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
+                                                        depth2d<float> sceneDepth [[texture(1)]],
+                                                        constant WaterUniforms& water
+                                                        [[buffer(3)]]) {
     float t = water.time;
     float sunUp = saturate(water.sunDirection.y);
 
@@ -751,45 +779,36 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     float3 world = relative + water.cameraPosition;
     float dist = length(relative);
 
-    // ---- Depth-based scattering: near water is clear, distance fades into
-    // murk. This owns the whole underwater tint now (the scene passes apply no
-    // fog below the surface). The murk accumulates only along the IN-WATER
-    // part of the ray: an upward ray exits through the surface after a few
-    // blocks, and fogging it by the opaque distance behind the surface (sky is
-    // far) drowned the whole upward view in murk.
-    const float UW_FOG_DENSITY = 0.075f;
+    // ---- Physically based water: per-channel Beer-Lambert absorption
+    // (WATER_SIGMA_A, shared with the SSR's reflected-path attenuation), so
+    // distance shifts everything through teal into deep blue instead of
+    // lerping toward one flat fog color. Absorption accumulates only along
+    // the IN-WATER part of the ray: an upward ray exits after a few blocks.
+    const float3 SIGMA_A = WATER_SIGMA_A;
     float3 rayDir = relative / max(dist, 1e-4f);
     float eyeY = water.cameraPosition.y;
-    float waterPath = dist;
-    if (rayDir.y > 0.02f) {
-        float exitDist = max(water.waterSurfaceY - eyeY, 0.0f) / rayDir.y;
-        waterPath = min(dist, exitDist);
-    }
-    float fogFactor = 1.0f - exp(-waterPath * UW_FOG_DENSITY);
+    float exitDist = (rayDir.y > 0.02f)
+                         ? max(water.waterSurfaceY - eyeY, 0.0f) / max(rayDir.y, 0.02f)
+                         : 3.4e38f;
+    float waterPath = min(dist, exitDist);
 
-    // Inscattered light: overhead sun lifts a brighter blue-green; sinking
-    // below sea level darkens the murk. Hydrology puts lakes at arbitrary
-    // elevations, so the ocean-depth term only ever darkens (a mountain lake
-    // reads as bright shallow water, which is right). skyExposure kills the
-    // sun term entirely in covered water (aquifers) where no sunlight enters.
-    const float3 UW_DEEP = float3(0.02f, 0.09f, 0.16f);    // dark blue, deep/no sun
-    const float3 UW_SHALLOW = float3(0.10f, 0.30f, 0.38f); // brighter blue-green
-    float camDepth = max(64.0f - water.cameraPosition.y, 0.0f);
-    float penetration = saturate(exp(-camDepth * 0.05f)) * sunUp * water.skyExposure;
-    float3 murk = mix(UW_DEEP, UW_SHALLOW, penetration);
+    // The light that reached the shaded point also crossed the water column
+    // above it (longer when the sun sits low), so deep floors go dark, not
+    // just blue. Points seen THROUGH the surface keep their above-water light,
+    // and covered water (skyExposure 0) is cave-lit already — no double dark.
+    float pointDepth = (dist <= exitDist + 0.5f)
+                           ? clamp(water.waterSurfaceY - world.y, 0.0f, 48.0f)
+                           : 0.0f;
+    float lightSlant = 1.0f / max(sunUp, 0.35f);
+    pointDepth *= water.skyExposure;
 
-    // ---- Caustics on up-facing submerged surfaces, added as a glow. The water
-    // surface pass only shades pixels behind a quad, so the floor at the
-    // player's feet would have none without this. The submerged gate is
-    // camera-anchored (this overlay only draws while the camera is inside
-    // water, so the local surface sits above the eye): shore terrain higher
-    // than eye + 2 must not catch caustics — a sea-level constant would light
-    // the wrong blocks around lakes and rivers hydrology places at any height.
-    // Caustics land on up-facing floors (walls stay dark). The normal comes
-    // from best-of-both-sides depth taps, not raw screen derivatives: a
-    // one-sided derivative straddles block silhouettes and lit dashed lines
-    // along every oblique edge (the same defect ssao.metal documents), while
-    // picking the continuous side per axis reads the true surface at edges.
+    // ---- Caustics on up-facing submerged surfaces (walls stay dark). The
+    // water surface pass only shades pixels behind a quad, so the floor at
+    // the player's feet would have none without this. The normal comes from
+    // best-of-both-sides depth taps, not raw screen derivatives: a one-sided
+    // derivative straddles block silhouettes and lit dashed lines along every
+    // oblique edge (the same defect ssao.metal documents), while picking the
+    // continuous side per axis reads the true surface at edges.
     float2 texel = 1.0f / water.resolution;
     float3 pL = reconstructCameraRelative(
         in.uv - float2(texel.x, 0.0f),
@@ -816,27 +835,42 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     // neither normal is trustworthy — fade rather than sparkle the block edge.
     float edgeSpan = max(min(spanL, spanR), min(spanD, spanU));
     upFacing *= 1.0f - smoothstep(dist * 0.04f + 0.15f, dist * 0.08f + 0.5f, edgeSpan);
-    // Only floors clearly below the eye catch caustics: refracted sunlight
-    // lands on submerged ground, never on shore terrain reconstructed BEHIND
-    // the water surface seen from below (a looser gate painted the web onto
-    // the surface overhead). skyExposure zeroes it in covered water.
-    // Caustics land only below the water surface: any opaque point past the
-    // ray's exit through the surface is seen THROUGH the from-below surface,
-    // whose pixels the surface pass already shaded — overlay caustics there
-    // painted the web onto the surface overhead.
+    // Caustics land only on submerged floors: refracted sunlight never lights
+    // shore terrain reconstructed BEHIND the from-below surface (whose pixels
+    // the surface pass already shaded), and the focusing decays with depth.
     float submerged = step(world.y, water.waterSurfaceY);
-    float throughSurface = 1.0f;
-    if (rayDir.y > 0.02f) {
-        float exitDist = max(water.waterSurfaceY - eyeY, 0.0f) / rayDir.y;
-        throughSurface = 1.0f - smoothstep(exitDist * 0.9f, exitDist * 1.1f, dist);
-    }
-    float caustic = causticPattern(world.xz, t) *
-                    exp(-max(water.waterSurfaceY - world.y, 0.0f) * 0.03f) * exp(-dist * 0.03f);
-    float3 causticGlow = water.sunColor * caustic * upFacing * submerged * throughSurface * sunUp *
-                         water.skyExposure * 0.9f;
+    float throughSurface = 1.0f - smoothstep(exitDist * 0.9f, exitDist * 1.1f, dist);
+    float caustic = causticPattern(world.xz, t) * exp(-pointDepth * 0.05f) * upFacing * submerged *
+                    throughSurface * sunUp * water.skyExposure;
 
-    // Premultiplied: fog lerps the scene toward murk, caustics add on top
-    return float4(murk * fogFactor + causticGlow, fogFactor);
+    // ---- Transmittance (dual-source color 1): the scene is multiplied per
+    // channel by the view-path and light-path absorption, and the caustic
+    // MODULATES that light instead of adding white — it rides the floor's own
+    // shading, so shadowed floors get proportionally dimmer webs.
+    float3 transmit = exp(-SIGMA_A * (waterPath + pointDepth * lightSlant)) *
+                      (1.0f + caustic * 1.8f);
+
+    // ---- Inscatter (dual-source color 0): sunlight scattered into the view
+    // ray by the water itself. Henyey-Greenstein makes looking toward the sun
+    // visibly brighter (the underwater silver lining); the light available in
+    // the volume decays with the camera's own depth per channel; a tiny
+    // ambient floor keeps covered water from reading as a void.
+    float camDepth = max(water.waterSurfaceY - eyeY, 0.0f);
+    float cosSun = dot(rayDir, normalize(water.sunDirection));
+    const float g = 0.45f;
+    float phase = (1.0f - g * g) / pow(1.0f + g * g - 2.0f * g * cosSun, 1.5f); // 1 = isotropic
+    float phaseN = phase / (1.0f + phase); // capped so the sun lobe brightens, never blows out
+    const float3 SCATTER_COLOR = float3(0.02f, 0.10f, 0.17f);
+    float3 volLight =
+        water.sunColor * sunUp * water.skyExposure * exp(-SIGMA_A * camDepth * 0.7f);
+    float buildup = 1.0f - exp(-0.15f * waterPath);
+    float3 inscatter = SCATTER_COLOR * volLight * (0.55f + 0.9f * phaseN) * buildup;
+    inscatter += float3(0.004f, 0.012f, 0.02f) * buildup;
+
+    UnderwaterOverlayOut out;
+    out.inscatter = float4(inscatter, 1.0f);
+    out.transmit = float4(transmit, 1.0f);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
