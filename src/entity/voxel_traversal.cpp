@@ -8,8 +8,10 @@
 // table. Targetable is wider than solid: flora is walk-through for physics
 // but still stops the crosshair ray so plants can be broken in place.
 // ---------------------------------------------------------------------------
-bool VoxelTraversal::isBlockSolid(World& world, int x, int y, int z) {
-    return isTargetable(world.getBlock(x, y, z));
+std::optional<bool> VoxelTraversal::isBlockTargetableIfLoaded(World& world, int x, int y, int z) {
+    const std::optional<BlockType> block = world.findBlockIfLoaded(x, y, z);
+    if (!block) return std::nullopt;
+    return isTargetable(*block);
 }
 
 // ---------------------------------------------------------------------------
@@ -48,7 +50,9 @@ std::optional<Vec3> VoxelTraversal::traceRay(const Vec3& origin, const Vec3& dir
     // DDA loop — advance along axis with smallest tMax
     while (t < maxDistance) {
         // Check current voxel
-        if (isBlockSolid(world, x, y, z)) {
+        const std::optional<bool> targetable = isBlockTargetableIfLoaded(world, x, y, z);
+        if (!targetable) return std::nullopt;
+        if (*targetable) {
             return Vec3{static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)};
         }
 
@@ -122,7 +126,9 @@ std::optional<std::pair<Vec3, Vec3>> VoxelTraversal::traceRayWithNormal(const Ve
     // DDA loop
     while (t < maxDistance) {
         // Check current voxel
-        if (isBlockSolid(world, x, y, z)) {
+        const std::optional<bool> targetable = isBlockTargetableIfLoaded(world, x, y, z);
+        if (!targetable) return std::nullopt;
+        if (*targetable) {
             // Compute face normal from previous to current position
             Vec3 normal;
             if (x != prevX) {

@@ -26,8 +26,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 // One in-game day in 20 Hz ticks — shared by the animation clock, the
@@ -41,11 +43,29 @@ constexpr uint64_t TICKS_PER_DAY = 24000;
 // the particle instance array) sub-allocate from this ring slot; the particle
 // array dominates at 192 KB.
 static constexpr uint64_t FRAME_RING_SLOT_BYTES = 256 * 1024;
+static constexpr uint64_t FAR_VERTEX_BUFFER_BYTES = 256ull * 1024 * 1024;
+static constexpr uint64_t FAR_INDEX_BUFFER_BYTES = 128ull * 1024 * 1024;
+static constexpr size_t MAX_FAR_UPLOADS_PER_FRAME = 12;
+static constexpr size_t MAX_FAR_UPLOAD_BYTES_PER_FRAME = 32ull * 1024 * 1024;
 
 RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
                                uint32_t height)
     : _device(device), _frameRing(device, FRAME_RING_SLOT_BYTES), _bloomIntensity(1.0f),
       _displayWidth(width), _displayHeight(height), _frustumPlanes{} {
+    if (const char* overlay = std::getenv("RYCRAFT_WORLDGEN_OVERLAY")) {
+        const std::string_view name{overlay};
+        if (name == "geology") {
+            _worldgenOverlayMode = WorldgenOverlayMode::GEOLOGY;
+        } else if (name == "hydrology") {
+            _worldgenOverlayMode = WorldgenOverlayMode::HYDROLOGY;
+        } else if (name == "climate") {
+            _worldgenOverlayMode = WorldgenOverlayMode::CLIMATE;
+        } else if (name == "biome") {
+            _worldgenOverlayMode = WorldgenOverlayMode::BIOME;
+        } else if (!name.empty()) {
+            RY_LOG_ERROR("RYCRAFT_WORLDGEN_OVERLAY must be geology, hydrology, climate, or biome");
+        }
+    }
     // ---- Load main chunk shader functions ----
     id<MTLFunction> vertexFunc = [shaderLibrary newFunctionWithName:@"vertexMain"];
     if (!vertexFunc) {
@@ -522,9 +542,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderPassDesc.depthAttachment.clearDepth = 1.0;
     _gpuTimer->attachPass(renderPassDesc, "scene");
 
-    // The locked chunk-list copy happens once here and feeds both the shadow
-    // passes and the scene pass.
-    std::vector<std::shared_ptr<Chunk>> loadedChunks = world.getLoadedChunks();
+    // One immutable tick snapshot feeds shadows, exact terrain, and entities.
+    // The render thread never copies or locks the cubic chunk map.
+    const auto loadedSnapshot = world.getLoadedSnapshot();
+    static const std::vector<std::shared_ptr<Chunk>> emptyChunks;
+    const auto& loadedChunks = loadedSnapshot ? *loadedSnapshot : emptyChunks;
 
     // ---- Shadow cascades (depth-only passes before the scene pass) ----
     renderShadows(commandBuffer, loadedChunks, camera, sunDirection, shadowStrength);
@@ -938,7 +960,7 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
         for (auto& chunk : loadedChunks) {
             if (!chunk || !chunk->generated)
                 continue;
-            uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
+            const ChunkPos key = chunk->pos();
             auto cached = _chunkMeshes.find(key);
             if (cached == _chunkMeshes.end() || !cached->second.uploaded)
                 continue;
@@ -949,7 +971,8 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
                 continue;
 
             ChunkOrigin origin{};
-            origin.origin = simd_make_float4(static_cast<float>(chunk->chunkX * CHUNK_WIDTH), 0.0f,
+            origin.origin = simd_make_float4(static_cast<float>(chunk->chunkX * CHUNK_WIDTH),
+                                             static_cast<float>(chunk->chunkY * CHUNK_HEIGHT),
                                              static_cast<float>(chunk->chunkZ * CHUNK_DEPTH), 0.0f);
             [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
             [encoder setVertexBuffer:meshState.alloc.vertexBuffer
@@ -977,9 +1000,11 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Bind pipeline state
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setDepthStencilState:_depthState];
-    // Flora cross-quads are single-winding and depend on cull mode None
-    // (Metal's default — pinned here so it survives future changes)
-    [encoder setCullMode:MTLCullModeNone];
+    // Opaque cube faces use outward CCW winding. Flora explicitly carries
+    // reverse indices, so it remains two-sided without disabling culling for
+    // the much larger terrain surface.
+    [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+    [encoder setCullMode:MTLCullModeBack];
 
     const float camX = cameraPosition.x;
     const float camY = cameraPosition.y;
@@ -1033,9 +1058,14 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Builds only happen within the render radius: the generation radius is
     // one chunk wider, so every meshable chunk has generated neighbors for
     // its snapshot (frontier chunks simply wait their turn).
-    const int camChunkX = Chunk::worldToChunk(static_cast<int>(std::floor(camX)));
-    const int camChunkZ = Chunk::worldToChunk(static_cast<int>(std::floor(camZ)));
-    const int renderRadius = world.getViewDistance();
+    const int64_t camChunkX = Chunk::worldToChunk(static_cast<int64_t>(std::floor(camX)));
+    const int32_t camChunkY = Chunk::worldToChunkY(static_cast<int32_t>(std::floor(camY)));
+    const int64_t camChunkZ = Chunk::worldToChunk(static_cast<int64_t>(std::floor(camZ)));
+    const int renderRadius = world.getExactViewDistance();
+    const auto meshCandidateSnapshot = world.getMeshCandidateSnapshot();
+    const auto shouldMesh = [&](ChunkPos pos) {
+        return meshCandidateSnapshot && meshCandidateSnapshot->contains(pos);
+    };
 
     // Recycle regions whose last GPU reader has finished, then sweep mesh
     // allocations of chunks the world has since unloaded — freed space can
@@ -1044,11 +1074,11 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     _liveChunkKeys.clear();
     for (const auto& chunk : loadedChunks) {
         if (chunk) {
-            _liveChunkKeys.insert(ChunkPos{chunk->chunkX, chunk->chunkZ}.packed());
+            _liveChunkKeys.insert(chunk->pos());
         }
     }
     for (auto it = _chunkMeshes.begin(); it != _chunkMeshes.end();) {
-        if (_liveChunkKeys.count(it->first) == 0) {
+        if (_liveChunkKeys.count(it->first) == 0 || !shouldMesh(it->first)) {
             if (it->second.uploaded) {
                 _megaBuffer->deferFree(it->second.alloc, _frameRing.frameIndex());
             }
@@ -1063,14 +1093,17 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         _meshScheduler = std::make_unique<MeshScheduler>(world, 2);
     }
 
-    // ---- MegaBuffer sized to the view distance ----
-    // Full-detail chunks average ~100 KB of vertices; 128 KB × visible
-    // chunks + 30% headroom keeps the free-list from thrashing. Growing
-    // recreates the buffers and drops every mesh — a settings-screen event,
-    // after which everything re-streams through the workers.
+    // ---- MegaBuffer sized once for the selected exact radius ----
+    // Surface columns retain roughly 4.5 exposed vertical sections. Base the
+    // allocation on that stable target instead of the currently loaded count,
+    // which grows every frame during streaming and would repeatedly discard
+    // the whole registry. The 256-chunk horizon does not enter this estimate.
     {
-        uint64_t visibleChunks = static_cast<uint64_t>(2 * renderRadius + 1) *
-                                 static_cast<uint64_t>(2 * renderRadius + 1);
+        constexpr double PI = 3.14159265358979323846;
+        const double estimatedColumns =
+            PI * static_cast<double>((renderRadius + 2) * (renderRadius + 2));
+        const uint64_t visibleChunks = std::min<uint64_t>(
+            MAX_MESH_RESIDENT_CUBES, static_cast<uint64_t>(std::ceil(estimatedColumns * 4.5)));
         uint64_t requiredVertexBytes =
             std::max<uint64_t>(128ull * 1024 * 1024, visibleChunks * 128ull * 1024 * 13 / 10);
         if (requiredVertexBytes > _megaBuffer->vertexCapacity()) {
@@ -1088,36 +1121,82 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // transient MegaBuffer-full failure (builtVersion stays 0, so the chunk
     // re-requests once space frees up).
     bool allocFailureLogged = false;
-    auto applyMesh = [&](uint64_t key, const MeshOutput& mesh, uint32_t builtVersion) -> bool {
-        ChunkMeshState& state = _chunkMeshes[key];
-        if (state.uploaded) {
-            // In-flight frames may still draw the old mesh; recycle later
-            _megaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
-            state.uploaded = false;
+    auto makeMeshSlot = [&](ChunkPos key) -> ChunkMeshState& {
+        auto existing = _chunkMeshes.find(key);
+        if (existing != _chunkMeshes.end())
+            return existing->second;
+        if (_chunkMeshes.size() >= MAX_MESH_RESIDENT_CUBES) {
+            auto victim = _chunkMeshes.end();
+            float farthestDistance = -1.0f;
+            for (auto it = _chunkMeshes.begin(); it != _chunkMeshes.end(); ++it) {
+                const float dx =
+                    static_cast<float>(it->first.x * CHUNK_EDGE + CHUNK_EDGE / 2) - camX;
+                const float dy =
+                    static_cast<float>(it->first.y * CHUNK_EDGE + CHUNK_EDGE / 2) - camY;
+                const float dz =
+                    static_cast<float>(it->first.z * CHUNK_EDGE + CHUNK_EDGE / 2) - camZ;
+                const float distance = dx * dx + dy * dy + dz * dz;
+                if (distance > farthestDistance) {
+                    farthestDistance = distance;
+                    victim = it;
+                }
+            }
+            if (victim != _chunkMeshes.end()) {
+                // Reuse the victim node so insertion at the hard cap cannot
+                // fail after discarding a live mesh.
+                auto node = _chunkMeshes.extract(victim);
+                if (node.mapped().uploaded) {
+                    _megaBuffer->deferFree(node.mapped().alloc, _frameRing.frameIndex());
+                }
+                node.key() = key;
+                node.mapped() = ChunkMeshState{};
+                return _chunkMeshes.insert(std::move(node)).position->second;
+            }
         }
-        state.requestedVersion = 0;
-        state.opaqueIndexCount = mesh.opaqueIndexCount;
+        return _chunkMeshes.try_emplace(key).first->second;
+    };
+    auto applyMesh = [&](ChunkPos key, const MeshOutput& mesh, uint32_t builtVersion) -> bool {
+        auto existing = _chunkMeshes.find(key);
+        if (existing != _chunkMeshes.end())
+            existing->second.requestedVersion = 0;
         if (mesh.vertices.empty()) {
+            ChunkMeshState& state = makeMeshSlot(key);
+            state.requestedVersion = 0;
+            if (state.uploaded) {
+                _megaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
+                state.uploaded = false;
+            }
+            state.opaqueIndexCount = 0;
             state.builtVersion = builtVersion; // all-air: nothing to draw
             return true;
         }
+        std::optional<MegaBuffer::ChunkAllocation> replacement;
         try {
-            auto alloc = _megaBuffer->allocate(static_cast<uint32_t>(mesh.vertices.size()),
-                                               static_cast<uint32_t>(mesh.indices.size()));
+            replacement = _megaBuffer->allocate(static_cast<uint32_t>(mesh.vertices.size()),
+                                                static_cast<uint32_t>(mesh.indices.size()));
             _megaBuffer->uploadVertices(mesh.vertices.data(), mesh.vertices.size() * sizeof(Vertex),
-                                        alloc.vertexOffset);
+                                        replacement->vertexOffset);
             _megaBuffer->uploadIndices(mesh.indices.data(), mesh.indices.size() * sizeof(uint32_t),
-                                       alloc.indexOffset);
-            state.alloc = alloc;
+                                       replacement->indexOffset);
+            // Do not evict a resident entry until allocation and upload have
+            // succeeded. At the cap makeMeshSlot reuses the victim map node.
+            ChunkMeshState& state = makeMeshSlot(key);
+            state.requestedVersion = 0;
+            if (state.uploaded) {
+                _megaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
+            }
+            state.alloc = *replacement;
+            state.opaqueIndexCount = mesh.opaqueIndexCount;
             state.uploaded = true;
             state.builtVersion = builtVersion;
             return true;
         } catch (const std::exception& e) {
+            if (replacement)
+                _megaBuffer->free(*replacement);
             if (!allocFailureLogged) {
                 RY_LOG_ERROR((std::string("Chunk mesh upload failed: ") + e.what()).c_str());
                 allocFailureLogged = true;
             }
-            state.builtVersion = 0;
             return false;
         }
     };
@@ -1125,18 +1204,26 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // 1. Drain worker results and upload within the per-frame budget; the
     //    leftovers stay in _pendingResults for next frame.
     _meshScheduler->drainCompleted(_pendingResults);
-    constexpr int MAX_MESH_UPLOADS_PER_FRAME = 24;
-    constexpr size_t MAX_UPLOAD_BYTES_PER_FRAME = 8 * 1024 * 1024;
+    constexpr int MAX_MESH_UPLOADS_PER_FRAME = 64;
+    constexpr size_t MAX_UPLOAD_BYTES_PER_FRAME = 32 * 1024 * 1024;
+    constexpr int MAX_ASYNC_UPLOADS_PER_FRAME = MAX_MESH_UPLOADS_PER_FRAME - 2;
+    constexpr size_t MAX_ASYNC_UPLOAD_BYTES_PER_FRAME =
+        MAX_UPLOAD_BYTES_PER_FRAME - 4 * 1024 * 1024;
     int uploads = 0;
     size_t uploadBytes = 0;
     size_t resultsConsumed = 0;
     for (MeshResult& result : _pendingResults) {
-        if (uploads >= MAX_MESH_UPLOADS_PER_FRAME || uploadBytes >= MAX_UPLOAD_BYTES_PER_FRAME) {
+        if (uploads >= MAX_ASYNC_UPLOADS_PER_FRAME ||
+            uploadBytes >= MAX_ASYNC_UPLOAD_BYTES_PER_FRAME) {
             break;
         }
-        uint64_t key = result.pos.packed();
+        ChunkPos key = result.pos;
         if (_liveChunkKeys.count(key) == 0) {
             ++resultsConsumed; // chunk unloaded while meshing — drop
+            continue;
+        }
+        if (!shouldMesh(key)) {
+            ++resultsConsumed;
             continue;
         }
         if (!result.snapshotOk) {
@@ -1149,26 +1236,33 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             ++resultsConsumed;
             continue;
         }
+        const size_t bytes = result.mesh.vertices.size() * sizeof(Vertex) +
+                             result.mesh.indices.size() * sizeof(uint32_t);
+        if (uploadBytes + bytes > MAX_ASYNC_UPLOAD_BYTES_PER_FRAME)
+            break;
         if (!applyMesh(key, result.mesh, result.builtVersion)) {
             break; // MegaBuffer full: retry this result next frame
         }
         ++uploads;
-        uploadBytes += result.mesh.vertices.size() * sizeof(Vertex) +
-                       result.mesh.indices.size() * sizeof(uint32_t);
+        uploadBytes += bytes;
         ++resultsConsumed;
     }
     _pendingResults.erase(_pendingResults.begin(),
                           _pendingResults.begin() + static_cast<long>(resultsConsumed));
+    _meshScheduler->acknowledgeConsumerPending(_pendingResults.size());
 
     // 2. Edit fast path: chunks right next to the camera re-mesh
     //    synchronously so breaking a block never shows a stale frame.
     int syncBuilds = 0;
     for (auto& chunk : loadedChunks) {
-        if (!chunk || !chunk->generated || syncBuilds >= 2)
+        if (!chunk || !chunk->generated || syncBuilds >= 2 || uploads >= MAX_MESH_UPLOADS_PER_FRAME)
             continue;
-        if (std::abs(chunk->chunkX - camChunkX) > 2 || std::abs(chunk->chunkZ - camChunkZ) > 2)
+        if (std::abs(chunk->chunkX - camChunkX) > 2 || std::abs(chunk->chunkY - camChunkY) > 2 ||
+            std::abs(chunk->chunkZ - camChunkZ) > 2)
             continue;
-        uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
+        if (!shouldMesh(chunk->pos()))
+            continue;
+        ChunkPos key = chunk->pos();
         auto it = _chunkMeshes.find(key);
         uint32_t version = chunk->version.load(std::memory_order_relaxed);
         // Only REBUILDS take the sync path (builtVersion != 0): first-time
@@ -1177,13 +1271,19 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             it->second.builtVersion == version) {
             continue;
         }
-        if (!world.snapshotForMeshing(ChunkPos{chunk->chunkX, chunk->chunkZ}, _meshSnapshot)) {
+        if (!world.snapshotForMeshing(chunk->pos(), _meshSnapshot)) {
             continue;
         }
         MeshOutput mesh = LODMesher::buildMesh(_meshSnapshot, _meshScratch);
-        applyMesh(key, mesh, _meshSnapshot.version);
-        ++syncBuilds;
-        ++uploads;
+        const size_t bytes =
+            mesh.vertices.size() * sizeof(Vertex) + mesh.indices.size() * sizeof(uint32_t);
+        if (uploadBytes + bytes > MAX_UPLOAD_BYTES_PER_FRAME)
+            continue;
+        if (applyMesh(key, mesh, _meshSnapshot.version)) {
+            ++syncBuilds;
+            ++uploads;
+            uploadBytes += bytes;
+        }
     }
 
     // 3. Candidate scan: every generated chunk in the render radius whose
@@ -1195,7 +1295,9 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         if (std::abs(chunk->chunkX - camChunkX) > renderRadius ||
             std::abs(chunk->chunkZ - camChunkZ) > renderRadius)
             continue; // frontier ring: generated but not rendered
-        uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
+        if (!shouldMesh(chunk->pos()))
+            continue;
+        ChunkPos key = chunk->pos();
         uint32_t version = chunk->version.load(std::memory_order_relaxed);
         auto it = _chunkMeshes.find(key);
         if (it != _chunkMeshes.end() &&
@@ -1203,27 +1305,102 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             continue; // up to date, or a build is already on its way
         }
         float dx = static_cast<float>(chunk->chunkX * CHUNK_WIDTH + CHUNK_WIDTH / 2) - camX;
+        float dy = static_cast<float>(chunk->chunkY * CHUNK_HEIGHT + CHUNK_HEIGHT / 2) - camY;
         float dz = static_cast<float>(chunk->chunkZ * CHUNK_DEPTH + CHUNK_DEPTH / 2) - camZ;
-        _meshCandidates.push_back({dx * dx + dz * dz, chunk.get()});
+        _meshCandidates.push_back({dx * dx + dy * dy + dz * dz, chunk.get()});
     }
     std::sort(_meshCandidates.begin(), _meshCandidates.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     for (const auto& [distSq, chunkPtr] : _meshCandidates) {
-        ChunkPos pos{chunkPtr->chunkX, chunkPtr->chunkZ};
+        ChunkPos pos = chunkPtr->pos();
         if (!_meshScheduler->enqueue(pos)) {
             break; // in-flight cap reached — re-prioritized next frame
         }
-        _chunkMeshes[pos.packed()].requestedVersion =
-            chunkPtr->version.load(std::memory_order_relaxed);
+        makeMeshSlot(pos).requestedVersion = chunkPtr->version.load(std::memory_order_relaxed);
     }
+
+    auto overlayColor = [&](const worldgen::SurfaceSample& sample) {
+        constexpr float biomeColors[][3] = {
+            {0.02f, 0.08f, 0.30f}, {0.03f, 0.22f, 0.55f}, {0.42f, 0.72f, 0.24f},
+            {0.08f, 0.45f, 0.13f}, {0.20f, 0.42f, 0.35f}, {0.88f, 0.74f, 0.28f},
+            {0.42f, 0.42f, 0.39f}, {0.17f, 0.39f, 0.25f}, {0.55f, 0.25f, 0.62f},
+            {0.75f, 0.89f, 0.95f}, {0.91f, 0.83f, 0.56f}, {0.04f, 0.42f, 0.80f},
+            {0.30f, 0.66f, 0.38f}, {0.64f, 0.82f, 0.30f}, {0.69f, 0.67f, 0.20f},
+            {0.03f, 0.56f, 0.17f}, {0.10f, 0.50f, 0.32f}, {0.48f, 0.54f, 0.27f},
+            {0.64f, 0.59f, 0.26f}, {0.72f, 0.65f, 0.49f}, {0.68f, 0.31f, 0.17f},
+            {0.55f, 0.62f, 0.53f}, {0.58f, 0.64f, 0.67f}, {0.13f, 0.44f, 0.29f},
+            {0.40f, 0.68f, 0.83f}, {0.29f, 0.23f, 0.22f}, {0.82f, 0.92f, 0.97f},
+            {0.52f, 0.61f, 0.25f}, {0.30f, 0.60f, 0.31f}, {0.55f, 0.47f, 0.22f},
+            {0.16f, 0.38f, 0.30f}, {0.12f, 0.50f, 0.28f}, {0.49f, 0.53f, 0.20f},
+        };
+        static_assert(std::size(biomeColors) == static_cast<size_t>(Biome::COUNT));
+        switch (_worldgenOverlayMode) {
+            case WorldgenOverlayMode::GEOLOGY: {
+                const uint64_t id = sample.geology.plateId;
+                float r = 0.2f + static_cast<float>((id >> 8U) & 255U) / 425.0f;
+                float g = 0.2f + static_cast<float>((id >> 24U) & 255U) / 425.0f;
+                float b = 0.2f + static_cast<float>((id >> 40U) & 255U) / 425.0f;
+                if (sample.geology.boundary != worldgen::PlateBoundary::NONE) {
+                    constexpr float boundaryColors[4][3] = {
+                        {0.65f, 0.65f, 0.65f},
+                        {0.95f, 0.16f, 0.08f},
+                        {0.10f, 0.43f, 1.00f},
+                        {1.00f, 0.65f, 0.06f},
+                    };
+                    const size_t boundary = static_cast<size_t>(sample.geology.boundary);
+                    const float proximity = static_cast<float>(
+                        std::clamp(1.0 - sample.geology.distanceToBoundary / 900.0, 0.0, 0.85));
+                    r = std::lerp(r, boundaryColors[boundary][0], proximity);
+                    g = std::lerp(g, boundaryColors[boundary][1], proximity);
+                    b = std::lerp(b, boundaryColors[boundary][2], proximity);
+                }
+                const float volcanic =
+                    static_cast<float>(std::clamp(sample.geology.volcanicActivity, 0.0, 1.0));
+                return simd_make_float4(std::lerp(r, 1.0f, volcanic * 0.7f),
+                                        std::lerp(g, 0.08f, volcanic * 0.7f),
+                                        std::lerp(b, 0.02f, volcanic * 0.7f), 0.72f);
+            }
+            case WorldgenOverlayMode::HYDROLOGY:
+                if (sample.hydrology.delta)
+                    return simd_make_float4(0.95f, 0.80f, 0.16f, 0.82f);
+                if (sample.hydrology.waterfall)
+                    return simd_make_float4(0.80f, 0.95f, 1.00f, 0.85f);
+                if (sample.hydrology.river)
+                    return simd_make_float4(0.02f, 0.65f, 1.00f, 0.82f);
+                if (sample.hydrology.lake)
+                    return simd_make_float4(0.08f, 0.42f, 0.94f, 0.78f);
+                if (sample.hydrology.ocean)
+                    return simd_make_float4(0.01f, 0.08f, 0.42f, 0.78f);
+                return simd_make_float4(0.18f, 0.16f, 0.11f, 0.65f);
+            case WorldgenOverlayMode::CLIMATE: {
+                const float temperature = static_cast<float>(
+                    std::clamp((sample.climate.temperatureC + 25.0) / 65.0, 0.0, 1.0));
+                const float rain = static_cast<float>(
+                    std::clamp(sample.climate.annualPrecipitationMm / 3000.0, 0.0, 1.0));
+                return simd_make_float4(temperature, rain, 1.0f - temperature, 0.74f);
+            }
+            case WorldgenOverlayMode::BIOME: {
+                const size_t primary = static_cast<size_t>(sample.biome.primary);
+                const size_t secondary = static_cast<size_t>(sample.biome.secondary);
+                const float blend =
+                    static_cast<float>(std::clamp(sample.biome.transition, 0.0, 1.0));
+                return simd_make_float4(
+                    std::lerp(biomeColors[primary][0], biomeColors[secondary][0], blend),
+                    std::lerp(biomeColors[primary][1], biomeColors[secondary][1], blend),
+                    std::lerp(biomeColors[primary][2], biomeColors[secondary][2], blend), 0.72f);
+            }
+            case WorldgenOverlayMode::NONE:
+                break;
+        }
+        return simd_make_float4(0.0f);
+    };
 
     // ---- Draw everything the registry has uploaded ----
     for (auto& chunk : loadedChunks) {
         if (!chunk || !chunk->generated)
             continue;
 
-        // Chunk key for mesh cache lookup (packed, no allocation)
-        uint64_t key = ChunkPos{chunk->chunkX, chunk->chunkZ}.packed();
+        ChunkPos key = chunk->pos();
 
         // Frustum culling
         AABB chunkAABB = chunk->getAABB();
@@ -1239,19 +1416,28 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         // Mesh vertices are chunk-local; this restores world space (and keeps
         // fp16 positions exact regardless of how far the chunk is from origin)
         ChunkOrigin origin{};
-        origin.origin = simd_make_float4(static_cast<float>(chunk->chunkX * CHUNK_WIDTH), 0.0f,
+        origin.origin = simd_make_float4(static_cast<float>(chunk->chunkX * CHUNK_WIDTH),
+                                         static_cast<float>(chunk->chunkY * CHUNK_HEIGHT),
                                          static_cast<float>(chunk->chunkZ * CHUNK_DEPTH), 0.0f);
+        if (_worldgenOverlayMode != WorldgenOverlayMode::NONE) {
+            const int64_t centerX = chunk->chunkX * CHUNK_WIDTH + CHUNK_WIDTH / 2;
+            const int64_t centerZ = chunk->chunkZ * CHUNK_DEPTH + CHUNK_DEPTH / 2;
+            if (const auto sample = world.findSurfaceSample(centerX, centerZ)) {
+                origin.overlayColorAndStrength = overlayColor(*sample);
+            }
+        }
 
         // The chunk's water section renders after the scene resolves
         uint32_t waterIndexCount = meshState.alloc.indexCount - meshState.opaqueIndexCount;
         if (waterIndexCount > 0) {
             float dx = static_cast<float>(chunk->chunkX * CHUNK_WIDTH + CHUNK_WIDTH / 2) - camX;
+            float dy = static_cast<float>(chunk->chunkY * CHUNK_HEIGHT + CHUNK_HEIGHT / 2) - camY;
             float dz = static_cast<float>(chunk->chunkZ * CHUNK_DEPTH + CHUNK_DEPTH / 2) - camZ;
             _waterDraws.push_back(WaterDraw{
-                origin.origin, meshState.alloc.vertexBuffer, meshState.alloc.indexBuffer,
-                meshState.alloc.vertexOffset,
+                origin.origin, origin.overlayColorAndStrength, meshState.alloc.vertexBuffer,
+                meshState.alloc.indexBuffer, meshState.alloc.vertexOffset,
                 meshState.alloc.indexOffset + meshState.opaqueIndexCount * sizeof(uint32_t),
-                waterIndexCount, dx * dx + dz * dz});
+                waterIndexCount, dx * dx + dy * dy + dz * dz});
         }
 
         if (meshState.opaqueIndexCount == 0)
@@ -1272,16 +1458,464 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                      indexBufferOffset:meshState.alloc.indexOffset];
     }
 
+    // Fill the 32..view-distance annulus after exact cubes. Biased opaque far
+    // tops remain a fallback until exact depth replaces them, while water and
+    // canopies use the shared one-chunk handoff to avoid duplicate coverage.
+    renderFarTerrain(encoder, world, cameraPosition, fogColor);
+
     // F3 HUD counters: uploads applied this frame + the workers' build EMA
     _chunkStats.meshBuildsLastFrame = static_cast<uint32_t>(uploads);
     _chunkStats.meshMsAvg = _meshScheduler->meshMsAvg();
-    _chunkStats.megaUsedMB = static_cast<float>(_megaBuffer->vertexUsed()) / (1024.f * 1024.f);
-    _chunkStats.megaCapMB = static_cast<float>(_megaBuffer->vertexCapacity()) / (1024.f * 1024.f);
+    _chunkStats.megaUsedMB =
+        static_cast<float>(_megaBuffer->vertexUsed() + _megaBuffer->indexUsed()) /
+        (1024.f * 1024.f);
+    _chunkStats.megaCapMB =
+        static_cast<float>(_megaBuffer->vertexCapacity() + _megaBuffer->indexCapacity()) /
+        (1024.f * 1024.f);
+    _chunkStats.meshCubeCount = static_cast<uint32_t>(_chunkMeshes.size());
+    const MeshSchedulerStats meshStats = _meshScheduler->stats();
+    _chunkStats.meshPendingCount =
+        static_cast<uint32_t>(meshStats.schedulerOwned + meshStats.consumerPending);
+    _chunkStats.meshQueueHighWater = static_cast<uint32_t>(meshStats.highWater);
+    _chunkStats.meshCoalescedCount = meshStats.coalesced;
+    _chunkStats.meshDroppedStaleCount = meshStats.droppedStale;
+}
+
+void RenderPipeline::resetFarTerrain(uint64_t worldSeed) {
+    if (_farTerrainSeed && *_farTerrainSeed == worldSeed && _farTerrainScheduler)
+        return;
+
+    if (_farTerrainScheduler)
+        _farTerrainScheduler->shutdown();
+    if (_farMegaBuffer) {
+        for (auto& [key, state] : _farTerrainMeshes) {
+            (void)key;
+            if (state.uploaded) {
+                _farMegaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
+            }
+        }
+    }
+    _farTerrainMeshes.clear();
+    _farTerrainWanted.clear();
+    _farTerrainActiveTiles.clear();
+    _farTerrainDesiredByTile.clear();
+    _farTerrainDisplayedByTile.clear();
+    _farTerrainComplexityByTile.clear();
+    _farTerrainTransitions.clear();
+    _farTerrainResults.clear();
+    _farTerrainCandidates.clear();
+    _farTerrainCenterTile.reset();
+
+    if (!_farMegaBuffer) {
+        _farMegaBuffer =
+            std::make_unique<MegaBuffer>(_device, FAR_VERTEX_BUFFER_BYTES, FAR_INDEX_BUFFER_BYTES);
+    }
+    _farTerrainScheduler = std::make_unique<FarTerrainScheduler>(worldSeed);
+    _farTerrainSeed = worldSeed;
+    _farTerrainMeshes.reserve(1024);
+    _farTerrainWanted.reserve(1024);
+    _farTerrainActiveTiles.reserve(1024);
+    _farTerrainDesiredByTile.reserve(1024);
+    _farTerrainDisplayedByTile.reserve(1024);
+    _farTerrainComplexityByTile.reserve(1024);
+    _farTerrainTransitions.reserve(64);
+    _farTerrainCandidates.reserve(1024);
+}
+
+void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const World& world,
+                                      const Vec3& cameraPosition, const float fogColor[3]) {
+    resetFarTerrain(world.getSeed());
+    _farMegaBuffer->drainDeferredFrees(_frameRing.completedFrame());
+    _farTerrainWanted.clear();
+    _farTerrainActiveTiles.clear();
+    _farTerrainCandidates.clear();
+
+    const int exactChunks = world.getExactViewDistance();
+    const int visibleChunks = std::min(world.getViewDistance(), FAR_TERRAIN_MAX_CHUNK_RADIUS);
+    const TerrainHorizonViewpoint viewpoint{cameraPosition.x, cameraPosition.y, cameraPosition.z};
+    selectFarTerrainView(cameraPosition.x, cameraPosition.z, exactChunks, visibleChunks,
+                         _farTerrainCandidates);
+    const int64_t cameraBlockX = static_cast<int64_t>(std::floor(cameraPosition.x));
+    const int64_t cameraBlockZ = static_cast<int64_t>(std::floor(cameraPosition.z));
+    const ColumnPos centerTile{
+        world_coord::floorDiv(cameraBlockX, static_cast<int64_t>(FAR_TERRAIN_TILE_EDGE)),
+        world_coord::floorDiv(cameraBlockZ, static_cast<int64_t>(FAR_TERRAIN_TILE_EDGE)),
+    };
+    if (_farTerrainCenterTile && (std::abs(centerTile.x - _farTerrainCenterTile->x) > 2 ||
+                                  std::abs(centerTile.z - _farTerrainCenterTile->z) > 2)) {
+        _farTerrainScheduler->advanceEpoch();
+    }
+    _farTerrainCenterTile = centerTile;
+    for (FarTerrainViewTile& tile : _farTerrainCandidates) {
+        const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+        _farTerrainActiveTiles.insert(coordinate);
+
+        // Retain the maximum observed value while the coordinate is active.
+        // Different sample spacings can under-resolve a narrow ridge or river;
+        // allowing that observation to fall again would make two tiers chase
+        // each other despite the distance hysteresis.
+        float& complexity = _farTerrainComplexityByTile[coordinate];
+        for (FarTerrainStep step : {FarTerrainStep::TWO, FarTerrainStep::FOUR,
+                                    FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN}) {
+            const auto resident = _farTerrainMeshes.find({tile.key.tileX, tile.key.tileZ, step});
+            if (resident != _farTerrainMeshes.end()) {
+                complexity = std::max(complexity, resident->second.complexity);
+            }
+        }
+        std::optional<FarTerrainStep> previousStep;
+        if (const auto previous = _farTerrainDesiredByTile.find(coordinate);
+            previous != _farTerrainDesiredByTile.end()) {
+            previousStep = previous->second.step;
+        }
+        if (const auto desired =
+                farTerrainStepForMetrics(tile.distanceChunks, complexity, previousStep)) {
+            tile.key.step = *desired;
+        }
+        _farTerrainWanted.insert(tile.key);
+        _farTerrainDesiredByTile.insert_or_assign(coordinate, tile.key);
+    }
+    for (auto it = _farTerrainDesiredByTile.begin(); it != _farTerrainDesiredByTile.end();) {
+        if (!_farTerrainActiveTiles.contains(it->first)) {
+            it = _farTerrainDesiredByTile.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = _farTerrainComplexityByTile.begin(); it != _farTerrainComplexityByTile.end();) {
+        if (!_farTerrainActiveTiles.contains(it->first)) {
+            it = _farTerrainComplexityByTile.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    _farTerrainScheduler->retainWanted(_farTerrainWanted);
+
+    size_t uploads = 0;
+    size_t uploadBytes = 0;
+    bool uploadFailureLogged = false;
+    auto uploadMesh = [&](const std::shared_ptr<const FarTerrainMesh>& mesh) {
+        if (!mesh || _farTerrainWanted.count(mesh->key) == 0 ||
+            _farTerrainMeshes.count(mesh->key) != 0 || uploads >= MAX_FAR_UPLOADS_PER_FRAME) {
+            return false;
+        }
+        const size_t bytes =
+            mesh->vertices.size() * sizeof(Vertex) + mesh->indices.size() * sizeof(uint32_t);
+        if (uploadBytes + bytes > MAX_FAR_UPLOAD_BYTES_PER_FRAME)
+            return false;
+        std::optional<MegaBuffer::ChunkAllocation> allocation;
+        try {
+            allocation = _farMegaBuffer->allocate(static_cast<uint32_t>(mesh->vertices.size()),
+                                                  static_cast<uint32_t>(mesh->indices.size()));
+            _farMegaBuffer->uploadVertices(mesh->vertices.data(),
+                                           mesh->vertices.size() * sizeof(Vertex),
+                                           allocation->vertexOffset);
+            _farMegaBuffer->uploadIndices(mesh->indices.data(),
+                                          mesh->indices.size() * sizeof(uint32_t),
+                                          allocation->indexOffset);
+            const auto [_, inserted] = _farTerrainMeshes.emplace(
+                mesh->key, FarTerrainMeshState{*allocation, mesh->bounds, mesh->surfaceBounds,
+                                               mesh->occluderPatches, mesh->opaqueIndexCount,
+                                               mesh->complexity, mesh->deterministicHash, true});
+            if (!inserted) {
+                _farMegaBuffer->free(*allocation);
+                return false;
+            }
+            ++uploads;
+            uploadBytes += bytes;
+            return true;
+        } catch (const std::exception& error) {
+            if (allocation)
+                _farMegaBuffer->free(*allocation);
+            if (!uploadFailureLogged) {
+                RY_LOG_ERROR((std::string("Far-terrain upload failed: ") + error.what()).c_str());
+                uploadFailureLogged = true;
+            }
+            return false;
+        }
+    };
+
+    _farTerrainResults.clear();
+    _farTerrainScheduler->drainCompleted(_farTerrainResults);
+    for (const FarTerrainResult& result : _farTerrainResults) {
+        if (!result.failed)
+            uploadMesh(result.mesh);
+    }
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        if (uploads >= MAX_FAR_UPLOADS_PER_FRAME || uploadBytes >= MAX_FAR_UPLOAD_BYTES_PER_FRAME) {
+            break;
+        }
+        if (_farTerrainMeshes.count(tile.key) != 0)
+            continue;
+        uploadMesh(_farTerrainScheduler->findCached(tile.key));
+    }
+
+    // Submission is nearest-first and bounded inside the scheduler. A full
+    // queue simply causes the remaining coordinates to be reconsidered next
+    // frame, preserving priorities after every camera move.
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        if (_farTerrainMeshes.count(tile.key) == 0)
+            _farTerrainScheduler->enqueue(tile.key);
+    }
+
+    const double lodTimeSeconds = CACurrentMediaTime();
+    auto isResident = [&](const FarTerrainKey& key) {
+        const auto found = _farTerrainMeshes.find(key);
+        return found != _farTerrainMeshes.end() && found->second.uploaded;
+    };
+
+    // Finish or redirect in-progress replacements before starting new ones.
+    // Choosing whichever topology is currently visible prevents a geometry
+    // jump if the desired tier changes during the hidden replacement.
+    for (auto it = _farTerrainTransitions.begin(); it != _farTerrainTransitions.end();) {
+        const auto desired = _farTerrainDesiredByTile.find(it->first);
+        if (!_farTerrainActiveTiles.contains(it->first) ||
+            desired == _farTerrainDesiredByTile.end()) {
+            it = _farTerrainTransitions.erase(it);
+            continue;
+        }
+        const FarTerrainTransitionSample sample = sampleFarTerrainTransition(
+            static_cast<float>(lodTimeSeconds - it->second.startedAtSeconds));
+        if (desired->second != it->second.to) {
+            _farTerrainDisplayedByTile.insert_or_assign(
+                it->first, sample.drawTarget ? it->second.to : it->second.from);
+            it = _farTerrainTransitions.erase(it);
+        } else if (sample.complete) {
+            _farTerrainDisplayedByTile.insert_or_assign(it->first, it->second.to);
+            it = _farTerrainTransitions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = _farTerrainDisplayedByTile.begin(); it != _farTerrainDisplayedByTile.end();) {
+        if (!_farTerrainActiveTiles.contains(it->first)) {
+            it = _farTerrainDisplayedByTile.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Preserve an already visible tier until its replacement is resident.
+    // First-time tiles appear immediately; subsequent tier changes use the
+    // bounded fog transition below.
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+        auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+        if (displayed != _farTerrainDisplayedByTile.end() && isResident(displayed->second)) {
+            continue;
+        }
+        const FarTerrainKey desired = _farTerrainDesiredByTile.at(coordinate);
+        if (isResident(desired)) {
+            _farTerrainDisplayedByTile.insert_or_assign(coordinate, desired);
+            continue;
+        }
+        for (FarTerrainStep fallback : {FarTerrainStep::TWO, FarTerrainStep::FOUR,
+                                        FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN}) {
+            const FarTerrainKey fallbackKey{coordinate.x, coordinate.z, fallback};
+            if (isResident(fallbackKey)) {
+                _farTerrainDisplayedByTile.insert_or_assign(coordinate, fallbackKey);
+                break;
+            }
+        }
+    }
+
+    constexpr size_t MAX_SIMULTANEOUS_FAR_LOD_TRANSITIONS = 64;
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        if (_farTerrainTransitions.size() >= MAX_SIMULTANEOUS_FAR_LOD_TRANSITIONS)
+            break;
+        const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+        if (_farTerrainTransitions.contains(coordinate))
+            continue;
+        const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+        const auto desired = _farTerrainDesiredByTile.find(coordinate);
+        if (displayed == _farTerrainDisplayedByTile.end() ||
+            desired == _farTerrainDesiredByTile.end() || displayed->second == desired->second ||
+            !isResident(displayed->second) || !isResident(desired->second)) {
+            continue;
+        }
+        _farTerrainTransitions.emplace(
+            coordinate,
+            FarTerrainLodTransition{displayed->second, desired->second, lodTimeSeconds});
+    }
+
+    // GPU residency follows the full circular horizon rather than the current
+    // camera direction. During a replacement, both immutable tiers stay live;
+    // all other stale tiers retire through the frame-safe arena immediately.
+    for (auto it = _farTerrainMeshes.begin(); it != _farTerrainMeshes.end();) {
+        const ColumnPos coordinate{it->first.tileX, it->first.tileZ};
+        bool keep = _farTerrainActiveTiles.contains(coordinate);
+        if (keep) {
+            const auto desired = _farTerrainDesiredByTile.find(coordinate);
+            const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+            const auto transition = _farTerrainTransitions.find(coordinate);
+            keep =
+                (desired != _farTerrainDesiredByTile.end() && desired->second == it->first) ||
+                (displayed != _farTerrainDisplayedByTile.end() && displayed->second == it->first) ||
+                (transition != _farTerrainTransitions.end() &&
+                 (transition->second.from == it->first || transition->second.to == it->first));
+        }
+        if (!keep) {
+            if (it->second.uploaded) {
+                _farMegaBuffer->deferFree(it->second.alloc, _frameRing.frameIndex());
+            }
+            it = _farTerrainMeshes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    [encoder setRenderPipelineState:_pipelineState];
+    [encoder setDepthStencilState:_depthState];
+    [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+    [encoder setCullMode:MTLCullModeBack];
+    // Exact terrain draws first. A small positive depth bias keeps overlapping
+    // far tops behind resident exact surfaces while leaving them available as
+    // a lit fallback wherever exact meshing has not caught up yet.
+    [encoder setDepthBias:4.0f slopeScale:1.0f clamp:0.000002f];
+
+    TerrainHorizonCuller horizon(viewpoint);
+    const double fullyOpaqueFarRadius =
+        static_cast<double>(exactChunks * CHUNK_EDGE) + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
+    const double fullyOpaqueFarRadiusSquared = fullyOpaqueFarRadius * fullyOpaqueFarRadius;
+    uint32_t drawn = 0;
+    uint32_t frustumCulled = 0;
+    uint32_t occlusionCulled = 0;
+    auto displayedKeyFor = [&](ColumnPos coordinate) -> std::optional<FarTerrainKey> {
+        if (!_farTerrainActiveTiles.contains(coordinate))
+            return std::nullopt;
+
+        if (const auto transition = _farTerrainTransitions.find(coordinate);
+            transition != _farTerrainTransitions.end()) {
+            const FarTerrainTransitionSample sample = sampleFarTerrainTransition(
+                static_cast<float>(lodTimeSeconds - transition->second.startedAtSeconds));
+            const FarTerrainKey key =
+                sample.drawTarget ? transition->second.to : transition->second.from;
+            if (isResident(key))
+                return key;
+        }
+        if (const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+            displayed != _farTerrainDisplayedByTile.end() && isResident(displayed->second)) {
+            return displayed->second;
+        }
+        for (FarTerrainStep fallback : {FarTerrainStep::TWO, FarTerrainStep::FOUR,
+                                        FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN}) {
+            const FarTerrainKey key{coordinate.x, coordinate.z, fallback};
+            if (isResident(key))
+                return key;
+        }
+        return std::nullopt;
+    };
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+        float lodFogBlend = 0.0F;
+        if (const auto transition = _farTerrainTransitions.find(coordinate);
+            transition != _farTerrainTransitions.end()) {
+            const FarTerrainTransitionSample sample = sampleFarTerrainTransition(
+                static_cast<float>(lodTimeSeconds - transition->second.startedAtSeconds));
+            lodFogBlend = sample.fogBlend;
+        }
+
+        const std::optional<FarTerrainKey> drawKey = displayedKeyFor(coordinate);
+        if (!drawKey)
+            continue;
+        const auto found = _farTerrainMeshes.find(*drawKey);
+        if (found == _farTerrainMeshes.end() || !found->second.uploaded)
+            continue;
+        const FarTerrainMeshState& state = found->second;
+        const AABB aabb{{static_cast<float>(state.surfaceBounds.minX), state.surfaceBounds.minY,
+                         static_cast<float>(state.surfaceBounds.minZ)},
+                        {static_cast<float>(state.surfaceBounds.maxX), state.surfaceBounds.maxY,
+                         static_cast<float>(state.surfaceBounds.maxZ)}};
+        if (!isChunkInFrustum(aabb)) {
+            ++frustumCulled;
+            continue;
+        }
+        if (horizon.isOccluded(state.surfaceBounds)) {
+            ++occlusionCulled;
+            continue;
+        }
+        for (const FarTerrainBounds& patch : state.occluderPatches) {
+            // A clipped or dithered patch is not a conservative solid
+            // occluder. Boundary tiles are few, so omit those patches until
+            // their complete bounds are beyond the handoff band.
+            if (TerrainHorizonCuller::horizontalDistanceSquared(patch, viewpoint) >=
+                fullyOpaqueFarRadiusSquared) {
+                horizon.addOccluder(patch);
+            }
+        }
+
+        ChunkOrigin origin{};
+        origin.origin = simd_make_float4(static_cast<float>(state.bounds.minX), 0.0f,
+                                         static_cast<float>(state.bounds.minZ),
+                                         static_cast<float>(exactChunks * CHUNK_EDGE));
+        origin.overlayColorAndStrength =
+            simd_make_float4(fogColor[0], fogColor[1], fogColor[2], lodFogBlend);
+        std::array<std::optional<FarTerrainStep>, 4> displayedNeighborSteps;
+        const std::array<ColumnPos, 4> neighborCoordinates = {
+            ColumnPos{coordinate.x + 1, coordinate.z}, ColumnPos{coordinate.x - 1, coordinate.z},
+            ColumnPos{coordinate.x, coordinate.z + 1}, ColumnPos{coordinate.x, coordinate.z - 1}};
+        for (size_t edge = 0; edge < neighborCoordinates.size(); ++edge) {
+            if (const auto neighbor = displayedKeyFor(neighborCoordinates[edge])) {
+                displayedNeighborSteps[edge] = neighbor->step;
+            }
+        }
+        origin.farMetadata.x = farTerrainSkirtEdgeMask(drawKey->step, displayedNeighborSteps);
+        const uint32_t waterIndexCount = state.alloc.indexCount - state.opaqueIndexCount;
+        if (waterIndexCount > 0) {
+            const double centerX =
+                static_cast<double>(state.surfaceBounds.minX) +
+                static_cast<double>(state.surfaceBounds.maxX - state.surfaceBounds.minX) * 0.5;
+            const double centerY =
+                static_cast<double>(state.surfaceBounds.minY) +
+                static_cast<double>(state.surfaceBounds.maxY - state.surfaceBounds.minY) * 0.5;
+            const double centerZ =
+                static_cast<double>(state.surfaceBounds.minZ) +
+                static_cast<double>(state.surfaceBounds.maxZ - state.surfaceBounds.minZ) * 0.5;
+            const double dx = centerX - cameraPosition.x;
+            const double dy = centerY - cameraPosition.y;
+            const double dz = centerZ - cameraPosition.z;
+            _waterDraws.push_back(
+                WaterDraw{origin.origin, origin.overlayColorAndStrength, state.alloc.vertexBuffer,
+                          state.alloc.indexBuffer, state.alloc.vertexOffset,
+                          state.alloc.indexOffset + state.opaqueIndexCount * sizeof(uint32_t),
+                          waterIndexCount, static_cast<float>(dx * dx + dy * dy + dz * dz)});
+        }
+        if (state.opaqueIndexCount > 0) {
+            [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
+            [encoder setVertexBuffer:state.alloc.vertexBuffer
+                              offset:state.alloc.vertexOffset
+                             atIndex:0];
+            [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:state.opaqueIndexCount
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:state.alloc.indexBuffer
+                         indexBufferOffset:state.alloc.indexOffset];
+        }
+        ++drawn;
+    }
+    [encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+
+    const FarTerrainSchedulerStats schedulerStats = _farTerrainScheduler->stats();
+    _chunkStats.farWantedTileCount = static_cast<uint32_t>(_farTerrainCandidates.size());
+    _chunkStats.farResidentTileCount = static_cast<uint32_t>(
+        std::count_if(_farTerrainWanted.begin(), _farTerrainWanted.end(), isResident));
+    _chunkStats.farDrawnTileCount = drawn;
+    _chunkStats.farFrustumCulledTileCount = frustumCulled;
+    _chunkStats.farOcclusionCulledTileCount = occlusionCulled;
+    _chunkStats.farPendingTileCount =
+        static_cast<uint32_t>(schedulerStats.inFlight + schedulerStats.completed);
+    _chunkStats.farUploadsLastFrame = static_cast<uint32_t>(uploads);
+    _chunkStats.farCacheMB = static_cast<float>(schedulerStats.cacheBytes) / (1024.0f * 1024.0f);
+    _chunkStats.farMegaUsedMB =
+        static_cast<float>(_farMegaBuffer->vertexUsed() + _farMegaBuffer->indexUsed()) /
+        (1024.0f * 1024.0f);
 }
 
 void RenderPipeline::shutdownMeshWorkers() {
     if (_meshScheduler) {
         _meshScheduler->shutdown();
+    }
+    if (_farTerrainScheduler) {
+        _farTerrainScheduler->shutdown();
     }
 }
 
@@ -1321,8 +1955,13 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     simd_float4x4 view, proj;
     std::memcpy(&view, viewMatrix.data.data(), sizeof(view));
     std::memcpy(&proj, projectionMatrix.data.data(), sizeof(proj));
-    wu.invViewProjection = simd_inverse(simd_mul(proj, view));
-    wu.viewProjection = simd_mul(proj, view);
+    // Water depth differences are only a few blocks, even when absolute world
+    // coordinates are large. Remove camera translation before inversion so
+    // reconstructing those positions cannot quantize at chunk boundaries.
+    simd_float4x4 cameraRelativeView = view;
+    cameraRelativeView.columns[3] = simd_make_float4(0.0f, 0.0f, 0.0f, 1.0f);
+    wu.cameraRelativeViewProjection = simd_mul(proj, cameraRelativeView);
+    wu.invCameraRelativeViewProjection = simd_inverse(wu.cameraRelativeViewProjection);
     wu.zenithColor = skyUniforms.zenithColor;
     wu.horizonColor = skyUniforms.horizonColor;
     wu.sunDirection = skyUniforms.sunDirection;
@@ -1364,7 +2003,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
         [encoder setFragmentTexture:_depthResolve atIndex:1];
 
         for (const WaterDraw& draw : _waterDraws) {
-            ChunkOrigin origin{draw.origin};
+            ChunkOrigin origin{draw.origin, draw.overlayColorAndStrength, simd_make_uint4(0U)};
             [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
             [encoder setVertexBuffer:draw.vertexBuffer offset:draw.vertexOffset atIndex:0];
             [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle

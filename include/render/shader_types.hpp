@@ -7,6 +7,56 @@
 // corrupted frame.
 #include <simd/simd.h>
 
+#ifndef __METAL_VERSION__
+#include <algorithm>
+#endif
+
+#define FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS 16.0f
+#define FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK (1u << 28u)
+#define FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK (1u << 29u)
+
+// Exact cubic terrain owns water and canopy fragments through its advertised
+// radius. Those far summaries fade in over the following chunk through a
+// stable world-space threshold. Opaque far tops remain as depth-tested cold
+// residency fallback until their exact surfaces arrive.
+static inline float farTerrainHandoffCoverage(float horizontalDistance, float exactRadius) {
+    if (exactRadius <= 0.0f) {
+        return 1.0f;
+    }
+    float amount = (horizontalDistance - exactRadius) / FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
+#ifdef __METAL_VERSION__
+    amount = metal::clamp(amount, 0.0f, 1.0f);
+#else
+    amount = std::clamp(amount, 0.0f, 1.0f);
+#endif
+    return amount * amount * (3.0f - 2.0f * amount);
+}
+
+static inline bool farTerrainHandoffVisible(float horizontalDistance, float exactRadius,
+                                            float ditherThreshold) {
+    const float coverage = farTerrainHandoffCoverage(horizontalDistance, exactRadius);
+    if (coverage <= 0.0f) {
+        return false;
+    }
+    if (coverage >= 1.0f) {
+        return true;
+    }
+#ifdef __METAL_VERSION__
+    ditherThreshold = metal::clamp(ditherThreshold, 0.0f, 1.0f);
+#else
+    ditherThreshold = std::clamp(ditherThreshold, 0.0f, 1.0f);
+#endif
+    return ditherThreshold < coverage;
+}
+
+// Boundary skirts cover cracks between resident far-terrain tiers. Exact
+// terrain already supplies crack-free geometry throughout the handoff band,
+// so exposing a skirt there would turn a tile edge into a deep vertical wall.
+static inline bool farTerrainSkirtVisible(float horizontalDistance, float exactRadius) {
+    return exactRadius <= 0.0f ||
+           horizontalDistance >= exactRadius + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
+}
+
 #ifdef __METAL_VERSION__
 // Interleaved gradient noise — the engine's one deterministic per-pixel
 // dither/rotation source (convention: seeded randomness only, no temporal
@@ -63,8 +113,14 @@ struct Uniforms {
 
 // Per-chunk world offset, bound at buffer(2) via setVertexBytes. Vertices are
 // chunk-local so their fp16 coordinates stay exact; this restores world space.
+// origin.w is zero for exact cubes and the exact-radius handoff start for far
+// tiles. overlayColorAndStrength remains independent for LOD fog transitions.
+// farMetadata.x contains the four displayed-neighbor skirt edge bits ordered
+// by FaceNormal values +X, -X, +Z, and -Z.
 struct ChunkOrigin {
     simd_float4 origin;
+    simd_float4 overlayColorAndStrength;
+    simd_uint4 farMetadata;
 };
 
 // One cascade's light view-projection, bound at buffer(1) via setVertexBytes
@@ -94,11 +150,12 @@ struct ShadowUniforms {
 
 // Bound at buffer(3) in the water shaders (vertex: wave time; fragment:
 // refraction/reflection/caustics). The water pass composites its own pixels
-// from the resolved opaque scene, so it needs the full camera inverse and
-// the sky palette that the fresnel reflection samples procedurally.
+// from the resolved opaque scene. Screen-space positions reconstruct into a
+// camera-relative world frame so large absolute coordinates cannot quantize
+// water thickness or caustic placement at cubic chunk boundaries.
 struct WaterUniforms {
-    simd_float4x4 invViewProjection; // clip → world, for depth reconstruction
-    simd_float4x4 viewProjection;    // world → clip, for SSR ray projection
+    simd_float4x4 invCameraRelativeViewProjection; // clip → camera-relative world
+    simd_float4x4 cameraRelativeViewProjection;    // camera-relative world → clip
     simd_float3 zenithColor;
     simd_float3 horizonColor;
     simd_float3 sunDirection;
@@ -277,6 +334,8 @@ struct FlareState {
 #include <cstddef>
 
 static_assert(sizeof(Uniforms) == 304);
+static_assert(sizeof(ChunkOrigin) == 48);
+static_assert(offsetof(ChunkOrigin, farMetadata) == 32);
 static_assert(offsetof(Uniforms, sunDirection) == 192);
 static_assert(offsetof(Uniforms, fogColor) == 240);
 static_assert(offsetof(Uniforms, fogDensity) == 256);
@@ -286,7 +345,7 @@ static_assert(offsetof(Uniforms, swayStrength) == 292);
 static_assert(offsetof(Uniforms, wetness) == 296);
 
 static_assert(sizeof(WaterUniforms) == 256);
-static_assert(offsetof(WaterUniforms, viewProjection) == 64);
+static_assert(offsetof(WaterUniforms, cameraRelativeViewProjection) == 64);
 static_assert(offsetof(WaterUniforms, zenithColor) == 128);
 static_assert(offsetof(WaterUniforms, resolution) == 224);
 static_assert(offsetof(WaterUniforms, fogDensity) == 232);

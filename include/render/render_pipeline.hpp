@@ -13,6 +13,7 @@
 #include "common/math.hpp"
 #include "engine/hotbar.hpp"
 #include "render/block_texture_array.hpp"
+#include "render/far_terrain.hpp"
 #include "render/frame_ring.hpp"
 #include "render/gpu_timer.hpp"
 #include "render/graphics_settings.hpp"
@@ -51,10 +52,32 @@ struct ChunkMeshState {
     bool uploaded = false;
 };
 
+// GPU allocation for one immutable 256x256-block far-terrain tile. Far tiles
+// use the same compact vertex format and shader as exact cubes, but live in a
+// separate bounded arena so horizon streaming can never evict collision-zone
+// meshes.
+struct FarTerrainMeshState {
+    MegaBuffer::ChunkAllocation alloc;
+    FarTerrainBounds bounds;
+    FarTerrainBounds surfaceBounds;
+    std::array<FarTerrainBounds, FAR_TERRAIN_OCCLUDER_PATCH_COUNT> occluderPatches{};
+    uint32_t opaqueIndexCount = 0;
+    float complexity = 0.0F;
+    uint64_t deterministicHash = 0;
+    bool uploaded = false;
+};
+
+struct FarTerrainLodTransition {
+    FarTerrainKey from;
+    FarTerrainKey to;
+    double startedAtSeconds = 0.0;
+};
+
 // One chunk's water draw, recorded during the opaque pass and encoded by
 // the water pass after the scene resolves.
 struct WaterDraw {
     simd_float4 origin;
+    simd_float4 overlayColorAndStrength;
     id<MTLBuffer> vertexBuffer;
     id<MTLBuffer> indexBuffer;
     uint64_t vertexOffset;
@@ -123,6 +146,20 @@ public:
         uint32_t meshBuildsLastFrame = 0;
         float megaUsedMB = 0.f;
         float megaCapMB = 0.f;
+        uint32_t meshCubeCount = 0;
+        uint32_t meshPendingCount = 0;
+        uint32_t meshQueueHighWater = 0;
+        uint64_t meshCoalescedCount = 0;
+        uint64_t meshDroppedStaleCount = 0;
+        uint32_t farWantedTileCount = 0;
+        uint32_t farResidentTileCount = 0;
+        uint32_t farDrawnTileCount = 0;
+        uint32_t farFrustumCulledTileCount = 0;
+        uint32_t farOcclusionCulledTileCount = 0;
+        uint32_t farPendingTileCount = 0;
+        uint32_t farUploadsLastFrame = 0;
+        float farCacheMB = 0.f;
+        float farMegaUsedMB = 0.f;
     };
     ChunkRenderStats chunkRenderStats() const { return _chunkStats; }
 
@@ -139,6 +176,14 @@ public:
     void shutdownMeshWorkers();
 
 private:
+    enum class WorldgenOverlayMode : uint8_t {
+        NONE,
+        GEOLOGY,
+        HYDROLOGY,
+        CLIMATE,
+        BIOME,
+    };
+
     // ---- Metal resources ----
     id<MTLDevice> _device;
     id<MTLRenderPipelineState> _pipelineState;
@@ -239,6 +284,10 @@ private:
     // the two can never sample different phases.
     float _animTime = 0.0f;
 
+    // Optional deterministic developer overlay selected by
+    // RYCRAFT_WORLDGEN_OVERLAY.
+    WorldgenOverlayMode _worldgenOverlayMode = WorldgenOverlayMode::NONE;
+
     // Drawable dimensions (the scene renders at native resolution)
     uint32_t _displayWidth;
     uint32_t _displayHeight;
@@ -258,14 +307,13 @@ private:
     float _frustumPlanes[6][4];
 
     // ---- Chunk mesh cache ----
-    // Key: packed int64 ((uint32_t)chunkX << 32 | (uint32_t)chunkZ).
-    // An entry with uploaded == false marks a chunk whose mesh is empty
+    // An entry with uploaded == false marks a cube whose mesh is empty
     // (all air) so it is not rebuilt every frame.
-    std::unordered_map<uint64_t, ChunkMeshState> _chunkMeshes;
+    std::unordered_map<ChunkPos, ChunkMeshState> _chunkMeshes;
 
     // Scratch set reused each frame to sweep meshes of unloaded chunks
     // without per-frame allocation.
-    std::unordered_set<uint64_t> _liveChunkKeys;
+    std::unordered_set<ChunkPos> _liveChunkKeys;
 
     // HUD counters, written only by the render thread during renderChunks.
     ChunkRenderStats _chunkStats;
@@ -281,6 +329,29 @@ private:
     std::unique_ptr<MeshScheduler> _meshScheduler;
     std::vector<MeshResult> _pendingResults;
     std::vector<std::pair<float, const Chunk*>> _meshCandidates;
+
+    // ---- Far-terrain LOD annulus ----
+    // Exact cubic terrain stops at radius 32. Immutable 256x256-block tiles
+    // cover the remaining visible annulus with 4, 8, and 16-block sampling.
+    // CPU construction, CPU caching, and GPU residency all have independent
+    // hard bounds so the 256-chunk horizon remains inside the 64 GB target.
+    std::unique_ptr<FarTerrainScheduler> _farTerrainScheduler;
+    std::unique_ptr<MegaBuffer> _farMegaBuffer;
+    std::optional<uint64_t> _farTerrainSeed;
+    std::optional<ColumnPos> _farTerrainCenterTile;
+    std::unordered_map<FarTerrainKey, FarTerrainMeshState, FarTerrainKeyHash> _farTerrainMeshes;
+    std::unordered_set<FarTerrainKey, FarTerrainKeyHash> _farTerrainWanted;
+    std::unordered_set<ColumnPos> _farTerrainActiveTiles;
+    std::unordered_map<ColumnPos, FarTerrainKey> _farTerrainDesiredByTile;
+    std::unordered_map<ColumnPos, FarTerrainKey> _farTerrainDisplayedByTile;
+    std::unordered_map<ColumnPos, float> _farTerrainComplexityByTile;
+    std::unordered_map<ColumnPos, FarTerrainLodTransition> _farTerrainTransitions;
+    std::vector<FarTerrainResult> _farTerrainResults;
+    std::vector<FarTerrainViewTile> _farTerrainCandidates;
+
+    void renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const World& world,
+                          const Vec3& cameraPosition, const float fogColor[3]);
+    void resetFarTerrain(uint64_t worldSeed);
 
     // ---- Day/Night Cycle ----
     // sunDirection/sunColor come out as the ACTIVE directional light — the sun

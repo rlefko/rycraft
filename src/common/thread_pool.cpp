@@ -7,9 +7,10 @@
 // ---------------------------------------------------------------------------
 // ThreadPool implementation
 // ---------------------------------------------------------------------------
-ThreadPool::ThreadPool(size_t numWorkers) {
+ThreadPool::ThreadPool(size_t numWorkers, ThreadPriority priority) : priority_(priority) {
     for (size_t i = 0; i < numWorkers; ++i) {
         workers_.emplace_back([this]() {
+            setCurrentThreadPriority(priority_);
             while (true) {
                 std::function<void()> task;
 
