@@ -609,8 +609,10 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     float waterDepth = max(distance(behindRelative, in.vCameraRelativePosition), 0.0f);
 
     // ---- Refraction: wave-distorted resample of the scene, pinned at the
-    // shoreline so shallow edges don't smear
-    float distortion = min(waterDepth, 4.0f) * 0.25f;
+    // shoreline so shallow edges don't smear. From below the distorted tap
+    // crosses the surface boundary into unrelated above-water content, so the
+    // transmission samples straight through instead.
+    float distortion = fromBelow ? 0.0f : min(waterDepth, 4.0f) * 0.25f;
     float2 refractUV = clamp(screenUV + N.xz * 0.035f * distortion, 0.001f, 0.999f);
     float refractDepth = sceneDepth.sample(screenSampler, refractUV);
     if (refractDepth < in.clipPosition.z) {
@@ -627,11 +629,16 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     float3 refractedWorld = refractedRelative + water.cameraPosition;
     float depthBelow = max(in.vCameraRelativePosition.y - refractedRelative.y, 0.0f);
 
-    // ---- Caustics: refracted-light web on the shallow floor. World-anchored
-    // (unscaled xz: causticPattern bakes its own cell scale and wave warp).
-    float caustic = causticPattern(refractedWorld.xz, water.time) * exp(-depthBelow * 0.22f);
-    refracted +=
-        water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
+    // ---- Caustics: refracted-light web on the shallow floor, seen from
+    // above only. World-anchored (unscaled xz: causticPattern bakes its own
+    // cell scale and wave warp). From below the reconstruction lands on
+    // above-water content, which painted mis-oriented white bands onto the
+    // transmission — the from-below floor gets its caustics from the overlay.
+    if (!fromBelow) {
+        float caustic = causticPattern(refractedWorld.xz, water.time) * exp(-depthBelow * 0.22f);
+        refracted +=
+            water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
+    }
 
     // ---- Absorption: shallow water reads turquoise and filters toward deep
     // blue with depth (red light dies first), the floor showing through shallows
@@ -657,10 +664,13 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
         if (sinT2 >= 1.0f) {
             fresnel = 1.0f; // total internal reflection: pure mirror
         } else {
-            // Schlick against the transmitted angle (the dense-side form)
+            // Schlick against the transmitted angle (the dense-side form),
+            // eased into the mirror near the critical angle so per-quad wave
+            // normals don't flip whole cells into hard-edged panels.
             const float R0 = 0.02f; // ((1.33-1)/(1.33+1))^2
             float cosT = sqrt(1.0f - sinT2);
             fresnel = R0 + (1.0f - R0) * pow(1.0f - cosT, 5.0f);
+            fresnel = mix(fresnel, 1.0f, smoothstep(0.90f, 1.0f, sinT2));
         }
         // The mirror shows the underwater scene: SSR marches the downward
         // reflected ray; where it misses, the deep water body shows (the
