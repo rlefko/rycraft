@@ -436,9 +436,15 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
         // fragment normal, see shader_types.hpp); world-space input keeps the
         // waves continuous across chunk borders, and flow advects the phase in
         // its packed cardinal direction so currents visibly travel while still
-        // water keeps the resting interference.
+        // water keeps the resting interference. The midline is biased DOWN so
+        // a full crest (rest plane 0.875 + peak ~0.21) stays below the block
+        // top instead of washing over adjacent shoreline blocks, and thin
+        // flowing sheets scale their swell by their own fluid level so a
+        // near-empty cell never displaces below its floor.
+        float levelFrac = fract(in.position.y);
+        float waveScale = saturate(levelFrac * 1.143f); // 0.875 (full cell) -> 1
         float2 phase = pos.xz - waterFlowVector(flow) * water.time * 0.7f;
-        pos.y += waterWaveHeight(phase, water.time);
+        pos.y += (waterWaveHeight(phase, water.time) - 0.10f) * waveScale;
     }
 
     WaterVertexOutput out;
@@ -462,31 +468,59 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
 // filaments that drift with the surface, rather than a static grid or cells.
 // Driven by the water time and warped by the shared wave field so the light
 // moves with the actual waves overhead.
-static float causticPattern(float2 worldXZ, float t) {
-    // Warp the lookup by the wave gradient (unscaled world xz, so it uses the
-    // real per-block wave frequencies) so the caustics ride the same waves the
-    // surface shows; the caustic cell scale is baked in (~2.2 block tiles —
-    // wider cells put the viewer inside one bright web arm and washed the
-    // near floor solid white).
-    const float scale = 0.45f;
-    float3 wn = waterSurfaceNormal(worldXZ, t);
-    float2 wp = worldXZ * (scale * 6.28318f) + wn.xz;
+// One octave of the iterative web, over a domain already scaled to radians.
+// The wrap keeps the iteration numerically bounded at large world
+// coordinates, which makes a single octave exactly periodic per tile.
+static float causticOctave(float2 wp, float t, int iterations) {
     // GLSL-style positive wrap: MSL fmod follows the dividend's sign, which
     // would flip the pattern's anchor across the world origin.
     float2 p = wp - 6.28318f * floor(wp / 6.28318f) - 250.0f;
     float2 i = p;
     float c = 1.0f;
     const float inten = 0.005f;
-    for (int n = 0; n < 5; ++n) {
+    for (int n = 0; n < iterations; ++n) {
         float tt = t * (1.0f - (3.5f / float(n + 1)));
         i = p + float2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
         c += 1.0f / length(float2(p.x / (sin(i.x + tt) / inten), p.y / (cos(i.y + tt) / inten)));
     }
-    c /= 5.0f;
+    c /= float(iterations);
     c = 1.17f - pow(c, 1.4f);
+    return pow(abs(c), 8.0f);
+}
+
+// floorDepth is the shaded point's depth below the water surface in blocks.
+// Physically the crisp web is focused by the short ripples (cell size tracks
+// ripple wavelength) and the focus blurs away with distance from the surface,
+// so shallow floors show fine sharp cells and deep floors only soft, large
+// patches from the swells — a fixed web at every depth read as painted-on.
+static float causticPattern(float2 worldXZ, float t, float floorDepth) {
+    // Warp the lookup by the wave gradient (unscaled world xz, so it uses the
+    // real per-block wave frequencies), scaled up so the web arms visibly
+    // wiggle with the same ripples that focus them.
+    float3 wn = waterSurfaceNormal(worldXZ, t);
+    float2 warp = wn.xz * 3.0f;
+    // One crisp web, MODULATED by a slow rotated octave. A single wrapped
+    // octave is exactly periodic (a visible grid of identical ~2-block cells
+    // covered every floor); the incommensurate rotated modulator varies the
+    // web's brightness over a beat period of hundreds of blocks, so no
+    // repetition survives to the eye — while the arms stay sharp (summing two
+    // full webs blurred them into mush instead).
+    const float freqA = 0.30f * 6.28318f; // ~3.3 block web cells (ripple scale)
+    const float freqB = 0.11f * 6.28318f; // ~9 block modulation (swell scale)
+    float2 pA = worldXZ * freqA + warp;
+    float2 rot = float2(worldXZ.x * 0.7986f - worldXZ.y * 0.6018f,
+                        worldXZ.x * 0.6018f + worldXZ.y * 0.7986f);
+    float2 pB = rot * freqB + warp + float2(87.31f, -42.77f);
+    float web = causticOctave(pA, t, 5);
+    float modulation = saturate(causticOctave(pB, t * 0.7f, 3));
+    // Defocus with depth: the crisp ripple web washes out over ~8 blocks,
+    // leaving the broad swell-scale patches.
+    float defocus = saturate(floorDepth * 0.12f);
+    float focused = web * (0.5f + 0.9f * modulation);
+    float diffuse = modulation * 0.8f;
     // Saturate: the web centers overshoot 1, and an unclamped HDR caustic times
     // its gain crossed the bloom threshold across whole floors (white-out).
-    return saturate(pow(abs(c), 8.0f));
+    return saturate(mix(focused, diffuse, defocus));
 }
 
 // Camera-relative world position of a screen UV + its stored depth. Keeping
@@ -526,8 +560,10 @@ static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool under
     const int STEPS = 24;
     // Jitter the first stride per pixel (the engine's IGN convention): a
     // coherent march start turned the coarse steps into visible stair bands
-    // across every reflection.
-    float stride = 1.5f * (0.75f + 0.5f * interleavedGradientNoise(fragPx));
+    // across every reflection. The range is deliberately narrow — wide jitter
+    // traded the bands for salt-and-pepper speckle, and with MSAA instead of
+    // a temporal history there is nothing downstream to average it away.
+    float stride = 1.5f * (0.88f + 0.24f * interleavedGradientNoise(fragPx));
     float3 pos = origin;
     for (int i = 0; i < STEPS; ++i) {
         float3 prev = pos;
@@ -564,11 +600,15 @@ static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool under
         }
         float4 hclip = water.cameraRelativeViewProjection * float4(hi, 1.0f);
         float2 hitUV = (hclip.xy / hclip.w) * float2(0.5f, -0.5f) + 0.5f;
-        // Reject a hit hiding far behind a thick occluder (a false crossing).
+        // Reject a hit hiding far behind a thick occluder (a false crossing),
+        // but keep marching rather than giving up: bailing out here flipped
+        // neighboring jittered pixels between hit and sky fallback, which
+        // read as speckle noise along every reflection silhouette.
         float3 hitRelative =
             reconstructCameraRelative(hitUV, sceneDepth.sample(depthPoint, hitUV), water);
         if (length(hi) - length(hitRelative) > 1.5f) {
-            break;
+            pos = hi;
+            continue;
         }
         // Fade as the hit nears a screen edge (data runs out there).
         float2 e = smoothstep(0.0f, 0.12f, hitUV) * smoothstep(0.0f, 0.12f, 1.0f - hitUV);
@@ -653,18 +693,26 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // above-water content, which painted mis-oriented white bands onto the
     // transmission — the from-below floor gets its caustics from the overlay.
     if (!fromBelow) {
-        float caustic = causticPattern(refractedWorld.xz, water.time) * exp(-depthBelow * 0.22f);
+        float caustic =
+            causticPattern(refractedWorld.xz, water.time, depthBelow) * exp(-depthBelow * 0.22f);
         refracted +=
             water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
     }
 
     // ---- Absorption: shallow water reads turquoise and filters toward deep
-    // blue with depth (red light dies first), the floor showing through shallows
+    // blue with depth (red light dies first), the floor showing through
+    // shallows. From above, waterDepth is the submerged column behind the
+    // surface. From below it is the distance to the sky or shore in the AIR
+    // beyond the surface, which absorbs nothing — the underwater overlay
+    // already absorbs the eye-to-surface water segment, so absorbing here
+    // turned the whole Snell window into opaque flat blue instead of a view
+    // of the world above.
     float3 shallowTint = float3(0.10f, 0.42f, 0.48f);
     float3 deepTint = float3(0.02f, 0.10f, 0.22f);
     float3 waterColor = mix(shallowTint, deepTint, saturate(waterDepth * 0.12f));
     float absorb = 1.0f - exp(-waterDepth * 0.16f);
-    float3 body = mix(refracted * float3(0.75f, 0.92f, 0.96f), waterColor, absorb);
+    float3 body =
+        fromBelow ? refracted : mix(refracted * float3(0.75f, 0.92f, 0.96f), waterColor, absorb);
 
     // ---- Fresnel reflection + sun sparkle (skylight gates both, so flooded
     // caves reflect darkness rather than open sky). From below the physics
@@ -713,7 +761,11 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     if (!fromBelow) {
         float sunAlign = saturate(dot(Rsky, water.sunDirection));
         float sparkle = pow(sunAlign, 240.0f) * 2.0f + pow(sunAlign, 32.0f) * 0.25f;
-        color += water.sunColor * sparkle * in.vSkyLight;
+        // The glint is a specular reflection, so it obeys the same Fresnel as
+        // the sky term: ~2% at normal incidence, rising toward grazing.
+        // Unscaled, a zenith sun mirrored in every up-facing wave below the
+        // camera and bloomed into one giant white blob on the surface.
+        color += water.sunColor * sparkle * fresnel * in.vSkyLight;
     }
 
     color =
@@ -728,7 +780,8 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     if (!fromBelow) {
         float foamBand =
             smoothstep(0.05f, 0.4f, waterDepth) * (1.0f - smoothstep(0.4f, 1.4f, waterDepth));
-        float foam = foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz, water.time));
+        float foam =
+            foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz, water.time, 0.0f));
         color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * in.vSkyLight);
     }
 
@@ -840,7 +893,8 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
     // the surface pass already shaded), and the focusing decays with depth.
     float submerged = step(world.y, water.waterSurfaceY);
     float throughSurface = 1.0f - smoothstep(exitDist * 0.9f, exitDist * 1.1f, dist);
-    float caustic = causticPattern(world.xz, t) * exp(-pointDepth * 0.05f) * upFacing * submerged *
+    float caustic = causticPattern(world.xz, t, pointDepth) * exp(-pointDepth * 0.05f) *
+                    upFacing * submerged *
                     throughSurface * sunUp * water.skyExposure;
 
     // ---- Transmittance (dual-source color 1): the scene is multiplied per
