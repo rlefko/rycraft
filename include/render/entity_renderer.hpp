@@ -5,6 +5,7 @@
 #include "entity/entity.hpp"
 #include "render/shader_types.hpp"
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -34,8 +35,9 @@ private:
         uint32_t indexCount = 0;
     };
 
-    static constexpr int TYPE_COUNT = 4; // SHEEP, COW, PIG, CHICKEN
-    Mesh _meshes[TYPE_COUNT][2];         // [type][adult=0 / baby=1]
+    static constexpr size_t TYPE_COUNT = ENTITY_TYPE_COUNT;
+    static_assert(TYPE_COUNT == static_cast<size_t>(EntityType::COUNT));
+    std::array<std::array<Mesh, 2>, TYPE_COUNT> _meshes; // [type][adult=0 / baby=1]
 
     id<MTLRenderPipelineState> _pipelineState;
 
