@@ -106,10 +106,12 @@ struct WaterWave {
     float amp;         // crest height in blocks
     float speed;       // temporal frequency (radians per second)
 };
+// Amplitudes total ~0.21 blocks: visible swell at eye level, still far under
+// the 0.875 surface inset so a displaced top never pokes above its side quads.
 constant WaterWave WATER_WAVES[3] = {
-    {metal::float2(0.80f, 0.60f), 0.52f, 0.060f, 1.1f},
-    {metal::float2(-0.50f, 0.87f), 0.80f, 0.035f, 1.5f},
-    {metal::float2(0.20f, -0.98f), 1.05f, 0.020f, 2.1f},
+    {metal::float2(0.80f, 0.60f), 0.52f, 0.110f, 1.1f},
+    {metal::float2(-0.50f, 0.87f), 0.80f, 0.065f, 1.5f},
+    {metal::float2(0.20f, -0.98f), 1.05f, 0.040f, 2.1f},
 };
 
 static inline float waterWaveHeight(metal::float2 p, float t) {
@@ -130,9 +132,12 @@ static inline metal::float3 waterSurfaceNormal(metal::float2 p, float t) {
         WaterWave w = WATER_WAVES[i];
         g += w.amp * w.freq * w.dir * metal::cos(metal::dot(p, w.dir) * w.freq + t * w.speed);
     }
-    // Faint fine ripple, shading only (not displaced), for sparkle
-    g += 0.008f *
+    // Fine ripple octaves, shading only (not displaced): they carry the
+    // perceived chop and sparkle that geometric displacement alone cannot.
+    g += 0.014f *
          metal::float2(metal::cos(p.x * 1.9f + t * 2.3f), metal::cos(p.y * 2.2f - t * 2.0f));
+    g += 0.007f * metal::float2(metal::cos((p.x + p.y) * 3.7f + t * 3.1f),
+                                metal::cos((p.y - p.x) * 3.3f - t * 2.7f));
     const float slope = 1.5f;
     return metal::normalize(metal::float3(-g.x * slope, 1.0f, -g.y * slope));
 }
