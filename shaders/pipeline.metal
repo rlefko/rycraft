@@ -551,6 +551,35 @@ static float3 reconstructCameraRelative(float2 uv, float depth, constant WaterUn
 // absorb differently along different ray types.
 constant float3 WATER_SIGMA_A = float3(0.16f, 0.05f, 0.028f);
 
+// Water volume scatter color and ambient floor. ONE definition shared by the
+// underwater overlay's inscatter and the total-internal-reflection fallback
+// in the water pass, so mirrored water can never glow a different color than
+// the volume it reflects.
+constant float3 WATER_SCATTER = float3(0.02f, 0.10f, 0.17f);
+constant float3 WATER_AMBIENT = float3(0.004f, 0.012f, 0.02f);
+
+// Exact unpolarized dielectric Fresnel for the air/water interface: the mean
+// of the s- and p-polarized reflectances, with total internal reflection
+// falling out of Snell's law when the transmitted sine exceeds one. The
+// Schlick approximations this replaces needed a hand-tuned ease near the
+// critical angle and read as either a mushy window edge or hard mirror
+// panels; the exact form costs a handful of ALU on water pixels only.
+static float waterFresnel(float cosI, bool fromWater) {
+    const float N_AIR = 1.0f;
+    const float N_WATER = 1.33f;
+    float n1 = fromWater ? N_WATER : N_AIR;
+    float n2 = fromWater ? N_AIR : N_WATER;
+    float eta = n1 / n2;
+    float sinT2 = eta * eta * (1.0f - cosI * cosI);
+    if (sinT2 >= 1.0f) {
+        return 1.0f; // total internal reflection
+    }
+    float cosT = sqrt(1.0f - sinT2);
+    float rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
+    float rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
+    return 0.5f * (rs * rs + rp * rp);
+}
+
 static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool underwater,
                             depth2d<float> sceneDepth, texture2d<float> sceneColor,
                             constant WaterUniforms& water) {
@@ -658,6 +687,16 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
                        0.08f;
         N = normalize(N + float3(0.0f, streak, 0.0f));
     }
+    // Which side of the interface this fragment shows is a per-fragment
+    // geometric fact, not a camera flag: an elevated lake's underside seen
+    // from dry land is still the water-to-air interface. Branching on the
+    // camera alone gave such surfaces air-side Fresnel against a backfacing
+    // normal, which saturated into a full sky mirror.
+    float NdotV = dot(V, N);
+    bool underside = NdotV < 0.0f;
+    float cosI = saturate(abs(NdotV));
+    // The camera flag still decides what medium the eye and the SSR's
+    // reflected rays travel through.
     bool fromBelow = water.cameraUnderwater > 0.5f;
 
     // Reconstruct both points in the same camera-relative frame. Absolute
@@ -670,7 +709,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // shoreline so shallow edges don't smear. From below the distorted tap
     // crosses the surface boundary into unrelated above-water content, so the
     // transmission samples straight through instead.
-    float distortion = fromBelow ? 0.0f : min(waterDepth, 4.0f) * 0.25f;
+    float distortion = underside ? 0.0f : min(waterDepth, 4.0f) * 0.25f;
     float2 refractUV = clamp(screenUV + N.xz * 0.035f * distortion, 0.001f, 0.999f);
     float refractDepth = sceneDepth.sample(screenSampler, refractUV);
     if (refractDepth < in.clipPosition.z) {
@@ -692,7 +731,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // cell scale and wave warp). From below the reconstruction lands on
     // above-water content, which painted mis-oriented white bands onto the
     // transmission — the from-below floor gets its caustics from the overlay.
-    if (!fromBelow) {
+    if (!underside) {
         float caustic =
             causticPattern(refractedWorld.xz, water.time, depthBelow) * exp(-depthBelow * 0.22f);
         refracted +=
@@ -712,44 +751,31 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     float3 waterColor = mix(shallowTint, deepTint, saturate(waterDepth * 0.12f));
     float absorb = 1.0f - exp(-waterDepth * 0.16f);
     float3 body =
-        fromBelow ? refracted : mix(refracted * float3(0.75f, 0.92f, 0.96f), waterColor, absorb);
+        underside ? refracted : mix(refracted * float3(0.75f, 0.92f, 0.96f), waterColor, absorb);
 
     // ---- Fresnel reflection + sun sparkle (skylight gates both, so flooded
     // caves reflect darkness rather than open sky). From below the physics
     // flips: water-to-air refraction hits total internal reflection beyond the
     // critical angle (~48.6 deg), so the surface turns into a mirror of the
     // underwater scene (SSR provides it) instead of a window to the sky.
-    float3 R = reflect(-V, N);                // true reflection, for SSR marching
+    float3 R = reflect(-V, N);                // symmetric in the normal's sign
     float3 Rsky = float3(R.x, abs(R.y), R.z); // up-facing form for sky + sparkle
-    // From below, the interface normal faces the camera as -N: dot(V, N)
-    // saturates to zero against the up-facing wave normal, which read as
-    // sinT2 >= 1 (total internal reflection) for EVERY submerged pixel — the
-    // whole surface became a permanent mirror and the Snell window never
-    // transmitted. reflect() is symmetric in the normal's sign, so only the
-    // Fresnel angle needs the flip.
-    float cosI = saturate(dot(V, fromBelow ? -N : N));
-    float fresnel;
+    // Exact dielectric Fresnel for whichever side of the interface this
+    // fragment shows: from the water side, total internal reflection falls
+    // out of Snell's law past ~48.6 degrees, and inside that window the
+    // transmission dominates (~2% reflectance near vertical).
+    float fresnel = waterFresnel(cosI, underside);
     float3 reflection;
-    if (fromBelow) {
-        const float ETA = 1.33f; // water/air refractive index ratio
-        float sinT2 = ETA * ETA * (1.0f - cosI * cosI);
-        if (sinT2 >= 1.0f) {
-            fresnel = 1.0f; // total internal reflection: pure mirror
-        } else {
-            // Schlick against the transmitted angle (the dense-side form),
-            // eased into the mirror near the critical angle so per-quad wave
-            // normals don't flip whole cells into hard-edged panels.
-            const float R0 = 0.02f; // ((1.33-1)/(1.33+1))^2
-            float cosT = sqrt(1.0f - sinT2);
-            fresnel = R0 + (1.0f - R0) * pow(1.0f - cosT, 5.0f);
-            fresnel = mix(fresnel, 1.0f, smoothstep(0.90f, 1.0f, sinT2));
-        }
-        // The mirror shows the underwater scene: SSR marches the downward
-        // reflected ray; where it misses, the deep water body shows (the
-        // bright shallow tint here read as glowing panels overhead).
-        reflection = deepTint;
+    if (underside) {
+        // The mirror shows the underwater scene: SSR marches the reflected
+        // ray; where it misses, the sunlit water volume glows through the
+        // same scatter terms as the overlay. A near-black fallback here read
+        // as flat dark panels, where a real internal mirror reflects
+        // luminous water.
+        reflection = WATER_SCATTER * 1.5f * water.sunColor * saturate(water.sunDirection.y) *
+                         water.skyExposure +
+                     WATER_AMBIENT;
     } else {
-        fresnel = mix(0.04f, 1.0f, pow(1.0f - cosI, 5.0f));
         float horizonBlend = pow(1.0f - saturate(Rsky.y), 2.0f);
         reflection = mix(water.zenithColor, water.horizonColor, horizonBlend);
     }
@@ -763,8 +789,8 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
         reflection = mix(reflection, ssr.rgb, ssr.a * water.ssrStrength);
     }
 
-    float3 color = mix(body, reflection, fresnel * (fromBelow ? 1.0f : in.vSkyLight));
-    if (!fromBelow) {
+    float3 color = mix(body, reflection, fresnel * (underside ? 1.0f : in.vSkyLight));
+    if (!underside) {
         float sunAlign = saturate(dot(Rsky, water.sunDirection));
         float sparkle = pow(sunAlign, 240.0f) * 2.0f + pow(sunAlign, 32.0f) * 0.25f;
         // The glint is a specular reflection, so it obeys the same Fresnel as
@@ -783,7 +809,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // by skylight so flooded caves stay dark, and by the above-water view —
     // foam is surface froth, so from below it painted white streaks along the
     // waterline. Reuses the caustic web to break the band into moving flecks.
-    if (!fromBelow) {
+    if (!underside) {
         // Kept narrow and well under full white: froth is sparse flecks, and
         // a wide bright band rimmed every water body like a glowing outline.
         float foamBand =
@@ -922,12 +948,12 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
     const float g = 0.45f;
     float phase = (1.0f - g * g) / pow(1.0f + g * g - 2.0f * g * cosSun, 1.5f); // 1 = isotropic
     float phaseN = phase / (1.0f + phase); // capped so the sun lobe brightens, never blows out
-    const float3 SCATTER_COLOR = float3(0.02f, 0.10f, 0.17f);
+    const float3 SCATTER_COLOR = WATER_SCATTER; // shared with the TIR mirror fallback
     float3 volLight =
         water.sunColor * sunUp * water.skyExposure * exp(-SIGMA_A * camDepth * 0.7f);
     float buildup = 1.0f - exp(-0.15f * waterPath);
     float3 inscatter = SCATTER_COLOR * volLight * (0.55f + 0.9f * phaseN) * buildup;
-    inscatter += float3(0.004f, 0.012f, 0.02f) * buildup;
+    inscatter += WATER_AMBIENT * buildup;
 
     UnderwaterOverlayOut out;
     out.inscatter = float4(inscatter, 1.0f);
