@@ -721,7 +721,13 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // underwater scene (SSR provides it) instead of a window to the sky.
     float3 R = reflect(-V, N);                // true reflection, for SSR marching
     float3 Rsky = float3(R.x, abs(R.y), R.z); // up-facing form for sky + sparkle
-    float cosI = saturate(dot(V, N));
+    // From below, the interface normal faces the camera as -N: dot(V, N)
+    // saturates to zero against the up-facing wave normal, which read as
+    // sinT2 >= 1 (total internal reflection) for EVERY submerged pixel — the
+    // whole surface became a permanent mirror and the Snell window never
+    // transmitted. reflect() is symmetric in the normal's sign, so only the
+    // Fresnel angle needs the flip.
+    float cosI = saturate(dot(V, fromBelow ? -N : N));
     float fresnel;
     float3 reflection;
     if (fromBelow) {
@@ -778,11 +784,13 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // foam is surface froth, so from below it painted white streaks along the
     // waterline. Reuses the caustic web to break the band into moving flecks.
     if (!fromBelow) {
+        // Kept narrow and well under full white: froth is sparse flecks, and
+        // a wide bright band rimmed every water body like a glowing outline.
         float foamBand =
-            smoothstep(0.05f, 0.4f, waterDepth) * (1.0f - smoothstep(0.4f, 1.4f, waterDepth));
+            smoothstep(0.05f, 0.35f, waterDepth) * (1.0f - smoothstep(0.35f, 0.9f, waterDepth));
         float foam =
             foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz, water.time, 0.0f));
-        color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * in.vSkyLight);
+        color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * 0.45f * in.vSkyLight);
     }
 
     color = mix(color, in.vOverlayColor.rgb, saturate(in.vOverlayColor.a));
