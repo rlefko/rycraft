@@ -4,9 +4,12 @@
 #include "world/chunk.hpp"
 #include "world/noise.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <numeric>
+#include <vector>
 
 // BGRA8Unorm pixel — 4 bytes per pixel
 struct alignas(4) BgraPixel {
@@ -32,6 +35,83 @@ static void fillTilePixel(BgraPixel* pixel, double baseR, double baseG, double b
     pixel->b = clampToByte(baseB * factor);
     pixel->a = alpha;
 }
+
+namespace {
+
+constexpr uint8_t ALPHA_TEST_CUTOFF = 128;
+
+std::vector<BgraPixel> downsampleAlphaAware(const std::vector<BgraPixel>& source,
+                                            uint32_t sourceEdge) {
+    const uint32_t destinationEdge = sourceEdge / 2;
+    std::vector<BgraPixel> destination(destinationEdge * destinationEdge);
+
+    for (uint32_t y = 0; y < destinationEdge; ++y) {
+        for (uint32_t x = 0; x < destinationEdge; ++x) {
+            uint32_t alphaSum = 0;
+            uint32_t bluePremultiplied = 0;
+            uint32_t greenPremultiplied = 0;
+            uint32_t redPremultiplied = 0;
+            for (uint32_t childY = 0; childY < 2; ++childY) {
+                for (uint32_t childX = 0; childX < 2; ++childX) {
+                    const BgraPixel& child = source[(y * 2 + childY) * sourceEdge + x * 2 + childX];
+                    alphaSum += child.a;
+                    bluePremultiplied += static_cast<uint32_t>(child.b) * child.a;
+                    greenPremultiplied += static_cast<uint32_t>(child.g) * child.a;
+                    redPremultiplied += static_cast<uint32_t>(child.r) * child.a;
+                }
+            }
+
+            BgraPixel& result = destination[y * destinationEdge + x];
+            result.a = static_cast<uint8_t>((alphaSum + 2) / 4);
+            if (alphaSum == 0)
+                continue;
+
+            result.b = static_cast<uint8_t>((bluePremultiplied + alphaSum / 2) / alphaSum);
+            result.g = static_cast<uint8_t>((greenPremultiplied + alphaSum / 2) / alphaSum);
+            result.r = static_cast<uint8_t>((redPremultiplied + alphaSum / 2) / alphaSum);
+        }
+    }
+    return destination;
+}
+
+uint32_t alphaCoverage(const std::vector<BgraPixel>& pixels) {
+    return static_cast<uint32_t>(std::count_if(pixels.begin(), pixels.end(), [](BgraPixel pixel) {
+        return pixel.a >= ALPHA_TEST_CUTOFF;
+    }));
+}
+
+void preserveAlphaCoverage(std::vector<BgraPixel>& pixels, uint32_t baseCovered,
+                           uint32_t baseTexelCount) {
+    if (baseCovered == 0 || baseCovered == baseTexelCount)
+        return;
+
+    // Quantize the base-level coverage to this mip's texel count. A nonempty
+    // cutout keeps at least one covered texel so thin flora cannot disappear
+    // completely at the tail of the mip chain.
+    uint32_t desiredCovered = static_cast<uint32_t>(
+        (static_cast<uint64_t>(baseCovered) * pixels.size() + baseTexelCount / 2) / baseTexelCount);
+    desiredCovered = std::clamp(desiredCovered, 1U, static_cast<uint32_t>(pixels.size()));
+
+    // Rank by the box-filtered alpha and resolve ties by texel index. Moving
+    // the selected values to opposite sides of the shader's fixed cutoff
+    // preserves the exact representable coverage without platform-dependent
+    // floating-point searches or black fringes in the RGB channels.
+    std::vector<uint32_t> ranked(pixels.size());
+    std::iota(ranked.begin(), ranked.end(), 0U);
+    std::stable_sort(ranked.begin(), ranked.end(), [&](uint32_t left, uint32_t right) {
+        return pixels[left].a > pixels[right].a;
+    });
+    for (uint32_t rank = 0; rank < ranked.size(); ++rank) {
+        BgraPixel& pixel = pixels[ranked[rank]];
+        if (rank < desiredCovered) {
+            pixel.a = std::max(pixel.a, ALPHA_TEST_CUTOFF);
+        } else {
+            pixel.a = std::min<uint8_t>(pixel.a, ALPHA_TEST_CUTOFF - 1);
+        }
+    }
+}
+
+} // namespace
 
 void BlockTextureArray::generateLayer(uint8_t layer) {
     std::array<BgraPixel, TILE_SIZE * TILE_SIZE> tilePixels;
@@ -189,6 +269,22 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                 break;
             }
 
+            case BlockType::ACACIA_LOG:
+                paintBark(0.55, 0.28, 0.12, 0.32);
+                break;
+            case BlockType::JUNGLE_LOG:
+                paintBark(0.42, 0.27, 0.14, 0.30);
+                break;
+            case BlockType::MANGROVE_LOG:
+                paintBark(0.38, 0.18, 0.12, 0.38);
+                break;
+            case BlockType::PALM_LOG:
+                paintBark(0.58, 0.43, 0.22, 0.24);
+                break;
+            case BlockType::WILLOW_LOG:
+                paintBark(0.35, 0.31, 0.19, 0.28);
+                break;
+
             case BlockType::BIRCH_LOG: {
                 // Near-white bark with dark horizontal dash patches
                 for (uint32_t y = 0; y < TILE_SIZE; ++y) {
@@ -212,16 +308,42 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
 
             case BlockType::LEAVES:
             case BlockType::BIRCH_LEAVES:
-            case BlockType::SPRUCE_LEAVES: {
+            case BlockType::SPRUCE_LEAVES:
+            case BlockType::ACACIA_LEAVES:
+            case BlockType::JUNGLE_LEAVES:
+            case BlockType::MANGROVE_LEAVES:
+            case BlockType::PALM_LEAVES:
+            case BlockType::WILLOW_LEAVES: {
                 double leafR = 0.2, leafG = 0.5, leafB = 0.15; // oak
-                if (static_cast<BlockType>(layer) == BlockType::BIRCH_LEAVES) {
+                BlockType leaf = static_cast<BlockType>(layer);
+                if (leaf == BlockType::BIRCH_LEAVES) {
                     leafR = 0.35;
                     leafG = 0.55;
                     leafB = 0.25;
-                } else if (static_cast<BlockType>(layer) == BlockType::SPRUCE_LEAVES) {
+                } else if (leaf == BlockType::SPRUCE_LEAVES) {
                     leafR = 0.12;
                     leafG = 0.35;
                     leafB = 0.18;
+                } else if (leaf == BlockType::ACACIA_LEAVES) {
+                    leafR = 0.30;
+                    leafG = 0.52;
+                    leafB = 0.16;
+                } else if (leaf == BlockType::JUNGLE_LEAVES) {
+                    leafR = 0.10;
+                    leafG = 0.48;
+                    leafB = 0.13;
+                } else if (leaf == BlockType::MANGROVE_LEAVES) {
+                    leafR = 0.12;
+                    leafG = 0.40;
+                    leafB = 0.20;
+                } else if (leaf == BlockType::PALM_LEAVES) {
+                    leafR = 0.20;
+                    leafG = 0.58;
+                    leafB = 0.18;
+                } else if (leaf == BlockType::WILLOW_LEAVES) {
+                    leafR = 0.28;
+                    leafG = 0.52;
+                    leafB = 0.22;
                 }
                 for (uint32_t y = 0; y < TILE_SIZE; ++y) {
                     for (uint32_t x = 0; x < TILE_SIZE; ++x) {
@@ -328,6 +450,88 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                     for (uint32_t x = 0; x < TILE_SIZE; ++x) {
                         double n = noise.noise2D(x * 0.25, y * 0.25);
                         fillTilePixel(&getTilePixel(x, y), 0.55, 0.55, 0.55, n, 0.15);
+                    }
+                }
+                break;
+            }
+
+            case BlockType::MUD:
+            case BlockType::CLAY:
+            case BlockType::SILT:
+            case BlockType::BASALT:
+            case BlockType::VOLCANIC_ASH:
+            case BlockType::LIMESTONE:
+            case BlockType::OBSIDIAN:
+            case BlockType::ANDESITE: {
+                double r = 0.30, g = 0.23, b = 0.17;
+                switch (static_cast<BlockType>(layer)) {
+                    case BlockType::CLAY:
+                        r = 0.56;
+                        g = 0.58;
+                        b = 0.60;
+                        break;
+                    case BlockType::SILT:
+                        r = 0.50;
+                        g = 0.43;
+                        b = 0.31;
+                        break;
+                    case BlockType::BASALT:
+                        r = 0.20;
+                        g = 0.21;
+                        b = 0.22;
+                        break;
+                    case BlockType::VOLCANIC_ASH:
+                        r = 0.27;
+                        g = 0.26;
+                        b = 0.25;
+                        break;
+                    case BlockType::LIMESTONE:
+                        r = 0.72;
+                        g = 0.70;
+                        b = 0.62;
+                        break;
+                    case BlockType::OBSIDIAN:
+                        r = 0.12;
+                        g = 0.08;
+                        b = 0.17;
+                        break;
+                    case BlockType::ANDESITE:
+                        r = 0.42;
+                        g = 0.43;
+                        b = 0.42;
+                        break;
+                    default:
+                        break;
+                }
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.24, y * 0.24);
+                        double variation = 0.13;
+                        switch (static_cast<BlockType>(layer)) {
+                            case BlockType::BASALT:
+                                n = n * 0.72 + noise.noise2D(x * 0.62, y * 0.18) * 0.28;
+                                variation = 0.10;
+                                break;
+                            case BlockType::VOLCANIC_ASH:
+                                n = noise.noise2D(x * 0.52, y * 0.52);
+                                variation = 0.07;
+                                break;
+                            case BlockType::LIMESTONE:
+                                n = n * 0.78 + ((y + 1) % 5 == 0 ? -0.22 : 0.0);
+                                variation = 0.11;
+                                break;
+                            case BlockType::OBSIDIAN:
+                                n = n * 0.45 + ((x + y * 2) % 13 == 0 ? 0.48 : -0.05);
+                                variation = 0.09;
+                                break;
+                            case BlockType::ANDESITE:
+                                n = n * 0.60 + noise.noise2D(x * 0.58, y * 0.58) * 0.40;
+                                variation = 0.14;
+                                break;
+                            default:
+                                break;
+                        }
+                        fillTilePixel(&getTilePixel(x, y), r, g, b, n, variation);
                     }
                 }
                 break;
@@ -455,8 +659,10 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
             }
 
             case BlockType::FLOWER_YELLOW:
-            case BlockType::FLOWER_RED: {
+            case BlockType::FLOWER_RED:
+            case BlockType::FLOWER_BLUE: {
                 bool red = static_cast<BlockType>(layer) == BlockType::FLOWER_RED;
+                bool blue = static_cast<BlockType>(layer) == BlockType::FLOWER_BLUE;
                 // Stem: bottom half, center column with a leaf nub
                 for (uint32_t py = 8; py < TILE_SIZE; ++py) {
                     auto& p = getTilePixel(7, py);
@@ -473,9 +679,9 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                             continue;
                         auto& p = getTilePixel(static_cast<uint32_t>(7 + dx),
                                                static_cast<uint32_t>(5 + dy));
-                        p.r = clampToByte(red ? 0.85 : 0.9);
-                        p.g = clampToByte(red ? 0.15 : 0.8);
-                        p.b = clampToByte(red ? 0.15 : 0.2);
+                        p.r = clampToByte(blue ? 0.25 : (red ? 0.85 : 0.9));
+                        p.g = clampToByte(blue ? 0.45 : (red ? 0.15 : 0.8));
+                        p.b = clampToByte(blue ? 0.90 : (red ? 0.15 : 0.2));
                         p.a = 255;
                     }
                 }
@@ -483,6 +689,45 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                 center.r = clampToByte(red ? 0.95 : 0.6);
                 center.g = clampToByte(red ? 0.85 : 0.4);
                 center.b = clampToByte(0.2);
+                break;
+            }
+
+            case BlockType::FERN:
+            case BlockType::SHRUB:
+            case BlockType::CATTAIL:
+            case BlockType::SUCCULENT: {
+                double r = 0.18, g = 0.48, b = 0.16;
+                if (static_cast<BlockType>(layer) == BlockType::CATTAIL) {
+                    r = 0.42;
+                    g = 0.48;
+                    b = 0.18;
+                } else if (static_cast<BlockType>(layer) == BlockType::SUCCULENT) {
+                    r = 0.28;
+                    g = 0.52;
+                    b = 0.34;
+                }
+                for (uint32_t py = 3; py < TILE_SIZE; ++py) {
+                    int halfWidth = std::max(0, 5 - std::abs(11 - static_cast<int>(py)) / 2);
+                    for (int dx = -halfWidth; dx <= halfWidth; ++dx) {
+                        uint32_t px = static_cast<uint32_t>(std::clamp(7 + dx, 0, 15));
+                        fillTilePixel(&getTilePixel(px, py), r, g, b,
+                                      noise.noise2D(px * 0.4, py * 0.4), 0.15);
+                    }
+                }
+                break;
+            }
+
+            case BlockType::LILY_PAD: {
+                for (uint32_t y = 2; y < 14; ++y) {
+                    for (uint32_t x = 2; x < 14; ++x) {
+                        double dx = static_cast<double>(x) - 7.5;
+                        double dy = static_cast<double>(y) - 7.5;
+                        if (dx * dx + dy * dy > 34.0 || (x >= 8 && y <= 7))
+                            continue;
+                        fillTilePixel(&getTilePixel(x, y), 0.18, 0.48, 0.16,
+                                      noise.noise2D(x * 0.3, y * 0.3), 0.12);
+                    }
+                }
                 break;
             }
 
@@ -578,12 +823,25 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
         }
     }
 
-    [_texture replaceRegion:MTLRegionMake2D(0, 0, TILE_SIZE, TILE_SIZE)
-                mipmapLevel:0
-                      slice:layer
-                  withBytes:tilePixels.data()
-                bytesPerRow:TILE_SIZE * sizeof(BgraPixel)
-              bytesPerImage:0];
+    std::vector<BgraPixel> mipPixels(tilePixels.begin(), tilePixels.end());
+    const uint32_t baseCovered = alphaCoverage(mipPixels);
+    constexpr uint32_t BASE_TEXEL_COUNT = TILE_SIZE * TILE_SIZE;
+    uint32_t mipEdge = TILE_SIZE;
+
+    for (uint32_t mipLevel = 0; mipLevel < MIP_LEVEL_COUNT; ++mipLevel) {
+        [_texture replaceRegion:MTLRegionMake2D(0, 0, mipEdge, mipEdge)
+                    mipmapLevel:mipLevel
+                          slice:layer
+                      withBytes:mipPixels.data()
+                    bytesPerRow:mipEdge * sizeof(BgraPixel)
+                  bytesPerImage:0];
+
+        if (mipLevel + 1 == MIP_LEVEL_COUNT)
+            break;
+        mipPixels = downsampleAlphaAware(mipPixels, mipEdge);
+        preserveAlphaCoverage(mipPixels, baseCovered, BASE_TEXEL_COUNT);
+        mipEdge /= 2;
+    }
 }
 
 BlockTextureArray::BlockTextureArray(id<MTLDevice> device) {
@@ -593,6 +851,7 @@ BlockTextureArray::BlockTextureArray(id<MTLDevice> device) {
     descriptor.width = TILE_SIZE;
     descriptor.height = TILE_SIZE;
     descriptor.arrayLength = TEXTURE_LAYER_COUNT;
+    descriptor.mipmapLevelCount = MIP_LEVEL_COUNT;
     descriptor.usage = MTLTextureUsageShaderRead;
 
     _texture = [device newTextureWithDescriptor:descriptor];
@@ -604,8 +863,9 @@ BlockTextureArray::BlockTextureArray(id<MTLDevice> device) {
     // across every block it covers.
     auto samplerDesc = [[MTLSamplerDescriptor alloc] init];
     samplerDesc.magFilter = MTLSamplerMinMagFilterNearest;
-    samplerDesc.minFilter = MTLSamplerMinMagFilterNearest;
-    samplerDesc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
+    samplerDesc.mipFilter = MTLSamplerMipFilterLinear;
+    samplerDesc.maxAnisotropy = MAX_ANISOTROPY;
     samplerDesc.sAddressMode = MTLSamplerAddressModeRepeat;
     samplerDesc.tAddressMode = MTLSamplerAddressModeRepeat;
     _sampler = [device newSamplerStateWithDescriptor:samplerDesc];

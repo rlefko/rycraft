@@ -1,180 +1,297 @@
 #pragma once
+
 #include "common/ema.hpp"
 #include "common/thread_pool.hpp"
 #include "world/chunk.hpp"
 #include "world/chunk_generator.hpp"
 #include "world/chunk_pos.hpp"
+#include "world/fluid.hpp"
 #include "world/mesh_snapshot.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 class SaveManager;
 
-// Sorts farthest-first so pop_back() consumes the nearest chunk next
-// (free function so priority ordering is unit-testable).
-void sortChunksByDistance(std::vector<ChunkPos>& chunks, int centerChunkX, int centerChunkZ);
+void sortChunksByDistance(std::vector<ChunkPos>& chunks, int64_t centerChunkX, int32_t centerChunkY,
+                          int64_t centerChunkZ);
+inline void sortChunksByDistance(std::vector<ChunkPos>& chunks, int64_t centerChunkX,
+                                 int64_t centerChunkZ) {
+    sortChunksByDistance(chunks, centerChunkX, 0, centerChunkZ);
+}
 
-// Generation submission window: nearest chunks stream through a small
-// in-flight set so a boundary cross re-prioritizes everything still queued
-// instead of fighting hundreds of already-submitted stale-priority tasks.
-inline constexpr size_t MAX_INFLIGHT_GEN = 32;
+inline constexpr size_t MAX_INFLIGHT_GEN = 64;
+inline constexpr size_t MAX_LOADED_CUBES = 32768;
+inline constexpr size_t MAX_MESH_RESIDENT_CUBES = 16384;
+inline constexpr size_t MAX_COLD_COLUMN_PLANS = 2;
+inline constexpr int DEFAULT_RENDER_DISTANCE_CHUNKS = 256;
+inline constexpr int MIN_RENDER_DISTANCE_CHUNKS = 4;
+inline constexpr int MAX_RENDER_DISTANCE_CHUNKS = 256;
+inline constexpr int MAX_EXACT_CUBIC_DISTANCE_CHUNKS = 32;
+inline constexpr int EXPLORATION_RADIUS_CHUNKS = 6;
+inline constexpr int EXPLORATION_VERTICAL_RADIUS_CUBES = 4;
+inline constexpr int HORIZONTAL_UNLOAD_HYSTERESIS_CHUNKS = 2;
+inline constexpr int VERTICAL_UNLOAD_HYSTERESIS_CUBES = 1;
+inline constexpr size_t COLUMN_PLAN_REBUILD_BATCH = 128;
+inline constexpr size_t COLUMN_PLAN_REBUILD_COOLDOWN_TICKS = 4;
 
-class World {
+struct StreamingWorkStats {
+    uint64_t activeSetRebuilds = 0;
+    uint64_t planApronCenters = 0;
+    uint64_t planApronExpansionAttempts = 0;
+    uint64_t planApronCubeExpansionEquivalent = 0;
+    uint64_t completedColumnPlans = 0;
+    uint64_t planDependentChecks = 0;
+    // Retained-cube visits the previous completion-wide scan would perform.
+    uint64_t fullRetainedScanEquivalent = 0;
+    uint64_t activeSetRebuildNotifications = 0;
+    uint64_t hysteresisRetainedCubes = 0;
+    uint64_t activeSetRequests = 0;
+    uint64_t activeSetRequestsCoalesced = 0;
+    uint64_t activeSetBuildsCanceled = 0;
+    float activeSetBuildMs = 0.0F;
+};
+inline constexpr size_t MAX_FLUID_RESUME_CUBES_PER_FRAME = 64;
+inline constexpr size_t MAX_FLUID_FRONTIER_RESUMES_PER_FRAME = 256;
+inline constexpr size_t MAX_FLUID_FRONTIER_RESUMES_PER_CUBE = 16;
+
+class World : public FluidWorldAccess {
 public:
-    explicit World(uint32_t seed, int viewDistance = 32);
+    explicit World(uint32_t seed, int viewDistance = DEFAULT_RENDER_DISTANCE_CHUNKS);
     ~World();
 
-    // Delete copy/move (contains non-copyable ThreadPool and mutex)
     World(const World&) = delete;
     World& operator=(const World&) = delete;
     World(World&&) = delete;
     World& operator=(World&&) = delete;
 
-    // Get or generate a chunk (thread-safe)
-    std::shared_ptr<Chunk> getChunk(int chunkX, int chunkZ);
+    std::shared_ptr<Chunk> getChunk(ChunkPos pos);
+    std::shared_ptr<Chunk> getChunk(int64_t chunkX, int32_t chunkY, int64_t chunkZ) {
+        return getChunk(ChunkPos{chunkX, chunkY, chunkZ});
+    }
+    // Compatibility for callers deliberately addressing the cube containing Y=0.
+    std::shared_ptr<Chunk> getChunk(int64_t chunkX, int64_t chunkZ) {
+        return getChunk(ChunkPos{chunkX, 0, chunkZ});
+    }
 
-    // Get block at world position (thread-safe; generates the chunk on a
-    // miss — never call from the render path)
-    BlockType getBlock(int x, int y, int z);
+    BlockType getBlock(int64_t x, int32_t y, int64_t z);
+    // A missing cube is distinct from air for targeting and other queries
+    // that must never make absent world data interactive.
+    std::optional<BlockType> findBlockIfLoaded(int64_t x, int32_t y, int64_t z) const;
+    BlockType getBlockIfLoaded(int64_t x, int32_t y, int64_t z) const;
+    BlockType getCollisionBlockIfLoaded(int64_t x, int32_t y, int64_t z) const;
+    bool isChunkLoaded(ChunkPos pos) const;
+    bool shouldMeshChunk(ChunkPos pos) const;
+    void setBlock(int64_t x, int32_t y, int64_t z, BlockType type);
 
-    // Non-generating read: a missing chunk reads as air. For per-frame
-    // queries (e.g. is-the-camera-underwater) that must never stall on
-    // generation or disk.
-    BlockType getBlockIfLoaded(int x, int y, int z) const;
+    FluidCell readFluidCell(FluidPos position) const override;
+    void writeWater(FluidPos position, FluidState state) override;
+    void removeWater(FluidPos position) override;
+    size_t tickFluids(double elapsedSeconds);
+    float getFluidHeightIfLoaded(int64_t x, int32_t y, int64_t z) const;
+    size_t getPendingFluidCount() const;
+    uint64_t getDroppedFluidUpdateCount() const;
+    uint64_t getDroppedFluidFrontierCount() const;
 
-    // Non-generating surface lookup (the heightMap top of the column), or
-    // nullopt while the chunk isn't loaded. Weather uses it to keep rain
-    // from spawning inside caves and under overhangs.
-    std::optional<int> surfaceHeightIfLoaded(int x, int z) const;
+    double getTerrainHeight(int64_t x, int64_t z) const;
+    Biome getBiome(int64_t x, int64_t z) const;
+    worldgen::SurfaceSample sampleSurface(int64_t x, int64_t z) const;
+    std::optional<worldgen::SurfaceSample> findSurfaceSample(int64_t x, int64_t z) const;
+    // Highest opaque block in the loaded cubic column, or nullopt if no cube
+    // in the column is loaded. Weather uses this without forcing generation.
+    std::optional<int> surfaceHeightIfLoaded(int64_t x, int64_t z) const;
+    size_t cachedColumnPlanCount() const { return generator_.cachedColumnPlanCount(); }
 
-    // Set block at world position (thread-safe, marks chunk dirty)
-    void setBlock(int x, int y, int z, BlockType type);
-
-    // Get terrain height at world position
-    double getTerrainHeight(int x, int z) const;
-
-    // Get biome at world position
-    Biome getBiome(int x, int z) const;
-
-    // Get all loaded chunks
     std::vector<std::shared_ptr<Chunk>> getLoadedChunks() const;
-
-    // Copy a chunk + one-block neighbor walls for lock-free meshing.
-    // Returns false until the chunk and all four face neighbors are
-    // generated (the caller simply retries next frame).
+    std::shared_ptr<const std::vector<std::shared_ptr<Chunk>>> getLoadedSnapshot() const;
+    std::shared_ptr<const std::unordered_set<ChunkPos>> getMeshCandidateSnapshot() const;
+    void publishLoadedSnapshot();
     bool snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const;
-
-    // Get chunks that need mesh updates
     std::vector<std::shared_ptr<Chunk>> getDirtyChunks();
+    void markChunkMeshed(ChunkPos pos);
+    void markChunkMeshed(int64_t chunkX, int32_t chunkY, int64_t chunkZ) {
+        markChunkMeshed(ChunkPos{chunkX, chunkY, chunkZ});
+    }
+    void markChunkMeshed(int64_t chunkX, int64_t chunkZ) {
+        markChunkMeshed(ChunkPos{chunkX, 0, chunkZ});
+    }
 
-    // Mark chunk as meshed
-    void markChunkMeshed(int chunkX, int chunkZ);
-
-    // Get seed
-    uint32_t getSeed() const;
-
-    // View distance
-    int getViewDistance() const;
+    uint32_t getSeed() const { return seed_; }
+    int getViewDistance() const { return viewDistance_.load(std::memory_order_relaxed); }
+    int getExactViewDistance() const {
+        return std::min(getViewDistance(), MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
+    }
     void setViewDistance(int distance);
 
-    // Update chunks around player position (synchronous)
-    void updatePlayerPosition(int playerX, int playerZ);
+    void updatePlayerPosition(int64_t playerX, int32_t playerY, int64_t playerZ);
+    void updatePlayerPosition(int64_t playerX, int64_t playerZ) {
+        updatePlayerPosition(playerX, SEA_LEVEL, playerZ);
+    }
+    // Pull block light across all six cube faces until quiescent, bounded so a
+    // simulation tick cannot stall on a large lighting update.
+    void reconcileLight(int budgetCubes);
 
-    // Drain the block-light reconcile queue: pull lava light across chunk
-    // borders until quiescent, bounded to budgetChunks re-floods per call so
-    // the tick never stalls. Called every tick; re-meshes chunks whose light
-    // changed. See LightEngine for the flood/fixed-point rationale.
-    void reconcileLight(int budgetChunks);
-
-    // Unload chunks outside the view distance (called by updatePlayerPosition).
-    // Edited chunks queue for saving as they leave the map.
     void unloadDistantChunks();
-
-    // Queue every still-loaded edited chunk for saving (quit path — callers
-    // must not mutate blocks afterward until SaveManager::flush returns)
-    void saveModifiedChunks();
-
-    // Rebuild the generation backlog (nearest-first) and start pumping
-    void generateAroundPlayer(int playerX, int playerZ);
-
-    // Submit backlog chunks up to the in-flight window. Called every tick
-    // and by finishing workers, so the pipeline sustains itself.
+    bool saveModifiedChunks();
+    void generateAroundPlayer(int64_t playerX, int32_t playerY, int64_t playerZ);
+    void generateAroundPlayer(int64_t playerX, int64_t playerZ) {
+        generateAroundPlayer(playerX, SEA_LEVEL, playerZ);
+    }
     void pumpGeneration();
 
-    // Get generation queue status
     size_t getPendingChunkCount() const;
-
-    // EMA of per-chunk generation time in ms (updated by the gen workers,
-    // read lock-free by the HUD)
-    float averageGenMs() const;
-
-    // Attach the save manager (non-owning). Once set, getChunk and the async
-    // generation path try loading a chunk from disk before generating it —
-    // without this, saved block edits were written but never read back.
+    size_t getLoadedChunkCount() const;
+    StreamingWorkStats getStreamingWorkStats() const;
+    float averageGenMs() const { return genMs_.value(); }
     void setSaveManager(SaveManager* saveManager);
+
+    const ChunkGenerator& generator() const { return generator_; }
 
 private:
     uint32_t seed_;
-    int viewDistance_;
+    std::atomic<int> viewDistance_;
 
-    // Chunk storage keyed by chunk grid coordinate
     std::unordered_map<ChunkPos, std::shared_ptr<Chunk>> chunks_;
+    // One bit per supported vertical section, guarded by chunksMutex_. Mesh
+    // snapshots use this to prove a contiguous sky path without repeatedly
+    // probing the chunk map while workers wait on the world lock.
+    std::unordered_map<ColumnPos, uint64_t> loadedSectionMasks_;
     mutable std::mutex chunksMutex_;
+    std::shared_ptr<const std::vector<std::shared_ptr<Chunk>>> loadedSnapshot_;
+    std::shared_ptr<const std::unordered_set<ChunkPos>> meshCandidateSnapshot_;
+    std::atomic<bool> loadedSnapshotDirty_{true};
+    std::atomic<size_t> loadedCubeCount_{0};
 
-    // Persistence (non-owning; the engine owns the SaveManager)
+    struct SkyColumnKey {
+        int64_t x = 0;
+        int64_t z = 0;
+        constexpr bool operator==(const SkyColumnKey&) const = default;
+    };
+    struct SkyColumnKeyHash {
+        size_t operator()(const SkyColumnKey& key) const noexcept {
+            size_t seed = world_coord::mix(0, static_cast<uint64_t>(key.x));
+            return world_coord::mix(seed, static_cast<uint64_t>(key.z));
+        }
+    };
+    // Generated density uses immutable plan cutoffs. Loaded structures and
+    // edits can extend or replace that top, so only affected block columns
+    // retain an override for mesh snapshots.
+    std::unordered_map<SkyColumnKey, int32_t, SkyColumnKeyHash> skyCutoffOverrides_;
+    std::unordered_set<ColumnPos> skyOverrideChunkColumns_;
+
     SaveManager* saveManager_ = nullptr;
-
-    // World generation (climate + density + surface + features)
     ChunkGenerator generator_;
 
-    // Player position for chunk loading. hasPlayerChunk_ stays false until
-    // the first updatePlayerPosition call, so the spawn area streams in even
-    // when the player starts in chunk (0, 0).
-    int playerChunkX_ = 0;
-    int playerChunkZ_ = 0;
+    int64_t playerChunkX_ = 0;
+    int32_t playerChunkY_ = SEA_LEVEL / CHUNK_EDGE;
+    int64_t playerChunkZ_ = 0;
     bool hasPlayerChunk_ = false;
+    size_t activeSetRebuildCooldownTicks_ = 0; // main simulation tick only
 
-    // Async generation state. genBacklog_ holds not-yet-submitted chunks
-    // sorted farthest-first (pop_back = nearest); both containers are
-    // guarded by pendingMutex_ (lock order: pendingMutex_ → chunksMutex_).
-    std::shared_ptr<ThreadPool> genPool_; // lazily initialized
+    struct ActiveSetRequest {
+        int64_t playerX = 0;
+        int32_t playerY = SEA_LEVEL;
+        int64_t playerZ = 0;
+        int viewDistance = DEFAULT_RENDER_DISTANCE_CHUNKS;
+        uint64_t id = 0;
+    };
+    std::optional<ActiveSetRequest> pendingActiveSetRequest_;
+    std::thread activeSetThread_;
+    mutable std::mutex activeSetRequestMutex_;
+    std::condition_variable activeSetRequestCv_;
+    std::mutex activeSetBuildMutex_;
+    bool stopActiveSetThread_ = false; // guarded by activeSetRequestMutex_
+    std::atomic<bool> activeSetWorkPending_{false};
+    std::atomic<uint64_t> latestActiveSetRequestId_{0};
+    uint64_t nextActiveSetRequestId_ = 0; // guarded by activeSetRequestMutex_
+
+    std::shared_ptr<ThreadPool> genPool_;
     std::unordered_map<ChunkPos, std::future<void>> pendingGenerations_;
+    std::unordered_set<ChunkPos> generationsInFlight_;
+    std::unordered_map<ColumnPos, std::future<void>> pendingColumnPlans_;
+    std::unordered_set<ColumnPos> columnPlansInFlight_;
     std::vector<ChunkPos> genBacklog_;
+    std::unordered_set<ChunkPos> genBacklogSet_;
+    std::vector<ColumnPos> columnPlanBacklog_;
+    enum class PlanDependencyKind : uint8_t { OWN_PLAN, EXPOSED_APRON };
+    struct PlanDependent {
+        ChunkPos pos;
+        uint64_t activeSetEpoch = 0;
+        PlanDependencyKind kind = PlanDependencyKind::OWN_PLAN;
+    };
+    std::unordered_map<ColumnPos, std::vector<PlanDependent>> planDependents_;
+    std::unordered_map<ChunkPos, uint8_t> missingPlanDependencies_;
+    uint64_t activeSetEpoch_ = 0;                      // guarded by pendingMutex_
+    size_t completedPlansSinceRebuild_ = 0;            // guarded by pendingMutex_
+    size_t retainedCubeCountForStats_ = 0;             // guarded by pendingMutex_
+    std::unordered_set<ChunkPos> retainedChunks_;      // guarded by chunksMutex_
+    std::unordered_set<ChunkPos> meshCandidateChunks_; // guarded by chunksMutex_
     std::atomic<bool> shuttingDown_{false};
+    std::atomic<bool> columnPlansChanged_{false};
+    size_t activeColumnPlanJobs_ = 0; // guarded by pendingMutex_
     mutable std::mutex pendingMutex_;
-
-    // Generation-time EMA: workers record, the HUD reads
+    std::atomic<uint64_t> activeSetRebuilds_{0};
+    std::atomic<uint64_t> planApronCenters_{0};
+    std::atomic<uint64_t> planApronExpansionAttempts_{0};
+    std::atomic<uint64_t> planApronCubeExpansionEquivalent_{0};
+    std::atomic<uint64_t> completedColumnPlans_{0};
+    std::atomic<uint64_t> planDependentChecks_{0};
+    std::atomic<uint64_t> fullRetainedScanEquivalent_{0};
+    std::atomic<uint64_t> activeSetRebuildNotifications_{0};
+    std::atomic<uint64_t> hysteresisRetainedCubes_{0};
+    std::atomic<uint64_t> activeSetRequests_{0};
+    std::atomic<uint64_t> activeSetRequestsCoalesced_{0};
+    std::atomic<uint64_t> activeSetBuildsCanceled_{0};
+    AtomicEmaMs activeSetBuildMs_;
     AtomicEmaMs genMs_;
+    FluidScheduler fluidScheduler_;
+    std::deque<ChunkPos> fluidResumeQueue_;          // guarded by pendingMutex_
+    std::unordered_set<ChunkPos> fluidResumeQueued_; // guarded by pendingMutex_
 
-    // Block-light reconcile queue: chunks whose stored light may be stale
-    // because a neighbor loaded or an edit landed. Drained by reconcileLight
-    // on the tick thread. lightQueued_ dedups. lightMutex_ is a leaf below
-    // chunksMutex_ (only ever taken innermost; never held while acquiring
-    // another lock).
+    // Cubes whose derived block light may be stale because a neighbor loaded
+    // or an edit landed. The queue is deduplicated and drained on the tick
+    // thread. lightMutex_ is never held while acquiring chunksMutex_.
     std::vector<ChunkPos> lightQueue_;
     std::unordered_set<ChunkPos> lightQueued_;
     mutable std::mutex lightMutex_;
 
-    // Enqueue a chunk (and its four face neighbors) for light reconciliation.
     void queueLightReconcile(ChunkPos pos);
     void queueFaceNeighbors(ChunkPos pos);
     void queueLightReconcileWithNeighbors(ChunkPos pos);
 
-    // Generate a single chunk (synchronous)
-    void generateChunk(std::shared_ptr<Chunk> chunk);
-
-    // Generate chunk asynchronously
-    void generateChunkAsync(int chunkX, int chunkZ);
-
-    // Load the chunk from disk when possible, otherwise generate it
-    // (with the flat-fallback policy on generation failure).
-    std::shared_ptr<Chunk> loadOrGenerateChunk(int chunkX, int chunkZ);
+    void generateChunk(const std::shared_ptr<Chunk>& chunk);
+    void generateChunkAsync(ChunkPos pos);
+    void generateColumnPlanAsync(ColumnPos pos);
+    std::shared_ptr<Chunk> loadOrGenerateChunk(ChunkPos pos, bool* loadedFromSave = nullptr);
+    bool shouldRetain(ChunkPos pos) const;
+    void setBlockLoaded(BlockPos position, BlockType type, std::optional<FluidState> fluidState);
+    bool refreshSkyCutoffLocked(int64_t worldX, int64_t worldZ);
+    bool refreshSkyOverrideColumnLocked(ColumnPos column);
+    bool extendGeneratedSkyCutoffsLocked(const Chunk& chunk);
+    void refreshSavedSkyCutoffsLocked(ChunkPos pos);
+    void markColumnMeshesDirtyLocked(ColumnPos column);
+    void markHaloNeighborMeshesDirtyLocked(ChunkPos pos);
+    void markSkyContinuityBelowLocked(ColumnPos column, int32_t changedSectionY);
+    void markSkyCutoffMeshesDirtyLocked(int64_t worldX, int64_t worldZ);
+    void markSkyColumnMeshesDirtyLocked(ColumnPos column);
+    void queueFluidResume(ChunkPos pos);
+    void registerPlanDependenciesLocked(ChunkPos pos);
+    void wakePlanDependents(ColumnPos completedPlan);
+    void queueGenerationLocked(ChunkPos pos);
+    void ensureStreamingWorkers();
+    void requestActiveSetRebuild(int64_t playerX, int32_t playerY, int64_t playerZ);
+    void activeSetWorkerLoop();
+    bool rebuildActiveSet(const ActiveSetRequest& request);
+    bool activeSetRequestIsStale(uint64_t requestId) const;
 };

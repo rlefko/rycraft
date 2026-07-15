@@ -1,6 +1,6 @@
 # rycraft
 
-A Minecraft-like voxel game for macOS, built from scratch in C++23 on Metal. No engine, no asset files — the terrain, the block textures, and even the sound effects are all generated procedurally at runtime.
+A Minecraft-like voxel game for macOS, built from scratch in C++23 on Metal. Terrain, block textures, voxel models, and sound effects are generated procedurally at runtime.
 
 ![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue)
 ![Apple Silicon](https://img.shields.io/badge/CPU-Apple%20Silicon-orange)
@@ -10,81 +10,97 @@ A Minecraft-like voxel game for macOS, built from scratch in C++23 on Metal. No 
 ## Quick start
 
 ```bash
-brew install meson ninja        # requires Xcode command line tools
-meson setup build
+brew install meson ninja
+meson setup build --buildtype=debugoptimized
 ninja -C build
 ./build/src/rycraft
 ```
 
-Run the tests with `ninja -C build test`.
+Xcode command line tools are required. Run the tests with `ninja -C build test`.
 
-**Controls:** WASD to move, mouse to look, Space to jump (hold it to keep hopping), double-tap W or hold Ctrl to sprint, left/right click to break/place blocks, 1–9 or scroll for the hotbar, F3 for the debug HUD, ESC to pause (and to resume). In water, hold Space to float up or double-tap W to swim wherever you're looking. Double-tap Space to toggle flying — Space rises, Shift sinks, and landing with Shift (or another double-tap) ends the flight. The window opens on a title screen; click PLAY to capture the mouse.
+Controls: use WASD to move and the mouse to look. Space jumps, Ctrl or a double-tap of W sprints, and left or right click breaks or places blocks. Use 1 through 9 or the scroll wheel for the hotbar, F3 for diagnostics, and Escape to pause. In water, hold Space to rise or double-tap W to swim along the view direction. Double-tap Space to toggle flight; Space rises and Shift descends.
 
-## What's in the game
+## What is in the game
 
-- **Infinite procedural world** — simplex-noise terrain across 10 biomes, three kinds of caves, ore veins, trees, and grid-placed structures, streaming around the player on a worker pool
-- **A day** — twenty-minute day/night cycle with a moving sun, dawn/dusk skies, drifting procedural clouds, and column-skylight shadows under trees and inside caves
-- **Building** — raycast block breaking and placing with a highlight wireframe; edits persist to LZ4-compressed region files and load back next session
-- **Animals** — sheep, cows, pigs, and chickens with state-machine AI, flocking, and ambient calls, rendered from procedural voxel models
-- **Sound** — procedural block, footstep, wind, and animal sounds through a 16-voice Core Audio mixer
-- **A real game shell** — title screen, ESC pause menu, settings (render distance, fog, sensitivity, volume), pointer lock that never loses your cursor, and save-on-quit
-- **A lean renderer** — one 4x MSAA scene pass at native resolution plus bloom and fog, batched UI, ~60 FPS
+- **Sparse cubic world:** 16 by 16 by 16 chunks stream through a world that is horizontally unbounded and vertically spans Y=-128 through Y=511.
+- **Advanced procedural terrain:** deterministic plate relationships, hotspot chains, volcanic arcs, smoothly amplified mountain massifs, bounded Priority-Flood and D-infinity-inspired basins, erosion, climate, soil, 33 blended biomes, elevation ecotopes, cubic caves, aquifers, ores, structures, vegetation, rivers, lakes, waterfalls, distributary deltas, islands, calderas, crater lakes, conduits, and lava tubes. The terrestrial climate set includes representatives for all 14 biome classes shared by the One Earth and World Wildlife Fund terrestrial frameworks.
+- **Long visible horizon:** exact editable cubes extend through radius 32. A two-block far-terrain sampling tier uses the same emitted density surface immediately outside that boundary. Depth-biased far tops remain as lit fallback until exact meshes arrive, while a 16-block dither hands water and canopies between representations. Greedy 256 by 256-block tiles then adapt among 4-, 8-, and 16-block steps through radius 256 using distance, slope, and hydrology complexity. Exact tree anchors remain visible at the two- and four-block tiers, while deterministic aggregate forest clusters preserve continuous canopy mass at the eight- and sixteen-block tiers. Asymmetric hysteresis, fog-hidden topology changes, frustum culling, back-face culling, conservative terrain-horizon culling, and skirts limited to resident finer-to-coarser edges keep the taper stable.
+- **Generated and runtime water:** world-generated water starts settled and never runs generation-time ticks. Every standing voxel from the supported floor through the surface is an implicit source. A canonical 17 by 17 lake authority keeps shallow shores supported, validated crater lakes retain an enclosing irregular rim and freeboard, and separate narrow outlet falls connect valid elevated routed lakes to lower water without raising either standing surface. Stable rivers, lakes, and oceans emit top surfaces without artificial vertical walls; explicit waterfalls retain falling sides. Gameplay edits activate delayed Java-style source, falling, and flow-level rules.
+- **Building and persistence:** loaded-only raycast block editing, lit planned silhouettes at aboveground loading fronts, closed and dark unresolved openings underground, an outline highlight, LZ4-compressed RYCH v4 cubic saves, bounded coalesced save work, and manifests for edited vertical sections and indexed fluid frontiers.
+- **Habitat fauna:** sheep, cows, pigs, chickens, deer, goats, rabbits, frogs, and fish use deterministic territories, bounded populations, procedural voxel models, and movement-specific AI.
+- **A full day:** a twenty-minute day and night cycle with moving sun, dawn and dusk skies, procedural clouds, weather, and skylight shading.
+- **Native presentation:** linear HDR with texel-snapped shadow cascades, baked and screen-space ambient occlusion, volumetric clouds and light, weather, post-resolve water and screen-space reflections, exposure, bloom, lens flare, tonemapping, sharpening, complete alpha-aware block-texture mipmaps, trilinear 8x-anisotropic minification, and a native Metal UI.
 
-Full design notes live in [docs/game-concept.md](docs/game-concept.md).
+The generator uses bounded research-informed approximations so cubes remain fast to query in any order. See [world generation and persistence](docs/world-generation.md) for the implemented algorithms, limitations, and research references.
 
 ## Project structure
 
-```
+```text
 include/, src/
-  engine/      Game loop, game flow (title/pause), input, camera
-  render/      Metal pipeline, mesher, textures, UI, entities
-  world/       Terrain generation, chunks, saving/loading
-  entity/      Player physics, animal AI, spawning
-  audio/       Core Audio mixer, procedural sound effects
-  common/      Math, seeded randomness, thread pool
-shaders/       Metal shaders (compiled to one metallib)
-tests/         Catch2 suite — six hermetic modules, all headless
+  engine/      Game loop, game flow, input, camera, diagnostics
+  render/      Metal pipelines, cubic mesher, water, textures, UI, entities
+  world/       Macro generation, cubic chunks, fluids, saving and loading
+  entity/      Player physics, fauna AI, habitats, spawning
+  audio/       Core Audio mixer and procedural sound effects
+  common/      Math, deterministic randomness, thread pool, logging
+shaders/       Metal shaders compiled into one metallib
+tests/         Headless Catch2 modules
 docs/          Architecture, conventions, and domain references
 ```
 
-The deeper references: [architecture](docs/architecture.md) · [world generation & saves](docs/world-generation.md) · [rendering conventions](docs/rendering-conventions.md) · [performance conventions](docs/performance-conventions.md) · [code conventions](docs/code-conventions.md)
+More references: [architecture](docs/architecture.md), [rendering conventions](docs/rendering-conventions.md), [performance conventions](docs/performance-conventions.md), [code conventions](docs/code-conventions.md), and [game concept](docs/game-concept.md).
 
-## Tech stack
+## Technology
 
 | Component | Technology |
-|-----------|------------|
-| Language | C++23 (+ Objective-C++ at the Cocoa/Metal boundary) |
-| Rendering | Metal 3, MSL shaders shared with C++ via one types header |
-| Windowing & input | Cocoa, MTKView, NSEvent with CG pointer lock |
-| Audio | Core Audio (DefaultOutput unit) |
-| Build | Meson + Ninja |
-| Tests | Catch2 (via Meson wrap) |
-| Compression | LZ4 (system copy or wrap) |
+|---|---|
+| Language | C++23 and Objective-C++ at the Cocoa and Metal boundary |
+| Rendering | Metal 3 and MSL with shared C++ layout headers |
+| Windowing and input | Cocoa, MTKView, NSEvent, and CG pointer lock |
+| Audio | Core Audio DefaultOutput unit |
+| Build | Meson and Ninja |
+| Tests | Catch2 |
+| Compression | LZ4 |
 
 ## Development
 
 ```bash
-meson setup build                  # once (wraps download on first setup)
-ninja -C build                     # build (werror, warning_level=3)
-ninja -C build test                # run the test suite
-clang-format -i <files>            # format touched files (config in .clang-format)
+meson setup build --buildtype=debugoptimized
+ninja -C build
+ninja -C build test
+clang-format -i <touched files>
 ```
 
-Playtest hooks (used by CI-less visual verification and the `playtest` skill):
+`debugoptimized` keeps debug symbols and assertions while enabling the optimization required by world generation. Reconfigure an older unoptimized build directory with `meson setup --reconfigure build --buildtype=debugoptimized` before judging streaming or frame rate. Use a separate `release` build for the M4 Max acceptance run.
+
+Useful deterministic and playtest hooks:
 
 ```bash
-MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ./build/src/rycraft   # Metal validation
-RYCRAFT_CAPTURE=/tmp/frame.png ./build/src/rycraft              # dump a frame as PNG
-RYCRAFT_CAPTURE_FRAME=300 RYCRAFT_START_SCREEN=paused ...       # pick frame/screen
-RYCRAFT_BLOOM=0 ...                                             # scale/disable bloom
+RYCRAFT_WORLD_SEED=42 ./build/src/rycraft
+RYCRAFT_SPAWN=100,180,-240 ./build/src/rycraft
+RYCRAFT_WORLDGEN_OVERLAY=geology ./build/src/rycraft
+RYCRAFT_SHOW_DEBUG=1 ./build/src/rycraft
+RYCRAFT_VIEW_DISTANCE=256 ./build/src/rycraft
+./build/src/rycraft_worldgen_inspect 42
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ./build/src/rycraft
+RYCRAFT_CAPTURE=/tmp/frame.png RYCRAFT_CAPTURE_FRAME=500 ./build/src/rycraft
+RYCRAFT_BLOOM=0 ./build/src/rycraft
+RYCRAFT_NATIVE_WINDOW=1 RYCRAFT_PERF_WARMUP_FRAMES=1200 RYCRAFT_PERF_FRAMES=1200 ./build/src/rycraft
+RYCRAFT_WORLD_SEED=764891 RYCRAFT_SPAWN=23029,225,-111726 RYCRAFT_YAW=0 RYCRAFT_PITCH=-17 RYCRAFT_VIEW_DISTANCE=256 ./build/src/rycraft
 ```
+
+`rycraft_worldgen_inspect [seed] [sample_x sample_z]` reports deterministic feature locations, their surface samples, optional requested coordinates, separate column-plan and basin-cache information, benchmark timing, and a route hash as JSON. The positional seed is optional and takes precedence over `RYCRAFT_WORLD_SEED`.
+
+`RYCRAFT_WORLDGEN_OVERLAY` accepts exactly `geology`, `hydrology`, `climate`, or `biome`. Performance acceptance is measured at native resolution with 4x MSAA and view distance 256 on an Apple M4 Max. The target is a lowest sustained one-second rate of at least 60 FPS, with exact cubic simulation capped at radius 32 and total unified-memory use capped at 64 GB. Hardware timing is reported separately from the deterministic limits enforced in CI. See [performance conventions](docs/performance-conventions.md) for the canonical seed-764891 route, measured CPU microbenchmarks, and the current unverified integrated-target status.
 
 ## Troubleshooting
 
-- **`meson setup` fails finding `xcrun metal`** — install the Xcode command line tools (`xcode-select --install`); the shader pipeline compiles `.metal` sources with the Metal CLI.
-- **First `meson setup` downloads things** — Catch2 (and LZ4, when no system copy exists) come from Meson wraps into `subprojects/`; that's expected and cached.
-- **Stale build directory after big changes** — `meson setup --wipe build`.
-- **The game saves next to where you run it** — world data lands in `./rycraft_world/`; delete it for a fresh world.
+- If Meson cannot find `xcrun metal`, install Xcode command line tools with `xcode-select --install`.
+- The first setup may download Catch2 and LZ4 Meson wraps into `subprojects`; later setups reuse the cache.
+- After a large build-definition change, run `meson setup --wipe build`.
+- World data is relative to the launch directory at `./rycraft_world/`. Use a scratch launch directory for playtests that should not touch the normal save.
+- RYCH v3 chunk edits are not migrated to cubic v4. Old files remain on disk, compatible metadata remains readable, and terrain regenerates.
+- v4 metadata preserves the seed, player transform, health, selected hotbar slot, hotbar inventory, and world time.
 
 ## Author
 
@@ -92,4 +108,4 @@ Ryan Lefkowitz ([rlefkowitz1800@yahoo.com](mailto:rlefkowitz1800@yahoo.com))
 
 ## License
 
-GNU General Public License v3.0 — see [LICENSE](LICENSE).
+GNU General Public License v3.0. See [LICENSE](LICENSE).

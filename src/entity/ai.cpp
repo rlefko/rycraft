@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // Simple deterministic random for AI (seeded per entity ID)
@@ -18,6 +19,35 @@ static float entityRandom(uint64_t seed) {
     // (the old version advanced a shared static mt19937, so results depended
     // on global call order and raced across threads).
     return static_cast<float>(hash64(seed) >> 40) / static_cast<float>(1u << 23) - 1.0f;
+}
+
+static Vec3 applyMovementMode(Entity& entity, const Vec3& steering, int stateTicks) {
+    Vec3 result = steering;
+    const EntityConfig config = Entity::getConfig(entity.type);
+    const float horizontalSq = result.x * result.x + result.z * result.z;
+
+    switch (config.movementMode) {
+        case MovementMode::HOP:
+            if (entity.onGround && horizontalSq > 0.000001f && stateTicks % 12 == 1) {
+                result.y += config.jumpImpulse;
+            }
+            break;
+        case MovementMode::AMPHIBIOUS_HOP:
+            if (entity.onGround && horizontalSq > 0.000001f && stateTicks % 16 == 1) {
+                result.y += config.jumpImpulse;
+            }
+            break;
+        case MovementMode::CLIMB:
+            if (entity.onGround && horizontalSq > 0.000001f && stateTicks % 10 == 1) {
+                result.y += config.jumpImpulse;
+            }
+            break;
+        case MovementMode::WALK:
+        case MovementMode::SWIM:
+            break;
+    }
+
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +143,21 @@ void StateMachine::onExitFollowPlayer() {}
 // ---------------------------------------------------------------------------
 // Condition checks (pure functions)
 // ---------------------------------------------------------------------------
+bool StateMachine::playerMovedToward(const Vec3& previousPlayerPos, const Vec3& playerPos,
+                                     const Vec3& entityPos, float minimumMovement) {
+    const float movementX = playerPos.x - previousPlayerPos.x;
+    const float movementZ = playerPos.z - previousPlayerPos.z;
+    const float minimumMovementSquared = minimumMovement * minimumMovement;
+    if (movementX * movementX + movementZ * movementZ < minimumMovementSquared) return false;
+
+    const float previousX = entityPos.x - previousPlayerPos.x;
+    const float previousZ = entityPos.z - previousPlayerPos.z;
+    const float currentX = entityPos.x - playerPos.x;
+    const float currentZ = entityPos.z - playerPos.z;
+    return currentX * currentX + currentZ * currentZ <
+           previousX * previousX + previousZ * previousZ;
+}
+
 bool StateMachine::shouldFlee(const Vec3& entityPos, const Vec3& playerPos, bool playerMovingToward,
                               float fleeDistance) {
     if (!playerMovingToward) return false;
@@ -171,8 +216,7 @@ Vec3 StateMachine::update(Entity& entity, World& world, const Vec3& playerPositi
     idleTimer++;
 
     Vec3 steering = Vec3::zero();
-
-    auto entityPositions = spawner.getEntityPositions();
+    const EntityConfig config = Entity::getConfig(entity.type);
 
     // Priority 1: FLEE (highest priority, preempts everything)
     if (currentState != AnimalState::FLEE &&
@@ -195,7 +239,7 @@ Vec3 StateMachine::update(Entity& entity, World& world, const Vec3& playerPositi
         away.y = 0.f;
         float len = std::sqrt(away.x * away.x + away.z * away.z);
         if (len > 0.01f) {
-            steering = (away / len) * entity.getConfig(entity.type).speed * 2.f;
+            steering = (away / len) * config.speed * 2.f;
         }
 
         // Check if we should stop fleeing
@@ -203,11 +247,12 @@ Vec3 StateMachine::update(Entity& entity, World& world, const Vec3& playerPositi
             transitionTo(AnimalState::IDLE);
             return Vec3::zero();
         }
-        return steering;
+        return applyMovementMode(entity, steering, stateTimer);
     }
 
     // Priority 2: FOLLOW_PLAYER (when player holds food)
-    if (currentState != AnimalState::FOLLOW_PLAYER && currentState != AnimalState::EAT &&
+    if (config.movementMode != MovementMode::SWIM && currentState != AnimalState::FOLLOW_PLAYER &&
+        currentState != AnimalState::EAT &&
         shouldFollowPlayer(entity.position, playerPosition, playerHoldingFood)) {
         transitionTo(AnimalState::FOLLOW_PLAYER);
     }
@@ -219,12 +264,12 @@ Vec3 StateMachine::update(Entity& entity, World& world, const Vec3& playerPositi
             transitionTo(AnimalState::IDLE);
             return Vec3::zero();
         }
-        return steering;
+        return applyMovementMode(entity, steering, stateTimer);
     }
 
     // Priority 3: EAT (when hungry and on grass)
-    if (currentState != AnimalState::EAT && shouldEat(entity.hungerTimer) &&
-        BehaviorController::isOnGrass(entity, world)) {
+    if (currentState != AnimalState::EAT && BehaviorController::canGraze(entity.type) &&
+        shouldEat(entity.hungerTimer) && BehaviorController::isOnGrass(entity, world)) {
         transitionTo(AnimalState::EAT);
     }
 
@@ -260,8 +305,19 @@ Vec3 StateMachine::update(Entity& entity, World& world, const Vec3& playerPositi
         // Set wander target
         float angle = entityRandom(entity.id + stateTimer) * 2.f * 3.14159f;
         float distance = 8.f + entityRandom(entity.id + stateTimer + 1) * 4.f;
-        targetPosition = {entity.position.x + std::cos(angle) * distance, entity.position.y,
-                          entity.position.z + std::sin(angle) * distance};
+        targetPosition = {entity.homePosition.x + std::cos(angle) * distance, entity.position.y,
+                          entity.homePosition.z + std::sin(angle) * distance};
+
+        if (config.movementMode == MovementMode::SWIM) {
+            float verticalOffset = entityRandom(entity.id + stateTimer + 2) * 2.5f;
+            targetPosition.y = entity.homePosition.y + verticalOffset;
+            int targetX = static_cast<int>(std::floor(targetPosition.x));
+            int targetY = static_cast<int>(std::floor(targetPosition.y + config.height * 0.5f));
+            int targetZ = static_cast<int>(std::floor(targetPosition.z));
+            if (world.getBlockIfLoaded(targetX, targetY, targetZ) != BlockType::WATER) {
+                targetPosition = entity.homePosition;
+            }
+        }
     }
 
     if (currentState == AnimalState::IDLE) {
@@ -272,8 +328,10 @@ Vec3 StateMachine::update(Entity& entity, World& world, const Vec3& playerPositi
     if (currentState == AnimalState::WANDER) {
         // Check if wander target reached
         Vec3 toTarget = targetPosition - entity.position;
-        toTarget.y = 0.f;
-        float distToTarget = std::sqrt(toTarget.x * toTarget.x + toTarget.z * toTarget.z);
+        if (config.movementMode != MovementMode::SWIM) {
+            toTarget.y = 0.f;
+        }
+        float distToTarget = toTarget.length();
 
         if (distToTarget < 1.f || shouldStopWandering(stateTimer)) {
             transitionTo(AnimalState::IDLE);
@@ -281,13 +339,24 @@ Vec3 StateMachine::update(Entity& entity, World& world, const Vec3& playerPositi
         }
 
         // Steer toward wander target
-        steering = (toTarget / distToTarget) * entity.getConfig(entity.type).speed;
+        Vec3 direction = toTarget / distToTarget;
+        if (config.movementMode != MovementMode::SWIM &&
+            !EdgeDetector::isSafeToMove(entity.position, direction, entity.type, world)) {
+            Vec3 alternate{-direction.z, 0.f, direction.x};
+            if (entityRandom(entity.id + stateTimer + 3) < 0.f) alternate = -alternate;
+            if (!EdgeDetector::isSafeToMove(entity.position, alternate, entity.type, world)) {
+                transitionTo(AnimalState::IDLE);
+                return Vec3::zero();
+            }
+            direction = alternate;
+        }
+        steering = direction * config.speed;
 
         // Add flocking behavior
         Vec3 flockForce = FlockingController::computeSteering(entity, spawner);
         steering = steering + flockForce;
 
-        return steering;
+        return applyMovementMode(entity, steering, stateTimer);
     }
 
     return steering;
@@ -326,10 +395,13 @@ Vec3 FlockingController::computeSeparation(Entity& entity, const std::vector<uin
     for (uint64_t nid : neighborIds) {
         Entity* neighbor = spawner.getEntity(nid);
         if (!neighbor) continue;
+        if (neighbor->type != entity.type) continue;
 
         Vec3 diff = entity.position - neighbor->position;
-        diff.y = 0.f; // Horizontal only
-        float dist = std::sqrt(diff.x * diff.x + diff.z * diff.z);
+        if (Entity::getConfig(entity.type).movementMode != MovementMode::SWIM) {
+            diff.y = 0.f;
+        }
+        float dist = diff.length();
 
         if (dist > 0.01f && dist <= SEPARATION_RADIUS) {
             steer = steer + diff / (dist * dist); // Weight by inverse distance squared
@@ -339,7 +411,7 @@ Vec3 FlockingController::computeSeparation(Entity& entity, const std::vector<uin
 
     if (count == 0) return Vec3::zero();
     steer = steer / count;
-    float len = std::sqrt(steer.x * steer.x + steer.z * steer.z);
+    float len = steer.length();
     if (len > 0.01f) {
         steer = (steer / len) * 0.05f;
     }
@@ -354,6 +426,7 @@ Vec3 FlockingController::computeAlignment(Entity& entity, const std::vector<uint
     for (uint64_t nid : neighborIds) {
         Entity* neighbor = spawner.getEntity(nid);
         if (!neighbor) continue;
+        if (neighbor->type != entity.type) continue;
 
         Vec3 diff = entity.position - neighbor->position;
         float distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
@@ -381,6 +454,7 @@ Vec3 FlockingController::computeCohesion(Entity& entity, const std::vector<uint6
     for (uint64_t nid : neighborIds) {
         Entity* neighbor = spawner.getEntity(nid);
         if (!neighbor) continue;
+        if (neighbor->type != entity.type) continue;
 
         Vec3 diff = entity.position - neighbor->position;
         float distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
@@ -394,8 +468,10 @@ Vec3 FlockingController::computeCohesion(Entity& entity, const std::vector<uint6
     if (count == 0) return Vec3::zero();
     center = center / count;
     Vec3 steer = center - entity.position;
-    steer.y = 0.f; // Horizontal only
-    float len = std::sqrt(steer.x * steer.x + steer.z * steer.z);
+    if (Entity::getConfig(entity.type).movementMode != MovementMode::SWIM) {
+        steer.y = 0.f;
+    }
+    float len = steer.length();
     if (len > 0.01f) {
         steer = (steer / len) * 0.02f;
     }
@@ -415,8 +491,17 @@ Vec3 FlockingController::clampForce(const Vec3& force, float maxForce) {
 // ---------------------------------------------------------------------------
 bool EdgeDetector::isSafeToMove(const Vec3& entityPos, const Vec3& direction, EntityType entityType,
                                 World& world) {
-    // Pigs are okay with water
-    if (entityType != EntityType::PIG && isWaterAhead(entityPos, direction, world)) {
+    const MovementMode mode = Entity::getConfig(entityType).movementMode;
+    if (mode == MovementMode::SWIM) {
+        Vec3 checkPos = entityPos + direction * 1.5f;
+        int checkX = static_cast<int>(std::floor(checkPos.x));
+        int checkY = static_cast<int>(std::floor(checkPos.y));
+        int checkZ = static_cast<int>(std::floor(checkPos.z));
+        return world.getBlockIfLoaded(checkX, checkY, checkZ) == BlockType::WATER;
+    }
+
+    const bool entersWater = isWaterAhead(entityPos, direction, world);
+    if (mode != MovementMode::AMPHIBIOUS_HOP && entityType != EntityType::PIG && entersWater) {
         return false;
     }
     return !isCliffAhead(entityPos, direction, world);
@@ -433,8 +518,8 @@ bool EdgeDetector::isCliffAhead(const Vec3& entityPos, const Vec3& direction, Wo
 
         // Block at ground level ahead should be solid
         // If block at ground is AIR and block below that is also AIR → cliff
-        BlockType atGround = world.getBlock(checkX, groundY, checkZ);
-        BlockType belowGround = world.getBlock(checkX, groundY - 1, checkZ);
+        BlockType atGround = world.getBlockIfLoaded(checkX, groundY, checkZ);
+        BlockType belowGround = world.getBlockIfLoaded(checkX, groundY - 1, checkZ);
 
         if (atGround == BlockType::AIR && belowGround == BlockType::AIR) {
             return true; // Cliff detected
@@ -449,8 +534,8 @@ bool EdgeDetector::isWaterAhead(const Vec3& entityPos, const Vec3& direction, Wo
     int groundY = static_cast<int>(std::floor(entityPos.y)) - 1;
     int checkZ = static_cast<int>(std::floor(checkPos.z));
 
-    return world.getBlock(checkX, groundY, checkZ) == BlockType::WATER ||
-           world.getBlock(checkX, groundY + 1, checkZ) == BlockType::WATER;
+    return world.getBlockIfLoaded(checkX, groundY, checkZ) == BlockType::WATER ||
+           world.getBlockIfLoaded(checkX, groundY + 1, checkZ) == BlockType::WATER;
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +554,7 @@ void BehaviorController::doEat(Entity& entity, World& world) {
     int by = static_cast<int>(std::floor(entity.position.y));
     int bz = static_cast<int>(std::floor(entity.position.z));
 
-    if (world.getBlock(bx, by, bz) == BlockType::GRASS) {
+    if (world.getBlockIfLoaded(bx, by, bz) == BlockType::GRASS) {
         world.setBlock(bx, by, bz, BlockType::DIRT);
     }
 }
@@ -528,8 +613,26 @@ bool BehaviorController::isOnGrass(Entity& entity, World& world) {
     int by = static_cast<int>(std::floor(entity.position.y));
     int bz = static_cast<int>(std::floor(entity.position.z));
 
-    return world.getBlock(bx, by, bz) == BlockType::GRASS ||
-           world.getBlock(bx, by - 1, bz) == BlockType::GRASS;
+    return world.getBlockIfLoaded(bx, by, bz) == BlockType::GRASS ||
+           world.getBlockIfLoaded(bx, by - 1, bz) == BlockType::GRASS;
+}
+
+bool BehaviorController::canGraze(EntityType type) {
+    switch (type) {
+        case EntityType::SHEEP:
+        case EntityType::COW:
+        case EntityType::PIG:
+        case EntityType::CHICKEN:
+        case EntityType::DEER:
+        case EntityType::GOAT:
+        case EntityType::RABBIT:
+            return true;
+        case EntityType::FROG:
+        case EntityType::FISH:
+            return false;
+        case EntityType::COUNT:
+            std::unreachable();
+    }
 }
 
 bool BehaviorController::canBreed(Entity& entity, Spawner& spawner) {

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "engine/game_state.hpp"
+#include "world/macro_generation.hpp"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -47,10 +49,17 @@ struct MenuLayout {
 
 // Live values the settings screen displays.
 struct SettingsValues {
-    int viewDistance = 12;    // chunks
-    int fogLevel = 3;         // 0-10
-    int sensitivityLevel = 4; // 1-10
-    int volumeLevel = 8;      // 0-10
+    static constexpr int MIN_VIEW_DISTANCE = 4;
+    static constexpr int MAX_VIEW_DISTANCE = 256;
+    static constexpr int DEFAULT_VIEW_DISTANCE = 256;
+    inline static constexpr std::array<int, 10> VIEW_DISTANCES = {
+        4, 8, 12, 16, 24, 32, 64, 128, 192, 256,
+    };
+
+    int viewDistance = DEFAULT_VIEW_DISTANCE; // chunks
+    int fogLevel = 3;                         // 0-10
+    int sensitivityLevel = 4;                 // 1-10
+    int volumeLevel = 8;                      // 0-10
 };
 
 // Level → physical-unit conversions, defined once for the engine's init
@@ -66,6 +75,7 @@ constexpr float mouseSensitivityForLevel(int level) {
 struct PerformanceStats {
     float fps = 0.f;
     uint32_t chunkCount = 0;
+    uint32_t meshedCubeCount = 0;
     uint32_t entityCount = 0;
     float frameTimeMs = 0.f;
     float gpuFrameMs = 0.f;     // EMA of command-buffer GPUEndTime − GPUStartTime
@@ -73,8 +83,32 @@ struct PerformanceStats {
     float genMsAvg = 0.f;       // EMA of per-chunk generation time
     float meshMsAvg = 0.f;      // EMA of per-chunk mesh build time
     uint32_t meshBuildsFrame = 0;
-    float megaUsedMB = 0.f; // mega-buffer vertex bytes in use
+    float megaUsedMB = 0.f; // live combined vertex and index arena allocation
     float megaCapMB = 0.f;
+    uint32_t farWantedTiles = 0;
+    uint32_t farResidentTiles = 0;
+    uint32_t farDrawnTiles = 0;
+    uint32_t farFrustumCulledTiles = 0;
+    uint32_t farOcclusionCulledTiles = 0;
+    uint32_t farPendingTiles = 0;
+    float farCacheMB = 0.f;
+    float farMeshMB = 0.f;
+    int64_t cubeX = 0;
+    int32_t cubeY = 0;
+    int64_t cubeZ = 0;
+    uint64_t plateId = 0;
+    worldgen::PlateBoundary boundary = worldgen::PlateBoundary::NONE;
+    float temperatureC = 0.f;
+    float precipitationMm = 0.f;
+    Biome primaryBiome = Biome::PLAINS;
+    Biome secondaryBiome = Biome::PLAINS;
+    float biomeTransition = 0.f;
+    uint8_t riverOrder = 0;
+    uint32_t macroCacheEntries = 0;
+    float macroCacheMB = 0.f;
+    uint32_t pendingFluids = 0;
+    uint64_t droppedFluidUpdates = 0;
+    uint64_t droppedFluidFrontiers = 0;
 };
 
 // Everything the UI pass needs to draw one frame.

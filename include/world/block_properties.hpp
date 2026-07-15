@@ -1,15 +1,8 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
-
-// ---------------------------------------------------------------------------
-// Block types and their properties — the single source of truth.
-//
-// Every subsystem answers "is this block solid/opaque/transparent?" from
-// here. The engine previously carried four diverging isSolid definitions
-// (meshing, physics, raycasting, spawning), which made glass render as a
-// solid block that entities silently fell through.
-// ---------------------------------------------------------------------------
 
 enum class BlockType : uint8_t {
     AIR = 0,
@@ -29,7 +22,6 @@ enum class BlockType : uint8_t {
     DIAMOND_ORE = 14,
     PLANKS = 15,
     GLASS = 16,
-    // Values are persisted as raw bytes in saves: only append, never renumber.
     COBBLESTONE = 17,
     MOSSY_COBBLESTONE = 18,
     SANDSTONE = 19,
@@ -47,115 +39,258 @@ enum class BlockType : uint8_t {
     REED = 31,
     LAVA = 32,
     ICE = 33,
-    COUNT = 34
+    MUD = 34,
+    CLAY = 35,
+    SILT = 36,
+    BASALT = 37,
+    VOLCANIC_ASH = 38,
+    LIMESTONE = 39,
+    OBSIDIAN = 40,
+    ACACIA_LOG = 41,
+    ACACIA_LEAVES = 42,
+    JUNGLE_LOG = 43,
+    JUNGLE_LEAVES = 44,
+    MANGROVE_LOG = 45,
+    MANGROVE_LEAVES = 46,
+    PALM_LOG = 47,
+    PALM_LEAVES = 48,
+    WILLOW_LOG = 49,
+    WILLOW_LEAVES = 50,
+    FERN = 51,
+    SHRUB = 52,
+    CATTAIL = 53,
+    LILY_PAD = 54,
+    FLOWER_BLUE = 55,
+    SUCCULENT = 56,
+    ANDESITE = 57,
+    COUNT = 58
 };
 
-// Cross-quad rendered, walk-through decoration blocks (plants). They occupy
-// a cell but never collide, occlude, or cast column shadows.
+enum class BlockRenderShape : uint8_t {
+    NONE,
+    CUBE,
+    CROSS,
+    FLAT,
+    LIQUID,
+};
+
+enum class BlockSound : uint8_t {
+    UNDEFINED,
+    NONE,
+    STONE,
+    SOIL,
+    SAND,
+    WOOD,
+    PLANT,
+    GLASS,
+    WATER,
+    LAVA,
+    SNOW,
+};
+
+enum class BlockMaterial : uint8_t {
+    UNDEFINED,
+    AIR,
+    ROCK,
+    SOIL,
+    GRANULAR,
+    WOOD,
+    LEAVES,
+    PLANT,
+    GLASS,
+    WATER,
+    LAVA,
+    ICE,
+};
+
+struct BlockDefinition {
+    BlockRenderShape renderShape = BlockRenderShape::CUBE;
+    bool solid = true;
+    bool opaque = true;
+    bool targetable = true;
+    bool liquid = false;
+    bool leaf = false;
+    BlockSound sound = BlockSound::UNDEFINED;
+    BlockMaterial material = BlockMaterial::UNDEFINED;
+    uint8_t lightEmission = 0;
+    bool emissive = false;
+    uint8_t sway = 0;
+};
+
+inline constexpr size_t BLOCK_TYPE_COUNT = static_cast<size_t>(BlockType::COUNT);
+
+constexpr std::array<BlockDefinition, BLOCK_TYPE_COUNT> makeBlockDefinitions() {
+    std::array<BlockDefinition, BLOCK_TYPE_COUNT> definitions{};
+    definitions[static_cast<size_t>(BlockType::AIR)] = {
+        BlockRenderShape::NONE, false, false, false, false, false, BlockSound::NONE,
+        BlockMaterial::AIR};
+    definitions[static_cast<size_t>(BlockType::WATER)] = {
+        BlockRenderShape::LIQUID, false, false, false, true, false, BlockSound::WATER,
+        BlockMaterial::WATER};
+    definitions[static_cast<size_t>(BlockType::LAVA)] = {
+        BlockRenderShape::CUBE, false, true, false, true, false, BlockSound::LAVA,
+        BlockMaterial::LAVA};
+    definitions[static_cast<size_t>(BlockType::LAVA)].lightEmission = 15;
+    definitions[static_cast<size_t>(BlockType::LAVA)].emissive = true;
+    definitions[static_cast<size_t>(BlockType::GLASS)] = {
+        BlockRenderShape::CUBE, true, false, true, false, false, BlockSound::GLASS,
+        BlockMaterial::GLASS};
+
+    constexpr BlockType rocks[] = {
+        BlockType::STONE,       BlockType::BEDROCK,           BlockType::COAL_ORE,
+        BlockType::IRON_ORE,    BlockType::GOLD_ORE,          BlockType::DIAMOND_ORE,
+        BlockType::COBBLESTONE, BlockType::MOSSY_COBBLESTONE, BlockType::SANDSTONE,
+        BlockType::BASALT,      BlockType::LIMESTONE,         BlockType::OBSIDIAN,
+        BlockType::ANDESITE,
+    };
+    for (BlockType block : rocks) {
+        auto& definition = definitions[static_cast<size_t>(block)];
+        definition.sound = BlockSound::STONE;
+        definition.material = BlockMaterial::ROCK;
+    }
+
+    constexpr BlockType soils[] = {
+        BlockType::GRASS, BlockType::DIRT, BlockType::MUD,
+        BlockType::CLAY,  BlockType::SILT, BlockType::VOLCANIC_ASH,
+    };
+    for (BlockType block : soils) {
+        auto& definition = definitions[static_cast<size_t>(block)];
+        definition.sound = BlockSound::SOIL;
+        definition.material = BlockMaterial::SOIL;
+    }
+
+    constexpr BlockType granular[] = {BlockType::SAND, BlockType::GRAVEL};
+    for (BlockType block : granular) {
+        auto& definition = definitions[static_cast<size_t>(block)];
+        definition.sound = BlockSound::SAND;
+        definition.material = BlockMaterial::GRANULAR;
+    }
+
+    constexpr BlockType wood[] = {
+        BlockType::LOG,          BlockType::PLANKS,     BlockType::BIRCH_LOG,
+        BlockType::SPRUCE_LOG,   BlockType::ACACIA_LOG, BlockType::JUNGLE_LOG,
+        BlockType::MANGROVE_LOG, BlockType::PALM_LOG,   BlockType::WILLOW_LOG,
+    };
+    for (BlockType block : wood) {
+        auto& definition = definitions[static_cast<size_t>(block)];
+        definition.sound = BlockSound::WOOD;
+        definition.material = BlockMaterial::WOOD;
+    }
+
+    constexpr BlockType leaves[] = {
+        BlockType::LEAVES,        BlockType::BIRCH_LEAVES,  BlockType::SPRUCE_LEAVES,
+        BlockType::ACACIA_LEAVES, BlockType::JUNGLE_LEAVES, BlockType::MANGROVE_LEAVES,
+        BlockType::PALM_LEAVES,   BlockType::WILLOW_LEAVES,
+    };
+    for (BlockType block : leaves) {
+        auto& definition = definitions[static_cast<size_t>(block)];
+        definition.opaque = false;
+        definition.leaf = true;
+        definition.sound = BlockSound::PLANT;
+        definition.material = BlockMaterial::LEAVES;
+        definition.sway = 2;
+    }
+
+    constexpr BlockType crossFlora[] = {
+        BlockType::DEAD_BUSH,  BlockType::TALL_GRASS,     BlockType::FLOWER_YELLOW,
+        BlockType::FLOWER_RED, BlockType::MUSHROOM_BROWN, BlockType::MUSHROOM_RED,
+        BlockType::REED,       BlockType::FERN,           BlockType::SHRUB,
+        BlockType::CATTAIL,    BlockType::FLOWER_BLUE,    BlockType::SUCCULENT,
+    };
+    for (BlockType block : crossFlora) {
+        definitions[static_cast<size_t>(block)] = {
+            BlockRenderShape::CROSS, false, false, true, false, false, BlockSound::PLANT,
+            BlockMaterial::PLANT};
+    }
+    definitions[static_cast<size_t>(BlockType::LILY_PAD)] = {
+        BlockRenderShape::FLAT, false, false, true, false, false, BlockSound::PLANT,
+        BlockMaterial::PLANT};
+    definitions[static_cast<size_t>(BlockType::CACTUS)].sound = BlockSound::PLANT;
+    definitions[static_cast<size_t>(BlockType::CACTUS)].material = BlockMaterial::PLANT;
+    definitions[static_cast<size_t>(BlockType::SNOW)].sound = BlockSound::SNOW;
+    definitions[static_cast<size_t>(BlockType::SNOW)].material = BlockMaterial::ICE;
+    definitions[static_cast<size_t>(BlockType::ICE)].sound = BlockSound::GLASS;
+    definitions[static_cast<size_t>(BlockType::ICE)].material = BlockMaterial::ICE;
+
+    constexpr BlockType rootBendingFlora[] = {
+        BlockType::DEAD_BUSH,  BlockType::TALL_GRASS,  BlockType::FLOWER_YELLOW,
+        BlockType::FLOWER_RED, BlockType::FERN,        BlockType::SHRUB,
+        BlockType::CATTAIL,    BlockType::FLOWER_BLUE,
+    };
+    for (BlockType block : rootBendingFlora) {
+        definitions[static_cast<size_t>(block)].sway = 1;
+    }
+    definitions[static_cast<size_t>(BlockType::REED)].sway = 2;
+    return definitions;
+}
+
+inline constexpr auto BLOCK_DEFINITIONS = makeBlockDefinitions();
+static_assert(BLOCK_DEFINITIONS.size() == BLOCK_TYPE_COUNT);
+static_assert([] {
+    for (const BlockDefinition& definition : BLOCK_DEFINITIONS) {
+        if (definition.sound == BlockSound::UNDEFINED ||
+            definition.material == BlockMaterial::UNDEFINED || definition.lightEmission > 15 ||
+            definition.sway > 2 || definition.emissive != (definition.lightEmission > 0)) {
+            return false;
+        }
+    }
+    return true;
+}());
+
+constexpr const BlockDefinition& blockDefinition(BlockType type) {
+    return BLOCK_DEFINITIONS[static_cast<size_t>(type)];
+}
+
 constexpr bool isFlora(BlockType type) {
-    switch (type) {
-        case BlockType::DEAD_BUSH:
-        case BlockType::TALL_GRASS:
-        case BlockType::FLOWER_YELLOW:
-        case BlockType::FLOWER_RED:
-        case BlockType::MUSHROOM_BROWN:
-        case BlockType::MUSHROOM_RED:
-        case BlockType::REED:
-            return true;
-        default:
-            return false;
-    }
+    const auto shape = blockDefinition(type).renderShape;
+    return shape == BlockRenderShape::CROSS || shape == BlockRenderShape::FLAT;
 }
 
-// Liquids are swimmable (see PhysicsEngine::isInLiquid) and render in the
-// translucent pass, not the opaque chunk pass.
 constexpr bool isLiquid(BlockType type) {
-    return type == BlockType::WATER || type == BlockType::LAVA;
+    return blockDefinition(type).liquid;
 }
 
-// Leaf variants: alpha-cutout canopy blocks that tree emission may
-// overwrite with logs.
 constexpr bool isLeafBlock(BlockType type) {
-    return type == BlockType::LEAVES || type == BlockType::BIRCH_LEAVES ||
-           type == BlockType::SPRUCE_LEAVES;
+    return blockDefinition(type).leaf;
 }
 
-// Collision: blocks entities cannot pass through. Liquids are swimmable,
-// flora is walk-through; glass and ice ARE solid.
 constexpr bool isSolid(BlockType type) {
-    return type != BlockType::AIR && !isLiquid(type) && !isFlora(type);
+    return blockDefinition(type).solid;
 }
 
-// Meshing/occlusion: blocks that fully hide their neighbors' faces. Leaf
-// variants and glass are alpha-cutout textures (their transparent texels
-// are discarded in the fragment shader), so the faces behind them must
-// render; the same goes for non-cube flora and for water. Lava is opaque:
-// it renders as a full emissive cube even though entities swim through it.
 constexpr bool isOpaque(BlockType type) {
-    switch (type) {
-        case BlockType::AIR:
-        case BlockType::WATER:
-        case BlockType::LEAVES:
-        case BlockType::BIRCH_LEAVES:
-        case BlockType::SPRUCE_LEAVES:
-        case BlockType::GLASS:
-            return false;
-        default:
-            return !isFlora(type);
-    }
+    return blockDefinition(type).opaque;
 }
 
-// Meshing: blocks the opaque chunk pass emits cube faces for. Wider than
-// isSolid by exactly lava (swim-through but drawn as a cube); water renders
-// in the dedicated water pass instead.
 constexpr bool rendersAsCube(BlockType type) {
-    return isSolid(type) || type == BlockType::LAVA;
+    return blockDefinition(type).renderShape == BlockRenderShape::CUBE;
 }
 
-// Light/visibility: blocks you can (at least partially) see through.
 constexpr bool isTransparent(BlockType type) {
     return !isOpaque(type);
 }
 
-// Interaction: blocks the crosshair raycast stops on. Everything you can
-// stand on plus flora (breakable in place); liquids are click-through.
 constexpr bool isTargetable(BlockType type) {
-    return isSolid(type) || isFlora(type);
+    return blockDefinition(type).targetable;
 }
 
 // Block light: the level (0-15) a block emits into the world. Lava is the one
 // source today; this is the single home the LightEngine and the mesher share.
 // Light spreads through isTransparent cells losing one level per block.
 constexpr uint8_t blockLightEmission(BlockType type) {
-    return type == BlockType::LAVA ? 15u : 0u;
+    return blockDefinition(type).lightEmission;
 }
 
 // Wind sway class the vertex shaders animate: 0 static, 1 flora (bends from
 // the root, tip swings most), 2 leaves (whole canopy drifts). Mushrooms stay
 // static — cave flora sits out of the wind.
 constexpr uint8_t swayClass(BlockType type) {
-    switch (type) {
-        case BlockType::TALL_GRASS:
-        case BlockType::FLOWER_YELLOW:
-        case BlockType::FLOWER_RED:
-        case BlockType::DEAD_BUSH:
-            return 1;
-        // Reeds stack 2-3 blocks: class 1 would root each segment's base while
-        // the segment below swings its top, tearing every joint. The class-2
-        // continuous field displaces shared corners identically.
-        case BlockType::REED:
-        case BlockType::LEAVES:
-        case BlockType::BIRCH_LEAVES:
-        case BlockType::SPRUCE_LEAVES:
-            return 2;
-        default:
-            return 0;
-    }
+    return blockDefinition(type).sway;
 }
 
 // Rendering: a self-lit block whose faces glow at a fixed HDR level regardless
 // of sun, shadow, or skylight (and spill orange block light onto their
 // surroundings). Derived from the emission so the two can never disagree.
 constexpr bool isEmissive(BlockType type) {
-    return blockLightEmission(type) > 0u;
+    return blockDefinition(type).emissive;
 }

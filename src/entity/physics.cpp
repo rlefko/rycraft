@@ -10,7 +10,7 @@
 // through what looked like floor.
 // ---------------------------------------------------------------------------
 bool PhysicsEngine::isSolid(World& world, int x, int y, int z) {
-    return ::isSolid(world.getBlock(x, y, z));
+    return ::isSolid(world.getCollisionBlockIfLoaded(x, y, z));
 }
 
 // ---------------------------------------------------------------------------
@@ -32,7 +32,14 @@ bool PhysicsEngine::isInWater(World& world, const AABB& entityAABB) {
     for (int x = minX; x < maxX; ++x) {
         for (int y = minY; y < maxY; ++y) {
             for (int z = minZ; z < maxZ; ++z) {
-                if (isLiquid(world.getBlock(x, y, z))) {
+                BlockType block = world.getBlockIfLoaded(x, y, z);
+                if (block == BlockType::WATER) {
+                    const float surface =
+                        static_cast<float>(y) + world.getFluidHeightIfLoaded(x, y, z);
+                    if (entityAABB.min.y < surface && entityAABB.max.y > static_cast<float>(y)) {
+                        return true;
+                    }
+                } else if (block == BlockType::LAVA) {
                     return true;
                 }
             }

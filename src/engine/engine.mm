@@ -1,6 +1,7 @@
 #import <engine/engine.hpp>
 
 #import <QuartzCore/QuartzCore.h>
+#import <mach/mach.h>
 
 #include <audio/audio_engine.hpp>
 #include <audio/sfx.hpp>
@@ -15,6 +16,7 @@
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
+#include <render/far_terrain.hpp>
 #include <render/graphics_settings.hpp>
 #include <render/render_pipeline.hpp>
 #include <render/ui_menu.hpp>
@@ -22,13 +24,20 @@
 #include <world/world.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Engine — Singleton (Objective-C class with C++ internals)
@@ -37,12 +46,230 @@
 // Raycast hit result type for block interaction
 using BlockRayHit = std::optional<std::pair<Vec3, Vec3>>;
 
+struct PerformanceCapture {
+    uint64_t warmupFrames = 0;
+    uint64_t requestedFrames = 0;
+    std::vector<double> frameMilliseconds;
+    std::vector<double> fixedTickMilliseconds;
+    uint32_t maxLoadedCubes = 0;
+    uint32_t maxMeshedCubes = 0;
+    size_t maxGenerationQueue = 0;
+    uint32_t maxMeshQueue = 0;
+    uint32_t maxMeshQueueHighWater = 0;
+    uint64_t maxMeshCoalesced = 0;
+    uint64_t maxMeshDroppedStale = 0;
+    uint32_t maxFarWanted = 0;
+    uint32_t maxFarResident = 0;
+    uint32_t maxFarDrawn = 0;
+    uint32_t maxFarFrustumCulled = 0;
+    uint32_t maxFarOcclusionCulled = 0;
+    uint32_t maxFarPending = 0;
+    uint32_t maxExactUploads = 0;
+    uint32_t maxFarUploads = 0;
+    float maxFarCacheMB = 0.0f;
+    float maxFarArenaMB = 0.0f;
+    float maxExactArenaMB = 0.0f;
+    float maxGpuFrameMs = 0.0f;
+    uint64_t peakResidentBytes = 0;
+    uint64_t peakMetalBytes = 0;
+    double settleStartSeconds = -1.0;
+    double settleSeconds = -1.0;
+    bool reported = false;
+
+    bool enabled() const { return requestedFrames > 0; }
+};
+
+void recordPerformanceFixedTick(PerformanceCapture& capture, uint64_t frameCount,
+                                double milliseconds) {
+    if (!capture.enabled() || capture.reported || frameCount < capture.warmupFrames ||
+        capture.frameMilliseconds.size() >= capture.requestedFrames) {
+        return;
+    }
+    capture.fixedTickMilliseconds.push_back(milliseconds);
+}
+
+uint64_t unsignedEnvironmentValue(const char* name, uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (!value || !*value)
+        return fallback;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return end == value || *end != '\0' ? fallback : static_cast<uint64_t>(parsed);
+}
+
+uint64_t processResidentBytes() {
+    mach_task_basic_info_data_t info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    const kern_return_t result = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                                           reinterpret_cast<task_info_t>(&info), &count);
+    return result == KERN_SUCCESS ? static_cast<uint64_t>(info.resident_size) : 0;
+}
+
+bool updatePerformanceCapture(PerformanceCapture& capture, uint64_t frameCount,
+                              double frameMilliseconds, uint32_t loadedCubes,
+                              uint64_t autopilotStopFrame, World& world, RenderPipeline& renderer,
+                              id<MTLDevice> device) {
+    if (!capture.enabled() || capture.reported)
+        return false;
+
+    const RenderPipeline::ChunkRenderStats stats = renderer.chunkRenderStats();
+    if (autopilotStopFrame != std::numeric_limits<uint64_t>::max() &&
+        frameCount >= autopilotStopFrame) {
+        if (capture.settleStartSeconds < 0.0)
+            capture.settleStartSeconds = CACurrentMediaTime();
+        const bool settled = world.getPendingChunkCount() == 0 && stats.meshPendingCount == 0 &&
+                             stats.farPendingTileCount == 0 &&
+                             stats.farResidentTileCount >= stats.farWantedTileCount;
+        if (settled && capture.settleSeconds < 0.0) {
+            capture.settleSeconds = CACurrentMediaTime() - capture.settleStartSeconds;
+        }
+    }
+
+    if (frameCount < capture.warmupFrames ||
+        capture.frameMilliseconds.size() >= capture.requestedFrames) {
+        return false;
+    }
+
+    capture.frameMilliseconds.push_back(frameMilliseconds);
+    capture.maxLoadedCubes = std::max(capture.maxLoadedCubes, loadedCubes);
+    capture.maxMeshedCubes = std::max(capture.maxMeshedCubes, stats.meshCubeCount);
+    capture.maxGenerationQueue = std::max(capture.maxGenerationQueue, world.getPendingChunkCount());
+    capture.maxMeshQueue = std::max(capture.maxMeshQueue, stats.meshPendingCount);
+    capture.maxMeshQueueHighWater =
+        std::max(capture.maxMeshQueueHighWater, stats.meshQueueHighWater);
+    capture.maxMeshCoalesced = std::max(capture.maxMeshCoalesced, stats.meshCoalescedCount);
+    capture.maxMeshDroppedStale =
+        std::max(capture.maxMeshDroppedStale, stats.meshDroppedStaleCount);
+    capture.maxFarWanted = std::max(capture.maxFarWanted, stats.farWantedTileCount);
+    capture.maxFarResident = std::max(capture.maxFarResident, stats.farResidentTileCount);
+    capture.maxFarDrawn = std::max(capture.maxFarDrawn, stats.farDrawnTileCount);
+    capture.maxFarFrustumCulled =
+        std::max(capture.maxFarFrustumCulled, stats.farFrustumCulledTileCount);
+    capture.maxFarOcclusionCulled =
+        std::max(capture.maxFarOcclusionCulled, stats.farOcclusionCulledTileCount);
+    capture.maxFarPending = std::max(capture.maxFarPending, stats.farPendingTileCount);
+    capture.maxExactUploads = std::max(capture.maxExactUploads, stats.meshBuildsLastFrame);
+    capture.maxFarUploads = std::max(capture.maxFarUploads, stats.farUploadsLastFrame);
+    capture.maxFarCacheMB = std::max(capture.maxFarCacheMB, stats.farCacheMB);
+    capture.maxFarArenaMB = std::max(capture.maxFarArenaMB, stats.farMegaUsedMB);
+    capture.maxExactArenaMB = std::max(capture.maxExactArenaMB, stats.megaUsedMB);
+    capture.maxGpuFrameMs = std::max(capture.maxGpuFrameMs, renderer.gpuFrameMs());
+    if (frameCount % 30 == 0 || capture.frameMilliseconds.size() == 1) {
+        capture.peakResidentBytes = std::max(capture.peakResidentBytes, processResidentBytes());
+        capture.peakMetalBytes =
+            std::max(capture.peakMetalBytes, static_cast<uint64_t>([device currentAllocatedSize]));
+    }
+
+    if (capture.frameMilliseconds.size() < capture.requestedFrames)
+        return false;
+
+    std::vector<double> sorted = capture.frameMilliseconds;
+    std::sort(sorted.begin(), sorted.end());
+    const auto percentile = [&](double fraction) {
+        const size_t index =
+            static_cast<size_t>(std::ceil(fraction * static_cast<double>(sorted.size())) - 1.0);
+        return sorted[std::min(index, sorted.size() - 1)];
+    };
+    std::vector<double> prefix(capture.frameMilliseconds.size() + 1, 0.0);
+    for (size_t index = 0; index < capture.frameMilliseconds.size(); ++index) {
+        prefix[index + 1] = prefix[index] + capture.frameMilliseconds[index];
+    }
+    double lowestOneSecondFps = std::numeric_limits<double>::infinity();
+    for (size_t start = 0; start < capture.frameMilliseconds.size(); ++start) {
+        const auto end = std::lower_bound(prefix.begin() + static_cast<ptrdiff_t>(start + 1),
+                                          prefix.end(), prefix[start] + 1000.0);
+        if (end == prefix.end())
+            break;
+        const size_t endIndex = static_cast<size_t>(std::distance(prefix.begin(), end));
+        const double elapsed = prefix[endIndex] - prefix[start];
+        const double fps = static_cast<double>(endIndex - start) * 1000.0 / elapsed;
+        lowestOneSecondFps = std::min(lowestOneSecondFps, fps);
+    }
+    if (!std::isfinite(lowestOneSecondFps))
+        lowestOneSecondFps = 1000.0 / percentile(0.95);
+    const size_t overTwentyMilliseconds = static_cast<size_t>(
+        std::count_if(capture.frameMilliseconds.begin(), capture.frameMilliseconds.end(),
+                      [](double milliseconds) { return milliseconds > 20.0; }));
+    const double maximumFrame =
+        *std::max_element(capture.frameMilliseconds.begin(), capture.frameMilliseconds.end());
+    constexpr double MEBIBYTE = 1024.0 * 1024.0;
+    const double credibleUnifiedMB =
+        static_cast<double>(std::max(capture.peakResidentBytes, capture.peakMetalBytes)) / MEBIBYTE;
+
+    char timing[512];
+    std::snprintf(timing, sizeof(timing),
+                  "Performance summary: %zu frames p50 %.3f ms p95 %.3f ms max %.3f ms "
+                  "lowest 1s %.2f FPS over 20ms %zu gpu EMA max %.3f ms",
+                  capture.frameMilliseconds.size(), percentile(0.50), percentile(0.95),
+                  maximumFrame, lowestOneSecondFps, overTwentyMilliseconds, capture.maxGpuFrameMs);
+    RY_LOG_INFO(timing);
+
+    if (!capture.fixedTickMilliseconds.empty()) {
+        std::vector<double> sortedTicks = capture.fixedTickMilliseconds;
+        std::sort(sortedTicks.begin(), sortedTicks.end());
+        const auto tickPercentile = [&](double fraction) {
+            const size_t index = static_cast<size_t>(
+                std::ceil(fraction * static_cast<double>(sortedTicks.size())) - 1.0);
+            return sortedTicks[std::min(index, sortedTicks.size() - 1)];
+        };
+        const double maximumTick = *std::max_element(sortedTicks.begin(), sortedTicks.end());
+        char fixedTick[256];
+        std::snprintf(fixedTick, sizeof(fixedTick),
+                      "Performance fixed tick: %zu ticks p50 %.3f ms p95 %.3f ms max %.3f ms",
+                      sortedTicks.size(), tickPercentile(0.50), tickPercentile(0.95), maximumTick);
+        RY_LOG_INFO(fixedTick);
+    } else {
+        RY_LOG_INFO("Performance fixed tick: no gameplay ticks in capture window");
+    }
+
+    char residency[640];
+    std::snprintf(residency, sizeof(residency),
+                  "Performance residency: cubes loaded %u meshed %u queues gen %zu mesh %u high %u "
+                  "coalesced %llu stale %llu uploads exact %u far wanted %u resident %u drawn %u "
+                  "frustum %u occluded %u pending %u uploads %u cache %.1f MB arena %.1f MB exact "
+                  "arena %.1f MB",
+                  capture.maxLoadedCubes, capture.maxMeshedCubes, capture.maxGenerationQueue,
+                  capture.maxMeshQueue, capture.maxMeshQueueHighWater,
+                  static_cast<unsigned long long>(capture.maxMeshCoalesced),
+                  static_cast<unsigned long long>(capture.maxMeshDroppedStale),
+                  capture.maxExactUploads, capture.maxFarWanted, capture.maxFarResident,
+                  capture.maxFarDrawn, capture.maxFarFrustumCulled, capture.maxFarOcclusionCulled,
+                  capture.maxFarPending, capture.maxFarUploads, capture.maxFarCacheMB,
+                  capture.maxFarArenaMB, capture.maxExactArenaMB);
+    RY_LOG_INFO(residency);
+
+    const StreamingWorkStats streaming = world.getStreamingWorkStats();
+    char planner[384];
+    std::snprintf(planner, sizeof(planner),
+                  "Performance streaming planner: rebuilds %llu requests %llu coalesced %llu "
+                  "canceled %llu build EMA %.3f ms notifications %llu",
+                  static_cast<unsigned long long>(streaming.activeSetRebuilds),
+                  static_cast<unsigned long long>(streaming.activeSetRequests),
+                  static_cast<unsigned long long>(streaming.activeSetRequestsCoalesced),
+                  static_cast<unsigned long long>(streaming.activeSetBuildsCanceled),
+                  streaming.activeSetBuildMs,
+                  static_cast<unsigned long long>(streaming.activeSetRebuildNotifications));
+    RY_LOG_INFO(planner);
+
+    char memory[384];
+    std::snprintf(memory, sizeof(memory),
+                  "Performance memory: process RSS %.1f MB Metal allocated %.1f MB credible "
+                  "unified %.1f MB queue settle %.3f s",
+                  static_cast<double>(capture.peakResidentBytes) / MEBIBYTE,
+                  static_cast<double>(capture.peakMetalBytes) / MEBIBYTE, credibleUnifiedMB,
+                  capture.settleSeconds);
+    RY_LOG_INFO(memory);
+    capture.reported = true;
+    return true;
+}
+
 // Internal C++ state
 struct EngineState {
     // ---- Game loop state ----
     double lastTime = 0;
     double deltaTime = 0;
     uint64_t frameCount = 0;
+    uint64_t autoPauseFrame = std::numeric_limits<uint64_t>::max();
 
     // ---- Fixed timestep accumulator ----
     static constexpr double TICK_RATE = 20.0;
@@ -91,6 +318,9 @@ struct EngineState {
     float smoothedFrameMs = 16.7f;
     uint32_t cachedChunkCount = 0;
     uint32_t cachedPendingChunks = 0;
+    PerformanceCapture performance;
+    uint64_t autopilotStartFrame = 0;
+    uint64_t autopilotStopFrame = std::numeric_limits<uint64_t>::max();
 
     // ---- Player & World ----
     Player player;
@@ -101,7 +331,6 @@ struct EngineState {
     // ---- Animals ----
     std::unique_ptr<Spawner> spawner;
     std::unordered_map<uint64_t, StateMachine> entityBrains;
-    bool populationSpawned = false;
     int animalCallCooldown = 0;
 
     // ---- Audio ----
@@ -110,7 +339,7 @@ struct EngineState {
     std::vector<float> sfxBlockPlace;
     std::vector<float> sfxFootstep;
     std::vector<float> sfxWind;
-    std::vector<float> sfxAnimal[4]; // indexed by EntityType
+    std::array<std::vector<float>, ENTITY_TYPE_COUNT> sfxAnimal;
     int32_t windVoice = -1;
     float footstepDistance = 0.f; // ground distance walked since last step
     Vec3 lastFootstepPos{0.f, 0.f, 0.f};
@@ -163,6 +392,21 @@ static EngineState* _engineGetState(Engine* engine) {
         _queue = nil;
         _scrollAccumulator = 0;
         _state = std::make_unique<EngineState>();
+        _state->performance.requestedFrames =
+            std::min<uint64_t>(unsignedEnvironmentValue("RYCRAFT_PERF_FRAMES", 0), 36'000);
+        _state->performance.warmupFrames =
+            unsignedEnvironmentValue("RYCRAFT_PERF_WARMUP_FRAMES", 600);
+        if (_state->performance.enabled()) {
+            _state->performance.frameMilliseconds.reserve(
+                static_cast<size_t>(_state->performance.requestedFrames));
+            _state->performance.fixedTickMilliseconds.reserve(
+                static_cast<size_t>(_state->performance.requestedFrames));
+        }
+        _state->autopilotStartFrame = unsignedEnvironmentValue("RYCRAFT_AUTOPILOT_START_FRAME", 0);
+        _state->autopilotStopFrame = unsignedEnvironmentValue("RYCRAFT_AUTOPILOT_STOP_FRAME",
+                                                              std::numeric_limits<uint64_t>::max());
+        _state->autoPauseFrame = unsignedEnvironmentValue("RYCRAFT_AUTOPAUSE_FRAME",
+                                                          std::numeric_limits<uint64_t>::max());
         _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
 
         // Resume the saved world when one exists; otherwise start fresh
@@ -172,7 +416,25 @@ static EngineState* _engineGetState(Engine* engine) {
             seed = meta->seed;
             spawnPos = meta->spawnPos;
             _state->worldTime = meta->worldTime;
+            _state->player.yaw = meta->player.yaw;
+            _state->player.pitch = meta->player.pitch;
+            _state->player.health = meta->player.health;
+            _state->hotbar.selectSlot(meta->player.selectedSlot);
+            for (int slot = 0; slot < Hotbar::SLOTS; ++slot) {
+                _state->hotbar.setSlot(slot, meta->player.inventory[static_cast<size_t>(slot)]);
+            }
         }
+        if (const char* seedEnv = std::getenv("RYCRAFT_WORLD_SEED")) {
+            seed = static_cast<uint32_t>(std::strtoull(seedEnv, nullptr, 0));
+        }
+        if (const char* spawnEnv = std::getenv("RYCRAFT_SPAWN")) {
+            float x = 0.0f;
+            float y = 0.0f;
+            float z = 0.0f;
+            if (std::sscanf(spawnEnv, "%f,%f,%f", &x, &y, &z) == 3)
+                spawnPos = {x, y, z};
+        }
+
         // Playtest hook: pin the time of day (0..23999; 6000 = noon).
         if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
             _state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
@@ -180,7 +442,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
         // Persisted settings load before the World exists (view distance
         // feeds its constructor); env overrides win over the file for
-        // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..32>.
+        // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..256>.
         // An env-overridden session never saves settings — a playtest run
         // must not rewrite the user's file with its overrides.
         LoadedSettings loaded = loadSettings(settingsPath());
@@ -188,8 +450,16 @@ static EngineState* _engineGetState(Engine* engine) {
         _state->gfx = loaded.gfx;
         _state->envOverridesActive = _state->gfx.applyEnvOverrides();
         if (const char* vdEnv = std::getenv("RYCRAFT_VIEW_DISTANCE")) {
-            _state->settings.viewDistance = std::clamp(std::atoi(vdEnv), 4, 32);
+            _state->settings.viewDistance =
+                std::clamp(std::atoi(vdEnv), SettingsValues::MIN_VIEW_DISTANCE,
+                           SettingsValues::MAX_VIEW_DISTANCE);
             _state->envOverridesActive = true;
+        }
+        if (const char* overlayEnv = std::getenv("RYCRAFT_WORLDGEN_OVERLAY")) {
+            _state->showDebugHud = *overlayEnv != '\0';
+        }
+        if (const char* debugEnv = std::getenv("RYCRAFT_SHOW_DEBUG")) {
+            _state->showDebugHud = *debugEnv != '\0' && std::strcmp(debugEnv, "0") != 0;
         }
         _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
         // Chunks load from disk before regenerating, so block edits persist
@@ -226,15 +496,26 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 4. Create NSWindow
-    NSRect screenFrame = [[NSScreen mainScreen] visibleFrame];
-    NSRect windowRect = NSMakeRect((screenFrame.size.width - 1024) * 0.5,
-                                   (screenFrame.size.height - 768) * 0.5, 1024, 768);
-    _window = [[NSWindow alloc]
-        initWithContentRect:windowRect
-                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
-                    backing:NSBackingStoreBuffered
-                      defer:false];
+    const bool nativeWindow = [] {
+        const char* value = std::getenv("RYCRAFT_NATIVE_WINDOW");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    NSRect screenFrame =
+        nativeWindow ? [[NSScreen mainScreen] frame] : [[NSScreen mainScreen] visibleFrame];
+    const CGFloat windowWidth = nativeWindow ? screenFrame.size.width : 1024.0;
+    const CGFloat windowHeight = nativeWindow ? screenFrame.size.height : 768.0;
+    NSRect windowRect =
+        NSMakeRect(screenFrame.origin.x + (screenFrame.size.width - windowWidth) * 0.5,
+                   screenFrame.origin.y + (screenFrame.size.height - windowHeight) * 0.5,
+                   windowWidth, windowHeight);
+    const NSWindowStyleMask styleMask =
+        nativeWindow ? NSWindowStyleMaskBorderless
+                     : NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                           NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
+    _window = [[NSWindow alloc] initWithContentRect:windowRect
+                                          styleMask:styleMask
+                                            backing:NSBackingStoreBuffered
+                                              defer:false];
     if (!_window) {
         RY_LOG_FATAL("Failed to create NSWindow");
         return NO;
@@ -244,7 +525,8 @@ static EngineState* _engineGetState(Engine* engine) {
     [_window makeKeyAndOrderFront:nil];
 
     // 5. Create and configure MTKView
-    _view = [[MTKView alloc] initWithFrame:windowRect device:_device];
+    _view = [[MTKView alloc] initWithFrame:NSMakeRect(0.0, 0.0, windowWidth, windowHeight)
+                                    device:_device];
     if (!_view) {
         RY_LOG_FATAL("Failed to create MTKView");
         return NO;
@@ -253,6 +535,7 @@ static EngineState* _engineGetState(Engine* engine) {
     // Drawable pixel format. The render pipeline builds its own MSAA render
     // passes, so the view carries no sample count or depth buffer of its own.
     _view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+    _view.preferredFramesPerSecond = 120;
 
     // Disable automatic setNeedsDisplay — we drive rendering from the game loop
     _view.enableSetNeedsDisplay = false;
@@ -315,19 +598,21 @@ static EngineState* _engineGetState(Engine* engine) {
         _state->sfxBlockPlace = SoundEffect::generateBlockPlace();
         _state->sfxFootstep = SoundEffect::generateFootstep();
         _state->sfxWind = SoundEffect::generateAmbientWind();
-        _state->sfxAnimal[0] = SoundEffect::generateSheepBaa();
-        _state->sfxAnimal[1] = SoundEffect::generateCowMoo();
-        _state->sfxAnimal[2] = SoundEffect::generatePigOink();
-        _state->sfxAnimal[3] = SoundEffect::generateChickenCluck();
+        for (size_t index = 0; index < ENTITY_TYPE_COUNT; ++index) {
+            _state->sfxAnimal[index] =
+                SoundEffect::generateAnimalCall(static_cast<EntityType>(index));
+        }
         [self syncAudioVolume];
     } else {
         RY_LOG_ERROR("Audio engine failed to initialize — continuing without sound");
         _state->audio.reset();
     }
 
-    RY_LOG_INFO(std::string("Engine initialized — window: ") +
+    RY_LOG_INFO(std::string("Engine initialized - window: ") +
                 std::to_string(static_cast<int>(_view.bounds.size.width)) + "x" +
                 std::to_string(static_cast<int>(_view.bounds.size.height)) +
+                ", drawable: " + std::to_string(static_cast<int>(_view.drawableSize.width)) + "x" +
+                std::to_string(static_cast<int>(_view.drawableSize.height)) +
                 ", device: " + std::string([[_device name] UTF8String]));
 
     return YES;
@@ -371,10 +656,21 @@ static EngineState* _engineGetState(Engine* engine) {
     // menus stay responsive while the simulation is frozen
     [self handleGlobalInput];
 
+    // Performance hook: freeze the exact same streamed scene at a fixed frame
+    // so playing and paused windows can be compared without relying on a
+    // synthetic key event or a separately generated world.
+    if (state->frameCount == state->autoPauseFrame && state->flow.screen == GameScreen::PLAYING) {
+        state->flow.screen = GameScreen::PAUSED;
+        state->accumulator = 0.0;
+    }
+
     // 4. Fixed timestep game tick — menus freeze the world
     if (state->flow.screen == GameScreen::PLAYING) {
         while (state->accumulator >= EngineState::TICK_DT) {
+            const double tickStart = CACurrentMediaTime();
             [self gameTick:state];
+            recordPerformanceFixedTick(state->performance, state->frameCount,
+                                       (CACurrentMediaTime() - tickStart) * 1000.0);
             state->accumulator -= EngineState::TICK_DT;
         }
 
@@ -470,8 +766,25 @@ static EngineState* _engineGetState(Engine* engine) {
     switch (action) {
         case MenuAction::VIEW_DISTANCE_DOWN:
         case MenuAction::VIEW_DISTANCE_UP: {
-            int step = (action == MenuAction::VIEW_DISTANCE_UP) ? 2 : -2;
-            settings.viewDistance = std::clamp(settings.viewDistance + step, 4, 32);
+            constexpr const auto& distances = SettingsValues::VIEW_DISTANCES;
+            const bool increase = action == MenuAction::VIEW_DISTANCE_UP;
+            auto current =
+                std::lower_bound(distances.begin(), distances.end(), settings.viewDistance);
+            if (increase) {
+                if (current == distances.end()) {
+                    current = std::prev(distances.end());
+                } else if (*current <= settings.viewDistance) {
+                    const auto next = std::next(current);
+                    if (next != distances.end())
+                        current = next;
+                }
+            } else {
+                if (current == distances.end() || *current >= settings.viewDistance) {
+                    if (current != distances.begin())
+                        --current;
+                }
+            }
+            settings.viewDistance = *current;
             if (state->world) {
                 state->world->setViewDistance(settings.viewDistance);
             }
@@ -624,29 +937,41 @@ static EngineState* _engineGetState(Engine* engine) {
 - (void)saveWorldState {
     if (_savedWorld)
         return;
+    _savedWorld = true;
+
+    // Render workers retain references into World. Join them for every quit
+    // mode, including throwaway capture runs that intentionally skip saves.
+    if (_renderPipeline) {
+        _renderPipeline->shutdownMeshWorkers();
+    }
+
     // Capture runs are throwaway playtests: their spawned test blocks
     // (RYCRAFT_SPAWN_*) and drifted player position must not overwrite the
     // real save, and reproducible captures depend on the world not moving.
     if (std::getenv("RYCRAFT_CAPTURE")) {
-        _savedWorld = true;
         return;
-    }
-    _savedWorld = true;
-
-    // Mesh workers reference the World — stop them before anything else
-    // (ivar destruction order at teardown is not something to bet on)
-    if (_renderPipeline) {
-        _renderPipeline->shutdownMeshWorkers();
     }
 
     EngineState* state = _state.get();
     if (state->saveManager && state->world) {
         // Edited chunks persist on unload; the quit path sweeps the rest
-        state->world->saveModifiedChunks();
-        state->saveManager->saveMetadata(state->world->getSeed(), state->player.position,
-                                         state->worldTime);
-        state->saveManager->flush();
-        RY_LOG_INFO("World state saved");
+        const bool frontiersSaved = state->world->saveModifiedChunks();
+        SaveManager::PlayerMetadata playerMetadata;
+        playerMetadata.yaw = state->player.yaw;
+        playerMetadata.pitch = state->player.pitch;
+        playerMetadata.health = state->player.health;
+        playerMetadata.selectedSlot = state->hotbar.getSelectedIndex();
+        for (int slot = 0; slot < Hotbar::SLOTS; ++slot) {
+            playerMetadata.inventory[static_cast<size_t>(slot)] = state->hotbar.getSlot(slot);
+        }
+        const bool metadataSaved = state->saveManager->saveMetadata(
+            state->world->getSeed(), state->player.position, state->worldTime, playerMetadata);
+        const bool cubesSaved = state->saveManager->flush();
+        if (frontiersSaved && metadataSaved && cubesSaved) {
+            RY_LOG_INFO("World state saved");
+        } else {
+            RY_LOG_ERROR("World state save did not complete");
+        }
     }
 
     // Settings share the quit path so mid-session tweaks survive a close
@@ -686,6 +1011,16 @@ static EngineState* _engineGetState(Engine* engine) {
 
 - (void)windowDidResignKey:(NSNotification*)notification {
     (void)notification;
+    // Automated movement must keep exercising streaming when the launcher's
+    // terminal regains focus. Release the global pointer lock while leaving
+    // the simulation on the playing screen; gameTick restores only the
+    // synthetic movement keys on its next fixed tick.
+    if (std::getenv("RYCRAFT_AUTOPILOT")) {
+        if (_state->inputManager) {
+            _state->inputManager->releaseMouse();
+        }
+        return;
+    }
     // Cmd-Tab (or any focus loss) must never leave the pointer locked
     [self applyFlowEffects:_state->flow.onFocusLost()];
 }
@@ -698,18 +1033,19 @@ static EngineState* _engineGetState(Engine* engine) {
 
     InputState& input = state->inputManager->state();
 
-    // Playtest hook: RYCRAFT_AUTOPILOT=walk holds W down so headless runs
-    // can verify the full input→tick→physics path end to end; =sprint also
-    // holds the sprint key so captures can show the FOV widening
+    // Playtest hook: walk and sprint exercise ground physics. Fly holds a
+    // level aerial route above obstacles so streaming benchmarks cross many
+    // chunk boundaries without depending on one terrain fixture.
     static const char* autopilot = std::getenv("RYCRAFT_AUTOPILOT");
     if (autopilot) {
         const std::string_view mode{autopilot};
-        if (mode == "walk" || mode == "sprint") {
-            input.keysDown[Key::W] = true;
-        }
-        if (mode == "sprint") {
-            input.keysDown[Key::LeftControl] = true;
-        }
+        const bool active = state->frameCount >= state->autopilotStartFrame &&
+                            state->frameCount < state->autopilotStopFrame;
+        const bool aerial = mode == "fly";
+        if (aerial)
+            state->player.flying = true;
+        input.keysDown[Key::W] = active && (mode == "walk" || mode == "sprint" || aerial);
+        input.keysDown[Key::LeftControl] = active && (mode == "sprint" || aerial);
     }
 
     // 1. Advance world time (1 tick per game tick). Playtest hooks:
@@ -729,22 +1065,19 @@ static EngineState* _engineGetState(Engine* engine) {
     // written — collision then zeroes every move. Once the spawn chunk
     // exists, lift the player to the surface if they are embedded.
     if (!state->spawnValidated) {
-        int px = static_cast<int>(std::floor(state->player.position.x));
-        int pz = static_cast<int>(std::floor(state->player.position.z));
-        auto chunk = state->world->getChunk(Chunk::worldToChunk(px), Chunk::worldToChunk(pz));
+        int64_t px = static_cast<int64_t>(std::floor(state->player.position.x));
+        int64_t pz = static_cast<int64_t>(std::floor(state->player.position.z));
+        int32_t feetY = static_cast<int32_t>(std::floor(state->player.position.y));
+        auto chunk = state->world->getChunk(Chunk::worldToChunk(px), Chunk::worldToChunkY(feetY),
+                                            Chunk::worldToChunk(pz));
         if (chunk && chunk->generated) {
-            int feetY = static_cast<int>(std::floor(state->player.position.y));
             bool embedded = isSolid(state->world->getBlock(px, feetY, pz)) ||
                             isSolid(state->world->getBlock(px, feetY + 1, pz));
             if (embedded) {
-                for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
-                    if (isSolid(state->world->getBlock(px, y, pz))) {
-                        state->player.position.y = static_cast<float>(y + 1);
-                        state->player.velocity = Vec3{0.f, 0.f, 0.f};
-                        RY_LOG_INFO("Spawn was inside terrain — moved player to the surface");
-                        break;
-                    }
-                }
+                int32_t surfaceY = static_cast<int32_t>(state->world->getTerrainHeight(px, pz));
+                state->player.position.y = static_cast<float>(surfaceY + 2);
+                state->player.velocity = Vec3{0.f, 0.f, 0.f};
+                RY_LOG_INFO("Spawn was inside terrain and moved to the surface");
             }
 
             // Playtest hook: RYCRAFT_SPAWN_LAVA=1 carves a small surface lava
@@ -758,8 +1091,13 @@ static EngineState* _engineGetState(Engine* engine) {
             if (spawnLava) {
                 for (int dz = -2; dz <= 2; ++dz) {
                     for (int dx = -2; dx <= 2; ++dx) {
-                        int wx = px + dx, wz = pz + 6 + dz; // ahead (+Z) at spawn
-                        for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
+                        int64_t wx = px + dx;
+                        int64_t wz = pz + 6 + dz; // ahead (+Z) at spawn
+                        int32_t searchTop = static_cast<int32_t>(
+                            std::clamp(state->world->getTerrainHeight(wx, wz) + CHUNK_EDGE,
+                                       static_cast<double>(WORLD_MIN_Y + 1),
+                                       static_cast<double>(WORLD_MAX_Y - 1)));
+                        for (int32_t y = searchTop; y > WORLD_MIN_Y; --y) {
                             if (isSolid(state->world->getBlock(wx, y, wz))) {
                                 state->world->setBlock(wx, y, wz, BlockType::LAVA);
                                 state->world->setBlock(wx, y + 1, wz, BlockType::AIR);
@@ -780,14 +1118,21 @@ static EngineState* _engineGetState(Engine* engine) {
             if (spawnWater) {
                 auto isTrunk = [](BlockType b) {
                     return b == BlockType::LOG || b == BlockType::BIRCH_LOG ||
-                           b == BlockType::SPRUCE_LOG;
+                           b == BlockType::SPRUCE_LOG || b == BlockType::ACACIA_LOG ||
+                           b == BlockType::JUNGLE_LOG || b == BlockType::MANGROVE_LOG ||
+                           b == BlockType::PALM_LOG || b == BlockType::WILLOW_LOG;
                 };
                 for (int dz = 3; dz <= 22; ++dz) {
                     for (int dx = -10; dx <= 10; ++dx) {
-                        int wx = px + dx, wz = pz + dz;
+                        int64_t wx = px + dx;
+                        int64_t wz = pz + dz;
                         // Scan down to the terrain surface, past any tree trunk,
                         // so the pool sits at ground level (no floating water).
-                        for (int y = CHUNK_HEIGHT - 2; y > 0; --y) {
+                        int32_t searchTop = static_cast<int32_t>(
+                            std::clamp(state->world->getTerrainHeight(wx, wz) + CHUNK_EDGE,
+                                       static_cast<double>(WORLD_MIN_Y + 1),
+                                       static_cast<double>(WORLD_MAX_Y - 1)));
+                        for (int32_t y = searchTop; y > WORLD_MIN_Y; --y) {
                             BlockType b = state->world->getBlock(wx, y, wz);
                             if (isSolid(b) && !isTrunk(b)) {
                                 // Carve a pool six blocks deep (over-water shots
@@ -856,6 +1201,7 @@ static EngineState* _engineGetState(Engine* engine) {
     playerInput.descendHeld = input.isDown(bindings.sneak.key);
     playerInput.doubleTapForward = input.isDoubleTappedForTick(bindings.forward.key);
     playerInput.doubleTapJump = input.isDoubleTappedForTick(bindings.jump.key);
+    const Vec3 playerPositionBeforeMove = state->player.position;
     state->player.tick(*state->world, playerInput);
 
     // 5b. Footsteps: one thud roughly every two blocks walked on the ground
@@ -878,34 +1224,26 @@ static EngineState* _engineGetState(Engine* engine) {
     // updatePlayerPosition takes WORLD coordinates (it converts to chunk
     // coords itself) — passing pre-converted chunk coords made streaming
     // track chunk/16, so the world unloaded under the player ~200 blocks out
-    state->world->updatePlayerPosition(static_cast<int>(std::floor(state->player.position.x)),
-                                       static_cast<int>(std::floor(state->player.position.z)));
+    state->world->updatePlayerPosition(static_cast<int64_t>(std::floor(state->player.position.x)),
+                                       static_cast<int32_t>(std::floor(state->player.position.y)),
+                                       static_cast<int64_t>(std::floor(state->player.position.z)));
+    state->world->tickFluids(EngineState::TICK_DT);
 
     // 6b. Animals: initial population once the spawn area streamed in, then
     // per-tick AI steering + physics for every living entity
     if (state->spawner) {
-        if (!state->populationSpawned && state->world->getPendingChunkCount() == 0) {
-            // Populate only the chunks near spawn, with a hard cap — biome
-            // densities over the full view distance produce thousands of
-            // animals, which neither the AI tick nor the player needs.
-            constexpr int SPAWN_CHUNK_RADIUS = 3;
-            constexpr size_t MAX_ANIMALS = 64;
-            int playerChunkX = Chunk::worldToChunk(static_cast<int>(state->player.position.x));
-            int playerChunkZ = Chunk::worldToChunk(static_cast<int>(state->player.position.z));
-            for (int dz = -SPAWN_CHUNK_RADIUS; dz <= SPAWN_CHUNK_RADIUS; ++dz) {
-                for (int dx = -SPAWN_CHUNK_RADIUS; dx <= SPAWN_CHUNK_RADIUS; ++dx) {
-                    if (state->spawner->getEntities().size() >= MAX_ANIMALS)
-                        break;
-                    state->spawner->spawnForChunk(playerChunkX + dx, playerChunkZ + dz);
-                }
-            }
-            state->populationSpawned = true;
-            RY_LOG_INFO(std::string("Spawned ") +
-                        std::to_string(state->spawner->getEntities().size()) + " animals");
-        }
+        state->spawner->updatePopulation(state->player.position);
 
         auto& entities = state->spawner->getEntities();
         auto& spatialHash = state->spawner->getSpatialHash();
+        std::unordered_set<uint64_t> liveEntityIds;
+        liveEntityIds.reserve(entities.size());
+        for (const auto& entity : entities) {
+            if (entity)
+                liveEntityIds.insert(entity->id);
+        }
+        std::erase_if(state->entityBrains,
+                      [&](const auto& entry) { return !liveEntityIds.contains(entry.first); });
         // Index-based over a size snapshot with a shared_ptr copy: breeding
         // inside StateMachine::update can push_back into this very vector,
         // which would invalidate range-for iterators mid-loop.
@@ -922,10 +1260,13 @@ static EngineState* _engineGetState(Engine* engine) {
                 continue;
 
             StateMachine& brain = state->entityBrains[entity->id];
-            Vec3 steering = brain.update(*entity, *state->world, state->player.position,
-                                         /*playerMovingToward=*/false,
-                                         /*playerHoldingFood=*/false, *state->spawner);
+            const bool playerMovingToward = StateMachine::playerMovedToward(
+                playerPositionBeforeMove, state->player.position, entity->position);
+            Vec3 steering =
+                brain.update(*entity, *state->world, state->player.position, playerMovingToward,
+                             /*playerHoldingFood=*/false, *state->spawner);
             entity->velocity.x += steering.x;
+            entity->velocity.y += steering.y;
             entity->velocity.z += steering.z;
             entity->tick(*state->world);
 
@@ -1009,6 +1350,10 @@ static EngineState* _engineGetState(Engine* engine) {
         [self placeBlock:state hit:rayHit];
     }
 
+    // Publish the immutable loaded-cube registry once per simulation tick.
+    // Rendering reads this pointer without copying or taking the world lock.
+    state->world->publishLoadedSnapshot();
+
     // Tick-edge input consumed — a second tick in this frame must not re-fire
     input.clearTickPresses();
 }
@@ -1019,13 +1364,13 @@ static EngineState* _engineGetState(Engine* engine) {
     if (!hit.has_value())
         return;
 
-    int hitX = static_cast<int>(std::floor(hit->first.x));
-    int hitY = static_cast<int>(std::floor(hit->first.y));
-    int hitZ = static_cast<int>(std::floor(hit->first.z));
+    int64_t hitX = static_cast<int64_t>(std::floor(hit->first.x));
+    int32_t hitY = static_cast<int32_t>(std::floor(hit->first.y));
+    int64_t hitZ = static_cast<int64_t>(std::floor(hit->first.z));
 
     // Cannot break bedrock
-    BlockType current = state->world->getBlock(hitX, hitY, hitZ);
-    if (current == BlockType::BEDROCK)
+    const std::optional<BlockType> current = state->world->findBlockIfLoaded(hitX, hitY, hitZ);
+    if (!current || *current == BlockType::BEDROCK)
         return;
 
     // Set block to air
@@ -1033,7 +1378,8 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Flora standing on the broken block loses its support and pops with it
     // (same column → same chunk → the dirty/save below covers it)
-    if (isFlora(state->world->getBlock(hitX, hitY + 1, hitZ))) {
+    const std::optional<BlockType> flora = state->world->findBlockIfLoaded(hitX, hitY + 1, hitZ);
+    if (flora && isFlora(*flora)) {
         state->world->setBlock(hitX, hitY + 1, hitZ, BlockType::AIR);
     }
 
@@ -1053,9 +1399,12 @@ static EngineState* _engineGetState(Engine* engine) {
         return;
 
     // Calculate placement position: hit block + face normal
-    int placeX = static_cast<int>(std::floor(hit->first.x)) + static_cast<int>(hit->second.x);
-    int placeY = static_cast<int>(std::floor(hit->first.y)) + static_cast<int>(hit->second.y);
-    int placeZ = static_cast<int>(std::floor(hit->first.z)) + static_cast<int>(hit->second.z);
+    int64_t placeX =
+        static_cast<int64_t>(std::floor(hit->first.x)) + static_cast<int64_t>(hit->second.x);
+    int32_t placeY =
+        static_cast<int32_t>(std::floor(hit->first.y)) + static_cast<int32_t>(hit->second.y);
+    int64_t placeZ =
+        static_cast<int64_t>(std::floor(hit->first.z)) + static_cast<int64_t>(hit->second.z);
 
     // Validate: placement AABB must not overlap player AABB
     AABB placeBox{
@@ -1064,6 +1413,11 @@ static EngineState* _engineGetState(Engine* engine) {
              static_cast<float>(placeZ + 1)}};
 
     if (placeBox.intersects(state->player.getAABB()))
+        return;
+
+    const ChunkPos placeChunk{Chunk::worldToChunk(placeX), Chunk::worldToChunkY(placeY),
+                              Chunk::worldToChunk(placeZ)};
+    if (!state->world->isChunkLoaded(placeChunk))
         return;
 
     // Place block (World::setBlock marks the chunk and boundary neighbors
@@ -1098,8 +1452,11 @@ static EngineState* _engineGetState(Engine* engine) {
         state->drawableSize = currentSize;
         float aspect =
             static_cast<float>(currentSize.width) / static_cast<float>(currentSize.height);
+        const float farPlane =
+            std::max(1000.0f, static_cast<float>(state->settings.viewDistance * CHUNK_EDGE +
+                                                 FAR_TERRAIN_TILE_EDGE * 2));
         state->projectionMatrix = Mat4::perspective(
-            state->camera.FOV() * (static_cast<float>(M_PI) / 180.0f), aspect, 0.1f, 1000.0f);
+            state->camera.FOV() * (static_cast<float>(M_PI) / 180.0f), aspect, 0.1f, farPlane);
     }
 
     id<CAMetalDrawable> drawable = _view.currentDrawable;
@@ -1115,15 +1472,26 @@ static EngineState* _engineGetState(Engine* engine) {
     // the whole chunk vector)
     if (state->frameCount % 60 == 1) {
         auto chunkStats = _renderPipeline->chunkRenderStats();
-        char line[288];
+        const StreamingWorkStats streaming = state->world->getStreamingWorkStats();
+        char line[768];
         snprintf(line, sizeof(line),
-                 "Render: %u loaded chunks, frame %llu player (%.1f, %.1f, %.1f) | %.2f ms/frame "
-                 "gpu %.2f ms gen %.2f ms mesh %.2f ms pending %zu vram %.0f/%.0f MB",
-                 state->cachedChunkCount, static_cast<unsigned long long>(state->frameCount),
-                 state->player.position.x, state->player.position.y, state->player.position.z,
-                 state->smoothedFrameMs, _renderPipeline->gpuFrameMs(),
+                 "Render: frame %llu player (%.1f, %.1f, %.1f) | %.2f ms/frame gpu %.2f ms "
+                 "cubes %u loaded %u meshed gen %.2f ms mesh %.2f ms queues %zu/%u high %u "
+                 "exact %.0f/%.0f MB far %u wanted %u resident %u drawn %u frustum %u occluded "
+                 "%u pending %.0f MB cache %.0f MB arena planner %.1f ms %llu/%llu/%llu",
+                 static_cast<unsigned long long>(state->frameCount), state->player.position.x,
+                 state->player.position.y, state->player.position.z, state->smoothedFrameMs,
+                 _renderPipeline->gpuFrameMs(), state->cachedChunkCount, chunkStats.meshCubeCount,
                  state->world->averageGenMs(), chunkStats.meshMsAvg,
-                 state->world->getPendingChunkCount(), chunkStats.megaUsedMB, chunkStats.megaCapMB);
+                 state->world->getPendingChunkCount(), chunkStats.meshPendingCount,
+                 chunkStats.meshQueueHighWater, chunkStats.megaUsedMB, chunkStats.megaCapMB,
+                 chunkStats.farWantedTileCount, chunkStats.farResidentTileCount,
+                 chunkStats.farDrawnTileCount, chunkStats.farFrustumCulledTileCount,
+                 chunkStats.farOcclusionCulledTileCount, chunkStats.farPendingTileCount,
+                 chunkStats.farCacheMB, chunkStats.farMegaUsedMB, streaming.activeSetBuildMs,
+                 static_cast<unsigned long long>(streaming.activeSetRequests),
+                 static_cast<unsigned long long>(streaming.activeSetRequestsCoalesced),
+                 static_cast<unsigned long long>(streaming.activeSetBuildsCanceled));
         RY_LOG_INFO(line);
         // Per-pass GPU breakdown (RYCRAFT_GPU_COUNTERS=1) mirrors to the log
         // so headless runs can attribute frame cost to individual passes.
@@ -1160,7 +1528,7 @@ static EngineState* _engineGetState(Engine* engine) {
     state->smoothedFrameMs =
         state->smoothedFrameMs * 0.95f + static_cast<float>(state->deltaTime) * 1000.0f * 0.05f;
     if (state->frameCount % 30 == 0) {
-        state->cachedChunkCount = static_cast<uint32_t>(state->world->getLoadedChunks().size());
+        state->cachedChunkCount = static_cast<uint32_t>(state->world->getLoadedChunkCount());
         state->cachedPendingChunks = static_cast<uint32_t>(state->world->getPendingChunkCount());
     }
 
@@ -1172,10 +1540,13 @@ static EngineState* _engineGetState(Engine* engine) {
     // Non-generating read — a streaming lag must never stall the frame.
     {
         Vec3 camPos = state->camera.getPosition();
+        const int64_t waterX = static_cast<int64_t>(std::floor(camPos.x));
+        const int32_t waterY = static_cast<int32_t>(std::floor(camPos.y));
+        const int64_t waterZ = static_cast<int64_t>(std::floor(camPos.z));
         uiFrame.cameraUnderwater =
-            state->world->getBlockIfLoaded(
-                static_cast<int>(std::floor(camPos.x)), static_cast<int>(std::floor(camPos.y)),
-                static_cast<int>(std::floor(camPos.z))) == BlockType::WATER;
+            state->world->getBlockIfLoaded(waterX, waterY, waterZ) == BlockType::WATER &&
+            camPos.y < static_cast<float>(waterY) +
+                           state->world->getFluidHeightIfLoaded(waterX, waterY, waterZ);
     }
     uiFrame.stats.frameTimeMs = state->smoothedFrameMs;
     uiFrame.stats.gpuFrameMs = _renderPipeline->gpuFrameMs();
@@ -1190,6 +1561,40 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.stats.meshBuildsFrame = chunkStats.meshBuildsLastFrame;
     uiFrame.stats.megaUsedMB = chunkStats.megaUsedMB;
     uiFrame.stats.megaCapMB = chunkStats.megaCapMB;
+    uiFrame.stats.meshedCubeCount = chunkStats.meshCubeCount;
+    uiFrame.stats.farWantedTiles = chunkStats.farWantedTileCount;
+    uiFrame.stats.farResidentTiles = chunkStats.farResidentTileCount;
+    uiFrame.stats.farDrawnTiles = chunkStats.farDrawnTileCount;
+    uiFrame.stats.farFrustumCulledTiles = chunkStats.farFrustumCulledTileCount;
+    uiFrame.stats.farOcclusionCulledTiles = chunkStats.farOcclusionCulledTileCount;
+    uiFrame.stats.farPendingTiles = chunkStats.farPendingTileCount;
+    uiFrame.stats.farCacheMB = chunkStats.farCacheMB;
+    uiFrame.stats.farMeshMB = chunkStats.farMegaUsedMB;
+    const int64_t playerX = static_cast<int64_t>(std::floor(state->player.position.x));
+    const int32_t playerY = static_cast<int32_t>(std::floor(state->player.position.y));
+    const int64_t playerZ = static_cast<int64_t>(std::floor(state->player.position.z));
+    uiFrame.stats.cubeX = Chunk::worldToChunk(playerX);
+    uiFrame.stats.cubeY = Chunk::worldToChunkY(playerY);
+    uiFrame.stats.cubeZ = Chunk::worldToChunk(playerZ);
+    const size_t planEntries = state->world->cachedColumnPlanCount();
+    const worldgen::BasinCacheMetrics basinCache = state->world->generator().basinCacheMetrics();
+    uiFrame.stats.macroCacheEntries = static_cast<uint32_t>(planEntries + basinCache.entries);
+    uiFrame.stats.macroCacheMB =
+        static_cast<float>(planEntries * sizeof(ColumnPlan) + basinCache.bytes) /
+        (1024.0f * 1024.0f);
+    uiFrame.stats.pendingFluids = static_cast<uint32_t>(state->world->getPendingFluidCount());
+    uiFrame.stats.droppedFluidUpdates = state->world->getDroppedFluidUpdateCount();
+    uiFrame.stats.droppedFluidFrontiers = state->world->getDroppedFluidFrontierCount();
+    if (const auto surface = state->world->findSurfaceSample(playerX, playerZ)) {
+        uiFrame.stats.plateId = surface->geology.plateId;
+        uiFrame.stats.boundary = surface->geology.boundary;
+        uiFrame.stats.temperatureC = static_cast<float>(surface->climate.temperatureC);
+        uiFrame.stats.precipitationMm = static_cast<float>(surface->climate.annualPrecipitationMm);
+        uiFrame.stats.primaryBiome = surface->biome.primary;
+        uiFrame.stats.secondaryBiome = surface->biome.secondary;
+        uiFrame.stats.biomeTransition = static_cast<float>(surface->biome.transition);
+        uiFrame.stats.riverOrder = surface->hydrology.streamOrder;
+    }
     uiFrame.menu = state->menuLayout;
 
     _renderPipeline->render(
@@ -1197,6 +1602,12 @@ static EngineState* _engineGetState(Engine* engine) {
         state->worldTime, state->deltaTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
         state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
+
+    if (updatePerformanceCapture(state->performance, state->frameCount, state->deltaTime * 1000.0,
+                                 state->cachedChunkCount, state->autopilotStopFrame, *state->world,
+                                 *_renderPipeline, _device)) {
+        [self requestQuit];
+    }
 }
 
 - (double)deltaTime {

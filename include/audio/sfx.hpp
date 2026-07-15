@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <vector>
 
+enum class EntityType : uint8_t;
+
 // ---------------------------------------------------------------------------
 // SoundEffect — Procedural sound effect generation.
 //
@@ -35,6 +37,14 @@ public:
     static std::vector<float> generateCowMoo();
     static std::vector<float> generatePigOink();
     static std::vector<float> generateChickenCluck();
+    static std::vector<float> generateDeerCall();
+    static std::vector<float> generateGoatBleat();
+    static std::vector<float> generateRabbitChirp();
+    static std::vector<float> generateFrogCroak();
+    static std::vector<float> generateFishSplash();
+
+    // Exhaustive dispatch used by the engine's EntityType-indexed table.
+    static std::vector<float> generateAnimalCall(EntityType type);
 
     // Internal helpers
 private:

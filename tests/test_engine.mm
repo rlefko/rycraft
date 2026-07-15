@@ -196,7 +196,7 @@ TEST_CASE("Settings save/load round-trips values and video settings", "[engine][
     std::string path = dir.path() + "/settings.json";
 
     SettingsValues values;
-    values.viewDistance = 16;
+    values.viewDistance = SettingsValues::MAX_VIEW_DISTANCE;
     values.fogLevel = 7;
     values.sensitivityLevel = 9;
     values.volumeLevel = 2;
@@ -215,7 +215,7 @@ TEST_CASE("Settings save/load round-trips values and video settings", "[engine][
     REQUIRE(saveSettings(path, values, gfx));
     LoadedSettings loaded = loadSettings(path);
 
-    REQUIRE(loaded.values.viewDistance == 16);
+    REQUIRE(loaded.values.viewDistance == SettingsValues::MAX_VIEW_DISTANCE);
     REQUIRE(loaded.values.fogLevel == 7);
     REQUIRE(loaded.values.sensitivityLevel == 9);
     REQUIRE(loaded.values.volumeLevel == 2);
@@ -236,7 +236,7 @@ TEST_CASE("Settings load: missing file and out-of-range values fall back", "[eng
 
     // Missing file → the max-preset defaults
     LoadedSettings missing = loadSettings(dir.path() + "/nope.json");
-    REQUIRE(missing.values.viewDistance == 12);
+    REQUIRE(missing.values.viewDistance == SettingsValues::DEFAULT_VIEW_DISTANCE);
     REQUIRE(missing.gfx.shadowQuality == 2);
     REQUIRE(missing.gfx.volumetricLight);
     REQUIRE(missing.gfx.cloudMode == 2);
@@ -251,7 +251,7 @@ TEST_CASE("Settings load: missing file and out-of-range values fall back", "[eng
         file << "{ \"viewDistance\": 999, \"shadowQuality\": -3, \"vibrance\": 42 }";
     }
     LoadedSettings clamped = loadSettings(path);
-    REQUIRE(clamped.values.viewDistance == 32);
+    REQUIRE(clamped.values.viewDistance == SettingsValues::MAX_VIEW_DISTANCE);
     REQUIRE(clamped.gfx.shadowQuality == 0);
     REQUIRE(clamped.gfx.vibrance == 10);
     // Keys the file omits keep their defaults

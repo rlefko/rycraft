@@ -1,138 +1,172 @@
 #include "world/chunk.hpp"
 
 #include <algorithm>
-#include <stdexcept>
+#include <utility>
 
-Chunk::Chunk(int cx, int cz)
-    : chunkX(cx)
-    , chunkZ(cz)
-    , blocks(CHUNK_VOLUME, BlockType::AIR)
-    , biomes{}
-    , heightMap{} {
-    biomes.fill(Biome::PLAINS);
-    heightMap.fill(0);
-}
+Chunk::Chunk(ChunkPos chunkPos) : chunkX(chunkPos.x), chunkY(chunkPos.y), chunkZ(chunkPos.z) {}
 
 Chunk::Chunk(const Chunk& other)
     : chunkX(other.chunkX)
+    , chunkY(other.chunkY)
     , chunkZ(other.chunkZ)
-    , blocks(other.blocks)
-    , blockLight(other.blockLight)
-    , biomes(other.biomes)
-    , heightMap(other.heightMap)
     , needsMeshUpdate(other.needsMeshUpdate)
     , meshed(other.meshed)
     , generated(other.generated)
     , modifiedSinceSave(other.modifiedSinceSave)
-    , version(other.version.load()) {}
+    , version(other.version.load(std::memory_order_relaxed))
+    , uniformBlock_(other.uniformBlock_)
+    , blocks_(other.blocks_)
+    , fluidStates_(other.fluidStates_)
+    , blockLight_(other.blockLight_) {}
 
 Chunk::Chunk(Chunk&& other) noexcept
     : chunkX(other.chunkX)
+    , chunkY(other.chunkY)
     , chunkZ(other.chunkZ)
-    , blocks(std::move(other.blocks))
-    , blockLight(std::move(other.blockLight))
-    , biomes(other.biomes)
-    , heightMap(other.heightMap)
     , needsMeshUpdate(other.needsMeshUpdate)
     , meshed(other.meshed)
     , generated(other.generated)
     , modifiedSinceSave(other.modifiedSinceSave)
-    , version(other.version.load()) {}
+    , version(other.version.load(std::memory_order_relaxed))
+    , uniformBlock_(other.uniformBlock_)
+    , blocks_(std::move(other.blocks_))
+    , fluidStates_(std::move(other.fluidStates_))
+    , blockLight_(std::move(other.blockLight_)) {}
 
 Chunk& Chunk::operator=(const Chunk& other) {
+    if (this == &other) return *this;
     chunkX = other.chunkX;
+    chunkY = other.chunkY;
     chunkZ = other.chunkZ;
-    blocks = other.blocks;
-    blockLight = other.blockLight;
-    biomes = other.biomes;
-    heightMap = other.heightMap;
     needsMeshUpdate = other.needsMeshUpdate;
     meshed = other.meshed;
     generated = other.generated;
     modifiedSinceSave = other.modifiedSinceSave;
-    version.store(other.version.load());
+    version.store(other.version.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    uniformBlock_ = other.uniformBlock_;
+    blocks_ = other.blocks_;
+    fluidStates_ = other.fluidStates_;
+    blockLight_ = other.blockLight_;
     return *this;
 }
 
-// Internal index calculation: Y-major for greedy meshing
-static int chunkIndex(int x, int y, int z) {
-    return x + z * CHUNK_WIDTH + y * CHUNK_WIDTH * CHUNK_DEPTH;
+void Chunk::materialize() {
+    if (blocks_.empty()) blocks_.assign(CHUNK_VOLUME, uniformBlock_);
 }
 
 BlockType Chunk::getBlock(int localX, int localY, int localZ) const {
-    if (localX < 0 || localX >= CHUNK_WIDTH) return BlockType::AIR;
-    if (localY < 0 || localY >= CHUNK_HEIGHT) return BlockType::AIR;
-    if (localZ < 0 || localZ >= CHUNK_DEPTH) return BlockType::AIR;
-    return blocks[chunkIndex(localX, localY, localZ)];
+    if (localX < 0 || localX >= CHUNK_EDGE || localY < 0 || localY >= CHUNK_EDGE || localZ < 0 ||
+        localZ >= CHUNK_EDGE) {
+        return BlockType::AIR;
+    }
+    return blocks_.empty() ? uniformBlock_ : blocks_[index(localX, localY, localZ)];
 }
 
 void Chunk::setBlock(int localX, int localY, int localZ, BlockType type) {
-    if (localX < 0 || localX >= CHUNK_WIDTH) return;
-    if (localY < 0 || localY >= CHUNK_HEIGHT) return;
-    if (localZ < 0 || localZ >= CHUNK_DEPTH) return;
-    blocks[chunkIndex(localX, localY, localZ)] = type;
-    needsMeshUpdate = true;
+    if (localX < 0 || localX >= CHUNK_EDGE || localY < 0 || localY >= CHUNK_EDGE || localZ < 0 ||
+        localZ >= CHUNK_EDGE) {
+        return;
+    }
+    if (blocks_.empty() && type == uniformBlock_) return;
+    materialize();
+    blocks_[index(localX, localY, localZ)] = type;
 }
 
 uint8_t Chunk::getBlockLight(int localX, int localY, int localZ) const {
-    if (blockLight.empty()) return 0;
-    if (localX < 0 || localX >= CHUNK_WIDTH) return 0;
-    if (localY < 0 || localY >= CHUNK_HEIGHT) return 0;
-    if (localZ < 0 || localZ >= CHUNK_DEPTH) return 0;
-    return blockLight[chunkIndex(localX, localY, localZ)];
+    if (blockLight_.empty()) return 0;
+    if (localX < 0 || localX >= CHUNK_EDGE || localY < 0 || localY >= CHUNK_EDGE || localZ < 0 ||
+        localZ >= CHUNK_EDGE) {
+        return 0;
+    }
+    return blockLight_[index(localX, localY, localZ)];
 }
 
 void Chunk::setBlockLight(int localX, int localY, int localZ, uint8_t level) {
-    if (localX < 0 || localX >= CHUNK_WIDTH) return;
-    if (localY < 0 || localY >= CHUNK_HEIGHT) return;
-    if (localZ < 0 || localZ >= CHUNK_DEPTH) return;
-    if (blockLight.empty()) {
-        if (level == 0) return; // stay unallocated while fully dark
-        blockLight.assign(CHUNK_VOLUME, 0);
+    if (localX < 0 || localX >= CHUNK_EDGE || localY < 0 || localY >= CHUNK_EDGE || localZ < 0 ||
+        localZ >= CHUNK_EDGE) {
+        return;
     }
-    blockLight[chunkIndex(localX, localY, localZ)] = level;
+    level = std::min<uint8_t>(level, 15);
+    if (blockLight_.empty()) {
+        if (level == 0) return; // stay unallocated while fully dark
+        blockLight_.assign(CHUNK_VOLUME, 0);
+    }
+    blockLight_[index(localX, localY, localZ)] = level;
 }
 
-BlockType Chunk::getBlockWorld(int x, int y, int z) const {
-    int localX = x - chunkX * CHUNK_WIDTH;
-    int localZ = z - chunkZ * CHUNK_DEPTH;
-    return getBlock(localX, y, localZ);
+void Chunk::replaceBlockLight(std::vector<uint8_t> light) {
+    if (!light.empty() && light.size() != CHUNK_VOLUME) return;
+    if (std::none_of(light.begin(), light.end(), [](uint8_t level) { return level != 0; })) {
+        light.clear();
+    }
+    blockLight_ = std::move(light);
 }
 
-void Chunk::setBlockWorld(int x, int y, int z, BlockType type) {
-    int localX = x - chunkX * CHUNK_WIDTH;
-    int localZ = z - chunkZ * CHUNK_DEPTH;
-    setBlock(localX, y, localZ, type);
+BlockType Chunk::getBlockWorld(int64_t x, int32_t y, int64_t z) const {
+    return getBlock(worldToLocal(x), worldToLocalY(y), worldToLocal(z));
 }
 
-int Chunk::worldToChunk(int worldCoord) {
-    // Truncate toward zero for positive, floor for negative
-    return (worldCoord >= 0) ? (worldCoord / CHUNK_WIDTH)
-                             : ((worldCoord - CHUNK_WIDTH + 1) / CHUNK_WIDTH);
+void Chunk::setBlockWorld(int64_t x, int32_t y, int64_t z, BlockType type) {
+    setBlock(worldToLocal(x), worldToLocalY(y), worldToLocal(z), type);
 }
 
-int Chunk::chunkToWorld(int chunkCoord, int localCoord) {
-    return chunkCoord * CHUNK_WIDTH + localCoord;
+std::vector<BlockType> Chunk::copyBlocks() const {
+    if (!blocks_.empty()) return blocks_;
+    return std::vector<BlockType>(CHUNK_VOLUME, uniformBlock_);
+}
+
+void Chunk::replaceBlocks(std::vector<BlockType> blocks) {
+    if (blocks.size() != CHUNK_VOLUME) return;
+    blocks_ = std::move(blocks);
+    compactStorage();
+}
+
+void Chunk::fill(BlockType type) {
+    uniformBlock_ = type;
+    blocks_.clear();
+}
+
+void Chunk::compactStorage() {
+    if (blocks_.empty()) return;
+    const BlockType first = blocks_.front();
+    if (std::all_of(blocks_.begin(), blocks_.end(),
+                    [first](BlockType block) { return block == first; })) {
+        uniformBlock_ = first;
+        blocks_.clear();
+    }
+}
+
+FluidState Chunk::getFluidState(int localX, int localY, int localZ) const {
+    if (localX < 0 || localX >= CHUNK_EDGE || localY < 0 || localY >= CHUNK_EDGE || localZ < 0 ||
+        localZ >= CHUNK_EDGE || fluidStates_.empty()) {
+        return FluidState::source();
+    }
+    const uint8_t packed = fluidStates_[index(localX, localY, localZ)];
+    return packed == 0xFF ? FluidState::source() : FluidState::fromPacked(packed);
+}
+
+void Chunk::setFluidState(int localX, int localY, int localZ, FluidState state) {
+    if (localX < 0 || localX >= CHUNK_EDGE || localY < 0 || localY >= CHUNK_EDGE || localZ < 0 ||
+        localZ >= CHUNK_EDGE) {
+        return;
+    }
+    if (fluidStates_.empty() && state.isSource()) return;
+    if (fluidStates_.empty()) fluidStates_.assign(CHUNK_VOLUME, 0xFF);
+    fluidStates_[index(localX, localY, localZ)] = state.isSource() ? 0xFF : state.packed();
+}
+
+void Chunk::replaceFluidStates(std::vector<uint8_t> states) {
+    if (!states.empty() && states.size() != CHUNK_VOLUME) return;
+    fluidStates_ = std::move(states);
 }
 
 Vec3 Chunk::getWorldPosition() const {
-    return Vec3{static_cast<float>(chunkX * CHUNK_WIDTH), 0.f,
-                static_cast<float>(chunkZ * CHUNK_DEPTH)};
-}
-
-void Chunk::markDirty() {
-    needsMeshUpdate = true;
-}
-
-void Chunk::setMeshed(bool value) {
-    meshed = value;
-    needsMeshUpdate = false;
+    return {static_cast<float>(chunkX * CHUNK_EDGE), static_cast<float>(chunkY * CHUNK_EDGE),
+            static_cast<float>(chunkZ * CHUNK_EDGE)};
 }
 
 AABB Chunk::getAABB() const {
-    Vec3 min{static_cast<float>(chunkX * CHUNK_WIDTH), 0.f,
-             static_cast<float>(chunkZ * CHUNK_DEPTH)};
-    Vec3 max{static_cast<float>((chunkX + 1) * CHUNK_WIDTH), static_cast<float>(CHUNK_HEIGHT),
-             static_cast<float>((chunkZ + 1) * CHUNK_DEPTH)};
-    return AABB{min, max};
+    const Vec3 min = getWorldPosition();
+    const Vec3 max{min.x + CHUNK_EDGE, min.y + CHUNK_EDGE, min.z + CHUNK_EDGE};
+    return {min, max};
 }

@@ -3,11 +3,13 @@
 #include "render/vertex.hpp"
 #include "world/block_properties.hpp"
 #include "world/mesh_snapshot.hpp"
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
 // Forward declaration
-struct Chunk;
+class Chunk;
 
 // Output of a single chunk mesh build. One vertex/index stream holds two
 // sections: indices [0, opaqueIndexCount) draw in the opaque chunk pass,
@@ -25,32 +27,30 @@ struct MeshOutput {
 
 // Level of Detail enum for chunk meshing.
 enum class ChunkLOD : int {
-    FULL = 0,   // 16x16x256, full greedy meshing
-    MEDIUM = 1, // 8x8x128, 2x downsampling
-    COARSE = 2, // 4x4x64, 4x downsampling
+    FULL = 0,   // 16x16x16, full greedy meshing
+    MEDIUM = 1, // 8x8x8, 2x downsampling
+    COARSE = 2, // 4x4x4, 4x downsampling
     COUNT = 3
 };
 
-// Reusable per-thread meshing buffers. Building a full chunk mesh used to
-// heap-allocate ~2.25 MB of scratch per build (~36 MB/frame during
-// streaming bursts); assign() on long-lived vectors keeps the capacity.
+// Fixed-size per-thread buffers for one cubic mesh plane and its skylight
+// halo. A packed nonzero face key stores block type, sky light, block light,
+// and four corner-AO values. Zero represents an empty or consumed mask cell.
 struct MeshScratch {
-    std::vector<bool> faceMask;
-    std::vector<BlockType> blockTypes;
-    std::vector<uint8_t> cellLight;
-    std::vector<uint8_t> cellBlockLight; // lava block light reaching each exposed face cell
-    std::vector<uint8_t> cellAO;         // four 2-bit corner-AO values per exposed face cell
-    std::vector<bool> merged;
-    std::vector<int> skyHeight;
+    static constexpr size_t MAX_FACE_CELLS = CHUNK_EDGE * CHUNK_EDGE;
+    static constexpr size_t MAX_SKY_COLUMNS = (CHUNK_EDGE + 2) * (CHUNK_EDGE + 2);
+
+    std::array<uint32_t, MAX_FACE_CELLS> faceKeys{};
+    std::array<int32_t, MAX_SKY_COLUMNS> skyHeight{};
 };
 
 // Greedy mesher with level-of-detail support. This is the single mesher in
-// the engine: ChunkLOD::FULL runs the standard 16×16×256 greedy meshing, the
+// the engine: ChunkLOD::FULL runs the standard 16x16x16 greedy meshing, the
 // coarser levels sample the chunk at reduced resolution first.
 //
-//   LOD 0 (near,  < 128 blocks):  full greedy meshing (16×16×256)
-//   LOD 1 (mid,   128-256 blocks): 2× downsampling (8×8×128)
-//   LOD 2 (far,   256-512 blocks): 4× downsampling (4×4×64)
+//   LOD 0 (near,  < 128 blocks):  full greedy meshing (16x16x16)
+//   LOD 1 (mid,   128-256 blocks): 2x downsampling (8x8x8)
+//   LOD 2 (far,   256-512 blocks): 4x downsampling (4x4x4)
 //   Beyond 512 blocks: returns empty mesh (distance culling)
 //
 // The game meshes through the MeshSnapshot overload: real neighbor walls

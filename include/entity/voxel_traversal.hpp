@@ -32,7 +32,7 @@ public:
                                                                    float maxDistance = 6.0f);
 
 private:
-    // Check if a block at integer coordinates is solid (for ray tracing).
-    // Uses the same definition as PhysicsEngine::isSolid.
-    static bool isBlockSolid(World& world, int x, int y, int z);
+    // A disengaged result means the cube is unavailable. Traversal stops at
+    // that boundary without generating or targeting a placeholder block.
+    static std::optional<bool> isBlockTargetableIfLoaded(World& world, int x, int y, int z);
 };

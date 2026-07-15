@@ -1,7 +1,10 @@
 #include "audio/sfx.hpp"
+#include "entity/entity.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -301,4 +304,110 @@ std::vector<float> SoundEffect::generateChickenCluck() {
     }
 
     return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Deer call: a soft rising whistle
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generateDeerCall() {
+    uint32_t duration = static_cast<uint32_t>(0.35f * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    for (uint32_t i = 0; i < duration; ++i) {
+        float tone = frequencySweep(i, SAMPLE_RATE, 180.0f, 260.0f, duration);
+        tone += sinOscillator(i, SAMPLE_RATE, 360.0f) * 0.2f;
+        float envelope = adsrEnvelope(i, duration, 0.04f, 0.08f, 0.55f, 0.12f);
+        samples[i] = tone * envelope * 0.38f;
+    }
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Goat bleat: a nasal, rapidly modulated tone
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generateGoatBleat() {
+    uint32_t duration = static_cast<uint32_t>(0.3f * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    for (uint32_t i = 0; i < duration; ++i) {
+        float vibrato = 32.0f * sinOscillator(i, SAMPLE_RATE, 8.0f);
+        float tone = sinOscillator(i, SAMPLE_RATE, 310.0f + vibrato);
+        tone += sinOscillator(i, SAMPLE_RATE, 620.0f + vibrato) * 0.22f;
+        float envelope = adsrEnvelope(i, duration, 0.015f, 0.05f, 0.6f, 0.1f);
+        samples[i] = tone * envelope * 0.4f;
+    }
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Rabbit chirp: a brief high-pitched squeak
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generateRabbitChirp() {
+    uint32_t duration = static_cast<uint32_t>(0.08f * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    for (uint32_t i = 0; i < duration; ++i) {
+        float tone = frequencySweep(i, SAMPLE_RATE, 1050.0f, 720.0f, duration);
+        float envelope = adsrEnvelope(i, duration, 0.004f, 0.015f, 0.25f, 0.04f);
+        samples[i] = tone * envelope * 0.3f;
+    }
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Frog croak: low pulses with a resonant harmonic
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generateFrogCroak() {
+    uint32_t duration = static_cast<uint32_t>(0.45f * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    float filterState = 0.0f;
+    for (uint32_t i = 0; i < duration; ++i) {
+        float pulse = 0.35f + 0.65f * std::max(0.0f, sinOscillator(i, SAMPLE_RATE, 13.0f));
+        float raw = sinOscillator(i, SAMPLE_RATE, 92.0f);
+        raw += sinOscillator(i, SAMPLE_RATE, 184.0f) * 0.35f;
+        raw += randomNoise(0xF206u, i / 3) * 0.08f;
+        raw = lowPassFilter(raw, &filterState, 420.0f, SAMPLE_RATE);
+        float envelope = adsrEnvelope(i, duration, 0.025f, 0.06f, 0.65f, 0.14f);
+        samples[i] = raw * pulse * envelope * 0.42f;
+    }
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Fish splash: a short filtered water-noise burst
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generateFishSplash() {
+    uint32_t duration = static_cast<uint32_t>(0.12f * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    float filterState = 0.0f;
+    for (uint32_t i = 0; i < duration; ++i) {
+        float noise = randomNoise(0xF157u, i);
+        float bubble = frequencySweep(i, SAMPLE_RATE, 520.0f, 180.0f, duration) * 0.25f;
+        float raw = lowPassFilter(noise * 0.65f + bubble, &filterState, 900.0f, SAMPLE_RATE);
+        float envelope = adsrEnvelope(i, duration, 0.003f, 0.025f, 0.12f, 0.07f);
+        samples[i] = raw * envelope * 0.38f;
+    }
+    return samples;
+}
+
+std::vector<float> SoundEffect::generateAnimalCall(EntityType type) {
+    switch (type) {
+        case EntityType::SHEEP:
+            return generateSheepBaa();
+        case EntityType::COW:
+            return generateCowMoo();
+        case EntityType::PIG:
+            return generatePigOink();
+        case EntityType::CHICKEN:
+            return generateChickenCluck();
+        case EntityType::DEER:
+            return generateDeerCall();
+        case EntityType::GOAT:
+            return generateGoatBleat();
+        case EntityType::RABBIT:
+            return generateRabbitChirp();
+        case EntityType::FROG:
+            return generateFrogCroak();
+        case EntityType::FISH:
+            return generateFishSplash();
+        case EntityType::COUNT:
+            std::unreachable();
+    }
 }

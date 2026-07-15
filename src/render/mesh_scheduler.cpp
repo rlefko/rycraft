@@ -1,9 +1,26 @@
 #include "render/mesh_scheduler.hpp"
 
+#include "common/thread_priority.hpp"
 #include "world/world.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
+
+namespace {
+
+bool shouldReplace(const MeshResult& existing, const MeshResult& incoming) {
+    if (existing.snapshotOk != incoming.snapshotOk) return incoming.snapshotOk;
+    if (!incoming.snapshotOk) return true;
+    return static_cast<int32_t>(incoming.builtVersion - existing.builtVersion) >= 0;
+}
+
+auto findResult(std::vector<MeshResult>& results, ChunkPos pos) {
+    return std::find_if(results.begin(), results.end(),
+                        [pos](const MeshResult& result) { return result.pos == pos; });
+}
+
+} // namespace
 
 MeshScheduler::MeshScheduler(const World& world, size_t workerCount) : world_(world) {
     workers_.reserve(workerCount);
@@ -33,36 +50,107 @@ void MeshScheduler::shutdown() {
         }
     }
     workers_.clear();
+
+    {
+        std::lock_guard<std::mutex> lock(completedMutex_);
+        inFlight_.fetch_sub(completed_.size(), std::memory_order_relaxed);
+        completed_.clear();
+    }
+    consumerPending_.store(0, std::memory_order_relaxed);
+}
+
+bool MeshScheduler::reserveSlot() {
+    size_t owned = inFlight_.load(std::memory_order_relaxed);
+    for (;;) {
+        const size_t consumer = consumerPending_.load(std::memory_order_relaxed);
+        if (owned + consumer >= MAX_INFLIGHT_MESH) return false;
+        if (inFlight_.compare_exchange_weak(owned, owned + 1, std::memory_order_relaxed)) {
+            const size_t total = owned + 1 + consumer;
+            size_t high = highWater_.load(std::memory_order_relaxed);
+            while (high < total &&
+                   !highWater_.compare_exchange_weak(high, total, std::memory_order_relaxed)) {
+            }
+            return true;
+        }
+    }
 }
 
 bool MeshScheduler::enqueue(ChunkPos pos) {
-    if (!running_.load(std::memory_order_relaxed) ||
-        inFlight_.load(std::memory_order_relaxed) >= MAX_INFLIGHT_MESH) {
-        return false;
-    }
+    if (!running_.load(std::memory_order_relaxed) || !reserveSlot()) return false;
     {
         std::lock_guard<std::mutex> lock(jobMutex_);
+        if (!running_.load(std::memory_order_relaxed)) {
+            inFlight_.fetch_sub(1, std::memory_order_relaxed);
+            return false;
+        }
         jobs_.push_back(pos);
     }
-    inFlight_.fetch_add(1, std::memory_order_relaxed);
     jobCv_.notify_one();
     return true;
 }
 
 void MeshScheduler::drainCompleted(std::vector<MeshResult>& out) {
     std::lock_guard<std::mutex> lock(completedMutex_);
-    if (out.empty()) {
-        out.swap(completed_);
-    } else {
-        // Rare path: the caller still holds results (upload budget ran out)
-        for (MeshResult& result : completed_) {
-            out.push_back(std::move(result));
+
+    // Observe results the renderer consumed since the previous drain before
+    // admitting more work. Keeping the count one frame conservative is what
+    // closes the old unbounded scheduler-to-renderer handoff.
+    consumerPending_.store(std::min(out.size(), MAX_INFLIGHT_MESH), std::memory_order_relaxed);
+
+    size_t released = 0;
+    size_t retained = 0;
+    for (size_t index = 0; index < completed_.size(); ++index) {
+        MeshResult& result = completed_[index];
+        auto existing = findResult(out, result.pos);
+        if (existing != out.end()) {
+            if (shouldReplace(*existing, result)) {
+                *existing = std::move(result);
+                coalesced_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                droppedStale_.fetch_add(1, std::memory_order_relaxed);
+            }
+            ++released;
+            continue;
         }
-        completed_.clear();
+        if (out.size() < MAX_INFLIGHT_MESH) {
+            out.push_back(std::move(result));
+            ++released;
+            continue;
+        }
+        if (retained != index) completed_[retained] = std::move(result);
+        ++retained;
     }
+    completed_.resize(retained);
+
+    // Count the consumer side before releasing scheduler slots. Concurrent
+    // enqueue attempts can be overly conservative during this short window,
+    // but can never oversubscribe the shared 64-result contract.
+    consumerPending_.store(std::min(out.size(), MAX_INFLIGHT_MESH), std::memory_order_relaxed);
+    if (released != 0) inFlight_.fetch_sub(released, std::memory_order_relaxed);
+}
+
+void MeshScheduler::acknowledgeConsumerPending(size_t count) {
+    consumerPending_.store(std::min(count, MAX_INFLIGHT_MESH), std::memory_order_relaxed);
+}
+
+void MeshScheduler::publishCompleted(MeshResult result) {
+    std::lock_guard<std::mutex> lock(completedMutex_);
+    auto existing = findResult(completed_, result.pos);
+    if (existing == completed_.end()) {
+        completed_.push_back(std::move(result));
+        return;
+    }
+    if (shouldReplace(*existing, result)) {
+        *existing = std::move(result);
+        coalesced_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        droppedStale_.fetch_add(1, std::memory_order_relaxed);
+    }
+    inFlight_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void MeshScheduler::workerLoop() {
+    setCurrentThreadPriority(ThreadPriority::USER_INITIATED);
     // Per-worker buffers keep their capacity across builds
     thread_local MeshSnapshot snapshot;
     thread_local MeshScratch scratch;
@@ -81,9 +169,9 @@ void MeshScheduler::workerLoop() {
 
         MeshResult result;
         result.pos = pos;
-        // snapshotForMeshing takes chunksMutex_ for one bounded copy — the
-        // only lock a mesh worker ever holds, and never together with the
-        // scheduler's own (leaf) locks
+        // snapshotForMeshing reads immutable column metadata, then takes
+        // chunksMutex_ for one bounded copy. It never nests that lock with
+        // the scheduler's own leaf locks.
         if (world_.snapshotForMeshing(pos, snapshot)) {
             result.snapshotOk = true;
             result.builtVersion = snapshot.version;
@@ -94,12 +182,22 @@ void MeshScheduler::workerLoop() {
                     .count());
         }
 
-        {
-            std::lock_guard<std::mutex> lock(completedMutex_);
-            completed_.push_back(std::move(result));
-        }
-        inFlight_.fetch_sub(1, std::memory_order_relaxed);
+        publishCompleted(std::move(result));
     }
+}
+
+MeshSchedulerStats MeshScheduler::stats() const {
+    MeshSchedulerStats result;
+    result.schedulerOwned = inFlight_.load(std::memory_order_relaxed);
+    result.consumerPending = consumerPending_.load(std::memory_order_relaxed);
+    result.highWater = highWater_.load(std::memory_order_relaxed);
+    result.coalesced = coalesced_.load(std::memory_order_relaxed);
+    result.droppedStale = droppedStale_.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(completedMutex_);
+        result.completed = completed_.size();
+    }
+    return result;
 }
 
 float MeshScheduler::meshMsAvg() const {

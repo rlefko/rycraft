@@ -75,6 +75,8 @@ public:
     // -----------------------------------------------------------------------
     // Condition checks (pure functions)
     // -----------------------------------------------------------------------
+    static bool playerMovedToward(const Vec3& previousPlayerPos, const Vec3& playerPos,
+                                  const Vec3& entityPos, float minimumMovement = 1.0e-4f);
     static bool shouldFlee(const Vec3& entityPos, const Vec3& playerPos, bool playerMovingToward,
                            float fleeDistance = 6.0f);
     static bool shouldStopFleeing(const Vec3& entityPos, const Vec3& playerPos, int fleeTicks,
@@ -162,6 +164,9 @@ public:
 
     // Check if entity is standing on grass
     static bool isOnGrass(Entity& entity, World& world);
+
+    // Only grazing species consume grass and enter the eat behavior.
+    static bool canGraze(EntityType type);
 
     // Check if entity can breed: mate nearby and both fed
     static bool canBreed(Entity& entity, Spawner& spawner);

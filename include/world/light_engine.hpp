@@ -19,13 +19,12 @@
 // ---------------------------------------------------------------------------
 namespace LightEngine {
 
-// The four horizontal face neighbors whose border light spills into a chunk,
-// in -X, +X, -Z, +Z order (vertical stays inside a full-height chunk). Null
-// entries are treated as dark — an un-loaded neighbor pulls its light in later
-// when it loads and re-queues this chunk.
-using FaceNeighbors = std::array<const Chunk*, 4>;
+// The six face neighbors whose border light spills into a cubic chunk, in
+// -X, +X, -Z, +Z, -Y, +Y order. Null entries are treated as dark. A neighbor
+// that loads later participates when the world reconciles the shared face.
+using FaceNeighbors = std::array<const Chunk*, 6>;
 
-// Recompute chunk.blockLight from its own emitters plus the neighbors' border
+// Recompute the chunk's derived block light from its own emitters and the neighbors' border
 // light. Returns true if the light changed, so the caller can re-mesh the
 // chunk and re-reconcile its neighbors.
 bool floodChunk(Chunk& chunk, const FaceNeighbors& neighbors);
@@ -34,7 +33,7 @@ bool floodChunk(Chunk& chunk, const FaceNeighbors& neighbors);
 // worker before the chunk is shared, so the first mesh already shows lava glow;
 // cross-chunk spill is layered on later by reconcileLight.
 inline bool computeSelfLight(Chunk& chunk) {
-    return floodChunk(chunk, FaceNeighbors{nullptr, nullptr, nullptr, nullptr});
+    return floodChunk(chunk, FaceNeighbors{});
 }
 
 } // namespace LightEngine

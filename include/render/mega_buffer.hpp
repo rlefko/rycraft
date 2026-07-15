@@ -66,8 +66,10 @@ private:
     std::vector<DeferredFree> _deferredFrees;
     mutable std::mutex _mutex;
 
-    // free() body without the lock, shared by free() and the deferred drain.
-    void freeLocked(ChunkAllocation& alloc);
+    // free() body without the lock. Deferred drains append a whole completed
+    // frame's regions before coalescing once, avoiding one free-list sort per
+    // retired cube during movement.
+    void freeLocked(ChunkAllocation& alloc, bool coalesce);
 
     bool tryBumpAllocate(uint64_t& outOffset, uint64_t alignedSize, uint64_t bufferSize,
                          uint64_t& bumpPtr) const;

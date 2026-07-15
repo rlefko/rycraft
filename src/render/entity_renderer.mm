@@ -86,7 +86,7 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         RY_LOG_FATAL("Failed to create entity pipeline state");
     }
 
-    for (int type = 0; type < TYPE_COUNT; ++type) {
+    for (size_t type = 0; type < TYPE_COUNT; ++type) {
         _meshes[type][0] = buildMesh(device, static_cast<EntityType>(type), false);
         _meshes[type][1] = buildMesh(device, static_cast<EntityType>(type), true);
     }
@@ -109,8 +109,8 @@ void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> u
         if (!isVisible(entity->aabb))
             continue;
 
-        const int type = static_cast<int>(entity->type);
-        if (type < 0 || type >= TYPE_COUNT)
+        const size_t type = static_cast<size_t>(entity->type);
+        if (type >= TYPE_COUNT)
             continue;
         const Mesh& mesh = _meshes[type][entity->isBaby ? 1 : 0];
 

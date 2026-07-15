@@ -191,6 +191,46 @@ void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
                 g = 0.45f;
                 b = 0.85f;
                 break;
+            case BlockType::MUD:
+                r = 0.30f;
+                g = 0.23f;
+                b = 0.17f;
+                break;
+            case BlockType::CLAY:
+                r = 0.56f;
+                g = 0.58f;
+                b = 0.60f;
+                break;
+            case BlockType::SILT:
+                r = 0.50f;
+                g = 0.43f;
+                b = 0.31f;
+                break;
+            case BlockType::BASALT:
+                r = 0.20f;
+                g = 0.21f;
+                b = 0.22f;
+                break;
+            case BlockType::VOLCANIC_ASH:
+                r = 0.27f;
+                g = 0.26f;
+                b = 0.25f;
+                break;
+            case BlockType::LIMESTONE:
+                r = 0.72f;
+                g = 0.70f;
+                b = 0.62f;
+                break;
+            case BlockType::OBSIDIAN:
+                r = 0.12f;
+                g = 0.08f;
+                b = 0.17f;
+                break;
+            case BlockType::ANDESITE:
+                r = 0.42f;
+                g = 0.43f;
+                b = 0.42f;
+                break;
             default:
                 r = 0.5f;
                 g = 0.5f;

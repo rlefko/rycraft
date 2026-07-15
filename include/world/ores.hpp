@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/counter_rng.hpp"
 #include "world/chunk.hpp"
 
 #include <cstdint>
@@ -21,5 +22,5 @@ public:
     void place(Chunk& chunk) const;
 
 private:
-    uint32_t seed_;
+    CounterRng random_;
 };
