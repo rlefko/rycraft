@@ -558,26 +558,22 @@ constant float3 WATER_SIGMA_A = float3(0.16f, 0.05f, 0.028f);
 constant float3 WATER_SCATTER = float3(0.02f, 0.10f, 0.17f);
 constant float3 WATER_AMBIENT = float3(0.004f, 0.012f, 0.02f);
 
-// Exact unpolarized dielectric Fresnel for the air/water interface: the mean
-// of the s- and p-polarized reflectances, with total internal reflection
-// falling out of Snell's law when the transmitted sine exceeds one. The
-// Schlick approximations this replaces needed a hand-tuned ease near the
-// critical angle and read as either a mushy window edge or hard mirror
-// panels; the exact form costs a handful of ALU on water pixels only.
+// Schlick Fresnel for the air/water interface. From the dense (water) side
+// the lobe is evaluated against the TRANSMITTED angle: cosT reaches zero
+// exactly at the critical angle, so the reflectance rises continuously to
+// the total-internal-reflection mirror with no hand-tuned ease, at a
+// fraction of the exact dielectric form's cost.
 static float waterFresnel(float cosI, bool fromWater) {
-    const float N_AIR = 1.0f;
-    const float N_WATER = 1.33f;
-    float n1 = fromWater ? N_WATER : N_AIR;
-    float n2 = fromWater ? N_AIR : N_WATER;
-    float eta = n1 / n2;
-    float sinT2 = eta * eta * (1.0f - cosI * cosI);
-    if (sinT2 >= 1.0f) {
-        return 1.0f; // total internal reflection
+    const float R0 = 0.02f; // ((1.33 - 1) / (1.33 + 1))^2, both directions
+    if (fromWater) {
+        const float ETA = 1.33f; // water to air
+        float sinT2 = ETA * ETA * (1.0f - cosI * cosI);
+        if (sinT2 >= 1.0f) {
+            return 1.0f; // total internal reflection
+        }
+        cosI = sqrt(1.0f - sinT2); // Schlick against the transmitted angle
     }
-    float cosT = sqrt(1.0f - sinT2);
-    float rs = (n1 * cosI - n2 * cosT) / (n1 * cosI + n2 * cosT);
-    float rp = (n1 * cosT - n2 * cosI) / (n1 * cosT + n2 * cosI);
-    return 0.5f * (rs * rs + rp * rp);
+    return R0 + (1.0f - R0) * pow(1.0f - cosI, 5.0f);
 }
 
 static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool underwater,
