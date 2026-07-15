@@ -283,6 +283,9 @@ private:
     // the rain-wetness sun sheen off: a gloss toward the sun on floors seen
     // through five blocks of water read as a white-out, not rain.
     bool _cameraUnderwater = false;
+    // Eased sky exposure of the camera's water column (see render()); 0 in
+    // sealed aquifers and under roofed water where sunlight cannot reach.
+    float _uwSkyExposure = 1.0f;
 
     // Frame animation clock driving water waves, caustics, and foliage sway in
     // the scene AND shadow passes — one value per frame so the two can never

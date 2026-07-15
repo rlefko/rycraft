@@ -3234,6 +3234,7 @@ TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-typ
     REQUIRE(offsetof(WaterUniforms, time) == 236);
     REQUIRE(offsetof(WaterUniforms, cameraUnderwater) == 240);
     REQUIRE(offsetof(WaterUniforms, ssrStrength) == 244);
+    REQUIRE(offsetof(WaterUniforms, skyExposure) == 248);
 }
 
 TEST_CASE("Camera-relative water depth stays continuous at large world coordinates",

@@ -210,6 +210,10 @@ struct WaterUniforms {
     float time;             // seconds; drives waves + caustics
     float cameraUnderwater; // 1.0 when the camera is inside water
     float ssrStrength;      // 0 = sky-only reflection (the pre-SSR look)
+    float skyExposure;      // 0 when solid ground seals the camera's water
+                            // column (aquifers, roofed lakes): no sunlight
+                            // reaches covered water, so caustics and the
+                            // sun-driven murk must go dark, not track the sun
 };
 
 // Atmospheric sky, bound at buffer(1) in sky.metal. The fragment shader
@@ -388,6 +392,7 @@ static_assert(offsetof(Uniforms, swayStrength) == 292);
 static_assert(offsetof(Uniforms, wetness) == 296);
 
 static_assert(sizeof(WaterUniforms) == 256);
+static_assert(offsetof(WaterUniforms, skyExposure) == 248);
 static_assert(offsetof(WaterUniforms, cameraRelativeViewProjection) == 64);
 static_assert(offsetof(WaterUniforms, zenithColor) == 128);
 static_assert(offsetof(WaterUniforms, resolution) == 224);

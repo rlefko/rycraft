@@ -117,7 +117,7 @@ fragment float4 volumetricFragment(VolVertexOut in [[stage_in]],
     if (vol.underwater > 0.5f) {
         // Dimmed hard: at full strength the unshadowed submerged march painted
         // every floor white; shafts should read as slanting light, not fill.
-        color *= float3(0.4f, 0.7f, 1.0f) * 0.12f;
+        color *= float3(0.4f, 0.7f, 1.0f) * 0.07f;
     }
     return float4(color, 1.0f);
 }

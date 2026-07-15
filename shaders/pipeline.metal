@@ -641,30 +641,51 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     float absorb = 1.0f - exp(-waterDepth * 0.16f);
     float3 body = mix(refracted * float3(0.75f, 0.92f, 0.96f), waterColor, absorb);
 
-    // ---- Fresnel sky reflection + sun sparkle (skylight gates both, so
-    // flooded caves reflect darkness rather than open sky)
+    // ---- Fresnel reflection + sun sparkle (skylight gates both, so flooded
+    // caves reflect darkness rather than open sky). From below the physics
+    // flips: water-to-air refraction hits total internal reflection beyond the
+    // critical angle (~48.6 deg), so the surface turns into a mirror of the
+    // underwater scene (SSR provides it) instead of a window to the sky.
     float3 R = reflect(-V, N);                // true reflection, for SSR marching
     float3 Rsky = float3(R.x, abs(R.y), R.z); // up-facing form for sky + sparkle
-    float horizonBlend = pow(1.0f - saturate(Rsky.y), 2.0f);
-    float3 skyReflection = mix(water.zenithColor, water.horizonColor, horizonBlend);
-
-    // Screen-space reflection layered over the procedural sky: where the
-    // reflected ray finds on-screen geometry (far shore, trees), mirror it;
-    // elsewhere the sky term shows through. Skipped when looking up from below.
-    if (water.ssrStrength > 0.0f && !fromBelow) {
-        float4 ssr = traceWaterSSR(in.vCameraRelativePosition, R, sceneDepth, sceneColor, water);
-        skyReflection = mix(skyReflection, ssr.rgb, ssr.a * water.ssrStrength);
-    }
-
-    float sunAlign = saturate(dot(Rsky, water.sunDirection));
-    float sparkle = pow(sunAlign, 240.0f) * 2.0f + pow(sunAlign, 32.0f) * 0.25f;
-    float fresnel = mix(0.04f, 1.0f, pow(1.0f - saturate(dot(V, N)), 5.0f));
+    float cosI = saturate(dot(V, N));
+    float fresnel;
+    float3 reflection;
     if (fromBelow) {
-        fresnel *= 0.3f; // looking up at the surface: mostly see through it
+        const float ETA = 1.33f; // water/air refractive index ratio
+        float sinT2 = ETA * ETA * (1.0f - cosI * cosI);
+        if (sinT2 >= 1.0f) {
+            fresnel = 1.0f; // total internal reflection: pure mirror
+        } else {
+            // Schlick against the transmitted angle (the dense-side form)
+            const float R0 = 0.02f; // ((1.33-1)/(1.33+1))^2
+            float cosT = sqrt(1.0f - sinT2);
+            fresnel = R0 + (1.0f - R0) * pow(1.0f - cosT, 5.0f);
+        }
+        // The mirror shows the underwater scene: SSR marches the downward
+        // reflected ray; where it misses, the deep water body shows (the
+        // bright shallow tint here read as glowing panels overhead).
+        reflection = deepTint;
+    } else {
+        fresnel = mix(0.04f, 1.0f, pow(1.0f - cosI, 5.0f));
+        float horizonBlend = pow(1.0f - saturate(Rsky.y), 2.0f);
+        reflection = mix(water.zenithColor, water.horizonColor, horizonBlend);
     }
 
-    float3 color = mix(body, skyReflection, fresnel * in.vSkyLight);
-    color += water.sunColor * sparkle * in.vSkyLight;
+    // Screen-space reflection layered over the fallback: where the reflected
+    // ray finds on-screen geometry (far shore and trees from above, the floor
+    // under total internal reflection from below), mirror it.
+    if (water.ssrStrength > 0.0f) {
+        float4 ssr = traceWaterSSR(in.vCameraRelativePosition, R, sceneDepth, sceneColor, water);
+        reflection = mix(reflection, ssr.rgb, ssr.a * water.ssrStrength);
+    }
+
+    float3 color = mix(body, reflection, fresnel * (fromBelow ? 1.0f : in.vSkyLight));
+    if (!fromBelow) {
+        float sunAlign = saturate(dot(Rsky, water.sunDirection));
+        float sparkle = pow(sunAlign, 240.0f) * 2.0f + pow(sunAlign, 32.0f) * 0.25f;
+        color += water.sunColor * sparkle * in.vSkyLight;
+    }
 
     color =
         applyFog(color, in.vWorldPosition, water.cameraPosition, water.fogDensity, water.fogColor);
@@ -672,12 +693,15 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // Hairline shorelines dissolve into the shore instead of aliasing
     color = mix(refracted, color, saturate(waterDepth * 3.0f));
     // Shoreline foam: a bright animated band just off the shallow edge, gated
-    // by skylight so flooded caves stay dark. Reuses the caustic web to break
-    // the band into moving flecks rather than a hard rim.
-    float foamBand =
-        smoothstep(0.05f, 0.4f, waterDepth) * (1.0f - smoothstep(0.4f, 1.4f, waterDepth));
-    float foam = foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz, water.time));
-    color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * in.vSkyLight);
+    // by skylight so flooded caves stay dark, and by the above-water view —
+    // foam is surface froth, so from below it painted white streaks along the
+    // waterline. Reuses the caustic web to break the band into moving flecks.
+    if (!fromBelow) {
+        float foamBand =
+            smoothstep(0.05f, 0.4f, waterDepth) * (1.0f - smoothstep(0.4f, 1.4f, waterDepth));
+        float foam = foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz, water.time));
+        color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * in.vSkyLight);
+    }
 
     color = mix(color, in.vOverlayColor.rgb, saturate(in.vOverlayColor.a));
     return float4(color, 1.0f);
@@ -727,11 +751,12 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     // Inscattered light: overhead sun lifts a brighter blue-green; sinking
     // below sea level darkens the murk. Hydrology puts lakes at arbitrary
     // elevations, so the ocean-depth term only ever darkens (a mountain lake
-    // reads as bright shallow water, which is right).
+    // reads as bright shallow water, which is right). skyExposure kills the
+    // sun term entirely in covered water (aquifers) where no sunlight enters.
     const float3 UW_DEEP = float3(0.02f, 0.09f, 0.16f);    // dark blue, deep/no sun
     const float3 UW_SHALLOW = float3(0.10f, 0.30f, 0.38f); // brighter blue-green
     float camDepth = max(64.0f - water.cameraPosition.y, 0.0f);
-    float penetration = saturate(exp(-camDepth * 0.05f)) * sunUp;
+    float penetration = saturate(exp(-camDepth * 0.05f)) * sunUp * water.skyExposure;
     float3 murk = mix(UW_DEEP, UW_SHALLOW, penetration);
 
     // ---- Caustics on up-facing submerged surfaces, added as a glow. The water
@@ -772,11 +797,26 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     // neither normal is trustworthy — fade rather than sparkle the block edge.
     float edgeSpan = max(min(spanL, spanR), min(spanD, spanU));
     upFacing *= 1.0f - smoothstep(dist * 0.04f + 0.15f, dist * 0.08f + 0.5f, edgeSpan);
+    // Only floors clearly below the eye catch caustics: refracted sunlight
+    // lands on submerged ground, never on shore terrain reconstructed BEHIND
+    // the water surface seen from below (a looser gate painted the web onto
+    // the surface overhead). skyExposure zeroes it in covered water.
     float eyeY = water.cameraPosition.y;
-    float submerged = step(world.y, eyeY + 2.0f);
+    float submerged = step(world.y, eyeY + 0.75f);
+    // Upward rays exit the water at roughly eye + 1: any opaque point beyond
+    // that exit is seen THROUGH the from-below surface, whose pixels the
+    // surface pass already shaded — overlay caustics there painted the web
+    // onto the surface overhead. Fade the caustic out past the exit distance.
+    float3 rayDir = relative / max(dist, 1e-4f);
+    float throughSurface = 1.0f;
+    if (rayDir.y > 0.02f) {
+        float exitDist = 1.0f / rayDir.y;
+        throughSurface = 1.0f - smoothstep(exitDist * 0.8f, exitDist * 1.2f, dist);
+    }
     float caustic = causticPattern(world.xz, t) * exp(-max(eyeY + 1.0f - world.y, 0.0f) * 0.03f) *
                     exp(-dist * 0.03f);
-    float3 causticGlow = water.sunColor * caustic * upFacing * submerged * sunUp * 0.9f;
+    float3 causticGlow = water.sunColor * caustic * upFacing * submerged * throughSurface * sunUp *
+                         water.skyExposure * 0.9f;
 
     // Premultiplied: fog lerps the scene toward murk, caustics add on top
     return float4(murk * fogFactor + causticGlow, fogFactor);

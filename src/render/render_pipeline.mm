@@ -576,6 +576,25 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     // surface (two fogs stacked over-darkened the near water).
     const bool cameraUnderwater = uiFrame.cameraUnderwater;
     _cameraUnderwater = cameraUnderwater;
+
+    // Sky exposure of the camera's water column: 0 when solid ground seals it
+    // (aquifers, roofed lakes — the same surface-height gate rain spawning
+    // uses). Sunlight cannot reach covered water, so the underwater caustics,
+    // sun-driven murk, and volumetric shafts all scale by this. Eased so
+    // swimming under an overhang lip fades rather than pops.
+    {
+        float target = 1.0f;
+        if (cameraUnderwater) {
+            const Vec3 camPos = camera.getPosition();
+            auto surface = world.surfaceHeightIfLoaded(static_cast<int64_t>(std::floor(camPos.x)),
+                                                       static_cast<int64_t>(std::floor(camPos.z)));
+            if (surface.has_value() && static_cast<double>(*surface) > camPos.y) {
+                target = 0.0f;
+            }
+        }
+        _uwSkyExposure += (target - _uwSkyExposure) * 0.1f;
+    }
+
     const float fogColor[3] = {skyUniforms.horizonColor.x, skyUniforms.horizonColor.y,
                                skyUniforms.horizonColor.z};
     const float savedFogDensity = _fogDensity;
@@ -646,7 +665,10 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         vu.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
         vu.sunColor = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
         vu.stepCount = 24.0f;
-        vu.density = 0.055f;
+        // Covered water (aquifers, roofed lakes) receives no sunlight: the
+        // cascades cannot occlude terrain hundreds of blocks up, so without
+        // this gate sealed pockets grew impossible sun shafts.
+        vu.density = 0.055f * (cameraUnderwater ? _uwSkyExposure : 1.0f);
         vu.anisotropy = 0.6f; // forward scatter → bright halo toward the light
         vu.maxDistance = 96.0f;
         vu.underwater = cameraUnderwater ? 1.0f : 0.0f;
@@ -1988,6 +2010,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     // Screen-space reflections layer onto the fresnel sky term; 0 keeps the
     // pre-SSR look (also the RYCRAFT_SSR=0 / setting-off path).
     wu.ssrStrength = _gfx.waterReflections ? 1.0f : 0.0f;
+    wu.skyExposure = _uwSkyExposure;
     FrameRing::Alloc waterAlloc = _frameRing.push(&wu, sizeof(WaterUniforms));
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];
