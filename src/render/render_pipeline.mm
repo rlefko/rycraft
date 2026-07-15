@@ -268,7 +268,10 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         overlayDesc.colorAttachments[0].blendingEnabled = true;
         overlayDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
         overlayDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-        overlayDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        // Premultiplied alpha: the fragment outputs murk*fogFactor + causticGlow
+        // with alpha = fogFactor, so distance-fog toward murk and the additive
+        // caustic glow composite in one pass.
+        overlayDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
         overlayDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
         overlayDesc.colorAttachments[0].destinationRGBBlendFactor =
             MTLBlendFactorOneMinusSourceAlpha;
@@ -546,11 +549,12 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderSky(encoder, skyAlloc);
 
     // Underwater the whole scene sinks into a dense blue veil (light
-    // attenuation); the water pass adds the god-ray overlay on top.
+    // attenuation) — owned entirely by the underwater overlay's depth-based
+    // scattering, so the scene/water passes apply no fog of their own below the
+    // surface (two fogs stacked over-darkened the near water).
     const bool cameraUnderwater = uiFrame.cameraUnderwater;
-    const float fogColor[3] = {cameraUnderwater ? 0.05f : skyUniforms.horizonColor.x,
-                               cameraUnderwater ? 0.15f : skyUniforms.horizonColor.y,
-                               cameraUnderwater ? 0.32f : skyUniforms.horizonColor.z};
+    const float fogColor[3] = {skyUniforms.horizonColor.x, skyUniforms.horizonColor.y,
+                               skyUniforms.horizonColor.z};
     const float savedFogDensity = _fogDensity;
     {
         // Morning fog: a dawn haze that thickens fog and burns off by
@@ -561,7 +565,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         _fogDensity *= 1.0f + 5.0f * morning * morning;
     }
     if (cameraUnderwater) {
-        _fogDensity = std::max(_fogDensity, 0.035f);
+        _fogDensity = 0.0f; // the overlay owns the underwater murk
     }
     renderChunks(encoder, world, loadedChunks, viewMatrix, projectionMatrix, camera.getPosition(),
                  sunDirection, sunColor, ambientColor, fogColor);

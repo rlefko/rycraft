@@ -373,43 +373,31 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
     return out;
 }
 
-// Cheap 2D value hash -> point in [0,1]^2, for the Voronoi caustic cells.
-static float2 causticHash(float2 c) {
-    float2 p = float2(dot(c, float2(127.1f, 311.7f)), dot(c, float2(269.5f, 183.3f)));
-    return fract(sin(p) * 43758.5453f);
-}
-
-// Animated Voronoi caustic web. Each grid cell owns a feature point that
-// drifts on a circle over time; the bright filaments sit where two cells are
-// nearly equidistant (F2 - F1 small), which reads as refracted-sunlight
-// caustics rather than the axis-aligned grid the old summed sines produced.
-// Two octaves at different scale and drift keep it organic.
-static float causticPattern(float2 p, float t) {
-    float web = 0.0f;
-    float amp = 1.0f;
-    for (int layer = 0; layer < 2; ++layer) {
-        float2 sp = p * (1.0f + 0.9f * float(layer)) + float2(3.7f * float(layer));
-        float2 cell = floor(sp);
-        float2 f = fract(sp);
-        float f1 = 8.0f, f2 = 8.0f;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                float2 g = float2(dx, dy);
-                float2 o = causticHash(cell + g);
-                o = 0.5f + 0.5f * sin(t * (0.9f + 0.3f * float(layer)) + 6.2831853f * o);
-                float d = length(g + o - f);
-                if (d < f1) {
-                    f2 = f1;
-                    f1 = d;
-                } else if (d < f2) {
-                    f2 = d;
-                }
-            }
-        }
-        web += amp * smoothstep(0.16f, 0.0f, f2 - f1); // bright where cells meet
-        amp *= 0.55f;
+// Water caustics: the flowing bright web sunlight focuses into as it refracts
+// through moving water. This is the standard iterative domain-warped caustic
+// (the look Sildur and most Minecraft shaders use): each iteration folds the
+// coordinate through the previous one so the pattern converges into curved
+// filaments that drift with the surface, rather than a static grid or cells.
+// Driven by the water time and warped by the shared wave field so the light
+// moves with the actual waves overhead.
+static float causticPattern(float2 worldXZ, float t) {
+    // Warp the lookup by the wave gradient (unscaled world xz, so it uses the
+    // real per-block wave frequencies) so the caustics ride the same waves the
+    // surface shows; the caustic cell scale is baked in (~6.7 block tiles).
+    const float scale = 0.15f;
+    float3 wn = waterSurfaceNormal(worldXZ, t);
+    float2 p = fmod(worldXZ * (scale * 6.28318f) + wn.xz, 6.28318f) - 250.0f;
+    float2 i = p;
+    float c = 1.0f;
+    const float inten = 0.005f;
+    for (int n = 0; n < 5; ++n) {
+        float tt = t * (1.0f - (3.5f / float(n + 1)));
+        i = p + float2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+        c += 1.0f / length(float2(p.x / (sin(i.x + tt) / inten), p.y / (cos(i.y + tt) / inten)));
     }
-    return pow(saturate(web), 1.4f);
+    c /= 5.0f;
+    c = 1.17f - pow(c, 1.4f);
+    return pow(abs(c), 8.0f);
 }
 
 // World position of a screen UV + its stored depth, via the camera inverse.
@@ -525,7 +513,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     float depthBelow = max(in.vWorldPosition.y - rworld.y, 0.0f);
 
     // ---- Caustics: refracted-light web on the shallow floor (~3.5 block cells)
-    float caustic = causticPattern(rworld.xz * 0.28f, water.time) * exp(-depthBelow * 0.22f);
+    float caustic = causticPattern(rworld.xz, water.time) * exp(-depthBelow * 0.22f);
     refracted +=
         water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
 
@@ -573,8 +561,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // the band into moving flecks rather than a hard rim.
     float foamBand =
         smoothstep(0.05f, 0.4f, waterDepth) * (1.0f - smoothstep(0.4f, 1.4f, waterDepth));
-    float foam =
-        foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz * 0.5f, water.time));
+    float foam = foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz, water.time));
     color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * in.vSkyLight);
 
     return float4(color, 1.0f);
@@ -606,26 +593,44 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     float t = water.time;
     float sunUp = saturate(water.sunDirection.y);
 
-    // Caustics on every submerged surface around the camera — the water
-    // pass only shades pixels behind a surface quad, so without this the
-    // floor at the player's feet had none. Reconstruct the opaque world
-    // position and project the same caustic field onto up-facing geometry.
     constexpr sampler screenSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float depth = sceneDepth.sample(screenSampler, in.uv);
     float3 world = reconstructWorld(in.uv, depth, water);
-    // Screen-space derivatives give the surface normal: walls get none
-    float3 surfaceNormal = normalize(cross(dfdx(world), dfdy(world)));
-    float upFacing = saturate(abs(surfaceNormal.y));
-    // SEA_LEVEL (64, chunk.hpp) minus an epsilon: the water surface renders
-    // at 63.875, so shore blocks at y >= 64 must not catch caustics
-    float submerged = step(world.y, 63.9f);
     float dist = distance(world, water.cameraPosition);
-    float caustic = causticPattern(world.xz * 0.85f, t) * exp(-max(64.0f - world.y, 0.0f) * 0.10f) *
-                    exp(-dist * 0.03f);
-    float3 causticColor = water.sunColor * caustic * upFacing * submerged * sunUp * 2.4f;
 
-    float3 veil = float3(0.05f, 0.18f, 0.32f);
-    return float4(veil + causticColor, 0.35f);
+    // ---- Depth-based scattering: near water is clear, distance fades into
+    // murk. This owns the whole underwater tint now (the scene passes apply no
+    // fog below the surface), so it must fog every pixel including the sky seen
+    // through the surface (depth 1 reconstructs far away -> full murk).
+    const float UW_FOG_DENSITY = 0.045f;
+    float fogFactor = 1.0f - exp(-dist * UW_FOG_DENSITY);
+
+    // Inscattered light brightens toward the surface: the deeper the camera
+    // sits below sea level (64), the darker and bluer the murk; overhead sun
+    // lifts a blue-green glow. Camera depth (not per-pixel) sets the mood.
+    const float3 UW_DEEP = float3(0.02f, 0.09f, 0.16f);    // dark blue, deep/no sun
+    const float3 UW_SHALLOW = float3(0.10f, 0.30f, 0.38f); // brighter blue-green
+    float camDepth = max(64.0f - water.cameraPosition.y, 0.0f);
+    float penetration = saturate(exp(-camDepth * 0.05f)) * sunUp;
+    float3 murk = mix(UW_DEEP, UW_SHALLOW, penetration);
+
+    // ---- Caustics on up-facing submerged surfaces, added as a glow. The water
+    // surface pass only shades pixels behind a quad, so the floor at the
+    // player's feet would have none without this. SEA_LEVEL (64) minus an
+    // epsilon: the surface renders at 63.875, so shore blocks at y >= 64 do not
+    // catch caustics.
+    float3 surfaceNormal = normalize(cross(dfdx(world), dfdy(world)));
+    // Caustics land on up-facing floors (walls, normal.y ~ 0, stay dark). The
+    // depth falloff is gentle (0.03/block) so the pool floor several blocks
+    // down still catches a bright web instead of only the near-surface cells.
+    float upFacing = saturate(abs(surfaceNormal.y));
+    float submerged = step(world.y, 63.9f);
+    float caustic =
+        causticPattern(world.xz, t) * exp(-max(64.0f - world.y, 0.0f) * 0.03f) * exp(-dist * 0.03f);
+    float3 causticGlow = water.sunColor * caustic * upFacing * submerged * sunUp * 2.6f;
+
+    // Premultiplied: fog lerps the scene toward murk, caustics add on top
+    return float4(murk * fogFactor + causticGlow, fogFactor);
 }
 
 // ---------------------------------------------------------------------------
