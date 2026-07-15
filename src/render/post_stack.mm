@@ -136,13 +136,20 @@ void PostStack::encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture
     // keyValue ≈ a lit surface's average luminance, so daylight maps near
     // exposure 1.0 (a middle-grey 0.18 target over-darkened bright scenes).
     params.keyValue = 0.5f;
-    params.adaptationRate = 0.04f; // ~0.4 s to adapt at 60 fps
+    params.adaptationDownRate = 0.10f; // ~0.15 s to stop down at 60 fps
+    params.adaptationUpRate = 0.03f;   // ~0.5 s to recover when it darkens
     params.minLogLum = -8.0f;
     params.maxLogLum = 4.0f;
     params.sampleGrid = simd_make_uint2(16, 16); // 256 samples = 1 threadgroup
-    // Floor 0.7 keeps bright outdoors from dimming; ceiling 4 lifts caves.
-    params.minExposure = 0.7f;
+    // Floor 0.35 lets sun-facing frames actually stop down (0.7 pinned the
+    // exposure before it could react); ceiling 4 still lifts caves and night
+    // — with no highlights the weighted mean matches the plain mean, so dark
+    // scenes are not crushed.
+    params.minExposure = 0.35f;
     params.maxExposure = 4.0f;
+    params.highlightGain = 2.0f;
+    params.highlightKnee = 1.0f;  // log2: above ~2x a typical lit surface
+    params.highlightRange = 3.0f; // full weight ~8 log2 luminance and up
 
     [encoder setComputePipelineState:_exposurePipelineState];
     [encoder setTexture:sceneHDR atIndex:0];

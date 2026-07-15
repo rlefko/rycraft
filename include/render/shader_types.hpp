@@ -347,14 +347,23 @@ struct ExposureParams {
     // so keyValue ≈ a lit surface's average luminance keeps day near 1.0
     // (mapping the average to middle grey instead over-darkens bright scenes).
     float keyValue;
-    float adaptationRate;  // 0..1 EMA weight for this frame (eye adaptation speed)
-    float minLogLum;       // clamp floor for scene log-luminance
-    float maxLogLum;       // clamp ceiling
-    simd_uint2 sampleGrid; // reduction sample count across the frame (e.g. 16×16)
-    // Exposure clamp: minExposure well above 0 keeps bright outdoor scenes
-    // from being crushed dim; maxExposure lifts caves/night without blowing up.
+    float adaptationDownRate; // 0..1 EMA weight when the scene brightens (fast:
+                              // the eye stops down quickly facing the sun)
+    float minLogLum;          // clamp floor for scene log-luminance
+    float maxLogLum;          // clamp ceiling
+    simd_uint2 sampleGrid;    // reduction sample count across the frame (e.g. 16×16)
+    // Exposure clamp: minExposure keeps bright outdoor scenes from being
+    // crushed dim; maxExposure lifts caves/night without blowing up.
     float minExposure;
     float maxExposure;
+    float adaptationUpRate; // slower EMA weight when the scene darkens
+    // Highlight weighting: a plain mean barely moves when a small bright sun
+    // enters the frame, so bright samples get up-weighted —
+    // w = 1 + gain * saturate((logLum - knee) / range) — and facing the sun
+    // actually stops the scene down.
+    float highlightGain;
+    float highlightKnee;  // log2 luminance where up-weighting starts
+    float highlightRange; // log2 range over which the weight ramps in
 };
 
 // Bound at buffer(0) in the final composite (post.metal): the one pass that
@@ -465,9 +474,13 @@ static_assert(offsetof(VolumetricUniforms, frameIndex) == 132);
 static_assert(sizeof(ExposureState) == 8);
 static_assert(offsetof(ExposureState, exposure) == 4);
 
-static_assert(sizeof(ExposureParams) == 32);
-static_assert(offsetof(ExposureParams, adaptationRate) == 4);
+static_assert(sizeof(ExposureParams) == 48);
+static_assert(offsetof(ExposureParams, adaptationDownRate) == 4);
 static_assert(offsetof(ExposureParams, sampleGrid) == 16);
 static_assert(offsetof(ExposureParams, minExposure) == 24);
 static_assert(offsetof(ExposureParams, maxExposure) == 28);
+static_assert(offsetof(ExposureParams, adaptationUpRate) == 32);
+static_assert(offsetof(ExposureParams, highlightGain) == 36);
+static_assert(offsetof(ExposureParams, highlightKnee) == 40);
+static_assert(offsetof(ExposureParams, highlightRange) == 44);
 #endif

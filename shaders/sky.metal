@@ -82,10 +82,13 @@ fragment float4 skyFragmentMain(SkyVertexOut in [[stage_in]],
     color += float3(0.6f, 0.65f, 0.8f) * moonHalo * sky.starStrength;
 
     // Sun disc: sharp, limb-darkened, HDR-bright so the bloom pass halos it.
+    // HDR 8 (was 12) stays far above the bloom threshold but keeps the limb
+    // gradient visible once the highlight-aware exposure stops down, instead
+    // of plateauing deep in the tonemap shoulder as flat white.
     if (sky.sunIntensity > 0.001f) {
         float sunDisc = smoothstep(0.9992f, 0.9996f, sunCos);
         float limb = 0.7f + 0.3f * smoothstep(0.9992f, 1.0f, sunCos);
-        color = mix(color, sky.sunColor * 12.0f * limb, sunDisc);
+        color = mix(color, sky.sunColor * 8.0f * limb, sunDisc);
     }
 
     return float4(color, 1.0f);
