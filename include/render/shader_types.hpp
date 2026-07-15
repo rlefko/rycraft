@@ -93,6 +93,49 @@ static inline metal::float3 applySway(metal::float3 worldPos, uint sway, float v
     }
     return worldPos;
 }
+
+// Water surface waves. The three directional waves live in ONE table so the
+// vertex displacement (waterWaveHeight) and the fragment normal
+// (waterSurfaceNormal) can never drift apart — editing the sea updates both
+// (the same never-drift rule as applySway). A gentle sea, not chop, in world
+// space so it stays continuous across chunk borders: coincident border
+// vertices from the uniform water tessellation displace identically.
+struct WaterWave {
+    metal::float2 dir; // travel direction (unit-ish)
+    float freq;        // spatial frequency (radians per block)
+    float amp;         // crest height in blocks
+    float speed;       // temporal frequency (radians per second)
+};
+constant WaterWave WATER_WAVES[3] = {
+    {metal::float2(0.80f, 0.60f), 0.52f, 0.060f, 1.1f},
+    {metal::float2(-0.50f, 0.87f), 0.80f, 0.035f, 1.5f},
+    {metal::float2(0.20f, -0.98f), 1.05f, 0.020f, 2.1f},
+};
+
+static inline float waterWaveHeight(metal::float2 p, float t) {
+    float h = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        WaterWave w = WATER_WAVES[i];
+        h += w.amp * metal::sin(metal::dot(p, w.dir) * w.freq + t * w.speed);
+    }
+    return h;
+}
+
+// Analytic normal of the same wave field (the gradient of waterWaveHeight,
+// d/dp of A*sin(dot(p,D)*K + t*S) = A*D*K*cos(...)) plus a faint fine ripple
+// for specular sparkle. The slope scale keeps the surface glassy.
+static inline metal::float3 waterSurfaceNormal(metal::float2 p, float t) {
+    metal::float2 g = metal::float2(0.0f, 0.0f);
+    for (int i = 0; i < 3; ++i) {
+        WaterWave w = WATER_WAVES[i];
+        g += w.amp * w.freq * w.dir * metal::cos(metal::dot(p, w.dir) * w.freq + t * w.speed);
+    }
+    // Faint fine ripple, shading only (not displaced), for sparkle
+    g += 0.008f *
+         metal::float2(metal::cos(p.x * 1.9f + t * 2.3f), metal::cos(p.y * 2.2f - t * 2.0f));
+    const float slope = 1.5f;
+    return metal::normalize(metal::float3(-g.x * slope, 1.0f, -g.y * slope));
+}
 #endif
 
 // Bound at buffer(1) in the main chunk/highlight shaders.
@@ -167,6 +210,14 @@ struct WaterUniforms {
     float time;             // seconds; drives waves + caustics
     float cameraUnderwater; // 1.0 when the camera is inside water
     float ssrStrength;      // 0 = sky-only reflection (the pre-SSR look)
+    float skyExposure;      // 0 when solid ground seals the camera's water
+                            // column (aquifers, roofed lakes): no sunlight
+                            // reaches covered water, so caustics and the
+                            // sun-driven murk must go dark, not track the sun
+    float waterSurfaceY;    // world Y of the surface of the water body the
+                            // camera is in: upward rays leave the water there,
+                            // so murk and caustics must stop at that exit
+                            // instead of fogging out to the opaque depth
 };
 
 // Atmospheric sky, bound at buffer(1) in sky.metal. The fragment shader
@@ -296,14 +347,23 @@ struct ExposureParams {
     // so keyValue ≈ a lit surface's average luminance keeps day near 1.0
     // (mapping the average to middle grey instead over-darkens bright scenes).
     float keyValue;
-    float adaptationRate;  // 0..1 EMA weight for this frame (eye adaptation speed)
-    float minLogLum;       // clamp floor for scene log-luminance
-    float maxLogLum;       // clamp ceiling
-    simd_uint2 sampleGrid; // reduction sample count across the frame (e.g. 16×16)
-    // Exposure clamp: minExposure well above 0 keeps bright outdoor scenes
-    // from being crushed dim; maxExposure lifts caves/night without blowing up.
+    float adaptationDownRate; // 0..1 EMA weight when the scene brightens (fast:
+                              // the eye stops down quickly facing the sun)
+    float minLogLum;          // clamp floor for scene log-luminance
+    float maxLogLum;          // clamp ceiling
+    simd_uint2 sampleGrid;    // reduction sample count across the frame (e.g. 16×16)
+    // Exposure clamp: minExposure keeps bright outdoor scenes from being
+    // crushed dim; maxExposure lifts caves/night without blowing up.
     float minExposure;
     float maxExposure;
+    float adaptationUpRate; // slower EMA weight when the scene darkens
+    // Highlight weighting: a plain mean barely moves when a small bright sun
+    // enters the frame, so bright samples get up-weighted —
+    // w = 1 + gain * saturate((logLum - knee) / range) — and facing the sun
+    // actually stops the scene down.
+    float highlightGain;
+    float highlightKnee;  // log2 luminance where up-weighting starts
+    float highlightRange; // log2 range over which the weight ramps in
 };
 
 // Bound at buffer(0) in the final composite (post.metal): the one pass that
@@ -345,6 +405,8 @@ static_assert(offsetof(Uniforms, swayStrength) == 292);
 static_assert(offsetof(Uniforms, wetness) == 296);
 
 static_assert(sizeof(WaterUniforms) == 256);
+static_assert(offsetof(WaterUniforms, skyExposure) == 248);
+static_assert(offsetof(WaterUniforms, waterSurfaceY) == 252);
 static_assert(offsetof(WaterUniforms, cameraRelativeViewProjection) == 64);
 static_assert(offsetof(WaterUniforms, zenithColor) == 128);
 static_assert(offsetof(WaterUniforms, resolution) == 224);
@@ -412,9 +474,13 @@ static_assert(offsetof(VolumetricUniforms, frameIndex) == 132);
 static_assert(sizeof(ExposureState) == 8);
 static_assert(offsetof(ExposureState, exposure) == 4);
 
-static_assert(sizeof(ExposureParams) == 32);
-static_assert(offsetof(ExposureParams, adaptationRate) == 4);
+static_assert(sizeof(ExposureParams) == 48);
+static_assert(offsetof(ExposureParams, adaptationDownRate) == 4);
 static_assert(offsetof(ExposureParams, sampleGrid) == 16);
 static_assert(offsetof(ExposureParams, minExposure) == 24);
 static_assert(offsetof(ExposureParams, maxExposure) == 28);
+static_assert(offsetof(ExposureParams, adaptationUpRate) == 32);
+static_assert(offsetof(ExposureParams, highlightGain) == 36);
+static_assert(offsetof(ExposureParams, highlightKnee) == 40);
+static_assert(offsetof(ExposureParams, highlightRange) == 44);
 #endif

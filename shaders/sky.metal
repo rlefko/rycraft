@@ -58,11 +58,14 @@ fragment float4 skyFragmentMain(SkyVertexOut in [[stage_in]],
 
     float sunCos = dot(dir, sunDir);
 
-    // Mie forward scatter: a broad warm glow around the sun, strongest when
-    // the sun sits low (sunrise/sunset), so dawn and dusk bleed orange.
-    float mie = pow(max(sunCos, 0.0f), 8.0f);
+    // Mie forward scatter: a warm glow around the sun, strongest when the sun
+    // sits low (sunrise/sunset), so dawn and dusk bleed orange. The lobe is
+    // deliberately tight (pow 24) at moderate amplitude: the old broad pow-8
+    // full-strength halo washed a quarter of the frame to white whenever the
+    // sun was in view, reading as glare no exposure could recover.
+    float mie = pow(max(sunCos, 0.0f), 24.0f);
     float lowSun = 1.0f - clamp(sky.sunDirection.y * 2.0f, 0.0f, 1.0f);
-    color += sky.sunColor * mie * (0.35f + 0.65f * lowSun) * sky.sunIntensity;
+    color += sky.sunColor * mie * (0.22f + 0.45f * lowSun) * sky.sunIntensity;
 
     // Stars: hash a coarse direction lattice; only the brightest cells light,
     // and only above the horizon, fading in as the sun drops.
@@ -82,10 +85,13 @@ fragment float4 skyFragmentMain(SkyVertexOut in [[stage_in]],
     color += float3(0.6f, 0.65f, 0.8f) * moonHalo * sky.starStrength;
 
     // Sun disc: sharp, limb-darkened, HDR-bright so the bloom pass halos it.
+    // HDR 8 (was 12) stays far above the bloom threshold but keeps the limb
+    // gradient visible once the highlight-aware exposure stops down, instead
+    // of plateauing deep in the tonemap shoulder as flat white.
     if (sky.sunIntensity > 0.001f) {
         float sunDisc = smoothstep(0.9992f, 0.9996f, sunCos);
         float limb = 0.7f + 0.3f * smoothstep(0.9992f, 1.0f, sunCos);
-        color = mix(color, sky.sunColor * 12.0f * limb, sunDisc);
+        color = mix(color, sky.sunColor * 8.0f * limb, sunDisc);
     }
 
     return float4(color, 1.0f);

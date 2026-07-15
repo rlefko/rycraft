@@ -157,8 +157,22 @@ Water renders after the opaque scene resolves into `_colorResolve`:
 - The shader owns its composite pixel, so the surface pipeline has no blend state.
 - Exact and far water draws sort back to front by full three-dimensional distance.
 - Screen-space reflection, depth absorption, procedural caustics, Fresnel sky reflection, sun sparkle, and shared fog run in this pass when enabled.
-- The underwater veil, god rays, and caustics render last when the camera is submerged.
+- The underwater overlay, god rays, and caustics render last when the camera is submerged.
 - Anything that belongs behind water renders in the scene pass. Anything intentionally above water renders afterward.
+- **The wave field is one table.** `WATER_WAVES` in `shader_types.hpp` drives both the vertex displacement (`waterWaveHeight`) and the fragment normal (`waterSurfaceNormal`), with the phase advected by the packed flow direction. Why: the two lived as separate formulas once, and editing the sea in one silently desynced the shading from the geometry.
+- **The SSR march starts at an IGN-jittered stride** and, when the camera is submerged, attenuates the reflected hit per channel by `WATER_SIGMA_A` over the reflected path. Why: a coherent stride turned the coarse march into stair bands across every reflection, and unabsorbed hits mirrored crisp daylight colors from deep underwater.
+- **From below, the surface is physical.** Water-to-air Fresnel with total internal reflection past the critical angle (eased near it so per-quad wave normals do not flip whole cells into hard panels); SSR mirrors the underwater scene with the deep tint as fallback; foam, refraction distortion, and the floor-caustic add are above-water-only. Why: each of those painted above-water effects onto the from-below view, including white waterline streaks and mis-oriented caustic bands.
+
+### The underwater overlay is physically based
+
+When the camera is submerged, the fullscreen overlay owns the entire water tint (the scene passes apply no fog below the surface, and the rain sheen turns off):
+
+- **Per-channel Beer-Lambert absorption through dual-source blending.** The fragment outputs inscatter at `color(0) index(0)` and per-channel transmittance at `index(1)`; the pipeline blends `result = inscatter + scene * transmit`. Why: a single alpha cannot express spectral absorption, and red must die faster than blue for distance to read as water rather than flat fog.
+- **Absorption counts only the in-water path.** Upward rays stop accumulating at the water surface (`waterSurfaceY`, scanned up from the camera cell on the CPU), and the shaded point's own depth below the surface attenuates the light that reached it. Why: fogging by the opaque distance behind the surface (the sky is far) drowned every upward view in murk, and depth-independent lighting made deep floors look daylit.
+- **Sunlight is gated by sky exposure.** Covered water (sealed aquifers, roofed lakes, checked against the surface-height map like rain spawning) zeroes the caustics, the sun-driven inscatter, and the submerged volumetric shafts. Why: the shadow cascades cannot occlude terrain hundreds of blocks up, so sealed pockets grew impossible sun caustics and shafts.
+- **Caustics modulate, never add.** The web multiplies the transmittance, so it rides each floor's own shading; the pattern is the iterative wave-warped web (`causticPattern`, warped by the shared wave normal so light moves with the waves) and is clamped, because an unclamped HDR caustic crossed the bloom threshold across whole floors and whited them out.
+- **Screen-space normals for the caustic gate use best-of-both-sides depth taps** with a silhouette feather, the same reconstruction rationale as `ssao.metal`. Why: one-sided derivatives straddle block silhouettes and lit dashed lines along every oblique edge.
+- **Inscatter is anisotropic.** A capped Henyey-Greenstein lobe brightens the view toward the sun. Why: isotropic murk lost the underwater silver lining that makes the volume read as sunlit water.
 
 ## 10. HDR frame graph and the one tonemap
 
@@ -170,9 +184,9 @@ The scene renders in linear HDR and is graded exactly once.
 4. Scene application combines opaque HDR, AO, and clouds.
 5. Water composites against copied opaque color and resolved depth.
 6. Volumetric light marches the cascades and composites into HDR.
-7. GPU compute updates persistent exposure and flare state without CPU readback.
+7. GPU compute updates persistent exposure and flare state without CPU readback. Exposure meters a highlight-weighted mean of log luminance with asymmetric adaptation (fast down, slow up). Why: a flat mean barely moves when the small bright sun enters the frame, so facing the sun never stopped the scene down; with no highlights the weighted mean equals the plain mean, so caves and night keep their lift.
 8. Bloom builds its HDR pyramid when enabled.
-9. One always-on final composite applies exposure, Uchimura tonemap, vibrance, contrast, lens flare, optional CAS sharpening, and dithering.
+9. One always-on final composite applies exposure, Uchimura tonemap (linear length 0.30, so the shoulder starts early enough that the sun disc keeps its limb gradient), vibrance, contrast, lens flare, optional CAS sharpening, and dithering.
 10. UI draws at display resolution.
 
 Toggled-off effects skip work or bind static fallback textures. They do not fork the scene into an untonemapped path. Half- and quarter-resolution effects dither in space because this renderer uses memoryless 4x MSAA rather than a temporal history.
@@ -184,6 +198,7 @@ Toggled-off effects skip work or bind static fallback textures. They do not fork
 - Shadow casters render cull-none with alpha-cutout discard.
 - Baked corner ambient occlusion, derived block light, emissive state, and skylight ride `faceAttr`.
 - SSAO rejects samples behind the receiver tangent plane rather than using raw depth difference alone.
+- SSAO is bilateral-blurred at half resolution before it multiplies the scene, weighted by view-space depth so it never bleeds across block silhouettes, and its strength fades at grazing view angles. Why: the generate pass rotates its kernel with per-pixel IGN and MSAA keeps no temporal history to hide that noise under, so unblurred AO printed diagonal scan lines on ceilings and grazing ground.
 - Lava remains emissive in linear HDR and seeds derived block light into neighboring transparent cells.
 - Rain wetness, foliage subsurface response, wind sway, cloud shadowing, fog, and post effects consume the same world and sky uniforms in exact and far geometry where applicable.
 

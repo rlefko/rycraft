@@ -2947,7 +2947,7 @@ TEST_CASE("Day/night cycle: sun elevation drives ambient brightness", "[phase6][
 // curve's contract: black stays black, a linear mid section preserves the
 // vibrant look, highlights compress, and it never decreases.
 static float uchimuraToneMap(float x) {
-    const float P = 1.0f, a = 1.0f, m = 0.22f, l = 0.4f, c = 1.33f, b = 0.0f;
+    const float P = 1.0f, a = 1.0f, m = 0.22f, l = 0.30f, c = 1.33f, b = 0.0f;
     const float l0 = ((P - m) * l) / a;
     const float S0 = m + l0;
     const float S1 = m + a * l0;
@@ -3234,6 +3234,8 @@ TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-typ
     REQUIRE(offsetof(WaterUniforms, time) == 236);
     REQUIRE(offsetof(WaterUniforms, cameraUnderwater) == 240);
     REQUIRE(offsetof(WaterUniforms, ssrStrength) == 244);
+    REQUIRE(offsetof(WaterUniforms, skyExposure) == 248);
+    REQUIRE(offsetof(WaterUniforms, waterSurfaceY) == 252);
 }
 
 TEST_CASE("Camera-relative water depth stays continuous at large world coordinates",
@@ -3351,12 +3353,16 @@ TEST_CASE("Shader types: ExposureState + ExposureParams layout match MSL",
     REQUIRE(offsetof(ExposureState, smoothedLogLum) == 0);
     REQUIRE(offsetof(ExposureState, exposure) == 4);
 
-    REQUIRE(sizeof(ExposureParams) == 32);
+    REQUIRE(sizeof(ExposureParams) == 48);
     REQUIRE(offsetof(ExposureParams, keyValue) == 0);
-    REQUIRE(offsetof(ExposureParams, adaptationRate) == 4);
+    REQUIRE(offsetof(ExposureParams, adaptationDownRate) == 4);
     REQUIRE(offsetof(ExposureParams, minLogLum) == 8);
     REQUIRE(offsetof(ExposureParams, maxLogLum) == 12);
     REQUIRE(offsetof(ExposureParams, sampleGrid) == 16);
     REQUIRE(offsetof(ExposureParams, minExposure) == 24);
     REQUIRE(offsetof(ExposureParams, maxExposure) == 28);
+    REQUIRE(offsetof(ExposureParams, adaptationUpRate) == 32);
+    REQUIRE(offsetof(ExposureParams, highlightGain) == 36);
+    REQUIRE(offsetof(ExposureParams, highlightKnee) == 40);
+    REQUIRE(offsetof(ExposureParams, highlightRange) == 44);
 }

@@ -109,7 +109,8 @@ public:
     // Handles empty world gracefully (sky-only output).
     void render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable, const Mat4& viewMatrix,
                 const Mat4& projectionMatrix, const World& world, const Camera& camera,
-                uint64_t worldTime = 0, std::optional<Vec3> highlightedBlock = std::nullopt,
+                uint64_t worldTime = 0, double deltaSeconds = 0.0,
+                std::optional<Vec3> highlightedBlock = std::nullopt,
                 const Hotbar& hotbar = Hotbar(), const UIFrameState& uiFrame = UIFrameState{},
                 const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
 
@@ -278,11 +279,24 @@ private:
     // Exponential fog density per block
     float _fogDensity = 0.0003f;
     float _wetness = 0.0f;
+    // True while the camera is submerged this frame (set by render()). Gates
+    // the rain-wetness sun sheen off: a gloss toward the sun on floors seen
+    // through five blocks of water read as a white-out, not rain.
+    bool _cameraUnderwater = false;
+    // Eased sky exposure of the camera's water column (see render()); 0 in
+    // sealed aquifers and under roofed water where sunlight cannot reach.
+    float _uwSkyExposure = 1.0f;
+    // World Y of the surface of the water body the camera is in (see render()).
+    float _uwSurfaceY = 0.0f;
 
-    // Frame animation clock (worldTime -> seconds, wraps daily) driving the
-    // foliage sway in the scene AND shadow passes — one value per frame so
-    // the two can never sample different phases.
+    // Frame animation clock driving water waves, caustics, and foliage sway in
+    // the scene AND shadow passes — one value per frame so the two can never
+    // sample different phases. It accumulates the real frame delta (NOT the
+    // day-night worldTime), so animation keeps flowing when the time of day is
+    // frozen (captures) or paused and never jumps at the daily rollover. Bounded
+    // (wraps at 3600 s) so the float keeps sub-millisecond phase precision.
     float _animTime = 0.0f;
+    double _animClock = 0.0;
 
     // Optional deterministic developer overlay selected by
     // RYCRAFT_WORLDGEN_OVERLAY.

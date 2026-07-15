@@ -1135,8 +1135,12 @@ static EngineState* _engineGetState(Engine* engine) {
                         for (int32_t y = searchTop; y > WORLD_MIN_Y; --y) {
                             BlockType b = state->world->getBlock(wx, y, wz);
                             if (isSolid(b) && !isTrunk(b)) {
-                                state->world->setBlock(wx, y, wz, BlockType::WATER);
-                                state->world->setBlock(wx, y - 1, wz, BlockType::WATER);
+                                // Carve a pool six blocks deep (over-water shots
+                                // see the surface; walking in submerges the
+                                // camera for underwater captures), air above.
+                                for (int d = 0; d < 6; ++d) {
+                                    state->world->setBlock(wx, y - d, wz, BlockType::WATER);
+                                }
                                 state->world->setBlock(wx, y + 1, wz, BlockType::AIR);
                                 break;
                             }
@@ -1595,7 +1599,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     _renderPipeline->render(
         _queue, drawable, viewMatrix, state->projectionMatrix, *state->world, state->camera,
-        state->worldTime,
+        state->worldTime, state->deltaTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
         state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
 

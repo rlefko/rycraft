@@ -288,12 +288,14 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         overlayDesc.colorAttachments[0].blendingEnabled = true;
         overlayDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
         overlayDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-        overlayDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        // Dual-source blending: result = inscatter + scene * transmit. The
+        // fragment's color(0) index(0) is the inscattered light and index(1)
+        // the per-channel Beer-Lambert transmittance — a single alpha cannot
+        // express spectral absorption (red must die faster than blue).
+        overlayDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
         overlayDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-        overlayDesc.colorAttachments[0].destinationRGBBlendFactor =
-            MTLBlendFactorOneMinusSourceAlpha;
-        overlayDesc.colorAttachments[0].destinationAlphaBlendFactor =
-            MTLBlendFactorOneMinusSourceAlpha;
+        overlayDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorSource1Color;
+        overlayDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorZero;
         overlayDesc.rasterSampleCount = 1;
         _underwaterOverlayState = [_device newRenderPipelineStateWithDescriptor:overlayDesc
                                                                           error:&error];
@@ -454,8 +456,8 @@ void RenderPipeline::allocateSceneTargets() {
 void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
                             const Mat4& viewMatrix, const Mat4& projectionMatrix,
                             const World& world, const Camera& camera, uint64_t worldTime,
-                            std::optional<Vec3> highlightedBlock, const Hotbar& hotbar,
-                            const UIFrameState& uiFrame,
+                            double deltaSeconds, std::optional<Vec3> highlightedBlock,
+                            const Hotbar& hotbar, const UIFrameState& uiFrame,
                             const std::vector<std::shared_ptr<Entity>>* entities) {
     if (!drawable || !queue)
         return;
@@ -482,8 +484,15 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     computeDayNightUniforms(worldTime, sunDirection, sunColor, ambientColor, skyUniforms,
                             shadowStrength);
 
-    // 20 Hz world time -> seconds (the same stepping the water pass animates with)
-    _animTime = static_cast<float>(worldTime % TICKS_PER_DAY) * 0.05f;
+    // Animation clock accumulates the real frame delta (the engine already
+    // clamps it to <= 0.25 s past a hitch/pause), NOT the day-night worldTime,
+    // so water/caustics/foliage keep flowing even when the time of day is frozen
+    // (captures) or paused and never jump at the daily rollover. It wraps at
+    // 3600 s so the float stays sub-millisecond precise.
+    if (deltaSeconds > 0.0) {
+        _animClock = std::fmod(_animClock + deltaSeconds, 3600.0);
+    }
+    _animTime = static_cast<float>(_animClock);
 
     // Normalize sun direction
     float sunLen = std::sqrt(sunDirection[0] * sunDirection[0] + sunDirection[1] * sunDirection[1] +
@@ -561,11 +570,43 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderSky(encoder, skyAlloc);
 
     // Underwater the whole scene sinks into a dense blue veil (light
-    // attenuation); the water pass adds the god-ray overlay on top.
+    // attenuation) — owned entirely by the underwater overlay's depth-based
+    // scattering, so the scene/water passes apply no fog of their own below the
+    // surface (two fogs stacked over-darkened the near water).
     const bool cameraUnderwater = uiFrame.cameraUnderwater;
-    const float fogColor[3] = {cameraUnderwater ? 0.05f : skyUniforms.horizonColor.x,
-                               cameraUnderwater ? 0.15f : skyUniforms.horizonColor.y,
-                               cameraUnderwater ? 0.32f : skyUniforms.horizonColor.z};
+    _cameraUnderwater = cameraUnderwater;
+
+    // Sky exposure of the camera's water column: 0 when solid ground seals it
+    // (aquifers, roofed lakes — the same surface-height gate rain spawning
+    // uses). Sunlight cannot reach covered water, so the underwater caustics,
+    // sun-driven murk, and volumetric shafts all scale by this. Eased so
+    // swimming under an overhang lip fades rather than pops.
+    {
+        float target = 1.0f;
+        if (cameraUnderwater) {
+            const Vec3 camPos = camera.getPosition();
+            auto surface = world.surfaceHeightIfLoaded(static_cast<int64_t>(std::floor(camPos.x)),
+                                                       static_cast<int64_t>(std::floor(camPos.z)));
+            if (surface.has_value() && static_cast<double>(*surface) > camPos.y) {
+                target = 0.0f;
+            }
+            // Scan up for the top of the water body the camera is in: upward
+            // rays exit the water there, so murk and caustics must stop at
+            // that height instead of fogging out to the opaque depth behind
+            // the from-below surface. 0.875 is the rendered surface plane.
+            const int64_t bx = static_cast<int64_t>(std::floor(camPos.x));
+            const int64_t bz = static_cast<int64_t>(std::floor(camPos.z));
+            int32_t top = static_cast<int32_t>(std::floor(camPos.y));
+            while (world.getBlockIfLoaded(bx, top + 1, bz) == BlockType::WATER) {
+                ++top;
+            }
+            _uwSurfaceY = static_cast<float>(top) + 0.875f;
+        }
+        _uwSkyExposure += (target - _uwSkyExposure) * 0.1f;
+    }
+
+    const float fogColor[3] = {skyUniforms.horizonColor.x, skyUniforms.horizonColor.y,
+                               skyUniforms.horizonColor.z};
     const float savedFogDensity = _fogDensity;
     {
         // Morning fog: a dawn haze that thickens fog and burns off by
@@ -576,7 +617,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         _fogDensity *= 1.0f + 5.0f * morning * morning;
     }
     if (cameraUnderwater) {
-        _fogDensity = std::max(_fogDensity, 0.035f);
+        _fogDensity = 0.0f; // the overlay owns the underwater murk
     }
     renderChunks(encoder, world, loadedChunks, viewMatrix, projectionMatrix, camera.getPosition(),
                  sunDirection, sunColor, ambientColor, fogColor);
@@ -634,7 +675,10 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         vu.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
         vu.sunColor = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
         vu.stepCount = 24.0f;
-        vu.density = 0.055f;
+        // Covered water (aquifers, roofed lakes) receives no sunlight: the
+        // cascades cannot occlude terrain hundreds of blocks up, so without
+        // this gate sealed pockets grew impossible sun shafts.
+        vu.density = 0.055f * (cameraUnderwater ? _uwSkyExposure : 1.0f);
         vu.anisotropy = 0.6f; // forward scatter → bright halo toward the light
         vu.maxDistance = 96.0f;
         vu.underwater = cameraUnderwater ? 1.0f : 0.0f;
@@ -1033,7 +1077,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Foliage sway clock + the waving toggle (0 freezes blades at rest)
     uniforms.time = _animTime;
     uniforms.swayStrength = _gfx.wavingFoliage ? 1.0f : 0.0f;
-    uniforms.wetness = _wetness;
+    uniforms.wetness = _cameraUnderwater ? 0.0f : _wetness;
 
     // Upload to GPU (kept for the entity renderer + water vertex stage too)
     _frameUniforms = _frameRing.push(&uniforms, sizeof(Uniforms));
@@ -1976,6 +2020,8 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     // Screen-space reflections layer onto the fresnel sky term; 0 keeps the
     // pre-SSR look (also the RYCRAFT_SSR=0 / setting-off path).
     wu.ssrStrength = _gfx.waterReflections ? 1.0f : 0.0f;
+    wu.skyExposure = _uwSkyExposure;
+    wu.waterSurfaceY = _uwSurfaceY;
     FrameRing::Alloc waterAlloc = _frameRing.push(&wu, sizeof(WaterUniforms));
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];

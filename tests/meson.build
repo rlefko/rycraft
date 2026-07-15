@@ -26,4 +26,6 @@ test_exe = executable('test_rycraft',
   dependencies : [catch2_with_main_dep, lz4_dep],
 )
 
-test('rycraft tests', test_exe, timeout : 180)
+# The worldgen regression suite alone runs ~3.5 minutes in a debug build;
+# 180 s killed a fully passing run mid-suite.
+test('rycraft tests', test_exe, timeout : 480)

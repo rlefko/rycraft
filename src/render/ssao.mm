@@ -9,9 +9,10 @@ Ssao::Ssao(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width, u
     : _device(device) {
     id<MTLFunction> genVertex = [shaderLibrary newFunctionWithName:@"ssaoVertex"];
     id<MTLFunction> genFragment = [shaderLibrary newFunctionWithName:@"ssaoGenerateFragment"];
+    id<MTLFunction> blurFragment = [shaderLibrary newFunctionWithName:@"ssaoBlurFragment"];
     id<MTLFunction> applyVertex = [shaderLibrary newFunctionWithName:@"ssaoApplyVertex"];
     id<MTLFunction> applyFragment = [shaderLibrary newFunctionWithName:@"ssaoApplyFragment"];
-    if (!genVertex || !genFragment || !applyVertex || !applyFragment) {
+    if (!genVertex || !genFragment || !blurFragment || !applyVertex || !applyFragment) {
         RY_LOG_FATAL("Failed to load SSAO shader functions");
     }
 
@@ -23,6 +24,15 @@ Ssao::Ssao(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width, u
     _generatePipeline = [_device newRenderPipelineStateWithDescriptor:genDesc error:&error];
     if (!_generatePipeline) {
         RY_LOG_FATAL("Failed to create SSAO generate pipeline state");
+    }
+
+    auto blurDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    blurDesc.vertexFunction = genVertex;
+    blurDesc.fragmentFunction = blurFragment;
+    blurDesc.colorAttachments[0].pixelFormat = PixelFormats::AO;
+    _blurPipeline = [_device newRenderPipelineStateWithDescriptor:blurDesc error:&error];
+    if (!_blurPipeline) {
+        RY_LOG_FATAL("Failed to create SSAO blur pipeline state");
     }
 
     // The apply multiplies AO onto the HDR scene (dst * src, no self-read).
@@ -55,8 +65,9 @@ void Ssao::allocateTarget() {
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     desc.storageMode = MTLStorageModePrivate;
     _aoTex = [_device newTextureWithDescriptor:desc];
-    if (!_aoTex) {
-        RY_LOG_FATAL("Failed to allocate SSAO target");
+    _aoBlurTex = [_device newTextureWithDescriptor:desc];
+    if (!_aoTex || !_aoBlurTex) {
+        RY_LOG_FATAL("Failed to allocate SSAO targets");
     }
 }
 
@@ -92,6 +103,22 @@ void Ssao::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR,
     [gen drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [gen endEncoding];
 
+    // ---- Bilateral blur (depth-aware) before the apply ----
+    auto blurPass = [[MTLRenderPassDescriptor alloc] init];
+    blurPass.colorAttachments[0].texture = _aoBlurTex;
+    blurPass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    blurPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> blur = [commandBuffer renderCommandEncoderWithDescriptor:blurPass];
+    if (!blur) {
+        return;
+    }
+    [blur setRenderPipelineState:_blurPipeline];
+    [blur setFragmentTexture:_aoTex atIndex:0];
+    [blur setFragmentTexture:depthResolve atIndex:1];
+    [blur setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+    [blur drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [blur endEncoding];
+
     // ---- Multiply the AO onto the HDR scene ----
     auto applyPass = [[MTLRenderPassDescriptor alloc] init];
     applyPass.colorAttachments[0].texture = sceneHDR;
@@ -103,7 +130,7 @@ void Ssao::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR,
         return;
     }
     [apply setRenderPipelineState:_applyPipeline];
-    [apply setFragmentTexture:_aoTex atIndex:0];
+    [apply setFragmentTexture:_aoBlurTex atIndex:0];
     [apply drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [apply endEncoding];
 }
