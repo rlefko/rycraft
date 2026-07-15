@@ -145,9 +145,9 @@ void PostStack::encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture
     // exposure before it could react); ceiling 4 still lifts caves and night
     // — with no highlights the weighted mean matches the plain mean, so dark
     // scenes are not crushed.
-    params.minExposure = 0.35f;
+    params.minExposure = 0.25f;
     params.maxExposure = 4.0f;
-    params.highlightGain = 2.0f;
+    params.highlightGain = 3.5f;
     params.highlightKnee = 1.0f;  // log2: above ~2x a typical lit surface
     params.highlightRange = 3.0f; // full weight ~8 log2 luminance and up
 
