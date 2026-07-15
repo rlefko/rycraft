@@ -9,7 +9,7 @@
 // PostStack — the terminal display pass.
 //
 // One fullscreen pass converts the linear HDR scene to the BGRA8 drawable:
-// exposure → bloom add → Uchimura tonemap → vibrance grade → optional CAS
+// exposure → bloom add → Hable filmic tonemap → vibrance grade → optional CAS
 // sharpen → dither. It ALWAYS runs (the pre-HDR pipeline blitted raw scene
 // colors when bloom was off, so the no-bloom path was never tonemapped);
 // with bloom disabled the caller passes the class's own 4×4 black fallback

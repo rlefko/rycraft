@@ -2942,44 +2942,41 @@ TEST_CASE("Day/night cycle: sun elevation drives ambient brightness", "[phase6][
 
 // ---- Bloom Tests ----
 
-// Uchimura "Gran Turismo" tonemap replicated from post.metal (the composite
-// owns tonemapping now — ACES lived in the deleted bloom composite). Pins the
-// curve's contract: black stays black, a linear mid section preserves the
-// vibrant look, highlights compress, and it never decreases.
-static float uchimuraToneMap(float x) {
-    const float P = 1.0f, a = 1.0f, m = 0.22f, l = 0.30f, c = 1.33f, b = 0.0f;
-    const float l0 = ((P - m) * l) / a;
-    const float S0 = m + l0;
-    const float S1 = m + a * l0;
-    const float C2 = (a * P) / (P - S1);
-    const float CP = -C2 / P;
-    float w0 =
-        1.0f - (x <= 0.0f ? 0.0f : (x >= m ? 1.0f : (x / m) * (x / m) * (3.0f - 2.0f * x / m)));
-    float w2 = (x >= m + l0) ? 1.0f : 0.0f;
-    float w1 = 1.0f - w0 - w2;
-    float T = m * std::pow(x / m, c) + b;
-    float L = m + a * (x - m);
-    float S = P - (P - S1) * std::exp(CP * (x - S0));
-    return T * w0 + L * w1 + S * w2;
+// Hable "Uncharted 2" filmic tonemap replicated from post.metal (the
+// composite owns tonemapping; this replaced Uchimura, whose shoulder
+// plateaued the HDR sun to flat white within a few stops). Pins the curve's
+// contract: black stays black, mids survive the fixed 2x gain near identity,
+// highlights keep compressing across many stops, and it never decreases.
+static float hableFilmicToneMap(float x) {
+    auto curve = [](float v) {
+        const float A = 0.15f, B = 0.50f, C = 0.10f, D = 0.20f, E = 0.02f, F = 0.30f;
+        return ((v * (A * v + C * B) + D * E) / (v * (A * v + B) + D * F)) - E / F;
+    };
+    const float W = 11.2f;             // linear white point
+    return curve(x * 2.0f) / curve(W); // 2x gain matches displayColor
 }
 
-TEST_CASE("Post: Uchimura tone mapping curve", "[hdr][post]") {
+TEST_CASE("Post: filmic tone mapping curve", "[hdr][post]") {
     // Black in, black out
-    REQUIRE(uchimuraToneMap(0.0f) == Catch::Approx(0.0f).margin(0.001f));
+    REQUIRE(hableFilmicToneMap(0.0f) == Catch::Approx(0.0f).margin(0.001f));
 
-    // The linear mid keeps mid-tones near identity (the vibrant look)
-    float atMid = uchimuraToneMap(0.5f);
-    REQUIRE(atMid > 0.35f);
-    REQUIRE(atMid < 0.65f);
+    // The raw curve sits about a stop under identity at the mids; the
+    // exposure key (0.85 in encodeExposure) compensates in the live path
+    float atMid = hableFilmicToneMap(0.5f);
+    REQUIRE(atMid > 0.22f);
+    REQUIRE(atMid < 0.55f);
 
-    // HDR highlights compress below the display max
-    REQUIRE(uchimuraToneMap(4.0f) < 1.0f);
-    REQUIRE(uchimuraToneMap(8.0f) < 1.0f);
+    // HDR highlights compress below display max and keep separating up to
+    // the white point (5.6 scene units after the 2x gain); the auto-exposure
+    // stop-down keeps the HDR-8 sun disc below it in the live path
+    REQUIRE(hableFilmicToneMap(4.0f) < 1.0f);
+    REQUIRE(hableFilmicToneMap(4.0f) - hableFilmicToneMap(2.0f) > 0.05f);
+    REQUIRE(hableFilmicToneMap(8.0f) >= 1.0f); // past white: display max by design
 
     // Monotonically increasing across the range
-    REQUIRE(uchimuraToneMap(0.2f) < uchimuraToneMap(0.5f));
-    REQUIRE(uchimuraToneMap(0.5f) < uchimuraToneMap(1.0f));
-    REQUIRE(uchimuraToneMap(1.0f) < uchimuraToneMap(2.0f));
+    REQUIRE(hableFilmicToneMap(0.2f) < hableFilmicToneMap(0.5f));
+    REQUIRE(hableFilmicToneMap(0.5f) < hableFilmicToneMap(1.0f));
+    REQUIRE(hableFilmicToneMap(1.0f) < hableFilmicToneMap(2.0f));
 }
 
 TEST_CASE("Post: vibrance boosts low-saturation colors more than saturated ones", "[hdr][post]") {

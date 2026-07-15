@@ -373,7 +373,7 @@ struct ExposureParams {
 
 // Bound at buffer(0) in the final composite (post.metal): the one pass that
 // converts the linear HDR scene to the display — exposure, bloom add,
-// Uchimura tonemap, vibrance grade, optional CAS sharpen, dither. It always
+// filmic tonemap, vibrance grade, optional CAS sharpen, dither. It always
 // runs, so the frame is tonemapped even with bloom off.
 struct PostUniforms {
     simd_float2 resolution;  // drawable size in pixels

@@ -133,20 +133,23 @@ void PostStack::encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture
         return;
 
     ExposureParams params{};
-    // keyValue ≈ a lit surface's average luminance, so daylight maps near
-    // exposure 1.0 (a middle-grey 0.18 target over-darkened bright scenes).
-    params.keyValue = 0.5f;
+    // keyValue sets where metered daylight lands (exposure = key / avgLum).
+    // 0.85 compensates the filmic curve, which maps the same input about a
+    // stop lower through the mids than the old curve did — a 0.5 key read as
+    // globally underexposed navy once the curve changed.
+    params.keyValue = 0.85f;
     params.adaptationDownRate = 0.10f; // ~0.15 s to stop down at 60 fps
     params.adaptationUpRate = 0.03f;   // ~0.5 s to recover when it darkens
     params.minLogLum = -8.0f;
     params.maxLogLum = 4.0f;
     params.sampleGrid = simd_make_uint2(16, 16); // 256 samples = 1 threadgroup
-    // Floor 0.35 lets sun-facing frames actually stop down (0.7 pinned the
-    // exposure before it could react); ceiling 4 still lifts caves and night
-    // — with no highlights the weighted mean matches the plain mean, so dark
-    // scenes are not crushed.
+    // Floor 0.25 lets sun-facing frames actually stop down (0.7 pinned the
+    // exposure before it could react). Ceiling 3.0: the filmic toe already
+    // holds shadow detail, and the old 4x lift made caves and night look
+    // daylit — dark places should read dark, with the curve doing the
+    // grading, while sunlit water a few blocks down stays legible.
     params.minExposure = 0.25f;
-    params.maxExposure = 4.0f;
+    params.maxExposure = 3.0f;
     params.highlightGain = 3.5f;
     params.highlightKnee = 1.0f;  // log2: above ~2x a typical lit surface
     params.highlightRange = 3.0f; // full weight ~8 log2 luminance and up
