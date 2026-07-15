@@ -575,6 +575,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     // scattering, so the scene/water passes apply no fog of their own below the
     // surface (two fogs stacked over-darkened the near water).
     const bool cameraUnderwater = uiFrame.cameraUnderwater;
+    _cameraUnderwater = cameraUnderwater;
     const float fogColor[3] = {skyUniforms.horizonColor.x, skyUniforms.horizonColor.y,
                                skyUniforms.horizonColor.z};
     const float savedFogDensity = _fogDensity;
@@ -1044,7 +1045,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Foliage sway clock + the waving toggle (0 freezes blades at rest)
     uniforms.time = _animTime;
     uniforms.swayStrength = _gfx.wavingFoliage ? 1.0f : 0.0f;
-    uniforms.wetness = _wetness;
+    uniforms.wetness = _cameraUnderwater ? 0.0f : _wetness;
 
     // Upload to GPU (kept for the entity renderer + water vertex stage too)
     _frameUniforms = _frameRing.push(&uniforms, sizeof(Uniforms));

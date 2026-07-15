@@ -100,7 +100,13 @@ fragment float4 volumetricFragment(VolVertexOut in [[stage_in]],
         float vis = marchVisibility(p, t, shadowMap, shadowSampler, shadow);
         float atten = 1.0f;
         if (vol.underwater > 0.5f) {
-            atten = exp(-t * 0.06f); // water absorbs the shaft with depth
+            // The cascades hold no water surface, so the sun reaches every
+            // sample unoccluded and a plain march white-washed the floor.
+            // Attenuate each sample by its water column (surface approximated
+            // at eye + 1: this pass only runs submerged) on top of the ray
+            // absorption, so shafts slant from the surface and die with depth.
+            float depthBelow = max(vol.cameraPosition.y + 1.0f - p.y, 0.0f);
+            atten = exp(-t * 0.06f) * exp(-depthBelow * 0.20f);
         }
         inscatter += vis * atten * stepSize;
         t += stepSize;
@@ -109,7 +115,9 @@ fragment float4 volumetricFragment(VolVertexOut in [[stage_in]],
 
     float3 color = vol.sunColor * inscatter;
     if (vol.underwater > 0.5f) {
-        color *= float3(0.4f, 0.7f, 1.0f); // cool underwater tint
+        // Dimmed hard: at full strength the unshadowed submerged march painted
+        // every floor white; shafts should read as slanting light, not fill.
+        color *= float3(0.4f, 0.7f, 1.0f) * 0.12f;
     }
     return float4(color, 1.0f);
 }

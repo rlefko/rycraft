@@ -279,6 +279,10 @@ private:
     // Exponential fog density per block
     float _fogDensity = 0.0003f;
     float _wetness = 0.0f;
+    // True while the camera is submerged this frame (set by render()). Gates
+    // the rain-wetness sun sheen off: a gloss toward the sun on floors seen
+    // through five blocks of water read as a white-out, not rain.
+    bool _cameraUnderwater = false;
 
     // Frame animation clock driving water waves, caustics, and foliage sway in
     // the scene AND shadow passes — one value per frame so the two can never
