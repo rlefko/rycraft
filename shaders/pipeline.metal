@@ -753,10 +753,19 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
 
     // ---- Depth-based scattering: near water is clear, distance fades into
     // murk. This owns the whole underwater tint now (the scene passes apply no
-    // fog below the surface), so it must fog every pixel including the sky seen
-    // through the surface (depth 1 reconstructs far away -> full murk).
+    // fog below the surface). The murk accumulates only along the IN-WATER
+    // part of the ray: an upward ray exits through the surface after a few
+    // blocks, and fogging it by the opaque distance behind the surface (sky is
+    // far) drowned the whole upward view in murk.
     const float UW_FOG_DENSITY = 0.075f;
-    float fogFactor = 1.0f - exp(-dist * UW_FOG_DENSITY);
+    float3 rayDir = relative / max(dist, 1e-4f);
+    float eyeY = water.cameraPosition.y;
+    float waterPath = dist;
+    if (rayDir.y > 0.02f) {
+        float exitDist = max(water.waterSurfaceY - eyeY, 0.0f) / rayDir.y;
+        waterPath = min(dist, exitDist);
+    }
+    float fogFactor = 1.0f - exp(-waterPath * UW_FOG_DENSITY);
 
     // Inscattered light: overhead sun lifts a brighter blue-green; sinking
     // below sea level darkens the murk. Hydrology puts lakes at arbitrary
@@ -811,20 +820,18 @@ fragment float4 underwaterOverlayFragment(OverlayVertexOutput in [[stage_in]],
     // lands on submerged ground, never on shore terrain reconstructed BEHIND
     // the water surface seen from below (a looser gate painted the web onto
     // the surface overhead). skyExposure zeroes it in covered water.
-    float eyeY = water.cameraPosition.y;
-    float submerged = step(world.y, eyeY + 0.75f);
-    // Upward rays exit the water at roughly eye + 1: any opaque point beyond
-    // that exit is seen THROUGH the from-below surface, whose pixels the
-    // surface pass already shaded — overlay caustics there painted the web
-    // onto the surface overhead. Fade the caustic out past the exit distance.
-    float3 rayDir = relative / max(dist, 1e-4f);
+    // Caustics land only below the water surface: any opaque point past the
+    // ray's exit through the surface is seen THROUGH the from-below surface,
+    // whose pixels the surface pass already shaded — overlay caustics there
+    // painted the web onto the surface overhead.
+    float submerged = step(world.y, water.waterSurfaceY);
     float throughSurface = 1.0f;
     if (rayDir.y > 0.02f) {
-        float exitDist = 1.0f / rayDir.y;
-        throughSurface = 1.0f - smoothstep(exitDist * 0.8f, exitDist * 1.2f, dist);
+        float exitDist = max(water.waterSurfaceY - eyeY, 0.0f) / rayDir.y;
+        throughSurface = 1.0f - smoothstep(exitDist * 0.9f, exitDist * 1.1f, dist);
     }
-    float caustic = causticPattern(world.xz, t) * exp(-max(eyeY + 1.0f - world.y, 0.0f) * 0.03f) *
-                    exp(-dist * 0.03f);
+    float caustic = causticPattern(world.xz, t) *
+                    exp(-max(water.waterSurfaceY - world.y, 0.0f) * 0.03f) * exp(-dist * 0.03f);
     float3 causticGlow = water.sunColor * caustic * upFacing * submerged * throughSurface * sunUp *
                          water.skyExposure * 0.9f;
 

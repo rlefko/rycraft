@@ -286,6 +286,8 @@ private:
     // Eased sky exposure of the camera's water column (see render()); 0 in
     // sealed aquifers and under roofed water where sunlight cannot reach.
     float _uwSkyExposure = 1.0f;
+    // World Y of the surface of the water body the camera is in (see render()).
+    float _uwSurfaceY = 0.0f;
 
     // Frame animation clock driving water waves, caustics, and foliage sway in
     // the scene AND shadow passes — one value per frame so the two can never

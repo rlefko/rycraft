@@ -591,6 +591,17 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
             if (surface.has_value() && static_cast<double>(*surface) > camPos.y) {
                 target = 0.0f;
             }
+            // Scan up for the top of the water body the camera is in: upward
+            // rays exit the water there, so murk and caustics must stop at
+            // that height instead of fogging out to the opaque depth behind
+            // the from-below surface. 0.875 is the rendered surface plane.
+            const int64_t bx = static_cast<int64_t>(std::floor(camPos.x));
+            const int64_t bz = static_cast<int64_t>(std::floor(camPos.z));
+            int32_t top = static_cast<int32_t>(std::floor(camPos.y));
+            while (world.getBlockIfLoaded(bx, top + 1, bz) == BlockType::WATER) {
+                ++top;
+            }
+            _uwSurfaceY = static_cast<float>(top) + 0.875f;
         }
         _uwSkyExposure += (target - _uwSkyExposure) * 0.1f;
     }
@@ -2011,6 +2022,7 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     // pre-SSR look (also the RYCRAFT_SSR=0 / setting-off path).
     wu.ssrStrength = _gfx.waterReflections ? 1.0f : 0.0f;
     wu.skyExposure = _uwSkyExposure;
+    wu.waterSurfaceY = _uwSurfaceY;
     FrameRing::Alloc waterAlloc = _frameRing.push(&wu, sizeof(WaterUniforms));
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];

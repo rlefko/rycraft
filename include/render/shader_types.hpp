@@ -214,6 +214,10 @@ struct WaterUniforms {
                             // column (aquifers, roofed lakes): no sunlight
                             // reaches covered water, so caustics and the
                             // sun-driven murk must go dark, not track the sun
+    float waterSurfaceY;    // world Y of the surface of the water body the
+                            // camera is in: upward rays leave the water there,
+                            // so murk and caustics must stop at that exit
+                            // instead of fogging out to the opaque depth
 };
 
 // Atmospheric sky, bound at buffer(1) in sky.metal. The fragment shader
@@ -393,6 +397,7 @@ static_assert(offsetof(Uniforms, wetness) == 296);
 
 static_assert(sizeof(WaterUniforms) == 256);
 static_assert(offsetof(WaterUniforms, skyExposure) == 248);
+static_assert(offsetof(WaterUniforms, waterSurfaceY) == 252);
 static_assert(offsetof(WaterUniforms, cameraRelativeViewProjection) == 64);
 static_assert(offsetof(WaterUniforms, zenithColor) == 128);
 static_assert(offsetof(WaterUniforms, resolution) == 224);
