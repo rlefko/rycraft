@@ -3,11 +3,11 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// Deterministic randomness — the single source for seeded hashing and PRNG.
+// Deterministic hashing and serial visual-effect randomness.
 //
-// Everything random in a world must derive from the world seed so the same
-// seed always produces the same world (the engine previously mixed six
-// ad-hoc schemes, including std::random_device weather in a seeded game).
+// Coordinate-addressed generation and wild spawning use CounterRng instead,
+// so query order and worker scheduling cannot advance mutable state. Hashing,
+// seed derivation, and serial particle effects use the helpers below.
 // ---------------------------------------------------------------------------
 
 // splitmix64 finalizer — fast 64-bit hash with full avalanche.
@@ -16,13 +16,6 @@ constexpr uint64_t hash64(uint64_t x) {
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
     return x ^ (x >> 31);
-}
-
-// Deterministic per-coordinate hash for world generation decisions.
-constexpr uint64_t hashCoords(int32_t x, int32_t z, uint32_t seed) {
-    uint64_t packed = (static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32) |
-                      static_cast<uint64_t>(static_cast<uint32_t>(z));
-    return hash64(packed ^ (static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ULL));
 }
 
 // Small deterministic PRNG (splitmix64 stream). Cheap to construct, cheap to
