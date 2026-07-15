@@ -6,7 +6,7 @@ using namespace metal;
 // Final composite — the one linear-HDR → display conversion.
 //
 // Samples the HDR scene and the (half-res) bloom pyramid, then applies:
-//   exposure → bloom add → Uchimura tonemap → vibrance grade →
+//   exposure → bloom add → Hable filmic tonemap → vibrance grade →
 //   optional CAS sharpen → dither → BGRA8 drawable.
 //
 // This pass ALWAYS runs — with bloom disabled the renderer binds a 4×4
@@ -29,34 +29,25 @@ vertex PostVertexOut postCompositeVertex(uint vertexID [[vertex_id]]) {
     return out;
 }
 
-// Uchimura 2017 "Gran Turismo" tonemap: a linear section through the mids
-// (the vibrant look keeps its saturation there), smooth toe and shoulder.
-// P = 1 (display max), a = 1 (linear slope), m = 0.22 (linear start),
-// l = 0.30 (linear length), c = 1.33 (black tightness), b = 0.
-static float uchimura(float x) {
-    // l = 0.30 starts the shoulder earlier than the stock 0.4, compressing
-    // more highlight range below display max so the sun disc keeps its limb
-    // gradient instead of plateauing flat white.
-    constexpr float P = 1.0f, a = 1.0f, m = 0.22f, l = 0.30f, c = 1.33f, b = 0.0f;
-    const float l0 = ((P - m) * l) / a;
-    const float S0 = m + l0;
-    const float S1 = m + a * l0;
-    const float C2 = (a * P) / (P - S1);
-    const float CP = -C2 / P;
-
-    float w0 = 1.0f - smoothstep(0.0f, m, x);
-    float w2 = step(m + l0, x);
-    float w1 = 1.0f - w0 - w2;
-
-    float T = m * pow(x / m, c) + b;             // toe
-    float L = m + a * (x - m);                   // linear
-    float S = P - (P - S1) * exp(CP * (x - S0)); // shoulder
-
-    return T * w0 + L * w1 + S * w2;
+// Hable "Uncharted 2" filmic tonemap: a strong shoulder that keeps rolling
+// far past display max (a 12x HDR sun still lands on a gradient, where the
+// previous Uchimura shoulder plateaued to flat white within a few stops) and
+// a filmic toe that holds blacks down so dark scenes need less exposure lift.
+// Standard constants; W is the linear white point the curve normalizes to.
+static float hableCurve(float x) {
+    constexpr float A = 0.15f; // shoulder strength
+    constexpr float B = 0.50f; // linear strength
+    constexpr float C = 0.10f; // linear angle
+    constexpr float D = 0.20f; // toe strength
+    constexpr float E = 0.02f; // toe numerator
+    constexpr float F = 0.30f; // toe denominator
+    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
 }
 
-static float3 uchimura3(float3 x) {
-    return float3(uchimura(x.r), uchimura(x.g), uchimura(x.b));
+static float3 filmic3(float3 x) {
+    constexpr float W = 11.2f; // linear white point
+    const float whiteScale = 1.0f / hableCurve(W);
+    return float3(hableCurve(x.r), hableCurve(x.g), hableCurve(x.b)) * whiteScale;
 }
 
 // Rec.709 luminance — the shared luma everywhere in the post stack.
@@ -81,7 +72,9 @@ static float3 displayColor(texture2d<float> scene, texture2d<float> bloom, sampl
     float3 hdr = scene.sample(s, uv).rgb;
     hdr += bloom.sample(s, uv).rgb * post.bloomIntensity;
     hdr *= exposure * post.exposure;
-    float3 mapped = uchimura3(max(hdr, 0.0f));
+    // The filmic curve maps ~2x brighter input to the same display value as
+    // the old curve's mids, so a fixed gain keeps daylight where it was.
+    float3 mapped = filmic3(max(hdr, 0.0f) * 2.0f);
     return applyVibrance(mapped, post.vibrance - 1.0f);
 }
 
