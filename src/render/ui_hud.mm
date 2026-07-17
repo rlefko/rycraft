@@ -88,18 +88,18 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
 
     // ---- Hotbar (9 slots at bottom of screen) ----
     const int slotCount = static_cast<int>(frame.hotbar.slots.size());
-    float slotSize = 48.0f / h;
+    float slotSize = 58.0f / h;
     float slotGap = 2.0f / h;
-    float hotbarY = 6.0f / h;
+    float hotbarY = 8.0f / h;
     float totalWidth = slotCount * slotSize + (slotCount - 1) * slotGap;
     float hotbarX = (1.0f - totalWidth) * 0.5f;
 
     // ---- Survival stat rows (hearts, hunger, air) above the hotbar ----
     if (frame.mode == GameMode::SURVIVAL && frame.screen == GameScreen::PLAYING) {
-        // scale = device pixels per 8x8 bitmap pixel (an ~18px icon at 2x).
-        const float iconScale = 2.25f * (h / 768.0f);
+        // scale = device pixels per 8x8 bitmap pixel (an ~14px icon at 2x).
+        const float iconScale = 1.75f * (h / 768.0f);
         const float pitch = 9.0f * iconScale / w;
-        const float heartsY = hotbarY + slotSize + 10.0f / h;
+        const float heartsY = hotbarY + slotSize + 8.0f / h;
         drawStatRow(ui, HEART_ICON, frame.health, 10, hotbarX, heartsY, iconScale, w, h, 0.85f,
                     0.12f, 0.12f);
         const float hungerStartX = hotbarX + totalWidth - 10 * pitch;
