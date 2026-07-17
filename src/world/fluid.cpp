@@ -113,7 +113,11 @@ bool acceptsHorizontalWater(const FluidCell& cell, FluidState candidate) {
     if (!cell.isWater() || cell.state.isSource()) {
         return false;
     }
-    return cell.state.isFalling() || cell.state.level() > candidate.level();
+    // A supported falling column already has a stronger vertical feed than
+    // horizontal runoff. Replacing it with a side-flow level makes adjacent
+    // waterfall lanes repeatedly rewrite one another at the receiving pool.
+    if (cell.state.isFalling()) return false;
+    return cell.state.level() > candidate.level();
 }
 
 bool positionLess(const FluidPos& left, const FluidPos& right) {
@@ -321,6 +325,14 @@ FluidRuleResult evaluateWaterRules(const FluidNeighborhood& cells) noexcept {
         if (!cells.down.isWater() || cells.down.state != downward) {
             appendSet(result, FluidDirection::DOWN, downward);
         }
+        return result;
+    }
+
+    // A falling column remains vertical until it reaches solid ground. A
+    // source receiver already supplies the landing pool, so spreading from
+    // the falling cell itself would create a second, artificial horizontal
+    // origin around every generated waterfall.
+    if (effective.state.isFalling() && cells.down.isWater()) {
         return result;
     }
 
