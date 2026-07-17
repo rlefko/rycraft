@@ -378,6 +378,9 @@ struct EngineState {
     std::vector<float> sfxHurt;
     std::vector<float> sfxEat;
     std::vector<float> sfxDeath;
+    std::vector<float> sfxClick;
+    std::vector<float> sfxPickup;
+    std::vector<float> sfxFurnacePop;
     std::array<std::vector<float>, ENTITY_TYPE_COUNT> sfxAnimal;
     int32_t windVoice = -1;
     float footstepDistance = 0.f; // ground distance walked since last step
@@ -831,6 +834,9 @@ static std::string defaultWorldDirectory() {
         _state->sfxHurt = SoundEffect::generateHurt();
         _state->sfxEat = SoundEffect::generateEat();
         _state->sfxDeath = SoundEffect::generateDeath();
+        _state->sfxClick = SoundEffect::generateClick();
+        _state->sfxPickup = SoundEffect::generatePickup();
+        _state->sfxFurnacePop = SoundEffect::generateFurnacePop();
         for (size_t index = 0; index < ENTITY_TYPE_COUNT; ++index) {
             _state->sfxAnimal[index] =
                 SoundEffect::generateAnimalCall(static_cast<EntityType>(index));
@@ -962,19 +968,35 @@ static std::string defaultWorldDirectory() {
     if (!state->audio)
         return;
 
+    // Master volume follows the slider at all times so GUI clicks are audible
+    // in menus. The "paused world = paused soundscape" feel is kept by
+    // stopping the wind bed off the playing screen; frozen ticks produce no
+    // world one-shots anyway.
     const bool playing = state->flow.screen == GameScreen::PLAYING;
     float volume = static_cast<float>(state->settings.volumeLevel) / 10.0f;
-    state->audio->setMasterVolume(playing ? volume : 0.0f);
+    state->audio->setMasterVolume(volume);
 
     if (playing && state->windVoice < 0 && !state->sfxWind.empty()) {
         state->windVoice = state->audio->playSound(state->sfxWind, SoundEffect::SAMPLE_RATE, 0.18f,
                                                    /*looping=*/true);
+    } else if (!playing && state->windVoice >= 0) {
+        state->audio->stopVoice(state->windVoice);
+        state->windVoice = -1;
     }
 }
 
 - (void)playSfx:(const std::vector<float>&)buffer gain:(float)gain {
     EngineState* state = _state.get();
     if (!state->audio || state->flow.screen != GameScreen::PLAYING)
+        return;
+    state->audio->playSound(buffer, SoundEffect::SAMPLE_RATE, gain);
+}
+
+// Interface sounds bypass the playing-screen gate so buttons and slot clicks
+// respond on every menu screen.
+- (void)playUiSfx:(const std::vector<float>&)buffer gain:(float)gain {
+    EngineState* state = _state.get();
+    if (!state->audio)
         return;
     state->audio->playSound(buffer, SoundEffect::SAMPLE_RATE, gain);
 }
@@ -1136,7 +1158,7 @@ static std::string defaultWorldDirectory() {
             state->world->setBlock(pos.x, pos.y, pos.z,
                                    furnace.lit() ? BlockType::FURNACE_LIT : BlockType::FURNACE);
             if (furnace.lit()) {
-                [self playSfx:state->sfxBlockPlace gain:0.3f];
+                [self playSfx:state->sfxFurnacePop gain:0.4f];
             }
         }
     }
@@ -1280,7 +1302,7 @@ static std::string defaultWorldDirectory() {
     if (pickedUp) {
         state->itemEntities.compact();
         if (state->pickupSoundCooldown == 0) {
-            [self playSfx:state->sfxBlockPlace gain:0.35f];
+            [self playSfx:state->sfxPickup gain:0.4f];
             state->pickupSoundCooldown = 2;
         }
     }
@@ -1592,7 +1614,11 @@ static std::string defaultWorldDirectory() {
                                        : input.isDown(Key::LeftShift) ? SlotClickKind::SHIFT_LEFT
                                                                       : SlotClickKind::LEFT;
             SlotAccess access = [self slotAccessForScreen];
-            applySlotClick(access, state->cursorStack, slotWidget.ref, kind);
+            const SlotClickOutcome outcome =
+                applySlotClick(access, state->cursorStack, slotWidget.ref, kind);
+            if (outcome.changed) {
+                [self playUiSfx:state->sfxClick gain:0.3f];
+            }
         }
 
         if (input.isJustPressed(Key::MouseLeft)) {
@@ -1601,12 +1627,14 @@ static std::string defaultWorldDirectory() {
                 state->worldCreate.focusedField = hit.index;
                 input.beginTextEntry(hit.index == 0 ? state->worldCreate.name
                                                     : state->worldCreate.seedText);
+                [self playUiSfx:state->sfxClick gain:0.3f];
             } else {
                 [self commitTextEntry];
             }
             if (hit.kind == UIHitKind::BUTTON) {
                 const MenuButton& button =
                     state->menuLayout.buttons[static_cast<size_t>(hit.index)];
+                [self playUiSfx:state->sfxClick gain:0.3f];
                 [self handleMenuAction:button.action payload:button.payload];
             }
         }

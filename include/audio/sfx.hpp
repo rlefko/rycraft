@@ -31,6 +31,11 @@ public:
     static std::vector<float> generateEat();
     static std::vector<float> generateDeath();
 
+    // Interface and world feedback: GUI clicks, item pickup, smelt completion.
+    static std::vector<float> generateClick();
+    static std::vector<float> generatePickup();
+    static std::vector<float> generateFurnacePop();
+
     // Movement sounds
     static std::vector<float> generateFootstep();
 

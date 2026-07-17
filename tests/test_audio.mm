@@ -8,8 +8,8 @@
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
 #include <engine/game_state.hpp>
-#include <engine/inventory.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -271,5 +271,20 @@ TEST_CASE("SFX: deterministic output for same parameters", "[phase8][sfx]") {
     REQUIRE(samples1a.size() == samples1b.size());
     for (size_t i = 0; i < samples1a.size(); ++i) {
         REQUIRE(samples1a[i] == samples1b[i]);
+    }
+}
+
+TEST_CASE("SFX: survival and interface sounds are non-empty and in range", "[phase8][sfx]") {
+    const std::vector<std::vector<float>> buffers = {
+        SoundEffect::generateHurt(),   SoundEffect::generateEat(),
+        SoundEffect::generateDeath(),  SoundEffect::generateClick(),
+        SoundEffect::generatePickup(), SoundEffect::generateFurnacePop(),
+    };
+    for (const auto& samples : buffers) {
+        REQUIRE_FALSE(samples.empty());
+        for (float s : samples) {
+            REQUIRE(s >= -1.0f);
+            REQUIRE(s <= 1.0f);
+        }
     }
 }

@@ -163,6 +163,47 @@ std::vector<float> SoundEffect::generateDeath() {
 }
 
 // ---------------------------------------------------------------------------
+// Click: a short bright tick for GUI buttons and slots (1.2kHz, 8ms)
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generateClick() {
+    uint32_t duration = static_cast<uint32_t>(0.008f * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    for (uint32_t i = 0; i < duration; ++i) {
+        float tone = sinOscillator(i, SAMPLE_RATE, 1200.0f) * 0.5f;
+        samples[i] = tone * adsrEnvelope(i, duration, 0.001f, 0.003f, 0.0f, 0.004f);
+    }
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Pickup: a quick rising pop when an item enters the inventory (600→1200Hz)
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generatePickup() {
+    uint32_t duration = static_cast<uint32_t>(0.08f * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    for (uint32_t i = 0; i < duration; ++i) {
+        float sweep = frequencySweep(i, SAMPLE_RATE, 600.0f, 1200.0f, duration) * 0.4f;
+        samples[i] = sweep * adsrEnvelope(i, duration, 0.003f, 0.03f, 0.2f, 0.04f);
+    }
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Furnace pop: a brief crackle when an item finishes smelting (0.12s)
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generateFurnacePop() {
+    uint32_t duration = static_cast<uint32_t>(0.12f * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    float filterState = 0.0f;
+    for (uint32_t i = 0; i < duration; ++i) {
+        float noise = randomNoise(313, i) * 0.5f;
+        float low = lowPassFilter(noise, &filterState, 600.0f, SAMPLE_RATE);
+        samples[i] = low * adsrEnvelope(i, duration, 0.002f, 0.04f, 0.1f, 0.07f);
+    }
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
 // Block place: noise burst with frequency sweep (800→200Hz, 0.08s)
 // ---------------------------------------------------------------------------
 std::vector<float> SoundEffect::generateBlockPlace() {
