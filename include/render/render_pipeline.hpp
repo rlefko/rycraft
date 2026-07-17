@@ -428,7 +428,7 @@ private:
 
     void renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const World& world,
                           const Vec3& cameraPosition, const float fogColor[3]);
-    void resetFarTerrain(uint64_t worldSeed);
+    void resetFarTerrain(uint64_t worldSeed, GenerationSettings generation = {});
     void setExactSectionOwned(ChunkPos position, bool owned);
     void clearExactSectionOwnership();
 

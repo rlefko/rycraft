@@ -8,6 +8,7 @@
 #include "world/ores.hpp"
 #include "world/structures.hpp"
 #include "world/surface_material.hpp"
+#include "world/world_config.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -89,7 +90,10 @@ struct GenScratch {
 
 class ChunkGenerator {
 public:
-    explicit ChunkGenerator(uint32_t worldSeed);
+    // Default settings generate byte-identical output to the settings-free
+    // form; the structures toggle is the only knob that reaches the
+    // generator.
+    explicit ChunkGenerator(uint32_t worldSeed, GenerationSettings generation = {});
 
     void generate(Chunk& chunk) const;
     void generateCube(Chunk& chunk) const { generate(chunk); }

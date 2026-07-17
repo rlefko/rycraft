@@ -116,11 +116,17 @@ struct ChunkWriter {
 
 } // namespace
 
-StructurePlacer::StructurePlacer(uint32_t worldSeed) : random_(worldSeed) {}
+StructurePlacer::StructurePlacer(uint32_t worldSeed, bool enabled)
+    : random_(worldSeed)
+    , enabled_(enabled) {}
 
 const StructurePlacement& StructurePlacer::regionPlacement(int64_t regionX, int64_t regionZ,
                                                            const ChunkGenerator& gen,
                                                            GenScratch& scratch) const {
+    if (!enabled_) {
+        static const StructurePlacement DISABLED{};
+        return DISABLED;
+    }
     const ColumnPos key{regionX, regionZ};
     auto it = scratch.structurePlacements.find(key);
     if (it != scratch.structurePlacements.end()) return it->second;
@@ -157,6 +163,7 @@ const StructurePlacement& StructurePlacer::regionPlacement(int64_t regionX, int6
 
 bool StructurePlacer::insideStructure(int64_t x, int64_t z, int64_t chunkX, int64_t chunkZ,
                                       int margin) const {
+    if (!enabled_) return false;
     int64_t minRegionX = floorDiv(chunkX - 1, STRUCTURE_REGION_CHUNKS);
     int64_t maxRegionX = floorDiv(chunkX + 1, STRUCTURE_REGION_CHUNKS);
     int64_t minRegionZ = floorDiv(chunkZ - 1, STRUCTURE_REGION_CHUNKS);
@@ -179,6 +186,7 @@ bool StructurePlacer::insideStructure(int64_t x, int64_t z, int64_t chunkX, int6
 }
 
 void StructurePlacer::place(Chunk& chunk, const ChunkGenerator& gen, GenScratch& scratch) const {
+    if (!enabled_) return;
     ChunkWriter out{chunk, chunk.chunkX * CHUNK_WIDTH, chunk.chunkY * CHUNK_HEIGHT,
                     chunk.chunkZ * CHUNK_DEPTH};
 

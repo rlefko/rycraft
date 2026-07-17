@@ -486,10 +486,13 @@ static EngineState* _engineGetState(Engine* engine) {
         if (const char* debugEnv = std::getenv("RYCRAFT_SHOW_DEBUG")) {
             _state->showDebugHud = *debugEnv != '\0' && std::strcmp(debugEnv, "0") != 0;
         }
-        _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
+        _state->world = std::make_shared<World>(seed, _state->settings.viewDistance,
+                                                MAX_LOADED_CUBES, _state->generation);
         // Chunks load from disk before regenerating, so block edits persist
         _state->world->setSaveManager(_state->saveManager.get());
-        _state->spawner = std::make_unique<Spawner>(*_state->world);
+        if (_state->generation.fauna) {
+            _state->spawner = std::make_unique<Spawner>(*_state->world);
+        }
         _state->player.position = playerPos;
     }
     return self;
@@ -1091,7 +1094,7 @@ static EngineState* _engineGetState(Engine* engine) {
         const char* f = std::getenv("RYCRAFT_TIME_FREEZE");
         return f && *f && std::strcmp(f, "0") != 0;
     }();
-    if (!freezeTime) {
+    if (!freezeTime && state->generation.dayCycle) {
         state->worldTime++;
     }
 
@@ -1339,8 +1342,8 @@ static EngineState* _engineGetState(Engine* engine) {
         uint32_t tod = static_cast<uint32_t>(state->worldTime % EngineState::TICKS_PER_DAY);
         uint32_t start = 3000u + static_cast<uint32_t>((h >> 8) % 12000u);
         uint32_t length = 2000u + static_cast<uint32_t>((h >> 4) % 4000u);
-        state->raining =
-            (h % 100u) < EngineState::RAIN_DAYS_PERCENT && tod >= start && tod < start + length;
+        state->raining = state->generation.weather && (h % 100u) < EngineState::RAIN_DAYS_PERCENT &&
+                         tod >= start && tod < start + length;
         static const char* weatherEnv = std::getenv("RYCRAFT_WEATHER");
         if (weatherEnv) {
             // Playtest override skips the soak ramp so captures are stable.

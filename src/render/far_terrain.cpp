@@ -4106,8 +4106,9 @@ FarTerrainScheduler::FarTerrainScheduler(FarTerrainSource source, FarTerrainSche
     }
 }
 
-FarTerrainScheduler::FarTerrainScheduler(uint64_t worldSeed, FarTerrainSchedulerLimits limits)
-    : generator_(std::make_shared<ChunkGenerator>(static_cast<uint32_t>(worldSeed)))
+FarTerrainScheduler::FarTerrainScheduler(uint64_t worldSeed, FarTerrainSchedulerLimits limits,
+                                         GenerationSettings generation)
+    : generator_(std::make_shared<ChunkGenerator>(static_cast<uint32_t>(worldSeed), generation))
     , source_(FarTerrainMesher::generatorGeometrySource(generator_))
     , limits_(limits) {
     validateLimits(limits_);

@@ -1162,7 +1162,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
 
     // Reset seed-owned far state before exact ownership is accumulated. The
     // second call in renderFarTerrain is then an inexpensive no-op.
-    resetFarTerrain(world.getSeed());
+    resetFarTerrain(world.getSeed(), world.getGenerationSettings());
 
     // Water draws recorded here render later, in the dedicated water pass
     _waterDraws.clear();
@@ -1673,7 +1673,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     _chunkStats.meshDroppedStaleCount = meshStats.droppedStale;
 }
 
-void RenderPipeline::resetFarTerrain(uint64_t worldSeed) {
+void RenderPipeline::resetFarTerrain(uint64_t worldSeed, GenerationSettings generation) {
     if (_farTerrainSeed && *_farTerrainSeed == worldSeed && _farTerrainScheduler)
         return;
 
@@ -1713,7 +1713,8 @@ void RenderPipeline::resetFarTerrain(uint64_t worldSeed) {
             _device, FAR_VERTEX_BUFFER_BYTES, FAR_INDEX_BUFFER_BYTES, FAR_VERTEX_BUFFER_SLAB_BYTES,
             FAR_INDEX_BUFFER_SLAB_BYTES);
     }
-    _farTerrainScheduler = std::make_unique<FarTerrainScheduler>(worldSeed);
+    _farTerrainScheduler =
+        std::make_unique<FarTerrainScheduler>(worldSeed, FarTerrainSchedulerLimits{}, generation);
     _farTerrainSeed = worldSeed;
     _farTerrainMeshes.reserve(8192);
     _farTerrainWanted.reserve(8192);
@@ -1752,7 +1753,7 @@ void RenderPipeline::clearExactSectionOwnership() {
 
 void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const World& world,
                                       const Vec3& cameraPosition, const float fogColor[3]) {
-    resetFarTerrain(world.getSeed());
+    resetFarTerrain(world.getSeed(), world.getGenerationSettings());
     _farMegaBuffer->drainDeferredFrees(_frameRing.completedFrame());
     _farTerrainActiveTiles.clear();
     _farTerrainCandidates.clear();

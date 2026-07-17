@@ -99,6 +99,9 @@ std::optional<std::string> createWorld(const std::string& name, uint32_t seed, G
     if (mode == GameMode::SURVIVAL) {
         metadata.player.inventory.fill(ItemStack{});
     }
+    if (!generation.dayCycle) {
+        metadata.worldTime = 6000; // frozen clocks read noon, not midnight
+    }
 
     SaveManager saves(directory.string());
     if (!saves.saveMetadata(metadata)) {

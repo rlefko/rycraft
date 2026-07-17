@@ -2260,3 +2260,56 @@ TEST_CASE("LightEngine: block light is derived, never serialized", "[world][ligh
     LightEngine::computeSelfLight(*restored);
     REQUIRE(restored->getBlockLight(9, 8, 8) == 14);
 }
+
+TEST_CASE("Default generation settings produce byte-identical cubes", "[worldgen][settings]") {
+    ChunkGenerator legacy(42);
+    ChunkGenerator configured(42, GenerationSettings{});
+    // Surface, underground, and structure-region fixtures around spawn.
+    constexpr std::array<ChunkPos, 5> POSITIONS = {
+        ChunkPos{0, 6, 0},  ChunkPos{3, 5, -2}, ChunkPos{-4, 4, 7},
+        ChunkPos{12, 6, 9}, ChunkPos{1, -2, 1},
+    };
+    for (ChunkPos position : POSITIONS) {
+        Chunk fromLegacy(position);
+        legacy.generate(fromLegacy);
+        Chunk fromConfigured(position);
+        configured.generate(fromConfigured);
+        REQUIRE(ChunkSerializer::serialize(fromLegacy) ==
+                ChunkSerializer::serialize(fromConfigured));
+    }
+}
+
+TEST_CASE("Disabled structures reserve no footprints", "[worldgen][settings][structures]") {
+    StructurePlacer enabled(42);
+    StructurePlacer disabled(42, false);
+
+    // The enabled placer reserves at least one candidate footprint in a wide
+    // scan; the disabled placer must reserve none anywhere.
+    bool foundReserved = false;
+    for (int64_t chunkX = -48; chunkX <= 48 && !foundReserved; ++chunkX) {
+        for (int64_t chunkZ = -48; chunkZ <= 48 && !foundReserved; ++chunkZ) {
+            const int64_t x = chunkX * CHUNK_WIDTH + 8;
+            const int64_t z = chunkZ * CHUNK_DEPTH + 8;
+            if (enabled.insideStructure(x, z, chunkX, chunkZ, 2)) {
+                foundReserved = true;
+                REQUIRE_FALSE(disabled.insideStructure(x, z, chunkX, chunkZ, 2));
+            }
+        }
+    }
+    REQUIRE(foundReserved);
+
+    // Disabled placement is invalid for every region.
+    ChunkGenerator generator(42, GenerationSettings{.structures = false});
+    GenScratch scratch;
+    REQUIRE_FALSE(disabled.regionPlacement(0, 0, generator, scratch).valid);
+    REQUIRE_FALSE(disabled.regionPlacement(-3, 7, generator, scratch).valid);
+}
+
+TEST_CASE("World carries its generation settings", "[world][settings]") {
+    const GenerationSettings settings{
+        .structures = false, .fauna = false, .weather = true, .dayCycle = false};
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS, 64, settings);
+    REQUIRE(world.getGenerationSettings() == settings);
+    World defaults(42, MIN_RENDER_DISTANCE_CHUNKS, 64);
+    REQUIRE(defaults.getGenerationSettings() == GenerationSettings{});
+}
