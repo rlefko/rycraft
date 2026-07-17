@@ -14,6 +14,7 @@
 #include <engine/inventory.hpp>
 #include <engine/mining.hpp>
 #include <engine/slot_interaction.hpp>
+#include <engine/survival.hpp>
 #include <entity/ai.hpp>
 #include <entity/item_entity.hpp>
 #include <entity/player.hpp>
@@ -318,7 +319,10 @@ struct EngineState {
     GenerationSettings generation;
     uint64_t worldCreatedMs = 0;
     Vec3 worldSpawn{0.f, 100.f, 0.f}; // respawn anchor, distinct from playerPos
-    int hunger = 20;
+    SurvivalStats survival;
+    EatingState eatingState;
+    std::string deathMessage;
+    int hurtSoundCooldown = 0;
     FurnaceMap furnaces;
     std::optional<BlockPos> openFurnace; // the furnace the FURNACE screen edits
     ItemEntityManager itemEntities;
@@ -370,6 +374,9 @@ struct EngineState {
     std::vector<float> sfxBlockPlace;
     std::vector<float> sfxFootstep;
     std::vector<float> sfxWind;
+    std::vector<float> sfxHurt;
+    std::vector<float> sfxEat;
+    std::vector<float> sfxDeath;
     std::array<std::vector<float>, ENTITY_TYPE_COUNT> sfxAnimal;
     int32_t windVoice = -1;
     float footstepDistance = 0.f; // ground distance walked since last step
@@ -539,7 +546,8 @@ static std::string defaultWorldDirectory() {
     state->player.pitch = playerMeta.pitch;
     state->player.health = playerMeta.health;
     state->camera.setLook(playerMeta.yaw, playerMeta.pitch);
-    state->hunger = playerMeta.hunger;
+    state->survival = SurvivalStats{};
+    state->survival.food = playerMeta.hunger;
     state->inventory.clear();
     state->inventory.selectSlot(playerMeta.selectedSlot);
     for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
@@ -550,6 +558,8 @@ static std::string defaultWorldDirectory() {
     state->itemEntities.clear();
     state->pickupSoundCooldown = 0;
     state->miningState.reset();
+    state->eatingState.reset();
+    state->deathMessage.clear();
     state->craftGrid.fill(ItemStack{});
     state->craftResult.clear();
     state->cursorStack.clear();
@@ -594,7 +604,7 @@ static std::string defaultWorldDirectory() {
     worldMetadata.player.yaw = state->player.yaw;
     worldMetadata.player.pitch = state->player.pitch;
     worldMetadata.player.health = state->player.health;
-    worldMetadata.player.hunger = state->hunger;
+    worldMetadata.player.hunger = state->survival.food;
     worldMetadata.player.selectedSlot = state->inventory.getSelectedIndex();
     for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
         worldMetadata.player.inventory[slot] = state->inventory.getSlot(static_cast<int>(slot));
@@ -752,7 +762,7 @@ static std::string defaultWorldDirectory() {
     const bool wantsGameplayScreen = screenName == "playing" || screenName == "paused" ||
                                      screenName == "settings" || screenName == "video" ||
                                      screenName == "inventory" || screenName == "crafting" ||
-                                     screenName == "furnace";
+                                     screenName == "furnace" || screenName == "death";
     const bool menuScreenRequested = !screenName.empty() && !wantsGameplayScreen;
     const bool wantsWorld = wantsGameplayScreen ||
                             (!menuScreenRequested &&
@@ -790,6 +800,9 @@ static std::string defaultWorldDirectory() {
                 _state->flow.screen = GameScreen::INVENTORY;
             } else if (screenName == "crafting") {
                 _state->flow.screen = GameScreen::CRAFTING;
+            } else if (screenName == "death") {
+                _state->deathMessage = "YOU FELL";
+                _state->flow.screen = GameScreen::DEATH;
             } else if (screenName == "furnace") {
                 // A sample smelting job so the capture shows filled slots and
                 // an advancing cook arrow.
@@ -814,6 +827,9 @@ static std::string defaultWorldDirectory() {
         _state->sfxBlockPlace = SoundEffect::generateBlockPlace();
         _state->sfxFootstep = SoundEffect::generateFootstep();
         _state->sfxWind = SoundEffect::generateAmbientWind();
+        _state->sfxHurt = SoundEffect::generateHurt();
+        _state->sfxEat = SoundEffect::generateEat();
+        _state->sfxDeath = SoundEffect::generateDeath();
         for (size_t index = 0; index < ENTITY_TYPE_COUNT; ++index) {
             _state->sfxAnimal[index] =
                 SoundEffect::generateAnimalCall(static_cast<EntityType>(index));
@@ -1125,6 +1141,58 @@ static std::string defaultWorldDirectory() {
     }
 }
 
+// Apply damage in survival, playing a rate-limited hurt sound and recording
+// the cause for the death screen. Never drops health below zero.
+- (void)damagePlayer:(EngineState*)state amount:(int)amount message:(const char*)message {
+    if (amount <= 0 || !modeTakesDamage(state->gameMode))
+        return;
+    state->player.health = std::max(0, state->player.health - amount);
+    state->deathMessage = message;
+    if (state->hurtSoundCooldown == 0) {
+        [self playSfx:state->sfxHurt gain:0.7f];
+        state->hurtSoundCooldown = 10;
+    }
+}
+
+// Death: scatter the whole inventory as item entities, clear it, and freeze
+// the world on the death screen until the player respawns.
+- (void)killPlayer:(EngineState*)state {
+    const Vec3 at = state->player.position + Vec3{0.f, 0.5f, 0.f};
+    for (int slot = 0; slot < Inventory::SLOTS; ++slot) {
+        const ItemStack stack = state->inventory.getSlot(slot);
+        if (stack.empty())
+            continue;
+        const uint64_t h = hash64(static_cast<uint64_t>(slot) * 2654435761ull +
+                                  static_cast<uint64_t>(state->frameCount));
+        const float vx = (static_cast<float>(h & 0xFF) / 255.f - 0.5f) * 0.4f;
+        const float vz = (static_cast<float>((h >> 8) & 0xFF) / 255.f - 0.5f) * 0.4f;
+        state->itemEntities.spawn(stack, at, Vec3{vx, 0.25f, vz}, 20);
+    }
+    state->inventory.clear();
+    state->cursorStack.clear();
+    state->miningState.reset();
+    state->eatingState.reset();
+    if (state->deathMessage.empty()) {
+        state->deathMessage = "YOU DIED";
+    }
+    [self playSfx:state->sfxDeath gain:0.8f];
+    [self applyFlowEffects:state->flow.onPlayerDied()];
+}
+
+// Respawn at the world's creation-time spawn anchor with reset stats. The
+// unstick pass places the player on solid ground next tick.
+- (void)respawnPlayer:(EngineState*)state {
+    state->player.position = state->worldSpawn;
+    state->player.velocity = Vec3{0.f, 0.f, 0.f};
+    state->player.health = 20;
+    state->player.flying = false;
+    state->player.resetFallDistance();
+    state->survival = SurvivalStats{};
+    state->deathMessage.clear();
+    state->spawnValidated = false;
+    [self applyFlowEffects:state->flow.onRespawn()];
+}
+
 // Dropped-item physics and the pickup pass. The manager owns physics/merge/
 // despawn; the inventory mutation lives here so the entity module never
 // depends on the engine's Inventory.
@@ -1328,6 +1396,9 @@ static std::string defaultWorldDirectory() {
             state->gameMode =
                 state->gameMode == GameMode::CREATIVE ? GameMode::SURVIVAL : GameMode::CREATIVE;
             return;
+        case MenuAction::RESPAWN:
+            [self respawnPlayer:state];
+            return;
         case MenuAction::SAVE_QUIT_TO_TITLE:
             [self stopWorld];
             return;
@@ -1407,6 +1478,7 @@ static std::string defaultWorldDirectory() {
         menuCtx.gfx = &state->gfx;
         menuCtx.mode = state->gameMode;
         menuCtx.caretVisible = (state->frameCount / 30) % 2 == 0;
+        menuCtx.deathMessage = state->deathMessage;
         if (state->flow.screen == GameScreen::WORLD_SELECT ||
             state->flow.screen == GameScreen::WORLD_DELETE_CONFIRM) {
             menuCtx.worldRows.reserve(state->worldList.size());
@@ -1776,8 +1848,27 @@ static std::string defaultWorldDirectory() {
     playerInput.doubleTapJump = input.isDoubleTappedForTick(bindings.jump.key);
     playerInput.allowFlight = modeAllowsFlight(state->gameMode);
     playerInput.takesFallDamage = modeTakesDamage(state->gameMode);
+    // Low food disables sprinting in survival.
+    if (modeDrainsHunger(state->gameMode) &&
+        state->survival.food <= SurvivalStats::SPRINT_DISABLE_FOOD) {
+        playerInput.sprintHeld = false;
+        playerInput.doubleTapForward = false;
+    }
+    const bool jumpedThisTick = playerInput.jumpPressed && state->player.onGround;
     const Vec3 playerPositionBeforeMove = state->player.position;
+    const int healthBeforeMove = state->player.health;
     state->player.tick(*state->world, playerInput);
+    if (state->hurtSoundCooldown > 0)
+        --state->hurtSoundCooldown;
+    // Player::tick applies fall damage directly to health; catch it here for
+    // the hurt sound and the death-screen cause.
+    if (state->player.health < healthBeforeMove && modeTakesDamage(state->gameMode)) {
+        state->deathMessage = "YOU FELL";
+        if (state->hurtSoundCooldown == 0) {
+            [self playSfx:state->sfxHurt gain:0.7f];
+            state->hurtSoundCooldown = 10;
+        }
+    }
 
     // 5b. Footsteps: one thud roughly every two blocks walked on the ground
     if (state->audio) {
@@ -1792,6 +1883,32 @@ static std::string defaultWorldDirectory() {
             }
         } else {
             state->footstepDistance = 0.f;
+        }
+    }
+
+    // 5c. Survival stats: exhaustion, hunger, air, regen, starvation, and
+    // drowning. Creative freezes them all.
+    if (modeTakesDamage(state->gameMode)) {
+        const Vec3 eye = state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f};
+        const int64_t ex = static_cast<int64_t>(std::floor(eye.x));
+        const int32_t ey = static_cast<int32_t>(std::floor(eye.y));
+        const int64_t ez = static_cast<int64_t>(std::floor(eye.z));
+        const bool eyesUnderwater =
+            state->world->getBlockIfLoaded(ex, ey, ez) == BlockType::WATER &&
+            eye.y < static_cast<float>(ey) + state->world->getFluidHeightIfLoaded(ex, ey, ez);
+
+        SurvivalTickInputs inputs;
+        inputs.sprinting = state->player.sprinting && state->player.onGround;
+        inputs.swimming = state->player.swimming;
+        inputs.jumped = jumpedThisTick;
+        inputs.eyesUnderwater = eyesUnderwater;
+        const int delta = tickSurvivalStats(state->survival, inputs, state->player.health);
+        if (delta < 0) {
+            [self damagePlayer:state
+                        amount:-delta
+                       message:eyesUnderwater ? "YOU DROWNED" : "YOU STARVED"];
+        } else if (delta > 0) {
+            state->player.health = std::min(20, state->player.health + delta);
         }
     }
 
@@ -1942,36 +2059,55 @@ static std::string defaultWorldDirectory() {
         if (tickMining(state->miningState, input.mouseLeftDown, hasTarget, tx, ty, tz, targetBlock,
                        held)) {
             [self breakBlock:state hit:rayHit withDrops:YES];
+            state->survival.exhaustion += SurvivalStats::EXHAUST_MINE_BLOCK;
         }
     }
 
-    // Right click: an interactable block opens its screen (unless sneaking
-    // to place against it), otherwise place the held block.
-    if (input.isPressedForTick(Key::MouseRight)) {
+    // Right click precedence: open an interactable block, else eat held food,
+    // else place. Opening and placing are click edges; eating is held.
+    {
         InputBindings bindings;
-        bool opened = NO;
-        if (rayHit.has_value() && !input.isDown(bindings.sneak.key)) {
+        bool interactableTarget = NO;
+        if (input.isPressedForTick(Key::MouseRight) && rayHit.has_value() &&
+            !input.isDown(bindings.sneak.key)) {
             const int64_t bx = static_cast<int64_t>(std::floor(rayHit->first.x));
             const int32_t by = static_cast<int32_t>(std::floor(rayHit->first.y));
             const int64_t bz = static_cast<int64_t>(std::floor(rayHit->first.z));
             const std::optional<BlockType> block = state->world->findBlockIfLoaded(bx, by, bz);
             if (block && isInteractable(*block)) {
+                interactableTarget = YES;
                 if (*block == BlockType::CRAFTING_TABLE) {
                     state->craftGrid.fill(ItemStack{});
                     state->craftResult.clear();
                     [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::CRAFTING)];
-                    opened = YES;
                 } else {
                     const BlockPos pos{bx, by, bz};
                     state->openFurnace = pos;
                     state->furnaces.try_emplace(pos);
                     [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::FURNACE)];
-                    opened = YES;
                 }
             }
         }
-        if (!opened) {
-            [self placeBlock:state hit:rayHit];
+
+        const ItemStack selected = state->inventory.getSelectedStack();
+        const bool holdingFood = modeDrainsHunger(state->gameMode) && isFood(selected.type) &&
+                                 state->survival.food < SurvivalStats::MAX_FOOD;
+        if (!interactableTarget && holdingFood) {
+            if (tickEating(state->eatingState, input.mouseRightDown,
+                           state->inventory.getSelectedIndex(), true, state->survival.food)) {
+                const ItemDefinition def = itemDefinition(selected.type);
+                state->survival.food =
+                    std::min(SurvivalStats::MAX_FOOD, state->survival.food + def.foodValue);
+                state->survival.saturation = std::min(static_cast<float>(state->survival.food),
+                                                      state->survival.saturation + def.foodValue);
+                state->inventory.consumeSelected();
+                [self playSfx:state->sfxEat gain:0.6f];
+            }
+        } else {
+            state->eatingState.reset();
+            if (!interactableTarget && input.isPressedForTick(Key::MouseRight)) {
+                [self placeBlock:state hit:rayHit];
+            }
         }
     }
 
@@ -1997,6 +2133,12 @@ static std::string defaultWorldDirectory() {
     // Dropped items: physics, merge, despawn, then a pickup pass into the
     // inventory. Beyond the manager's active radius items freeze.
     [self tickItemEntities:state];
+
+    // Death: any survival damage that emptied the health bar ends the tick on
+    // the death screen with the inventory scattered.
+    if (modeTakesDamage(state->gameMode) && state->player.health <= 0) {
+        [self killPlayer:state];
+    }
 
     // Publish the immutable loaded-cube registry once per simulation tick.
     // Rendering reads this pointer without copying or taking the world lock.
@@ -2300,6 +2442,12 @@ static std::string defaultWorldDirectory() {
     uiFrame.hoveredSlot = state->hoveredSlot;
     uiFrame.cursorStack = state->cursorStack;
     uiFrame.miningProgress = state->miningState.active ? state->miningState.progress : 0.f;
+    uiFrame.mode = state->gameMode;
+    uiFrame.health = state->player.health;
+    uiFrame.food = state->survival.food;
+    uiFrame.air = state->survival.air;
+    uiFrame.maxAir = SurvivalStats::MAX_AIR;
+    uiFrame.deathMessage = state->deathMessage;
     if (state->inputManager && _view) {
         const Vec2 mouse = state->inputManager->state().mousePosition;
         const float boundsW = static_cast<float>(_view.bounds.size.width);

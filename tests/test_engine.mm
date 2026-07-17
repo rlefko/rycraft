@@ -12,6 +12,7 @@
 #include <engine/inventory.hpp>
 #include <engine/mining.hpp>
 #include <engine/slot_interaction.hpp>
+#include <engine/survival.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -1524,4 +1525,94 @@ TEST_CASE("Mining respects tool speed and never breaks bedrock", "[mining]") {
     // Instant-break flora completes the first settled tick.
     MiningState grass;
     REQUIRE(tickMining(grass, true, true, 0, 0, 0, BlockType::TALL_GRASS, ItemType::NONE));
+}
+
+TEST_CASE("Survival exhaustion spends saturation then food", "[survival]") {
+    SurvivalStats stats;
+    stats.saturation = 1.0f;
+    stats.food = 20;
+    // One EXHAUSTION_THRESHOLD of sprint exhaustion spends one saturation.
+    stats.exhaustion = SurvivalStats::EXHAUSTION_THRESHOLD;
+    SurvivalTickInputs idle;
+    tickSurvivalStats(stats, idle, 20);
+    REQUIRE(stats.saturation == Catch::Approx(0.0f));
+    REQUIRE(stats.food == 20);
+
+    // With saturation gone, the next threshold eats into food.
+    stats.exhaustion = SurvivalStats::EXHAUSTION_THRESHOLD;
+    tickSurvivalStats(stats, idle, 20);
+    REQUIRE(stats.food == 19);
+}
+
+TEST_CASE("Survival regenerates at high food and starves at empty", "[survival]") {
+    SurvivalStats regen;
+    regen.food = 20;
+    SurvivalTickInputs idle;
+    int delta = 0;
+    for (int tick = 0; tick < SurvivalStats::REGEN_INTERVAL; ++tick) {
+        delta = tickSurvivalStats(regen, idle, 15);
+    }
+    REQUIRE(delta == 1); // +1 hp after the regen interval
+
+    SurvivalStats starve;
+    starve.food = 0;
+    int applied = 0;
+    for (int tick = 0; tick < SurvivalStats::STARVE_INTERVAL; ++tick) {
+        applied = tickSurvivalStats(starve, idle, 10);
+    }
+    REQUIRE(applied == -1); // -1 hp after the starve interval
+
+    // Starvation never drops below the floor.
+    SurvivalStats floored;
+    floored.food = 0;
+    for (int tick = 0; tick < SurvivalStats::STARVE_INTERVAL; ++tick) {
+        REQUIRE(tickSurvivalStats(floored, idle, SurvivalStats::STARVE_HEALTH_FLOOR) == 0);
+    }
+}
+
+TEST_CASE("Survival drains air underwater and drowns when empty", "[survival]") {
+    SurvivalStats stats;
+    SurvivalTickInputs under;
+    under.eyesUnderwater = true;
+
+    for (int tick = 0; tick < SurvivalStats::MAX_AIR; ++tick) {
+        tickSurvivalStats(stats, under, 20);
+    }
+    REQUIRE(stats.air == 0);
+
+    // Out of air, drowning damage lands once per interval.
+    int worst = 0;
+    for (int tick = 0; tick < SurvivalStats::DROWN_DAMAGE_INTERVAL; ++tick) {
+        worst = std::min(worst, tickSurvivalStats(stats, under, 20));
+    }
+    REQUIRE(worst == -SurvivalStats::DROWN_DAMAGE);
+
+    // Surfacing refills air quickly.
+    SurvivalTickInputs surface;
+    tickSurvivalStats(stats, surface, 20);
+    REQUIRE(stats.air == SurvivalStats::AIR_REFILL_PER_TICK);
+}
+
+TEST_CASE("Eating requires a held right-click over time on the same slot", "[survival]") {
+    EatingState eating;
+    // Not holding, or full food, never progresses.
+    REQUIRE_FALSE(tickEating(eating, false, 0, true, 10));
+    REQUIRE_FALSE(tickEating(eating, true, 0, false, 10));
+    REQUIRE_FALSE(tickEating(eating, true, 0, true, SurvivalStats::MAX_FOOD));
+
+    // Held for EAT_TICKS completes exactly once.
+    bool finished = false;
+    for (int tick = 0; tick < EatingState::EAT_TICKS; ++tick) {
+        finished = tickEating(eating, true, 2, true, 10);
+    }
+    REQUIRE(finished);
+    REQUIRE_FALSE(eating.active);
+
+    // Switching the selected slot restarts the timer.
+    for (int tick = 0; tick < EatingState::EAT_TICKS - 1; ++tick) {
+        tickEating(eating, true, 2, true, 10);
+    }
+    tickEating(eating, true, 5, true, 10);
+    REQUIRE(eating.slot == 5);
+    REQUIRE(eating.ticks == 1);
 }

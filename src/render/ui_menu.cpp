@@ -390,6 +390,22 @@ MenuLayout buildCraftingLayout(const LayoutContext& ctx, const MenuContext& menu
     return layout;
 }
 
+MenuLayout buildDeathLayout(const LayoutContext& ctx, const MenuContext& menu) {
+    MenuLayout layout;
+    layout.dimAlpha = 0.6f;
+    layout.dimR = 0.35f; // red wash over the frozen world
+
+    addCenteredText(layout, ctx, "YOU DIED!", 0.5f + ctx.py(120.f), 6.0f, 0.85f, 0.15f, 0.15f);
+    if (!menu.deathMessage.empty()) {
+        addCenteredText(layout, ctx, menu.deathMessage, 0.5f + ctx.py(64.f), 2.0f, 0.9f, 0.85f,
+                        0.85f);
+    }
+    addButton(layout, ctx, "RESPAWN", MenuAction::RESPAWN, 0.5f, 0.5f - ctx.py(20.f), 360.f, 44.f);
+    addButton(layout, ctx, "TITLE SCREEN", MenuAction::SAVE_QUIT_TO_TITLE, 0.5f,
+              0.5f - ctx.py(76.f), 360.f, 44.f);
+    return layout;
+}
+
 MenuLayout buildFurnaceLayout(const LayoutContext& ctx, const MenuContext& menu) {
     MenuLayout layout;
     layout.dimAlpha = 0.45f;
@@ -475,11 +491,12 @@ MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHei
             return buildCraftingLayout(layoutCtx, ctx);
         case GameScreen::FURNACE:
             return buildFurnaceLayout(layoutCtx, ctx);
+        case GameScreen::DEATH:
+            return buildDeathLayout(layoutCtx, ctx);
         case GameScreen::TITLE:
         case GameScreen::SETTINGS:
         case GameScreen::VIDEO_SETTINGS:
         case GameScreen::PLAYING:
-        case GameScreen::DEATH:
             return buildMenuLayout(screen, pixelWidth, pixelHeight, ctx.settings,
                                    ctx.gfx ? *ctx.gfx : DEFAULT_GRAPHICS);
     }

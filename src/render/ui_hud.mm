@@ -4,6 +4,50 @@
 #include "world/item.hpp"
 
 #include <algorithm>
+#include <array>
+
+namespace {
+
+// 8x8 HUD icon bitmaps, drawn per pixel like the bitmap font (MSB = leftmost).
+constexpr std::array<uint8_t, 8> HEART_ICON = {0x6C, 0xFE, 0xFE, 0xFE, 0x7C, 0x38, 0x10, 0x00};
+constexpr std::array<uint8_t, 8> FOOD_ICON = {0x38, 0x7C, 0x7C, 0x3C, 0x18, 0x18, 0x30, 0x00};
+constexpr std::array<uint8_t, 8> BUBBLE_ICON = {0x38, 0x7C, 0xDE, 0xDE, 0xFE, 0x7C, 0x38, 0x00};
+
+// Draw one 8x8 icon at (x, y) in normalized coords. leftHalfOnly paints only
+// the left four columns, giving a half-heart / half-drumstick.
+void drawHudIcon(UIOverlay& ui, const std::array<uint8_t, 8>& icon, float x, float y, float scale,
+                 float w, float h, float r, float g, float b, bool leftHalfOnly = false) {
+    const float px = scale / w;
+    const float py = scale / h;
+    for (int row = 0; row < 8; ++row) {
+        const uint8_t bits = icon[static_cast<size_t>(row)];
+        for (int col = 0; col < (leftHalfOnly ? 4 : 8); ++col) {
+            if (bits & (0x80 >> col)) {
+                ui.drawQuad(x + col * px, y + (7 - row) * py, px, py, r, g, b, 1.0f);
+            }
+        }
+    }
+}
+
+// A row of `count` icons filled to `value` (each icon is two units), starting
+// at startX and stepping by `dir` (+1 rightward, -1 leftward).
+void drawStatRow(UIOverlay& ui, const std::array<uint8_t, 8>& icon, int value, int count,
+                 float startX, float y, float scale, float w, float h, float fillR, float fillG,
+                 float fillB) {
+    const float pitch = 9.0f * scale / w;
+    for (int i = 0; i < count; ++i) {
+        const float x = startX + i * pitch;
+        drawHudIcon(ui, icon, x, y, scale, w, h, 0.15f, 0.05f, 0.05f); // empty backing
+        const int covered = value - i * 2;
+        if (covered >= 2) {
+            drawHudIcon(ui, icon, x, y, scale, w, h, fillR, fillG, fillB);
+        } else if (covered == 1) {
+            drawHudIcon(ui, icon, x, y, scale, w, h, fillR, fillG, fillB, true);
+        }
+    }
+}
+
+} // namespace
 
 void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
                  uint32_t displayHeight) {
@@ -50,6 +94,27 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
     float totalWidth = slotCount * slotSize + (slotCount - 1) * slotGap;
     float hotbarX = (1.0f - totalWidth) * 0.5f;
 
+    // ---- Survival stat rows (hearts, hunger, air) above the hotbar ----
+    if (frame.mode == GameMode::SURVIVAL && frame.screen == GameScreen::PLAYING) {
+        // scale = device pixels per 8x8 bitmap pixel (an ~18px icon at 2x).
+        const float iconScale = 2.25f * (h / 768.0f);
+        const float pitch = 9.0f * iconScale / w;
+        const float heartsY = hotbarY + slotSize + 10.0f / h;
+        drawStatRow(ui, HEART_ICON, frame.health, 10, hotbarX, heartsY, iconScale, w, h, 0.85f,
+                    0.12f, 0.12f);
+        const float hungerStartX = hotbarX + totalWidth - 10 * pitch;
+        drawStatRow(ui, FOOD_ICON, frame.food, 10, hungerStartX, heartsY, iconScale, w, h, 0.75f,
+                    0.5f, 0.2f);
+        // Air bubbles only while submerged, emptied as breath runs out.
+        if (frame.air < frame.maxAir) {
+            const int bubbles =
+                std::clamp((frame.air * 20 + frame.maxAir - 1) / frame.maxAir, 0, 20);
+            const float airY = heartsY + iconScale / h + 4.0f / h;
+            drawStatRow(ui, BUBBLE_ICON, bubbles, 10, hungerStartX, airY, iconScale, w, h, 0.5f,
+                        0.75f, 0.95f);
+        }
+    }
+
     int selectedIndex = frame.hotbar.selected;
 
     for (int i = 0; i < slotCount; ++i) {
@@ -94,7 +159,7 @@ void drawMenu(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
     const float h = static_cast<float>(displayHeight);
 
     if (layout.dimAlpha > 0.f) {
-        ui.drawQuad(0.f, 0.f, 1.f, 1.f, 0.f, 0.f, 0.f, layout.dimAlpha);
+        ui.drawQuad(0.f, 0.f, 1.f, 1.f, layout.dimR, layout.dimG, layout.dimB, layout.dimAlpha);
     }
 
     if (layout.panel.w > 0.f) {

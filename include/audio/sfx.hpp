@@ -26,6 +26,11 @@ public:
     static std::vector<float> generateBlockBreak();
     static std::vector<float> generateBlockPlace();
 
+    // Survival feedback: player hurt, eating, and death.
+    static std::vector<float> generateHurt();
+    static std::vector<float> generateEat();
+    static std::vector<float> generateDeath();
+
     // Movement sounds
     static std::vector<float> generateFootstep();
 

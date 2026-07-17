@@ -95,6 +95,7 @@ struct MenuLayout {
     std::vector<TextFieldWidget> textFields;
     std::vector<SlotWidget> slots;
     std::vector<MeterWidget> meters;
+    float dimR = 0.f, dimG = 0.f, dimB = 0.f; // tint over the full-screen dim
 };
 
 // Typed hit-testing across every widget kind. menuHitTest remains for
@@ -202,7 +203,13 @@ struct UIFrameState {
     float mouseX = 0.f; // normalized, for the held stack and tooltip
     float mouseY = 0.f;
     float miningProgress = 0.f; // 0 = not mining, drives the break bar
-    std::string tooltipText;    // hovered-slot display name, empty = none
+    GameMode mode = GameMode::SURVIVAL;
+    int health = 20; // half-hearts, 0-20
+    int food = 20;   // half-drumsticks, 0-20
+    int air = 300;   // ticks of breath; drives the bubble row when submerged
+    int maxAir = 300;
+    std::string deathMessage;
+    std::string tooltipText; // hovered-slot display name, empty = none
     bool showDebugHud = false;
     bool cameraUnderwater = false; // drives the underwater veil + god rays
     PerformanceStats stats{};
@@ -272,6 +279,7 @@ struct MenuContext {
     WorldCreateState worldCreate{};
     bool caretVisible = true;
     std::string deleteWorldName;
+    std::string deathMessage;
     ContainerView container{};
 };
 
