@@ -18,20 +18,81 @@ namespace {
 constexpr uint8_t CANONICAL_LAKE_KNOWN = 1U << 0U;
 constexpr uint8_t CANONICAL_LAKE_PRESENT = 1U << 1U;
 constexpr uint8_t CANONICAL_LAKE_ENDORHEIC = 1U << 2U;
-constexpr double CANONICAL_LAKE_DEPTH_SCALE = 64.0;
+constexpr uint8_t CANONICAL_LAKE_BANK = 1U << 3U;
+constexpr uint8_t CANONICAL_WATER_OCEAN = 1U << 0U;
+constexpr uint8_t CANONICAL_WATER_RIVER = 1U << 1U;
+constexpr uint8_t CANONICAL_WATER_DELTA = 1U << 2U;
+constexpr uint8_t CANONICAL_WATER_WATERFALL = 1U << 3U;
+constexpr uint8_t CANONICAL_WATER_WATERFALL_ANCHOR = 1U << 4U;
+constexpr uint8_t CANONICAL_WATER_CHANNEL_BANK = 1U << 5U;
+constexpr uint8_t CANONICAL_GEOLOGY_SECONDARY_SELECTED = 1U << 7U;
+constexpr uint8_t CANONICAL_GEOLOGY_BOUNDARY_MASK =
+    static_cast<uint8_t>(~CANONICAL_GEOLOGY_SECONDARY_SELECTED);
+constexpr double CANONICAL_GEOLOGY_CONTACT_SCALE = 8.0;
 
-uint16_t encodeCanonicalLakeDepth(double depth) {
-    return static_cast<uint16_t>(
-        std::clamp(std::ceil(std::max(0.0, depth) * CANONICAL_LAKE_DEPTH_SCALE), 0.0,
-                   static_cast<double>(std::numeric_limits<uint16_t>::max())));
+static_assert((CANONICAL_GEOLOGY_BOUNDARY_MASK & CANONICAL_GEOLOGY_SECONDARY_SELECTED) == 0U);
+static_assert(static_cast<uint8_t>(worldgen::PlateBoundary::TRANSFORM) <=
+              CANONICAL_GEOLOGY_BOUNDARY_MASK);
+
+int16_t encodeShoreDistance(double distance) {
+    if (!std::isfinite(distance) || distance <= -4095.0) {
+        return std::numeric_limits<int16_t>::min();
+    }
+    return static_cast<int16_t>(std::clamp(
+        std::lround(distance * 8.0), static_cast<long>(std::numeric_limits<int16_t>::min() + 1),
+        static_cast<long>(std::numeric_limits<int16_t>::max())));
 }
 
-double decodeCanonicalLakeDepth(uint16_t depth) {
-    return static_cast<double>(depth) / CANONICAL_LAKE_DEPTH_SCALE;
+double decodeShoreDistance(int16_t distance) {
+    return distance == std::numeric_limits<int16_t>::min() ? -1.0e9
+                                                           : static_cast<double>(distance) / 8.0;
 }
 
 double lerp(double first, double second, double amount) {
     return first + (second - first) * amount;
+}
+
+double smootherstep(double value) {
+    const double t = std::clamp(value, 0.0, 1.0);
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+double cubicHermite(double first, double second, double firstDerivative, double secondDerivative,
+                    double amount) {
+    const double t = std::clamp(amount, 0.0, 1.0);
+    const double t2 = t * t;
+    const double t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * first + (-2.0 * t3 + 3.0 * t2) * second +
+           (t3 - 2.0 * t2 + t) * firstDerivative + (t3 - t2) * secondDerivative;
+}
+
+int16_t encodeGeologyContactDistance(double distance) {
+    const double scaled = std::round(distance * CANONICAL_GEOLOGY_CONTACT_SCALE);
+    return static_cast<int16_t>(
+        std::clamp(scaled, static_cast<double>(std::numeric_limits<int16_t>::min()),
+                   static_cast<double>(std::numeric_limits<int16_t>::max())));
+}
+
+int16_t encodeFlowComponent(double component) {
+    constexpr double SCALE = static_cast<double>(std::numeric_limits<int16_t>::max());
+    return static_cast<int16_t>(std::lround(std::clamp(component, -1.0, 1.0) * SCALE));
+}
+
+double decodeFlowComponent(int16_t component) {
+    return static_cast<double>(component) /
+           static_cast<double>(std::numeric_limits<int16_t>::max());
+}
+
+double decodeGeologyContactDistance(int16_t distance) {
+    return static_cast<double>(distance) / CANONICAL_GEOLOGY_CONTACT_SCALE;
+}
+
+uint16_t encodeGeologyTransition(double transition) {
+    return static_cast<uint16_t>(std::round(std::clamp(transition, 0.0, 0.5) * 131070.0));
+}
+
+double decodeGeologyTransition(uint16_t transition) {
+    return static_cast<double>(transition) / 131070.0;
 }
 
 template <typename Getter>
@@ -53,6 +114,9 @@ worldgen::Vector2d normalized(worldgen::Vector2d value) {
 
 bool sameWaterBody(const worldgen::HydrologySample& sample,
                    const worldgen::HydrologySample& reference) {
+    if (reference.waterBodyId != worldgen::NO_WATER_BODY) {
+        return sample.waterBodyId == reference.waterBodyId;
+    }
     if (reference.ocean) return sample.ocean;
     if (reference.lake) return sample.lake;
     if (reference.river) return sample.river;
@@ -78,6 +142,7 @@ double waterSurface(const std::array<const worldgen::SurfaceSample*, 4>& samples
 }
 
 struct LakeBodySelection {
+    worldgen::WaterBodyId identity = worldgen::NO_WATER_BODY;
     double level = 0.0;
     double membership = 0.0;
     bool endorheic = false;
@@ -99,12 +164,16 @@ dominantLakeBody(const std::array<const worldgen::SurfaceSample*, 4>& samples, d
         if (!hydrology.lake || weights[index] <= 0.0) continue;
         size_t body = 0;
         while (body < bodyCount &&
-               (std::abs(bodies[body].level - hydrology.waterSurface) > 1.0e-4 ||
+               ((hydrology.waterBodyId != worldgen::NO_WATER_BODY &&
+                 bodies[body].identity != hydrology.waterBodyId) ||
+                (hydrology.waterBodyId == worldgen::NO_WATER_BODY &&
+                 std::abs(bodies[body].level - hydrology.waterSurface) > 1.0e-4) ||
                 bodies[body].endorheic != hydrology.endorheic)) {
             ++body;
         }
         if (body == bodyCount) {
             bodies[bodyCount++] = {
+                .identity = hydrology.waterBodyId,
                 .level = hydrology.waterSurface,
                 .membership = 0.0,
                 .endorheic = hydrology.endorheic,
@@ -154,8 +223,11 @@ void addSectionRange(std::set<int32_t>& sections, int minimumBlockY, int maximum
 ColumnPlan::ColumnPlan(ColumnPos chunkColumn, const ColumnPlanSurfaceSampler& sampleSurface,
                        const ColumnPlanHeightSampler& sampleHeight,
                        const ColumnPlanSurfaceGridSampler& sampleExactSurface,
-                       const ColumnPlanHydrologySampler& sampleHydrology)
-    : chunkColumn_(chunkColumn) {
+                       const ColumnPlanHydrologySampler& sampleHydrology,
+                       const ColumnPlanGeologySampler& sampleGeology,
+                       worldgen::MacroControlView continuousFields)
+    : chunkColumn_(chunkColumn)
+    , continuousFields_(std::move(continuousFields)) {
     const int64_t baseX = chunkColumn.x * CHUNK_EDGE;
     const int64_t baseZ = chunkColumn.z * CHUNK_EDGE;
     for (int latticeZ = 0; latticeZ < COLUMN_PLAN_LATTICE_EDGE; ++latticeZ) {
@@ -166,60 +238,135 @@ ColumnPlan::ColumnPlan(ColumnPos chunkColumn, const ColumnPlanSurfaceSampler& sa
                 sampleSurface(worldX, worldZ);
         }
     }
+    constexpr int TERRAIN_APRON_EDGE = COLUMN_PLAN_LATTICE_EDGE + 2;
+    std::array<double, TERRAIN_APRON_EDGE * TERRAIN_APRON_EDGE> terrainApron{};
+    const auto apronIndex = [](int latticeX, int latticeZ) {
+        return static_cast<size_t>((latticeZ + 1) * TERRAIN_APRON_EDGE + latticeX + 1);
+    };
+    for (int latticeZ = -1; latticeZ <= COLUMN_PLAN_LATTICE_EDGE; ++latticeZ) {
+        for (int latticeX = -1; latticeX <= COLUMN_PLAN_LATTICE_EDGE; ++latticeX) {
+            const bool retained = latticeX >= 0 && latticeX < COLUMN_PLAN_LATTICE_EDGE &&
+                                  latticeZ >= 0 && latticeZ < COLUMN_PLAN_LATTICE_EDGE;
+            terrainApron[apronIndex(latticeX, latticeZ)] =
+                retained ? lattice(latticeX, latticeZ).terrainHeight
+                         : sampleSurface(baseX + latticeX * COLUMN_PLAN_LATTICE_SPACING,
+                                         baseZ + latticeZ * COLUMN_PLAN_LATTICE_SPACING)
+                               .terrainHeight;
+        }
+    }
+    constexpr double FIRST_DERIVATIVE_SCALE = 0.5 / COLUMN_PLAN_LATTICE_SPACING;
+    constexpr double MIXED_DERIVATIVE_SCALE =
+        0.25 / (COLUMN_PLAN_LATTICE_SPACING * COLUMN_PLAN_LATTICE_SPACING);
+    for (int latticeZ = 0; latticeZ < COLUMN_PLAN_LATTICE_EDGE; ++latticeZ) {
+        for (int latticeX = 0; latticeX < COLUMN_PLAN_LATTICE_EDGE; ++latticeX) {
+            TerrainDerivative& derivative = terrainDerivatives_[static_cast<size_t>(
+                latticeZ * COLUMN_PLAN_LATTICE_EDGE + latticeX)];
+            derivative.x = static_cast<float>((terrainApron[apronIndex(latticeX + 1, latticeZ)] -
+                                               terrainApron[apronIndex(latticeX - 1, latticeZ)]) *
+                                              FIRST_DERIVATIVE_SCALE);
+            derivative.z = static_cast<float>((terrainApron[apronIndex(latticeX, latticeZ + 1)] -
+                                               terrainApron[apronIndex(latticeX, latticeZ - 1)]) *
+                                              FIRST_DERIVATIVE_SCALE);
+            derivative.mixed =
+                static_cast<float>((terrainApron[apronIndex(latticeX + 1, latticeZ + 1)] -
+                                    terrainApron[apronIndex(latticeX + 1, latticeZ - 1)] -
+                                    terrainApron[apronIndex(latticeX - 1, latticeZ + 1)] +
+                                    terrainApron[apronIndex(latticeX - 1, latticeZ - 1)]) *
+                                   MIXED_DERIVATIVE_SCALE);
+        }
+    }
     if (sampleHydrology) {
         const auto storeCanonicalLake = [](CanonicalLakeSample& destination,
                                            const worldgen::HydrologySample& hydrology) {
             destination.waterSurface = static_cast<float>(hydrology.waterSurface);
-            destination.encodedDepth = encodeCanonicalLakeDepth(hydrology.lakeDepth);
+            destination.surfaceElevation = static_cast<float>(hydrology.surfaceElevation);
+            destination.encodedShoreDistance = encodeShoreDistance(hydrology.lakeShoreDistance);
+            destination.encodedBankInfluence = static_cast<uint8_t>(
+                std::lround(std::clamp(hydrology.lakeBankInfluence, 0.0, 1.0) * 255.0));
             destination.flags = CANONICAL_LAKE_KNOWN;
             if (hydrology.lake) destination.flags |= CANONICAL_LAKE_PRESENT;
             if (hydrology.endorheic) destination.flags |= CANONICAL_LAKE_ENDORHEIC;
+            if (hydrology.lakeBank) destination.flags |= CANONICAL_LAKE_BANK;
         };
-        const auto sameLakeSignature = [](const worldgen::HydrologySample& first,
-                                          const worldgen::HydrologySample& second) {
-            return first.lake == second.lake &&
-                   (!first.lake || (first.endorheic == second.endorheic &&
-                                    std::abs(first.waterSurface - second.waterSurface) <= 1.0e-4));
-        };
+        waterBodyPalette_.push_back(worldgen::NO_WATER_BODY);
         for (int localZ = 0; localZ <= CHUNK_EDGE; ++localZ) {
             for (int localX = 0; localX <= CHUNK_EDGE; ++localX) {
-                CanonicalLakeSample& destination =
-                    canonicalLakes_[static_cast<size_t>(localZ * (CHUNK_EDGE + 1) + localX)];
-                const int latticeX =
-                    std::min(localX / COLUMN_PLAN_LATTICE_SPACING, COLUMN_PLAN_LATTICE_EDGE - 2);
-                const int latticeZ =
-                    std::min(localZ / COLUMN_PLAN_LATTICE_SPACING, COLUMN_PLAN_LATTICE_EDGE - 2);
-                const std::array<const worldgen::HydrologySample*, 4> corners = {
-                    &lattice(latticeX, latticeZ).hydrology,
-                    &lattice(latticeX + 1, latticeZ).hydrology,
-                    &lattice(latticeX, latticeZ + 1).hydrology,
-                    &lattice(latticeX + 1, latticeZ + 1).hydrology,
-                };
-                const bool uniform =
-                    std::all_of(corners.begin() + 1, corners.end(), [&](const auto* value) {
-                        return sameLakeSignature(*corners[0], *value);
-                    });
-                if (uniform) {
-                    const double fx =
-                        static_cast<double>(localX - latticeX * COLUMN_PLAN_LATTICE_SPACING) /
-                        COLUMN_PLAN_LATTICE_SPACING;
-                    const double fz =
-                        static_cast<double>(localZ - latticeZ * COLUMN_PLAN_LATTICE_SPACING) /
-                        COLUMN_PLAN_LATTICE_SPACING;
-                    destination.flags = CANONICAL_LAKE_KNOWN;
-                    if (corners[0]->lake) destination.flags |= CANONICAL_LAKE_PRESENT;
-                    if (corners[0]->endorheic) {
-                        destination.flags |= CANONICAL_LAKE_ENDORHEIC;
+                const size_t index = static_cast<size_t>(localZ * (CHUNK_EDGE + 1) + localX);
+                CanonicalLakeSample& destination = canonicalLakes_[index];
+                const worldgen::HydrologySample hydrology =
+                    sampleHydrology(baseX + localX, baseZ + localZ);
+                storeCanonicalLake(destination, hydrology);
+                generatedTopFluidStates_[index] =
+                    FluidState::flowing(hydrology.generatedFluidLevel).packed();
+                if (hydrology.generatedFluidLevel == 0)
+                    generatedTopFluidStates_[index] = FluidState::source().packed();
+                if (hydrology.transitionOwnerId != 0) {
+                    auto owner =
+                        std::find(transitionOwnerPalette_.begin(), transitionOwnerPalette_.end(),
+                                  hydrology.transitionOwnerId);
+                    if (owner == transitionOwnerPalette_.end()) {
+                        transitionOwnerPalette_.push_back(hydrology.transitionOwnerId);
+                        owner = std::prev(transitionOwnerPalette_.end());
                     }
-                    destination.waterSurface = static_cast<float>(
-                        lerp(lerp(corners[0]->waterSurface, corners[1]->waterSurface, fx),
-                             lerp(corners[2]->waterSurface, corners[3]->waterSurface, fx), fz));
-                    destination.encodedDepth = encodeCanonicalLakeDepth(
-                        lerp(lerp(corners[0]->lakeDepth, corners[1]->lakeDepth, fx),
-                             lerp(corners[2]->lakeDepth, corners[3]->lakeDepth, fx), fz));
-                } else {
-                    storeCanonicalLake(destination,
-                                       sampleHydrology(baseX + localX, baseZ + localZ));
+                    canonicalTransitions_.push_back({
+                        .localIndex = static_cast<uint16_t>(index),
+                        .ownerPaletteIndex = static_cast<uint16_t>(
+                            std::distance(transitionOwnerPalette_.begin(), owner)),
+                        .ownerKind = hydrology.transitionOwnerKind,
+                    });
+                }
+                auto body = std::find(waterBodyPalette_.begin(), waterBodyPalette_.end(),
+                                      hydrology.waterBodyId);
+                if (body == waterBodyPalette_.end()) {
+                    waterBodyPalette_.push_back(hydrology.waterBodyId);
+                    body = std::prev(waterBodyPalette_.end());
+                }
+                waterBodyIndices_[index] =
+                    static_cast<uint16_t>(std::distance(waterBodyPalette_.begin(), body));
+                uint8_t topology = 0;
+                if (hydrology.ocean) topology |= CANONICAL_WATER_OCEAN;
+                if (hydrology.river) topology |= CANONICAL_WATER_RIVER;
+                if (hydrology.delta) topology |= CANONICAL_WATER_DELTA;
+                if (hydrology.waterfall) topology |= CANONICAL_WATER_WATERFALL;
+                if (hydrology.waterfallAnchor) topology |= CANONICAL_WATER_WATERFALL_ANCHOR;
+                if (hydrology.channelBank) topology |= CANONICAL_WATER_CHANNEL_BANK;
+                waterTopologyFlags_[index] = topology;
+                if (hydrology.waterfall) {
+                    const worldgen::Vector2d flow = normalized(hydrology.flowDirection);
+                    canonicalWaterfalls_.push_back({
+                        .localIndex = static_cast<uint16_t>(index),
+                        .encodedFlowX = encodeFlowComponent(flow.x),
+                        .encodedFlowZ = encodeFlowComponent(flow.z),
+                        .top = static_cast<float>(hydrology.waterfallTop),
+                        .bottom = static_cast<float>(hydrology.waterfallBottom),
+                        .width = static_cast<float>(hydrology.waterfallWidth),
+                    });
+                    maximumWaterfallTop_ =
+                        std::max(maximumWaterfallTop_, static_cast<float>(hydrology.waterfallTop));
+                }
+            }
+        }
+    }
+    if (sampleGeology) {
+        hasCanonicalGeology_ = true;
+        for (int localZ = 0; localZ <= CHUNK_EDGE; ++localZ) {
+            for (int localX = 0; localX <= CHUNK_EDGE; ++localX) {
+                const worldgen::GeologySample geology =
+                    sampleGeology(baseX + localX, baseZ + localZ);
+                CanonicalGeologySample& destination =
+                    canonicalGeology_[static_cast<size_t>(localZ * (CHUNK_EDGE + 1) + localX)];
+                destination.plateId = geology.plateId;
+                destination.encodedContactDistance =
+                    encodeGeologyContactDistance(geology.lithology.contactDistance);
+                destination.encodedTransition =
+                    encodeGeologyTransition(geology.lithology.transition);
+                destination.primaryRock = static_cast<uint8_t>(geology.lithology.primary);
+                destination.secondaryRock = static_cast<uint8_t>(geology.lithology.secondary);
+                destination.crust = static_cast<uint8_t>(geology.crust);
+                destination.boundary = static_cast<uint8_t>(geology.boundary);
+                if (geology.rock == geology.lithology.secondary &&
+                    geology.lithology.secondary != geology.lithology.primary) {
+                    destination.boundary |= CANONICAL_GEOLOGY_SECONDARY_SELECTED;
                 }
             }
         }
@@ -243,6 +390,10 @@ const worldgen::SurfaceSample& ColumnPlan::lattice(int x, int z) const {
     return lattice_[static_cast<size_t>(z * COLUMN_PLAN_LATTICE_EDGE + x)];
 }
 
+const ColumnPlan::TerrainDerivative& ColumnPlan::terrainDerivative(int x, int z) const {
+    return terrainDerivatives_[static_cast<size_t>(z * COLUMN_PLAN_LATTICE_EDGE + x)];
+}
+
 int ColumnPlan::surfaceY(int localX, int localZ) const {
     const int clampedX = std::clamp(localX, 0, CHUNK_EDGE - 1);
     const int clampedZ = std::clamp(localZ, 0, CHUNK_EDGE - 1);
@@ -252,11 +403,6 @@ int ColumnPlan::surfaceY(int localX, int localZ) const {
 worldgen::SurfaceSample ColumnPlan::sample(int localX, int localZ) const {
     const int clampedX = std::clamp(localX, 0, CHUNK_EDGE);
     const int clampedZ = std::clamp(localZ, 0, CHUNK_EDGE);
-    if (clampedX % COLUMN_PLAN_LATTICE_SPACING == 0 &&
-        clampedZ % COLUMN_PLAN_LATTICE_SPACING == 0) {
-        return lattice(clampedX / COLUMN_PLAN_LATTICE_SPACING,
-                       clampedZ / COLUMN_PLAN_LATTICE_SPACING);
-    }
     const int latticeX =
         std::min(clampedX / COLUMN_PLAN_LATTICE_SPACING, COLUMN_PLAN_LATTICE_EDGE - 2);
     const int latticeZ =
@@ -276,29 +422,53 @@ worldgen::SurfaceSample ColumnPlan::sample(int localX, int localZ) const {
     const worldgen::SurfaceSample& nearest = *samples[static_cast<size_t>(nearestZ * 2 + nearestX)];
 
     worldgen::SurfaceSample result = nearest;
-    auto interpolate = [&](auto getter) { return bilerp(samples, fx, fz, getter); };
+    const double smoothFx = smootherstep(fx);
+    const double smoothFz = smootherstep(fz);
+    auto interpolate = [&](auto getter) { return bilerp(samples, smoothFx, smoothFz, getter); };
 
-    result.geology.plateVelocity = {
-        interpolate([](const auto& value) { return value.geology.plateVelocity.x; }),
-        interpolate([](const auto& value) { return value.geology.plateVelocity.z; }),
-    };
-    result.geology.continentalFraction =
-        interpolate([](const auto& value) { return value.geology.continentalFraction; });
-    result.geology.crustAge = interpolate([](const auto& value) { return value.geology.crustAge; });
-    result.geology.crustThickness =
-        interpolate([](const auto& value) { return value.geology.crustThickness; });
-    result.geology.crustDensity =
-        interpolate([](const auto& value) { return value.geology.crustDensity; });
-    result.geology.distanceToBoundary =
-        interpolate([](const auto& value) { return value.geology.distanceToBoundary; });
-    result.geology.uplift = interpolate([](const auto& value) { return value.geology.uplift; });
-    result.geology.rift = interpolate([](const auto& value) { return value.geology.rift; });
-    result.geology.faultStrength =
-        interpolate([](const auto& value) { return value.geology.faultStrength; });
-    result.geology.hotspotInfluence =
-        interpolate([](const auto& value) { return value.geology.hotspotInfluence; });
-    result.geology.volcanicActivity =
-        interpolate([](const auto& value) { return value.geology.volcanicActivity; });
+    if (hasCanonicalGeology_) {
+        const CanonicalGeologySample& geology =
+            canonicalGeology_[static_cast<size_t>(clampedZ * (CHUNK_EDGE + 1) + clampedX)];
+        result.geology.plateId = geology.plateId;
+        result.geology.crust = static_cast<worldgen::CrustType>(geology.crust);
+        result.geology.boundary = static_cast<worldgen::PlateBoundary>(
+            geology.boundary & CANONICAL_GEOLOGY_BOUNDARY_MASK);
+        result.geology.lithology.primary = static_cast<worldgen::RockType>(geology.primaryRock);
+        result.geology.lithology.secondary = static_cast<worldgen::RockType>(geology.secondaryRock);
+        result.geology.lithology.transition = decodeGeologyTransition(geology.encodedTransition);
+        result.geology.lithology.contactDistance =
+            decodeGeologyContactDistance(geology.encodedContactDistance);
+        // The high bit records the direct sampler's resolved facies without
+        // growing the compact authority structure.
+        result.geology.rock = (geology.boundary & CANONICAL_GEOLOGY_SECONDARY_SELECTED) != 0
+                                  ? result.geology.lithology.secondary
+                                  : result.geology.lithology.primary;
+    }
+
+    if (!continuousFields_) {
+        result.geology.plateVelocity = {
+            interpolate([](const auto& value) { return value.geology.plateVelocity.x; }),
+            interpolate([](const auto& value) { return value.geology.plateVelocity.z; }),
+        };
+        result.geology.continentalFraction =
+            interpolate([](const auto& value) { return value.geology.continentalFraction; });
+        result.geology.crustAge =
+            interpolate([](const auto& value) { return value.geology.crustAge; });
+        result.geology.crustThickness =
+            interpolate([](const auto& value) { return value.geology.crustThickness; });
+        result.geology.crustDensity =
+            interpolate([](const auto& value) { return value.geology.crustDensity; });
+        result.geology.distanceToBoundary =
+            interpolate([](const auto& value) { return value.geology.distanceToBoundary; });
+        result.geology.uplift = interpolate([](const auto& value) { return value.geology.uplift; });
+        result.geology.rift = interpolate([](const auto& value) { return value.geology.rift; });
+        result.geology.faultStrength =
+            interpolate([](const auto& value) { return value.geology.faultStrength; });
+        result.geology.hotspotInfluence =
+            interpolate([](const auto& value) { return value.geology.hotspotInfluence; });
+        result.geology.volcanicActivity =
+            interpolate([](const auto& value) { return value.geology.volcanicActivity; });
+    }
 
     result.hydrology.flowDirection = normalized(
         {interpolate([](const auto& value) { return value.hydrology.flowDirection.x; }),
@@ -322,49 +492,122 @@ worldgen::SurfaceSample ColumnPlan::sample(int localX, int localZ) const {
     result.hydrology.lakeShoreDistance =
         interpolate([](const auto& value) { return value.hydrology.lakeShoreDistance; });
     result.hydrology.shoreWaterSurface = nearest.hydrology.shoreWaterSurface;
-    const bool routedChannel =
+    const bool interpolatedRoutedChannel =
         result.hydrology.streamOrder > 0 && result.hydrology.channelWidth > 0.0 &&
         result.hydrology.channelDistance <= result.hydrology.channelWidth * 0.55;
-    result.hydrology.ocean = nearest.hydrology.ocean && !routedChannel;
     std::optional<LakeBodySelection> lakeBody;
-    const CanonicalLakeSample& canonical =
-        canonicalLakes_[static_cast<size_t>(clampedZ * (CHUNK_EDGE + 1) + clampedX)];
-    if ((canonical.flags & CANONICAL_LAKE_KNOWN) != 0) {
-        if ((canonical.flags & CANONICAL_LAKE_PRESENT) != 0) {
+    const size_t canonicalIndex = static_cast<size_t>(clampedZ * (CHUNK_EDGE + 1) + clampedX);
+    const CanonicalLakeSample& canonical = canonicalLakes_[canonicalIndex];
+    const uint8_t canonicalTopology = waterTopologyFlags_[canonicalIndex];
+    const FluidState canonicalTopFluidState =
+        FluidState::fromPacked(generatedTopFluidStates_[canonicalIndex]);
+    const uint16_t canonicalWaterBodyIndex = waterBodyIndices_[canonicalIndex];
+    const worldgen::WaterBodyId canonicalWaterBodyId =
+        canonicalWaterBodyIndex < waterBodyPalette_.size()
+            ? waterBodyPalette_[canonicalWaterBodyIndex]
+            : worldgen::NO_WATER_BODY;
+    const bool canonicalWaterKnown = (canonical.flags & CANONICAL_LAKE_KNOWN) != 0;
+    const bool canonicalLake = (canonical.flags & CANONICAL_LAKE_PRESENT) != 0;
+    const bool canonicalOcean = (canonicalTopology & CANONICAL_WATER_OCEAN) != 0;
+    const bool canonicalRiver = (canonicalTopology & CANONICAL_WATER_RIVER) != 0;
+    const bool canonicalDelta = (canonicalTopology & CANONICAL_WATER_DELTA) != 0;
+    const bool canonicalWaterfall = (canonicalTopology & CANONICAL_WATER_WATERFALL) != 0;
+    const bool canonicalWaterfallAnchor =
+        (canonicalTopology & CANONICAL_WATER_WATERFALL_ANCHOR) != 0;
+    const bool canonicalChannelBank = (canonicalTopology & CANONICAL_WATER_CHANNEL_BANK) != 0;
+    const bool canonicalLakeBank = (canonical.flags & CANONICAL_LAKE_BANK) != 0;
+    if (canonicalWaterKnown) {
+        result.hydrology.generatedFluidLevel =
+            canonicalTopFluidState.isSource() ? 0 : canonicalTopFluidState.level();
+        const auto transition = std::lower_bound(
+            canonicalTransitions_.begin(), canonicalTransitions_.end(), canonicalIndex,
+            [](const CanonicalTransitionSample& candidate, size_t index) {
+                return candidate.localIndex < index;
+            });
+        if (transition != canonicalTransitions_.end() && transition->localIndex == canonicalIndex &&
+            transition->ownerPaletteIndex < transitionOwnerPalette_.size()) {
+            result.hydrology.transitionOwnerKind = transition->ownerKind;
+            result.hydrology.transitionOwnerId =
+                transitionOwnerPalette_[transition->ownerPaletteIndex];
+        } else {
+            result.hydrology.transitionOwnerKind = worldgen::WaterTransitionKind::NONE;
+            result.hydrology.transitionOwnerId = 0;
+        }
+        result.hydrology.waterBodyId = canonicalWaterBodyId;
+        result.hydrology.lakeShoreDistance = decodeShoreDistance(canonical.encodedShoreDistance);
+        result.hydrology.shoreWaterSurface = canonical.waterSurface;
+        // The 17 by 17 canonical authority is already evaluated at block
+        // resolution. Use its unmodified macro floor for every category, not
+        // only wet cells, so final terrain retains sub-control detail. The
+        // generator applies coordinate-pure volcanic geometry afterward.
+        result.hydrology.surfaceElevation = canonical.surfaceElevation;
+        result.terrainHeight = canonical.surfaceElevation;
+        result.hydrology.ocean = canonicalOcean;
+        result.hydrology.channelBank = canonicalChannelBank;
+        if (canonicalLake) {
             lakeBody = LakeBodySelection{
+                .identity = canonicalWaterBodyId,
                 .level = canonical.waterSurface,
                 .membership = 1.0,
                 .endorheic = (canonical.flags & CANONICAL_LAKE_ENDORHEIC) != 0,
             };
             result.hydrology.ocean = false;
-            result.hydrology.surfaceElevation =
-                canonical.waterSurface - decodeCanonicalLakeDepth(canonical.encodedDepth);
         }
     } else {
+        result.hydrology.ocean = nearest.hydrology.ocean && !interpolatedRoutedChannel;
         lakeBody = dominantLakeBody(samples, fx, fz);
     }
-    result.hydrology.lake = !result.hydrology.ocean && lakeBody.has_value() &&
-                            lakeBody->level > result.hydrology.surfaceElevation + 0.05;
+    result.hydrology.lake = canonicalWaterKnown
+                                ? !result.hydrology.ocean && canonicalLake &&
+                                      canonical.waterSurface > canonical.surfaceElevation + 0.05
+                                : !result.hydrology.ocean && lakeBody.has_value() &&
+                                      lakeBody->level > result.hydrology.surfaceElevation + 0.05;
+    if (!canonicalWaterKnown) {
+        result.hydrology.waterBodyId =
+            result.hydrology.lake ? lakeBody->identity : nearest.hydrology.waterBodyId;
+    }
     result.hydrology.lakeDepth =
         result.hydrology.lake ? lakeBody->level - result.hydrology.surfaceElevation : 0.0;
-    result.hydrology.river = !result.hydrology.ocean && !result.hydrology.lake && routedChannel;
-    result.hydrology.endorheic = result.hydrology.lake && lakeBody->endorheic;
-    result.hydrology.waterfall = false;
-    result.hydrology.waterfallAnchor = false;
+    result.hydrology.river = !result.hydrology.ocean && !result.hydrology.lake &&
+                             (canonicalWaterKnown ? canonicalRiver : interpolatedRoutedChannel);
+    result.hydrology.endorheic =
+        result.hydrology.lake &&
+        (canonicalWaterKnown ? (canonical.flags & CANONICAL_LAKE_ENDORHEIC) != 0
+                             : lakeBody->endorheic);
+    result.hydrology.waterfall = canonicalWaterKnown && canonicalWaterfall;
+    result.hydrology.waterfallAnchor = canonicalWaterKnown && canonicalWaterfallAnchor;
     result.hydrology.waterfallTop = 0.0;
     result.hydrology.waterfallBottom = 0.0;
     result.hydrology.waterfallWidth = 0.0;
-    for (const worldgen::SurfaceSample* value : samples) {
-        if (!value->hydrology.waterfall) continue;
-        result.hydrology.waterfall = true;
-        if (value->hydrology.waterfallTop > result.hydrology.waterfallTop) {
-            result.hydrology.waterfallTop = value->hydrology.waterfallTop;
-            result.hydrology.waterfallBottom = value->hydrology.waterfallBottom;
-            result.hydrology.waterfallWidth = value->hydrology.waterfallWidth;
+    if (canonicalWaterfall) {
+        const auto waterfall = std::lower_bound(
+            canonicalWaterfalls_.begin(), canonicalWaterfalls_.end(), canonicalIndex,
+            [](const CanonicalWaterfallSample& candidate, size_t index) {
+                return candidate.localIndex < index;
+            });
+        if (waterfall != canonicalWaterfalls_.end() && waterfall->localIndex == canonicalIndex) {
+            result.hydrology.flowDirection =
+                normalized({decodeFlowComponent(waterfall->encodedFlowX),
+                            decodeFlowComponent(waterfall->encodedFlowZ)});
+            result.hydrology.waterfallTop = waterfall->top;
+            result.hydrology.waterfallBottom = waterfall->bottom;
+            result.hydrology.waterfallWidth = waterfall->width;
+        }
+    } else if (!canonicalWaterKnown) {
+        for (const worldgen::SurfaceSample* value : samples) {
+            if (!value->hydrology.waterfall) continue;
+            result.hydrology.waterfall = true;
+            if (value->hydrology.waterfallTop > result.hydrology.waterfallTop) {
+                result.hydrology.waterfallTop = value->hydrology.waterfallTop;
+                result.hydrology.waterfallBottom = value->hydrology.waterfallBottom;
+                result.hydrology.waterfallWidth = value->hydrology.waterfallWidth;
+            }
         }
     }
-    result.hydrology.delta = std::any_of(samples.begin(), samples.end(),
-                                         [](const auto* value) { return value->hydrology.delta; });
+    result.hydrology.delta =
+        canonicalWaterKnown ? canonicalDelta
+                            : std::any_of(samples.begin(), samples.end(),
+                                          [](const auto* value) { return value->hydrology.delta; });
     if (result.hydrology.river || result.hydrology.delta) {
         for (const worldgen::SurfaceSample* value : samples) {
             result.hydrology.streamOrder =
@@ -374,68 +617,81 @@ worldgen::SurfaceSample ColumnPlan::sample(int localX, int localZ) const {
         }
     }
     result.hydrology.waterSurface =
-        result.hydrology.lake ? lakeBody->level : waterSurface(samples, result.hydrology, fx, fz);
-    const double routedWaterSurface =
-        interpolate([](const auto& value) { return value.hydrology.waterSurface; });
+        canonicalWaterKnown
+            ? canonical.waterSurface
+            : (result.hydrology.lake ? lakeBody->level
+                                     : waterSurface(samples, result.hydrology, fx, fz));
+    if (!continuousFields_) {
+        result.climate.wind = {
+            interpolate([](const auto& value) { return value.climate.wind.x; }),
+            interpolate([](const auto& value) { return value.climate.wind.z; }),
+        };
+        result.climate.temperatureC =
+            interpolate([](const auto& value) { return value.climate.temperatureC; });
+        result.climate.annualPrecipitationMm =
+            interpolate([](const auto& value) { return value.climate.annualPrecipitationMm; });
+        result.climate.potentialEvapotranspirationMm = interpolate(
+            [](const auto& value) { return value.climate.potentialEvapotranspirationMm; });
+        result.climate.aridity =
+            interpolate([](const auto& value) { return value.climate.aridity; });
+        result.climate.relativeHumidity =
+            interpolate([](const auto& value) { return value.climate.relativeHumidity; });
 
-    result.climate.wind = {
-        interpolate([](const auto& value) { return value.climate.wind.x; }),
-        interpolate([](const auto& value) { return value.climate.wind.z; }),
-    };
-    result.climate.temperatureC =
-        interpolate([](const auto& value) { return value.climate.temperatureC; });
-    result.climate.annualPrecipitationMm =
-        interpolate([](const auto& value) { return value.climate.annualPrecipitationMm; });
-    result.climate.potentialEvapotranspirationMm =
-        interpolate([](const auto& value) { return value.climate.potentialEvapotranspirationMm; });
-    result.climate.aridity = interpolate([](const auto& value) { return value.climate.aridity; });
-    result.climate.relativeHumidity =
-        interpolate([](const auto& value) { return value.climate.relativeHumidity; });
-
-    result.soil.moisture = interpolate([](const auto& value) { return value.soil.moisture; });
-    result.soil.fertility = interpolate([](const auto& value) { return value.soil.fertility; });
-    result.soil.drainage = interpolate([](const auto& value) { return value.soil.drainage; });
-    result.soil.waterTable = interpolate([](const auto& value) { return value.soil.waterTable; });
-    for (size_t index = 0; index < result.suitability.scores.size(); ++index) {
-        result.suitability.scores[index] = static_cast<float>(
-            interpolate([index](const auto& value) { return value.suitability.scores[index]; }));
+        result.soil.moisture = interpolate([](const auto& value) { return value.soil.moisture; });
+        result.soil.fertility = interpolate([](const auto& value) { return value.soil.fertility; });
+        result.soil.drainage = interpolate([](const auto& value) { return value.soil.drainage; });
+        result.soil.waterTable =
+            interpolate([](const auto& value) { return value.soil.waterTable; });
+        for (size_t index = 0; index < result.suitability.scores.size(); ++index) {
+            result.suitability.scores[index] = static_cast<float>(interpolate(
+                [index](const auto& value) { return value.suitability.scores[index]; }));
+        }
+        result.biome = worldgen::MacroGenerationSampler::selectBiome(result.suitability);
     }
-    result.biome = worldgen::MacroGenerationSampler::selectBiome(result.suitability);
-    result.terrainHeight = interpolate([](const auto& value) { return value.terrainHeight; });
-    if (result.hydrology.lake && (canonical.flags & CANONICAL_LAKE_KNOWN) != 0) {
-        result.terrainHeight = result.hydrology.surfaceElevation;
+    const TerrainDerivative& derivative00 = terrainDerivative(latticeX, latticeZ);
+    const TerrainDerivative& derivative10 = terrainDerivative(latticeX + 1, latticeZ);
+    const TerrainDerivative& derivative01 = terrainDerivative(latticeX, latticeZ + 1);
+    const TerrainDerivative& derivative11 = terrainDerivative(latticeX + 1, latticeZ + 1);
+    constexpr double SPACING = COLUMN_PLAN_LATTICE_SPACING;
+    const double lowerTerrain =
+        cubicHermite(samples[0]->terrainHeight, samples[1]->terrainHeight, derivative00.x * SPACING,
+                     derivative10.x * SPACING, fx);
+    const double upperTerrain =
+        cubicHermite(samples[2]->terrainHeight, samples[3]->terrainHeight, derivative01.x * SPACING,
+                     derivative11.x * SPACING, fx);
+    const double lowerZDerivative =
+        cubicHermite(derivative00.z, derivative10.z, derivative00.mixed * SPACING,
+                     derivative10.mixed * SPACING, fx);
+    const double upperZDerivative =
+        cubicHermite(derivative01.z, derivative11.z, derivative01.mixed * SPACING,
+                     derivative11.mixed * SPACING, fx);
+    if (!canonicalWaterKnown) {
+        result.terrainHeight = cubicHermite(lowerTerrain, upperTerrain, lowerZDerivative * SPACING,
+                                            upperZDerivative * SPACING, fz);
     }
-    if (!result.hydrology.ocean && !result.hydrology.lake && !result.hydrology.river &&
-        result.hydrology.channelWidth > 0.0 &&
-        result.hydrology.channelDistance <=
-            result.hydrology.channelWidth * 0.55 + worldgen::BASIN_RASTER_SPACING) {
-        // Keep interpolated dry channel-edge samples on the same supported
-        // bank contract as direct basin samples. This closes the sub-lattice
-        // gaps that otherwise appear between a wet river column and lower,
-        // categorically dry terrain.
-        result.hydrology.surfaceElevation =
-            std::max(result.hydrology.surfaceElevation, routedWaterSurface);
-        result.terrainHeight = std::max(result.terrainHeight, routedWaterSurface);
-    }
-    result.hydrology.lakeBank = false;
-    result.hydrology.lakeBankTarget = 0.0;
-    result.hydrology.lakeBankInfluence = 0.0;
-    if (!result.hydrology.ocean && !result.hydrology.lake && !result.hydrology.river &&
-        result.hydrology.shoreWaterSurface > 0.0 && result.hydrology.lakeShoreDistance <= 0.0 &&
-        result.hydrology.lakeShoreDistance > -16.0) {
-        const double distance = -result.hydrology.lakeShoreDistance / 16.0;
-        const double smoothDistance = distance * distance * (3.0 - 2.0 * distance);
-        result.hydrology.lakeBankInfluence = 1.0 - smoothDistance;
+    if (canonicalWaterKnown) {
+        result.hydrology.lakeBank = canonicalLakeBank;
+        result.hydrology.lakeBankInfluence =
+            static_cast<double>(canonical.encodedBankInfluence) / 255.0;
         result.hydrology.lakeBankTarget =
-            result.terrainHeight +
-            std::max(0.0, std::ceil(result.hydrology.shoreWaterSurface) - result.terrainHeight) *
-                result.hydrology.lakeBankInfluence;
-        result.terrainHeight = std::max(result.terrainHeight, result.hydrology.lakeBankTarget);
-        result.hydrology.surfaceElevation = result.terrainHeight;
-        result.hydrology.lakeBank = result.hydrology.lakeBankInfluence > 1.0e-4;
+            result.hydrology.lakeBank ? canonical.surfaceElevation : 0.0;
+    } else if (result.hydrology.lakeBank) {
+        // Without exact authority, retain the sampled bank as descriptive
+        // metadata only. The reconstructed terrain is the physical substrate;
+        // a water stage must never raise it after hydrology has been sampled.
+        result.hydrology.lakeBankInfluence =
+            std::clamp(result.hydrology.lakeBankInfluence, 0.0, 1.0);
+        result.hydrology.lakeBankTarget = result.terrainHeight;
     }
     result.waterSurface = result.hydrology.waterSurface;
-    result.slope = interpolate([](const auto& value) { return value.slope; });
+    if (!continuousFields_) {
+        result.slope = interpolate([](const auto& value) { return value.slope; });
+    }
+
+    const int64_t worldX = chunkColumn_.x * CHUNK_EDGE + clampedX;
+    const int64_t worldZ = chunkColumn_.z * CHUNK_EDGE + clampedZ;
+    continuousFields_.reconstructContinuous(static_cast<double>(worldX),
+                                            static_cast<double>(worldZ), result);
 
     result.ecotopes = worldgen::MacroGenerationSampler::classifyEcotopes(result);
     return result;
@@ -447,7 +703,7 @@ void ColumnPlan::buildExposedSections(const ColumnPlanHeightSampler& sampleHeigh
     maximumSurfaceY_ = WORLD_MIN_Y;
 
     // A tree anchor can be six blocks outside the target column. Surface
-    // samples are bilinearly reconstructed from the world-aligned 8-block
+    // samples are bicubically reconstructed from the world-aligned 8-block
     // lattice, so one transient lattice apron on every side bounds every
     // possible anchor without a per-block climate scan. Only the central
     // 3 by 3 samples remain resident in the immutable plan.
@@ -509,7 +765,8 @@ void ColumnPlan::buildExposedSections(const ColumnPlanHeightSampler& sampleHeigh
             }
             if (current.hydrology.waterfall) {
                 const double waterfallTop =
-                    std::max(current.waterSurface, current.hydrology.waterfallTop);
+                    std::max({current.waterSurface, current.hydrology.waterfallTop,
+                              static_cast<double>(maximumWaterfallTop_)});
                 const int waterY = static_cast<int>(std::ceil(waterfallTop)) - 1;
                 for (int y = surfaceY; y <= waterY; y += CHUNK_EDGE)
                     addSection(sections, y);
@@ -568,7 +825,9 @@ std::shared_ptr<const ColumnPlan>
 ColumnPlanCache::getOrCreate(ColumnPos chunkColumn, const ColumnPlanSurfaceSampler& sampleSurface,
                              const ColumnPlanHeightSampler& sampleHeight,
                              const ColumnPlanSurfaceGridSampler& sampleExactSurface,
-                             const ColumnPlanHydrologySampler& sampleHydrology) const {
+                             const ColumnPlanHydrologySampler& sampleHydrology,
+                             const ColumnPlanGeologySampler& sampleGeology,
+                             worldgen::MacroControlView continuousFields) const {
     using PlanPointer = Impl::PlanPointer;
     std::shared_future<PlanPointer> future;
     std::shared_ptr<std::promise<PlanPointer>> producer;
@@ -621,7 +880,8 @@ ColumnPlanCache::getOrCreate(ColumnPos chunkColumn, const ColumnPlanSurfaceSampl
 
     try {
         PlanPointer plan = std::make_shared<ColumnPlan>(chunkColumn, sampleSurface, sampleHeight,
-                                                        sampleExactSurface, sampleHydrology);
+                                                        sampleExactSurface, sampleHydrology,
+                                                        sampleGeology, std::move(continuousFields));
         producer->set_value(plan);
         return plan;
     } catch (...) {

@@ -7,10 +7,12 @@
 #include "world/features.hpp"
 #include "world/ores.hpp"
 #include "world/structures.hpp"
+#include "world/surface_material.hpp"
 
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +49,7 @@ struct VolcanicColumnSample {
     double craterProfileInfluence = 0.0;
     double craterLakeRadius = 0.0;
     double craterLakeSurface = 0.0;
+    worldgen::WaterBodyId craterWaterBodyId = worldgen::NO_WATER_BODY;
     double craterRimElevation = 0.0;
     double craterRimWidth = 0.0;
     double centerDistance = 1.0e9;
@@ -94,28 +97,90 @@ public:
     std::shared_ptr<const ColumnPlan> getColumnPlan(ColumnPos chunkColumn) const;
     std::shared_ptr<const ColumnPlan> findColumnPlan(ColumnPos chunkColumn) const;
     worldgen::SurfaceSample sampleSurface(int64_t x, int64_t z) const;
+    worldgen::SurfaceSample sampleSurface(int64_t x, int64_t z,
+                                          worldgen::SurfaceFootprint footprint) const;
     // Geometry-only far samples omit climate, soil, and biome work that the
     // far mesh does not consume. Volcanic relief and canonical hydrology are
     // still applied so terrain and water remain identical.
     worldgen::SurfaceSample sampleFarGeometrySurface(int64_t x, int64_t z) const;
+    worldgen::SurfaceSample sampleFarGeometrySurface(int64_t x, int64_t z,
+                                                     worldgen::SurfaceFootprint footprint) const;
+    void sampleFarGeometryGrid(int64_t originX, int64_t originZ, int spacingX, int spacingZ,
+                               int sampleWidth, int sampleHeight,
+                               worldgen::SurfaceFootprint footprint,
+                               std::span<worldgen::SurfaceSample> output) const;
+    void sampleFarGeometryPoints(std::span<const ColumnPos> positions,
+                                 worldgen::SurfaceFootprint footprint,
+                                 std::span<worldgen::SurfaceSample> output) const;
     worldgen::SurfaceSample sampleExactGeometrySurface(int64_t x, int64_t z) const;
     // Returns the same climate, hydrology, and material inputs as
     // sampleSurface(), but replaces the provisional macro relief with the
     // exact emitted density top. The height is a mesh-plane coordinate, one
     // block above ColumnPlan::surfaceY(), so cubic and far terrain meet.
     worldgen::SurfaceSample sampleExactSurface(int64_t x, int64_t z) const;
+    // Batched counterpart for fine far-voxel tiles. It retains each immutable
+    // column plan once and reconstructs all of its block samples without
+    // repeating cache lookups and direct macro solves at every vertex.
+    void sampleExactSurfaceGrid(int64_t originX, int64_t originZ, int spacing, int sampleEdge,
+                                std::span<worldgen::SurfaceSample> output) const;
+    // Returns the exact local amplitude used by the near-surface density
+    // field. Coarse coverage bounds combine this with their filtered relief
+    // envelope instead of relying on one world-wide height allowance.
+    static double emittedSurfaceDetailAmplitude(const worldgen::SurfaceSample& surface,
+                                                double slopeEnvelope = 0.0);
     // Samples the globally aligned macro lattice without constructing a
     // 16-block plan around every sparse far-LOD vertex. At 8- and 16-block
     // aligned coordinates this matches the exact plan lattice, including
     // emitted volcanic relief.
     worldgen::SurfaceSample sampleFarSurface(int64_t x, int64_t z) const;
+    worldgen::SurfaceSample sampleFarSurface(int64_t x, int64_t z,
+                                             worldgen::SurfaceFootprint footprint) const;
+    // Canonical pre-overlay hydrology used by ColumnPlan water ownership.
+    // Tree control pages query it only for accepted roots, preventing a
+    // volcanic relief sample from hiding water that exact cube emission keeps.
+    worldgen::HydrologySample sampleGeneratedWaterAuthority(int64_t x, int64_t z) const;
+    void sampleGeneratedWaterAuthorityGrid(int64_t originX, int64_t originZ, int spacing,
+                                           int sampleEdge,
+                                           std::span<worldgen::HydrologySample> output) const;
+    void sampleGeneratedWaterAuthorityPoints(std::span<const ColumnPos> positions,
+                                             std::span<worldgen::HydrologySample> output) const;
+    // Applies coordinate-pure volcanic geometry to canonical hydrology
+    // without reconstructing climate, soil, or biome fields. These batches
+    // are the final water ownership authority used by far-mesh sentinels.
+    void sampleGeneratedWaterGeometryGrid(int64_t originX, int64_t originZ, int spacingX,
+                                          int spacingZ, int sampleWidth, int sampleHeight,
+                                          std::span<worldgen::SurfaceSample> output) const;
+    void sampleGeneratedWaterGeometryPoints(std::span<const ColumnPos> positions,
+                                            std::span<worldgen::SurfaceSample> output) const;
+    // Samples sparse final macro surfaces in one basin batch and applies the
+    // same coordinate-pure volcanic geometry used by scalar far sampling.
+    void sampleFarSurfacePoints(std::span<const ColumnPos> positions,
+                                worldgen::SurfaceFootprint footprint,
+                                std::span<worldgen::SurfaceSample> output) const;
+    // Internal block-footprint habitat authority for far feature candidates.
+    // Unlike the public exact sampler, this remains plan-free and batches all
+    // basin and macro-control work across the requested points.
+    void sampleFarHabitatPoints(std::span<const ColumnPos> positions,
+                                std::span<worldgen::SurfaceSample> output) const;
+    void sampleFarSurfaceGrid(int64_t originX, int64_t originZ, int spacing, int sampleEdge,
+                              worldgen::SurfaceFootprint footprint,
+                              std::span<worldgen::SurfaceSample> output) const;
     // Selects the visible top material through the exact column plan and the
     // same coordinate-pure geology, water, and weathering path used by cubic
     // emission. Fine far terrain samples this on its shared material lattice.
     BlockType surfaceMaterialAt(int64_t x, int64_t z) const;
+    worldgen::surface_material::SurfaceMaterialPalette surfaceMaterialPaletteAt(int64_t x,
+                                                                                int64_t z) const;
     // Macro counterpart for coarse far LODs. This avoids constructing column
     // plans where exact block-level shoreline parity is no longer visible.
     BlockType farSurfaceMaterialAt(int64_t x, int64_t z) const;
+    BlockType farSurfaceMaterialAt(int64_t x, int64_t z,
+                                   const worldgen::SurfaceSample& surface) const;
+    worldgen::surface_material::SurfaceMaterialPalette
+    farSurfaceMaterialPaletteAt(int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) const;
+    worldgen::surface_material::SurfaceMaterialPalette
+    farSurfaceMaterialPaletteAt(int64_t x, int64_t z, const worldgen::SurfaceSample& surface) const;
+    double farSurfaceMaterialRankAt(int64_t x, int64_t z) const;
     // Height-only counterpart for conservative plan perimeters. This avoids
     // climate and soil work while using the exact emitted volcano primitive.
     double sampleFarTerrainHeight(int64_t x, int64_t z) const;
@@ -134,6 +199,12 @@ public:
     size_t cachedColumnPlanCount() const { return columnPlanCache_.size(); }
     worldgen::BasinCacheMetrics basinCacheMetrics() const {
         return macroSampler_.basinCacheMetrics();
+    }
+    worldgen::MacroControlCacheMetrics macroControlCacheMetrics() const {
+        return macroSampler_.macroControlCacheMetrics();
+    }
+    worldgen::MacroControlCacheMetrics farClimateControlCacheMetrics() const {
+        return macroSampler_.farClimateControlCacheMetrics();
     }
     void clearMacroCaches() const;
 
@@ -163,6 +234,8 @@ private:
     const ColumnShape& latticeShape(int64_t lx, int64_t lz, GenScratch& scratch) const;
     const std::vector<double>& latticeDensityColumn(int64_t lx, int64_t lz,
                                                     GenScratch& scratch) const;
+    std::shared_ptr<const ColumnPlan> constructColumnPlan(ColumnPos chunkColumn,
+                                                          bool retainInCache) const;
     worldgen::SurfaceSample surfaceSampleFromPlan(int64_t x, int64_t z, const ColumnPlan& plan,
                                                   GenScratch& scratch) const;
     worldgen::SurfaceSample surfaceSampleAt(int64_t x, int64_t z, GenScratch& scratch) const;
