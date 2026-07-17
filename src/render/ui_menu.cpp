@@ -69,17 +69,21 @@ MenuLayout buildTitleLayout(const LayoutContext& ctx) {
     return layout;
 }
 
-MenuLayout buildPauseLayout(const LayoutContext& ctx) {
+MenuLayout buildPauseLayout(const LayoutContext& ctx, GameMode mode) {
     MenuLayout layout;
     layout.dimAlpha = 0.45f;
-    layout.panel = UIRect{0.5f - ctx.px(210.f), 0.5f - ctx.py(170.f), ctx.px(420.f), ctx.py(340.f)};
+    layout.panel = UIRect{0.5f - ctx.px(240.f), 0.5f - ctx.py(220.f), ctx.px(480.f), ctx.py(440.f)};
 
-    addCenteredText(layout, ctx, "PAUSED", 0.5f + ctx.py(120.f), 3.0f);
+    addCenteredText(layout, ctx, "PAUSED", 0.5f + ctx.py(170.f), 3.0f);
 
-    addButton(layout, ctx, "RESUME", MenuAction::RESUME, 0.5f, 0.5f + ctx.py(40.f), 320.f, 44.f);
-    addButton(layout, ctx, "SETTINGS", MenuAction::OPEN_SETTINGS, 0.5f, 0.5f - ctx.py(24.f), 320.f,
+    addButton(layout, ctx, "RESUME", MenuAction::RESUME, 0.5f, 0.5f + ctx.py(96.f), 360.f, 44.f);
+    addButton(layout, ctx, "SETTINGS", MenuAction::OPEN_SETTINGS, 0.5f, 0.5f + ctx.py(40.f), 360.f,
               44.f);
-    addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, 0.5f - ctx.py(88.f), 320.f, 44.f);
+    addSettingsRow(layout, ctx, "MODE", mode == GameMode::CREATIVE ? "CREATIVE" : "SURVIVAL",
+                   MenuAction::TOGGLE_GAME_MODE, MenuAction::TOGGLE_GAME_MODE, 0.5f - ctx.py(20.f));
+    addButton(layout, ctx, "SAVE AND QUIT TO TITLE", MenuAction::SAVE_QUIT_TO_TITLE, 0.5f,
+              0.5f - ctx.py(80.f), 360.f, 44.f);
+    addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, 0.5f - ctx.py(136.f), 360.f, 44.f);
     return layout;
 }
 
@@ -290,7 +294,7 @@ MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeigh
         case GameScreen::TITLE:
             return buildTitleLayout(ctx);
         case GameScreen::PAUSED:
-            return buildPauseLayout(ctx);
+            return buildPauseLayout(ctx, GameMode::SURVIVAL);
         case GameScreen::SETTINGS:
             return buildSettingsLayout(ctx, values);
         case GameScreen::VIDEO_SETTINGS:
@@ -324,6 +328,8 @@ MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHei
     static const GraphicsSettings DEFAULT_GRAPHICS{};
 
     switch (screen) {
+        case GameScreen::PAUSED:
+            return buildPauseLayout(layoutCtx, ctx.mode);
         case GameScreen::WORLD_SELECT:
             return buildWorldSelectLayout(layoutCtx, ctx);
         case GameScreen::WORLD_CREATE:
@@ -331,7 +337,6 @@ MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHei
         case GameScreen::WORLD_DELETE_CONFIRM:
             return buildDeleteConfirmLayout(layoutCtx, ctx);
         case GameScreen::TITLE:
-        case GameScreen::PAUSED:
         case GameScreen::SETTINGS:
         case GameScreen::VIDEO_SETTINGS:
         case GameScreen::PLAYING:

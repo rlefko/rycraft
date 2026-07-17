@@ -211,6 +211,7 @@ std::string filterTextField(const std::string& raw, bool digitsOnly, size_t maxL
 struct MenuContext {
     SettingsValues settings{};
     const GraphicsSettings* gfx = nullptr; // video screen only (non-owning)
+    GameMode mode = GameMode::SURVIVAL;    // pause-screen mode row
     std::vector<std::string> worldRows;    // display labels, cached on entry
     WorldSelectState worldSelect{};
     WorldCreateState worldCreate{};

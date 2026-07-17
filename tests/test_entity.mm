@@ -8,8 +8,8 @@
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
 #include <engine/game_state.hpp>
-#include <engine/inventory.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -2588,4 +2588,38 @@ TEST_CASE("Entity: eat animation stops at zero", "[entity][animation]") {
     entity->tick(*world);
 
     REQUIRE(entity->eatAnimationTimer == 0);
+}
+
+TEST_CASE("Game mode gates: flight refusal and fall damage immunity", "[player][modes]") {
+    auto world = makePlatform(101);
+    loadFixtureCubes(*world, -2, 100, -2, 2, 132, 2);
+
+    // Survival input ignores the fly double-tap and drops an active flier.
+    Player player;
+    player.position = Vec3{0.f, 102.f, 0.f};
+    PlayerInput survival;
+    survival.allowFlight = false;
+    survival.doubleTapJump = true;
+    player.tick(*world, survival);
+    REQUIRE_FALSE(player.flying);
+
+    player.flying = true;
+    survival.doubleTapJump = false;
+    player.tick(*world, survival);
+    REQUIRE_FALSE(player.flying);
+
+    // Creative input lands a tall drop unhurt.
+    Player creative;
+    creative.health = 20;
+    creative.position = Vec3{0.f, 130.f, 0.f};
+    creative.onGround = false;
+    PlayerInput noDamage;
+    noDamage.takesFallDamage = false;
+    for (int i = 0; i < 200; ++i) {
+        creative.tick(*world, noDamage);
+        if (creative.onGround)
+            break;
+    }
+    REQUIRE(creative.onGround);
+    REQUIRE(creative.health == 20);
 }

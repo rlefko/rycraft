@@ -507,6 +507,15 @@ static std::string defaultWorldDirectory() {
     if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
         state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
     }
+    // Playtest hook: force the mode without touching the saved metadata
+    // (env-override capture sessions never save).
+    if (const char* modeEnv = std::getenv("RYCRAFT_GAME_MODE")) {
+        if (std::strcmp(modeEnv, "survival") == 0) {
+            state->gameMode = GameMode::SURVIVAL;
+        } else if (std::strcmp(modeEnv, "creative") == 0) {
+            state->gameMode = GameMode::CREATIVE;
+        }
+    }
 
     state->worldSpawn = spawnPos;
     state->player = Player{};
@@ -1135,6 +1144,10 @@ static std::string defaultWorldDirectory() {
             [self applyFlowEffects:state->flow.onMenuAction(MenuAction::CANCEL_DELETE)];
             return;
         }
+        case MenuAction::TOGGLE_GAME_MODE:
+            state->gameMode =
+                state->gameMode == GameMode::CREATIVE ? GameMode::SURVIVAL : GameMode::CREATIVE;
+            return;
         case MenuAction::SAVE_QUIT_TO_TITLE:
             [self stopWorld];
             return;
@@ -1202,6 +1215,7 @@ static std::string defaultWorldDirectory() {
         MenuContext menuCtx;
         menuCtx.settings = state->settings;
         menuCtx.gfx = &state->gfx;
+        menuCtx.mode = state->gameMode;
         menuCtx.caretVisible = (state->frameCount / 30) % 2 == 0;
         if (state->flow.screen == GameScreen::WORLD_SELECT ||
             state->flow.screen == GameScreen::WORLD_DELETE_CONFIRM) {
@@ -1508,6 +1522,8 @@ static std::string defaultWorldDirectory() {
     playerInput.descendHeld = input.isDown(bindings.sneak.key);
     playerInput.doubleTapForward = input.isDoubleTappedForTick(bindings.forward.key);
     playerInput.doubleTapJump = input.isDoubleTappedForTick(bindings.jump.key);
+    playerInput.allowFlight = modeAllowsFlight(state->gameMode);
+    playerInput.takesFallDamage = modeTakesDamage(state->gameMode);
     const Vec3 playerPositionBeforeMove = state->player.position;
     state->player.tick(*state->world, playerInput);
 
