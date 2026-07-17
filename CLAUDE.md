@@ -63,4 +63,4 @@ Every PR must pass: **format** (clang-format check) â†’ **lint** (clang-tidy) â†
 
 ## Performance Targets
 
-60 FPS at native resolution, 20 Hz simulation, < 4 GB RAM, view distance 12 chunks default. The budgets table in `docs/performance-conventions.md` is authoritative.
+60 FPS at native resolution and 4x MSAA on the documented Apple M4 Max route, a 20 Hz simulation, view distance 512, and at most 64 GB unified memory. Exact cubic simulation remains capped at radius 32. Cold far coverage begins with step-32 voxel parents, then each connected coordinate can refine directly to its distance-selected target before optional intermediate tiers and exact ownership. The budgets table in `docs/performance-conventions.md` is authoritative.
