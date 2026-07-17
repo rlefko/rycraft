@@ -7,8 +7,11 @@ bool tickMining(MiningState& state, bool leftHeld, bool hasBlockTarget, int64_t 
         return false;
     }
 
+    // Switching tools mid-mine restarts progress so the break time always
+    // matches the item actually held.
     const bool sameTarget = state.active && state.x == targetX && state.y == targetY &&
-                            state.z == targetZ && state.block == targetBlock;
+                            state.z == targetZ && state.block == targetBlock &&
+                            state.tool == heldItem;
     if (!sameTarget) {
         const int needed = blockBreakTicks(targetBlock, heldItem);
         state.active = true;
@@ -16,6 +19,7 @@ bool tickMining(MiningState& state, bool leftHeld, bool hasBlockTarget, int64_t 
         state.y = targetY;
         state.z = targetZ;
         state.block = targetBlock;
+        state.tool = heldItem;
         state.ticksElapsed = 0;
         state.ticksNeeded = needed;
         state.progress = 0.f;

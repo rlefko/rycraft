@@ -17,6 +17,7 @@ struct MiningState {
     int32_t y = 0;
     int64_t z = 0;
     BlockType block = BlockType::AIR;
+    ItemType tool = ItemType::NONE; // held item the break time was computed for
     int ticksElapsed = 0;
     int ticksNeeded = 0;
     float progress = 0.f; // 0..1 for the HUD

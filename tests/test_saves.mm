@@ -131,6 +131,32 @@ TEST_CASE("Inventory slots tolerate out-of-range items and oversized counts", "[
     REQUIRE(loaded->player.hunger == 20); // clamped
 }
 
+TEST_CASE("Reserved-gap item ids read as empty, not phantom items", "[saves][metadata]") {
+    TempDir directory("metadata_reserved_gap");
+    // Id 100 sits in the reserved gap between block ids (< 62) and non-block
+    // items (>= 256); it must load as empty, honoring the parser's contract.
+    writeTextFile(directory.path() + "/metadata.json",
+                  "{\n"
+                  "  \"seed\": 1,\n"
+                  "  \"spawnPos\": { \"x\": 0, \"y\": 0, \"z\": 0 },\n"
+                  "  \"worldTime\": 0,\n"
+                  "  \"player\": {\n"
+                  "    \"inventorySlots\": [[100, 5, 0], [57, 1, 0], [0, 0, 0]"
+                  ", [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]"
+                  ", [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]"
+                  ", [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]"
+                  ", [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]"
+                  ", [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]"
+                  ", [0, 0, 0], [0, 0, 0], [0, 0, 0]]\n"
+                  "  }\n"
+                  "}\n");
+    const auto loaded = SaveManager::readMetadataFile(directory.path() + "/metadata.json");
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->player.inventory[0].empty()); // reserved-gap id 100 dropped
+    // The last valid block id (andesite = 57 < 62) still loads.
+    REQUIRE(loaded->player.inventory[1] == ItemStack{itemFromBlock(BlockType::ANDESITE), 1, 0});
+}
+
 TEST_CASE("Block entities sidecar round-trips furnaces", "[saves][block-entities]") {
     TempDir directory("block_entities_roundtrip");
     SaveManager saves(directory.path());

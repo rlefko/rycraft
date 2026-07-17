@@ -1277,6 +1277,33 @@ TEST_CASE("Craft output is take-only and consumes the grid", "[slots]") {
     REQUIRE(inventory[0] == ItemStack{itemFromBlock(BlockType::PLANKS), 8, 0});
 }
 
+TEST_CASE("Shift-crafting into a nearly full inventory never creates items", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    ItemStack result;
+    SlotAccess access = craftingAccess(inventory, grid, result, 4, 2);
+    ItemStack cursor;
+
+    // One log crafts {PLANKS, 4}. Fill every slot with a foreign item except
+    // one planks stack with room for exactly 1 more.
+    grid[0] = ItemStack{itemFromBlock(BlockType::LOG), 3, 0};
+    result = ItemStack{itemFromBlock(BlockType::PLANKS), 4, 0};
+    for (ItemStack& slot : inventory) {
+        slot = ItemStack{ItemType::COAL, 64, 0};
+    }
+    inventory[0] = ItemStack{itemFromBlock(BlockType::PLANKS), 63, 0};
+
+    const auto before = inventory;
+    // The 4-plank batch cannot fully fit (only room for 1), so the craft is
+    // refused: no partial deposit, the grid is untouched, the output stands.
+    const auto outcome =
+        applySlotClick(access, cursor, {SlotDomain::CRAFT_OUT, 0}, SlotClickKind::SHIFT_LEFT);
+    REQUIRE_FALSE(outcome.changed);
+    REQUIRE(inventory == before);
+    REQUIRE(grid[0].count == 3);
+    REQUIRE(result == ItemStack{itemFromBlock(BlockType::PLANKS), 4, 0});
+}
+
 TEST_CASE("Creative palette hands out stacks and eats held ones", "[slots]") {
     std::array<ItemStack, 36> inventory{};
     SlotAccess access;
@@ -1525,6 +1552,23 @@ TEST_CASE("Mining respects tool speed and never breaks bedrock", "[mining]") {
     // Instant-break flora completes the first settled tick.
     MiningState grass;
     REQUIRE(tickMining(grass, true, true, 0, 0, 0, BlockType::TALL_GRASS, ItemType::NONE));
+}
+
+TEST_CASE("Mining restarts when the held tool changes mid-mine", "[mining]") {
+    MiningState state;
+    // Start on stone with a stone pickaxe (fast).
+    for (int tick = 0; tick < 5; ++tick) {
+        tickMining(state, true, true, 0, 0, 0, BlockType::STONE, ItemType::STONE_PICKAXE);
+    }
+    const int fastNeeded = state.ticksNeeded;
+    REQUIRE(state.ticksElapsed == 5);
+
+    // Switching to a bare hand recomputes the (much longer) break time and
+    // restarts progress, so pickaxe timing cannot break stone by hand.
+    tickMining(state, true, true, 0, 0, 0, BlockType::STONE, ItemType::NONE);
+    REQUIRE(state.ticksElapsed == 1);
+    REQUIRE(state.ticksNeeded > fastNeeded);
+    REQUIRE(state.tool == ItemType::NONE);
 }
 
 TEST_CASE("Survival exhaustion spends saturation then food", "[survival]") {

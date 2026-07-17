@@ -61,6 +61,14 @@ constexpr bool isBlockItem(ItemType type) {
     return static_cast<uint16_t>(type) < ITEM_ID_BASE;
 }
 
+// A defined id: a real block (0..BLOCK_TYPE_COUNT-1) or a non-block item
+// (ITEM_ID_BASE..COUNT-1). The gap between the two ranges is reserved for
+// future block ids, so a saved value there is not yet valid.
+constexpr bool isValidItemId(uint16_t id) {
+    return id < BLOCK_TYPE_COUNT ||
+           (id >= ITEM_ID_BASE && id < static_cast<uint16_t>(ItemType::COUNT));
+}
+
 // AIR for non-block items and for block ids no block type defines.
 constexpr BlockType blockFromItem(ItemType type) {
     const auto id = static_cast<uint16_t>(type);

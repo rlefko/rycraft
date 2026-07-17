@@ -90,7 +90,7 @@ bool parseInventorySlots(const std::string& content,
         const unsigned long type = values[slot * 3];
         const unsigned long count = values[slot * 3 + 1];
         const unsigned long durability = values[slot * 3 + 2];
-        if (type == 0 || type >= static_cast<unsigned long>(ItemType::COUNT) || count == 0) {
+        if (type == 0 || !isValidItemId(static_cast<uint16_t>(type)) || count == 0) {
             inventory[slot] = ItemStack{};
             continue;
         }
@@ -570,7 +570,7 @@ FurnaceMap SaveManager::loadBlockEntities() const {
         auto readStack = [&stackValues](size_t base) {
             const unsigned type = stackValues[base];
             const unsigned count = stackValues[base + 1];
-            if (type == 0 || type >= static_cast<unsigned>(ItemType::COUNT) || count == 0) {
+            if (type == 0 || !isValidItemId(static_cast<uint16_t>(type)) || count == 0) {
                 return ItemStack{};
             }
             const auto item = static_cast<ItemType>(type);

@@ -7,6 +7,21 @@
 
 namespace {
 
+// How many of `stack` would fit into the slot range without mutating it.
+int roomFor(const ItemStack* slots, int count, const ItemStack& stack) {
+    if (!slots || stack.empty()) return 0;
+    const int limit = maxStackSize(stack.type);
+    int room = 0;
+    for (int index = 0; index < count; ++index) {
+        if (slots[index].empty()) {
+            room += limit;
+        } else if (slots[index].type == stack.type) {
+            room += std::max(0, limit - slots[index].count);
+        }
+    }
+    return std::min(room, static_cast<int>(stack.count));
+}
+
 // Merge-then-fill absorption into a raw slot range; returns items absorbed.
 int addToSlots(ItemStack* slots, int count, const ItemStack& stack) {
     if (!slots || stack.empty()) return 0;
@@ -71,30 +86,35 @@ SlotClickOutcome takeFromOutput(const SlotAccess& access, ItemStack& cursor, boo
     if (!output || output->empty()) return outcome;
 
     if (kind == SlotClickKind::SHIFT_LEFT) {
-        // Craft repeatedly while the grid still matches; a full inventory
-        // stops the loop with the result left in place. Hard-capped so a
-        // self-sustaining recipe cannot spin forever.
+        // Craft or drain the output into the inventory repeatedly. Hard-capped
+        // so a self-sustaining recipe cannot spin forever.
         for (int iteration = 0; iteration < 64; ++iteration) {
             if (output->empty()) break;
             const ItemStack batch = *output;
-            const int absorbed = addToSlots(access.inventory, 36, batch);
-            if (absorbed < batch.count) {
-                // Partial absorption: shrink the visible output and stop.
-                if (!isCraft) {
-                    output->count = static_cast<uint8_t>(batch.count - absorbed);
-                    if (output->count == 0) output->clear();
-                }
-                outcome.changed = absorbed > 0;
-                outcome.crafted |= absorbed > 0;
-                return outcome;
-            }
-            outcome.changed = true;
-            outcome.crafted = true;
             if (isCraft) {
+                // A craft batch is atomic: the virtual result exists only if a
+                // craft happens, so take it only when it fully fits. Never
+                // deposit a partial batch (that would create items).
+                if (roomFor(access.inventory, 36, batch) < batch.count) return outcome;
+                addToSlots(access.inventory, 36, batch);
                 consumeOneCraft(std::span<ItemStack>(access.craftGrid,
                                                      static_cast<size_t>(access.craftGridSize)));
                 refreshCraftResult(access);
+                outcome.changed = true;
+                outcome.crafted = true;
             } else {
+                // The furnace output is a real stack, so a partial take is
+                // fine: shrink it by whatever the inventory absorbed.
+                const int absorbed = addToSlots(access.inventory, 36, batch);
+                if (absorbed > 0) {
+                    outcome.changed = true;
+                    outcome.crafted = true;
+                }
+                if (absorbed < batch.count) {
+                    output->count = static_cast<uint8_t>(batch.count - absorbed);
+                    if (output->count == 0) output->clear();
+                    return outcome;
+                }
                 output->clear();
             }
         }
