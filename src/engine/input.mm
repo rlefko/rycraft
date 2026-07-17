@@ -150,6 +150,34 @@ Key keyFromString(const std::string& str) {
 // ---------------------------------------------------------------------------
 // InputState
 // ---------------------------------------------------------------------------
+void InputState::beginTextEntry(const std::string& initial) {
+    textEntryActive = true;
+    textBuffer = initial;
+    textSubmitted = false;
+}
+
+std::string InputState::endTextEntry() {
+    textEntryActive = false;
+    textSubmitted = false;
+    std::string result = std::move(textBuffer);
+    textBuffer.clear();
+    return result;
+}
+
+void InputState::applyTextKey(char c) {
+    if (!textEntryActive || c < 0x20 || c > 0x7E)
+        return;
+    if (textBuffer.size() >= TEXT_BUFFER_MAX)
+        return;
+    textBuffer.push_back(c);
+}
+
+void InputState::applyTextBackspace() {
+    if (!textEntryActive || textBuffer.empty())
+        return;
+    textBuffer.pop_back();
+}
+
 bool InputState::isDown(Key key) const {
     auto it = keysDown.find(key);
     return it != keysDown.end() && it->second;
@@ -173,6 +201,7 @@ void InputState::update() {
     keysJustPressed.clear();
     keysJustReleased.clear();
     scrollDelta = 0.f;
+    textSubmitted = false;
 }
 
 void InputState::recordPress(Key key, double timeSeconds) {
@@ -369,6 +398,33 @@ InputState& InputManager::state() {
 }
 
 void InputManager::handleKeyDown(NSEvent* event) {
+    // Text entry consumes the keyboard first (repeats included, so held
+    // backspace erases); only Escape falls through to the game handler.
+    if (state_.textEntryActive) {
+        const NSInteger code = [event keyCode];
+        if (code == 51) { // delete
+            state_.applyTextBackspace();
+            return;
+        }
+        if (code == 36 || code == 76) { // return / keypad enter
+            state_.textSubmitted = true;
+            return;
+        }
+        if (code == 53) { // escape
+            if (![event isARepeat]) {
+                state_.recordPress(Key::Escape, [event timestamp]);
+            }
+            return;
+        }
+        if (NSString* characters = [event characters]) {
+            const char* utf8 = [characters UTF8String];
+            for (const char* c = utf8; c != nullptr && *c != '\0'; ++c) {
+                state_.applyTextKey(*c);
+            }
+        }
+        return;
+    }
+
     // Auto-repeats would re-fire edge-triggered actions (held ESC flickered
     // pause/resume at the key-repeat rate)
     if ([event isARepeat]) {

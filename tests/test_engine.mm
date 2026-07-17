@@ -943,3 +943,49 @@ TEST_CASE("Performance HUD: float to string conversion", "[phase8][hud]") {
     floatToString(0.5f, buf, sizeof(buf));
     REQUIRE(std::string(buf) == "0.5");
 }
+
+TEST_CASE("InputState: text entry accumulates edits and suppresses nothing else", "[input][text]") {
+    InputState input;
+    REQUIRE_FALSE(input.textEntryActive);
+
+    // Inactive entry ignores edits entirely.
+    input.applyTextKey('x');
+    input.applyTextBackspace();
+    REQUIRE(input.textBuffer.empty());
+
+    input.beginTextEntry("Seed");
+    REQUIRE(input.textEntryActive);
+    REQUIRE(input.textBuffer == "Seed");
+
+    input.applyTextKey(' ');
+    input.applyTextKey('4');
+    input.applyTextKey('2');
+    REQUIRE(input.textBuffer == "Seed 42");
+
+    // Control characters and non-ASCII bytes never land in the buffer.
+    input.applyTextKey('\t');
+    input.applyTextKey('\n');
+    input.applyTextKey(static_cast<char>(0x1B));
+    input.applyTextKey(static_cast<char>(0xC3));
+    REQUIRE(input.textBuffer == "Seed 42");
+
+    input.applyTextBackspace();
+    REQUIRE(input.textBuffer == "Seed 4");
+
+    // The cap holds regardless of how much is typed.
+    for (int i = 0; i < 300; ++i) {
+        input.applyTextKey('a');
+    }
+    REQUIRE(input.textBuffer.size() == InputState::TEXT_BUFFER_MAX);
+
+    const std::string finished = input.endTextEntry();
+    REQUIRE_FALSE(input.textEntryActive);
+    REQUIRE(finished.size() == InputState::TEXT_BUFFER_MAX);
+    REQUIRE(input.textBuffer.empty());
+
+    // Submission is a one-frame edge cleared by update().
+    input.beginTextEntry("");
+    input.textSubmitted = true;
+    input.update();
+    REQUIRE_FALSE(input.textSubmitted);
+}

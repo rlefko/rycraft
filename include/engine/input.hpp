@@ -92,6 +92,20 @@ struct InputState {
     bool mouseLeftDown = false;
     bool mouseRightDown = false;
 
+    // Text entry (world name and seed fields). While active, printable
+    // ASCII accumulates in textBuffer and game keys are suppressed except
+    // Escape, so typed WASD never leaks into movement.
+    bool textEntryActive = false;
+    std::string textBuffer;
+    bool textSubmitted = false; // Return pressed this frame; cleared by update()
+    static constexpr size_t TEXT_BUFFER_MAX = 64;
+
+    void beginTextEntry(const std::string& initial);
+    std::string endTextEntry(); // deactivates and returns the buffer
+    // Pure editing rules so gesture-free tests need no Cocoa events.
+    void applyTextKey(char c); // printable 0x20..0x7E, capped at TEXT_BUFFER_MAX
+    void applyTextBackspace();
+
     bool isDown(Key key) const;
     bool isJustPressed(Key key) const;
     bool isJustReleased(Key key) const;
