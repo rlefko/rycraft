@@ -208,6 +208,8 @@ The scene renders in linear HDR and is graded exactly once.
 
 Toggled-off effects skip work or bind static fallback textures. They do not fork the scene into an untonemapped path. Half- and quarter-resolution effects dither in space because this renderer uses memoryless 4x MSAA rather than a temporal history.
 
+The UI overlay pass on the single-sample LDR drawable draws three fixed z-phases per frame: solid-color base quads, then textured item icons, then solid-color top quads (stack counts, tooltips, carets). This ordering keeps counts and tooltips above every icon and the cursor-held stack above everything. The icon phase uses a second pipeline (`uiIconVertexMain`/`uiIconFragmentMain`) with its own ring buffer and the shared `UIIconVertex` layout in `shader_types.hpp` (size and offset asserted in `tests/test_render.mm`); it samples the block texture array, which carries item-icon layers appended after the block-face layers and addressed by a constexpr offset from the contiguous non-block `ItemType` range. When no world session is live the frame is a single clear-plus-overlay menu-only pass (`renderMenuOnly`) with no HDR, depth, or world reads. Dropped items render inside the MSAA scene pass through a sibling of the entity renderer that reuses the entity shader and vertex format, so they introduce no new GPU-shared struct.
+
 ## 11. Shadows, ambient occlusion, block light, and weather response
 
 - Shadow cascade projections are texel-snapped to prevent crawling.

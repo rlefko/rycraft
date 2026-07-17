@@ -24,6 +24,18 @@ A concept gets exactly one definition, in one header, and everyone imports it. C
 | GPU-shared struct layouts | `render/shader_types.hpp` |
 | Block-face → texture layer mapping | `render/block_textures.hpp` |
 | Menu geometry (drawn AND hit-tested) | `render/ui_menu.hpp` |
+| Items, stacks, drops, item colors, and the mining-time formula | `world/item.hpp` |
+| Crafting and smelting recipes and fuels | `world/recipes.hpp` |
+| Furnace state and its 20 Hz step | `world/furnace.hpp` |
+| Game mode rules and per-world generation toggles | `world/world_config.hpp` |
+| World enumeration, creation, and deletion | `world/world_list.hpp` |
+| Player inventory (36 slots, hotbar selection) | `engine/inventory.hpp` |
+| Slot click interaction (pick/place/split/quick-move) | `engine/slot_interaction.hpp` |
+| Survival food/air/regen timers and eating | `engine/survival.hpp` |
+| Block mining progress and tracking | `engine/mining.hpp` |
+| Melee entity picking | `entity/entity_picking.hpp` |
+| Dropped item entities | `entity/item_entity.hpp` |
+| Item-icon texture layers and slot drawing | `render/block_textures.hpp`, `render/ui_item_icon.mm` |
 | Yaw/pitch → look direction | `common/math.hpp` (`directionFromYawPitch`) |
 
 **Why:** this codebase once had four `isSolid` definitions (glass rendered solid, entities fell through it), three chunk-key schemes (one allocating strings per block access), six RNG implementations (one seeded from `random_device` in a deterministic game), five copies of GPU structs (all drifted), a hand-copied camera basis whose inverted signs walked W backwards, and separate exact and far field rules that exposed straight handoff boundaries. Duplicated definitions do not stay in sync; they diverge and each divergence is a bug.

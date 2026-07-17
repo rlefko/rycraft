@@ -60,10 +60,11 @@ A separate immutable far-terrain branch selects every tile intersecting the visi
 
 ## Ownership and lifetimes
 
-- `EngineState` owns the `World`, `SaveManager`, `Spawner`, audio, input, player state, and graphics settings.
+- `EngineState` owns the `World`, `SaveManager`, `Spawner`, audio, input, player state, graphics settings, the 36-slot `Inventory`, survival stats, the furnace map, the dropped-item manager, and the per-world configuration (name, game mode, generation toggles).
+- A world session is created and torn down at runtime, not only at process start. `-init` reaches the title with no world; `-startWorldAtPath:` builds `SaveManager`, `World`, and `Spawner`, and `-stopWorld` saves and destroys them in strict order: `RenderPipeline::endWorldSession` (which detaches the mesh scheduler that lazily captured a `const World&`, clears the resident cube meshes, and drops the recorded far-terrain identity so a re-open under an equal seed still resets), then `Spawner`, then `World`, then `SaveManager`. With no world session the frame renders a menu-only pass (`RenderPipeline::renderMenuOnly`).
 - `World` holds a non-owning `SaveManager*`. The engine constructs the save manager first and destroys it after the world.
 - `World` owns the cubic map, one active-set planner, six-worker generation pool, bounded generation backlog, column generator, block-light reconciliation queue, and fluid scheduler.
-- `RenderPipeline` owns the exact four-worker `MeshScheduler`, eight-worker far-terrain scheduler, exact and far mesh registries, exact and far mega-buffers, frame ring, block textures, shadow map, SSAO, volumetrics, volumetric clouds, water, bloom, post stack, entity renderer, and UI renderer.
+- `RenderPipeline` owns the exact four-worker `MeshScheduler`, eight-worker far-terrain scheduler, exact and far mesh registries, exact and far mega-buffers, frame ring, block textures, shadow map, SSAO, volumetrics, volumetric clouds, water, bloom, post stack, entity renderer, item-entity renderer, and UI renderer. The block texture array carries appended item-icon layers, and the UI overlay draws three fixed z-phases (solid base, textured icons sampling that array, solid top for counts and tooltips).
 - `Spawner` owns entity shared pointers and the spatial hash. Stable territory IDs identify wild fauna independently of visit order.
 - `World::~World` marks shutdown, cancels and joins the active-set planner, moves generation futures out of their map, and waits without holding the pending-work mutex. Workers capture `this`, so teardown cannot finish while one is still inserting a cube.
 - The engine shuts down exact and far mesh workers before destroying the world because exact jobs read snapshots from it and both schedulers own active threads.
@@ -72,7 +73,7 @@ A separate immutable far-terrain branch selects every tile intersecting the visi
 
 | Context | Work |
 |---|---|
-| Main thread | Input, fixed ticks, player and fauna simulation, fluid scheduling, bounded GPU uploads, command encoding, UI |
+| Main thread | Input, fixed ticks, player and fauna simulation, survival stats, mining progress, dropped-item physics and pickup, furnace ticking, fluid scheduling, bounded GPU uploads, command encoding, UI |
 | Active-set planner | Coalesce camera requests, select exact cubes and plan dependencies, publish retention, and unload stale cubes |
 | Six generation workers | Load or generate cubic chunks and construct cold column plans and basin solutions |
 | Four exact mesh workers | Copy a bounded snapshot, build greedy cubic geometry without the world lock, return versioned results |
@@ -198,7 +199,9 @@ This division keeps generation order-independent while localized player disturba
 
 ## Persistence boundary
 
-Generator version three stores RYCH v4 edited cubic sections beneath `regions-v3` using 64-bit X and Z plus section Y. Its packed 44-byte header includes an IEEE CRC-32 of the uncompressed block and optional fluid payload. A per-column manifest records edited section Y values and deferred fluid frontiers. Bulk visible-column reads copy only the required manifest data under one short lock. Manifest disk I/O uses a separate serialized write lock, and the bounded save queue coalesces repeated snapshots for a cubic position to the newest revision. Metadata remains separate and preserves the seed, player position and orientation, health, selected hotbar slot, nine-slot hotbar inventory, settings, and world time.
+Generator version three stores RYCH v4 edited cubic sections beneath `regions-v3` using 64-bit X and Z plus section Y. Its packed 44-byte header includes an IEEE CRC-32 of the uncompressed block and optional fluid payload. A per-column manifest records edited section Y values and deferred fluid frontiers. Bulk visible-column reads copy only the required manifest data under one short lock. Manifest disk I/O uses a separate serialized write lock, and the bounded save queue coalesces repeated snapshots for a cubic position to the newest revision. Metadata remains separate and preserves the seed, the fixed spawn anchor, the last player position and orientation, health, hunger, the selected hotbar slot, the 36-slot item-stack inventory (with counts and durability), the display name, the game mode, the generation toggles, timestamps, settings, and world time.
+
+Worlds live under a CWD-relative `saves/<name>` directory, enumerated by `world/world_list.hpp`; the legacy `rycraft_world` directory is adopted in place and never migrated. Metadata parsing is tolerant and backward compatible: the older `spawnPos`-only and nine-number `inventory` shapes still load, and a missing player section keeps the classic starter hotbar. Furnace state is the only stateful block; it persists in a per-world plaintext sidecar `block_entities.dat` (`RYBE 1` line format, atomic temp-then-rename write, forward-tolerant read that skips unknown record types), keyed by block position and loaded once at world start. Dropped item entities are never persisted; they despawn on quit and on a world switch.
 
 Generator-version-two cube files and manifests remain beneath `regions` and are never loaded into generator-version-three terrain. They are not deleted or converted. Compatible metadata still loads, and its generator version advances after the next successful metadata save. Detailed layout and paths are in [world-generation.md](world-generation.md).
 
@@ -212,6 +215,8 @@ Generator-version-two cube files and manifests remain beneath `regions` and are 
 4. Audio initialization may fail without preventing play.
 
 There is no project-wide `Result<T, E>` wrapper. These boundaries use the smallest established mechanism for their failure mode.
+
+Master audio volume follows the settings slider on every screen so interface clicks are audible in menus (`-playUiSfx:gain:` bypasses the playing-screen gate that world one-shots still respect). The paused-world feel is kept instead by stopping the looping wind bed off the playing screen; a frozen tick produces no world sounds.
 
 ## GPU boundary
 
