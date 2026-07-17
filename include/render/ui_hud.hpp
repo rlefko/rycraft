@@ -21,8 +21,9 @@ class UIOverlay;
 void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
                  uint32_t displayHeight);
 
-// The current menu (title/pause/settings), with hover highlighting.
-void drawMenu(UIOverlay& ui, const MenuLayout& layout, int hoveredButton, uint32_t displayWidth,
+// The current menu or container screen, with hover highlighting, slot
+// icons, the cursor-held stack, and the hovered-item tooltip.
+void drawMenu(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
               uint32_t displayHeight);
 
 // One stack inside a slot rectangle: isometric mini-cube for cube blocks,

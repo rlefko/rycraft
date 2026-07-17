@@ -10,6 +10,7 @@
 #include <engine/game_state.hpp>
 #include <engine/input_bindings.hpp>
 #include <engine/inventory.hpp>
+#include <engine/slot_interaction.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -1126,4 +1127,288 @@ TEST_CASE("InputState: text entry accumulates edits and suppresses nothing else"
     input.textSubmitted = true;
     input.update();
     REQUIRE_FALSE(input.textSubmitted);
+}
+
+namespace {
+
+SlotAccess craftingAccess(std::array<ItemStack, 36>& inventory, std::array<ItemStack, 9>& grid,
+                          ItemStack& result, int gridSize, int gridWidth) {
+    SlotAccess access;
+    access.inventory = inventory.data();
+    access.craftGrid = grid.data();
+    access.craftGridSize = gridSize;
+    access.craftGridWidth = gridWidth;
+    access.craftResult = &result;
+    return access;
+}
+
+} // namespace
+
+TEST_CASE("Slot clicks pick place merge and split", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    ItemStack result;
+    SlotAccess access = craftingAccess(inventory, grid, result, 4, 2);
+    ItemStack cursor;
+
+    inventory[0] = ItemStack{ItemType::COAL, 10, 0};
+    inventory[1] = ItemStack{ItemType::COAL, 60, 0};
+    inventory[2] = ItemStack{ItemType::STICK, 5, 0};
+
+    // LEFT on a stack picks the whole thing up.
+    REQUIRE(
+        applySlotClick(access, cursor, {SlotDomain::INVENTORY, 0}, SlotClickKind::LEFT).changed);
+    REQUIRE(cursor == ItemStack{ItemType::COAL, 10, 0});
+    REQUIRE(inventory[0].empty());
+
+    // LEFT on the same type merges up to the cap and keeps the rest held.
+    REQUIRE(
+        applySlotClick(access, cursor, {SlotDomain::INVENTORY, 1}, SlotClickKind::LEFT).changed);
+    REQUIRE(inventory[1].count == 64);
+    REQUIRE(cursor.count == 6);
+
+    // LEFT on a different type swaps.
+    REQUIRE(
+        applySlotClick(access, cursor, {SlotDomain::INVENTORY, 2}, SlotClickKind::LEFT).changed);
+    REQUIRE(cursor == ItemStack{ItemType::STICK, 5, 0});
+    REQUIRE(inventory[2] == ItemStack{ItemType::COAL, 6, 0});
+
+    // RIGHT with a held stack places exactly one.
+    REQUIRE(
+        applySlotClick(access, cursor, {SlotDomain::INVENTORY, 3}, SlotClickKind::RIGHT).changed);
+    REQUIRE(inventory[3] == ItemStack{ItemType::STICK, 1, 0});
+    REQUIRE(cursor.count == 4);
+
+    // RIGHT with an empty cursor takes the larger half.
+    cursor.clear();
+    inventory[4] = ItemStack{ItemType::COAL, 7, 0};
+    REQUIRE(
+        applySlotClick(access, cursor, {SlotDomain::INVENTORY, 4}, SlotClickKind::RIGHT).changed);
+    REQUIRE(cursor.count == 4);
+    REQUIRE(inventory[4].count == 3);
+
+    // Clicks on empty air with an empty cursor change nothing.
+    cursor.clear();
+    REQUIRE_FALSE(
+        applySlotClick(access, cursor, {SlotDomain::INVENTORY, 30}, SlotClickKind::LEFT).changed);
+}
+
+TEST_CASE("Shift clicks quick-move between regions", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    ItemStack result;
+    SlotAccess access = craftingAccess(inventory, grid, result, 9, 3);
+    ItemStack cursor;
+
+    // Hotbar to main.
+    inventory[2] = ItemStack{ItemType::COAL, 12, 0};
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::INVENTORY, 2}, SlotClickKind::SHIFT_LEFT)
+                .changed);
+    REQUIRE(inventory[2].empty());
+    REQUIRE(inventory[9] == ItemStack{ItemType::COAL, 12, 0});
+
+    // Main to hotbar.
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::INVENTORY, 9}, SlotClickKind::SHIFT_LEFT)
+                .changed);
+    REQUIRE(inventory[0] == ItemStack{ItemType::COAL, 12, 0});
+
+    // Craft grid to inventory.
+    grid[4] = ItemStack{itemFromBlock(BlockType::PLANKS), 3, 0};
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::CRAFT_IN, 4}, SlotClickKind::SHIFT_LEFT)
+                .changed);
+    REQUIRE(grid[4].empty());
+
+    // Inventory to an open furnace, routed by what the item can do there.
+    ItemStack furnaceInput;
+    ItemStack furnaceFuel;
+    ItemStack furnaceOutput;
+    access.furnaceInput = &furnaceInput;
+    access.furnaceFuel = &furnaceFuel;
+    access.furnaceOutput = &furnaceOutput;
+    inventory[5] = ItemStack{ItemType::RAW_BEEF, 2, 0};
+    inventory[6] = ItemStack{ItemType::COAL, 12, 0};
+    inventory[7] = ItemStack{ItemType::IRON_INGOT, 1, 0};
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::INVENTORY, 5}, SlotClickKind::SHIFT_LEFT)
+                .changed);
+    REQUIRE(furnaceInput == ItemStack{ItemType::RAW_BEEF, 2, 0});
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::INVENTORY, 6}, SlotClickKind::SHIFT_LEFT)
+                .changed);
+    REQUIRE(furnaceFuel == ItemStack{ItemType::COAL, 12, 0});
+    // Neither smeltable nor fuel goes nowhere.
+    REQUIRE_FALSE(
+        applySlotClick(access, cursor, {SlotDomain::INVENTORY, 7}, SlotClickKind::SHIFT_LEFT)
+            .changed);
+}
+
+TEST_CASE("Craft output is take-only and consumes the grid", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    ItemStack result;
+    SlotAccess access = craftingAccess(inventory, grid, result, 4, 2);
+    ItemStack cursor;
+
+    grid[0] = ItemStack{itemFromBlock(BlockType::LOG), 3, 0};
+    result = ItemStack{itemFromBlock(BlockType::PLANKS), 4, 0};
+
+    // Placement onto the output is refused.
+    cursor = ItemStack{ItemType::COAL, 1, 0};
+    REQUIRE_FALSE(
+        applySlotClick(access, cursor, {SlotDomain::CRAFT_OUT, 0}, SlotClickKind::LEFT).changed);
+    cursor.clear();
+
+    // Taking crafts once: log consumed, result refreshed for the next craft.
+    const auto taken =
+        applySlotClick(access, cursor, {SlotDomain::CRAFT_OUT, 0}, SlotClickKind::LEFT);
+    REQUIRE(taken.changed);
+    REQUIRE(taken.crafted);
+    REQUIRE(cursor == ItemStack{itemFromBlock(BlockType::PLANKS), 4, 0});
+    REQUIRE(grid[0].count == 2);
+    REQUIRE(result == ItemStack{itemFromBlock(BlockType::PLANKS), 4, 0});
+
+    // Shift-crafting drains the remaining logs straight into the inventory.
+    cursor.clear();
+    const auto drained =
+        applySlotClick(access, cursor, {SlotDomain::CRAFT_OUT, 0}, SlotClickKind::SHIFT_LEFT);
+    REQUIRE(drained.crafted);
+    REQUIRE(grid[0].empty());
+    REQUIRE(result.empty());
+    REQUIRE(inventory[0] == ItemStack{itemFromBlock(BlockType::PLANKS), 8, 0});
+}
+
+TEST_CASE("Creative palette hands out stacks and eats held ones", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    SlotAccess access;
+    access.inventory = inventory.data();
+    access.palette = CREATIVE_PALETTE.data();
+    access.paletteSize = static_cast<int>(CREATIVE_PALETTE.size());
+    ItemStack cursor;
+
+    const ItemType first = CREATIVE_PALETTE[0];
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::CREATIVE_PALETTE, 0}, SlotClickKind::LEFT)
+                .changed);
+    REQUIRE(cursor.type == first);
+    REQUIRE(cursor.count == maxStackSize(first));
+
+    // Holding anything, a palette click trashes it.
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::CREATIVE_PALETTE, 5}, SlotClickKind::LEFT)
+                .changed);
+    REQUIRE(cursor.empty());
+
+    // RIGHT builds a stack one item at a time.
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::CREATIVE_PALETTE, 0}, SlotClickKind::RIGHT)
+                .changed);
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::CREATIVE_PALETTE, 0}, SlotClickKind::RIGHT)
+                .changed);
+    REQUIRE(cursor == ItemStack{first, 2, 0});
+
+    // SHIFT sends a full stack straight into the inventory; the palette
+    // itself never mutates.
+    cursor.clear();
+    REQUIRE(
+        applySlotClick(access, cursor, {SlotDomain::CREATIVE_PALETTE, 0}, SlotClickKind::SHIFT_LEFT)
+            .changed);
+    REQUIRE(inventory[0].type == first);
+}
+
+TEST_CASE("Outside drops and container close return items", "[slots]") {
+    ItemStack cursor{ItemType::COAL, 5, 0};
+    REQUIRE(takeOutsideDrop(cursor, SlotClickKind::RIGHT) == ItemStack{ItemType::COAL, 1, 0});
+    REQUIRE(cursor.count == 4);
+    REQUIRE(takeOutsideDrop(cursor, SlotClickKind::LEFT) == ItemStack{ItemType::COAL, 4, 0});
+    REQUIRE(cursor.empty());
+    REQUIRE(takeOutsideDrop(cursor, SlotClickKind::LEFT).empty());
+
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    ItemStack result{itemFromBlock(BlockType::PLANKS), 4, 0};
+    SlotAccess access = craftingAccess(inventory, grid, result, 9, 3);
+    grid[0] = ItemStack{itemFromBlock(BlockType::LOG), 2, 0};
+    grid[8] = ItemStack{ItemType::STICK, 7, 0};
+    cursor = ItemStack{ItemType::COAL, 3, 0};
+
+    REQUIRE(collectOnClose(access, cursor).empty());
+    REQUIRE(cursor.empty());
+    REQUIRE(grid[0].empty());
+    REQUIRE(result.empty());
+    int coal = 0;
+    int sticks = 0;
+    int logs = 0;
+    for (const ItemStack& slot : inventory) {
+        if (slot.type == ItemType::COAL)
+            coal += slot.count;
+        if (slot.type == ItemType::STICK)
+            sticks += slot.count;
+        if (slot.type == itemFromBlock(BlockType::LOG))
+            logs += slot.count;
+    }
+    REQUIRE(coal == 3);
+    REQUIRE(sticks == 7);
+    REQUIRE(logs == 2);
+
+    // A stuffed inventory reports the homeless remainder.
+    for (ItemStack& slot : inventory) {
+        slot = ItemStack{ItemType::STICK, 64, 0};
+    }
+    grid[0] = ItemStack{itemFromBlock(BlockType::LOG), 2, 0};
+    cursor = ItemStack{ItemType::COAL, 3, 0};
+    const auto overflow = collectOnClose(access, cursor);
+    REQUIRE(overflow.size() == 2);
+}
+
+TEST_CASE("Container layouts expose every slot with correct references", "[ui][containers]") {
+    MenuContext ctx;
+    ctx.container.inventory[0] = ItemStack{ItemType::COAL, 9, 0};
+    ctx.container.craftGrid[0] = ItemStack{itemFromBlock(BlockType::LOG), 1, 0};
+    ctx.container.craftResult = ItemStack{itemFromBlock(BlockType::PLANKS), 4, 0};
+
+    MenuLayout survival = buildScreenLayout(GameScreen::INVENTORY, 1024.f, 768.f, ctx);
+    int inventorySlots = 0;
+    int craftIn = 0;
+    int craftOut = 0;
+    for (const SlotWidget& slot : survival.slots) {
+        if (slot.ref.domain == SlotDomain::INVENTORY)
+            ++inventorySlots;
+        if (slot.ref.domain == SlotDomain::CRAFT_IN)
+            ++craftIn;
+        if (slot.ref.domain == SlotDomain::CRAFT_OUT)
+            ++craftOut;
+    }
+    REQUIRE(inventorySlots == 36);
+    REQUIRE(craftIn == 4);
+    REQUIRE(craftOut == 1);
+    REQUIRE(survival.slots.front().stack == ItemStack{itemFromBlock(BlockType::LOG), 1, 0});
+
+    MenuLayout crafting = buildScreenLayout(GameScreen::CRAFTING, 1024.f, 768.f, ctx);
+    craftIn = 0;
+    for (const SlotWidget& slot : crafting.slots) {
+        if (slot.ref.domain == SlotDomain::CRAFT_IN)
+            ++craftIn;
+    }
+    REQUIRE(craftIn == 9);
+
+    // Creative shows the paged palette instead of a craft grid.
+    ctx.container.creative = true;
+    ctx.container.creativePage = 1;
+    MenuLayout creative = buildScreenLayout(GameScreen::INVENTORY, 1024.f, 768.f, ctx);
+    int palette = 0;
+    int minIndex = 1 << 20;
+    for (const SlotWidget& slot : creative.slots) {
+        if (slot.ref.domain == SlotDomain::CREATIVE_PALETTE) {
+            ++palette;
+            minIndex = std::min(minIndex, slot.ref.index);
+        }
+        REQUIRE(slot.ref.domain != SlotDomain::CRAFT_IN);
+    }
+    const int expected =
+        std::min<int>(CREATIVE_PALETTE_PAGE_SIZE,
+                      static_cast<int>(CREATIVE_PALETTE.size()) - CREATIVE_PALETTE_PAGE_SIZE);
+    REQUIRE(palette == expected);
+    REQUIRE(minIndex == CREATIVE_PALETTE_PAGE_SIZE);
+
+    // Slot hit-testing resolves through the typed path.
+    const SlotWidget& probe = survival.slots.front();
+    const UIHit hit =
+        uiHitTest(survival, probe.rect.x + probe.rect.w * 0.5f, probe.rect.y + probe.rect.h * 0.5f);
+    REQUIRE(hit.kind == UIHitKind::SLOT);
+    REQUIRE(hit.index == 0);
 }

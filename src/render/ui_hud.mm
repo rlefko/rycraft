@@ -3,6 +3,8 @@
 #include "render/ui_overlay.hpp"
 #include "world/item.hpp"
 
+#include <algorithm>
+
 void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
                  uint32_t displayHeight) {
     if (!screenHasWorldSession(frame.screen))
@@ -72,8 +74,10 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
     }
 }
 
-void drawMenu(UIOverlay& ui, const MenuLayout& layout, int hoveredButton, uint32_t displayWidth,
+void drawMenu(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
               uint32_t displayHeight) {
+    const MenuLayout& layout = frame.menu;
+    const int hoveredButton = frame.hoveredButton;
     const float w = static_cast<float>(displayWidth);
     const float h = static_cast<float>(displayHeight);
 
@@ -153,5 +157,64 @@ void drawMenu(UIOverlay& ui, const MenuLayout& layout, int hoveredButton, uint32
 
     for (const MenuText& text : layout.texts) {
         ui.drawString(text.text.c_str(), text.x, text.y, text.scale, text.r, text.g, text.b);
+    }
+
+    // ---- Container slots: inset well, icon, count, hover overlay ----
+    for (size_t i = 0; i < layout.slots.size(); ++i) {
+        const SlotWidget& slot = layout.slots[i];
+        const float bx = 2.0f / w;
+        const float by = 2.0f / h;
+        ui.drawQuad(slot.rect.x - bx, slot.rect.y - by, slot.rect.w + 2 * bx, slot.rect.h + 2 * by,
+                    0.05f, 0.05f, 0.06f, 0.95f);
+        ui.drawQuad(slot.rect.x, slot.rect.y, slot.rect.w, slot.rect.h, 0.22f, 0.22f, 0.26f, 0.95f);
+
+        if (!slot.stack.empty()) {
+            const float inset = slot.rect.w * 0.12f;
+            const float insetY = slot.rect.h * 0.12f;
+            drawItemIcon(ui, slot.stack, slot.rect.x + inset, slot.rect.y + insetY,
+                         slot.rect.w - 2 * inset, slot.rect.h - 2 * insetY);
+            if (slot.stack.count > 1) {
+                char count[8];
+                UIOverlay::intToString(slot.stack.count, count, sizeof(count));
+                const float countScale = 1.5f * (h / 768.0f);
+                const float countWidth = ui.measureString(count, countScale);
+                const float countX = slot.rect.x + slot.rect.w - countWidth - 2.0f / w;
+                const float countY = slot.rect.y + 2.0f / h;
+                ui.drawStringTop(count, countX + 1.0f / w, countY - 1.0f / h, countScale, 0.05f,
+                                 0.05f, 0.05f);
+                ui.drawStringTop(count, countX, countY, countScale, 1.0f, 1.0f, 1.0f);
+            }
+        }
+        if (static_cast<int>(i) == frame.hoveredSlot) {
+            ui.drawQuadTop(slot.rect.x, slot.rect.y, slot.rect.w, slot.rect.h, 1.0f, 1.0f, 1.0f,
+                           0.22f);
+        }
+    }
+
+    // ---- Cursor-held stack rides the mouse above everything ----
+    if (!frame.cursorStack.empty()) {
+        const float iconH = 40.0f * (h / 768.0f) / h;
+        const float iconW = iconH * (h / w);
+        drawItemIcon(ui, frame.cursorStack, frame.mouseX - iconW * 0.5f,
+                     frame.mouseY - iconH * 0.5f, iconW, iconH);
+        if (frame.cursorStack.count > 1) {
+            char count[8];
+            UIOverlay::intToString(frame.cursorStack.count, count, sizeof(count));
+            const float countScale = 1.5f * (h / 768.0f);
+            ui.drawStringTop(count, frame.mouseX + iconW * 0.2f, frame.mouseY - iconH * 0.55f,
+                             countScale, 1.0f, 1.0f, 1.0f);
+        }
+    }
+
+    // ---- Tooltip: hovered item name near the cursor, top phase ----
+    if (!frame.tooltipText.empty() && frame.cursorStack.empty()) {
+        const float tipScale = 1.5f * (h / 768.0f);
+        const float tipWidth = ui.measureString(frame.tooltipText.c_str(), tipScale);
+        const float tipHeight = 10.0f * tipScale / h;
+        float tipX = std::min(frame.mouseX + 14.0f / w, 1.0f - tipWidth - 4.0f / w);
+        float tipY = std::min(frame.mouseY + 10.0f / h, 1.0f - tipHeight - 4.0f / h);
+        ui.drawQuadTop(tipX - 4.0f / w, tipY - 3.0f / h, tipWidth + 8.0f / w, tipHeight + 6.0f / h,
+                       0.05f, 0.05f, 0.08f, 0.92f);
+        ui.drawStringTop(frame.tooltipText.c_str(), tipX, tipY, tipScale, 1.0f, 1.0f, 1.0f);
     }
 }

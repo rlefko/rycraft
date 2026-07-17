@@ -12,6 +12,7 @@
 #include <engine/game_state.hpp>
 #include <engine/input_bindings.hpp>
 #include <engine/inventory.hpp>
+#include <engine/slot_interaction.hpp>
 #include <entity/ai.hpp>
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
@@ -20,6 +21,7 @@
 #include <render/graphics_settings.hpp>
 #include <render/render_pipeline.hpp>
 #include <render/ui_menu.hpp>
+#include <world/recipes.hpp>
 #include <world/save_manager.hpp>
 #include <world/world.hpp>
 #include <world/world_list.hpp>
@@ -316,6 +318,13 @@ struct EngineState {
     Vec3 worldSpawn{0.f, 100.f, 0.f}; // respawn anchor, distinct from playerPos
     int hunger = 20;
     FurnaceMap furnaces;
+
+    // ---- Container screens ----
+    std::array<ItemStack, 9> craftGrid{}; // first 4 used on the inventory screen
+    ItemStack craftResult;
+    ItemStack cursorStack;
+    int creativePage = 0;
+    int hoveredSlot = -1;
 
     // ---- Game flow & UI ----
     std::vector<WorldSummary> worldList; // cached on entering the world menus
@@ -723,7 +732,8 @@ static std::string defaultWorldDirectory() {
     const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN");
     const std::string screenName = screenEnv ? screenEnv : "";
     const bool wantsGameplayScreen = screenName == "playing" || screenName == "paused" ||
-                                     screenName == "settings" || screenName == "video";
+                                     screenName == "settings" || screenName == "video" ||
+                                     screenName == "inventory" || screenName == "crafting";
     const bool menuScreenRequested = !screenName.empty() && !wantsGameplayScreen;
     const bool wantsWorld = wantsGameplayScreen ||
                             (!menuScreenRequested &&
@@ -757,6 +767,10 @@ static std::string defaultWorldDirectory() {
                 _state->flow.screen = GameScreen::SETTINGS;
             } else if (screenName == "video") {
                 _state->flow.screen = GameScreen::VIDEO_SETTINGS;
+            } else if (screenName == "inventory") {
+                _state->flow.screen = GameScreen::INVENTORY;
+            } else if (screenName == "crafting") {
+                _state->flow.screen = GameScreen::CRAFTING;
             }
         }
     }
@@ -1044,6 +1058,45 @@ static std::string defaultWorldDirectory() {
     }
 }
 
+// Mutable stack access for the currently open container screen.
+- (SlotAccess)slotAccessForScreen {
+    EngineState* state = _state.get();
+    SlotAccess access;
+    access.inventory = state->inventory.slots().data();
+    const GameScreen screen = state->flow.screen;
+    const bool creative = state->gameMode == GameMode::CREATIVE;
+    if (screen == GameScreen::INVENTORY && creative) {
+        access.palette = CREATIVE_PALETTE.data();
+        access.paletteSize = static_cast<int>(CREATIVE_PALETTE.size());
+    } else if (screen == GameScreen::INVENTORY) {
+        access.craftGrid = state->craftGrid.data();
+        access.craftGridSize = 4;
+        access.craftGridWidth = 2;
+        access.craftResult = &state->craftResult;
+    } else if (screen == GameScreen::CRAFTING) {
+        access.craftGrid = state->craftGrid.data();
+        access.craftGridSize = 9;
+        access.craftGridWidth = 3;
+        access.craftResult = &state->craftResult;
+    }
+    return access;
+}
+
+// Leaving a container: the craft grid and held stack return to the
+// inventory. Anything that cannot fit is genuinely homeless (a full
+// inventory) and is logged; dropped item entities absorb this path next.
+- (void)closeContainerSession {
+    EngineState* state = _state.get();
+    SlotAccess access = [self slotAccessForScreen];
+    std::vector<ItemStack> overflow = collectOnClose(access, state->cursorStack);
+    for (const ItemStack& stack : overflow) {
+        if (state->inventory.add(stack) < stack.count) {
+            RY_LOG_ERROR("Container close overflow could not return every item");
+        }
+    }
+    state->hoveredSlot = -1;
+}
+
 // Close the focused text field, committing its filtered contents.
 - (void)commitTextEntry {
     EngineState* state = _state.get();
@@ -1144,6 +1197,16 @@ static std::string defaultWorldDirectory() {
             [self applyFlowEffects:state->flow.onMenuAction(MenuAction::CANCEL_DELETE)];
             return;
         }
+        case MenuAction::CREATIVE_PAGE_PREV:
+            state->creativePage = std::max(0, state->creativePage - 1);
+            return;
+        case MenuAction::CREATIVE_PAGE_NEXT: {
+            const int pageCount =
+                (static_cast<int>(CREATIVE_PALETTE.size()) + CREATIVE_PALETTE_PAGE_SIZE - 1) /
+                CREATIVE_PALETTE_PAGE_SIZE;
+            state->creativePage = std::min(pageCount - 1, state->creativePage + 1);
+            return;
+        }
         case MenuAction::TOGGLE_GAME_MODE:
             state->gameMode =
                 state->gameMode == GameMode::CREATIVE ? GameMode::SURVIVAL : GameMode::CREATIVE;
@@ -1168,11 +1231,21 @@ static std::string defaultWorldDirectory() {
         return;
     InputState& input = state->inputManager->state();
 
+    if (state->world && !input.textEntryActive &&
+        input.isJustPressed(InputBindings{}.inventory.key)) {
+        if (state->flow.inContainer()) {
+            [self closeContainerSession];
+        }
+        [self applyFlowEffects:state->flow.onInventoryKey()];
+    }
     if (input.isJustPressed(Key::Escape)) {
         if (input.textEntryActive) {
             // Escape closes the field, not the screen.
             [self commitTextEntry];
         } else {
+            if (state->flow.inContainer()) {
+                [self closeContainerSession];
+            }
             // Leaving a settings screen persists the values (not per click —
             // no disk I/O while stepping)
             bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
@@ -1235,11 +1308,42 @@ static std::string defaultWorldDirectory() {
         if (state->flow.screen == GameScreen::WORLD_CREATE) {
             menuCtx.worldCreate = state->worldCreate;
         }
+        if (state->flow.inContainer()) {
+            ContainerView& view = menuCtx.container;
+            view.inventory = state->inventory.slots();
+            view.craftGrid = state->craftGrid;
+            view.craftGridSize = state->flow.screen == GameScreen::CRAFTING ? 9 : 4;
+            view.craftResult = state->craftResult;
+            view.creative = state->flow.screen == GameScreen::INVENTORY &&
+                            state->gameMode == GameMode::CREATIVE;
+            view.creativePage = state->creativePage;
+        }
+        if (state->flow.inContainer() && state->flow.screen != GameScreen::FURNACE &&
+            state->gameMode != GameMode::CREATIVE) {
+            const int gridSize = state->flow.screen == GameScreen::CRAFTING ? 9 : 4;
+            const int gridWidth = state->flow.screen == GameScreen::CRAFTING ? 3 : 2;
+            const auto result = matchCraftingRecipe(
+                std::span<const ItemStack>(state->craftGrid.data(), static_cast<size_t>(gridSize)),
+                gridWidth);
+            state->craftResult = result.value_or(ItemStack{});
+            menuCtx.container.craftResult = state->craftResult;
+        }
         state->menuLayout = buildScreenLayout(state->flow.screen, boundsW, boundsH, menuCtx);
 
         Vec2 mouse = input.mousePosition;
         const UIHit hit = uiHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
         state->hoveredButton = hit.kind == UIHitKind::BUTTON ? hit.index : -1;
+        state->hoveredSlot = hit.kind == UIHitKind::SLOT ? hit.index : -1;
+
+        if (hit.kind == UIHitKind::SLOT &&
+            (input.isJustPressed(Key::MouseLeft) || input.isJustPressed(Key::MouseRight))) {
+            const SlotWidget& slotWidget = state->menuLayout.slots[static_cast<size_t>(hit.index)];
+            const SlotClickKind kind = input.isJustPressed(Key::MouseRight) ? SlotClickKind::RIGHT
+                                       : input.isDown(Key::LeftShift) ? SlotClickKind::SHIFT_LEFT
+                                                                      : SlotClickKind::LEFT;
+            SlotAccess access = [self slotAccessForScreen];
+            applySlotClick(access, state->cursorStack, slotWidget.ref, kind);
+        }
 
         if (input.isJustPressed(Key::MouseLeft)) {
             if (hit.kind == UIHitKind::TEXT_FIELD) {
@@ -1900,6 +2004,25 @@ static std::string defaultWorldDirectory() {
     uiFrame.hotbar.selected = state->inventory.getSelectedIndex();
     for (int slot = 0; slot < Inventory::HOTBAR_SLOTS; ++slot) {
         uiFrame.hotbar.slots[static_cast<size_t>(slot)] = state->inventory.getSlot(slot);
+    }
+    uiFrame.hoveredSlot = state->hoveredSlot;
+    uiFrame.cursorStack = state->cursorStack;
+    if (state->inputManager && _view) {
+        const Vec2 mouse = state->inputManager->state().mousePosition;
+        const float boundsW = static_cast<float>(_view.bounds.size.width);
+        const float boundsH = static_cast<float>(_view.bounds.size.height);
+        if (boundsW > 0.f && boundsH > 0.f) {
+            uiFrame.mouseX = mouse.x / boundsW;
+            uiFrame.mouseY = mouse.y / boundsH;
+        }
+    }
+    if (state->hoveredSlot >= 0 && state->cursorStack.empty() &&
+        state->hoveredSlot < static_cast<int>(state->menuLayout.slots.size())) {
+        const ItemStack& hovered =
+            state->menuLayout.slots[static_cast<size_t>(state->hoveredSlot)].stack;
+        if (!hovered.empty()) {
+            uiFrame.tooltipText = itemName(hovered.type);
+        }
     }
     // Underwater view (veil, god rays, dense fog): the camera cell is water.
     // Non-generating read — a streaming lag must never stall the frame.

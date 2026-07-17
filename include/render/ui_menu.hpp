@@ -55,17 +55,42 @@ struct TextFieldWidget {
     bool caret = false;
 };
 
+// Which stack collection a slot addresses; index is domain-relative
+// (INVENTORY 0-8 hotbar then 9-35 main, CREATIVE_PALETTE absolute).
+enum class SlotDomain : uint8_t {
+    NONE,
+    INVENTORY,
+    CRAFT_IN,
+    CRAFT_OUT,
+    FURNACE_INPUT,
+    FURNACE_FUEL,
+    FURNACE_OUTPUT,
+    CREATIVE_PALETTE,
+};
+
+struct SlotRef {
+    SlotDomain domain = SlotDomain::NONE;
+    int index = 0;
+};
+
+struct SlotWidget {
+    UIRect rect;
+    SlotRef ref;
+    ItemStack stack{}; // drawn snapshot (palette entries draw as full stacks)
+};
+
 struct MenuLayout {
     float dimAlpha = 0.f; // full-screen darkening behind the menu
     UIRect panel{};       // w == 0 → no panel
     std::vector<MenuText> texts;
     std::vector<MenuButton> buttons;
     std::vector<TextFieldWidget> textFields;
+    std::vector<SlotWidget> slots;
 };
 
 // Typed hit-testing across every widget kind. menuHitTest remains for
 // button-only callers.
-enum class UIHitKind : uint8_t { NONE, BUTTON, TEXT_FIELD };
+enum class UIHitKind : uint8_t { NONE, BUTTON, TEXT_FIELD, SLOT };
 struct UIHit {
     UIHitKind kind = UIHitKind::NONE;
     int index = -1; // into the matching layout vector
@@ -163,6 +188,11 @@ struct PerformanceStats {
 struct UIFrameState {
     GameScreen screen = GameScreen::TITLE;
     int hoveredButton = -1; // index into menu.buttons, -1 = none
+    int hoveredSlot = -1;   // index into menu.slots, -1 = none
+    ItemStack cursorStack{};
+    float mouseX = 0.f; // normalized, for the held stack and tooltip
+    float mouseY = 0.f;
+    std::string tooltipText; // hovered-slot display name, empty = none
     bool showDebugHud = false;
     bool cameraUnderwater = false; // drives the underwater veil + god rays
     PerformanceStats stats{};
@@ -207,6 +237,21 @@ struct WorldCreateState {
 // world_list.hpp so typed names always render and persist escape-free.
 std::string filterTextField(const std::string& raw, bool digitsOnly, size_t maxLength);
 
+// Everything a container screen shows, snapshotted by the engine per frame.
+struct ContainerView {
+    std::array<ItemStack, 36> inventory{}; // 0-8 hotbar, 9-35 main
+    std::array<ItemStack, 9> craftGrid{};  // first 4 used on INVENTORY
+    int craftGridSize = 4;                 // 4 (2x2) or 9 (3x3)
+    ItemStack craftResult{};
+    ItemStack furnaceInput{};
+    ItemStack furnaceFuel{};
+    ItemStack furnaceOutput{};
+    float furnaceCook = 0.f;     // 0..1 arrow fill
+    float furnaceFuelLeft = 0.f; // 0..1 flame fill
+    bool creative = false;       // palette instead of the craft grid
+    int creativePage = 0;
+};
+
 // Everything any menu screen draws, filled by the engine each frame.
 struct MenuContext {
     SettingsValues settings{};
@@ -217,7 +262,13 @@ struct MenuContext {
     WorldCreateState worldCreate{};
     bool caretVisible = true;
     std::string deleteWorldName;
+    ContainerView container{};
 };
+
+// Creative palette paging: 45 palette slots per screenful.
+inline constexpr int CREATIVE_PALETTE_COLUMNS = 9;
+inline constexpr int CREATIVE_PALETTE_ROWS = 5;
+inline constexpr int CREATIVE_PALETTE_PAGE_SIZE = CREATIVE_PALETTE_COLUMNS * CREATIVE_PALETTE_ROWS;
 
 // Build the layout for any screen (Playing returns an empty layout).
 MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHeight,

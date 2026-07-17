@@ -2954,7 +2954,7 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
     _uiOverlay->beginFrame();
     drawGameHud(*_uiOverlay, uiFrame, _displayWidth, _displayHeight);
     if (uiFrame.screen != GameScreen::PLAYING) {
-        drawMenu(*_uiOverlay, uiFrame.menu, uiFrame.hoveredButton, _displayWidth, _displayHeight);
+        drawMenu(*_uiOverlay, uiFrame, _displayWidth, _displayHeight);
     }
     _uiOverlay->flush(encoder);
 }

@@ -283,6 +283,113 @@ MenuLayout buildDeleteConfirmLayout(const LayoutContext& ctx, const MenuContext&
     return layout;
 }
 
+// One slot square; the widget stores its drawn snapshot for hit + render.
+void addSlot(MenuLayout& layout, const LayoutContext& ctx, SlotDomain domain, int index,
+             const ItemStack& stack, float centerX, float centerY) {
+    constexpr float SLOT = 44.f;
+    UIRect rect{centerX - ctx.px(SLOT) * 0.5f, centerY - ctx.py(SLOT) * 0.5f, ctx.px(SLOT),
+                ctx.py(SLOT)};
+    layout.slots.push_back(SlotWidget{rect, SlotRef{domain, index}, stack});
+}
+
+// The shared bottom block every container screen ends with: the 9x3 main
+// grid over the hotbar row, indices matching Inventory slot numbering.
+void addInventoryBlock(MenuLayout& layout, const LayoutContext& ctx, const ContainerView& view,
+                       float topY) {
+    constexpr float PITCH = 50.f;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 9; ++col) {
+            const int slot = 9 + row * 9 + col;
+            addSlot(layout, ctx, SlotDomain::INVENTORY, slot,
+                    view.inventory[static_cast<size_t>(slot)], 0.5f + ctx.px((col - 4) * PITCH),
+                    topY - ctx.py(row * PITCH));
+        }
+    }
+    const float hotbarY = topY - ctx.py(3 * PITCH + 14.f);
+    for (int col = 0; col < 9; ++col) {
+        addSlot(layout, ctx, SlotDomain::INVENTORY, col, view.inventory[static_cast<size_t>(col)],
+                0.5f + ctx.px((col - 4) * PITCH), hotbarY);
+    }
+}
+
+MenuLayout buildInventoryLayout(const LayoutContext& ctx, const MenuContext& menu) {
+    MenuLayout layout;
+    layout.dimAlpha = 0.45f;
+    const ContainerView& view = menu.container;
+    const float halfHeight = view.creative ? 330.f : 310.f;
+    layout.panel = UIRect{0.5f - ctx.px(250.f), 0.5f - ctx.py(halfHeight), ctx.px(500.f),
+                          ctx.py(halfHeight * 2.f)};
+
+    if (view.creative) {
+        addCenteredText(layout, ctx, "CREATIVE", 0.5f + ctx.py(300.f), 2.5f);
+        constexpr float PITCH = 50.f;
+        const int pageStart = view.creativePage * CREATIVE_PALETTE_PAGE_SIZE;
+        const int paletteCount = static_cast<int>(CREATIVE_PALETTE.size());
+        for (int cell = 0; cell < CREATIVE_PALETTE_PAGE_SIZE; ++cell) {
+            const int index = pageStart + cell;
+            if (index >= paletteCount) break;
+            const int row = cell / CREATIVE_PALETTE_COLUMNS;
+            const int col = cell % CREATIVE_PALETTE_COLUMNS;
+            const ItemType type = CREATIVE_PALETTE[static_cast<size_t>(index)];
+            addSlot(layout, ctx, SlotDomain::CREATIVE_PALETTE, index, makeItemStack(type, 1),
+                    0.5f + ctx.px((col - 4) * PITCH), 0.5f + ctx.py(250.f - row * PITCH));
+        }
+        const int pageCount =
+            (paletteCount + CREATIVE_PALETTE_PAGE_SIZE - 1) / CREATIVE_PALETTE_PAGE_SIZE;
+        if (view.creativePage > 0) {
+            addButton(layout, ctx, "-", MenuAction::CREATIVE_PAGE_PREV, 0.5f - ctx.px(60.f),
+                      0.5f - ctx.py(10.f), 36.f, 36.f);
+        }
+        addCenteredText(layout, ctx,
+                        "PAGE " + std::to_string(view.creativePage + 1) + "/" +
+                            std::to_string(pageCount),
+                        0.5f - ctx.py(10.f), 1.5f, 0.85f, 0.85f, 0.9f);
+        if ((view.creativePage + 1) < pageCount) {
+            addButton(layout, ctx, "+", MenuAction::CREATIVE_PAGE_NEXT, 0.5f + ctx.px(60.f),
+                      0.5f - ctx.py(10.f), 36.f, 36.f);
+        }
+    } else {
+        addCenteredText(layout, ctx, "INVENTORY", 0.5f + ctx.py(280.f), 2.5f);
+        // 2x2 crafting grid, arrow, and result at the top.
+        constexpr float PITCH = 50.f;
+        for (int cell = 0; cell < 4; ++cell) {
+            const int row = cell / 2;
+            const int col = cell % 2;
+            addSlot(layout, ctx, SlotDomain::CRAFT_IN, cell,
+                    view.craftGrid[static_cast<size_t>(cell)], 0.5f - ctx.px(75.f - col * PITCH),
+                    0.5f + ctx.py(230.f - row * PITCH));
+        }
+        addCenteredText(layout, ctx, "-", 0.5f + ctx.py(205.f), 3.0f, 0.8f, 0.8f, 0.85f);
+        addSlot(layout, ctx, SlotDomain::CRAFT_OUT, 0, view.craftResult, 0.5f + ctx.px(85.f),
+                0.5f + ctx.py(205.f));
+    }
+
+    addInventoryBlock(layout, ctx, view, 0.5f - ctx.py(view.creative ? 70.f : 20.f));
+    return layout;
+}
+
+MenuLayout buildCraftingLayout(const LayoutContext& ctx, const MenuContext& menu) {
+    MenuLayout layout;
+    layout.dimAlpha = 0.45f;
+    layout.panel = UIRect{0.5f - ctx.px(250.f), 0.5f - ctx.py(320.f), ctx.px(500.f), ctx.py(640.f)};
+    const ContainerView& view = menu.container;
+
+    addCenteredText(layout, ctx, "CRAFTING", 0.5f + ctx.py(290.f), 2.5f);
+    constexpr float PITCH = 50.f;
+    for (int cell = 0; cell < 9; ++cell) {
+        const int row = cell / 3;
+        const int col = cell % 3;
+        addSlot(layout, ctx, SlotDomain::CRAFT_IN, cell, view.craftGrid[static_cast<size_t>(cell)],
+                0.5f - ctx.px(100.f - col * PITCH), 0.5f + ctx.py(240.f - row * PITCH));
+    }
+    addCenteredText(layout, ctx, "-", 0.5f + ctx.py(190.f), 3.0f, 0.8f, 0.8f, 0.85f);
+    addSlot(layout, ctx, SlotDomain::CRAFT_OUT, 0, view.craftResult, 0.5f + ctx.px(120.f),
+            0.5f + ctx.py(190.f));
+
+    addInventoryBlock(layout, ctx, view, 0.5f - ctx.py(40.f));
+    return layout;
+}
+
 } // namespace
 
 MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeight,
@@ -336,12 +443,14 @@ MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHei
             return buildWorldCreateLayout(layoutCtx, ctx);
         case GameScreen::WORLD_DELETE_CONFIRM:
             return buildDeleteConfirmLayout(layoutCtx, ctx);
+        case GameScreen::INVENTORY:
+            return buildInventoryLayout(layoutCtx, ctx);
+        case GameScreen::CRAFTING:
+            return buildCraftingLayout(layoutCtx, ctx);
         case GameScreen::TITLE:
         case GameScreen::SETTINGS:
         case GameScreen::VIDEO_SETTINGS:
         case GameScreen::PLAYING:
-        case GameScreen::INVENTORY:
-        case GameScreen::CRAFTING:
         case GameScreen::FURNACE:
         case GameScreen::DEATH:
             return buildMenuLayout(screen, pixelWidth, pixelHeight, ctx.settings,
@@ -363,6 +472,11 @@ std::string filterTextField(const std::string& raw, bool digitsOnly, size_t maxL
 }
 
 UIHit uiHitTest(const MenuLayout& layout, float mouseX, float mouseY) {
+    for (size_t i = 0; i < layout.slots.size(); ++i) {
+        if (layout.slots[i].rect.contains(mouseX, mouseY)) {
+            return UIHit{UIHitKind::SLOT, static_cast<int>(i)};
+        }
+    }
     for (size_t i = 0; i < layout.textFields.size(); ++i) {
         if (layout.textFields[i].rect.contains(mouseX, mouseY)) {
             return UIHit{UIHitKind::TEXT_FIELD, static_cast<int>(i)};
