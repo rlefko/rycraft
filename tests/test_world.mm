@@ -7,8 +7,8 @@
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
 #include <engine/game_state.hpp>
-#include <engine/inventory.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -1336,7 +1336,11 @@ TEST_CASE("SaveManager snapshots edited sections under one manifest lock", "[sav
 TEST_CASE("SaveManager metadata records the cubic format version", "[save]") {
     TempDir directory("cubic_metadata");
     SaveManager saves(directory.path());
-    saves.saveMetadata(12345, Vec3{100.f, 80.f, -50.f}, 9876543210ULL);
+    SaveManager::WorldMetadata written;
+    written.seed = 12345;
+    written.spawnPos = Vec3{100.f, 80.f, -50.f};
+    written.worldTime = 9876543210ULL;
+    saves.saveMetadata(written);
 
     auto metadata = saves.loadMetadata();
     REQUIRE(metadata.has_value());
@@ -1350,15 +1354,18 @@ TEST_CASE("SaveManager metadata records the cubic format version", "[save]") {
 TEST_CASE("SaveManager preserves non-chunk player metadata", "[save][metadata]") {
     TempDir directory("rycraft_player_metadata");
     SaveManager saves(directory.path());
-    SaveManager::PlayerMetadata player;
-    player.yaw = 127.5f;
-    player.pitch = -31.25f;
-    player.health = 13;
-    player.selectedSlot = 7;
-    player.inventory[0] = BlockType::BASALT;
-    player.inventory[7] = BlockType::LILY_PAD;
+    SaveManager::WorldMetadata written;
+    written.seed = 9191;
+    written.spawnPos = Vec3{12.0f, 88.0f, -4.0f};
+    written.worldTime = 123456;
+    written.player.yaw = 127.5f;
+    written.player.pitch = -31.25f;
+    written.player.health = 13;
+    written.player.selectedSlot = 7;
+    written.player.inventory[0] = ItemStack{itemFromBlock(BlockType::BASALT), 12, 0};
+    written.player.inventory[35] = ItemStack{ItemType::IRON_PICKAXE, 1, 187};
 
-    saves.saveMetadata(9191, Vec3{12.0f, 88.0f, -4.0f}, 123456, player);
+    saves.saveMetadata(written);
     const auto loaded = saves.loadMetadata();
 
     REQUIRE(loaded.has_value());
@@ -1369,8 +1376,8 @@ TEST_CASE("SaveManager preserves non-chunk player metadata", "[save][metadata]")
     REQUIRE(loaded->player.pitch == Catch::Approx(-31.25f));
     REQUIRE(loaded->player.health == 13);
     REQUIRE(loaded->player.selectedSlot == 7);
-    REQUIRE(loaded->player.inventory[0] == BlockType::BASALT);
-    REQUIRE(loaded->player.inventory[7] == BlockType::LILY_PAD);
+    REQUIRE(loaded->player.inventory[0] == ItemStack{itemFromBlock(BlockType::BASALT), 12, 0});
+    REQUIRE(loaded->player.inventory[35] == ItemStack{ItemType::IRON_PICKAXE, 1, 187});
 }
 
 TEST_CASE("SaveManager persists activated fluid frontiers across restart", "[save][fluid]") {

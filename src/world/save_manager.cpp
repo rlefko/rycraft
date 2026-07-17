@@ -3,6 +3,7 @@
 #include "common/error.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -30,38 +31,97 @@ bool parseNumber(const std::string& content, const char* field, Number& value, P
     }
 }
 
-bool parseInventory(const std::string& content,
-                    std::array<BlockType, SaveManager::PLAYER_INVENTORY_SLOTS>& inventory) {
-    size_t position = content.find("\"inventory\"");
+// Reads `count` unsigned integers after `field`, skipping brackets, commas,
+// and whitespace. The minimal-JSON metadata format never nests arrays of
+// anything but numbers, so a flat scan is sufficient and stays tolerant.
+bool parseNumberList(const std::string& content, const char* field, unsigned long* values,
+                     size_t count) {
+    size_t position = content.find(field);
     if (position == std::string::npos) return false;
     position = content.find('[', position);
     if (position == std::string::npos) return false;
     ++position;
-    auto parsed = inventory;
-    for (size_t slot = 0; slot < parsed.size(); ++slot) {
-        while (
-            position < content.size() &&
-            (content[position] == ' ' || content[position] == '\n' || content[position] == ',')) {
+    for (size_t index = 0; index < count; ++index) {
+        while (position < content.size() &&
+               (content[position] == ' ' || content[position] == '\n' || content[position] == ',' ||
+                content[position] == '[' || content[position] == ']')) {
             ++position;
         }
         if (position >= content.size()) return false;
         size_t consumed = 0;
-        unsigned long value = 0;
         try {
-            value = std::stoul(content.substr(position), &consumed);
+            values[index] = std::stoul(content.substr(position), &consumed);
         } catch (...) {
             return false;
         }
-        if (consumed == 0 || value >= static_cast<unsigned long>(BlockType::COUNT)) return false;
-        parsed[slot] = static_cast<BlockType>(value);
+        if (consumed == 0) return false;
         position += consumed;
     }
+    return true;
+}
+
+// Legacy nine-block hotbar array ("inventory"); each entry becomes a
+// count-one stack.
+bool parseLegacyInventory(const std::string& content,
+                          std::array<ItemStack, SaveManager::PLAYER_INVENTORY_SLOTS>& inventory) {
+    std::array<unsigned long, SaveManager::PLAYER_HOTBAR_SLOTS> values{};
+    if (!parseNumberList(content, "\"inventory\"", values.data(), values.size())) return false;
+    for (unsigned long value : values) {
+        if (value >= static_cast<unsigned long>(BlockType::COUNT)) return false;
+    }
+    for (size_t slot = 0; slot < values.size(); ++slot) {
+        const auto block = static_cast<BlockType>(values[slot]);
+        inventory[slot] =
+            block == BlockType::AIR ? ItemStack{} : ItemStack{itemFromBlock(block), 1, 0};
+    }
+    return true;
+}
+
+// Current 36-slot stack array ("inventorySlots": [[type,count,durability],...]).
+// Out-of-range item ids and zero counts read as empty slots so newer saves
+// stay loadable.
+bool parseInventorySlots(const std::string& content,
+                         std::array<ItemStack, SaveManager::PLAYER_INVENTORY_SLOTS>& inventory) {
+    std::array<unsigned long, SaveManager::PLAYER_INVENTORY_SLOTS * 3> values{};
+    if (!parseNumberList(content, "\"inventorySlots\"", values.data(), values.size())) {
+        return false;
+    }
+    for (size_t slot = 0; slot < inventory.size(); ++slot) {
+        const unsigned long type = values[slot * 3];
+        const unsigned long count = values[slot * 3 + 1];
+        const unsigned long durability = values[slot * 3 + 2];
+        if (type == 0 || type >= static_cast<unsigned long>(ItemType::COUNT) || count == 0) {
+            inventory[slot] = ItemStack{};
+            continue;
+        }
+        const auto item = static_cast<ItemType>(type);
+        const auto capped =
+            static_cast<uint8_t>(std::min(count, static_cast<unsigned long>(maxStackSize(item))));
+        inventory[slot] = ItemStack{item, capped, static_cast<uint16_t>(durability)};
+    }
+    return true;
+}
+
+// One quoted string value; the world-name charset is restricted at input so
+// escapes never occur in a file this game wrote.
+bool parseString(const std::string& content, const char* field, std::string& value) {
+    size_t position = content.find(field);
+    if (position == std::string::npos) return false;
+    position += std::strlen(field);
     while (position < content.size() && (content[position] == ' ' || content[position] == '\n')) {
         ++position;
     }
-    if (position >= content.size() || content[position] != ']') return false;
-    inventory = parsed;
+    if (position >= content.size() || content[position] != '"') return false;
+    const size_t end = content.find('"', position + 1);
+    if (end == std::string::npos) return false;
+    value = content.substr(position + 1, end - position - 1);
     return true;
+}
+
+uint64_t wallClockMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count());
 }
 
 bool blockPositionLess(const BlockPos& left, const BlockPos& right) {
@@ -137,6 +197,7 @@ SaveManager::SaveManager(const std::string& worldPath, std::shared_ptr<TestHooks
     : worldPath_(worldPath)
     , regionsPath_(worldPath + "/" + CURRENT_REGIONS_DIRECTORY)
     , metadataPath_(worldPath + "/metadata.json")
+    , blockEntitiesPath_(worldPath + "/block_entities.dat")
     , testHooks_(std::move(testHooks)) {
     ensureDirectory(worldPath_);
     ensureDirectory(regionsPath_);
@@ -317,30 +378,43 @@ std::vector<FluidBoundaryFrontier> SaveManager::loadDeferredFluidFrontiers() con
     return result;
 }
 
-bool SaveManager::saveMetadata(uint32_t seed, Vec3 spawnPos, uint64_t worldTime) {
-    return saveMetadata(seed, spawnPos, worldTime, PlayerMetadata{});
-}
-
-bool SaveManager::saveMetadata(uint32_t seed, Vec3 spawnPos, uint64_t worldTime,
-                               const PlayerMetadata& player) {
+bool SaveManager::saveMetadata(const WorldMetadata& metadata) {
     std::ostringstream json;
     json << "{\n"
-         << "  \"seed\": " << seed << ",\n"
-         << "  \"spawnPos\": {\n"
-         << "    \"x\": " << spawnPos.x << ",\n"
-         << "    \"y\": " << spawnPos.y << ",\n"
-         << "    \"z\": " << spawnPos.z << "\n"
+         << "  \"name\": \"" << metadata.name << "\",\n"
+         << "  \"seed\": " << metadata.seed << ",\n"
+         << "  \"gameMode\": " << static_cast<unsigned>(metadata.gameMode) << ",\n"
+         << "  \"generation\": {\n"
+         << "    \"structures\": " << (metadata.generation.structures ? 1 : 0) << ",\n"
+         << "    \"fauna\": " << (metadata.generation.fauna ? 1 : 0) << ",\n"
+         << "    \"weather\": " << (metadata.generation.weather ? 1 : 0) << ",\n"
+         << "    \"dayCycle\": " << (metadata.generation.dayCycle ? 1 : 0) << "\n"
          << "  },\n"
-         << "  \"worldTime\": " << worldTime << ",\n"
+         << "  \"createdMs\": " << metadata.createdMs << ",\n"
+         << "  \"lastPlayedMs\": " << wallClockMs() << ",\n"
+         << "  \"spawnPos\": {\n"
+         << "    \"x\": " << metadata.spawnPos.x << ",\n"
+         << "    \"y\": " << metadata.spawnPos.y << ",\n"
+         << "    \"z\": " << metadata.spawnPos.z << "\n"
+         << "  },\n"
+         << "  \"playerPos\": {\n"
+         << "    \"px\": " << metadata.playerPos.x << ",\n"
+         << "    \"py\": " << metadata.playerPos.y << ",\n"
+         << "    \"pz\": " << metadata.playerPos.z << "\n"
+         << "  },\n"
+         << "  \"worldTime\": " << metadata.worldTime << ",\n"
          << "  \"player\": {\n"
-         << "    \"yaw\": " << player.yaw << ",\n"
-         << "    \"pitch\": " << player.pitch << ",\n"
-         << "    \"health\": " << player.health << ",\n"
-         << "    \"selectedSlot\": " << player.selectedSlot << ",\n"
-         << "    \"inventory\": [";
-    for (size_t slot = 0; slot < player.inventory.size(); ++slot) {
+         << "    \"yaw\": " << metadata.player.yaw << ",\n"
+         << "    \"pitch\": " << metadata.player.pitch << ",\n"
+         << "    \"health\": " << metadata.player.health << ",\n"
+         << "    \"hunger\": " << metadata.player.hunger << ",\n"
+         << "    \"selectedSlot\": " << metadata.player.selectedSlot << ",\n"
+         << "    \"inventorySlots\": [";
+    for (size_t slot = 0; slot < metadata.player.inventory.size(); ++slot) {
+        const ItemStack& stack = metadata.player.inventory[slot];
         if (slot != 0) json << ", ";
-        json << static_cast<unsigned>(player.inventory[slot]);
+        json << '[' << static_cast<unsigned>(stack.type) << ", "
+             << static_cast<unsigned>(stack.count) << ", " << stack.durability << ']';
     }
     json << "]\n"
          << "  },\n"
@@ -352,7 +426,11 @@ bool SaveManager::saveMetadata(uint32_t seed, Vec3 spawnPos, uint64_t worldTime,
 }
 
 std::optional<SaveManager::WorldMetadata> SaveManager::loadMetadata() const {
-    std::ifstream file(metadataPath_);
+    return readMetadataFile(metadataPath_);
+}
+
+std::optional<SaveManager::WorldMetadata> SaveManager::readMetadataFile(const std::string& path) {
+    std::ifstream file(path);
     if (!file.is_open()) return std::nullopt;
     const std::string content((std::istreambuf_iterator<char>(file)),
                               std::istreambuf_iterator<char>());
@@ -373,19 +451,142 @@ std::optional<SaveManager::WorldMetadata> SaveManager::loadMetadata() const {
                 [](const std::string& value) { return std::stoul(value); });
     parseNumber(content, "\"generatorVersion\":", metadata.generatorVersion,
                 [](const std::string& value) { return std::stoul(value); });
+    parseString(content, "\"name\":", metadata.name);
+    unsigned long mode = static_cast<unsigned long>(GameMode::CREATIVE);
+    parseNumber(content, "\"gameMode\":", mode,
+                [](const std::string& value) { return std::stoul(value); });
+    metadata.gameMode = mode == static_cast<unsigned long>(GameMode::SURVIVAL) ? GameMode::SURVIVAL
+                                                                               : GameMode::CREATIVE;
+    auto parseToggle = [&content](const char* field, bool& toggle) {
+        int value = toggle ? 1 : 0;
+        parseNumber(content, field, value, [](const std::string& text) { return std::stoi(text); });
+        toggle = value != 0;
+    };
+    parseToggle("\"structures\":", metadata.generation.structures);
+    parseToggle("\"fauna\":", metadata.generation.fauna);
+    parseToggle("\"weather\":", metadata.generation.weather);
+    parseToggle("\"dayCycle\":", metadata.generation.dayCycle);
+    parseNumber(content, "\"createdMs\":", metadata.createdMs,
+                [](const std::string& value) { return std::stoull(value); });
+    parseNumber(content, "\"lastPlayedMs\":", metadata.lastPlayedMs,
+                [](const std::string& value) { return std::stoull(value); });
+    metadata.playerPos = metadata.spawnPos;
+    parseNumber(content, "\"px\":", metadata.playerPos.x,
+                [](const std::string& value) { return std::stof(value); });
+    parseNumber(content, "\"py\":", metadata.playerPos.y,
+                [](const std::string& value) { return std::stof(value); });
+    parseNumber(content, "\"pz\":", metadata.playerPos.z,
+                [](const std::string& value) { return std::stof(value); });
     parseNumber(content, "\"yaw\":", metadata.player.yaw,
                 [](const std::string& value) { return std::stof(value); });
     parseNumber(content, "\"pitch\":", metadata.player.pitch,
                 [](const std::string& value) { return std::stof(value); });
     parseNumber(content, "\"health\":", metadata.player.health,
                 [](const std::string& value) { return std::stoi(value); });
+    parseNumber(content, "\"hunger\":", metadata.player.hunger,
+                [](const std::string& value) { return std::stoi(value); });
     parseNumber(content, "\"selectedSlot\":", metadata.player.selectedSlot,
                 [](const std::string& value) { return std::stoi(value); });
     metadata.player.health = std::clamp(metadata.player.health, 0, 20);
+    metadata.player.hunger = std::clamp(metadata.player.hunger, 0, 20);
     metadata.player.selectedSlot =
-        std::clamp(metadata.player.selectedSlot, 0, static_cast<int>(PLAYER_INVENTORY_SLOTS) - 1);
-    parseInventory(content, metadata.player.inventory);
+        std::clamp(metadata.player.selectedSlot, 0, static_cast<int>(PLAYER_HOTBAR_SLOTS) - 1);
+    if (!parseInventorySlots(content, metadata.player.inventory)) {
+        parseLegacyInventory(content, metadata.player.inventory);
+    }
     return metadata;
+}
+
+bool SaveManager::saveBlockEntities(const FurnaceMap& furnaces) {
+    // Deterministic order keeps the file diffable and the tests stable.
+    std::vector<const FurnaceMap::value_type*> entries;
+    entries.reserve(furnaces.size());
+    for (const auto& entry : furnaces) {
+        entries.push_back(&entry);
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto* left, const auto* right) {
+        return blockPositionLess(left->first, right->first);
+    });
+
+    std::ostringstream out;
+    out << "RYBE 1\n";
+    for (const auto* entry : entries) {
+        const BlockPos& pos = entry->first;
+        const FurnaceState& furnace = entry->second;
+        auto stack = [&out](const ItemStack& item) {
+            out << ' ' << static_cast<unsigned>(item.type) << ' '
+                << static_cast<unsigned>(item.count) << ' ' << item.durability;
+        };
+        out << "furnace " << pos.x << ' ' << pos.y << ' ' << pos.z << ' '
+            << furnace.burnTicksRemaining << ' ' << furnace.burnTicksTotal << ' '
+            << furnace.cookTicks;
+        stack(furnace.input);
+        stack(furnace.fuel);
+        stack(furnace.output);
+        out << '\n';
+    }
+    const std::string text = out.str();
+    return writeFileWithRetries(blockEntitiesPath_, std::vector<uint8_t>(text.begin(), text.end()));
+}
+
+FurnaceMap SaveManager::loadBlockEntities() const {
+    FurnaceMap furnaces;
+    std::ifstream file(blockEntitiesPath_);
+    if (!file.is_open()) return furnaces;
+
+    std::string header;
+    if (!std::getline(file, header) || header.rfind("RYBE ", 0) != 0) {
+        RY_LOG_ERROR("Block entities file has an unrecognized header; ignoring it");
+        return furnaces;
+    }
+
+    std::string line;
+    bool reportedMalformed = false;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        std::istringstream in(line);
+        std::string record;
+        in >> record;
+        if (record != "furnace") continue; // future record types load as unknown
+
+        long long x = 0;
+        long long z = 0;
+        int y = 0;
+        unsigned burnRemaining = 0;
+        unsigned burnTotal = 0;
+        unsigned cook = 0;
+        std::array<unsigned, 9> stackValues{};
+        in >> x >> y >> z >> burnRemaining >> burnTotal >> cook;
+        for (unsigned& value : stackValues) {
+            in >> value;
+        }
+        if (in.fail()) {
+            if (!reportedMalformed) {
+                RY_LOG_ERROR("Dropped a malformed block entity line");
+                reportedMalformed = true;
+            }
+            continue;
+        }
+        auto readStack = [&stackValues](size_t base) {
+            const unsigned type = stackValues[base];
+            const unsigned count = stackValues[base + 1];
+            if (type == 0 || type >= static_cast<unsigned>(ItemType::COUNT) || count == 0) {
+                return ItemStack{};
+            }
+            const auto item = static_cast<ItemType>(type);
+            const auto capped = static_cast<uint8_t>(std::min<unsigned>(count, maxStackSize(item)));
+            return ItemStack{item, capped, static_cast<uint16_t>(stackValues[base + 2])};
+        };
+        FurnaceState furnace;
+        furnace.burnTicksRemaining = static_cast<uint16_t>(burnRemaining);
+        furnace.burnTicksTotal = static_cast<uint16_t>(burnTotal);
+        furnace.cookTicks = static_cast<uint16_t>(cook);
+        furnace.input = readStack(0);
+        furnace.fuel = readStack(3);
+        furnace.output = readStack(6);
+        furnaces[BlockPos{static_cast<int64_t>(x), y, static_cast<int64_t>(z)}] = furnace;
+    }
+    return furnaces;
 }
 
 bool SaveManager::flush() {

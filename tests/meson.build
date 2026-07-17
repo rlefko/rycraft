@@ -23,6 +23,7 @@ test_sources = files(
   'test_entity.mm',
   'test_fauna_habitat.mm',
   'test_fluid_persistence.mm',
+  'test_saves.mm',
   'test_render_concurrency.mm',
   'test_engine.mm',
   'test_audio.mm',

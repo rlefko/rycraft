@@ -304,6 +304,16 @@ struct EngineState {
     Vec3 highlightedBlock; // Block currently targeted by crosshair
     bool hasHighlightedBlock = false;
 
+    // ---- Per-world configuration & stateful blocks ----
+    // Round-tripped through metadata.json and the block-entities sidecar.
+    std::string worldName;
+    GameMode gameMode = GameMode::CREATIVE;
+    GenerationSettings generation;
+    uint64_t worldCreatedMs = 0;
+    Vec3 worldSpawn{0.f, 100.f, 0.f}; // respawn anchor, distinct from playerPos
+    int hunger = 20;
+    FurnaceMap furnaces;
+
     // ---- Game flow & UI ----
     GameFlow flow;                   // Title → Playing ⇄ Paused ⇄ Settings
     bool spawnValidated = false;     // player unstuck from stale-save terrain
@@ -414,22 +424,28 @@ static EngineState* _engineGetState(Engine* engine) {
         uint32_t seed = 42;
         Vec3 spawnPos{0.f, 100.f, 0.f};
         SaveManager::PlayerMetadata playerMeta{};
+        Vec3 playerPos = spawnPos;
         if (auto meta = _state->saveManager->loadMetadata()) {
             seed = meta->seed;
             spawnPos = meta->spawnPos;
+            playerPos = meta->playerPos;
             _state->worldTime = meta->worldTime;
+            _state->worldName = meta->name;
+            _state->gameMode = meta->gameMode;
+            _state->generation = meta->generation;
+            _state->worldCreatedMs = meta->createdMs;
             playerMeta = meta->player;
         }
+        _state->worldSpawn = spawnPos;
         _state->player.yaw = playerMeta.yaw;
         _state->player.pitch = playerMeta.pitch;
         _state->player.health = playerMeta.health;
+        _state->hunger = playerMeta.hunger;
         _state->inventory.selectSlot(playerMeta.selectedSlot);
         for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
-            const BlockType block = playerMeta.inventory[slot];
-            _state->inventory.setSlot(
-                static_cast<int>(slot),
-                block == BlockType::AIR ? ItemStack{} : ItemStack{itemFromBlock(block), 1, 0});
+            _state->inventory.setSlot(static_cast<int>(slot), playerMeta.inventory[slot]);
         }
+        _state->furnaces = _state->saveManager->loadBlockEntities();
         if (const char* seedEnv = std::getenv("RYCRAFT_WORLD_SEED")) {
             seed = static_cast<uint32_t>(std::strtoull(seedEnv, nullptr, 0));
         }
@@ -437,8 +453,11 @@ static EngineState* _engineGetState(Engine* engine) {
             float x = 0.0f;
             float y = 0.0f;
             float z = 0.0f;
-            if (std::sscanf(spawnEnv, "%f,%f,%f", &x, &y, &z) == 3)
+            if (std::sscanf(spawnEnv, "%f,%f,%f", &x, &y, &z) == 3) {
                 spawnPos = {x, y, z};
+                playerPos = spawnPos;
+                _state->worldSpawn = spawnPos;
+            }
         }
 
         // Playtest hook: pin the time of day (0..23999; 6000 = noon).
@@ -471,7 +490,7 @@ static EngineState* _engineGetState(Engine* engine) {
         // Chunks load from disk before regenerating, so block edits persist
         _state->world->setSaveManager(_state->saveManager.get());
         _state->spawner = std::make_unique<Spawner>(*_state->world);
-        _state->player.position = spawnPos;
+        _state->player.position = playerPos;
     }
     return self;
 }
@@ -963,19 +982,27 @@ static EngineState* _engineGetState(Engine* engine) {
     if (state->saveManager && state->world) {
         // Edited chunks persist on unload; the quit path sweeps the rest
         const bool frontiersSaved = state->world->saveModifiedChunks();
-        SaveManager::PlayerMetadata playerMetadata;
-        playerMetadata.yaw = state->player.yaw;
-        playerMetadata.pitch = state->player.pitch;
-        playerMetadata.health = state->player.health;
-        playerMetadata.selectedSlot = state->inventory.getSelectedIndex();
+        SaveManager::WorldMetadata worldMetadata;
+        worldMetadata.seed = state->world->getSeed();
+        worldMetadata.spawnPos = state->worldSpawn;
+        worldMetadata.playerPos = state->player.position;
+        worldMetadata.worldTime = state->worldTime;
+        worldMetadata.name = state->worldName;
+        worldMetadata.gameMode = state->gameMode;
+        worldMetadata.generation = state->generation;
+        worldMetadata.createdMs = state->worldCreatedMs;
+        worldMetadata.player.yaw = state->player.yaw;
+        worldMetadata.player.pitch = state->player.pitch;
+        worldMetadata.player.health = state->player.health;
+        worldMetadata.player.hunger = state->hunger;
+        worldMetadata.player.selectedSlot = state->inventory.getSelectedIndex();
         for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
-            playerMetadata.inventory[slot] =
-                blockFromItem(state->inventory.getSlot(static_cast<int>(slot)).type);
+            worldMetadata.player.inventory[slot] = state->inventory.getSlot(static_cast<int>(slot));
         }
-        const bool metadataSaved = state->saveManager->saveMetadata(
-            state->world->getSeed(), state->player.position, state->worldTime, playerMetadata);
+        const bool metadataSaved = state->saveManager->saveMetadata(worldMetadata);
+        const bool blockEntitiesSaved = state->saveManager->saveBlockEntities(state->furnaces);
         const bool cubesSaved = state->saveManager->flush();
-        if (frontiersSaved && metadataSaved && cubesSaved) {
+        if (frontiersSaved && metadataSaved && blockEntitiesSaved && cubesSaved) {
             RY_LOG_INFO("World state saved");
         } else {
             RY_LOG_ERROR("World state save did not complete");
