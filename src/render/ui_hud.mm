@@ -87,11 +87,17 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
     }
 
     // ---- Hotbar (9 slots at bottom of screen) ----
+    // The UI projection has no aspect correction, so a square slot needs a
+    // width fraction (over w) and a height fraction (over h) that map to the
+    // same device pixels. slotH is the slot edge in height units; slotW is the
+    // matching width so the slot, its icon, and its count all align.
     const int slotCount = static_cast<int>(frame.hotbar.slots.size());
-    float slotSize = 58.0f / h;
-    float slotGap = 2.0f / h;
+    const float slotPixels = 58.0f;
+    float slotH = slotPixels / h;
+    float slotW = slotPixels / w;
+    float slotGapW = 2.0f / w;
     float hotbarY = 8.0f / h;
-    float totalWidth = slotCount * slotSize + (slotCount - 1) * slotGap;
+    float totalWidth = slotCount * slotW + (slotCount - 1) * slotGapW;
     float hotbarX = (1.0f - totalWidth) * 0.5f;
 
     // ---- Survival stat rows (hearts, hunger, air) above the hotbar ----
@@ -99,7 +105,7 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
         // scale = device pixels per 8x8 bitmap pixel (an ~14px icon at 2x).
         const float iconScale = 1.75f * (h / 768.0f);
         const float pitch = 9.0f * iconScale / w;
-        const float heartsY = hotbarY + slotSize + 8.0f / h;
+        const float heartsY = hotbarY + slotH + 8.0f / h;
         drawStatRow(ui, HEART_ICON, frame.health, 10, hotbarX, heartsY, iconScale, w, h, 0.85f,
                     0.12f, 0.12f);
         const float hungerStartX = hotbarX + totalWidth - 10 * pitch;
@@ -118,31 +124,30 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
     int selectedIndex = frame.hotbar.selected;
 
     for (int i = 0; i < slotCount; ++i) {
-        float slotX = hotbarX + i * (slotSize + slotGap);
+        float slotX = hotbarX + i * (slotW + slotGapW);
 
         if (i == selectedIndex) {
-            ui.drawQuad(slotX - 2.0f / w, hotbarY - 2.0f / h, slotSize + 4.0f / w,
-                        slotSize + 4.0f / h, 1.0f, 1.0f, 1.0f, 0.8f);
+            ui.drawQuad(slotX - 2.0f / w, hotbarY - 2.0f / h, slotW + 4.0f / w, slotH + 4.0f / h,
+                        1.0f, 1.0f, 1.0f, 0.8f);
         }
 
-        ui.drawQuad(slotX, hotbarY, slotSize, slotSize, 0.3f, 0.3f, 0.3f, 0.6f);
+        ui.drawQuad(slotX, hotbarY, slotW, slotH, 0.3f, 0.3f, 0.3f, 0.6f);
 
         // Item indicator: the real block/item texture, empty slots stay bare
         const ItemStack& stack = frame.hotbar.slots[static_cast<size_t>(i)];
         if (stack.empty())
             continue;
-        float innerSize = slotSize * 0.72f;
-        float innerOffset = (slotSize - innerSize) * 0.5f;
-        const float innerW = innerSize * (h / w);
-        const float innerX = slotX + (slotSize * (h / w) - innerW) * 0.5f;
-        drawItemIcon(ui, stack, innerX, hotbarY + innerOffset, innerW, innerSize);
+        const float insetW = slotW * 0.14f;
+        const float insetH = slotH * 0.14f;
+        drawItemIcon(ui, stack, slotX + insetW, hotbarY + insetH, slotW - 2 * insetW,
+                     slotH - 2 * insetH);
 
         if (stack.count > 1) {
             char count[8];
             UIOverlay::intToString(stack.count, count, sizeof(count));
             const float countScale = 1.5f * (h / 768.0f);
             const float countWidth = ui.measureString(count, countScale);
-            const float countX = slotX + slotSize * (h / w) - countWidth - 2.0f / w;
+            const float countX = slotX + slotW - countWidth - 2.0f / w;
             const float countY = hotbarY + 3.0f / h;
             ui.drawStringTop(count, countX + 1.0f / w, countY - 1.0f / h, countScale, 0.05f, 0.05f,
                              0.05f);

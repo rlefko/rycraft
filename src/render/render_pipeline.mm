@@ -881,8 +881,25 @@ void RenderPipeline::endWorldSession() {
     _liveChunksByPosition.clear();
     clearExactSectionOwnership();
     _waterDraws.clear();
-    // World identity, not seed equality: dropping the recorded seed makes
-    // the next frame's resetFarTerrain rebuild even for an identical seed.
+
+    // Far terrain: stop the eight workers and free the resident tiles now
+    // rather than pinning a full world's horizon arena and generation cache
+    // while sitting at the title. The next world's resetFarTerrain rebuilds
+    // the scheduler because it is null (which also forces a rebuild even for
+    // an identical seed, the World-identity guarantee).
+    if (_farTerrainScheduler) {
+        _farTerrainScheduler->shutdown();
+        _farTerrainScheduler.reset();
+    }
+    if (_farMegaBuffer) {
+        for (auto& [key, state] : _farTerrainMeshes) {
+            (void)key;
+            if (state.uploaded) {
+                _farMegaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
+            }
+        }
+    }
+    _farTerrainMeshes.clear();
     _farTerrainSeed.reset();
 }
 

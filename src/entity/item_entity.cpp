@@ -27,9 +27,11 @@ AABB ItemEntity::getAABB() const {
 void ItemEntity::tick(World& world) {
     ++ageTicks;
 
-    // Resting early-out: a grounded, still item costs nothing per tick.
+    // Resting early-out: a grounded, still item costs nothing per tick. Once a
+    // second it still runs the full path so an item whose support was mined
+    // out falls instead of floating.
     if (onGround && std::abs(velocity.x) < REST_EPSILON && std::abs(velocity.z) < REST_EPSILON &&
-        velocity.y <= 0.f) {
+        velocity.y <= 0.f && ageTicks % 20 != 0) {
         velocity = Vec3{0.f, 0.f, 0.f};
         return;
     }
