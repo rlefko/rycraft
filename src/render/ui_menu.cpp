@@ -173,6 +173,13 @@ MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeigh
         case GameScreen::VIDEO_SETTINGS:
             return buildVideoSettingsLayout(ctx, gfx);
         case GameScreen::PLAYING:
+        case GameScreen::WORLD_SELECT:
+        case GameScreen::WORLD_CREATE:
+        case GameScreen::WORLD_DELETE_CONFIRM:
+        case GameScreen::INVENTORY:
+        case GameScreen::CRAFTING:
+        case GameScreen::FURNACE:
+        case GameScreen::DEATH:
             return {};
     }
     return {};

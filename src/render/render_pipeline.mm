@@ -819,6 +819,64 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     [commandBuffer commit];
 }
 
+void RenderPipeline::renderMenuOnly(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
+                                    const UIFrameState& uiFrame) {
+    if (!drawable || !queue)
+        return;
+
+    if (drawable.texture.width != _displayWidth || drawable.texture.height != _displayHeight) {
+        resize(static_cast<uint32_t>(drawable.texture.width),
+               static_cast<uint32_t>(drawable.texture.height));
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    if (!commandBuffer)
+        return;
+
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.06, 0.07, 0.10, 1.0);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (encoder) {
+        renderUIOverlay(encoder, uiFrame);
+        [encoder endEncoding];
+    }
+
+    // Menu screens are capturable too (world selection playtests).
+    if (!_capturePath.empty()) {
+        encodeFrameCapture(commandBuffer, drawable.texture);
+    }
+
+    [commandBuffer presentDrawable:drawable];
+    [commandBuffer commit];
+}
+
+void RenderPipeline::endWorldSession() {
+    if (_meshScheduler) {
+        _meshScheduler->shutdown();
+        _meshScheduler.reset();
+    }
+    _pendingResults.clear();
+    if (_megaBuffer) {
+        for (auto& [key, state] : _chunkMeshes) {
+            (void)key;
+            if (state.uploaded) {
+                _megaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
+            }
+        }
+    }
+    _chunkMeshes.clear();
+    _liveChunksByPosition.clear();
+    clearExactSectionOwnership();
+    _waterDraws.clear();
+    // World identity, not seed equality: dropping the recorded seed makes
+    // the next frame's resetFarTerrain rebuild even for an identical seed.
+    _farTerrainSeed.reset();
+}
+
 // ---------------------------------------------------------------------------
 // Frame capture — copy the finished drawable into a shared texture and write
 // it out as a PNG once the GPU finishes. Lets automated playtests inspect

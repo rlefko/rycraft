@@ -364,6 +364,109 @@ TEST_CASE("GameFlow: focus loss force-pauses gameplay only", "[ui][flow]") {
     REQUIRE(!fx.releaseCursor);
 }
 
+TEST_CASE("GameFlow: world session transitions", "[ui][flow]") {
+    GameFlow flow;
+    REQUIRE(flow.screen == GameScreen::TITLE);
+    REQUIRE_FALSE(flow.worldScreens());
+
+    // Title -> world select -> create, ESC backs out one level at a time.
+    flow.onMenuAction(MenuAction::OPEN_WORLD_SELECT);
+    REQUIRE(flow.screen == GameScreen::WORLD_SELECT);
+    flow.onMenuAction(MenuAction::OPEN_WORLD_CREATE);
+    REQUIRE(flow.screen == GameScreen::WORLD_CREATE);
+    flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::WORLD_SELECT);
+    flow.onMenuAction(MenuAction::REQUEST_DELETE_WORLD);
+    REQUIRE(flow.screen == GameScreen::WORLD_DELETE_CONFIRM);
+    flow.onMenuAction(MenuAction::CANCEL_DELETE);
+    REQUIRE(flow.screen == GameScreen::WORLD_SELECT);
+    flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::TITLE);
+
+    // Side-effectful actions never change the screen by themselves.
+    flow.onMenuAction(MenuAction::OPEN_WORLD_SELECT);
+    auto fx = flow.onMenuAction(MenuAction::PLAY_SELECTED_WORLD);
+    REQUIRE(flow.screen == GameScreen::WORLD_SELECT);
+    REQUIRE(!fx.captureCursor);
+
+    // The engine drives the start after its side effect succeeds.
+    fx = flow.onWorldStarted();
+    REQUIRE(flow.screen == GameScreen::PLAYING);
+    REQUIRE(fx.captureCursor);
+    REQUIRE(fx.resetTiming);
+    REQUIRE(flow.worldScreens());
+
+    // Save-and-quit lands back on the title with a free cursor.
+    flow.onEscape(); // paused
+    fx = flow.onWorldStopped();
+    REQUIRE(flow.screen == GameScreen::TITLE);
+    REQUIRE(fx.releaseCursor);
+
+    // onWorldStarted refuses screens that already have a session.
+    flow.onWorldStarted();
+    flow.onEscape(); // paused
+    fx = flow.onWorldStarted();
+    REQUIRE(flow.screen == GameScreen::PAUSED);
+    REQUIRE(!fx.captureCursor);
+}
+
+TEST_CASE("GameFlow: inventory key and container screens", "[ui][flow]") {
+    GameFlow flow;
+    flow.onWorldStarted();
+    REQUIRE(flow.screen == GameScreen::PLAYING);
+
+    auto fx = flow.onInventoryKey();
+    REQUIRE(flow.screen == GameScreen::INVENTORY);
+    REQUIRE(fx.releaseCursor);
+    REQUIRE(flow.inMenu());
+    REQUIRE(flow.inContainer());
+
+    fx = flow.onInventoryKey();
+    REQUIRE(flow.screen == GameScreen::PLAYING);
+    REQUIRE(fx.captureCursor);
+
+    // Container blocks open their screens from gameplay only.
+    fx = flow.onContainerOpened(GameScreen::FURNACE);
+    REQUIRE(flow.screen == GameScreen::FURNACE);
+    REQUIRE(fx.releaseCursor);
+    fx = flow.onContainerOpened(GameScreen::CRAFTING);
+    REQUIRE(flow.screen == GameScreen::FURNACE);
+    flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::PLAYING);
+    fx = flow.onContainerOpened(GameScreen::CRAFTING);
+    REQUIRE(flow.screen == GameScreen::CRAFTING);
+    // E closes any container.
+    flow.onInventoryKey();
+    REQUIRE(flow.screen == GameScreen::PLAYING);
+    // Only container screens are valid targets.
+    fx = flow.onContainerOpened(GameScreen::PAUSED);
+    REQUIRE(flow.screen == GameScreen::PLAYING);
+}
+
+TEST_CASE("GameFlow: death ignores escape until respawn", "[ui][flow]") {
+    GameFlow flow;
+    flow.onWorldStarted();
+
+    auto fx = flow.onPlayerDied();
+    REQUIRE(flow.screen == GameScreen::DEATH);
+    REQUIRE(fx.releaseCursor);
+
+    fx = flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::DEATH);
+    REQUIRE(!fx.captureCursor);
+    fx = flow.onInventoryKey();
+    REQUIRE(flow.screen == GameScreen::DEATH);
+
+    fx = flow.onRespawn();
+    REQUIRE(flow.screen == GameScreen::PLAYING);
+    REQUIRE(fx.captureCursor);
+
+    // Dying only happens while playing.
+    flow.onEscape();
+    fx = flow.onPlayerDied();
+    REQUIRE(flow.screen == GameScreen::PAUSED);
+}
+
 TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][menu]") {
     SettingsValues values;
     GraphicsSettings gfx;

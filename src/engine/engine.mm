@@ -22,6 +22,7 @@
 #include <render/ui_menu.hpp>
 #include <world/save_manager.hpp>
 #include <world/world.hpp>
+#include <world/world_list.hpp>
 
 #include <algorithm>
 #include <array>
@@ -417,55 +418,7 @@ static EngineState* _engineGetState(Engine* engine) {
                                                               std::numeric_limits<uint64_t>::max());
         _state->autoPauseFrame = unsignedEnvironmentValue("RYCRAFT_AUTOPAUSE_FRAME",
                                                           std::numeric_limits<uint64_t>::max());
-        _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
-
-        // Resume the saved world when one exists; otherwise start fresh with
-        // the default hotbar palette.
-        uint32_t seed = 42;
-        Vec3 spawnPos{0.f, 100.f, 0.f};
-        SaveManager::PlayerMetadata playerMeta{};
-        Vec3 playerPos = spawnPos;
-        if (auto meta = _state->saveManager->loadMetadata()) {
-            seed = meta->seed;
-            spawnPos = meta->spawnPos;
-            playerPos = meta->playerPos;
-            _state->worldTime = meta->worldTime;
-            _state->worldName = meta->name;
-            _state->gameMode = meta->gameMode;
-            _state->generation = meta->generation;
-            _state->worldCreatedMs = meta->createdMs;
-            playerMeta = meta->player;
-        }
-        _state->worldSpawn = spawnPos;
-        _state->player.yaw = playerMeta.yaw;
-        _state->player.pitch = playerMeta.pitch;
-        _state->player.health = playerMeta.health;
-        _state->hunger = playerMeta.hunger;
-        _state->inventory.selectSlot(playerMeta.selectedSlot);
-        for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
-            _state->inventory.setSlot(static_cast<int>(slot), playerMeta.inventory[slot]);
-        }
-        _state->furnaces = _state->saveManager->loadBlockEntities();
-        if (const char* seedEnv = std::getenv("RYCRAFT_WORLD_SEED")) {
-            seed = static_cast<uint32_t>(std::strtoull(seedEnv, nullptr, 0));
-        }
-        if (const char* spawnEnv = std::getenv("RYCRAFT_SPAWN")) {
-            float x = 0.0f;
-            float y = 0.0f;
-            float z = 0.0f;
-            if (std::sscanf(spawnEnv, "%f,%f,%f", &x, &y, &z) == 3) {
-                spawnPos = {x, y, z};
-                playerPos = spawnPos;
-                _state->worldSpawn = spawnPos;
-            }
-        }
-
-        // Playtest hook: pin the time of day (0..23999; 6000 = noon).
-        if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
-            _state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
-        }
-
-        // Persisted settings load before the World exists (view distance
+        // Persisted settings load before any World exists (view distance
         // feeds its constructor); env overrides win over the file for
         // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..512>.
         // An env-overridden session never saves settings — a playtest run
@@ -486,16 +439,161 @@ static EngineState* _engineGetState(Engine* engine) {
         if (const char* debugEnv = std::getenv("RYCRAFT_SHOW_DEBUG")) {
             _state->showDebugHud = *debugEnv != '\0' && std::strcmp(debugEnv, "0") != 0;
         }
-        _state->world = std::make_shared<World>(seed, _state->settings.viewDistance,
-                                                MAX_LOADED_CUBES, _state->generation);
-        // Chunks load from disk before regenerating, so block edits persist
-        _state->world->setSaveManager(_state->saveManager.get());
-        if (_state->generation.fauna) {
-            _state->spawner = std::make_unique<Spawner>(*_state->world);
-        }
-        _state->player.position = playerPos;
     }
     return self;
+}
+
+// The world for launches that bypass the selection screen (playtest hooks
+// and headless captures): RYCRAFT_WORLD_DIR, else the legacy directory,
+// which is created fresh when missing exactly as the game always did.
+static std::string defaultWorldDirectory() {
+    if (const char* dirEnv = std::getenv("RYCRAFT_WORLD_DIR")) {
+        if (*dirEnv)
+            return dirEnv;
+    }
+    return LEGACY_WORLD_DIRECTORY;
+}
+
+// Build the live world session from a world directory. The caller drives the
+// screen flow (onWorldStarted) only after this succeeds.
+- (BOOL)startWorldAtPath:(const std::string&)worldDir {
+    EngineState* state = _state.get();
+    if (state->world) {
+        RY_LOG_ERROR("A world session is already live");
+        return NO;
+    }
+
+    state->saveManager = std::make_unique<SaveManager>(worldDir);
+
+    // Per-session defaults, then the saved world when one exists.
+    uint32_t seed = 42;
+    Vec3 spawnPos{0.f, 100.f, 0.f};
+    Vec3 playerPos = spawnPos;
+    SaveManager::PlayerMetadata playerMeta{};
+    state->worldTime = 0;
+    state->worldName.clear();
+    state->gameMode = GameMode::CREATIVE;
+    state->generation = GenerationSettings{};
+    state->worldCreatedMs = 0;
+    if (auto meta = state->saveManager->loadMetadata()) {
+        seed = meta->seed;
+        spawnPos = meta->spawnPos;
+        playerPos = meta->playerPos;
+        state->worldTime = meta->worldTime;
+        state->worldName = meta->name;
+        state->gameMode = meta->gameMode;
+        state->generation = meta->generation;
+        state->worldCreatedMs = meta->createdMs;
+        playerMeta = meta->player;
+    }
+    if (const char* seedEnv = std::getenv("RYCRAFT_WORLD_SEED")) {
+        seed = static_cast<uint32_t>(std::strtoull(seedEnv, nullptr, 0));
+    }
+    if (const char* spawnEnv = std::getenv("RYCRAFT_SPAWN")) {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        if (std::sscanf(spawnEnv, "%f,%f,%f", &x, &y, &z) == 3) {
+            spawnPos = {x, y, z};
+            playerPos = spawnPos;
+        }
+    }
+    // Playtest hook: pin the time of day (0..23999; 6000 = noon).
+    if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
+        state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
+    }
+
+    state->worldSpawn = spawnPos;
+    state->player = Player{};
+    state->player.position = playerPos;
+    state->player.yaw = playerMeta.yaw;
+    state->player.pitch = playerMeta.pitch;
+    state->player.health = playerMeta.health;
+    state->camera.setLook(playerMeta.yaw, playerMeta.pitch);
+    state->hunger = playerMeta.hunger;
+    state->inventory.clear();
+    state->inventory.selectSlot(playerMeta.selectedSlot);
+    for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
+        state->inventory.setSlot(static_cast<int>(slot), playerMeta.inventory[slot]);
+    }
+    state->furnaces = state->saveManager->loadBlockEntities();
+    state->entityBrains.clear();
+    state->spawnValidated = false;
+    state->hasHighlightedBlock = false;
+    state->raining = false;
+    state->wetness = 0.0f;
+    _scrollAccumulator = 0;
+    _savedWorld = NO;
+
+    state->world = std::make_shared<World>(seed, state->settings.viewDistance, MAX_LOADED_CUBES,
+                                           state->generation);
+    // Chunks load from disk before regenerating, so block edits persist
+    state->world->setSaveManager(state->saveManager.get());
+    if (state->generation.fauna) {
+        state->spawner = std::make_unique<Spawner>(*state->world);
+    }
+    return YES;
+}
+
+// Persist the live session: sweep edited cubes, write metadata and block
+// entities, and drain the save queue. Capture-run gating stays with the
+// callers so quit and world-switch share one body.
+- (void)saveCurrentWorld {
+    EngineState* state = _state.get();
+    if (!state->saveManager || !state->world)
+        return;
+    // Edited chunks persist on unload; this path sweeps the rest
+    const bool frontiersSaved = state->world->saveModifiedChunks();
+    SaveManager::WorldMetadata worldMetadata;
+    worldMetadata.seed = state->world->getSeed();
+    worldMetadata.spawnPos = state->worldSpawn;
+    worldMetadata.playerPos = state->player.position;
+    worldMetadata.worldTime = state->worldTime;
+    worldMetadata.name = state->worldName;
+    worldMetadata.gameMode = state->gameMode;
+    worldMetadata.generation = state->generation;
+    worldMetadata.createdMs = state->worldCreatedMs;
+    worldMetadata.player.yaw = state->player.yaw;
+    worldMetadata.player.pitch = state->player.pitch;
+    worldMetadata.player.health = state->player.health;
+    worldMetadata.player.hunger = state->hunger;
+    worldMetadata.player.selectedSlot = state->inventory.getSelectedIndex();
+    for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
+        worldMetadata.player.inventory[slot] = state->inventory.getSlot(static_cast<int>(slot));
+    }
+    const bool metadataSaved = state->saveManager->saveMetadata(worldMetadata);
+    const bool blockEntitiesSaved = state->saveManager->saveBlockEntities(state->furnaces);
+    const bool cubesSaved = state->saveManager->flush();
+    if (frontiersSaved && metadataSaved && blockEntitiesSaved && cubesSaved) {
+        RY_LOG_INFO("World state saved");
+    } else {
+        RY_LOG_ERROR("World state save did not complete");
+    }
+}
+
+// Save and tear down the live session, returning to the title. Order
+// matters: the renderer detaches first (its mesh scheduler captured a
+// const World&), then the Spawner (holds World&), then the World (joins
+// generation workers), then the SaveManager (joins the save thread).
+- (void)stopWorld {
+    EngineState* state = _state.get();
+    if (!state->world)
+        return;
+    if (!std::getenv("RYCRAFT_CAPTURE")) {
+        [self saveCurrentWorld];
+    }
+    if (_renderPipeline) {
+        _renderPipeline->endWorldSession();
+    }
+    state->spawner.reset();
+    state->entityBrains.clear();
+    state->world.reset();
+    state->saveManager.reset();
+    state->furnaces.clear();
+    state->inventory.clear();
+    state->hasHighlightedBlock = false;
+    state->worldName.clear();
+    [self applyFlowEffects:state->flow.onWorldStopped()];
 }
 
 - (BOOL)initialize {
@@ -605,18 +703,36 @@ static EngineState* _engineGetState(Engine* engine) {
     _state->camera.setMouseSensitivity(mouseSensitivityForLevel(_state->settings.sensitivityLevel));
 
     // Playtest override: start on a specific screen
-    // (title|playing|paused|settings|video)
-    if (const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN")) {
-        std::string name = screenEnv;
-        if (name == "playing") {
+    // (title|playing|paused|settings|video). Gameplay screens and headless
+    // hooks (capture/autopilot/perf) auto-start the default world; the boot
+    // path otherwise reaches the title with no world session.
+    const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN");
+    const std::string screenName = screenEnv ? screenEnv : "";
+    const bool wantsGameplayScreen = screenName == "playing" || screenName == "paused" ||
+                                     screenName == "settings" || screenName == "video";
+    const bool menuScreenRequested = !screenName.empty() && !wantsGameplayScreen;
+    const bool wantsWorld = wantsGameplayScreen ||
+                            (!menuScreenRequested &&
+                             (std::getenv("RYCRAFT_CAPTURE") || std::getenv("RYCRAFT_AUTOPILOT") ||
+                              _state->performance.enabled()));
+    if (wantsWorld) {
+        if ([self startWorldAtPath:defaultWorldDirectory()]) {
+            [self applyFlowEffects:_state->flow.onWorldStarted()];
+        }
+    }
+    if (_state->world && wantsGameplayScreen) {
+        if (screenName == "playing") {
             _state->flow.screen = GameScreen::PLAYING;
             _state->inputManager->captureMouse();
-        } else if (name == "paused") {
-            _state->flow.screen = GameScreen::PAUSED;
-        } else if (name == "settings") {
-            _state->flow.screen = GameScreen::SETTINGS;
-        } else if (name == "video") {
-            _state->flow.screen = GameScreen::VIDEO_SETTINGS;
+        } else {
+            _state->inputManager->releaseMouse();
+            if (screenName == "paused") {
+                _state->flow.screen = GameScreen::PAUSED;
+            } else if (screenName == "settings") {
+                _state->flow.screen = GameScreen::SETTINGS;
+            } else if (screenName == "video") {
+                _state->flow.screen = GameScreen::VIDEO_SETTINGS;
+            }
         }
     }
 
@@ -694,7 +810,7 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 4. Fixed timestep game tick — menus freeze the world
-    if (state->flow.screen == GameScreen::PLAYING) {
+    if (state->world && state->flow.screen == GameScreen::PLAYING) {
         while (state->accumulator >= EngineState::TICK_DT) {
             const double tickStart = CACurrentMediaTime();
             [self gameTick:state];
@@ -937,8 +1053,18 @@ static EngineState* _engineGetState(Engine* engine) {
         if (input.isJustPressed(Key::MouseLeft) && state->hoveredButton >= 0) {
             MenuAction action =
                 state->menuLayout.buttons[static_cast<size_t>(state->hoveredButton)].action;
-            [self applySettingAction:action];
-            [self applyFlowEffects:state->flow.onMenuAction(action)];
+            if (action == MenuAction::PLAY && !state->world) {
+                // Interim entry until the selection screen: PLAY opens the
+                // default world.
+                if ([self startWorldAtPath:defaultWorldDirectory()]) {
+                    [self applyFlowEffects:state->flow.onWorldStarted()];
+                }
+            } else if (action == MenuAction::SAVE_QUIT_TO_TITLE) {
+                [self stopWorld];
+            } else {
+                [self applySettingAction:action];
+                [self applyFlowEffects:state->flow.onMenuAction(action)];
+            }
             if ((action == MenuAction::CLOSE_SETTINGS ||
                  action == MenuAction::CLOSE_VIDEO_SETTINGS) &&
                 !state->envOverridesActive) {
@@ -982,35 +1108,7 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     EngineState* state = _state.get();
-    if (state->saveManager && state->world) {
-        // Edited chunks persist on unload; the quit path sweeps the rest
-        const bool frontiersSaved = state->world->saveModifiedChunks();
-        SaveManager::WorldMetadata worldMetadata;
-        worldMetadata.seed = state->world->getSeed();
-        worldMetadata.spawnPos = state->worldSpawn;
-        worldMetadata.playerPos = state->player.position;
-        worldMetadata.worldTime = state->worldTime;
-        worldMetadata.name = state->worldName;
-        worldMetadata.gameMode = state->gameMode;
-        worldMetadata.generation = state->generation;
-        worldMetadata.createdMs = state->worldCreatedMs;
-        worldMetadata.player.yaw = state->player.yaw;
-        worldMetadata.player.pitch = state->player.pitch;
-        worldMetadata.player.health = state->player.health;
-        worldMetadata.player.hunger = state->hunger;
-        worldMetadata.player.selectedSlot = state->inventory.getSelectedIndex();
-        for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
-            worldMetadata.player.inventory[slot] = state->inventory.getSlot(static_cast<int>(slot));
-        }
-        const bool metadataSaved = state->saveManager->saveMetadata(worldMetadata);
-        const bool blockEntitiesSaved = state->saveManager->saveBlockEntities(state->furnaces);
-        const bool cubesSaved = state->saveManager->flush();
-        if (frontiersSaved && metadataSaved && blockEntitiesSaved && cubesSaved) {
-            RY_LOG_INFO("World state saved");
-        } else {
-            RY_LOG_ERROR("World state save did not complete");
-        }
-    }
+    [self saveCurrentWorld];
 
     // Settings share the quit path so mid-session tweaks survive a close
     // that never revisited the settings screen. Env-overridden playtest
@@ -1504,8 +1602,38 @@ static EngineState* _engineGetState(Engine* engine) {
     if (!drawable)
         return;
 
-    if (!_renderPipeline || !state->world)
+    if (!_renderPipeline)
         return;
+
+    // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
+    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered, then
+    // quits ~1s later (the PNG write is async). A capture run is headless
+    // tooling — leaving it running leaked a full game instance per capture
+    // until concurrent playtests exhausted system memory. Runs before the
+    // world branch so menu screens capture too.
+    static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
+    if (capturePath && *capturePath) {
+        static const uint64_t captureFrame = [] {
+            const char* frameEnv = std::getenv("RYCRAFT_CAPTURE_FRAME");
+            return frameEnv ? static_cast<uint64_t>(std::atoll(frameEnv)) : uint64_t{240};
+        }();
+        if (state->frameCount == captureFrame) {
+            _renderPipeline->requestFrameCapture(capturePath);
+        }
+        if (state->frameCount == captureFrame + 60) {
+            [self requestQuit];
+        }
+    }
+
+    // Menu-only frame while no world session is live (title, world menus).
+    if (!state->world) {
+        UIFrameState uiFrame;
+        uiFrame.screen = state->flow.screen;
+        uiFrame.hoveredButton = state->hoveredButton;
+        uiFrame.menu = state->menuLayout;
+        _renderPipeline->renderMenuOnly(_queue, drawable, uiFrame);
+        return;
+    }
 
     // Log render + streaming diagnostics every 60 frames (the same numbers
     // the F3 HUD shows, so headless playtests can measure against budgets;
@@ -1563,25 +1691,6 @@ static EngineState* _engineGetState(Engine* engine) {
         std::string passes = _renderPipeline->gpuPassBreakdown();
         if (!passes.empty()) {
             RY_LOG_INFO(("GPU passes (ms): " + passes).c_str());
-        }
-    }
-
-    // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
-    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered, then
-    // quits ~1s later (the PNG write is async). A capture run is headless
-    // tooling — leaving it running leaked a full game instance per capture
-    // until concurrent playtests exhausted system memory.
-    static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
-    if (capturePath && *capturePath) {
-        static const uint64_t captureFrame = [] {
-            const char* frameEnv = std::getenv("RYCRAFT_CAPTURE_FRAME");
-            return frameEnv ? static_cast<uint64_t>(std::atoll(frameEnv)) : uint64_t{240};
-        }();
-        if (state->frameCount == captureFrame) {
-            _renderPipeline->requestFrameCapture(capturePath);
-        }
-        if (state->frameCount == captureFrame + 60) {
-            [self requestQuit];
         }
     }
 

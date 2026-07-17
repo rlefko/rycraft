@@ -141,6 +141,19 @@ public:
                 const UIFrameState& uiFrame = UIFrameState{},
                 const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
 
+    // Menu-only frame when no world session is live: one single-sample pass
+    // that clears the drawable to the backdrop color and draws the UI
+    // overlay. No HDR, no depth, no world reads.
+    void renderMenuOnly(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
+                        const UIFrameState& uiFrame);
+
+    // Detach every renderer structure that references or is keyed by the
+    // current World: the mesh scheduler (it captures a const World& lazily
+    // at first render), pending mesh results, resident cube meshes, exact
+    // ownership, and the recorded far-terrain identity so the next session
+    // rebuilds even under an equal seed. Must run before the World dies.
+    void endWorldSession();
+
     // Reallocate MSAA and resolve textures for new viewport size.
     void resize(uint32_t width, uint32_t height);
 
