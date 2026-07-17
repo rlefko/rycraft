@@ -18,6 +18,7 @@ test_sources = files(
   'test_alpine_morphology.mm',
   'test_tree_geometry.mm',
   'test_render.mm',
+  'test_items.mm',
   'test_entity.mm',
   'test_fauna_habitat.mm',
   'test_fluid_persistence.mm',

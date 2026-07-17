@@ -2,6 +2,7 @@
 
 #include <common/math.hpp>
 #include <world/chunk.hpp>
+#include <world/item.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +53,9 @@ struct EntityConfig {
     MovementMode movementMode;
     float jumpImpulse;
     float stepHeight;
+    int maxHealth; // half-hearts an attack must remove
+    ItemType drop; // survival loot on death; NONE drops nothing
+    uint8_t dropCount;
 };
 
 // ---------------------------------------------------------------------------
