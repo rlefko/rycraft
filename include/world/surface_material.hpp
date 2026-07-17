@@ -4,6 +4,7 @@
 #include "world/macro_generation.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace worldgen::surface_material {
@@ -16,12 +17,64 @@ struct VolcanicSignals {
     bool conduitExposure = false;
 };
 
+struct SurfaceMaterialPaletteEntry {
+    BlockType material = BlockType::AIR;
+    uint8_t weight = 0;
+};
+
+struct SurfaceMaterialPalette {
+    std::array<SurfaceMaterialPaletteEntry, 4> entries{};
+    uint8_t count = 0;
+};
+
+struct WeightedBiome {
+    Biome biome = Biome::PLAINS;
+    double weight = 0.0;
+};
+
+inline std::array<WeightedBiome, 4> weightedMaterialBiomes(const SurfaceSample& sample) {
+    std::array<WeightedBiome, 4> result{};
+    for (size_t index = 0; index < sample.suitability.scores.size(); ++index) {
+        // Squaring preserves a clear regional identity while allowing the
+        // third and fourth climate fits to appear naturally near broad
+        // transitions. It also avoids discontinuities when second place and
+        // third place exchange rank.
+        const double score = static_cast<double>(sample.suitability.scores[index]);
+        const double weight = score * score;
+        if (weight <= result.back().weight) continue;
+        size_t destination = result.size() - 1;
+        while (destination > 0 && weight > result[destination - 1].weight) {
+            result[destination] = result[destination - 1];
+            --destination;
+        }
+        result[destination] = {static_cast<Biome>(index), weight};
+    }
+    double total = 0.0;
+    for (const WeightedBiome entry : result)
+        total += entry.weight;
+    if (total <= 1.0e-12) {
+        const double secondary = std::clamp(sample.biome.transition, 0.0, 0.5);
+        result = {{{sample.biome.primary, 1.0 - secondary},
+                   {sample.biome.secondary, secondary},
+                   {sample.biome.primary, 0.0},
+                   {sample.biome.primary, 0.0}}};
+        return result;
+    }
+    for (WeightedBiome& entry : result)
+        entry.weight /= total;
+    return result;
+}
+
 inline Biome materialBiome(const SurfaceSample& sample, const CounterRng& random, int64_t x,
                            int64_t z) {
-    const double secondaryWeight = std::clamp(sample.biome.transition, 0.0, 0.5);
-    return multiscaleDitherThreshold(random, DITHER_STREAM, x, z) < secondaryWeight
-               ? sample.biome.secondary
-               : sample.biome.primary;
+    const std::array<WeightedBiome, 4> biomes = weightedMaterialBiomes(sample);
+    const double rank = multiscaleDitherThreshold(random, DITHER_STREAM, x, z);
+    double cumulative = 0.0;
+    for (const WeightedBiome entry : biomes) {
+        cumulative += entry.weight;
+        if (rank < cumulative) return entry.biome;
+    }
+    return biomes.front().biome;
 }
 
 inline bool frozen(const SurfaceSample& sample, Biome biome) {
@@ -49,8 +102,8 @@ inline double weathering(const SurfaceSample& sample) {
                       0.0, 1.0);
 }
 
-inline BlockType outcrop(const GeologySample& geology) {
-    switch (geology.rock) {
+inline BlockType outcrop(const GeologySample& geology, RockType rock) {
+    switch (rock) {
         case RockType::BASALT:
             return BlockType::BASALT;
         case RockType::VOLCANIC:
@@ -71,6 +124,10 @@ inline BlockType outcrop(const GeologySample& geology) {
             }
             return BlockType::STONE;
     }
+}
+
+inline BlockType outcrop(const GeologySample& geology) {
+    return outcrop(geology, geology.rock);
 }
 
 inline bool supportsSurfaceFlora(BlockType substrate) {
@@ -198,6 +255,122 @@ inline BlockType subsurface(const SurfaceSample& sample, Biome biome,
         default:
             return BlockType::DIRT;
     }
+}
+
+inline bool exposesLithology(const SurfaceSample& sample, Biome biome,
+                             const VolcanicSignals& volcanic, bool isFrozen, bool isSubmerged,
+                             bool alluvialDeposit = false) {
+    const double geothermal = MacroGenerationSampler::ecotopeInfluence(sample, Ecotope::GEOTHERMAL);
+    const double cliff = MacroGenerationSampler::ecotopeInfluence(sample, Ecotope::CLIFF);
+    const double canyon = MacroGenerationSampler::ecotopeInfluence(sample, Ecotope::CANYON);
+    const double scree = MacroGenerationSampler::ecotopeInfluence(sample, Ecotope::SCREE);
+    const double exposedPeak =
+        MacroGenerationSampler::ecotopeInfluence(sample, Ecotope::EXPOSED_PEAK);
+    const double altered = std::max(volcanic.basaltField, sample.geology.volcanicActivity);
+    const bool activeVent = volcanic.conduitExposure || volcanic.craterFactor > 0.58;
+    if (isSubmerged || (isFrozen && !activeVent) || (!activeVent && sample.hydrology.delta) ||
+        (!activeVent && alluvialDeposit)) {
+        return false;
+    }
+    const bool rareGlass = geothermal > 0.5 && sample.geology.volcanicActivity > 0.74 &&
+                           activeVent && (cliff > 0.25 || sample.slope > 0.38);
+    if (rareGlass) return false;
+    const bool volcanicGround =
+        altered > 0.50 || volcanic.basaltField > 0.16 || biome == Biome::VOLCANIC_BARREN;
+    if (volcanicGround) {
+        const bool depositionalAsh =
+            biome == Biome::VOLCANIC_BARREN && sample.slope < 0.62 && volcanic.craterFactor < 0.58;
+        return !depositionalAsh;
+    }
+    if (scree > 0.45 && sample.slope > 0.52) return false;
+    const double exposure = sample.slope * 0.72 + cliff * 0.42 + canyon * 0.24 +
+                            std::clamp((sample.terrainHeight - 105.0) / 150.0, 0.0, 0.32) -
+                            weathering(sample) * 0.30 - sample.soil.fertility * 0.08;
+    return exposure > 0.58 || exposedPeak > 0.58;
+}
+
+inline SurfaceMaterialPalette materialPalette(const SurfaceSample& sample,
+                                              const VolcanicSignals& volcanic, bool isFrozen,
+                                              bool isSubmerged, bool alluvialDeposit = false) {
+    struct WeightedMaterial {
+        BlockType material = BlockType::AIR;
+        double weight = 0.0;
+    };
+    std::array<WeightedMaterial, 8> candidates{};
+    size_t candidateCount = 0;
+    const auto addCandidate = [&](BlockType material, double weight) {
+        if (weight <= 0.0) return;
+        size_t destination = 0;
+        while (destination < candidateCount && candidates[destination].material != material) {
+            ++destination;
+        }
+        if (destination == candidateCount) {
+            if (candidateCount >= candidates.size()) return;
+            candidates[candidateCount].material = material;
+            ++candidateCount;
+        }
+        candidates[destination].weight += weight;
+    };
+
+    const std::array<WeightedBiome, 4> biomes = weightedMaterialBiomes(sample);
+    for (const WeightedBiome entry : biomes) {
+        if (entry.weight <= 0.0) continue;
+        if (exposesLithology(sample, entry.biome, volcanic, isFrozen, isSubmerged,
+                             alluvialDeposit) &&
+            sample.geology.lithology.primary != sample.geology.lithology.secondary) {
+            const double secondaryWeight =
+                std::clamp(sample.geology.lithology.transition, 0.0, 0.5);
+            addCandidate(outcrop(sample.geology, sample.geology.lithology.primary),
+                         entry.weight * (1.0 - secondaryWeight));
+            addCandidate(outcrop(sample.geology, sample.geology.lithology.secondary),
+                         entry.weight * secondaryWeight);
+        } else {
+            addCandidate(
+                surface(sample, entry.biome, volcanic, isFrozen, isSubmerged, alluvialDeposit),
+                entry.weight);
+        }
+    }
+    if (candidateCount == 0) {
+        addCandidate(
+            surface(sample, sample.biome.primary, volcanic, isFrozen, isSubmerged, alluvialDeposit),
+            1.0);
+    }
+
+    std::sort(candidates.begin(), candidates.begin() + static_cast<std::ptrdiff_t>(candidateCount),
+              [](const WeightedMaterial& lhs, const WeightedMaterial& rhs) {
+                  if (lhs.weight != rhs.weight) return lhs.weight > rhs.weight;
+                  return static_cast<uint8_t>(lhs.material) < static_cast<uint8_t>(rhs.material);
+              });
+    SurfaceMaterialPalette result;
+    result.count = static_cast<uint8_t>(std::min(candidateCount, result.entries.size()));
+    double remainingWeight = 0.0;
+    for (size_t index = 0; index < result.count; ++index)
+        remainingWeight += candidates[index].weight;
+    int remainingUnits = 255;
+    for (size_t index = 0; index < result.count; ++index) {
+        const int entriesAfter = static_cast<int>(result.count - index - 1);
+        const int units =
+            entriesAfter == 0
+                ? remainingUnits
+                : std::clamp(static_cast<int>(std::lround(candidates[index].weight /
+                                                          remainingWeight * remainingUnits)),
+                             1, remainingUnits - entriesAfter);
+        result.entries[index] = {candidates[index].material, static_cast<uint8_t>(units)};
+        remainingUnits -= units;
+        remainingWeight -= candidates[index].weight;
+    }
+    return result;
+}
+
+inline BlockType selectMaterial(const SurfaceMaterialPalette& palette, double rank) {
+    if (palette.count == 0) return BlockType::AIR;
+    const int target = std::clamp(static_cast<int>(rank * 255.0), 0, 254);
+    int cumulative = 0;
+    for (size_t index = 0; index < palette.count; ++index) {
+        cumulative += palette.entries[index].weight;
+        if (target < cumulative) return palette.entries[index].material;
+    }
+    return palette.entries[palette.count - 1].material;
 }
 
 } // namespace worldgen::surface_material

@@ -47,8 +47,7 @@ public:
 
     // True when (x, z) lies inside any structure footprint (plus margin)
     // that could reach the chunk neighborhood of (chunkX, chunkZ).
-    bool insideStructure(int64_t x, int64_t z, int64_t chunkX, int64_t chunkZ,
-                         const ChunkGenerator& gen, GenScratch& scratch, int margin) const;
+    bool insideStructure(int64_t x, int64_t z, int64_t chunkX, int64_t chunkZ, int margin) const;
 
 private:
     CounterRng random_;

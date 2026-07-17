@@ -60,6 +60,36 @@ void kindExtents(StructureKind kind, int& halfU, int& halfV) {
     }
 }
 
+StructurePlacement unvalidatedPlacement(const CounterRng& random, int64_t regionX,
+                                        int64_t regionZ) {
+    const int64_t anchorChunkX =
+        regionX * STRUCTURE_REGION_CHUNKS +
+        random.uniformInt(STRUCTURE_ANCHOR_CHUNK_X_STREAM, regionX, 0, regionZ, 0, 1, 6);
+    const int64_t anchorChunkZ =
+        regionZ * STRUCTURE_REGION_CHUNKS +
+        random.uniformInt(STRUCTURE_ANCHOR_CHUNK_Z_STREAM, regionX, 0, regionZ, 0, 1, 6);
+    const int anchorLocalX =
+        random.uniformInt(STRUCTURE_ANCHOR_LOCAL_X_STREAM, regionX, 0, regionZ, 0, 2, 13);
+    const int anchorLocalZ =
+        random.uniformInt(STRUCTURE_ANCHOR_LOCAL_Z_STREAM, regionX, 0, regionZ, 0, 2, 13);
+    const double kindRoll = random.uniform01(STRUCTURE_KIND_STREAM, regionX, 0, regionZ);
+    const int rotation = random.uniformInt(STRUCTURE_ROTATION_STREAM, regionX, 0, regionZ, 0, 0, 3);
+
+    StructurePlacement placement;
+    placement.kind = kindRoll < 0.4   ? StructureKind::RUIN
+                     : kindRoll < 0.7 ? StructureKind::WELL
+                                      : StructureKind::HOUSE;
+    placement.rotation = rotation;
+    placement.anchorX = anchorChunkX * CHUNK_WIDTH + anchorLocalX;
+    placement.anchorZ = anchorChunkZ * CHUNK_DEPTH + anchorLocalZ;
+    int halfU = 0;
+    int halfV = 0;
+    kindExtents(placement.kind, halfU, halfV);
+    placement.halfX = (rotation & 1) != 0 ? halfV : halfU;
+    placement.halfZ = (rotation & 1) != 0 ? halfU : halfV;
+    return placement;
+}
+
 bool isLandBiome(Biome biome) {
     return biome != Biome::OCEAN && biome != Biome::DEEP_OCEAN && biome != Biome::FROZEN_OCEAN &&
            biome != Biome::RIVER && biome != Biome::COUNT;
@@ -98,31 +128,7 @@ const StructurePlacement& StructurePlacer::regionPlacement(int64_t regionX, int6
     // The anchor margins (chunk offset 1..6 in the region, block offset
     // 2..13 in the chunk) bound footprint spill to under one chunk, which lets a
     // radius-1 chunk neighborhood see every structure that can reach it.
-    int64_t anchorChunkX =
-        regionX * STRUCTURE_REGION_CHUNKS +
-        random_.uniformInt(STRUCTURE_ANCHOR_CHUNK_X_STREAM, regionX, 0, regionZ, 0, 1, 6);
-    int64_t anchorChunkZ =
-        regionZ * STRUCTURE_REGION_CHUNKS +
-        random_.uniformInt(STRUCTURE_ANCHOR_CHUNK_Z_STREAM, regionX, 0, regionZ, 0, 1, 6);
-    int anchorLocalX =
-        random_.uniformInt(STRUCTURE_ANCHOR_LOCAL_X_STREAM, regionX, 0, regionZ, 0, 2, 13);
-    int anchorLocalZ =
-        random_.uniformInt(STRUCTURE_ANCHOR_LOCAL_Z_STREAM, regionX, 0, regionZ, 0, 2, 13);
-    double kindRoll = random_.uniform01(STRUCTURE_KIND_STREAM, regionX, 0, regionZ);
-    int rotation = random_.uniformInt(STRUCTURE_ROTATION_STREAM, regionX, 0, regionZ, 0, 0, 3);
-
-    StructurePlacement placement;
-    placement.kind = kindRoll < 0.4f   ? StructureKind::RUIN
-                     : kindRoll < 0.7f ? StructureKind::WELL
-                                       : StructureKind::HOUSE;
-    placement.rotation = rotation;
-    placement.anchorX = anchorChunkX * CHUNK_WIDTH + anchorLocalX;
-    placement.anchorZ = anchorChunkZ * CHUNK_DEPTH + anchorLocalZ;
-
-    int halfU = 0, halfV = 0;
-    kindExtents(placement.kind, halfU, halfV);
-    placement.halfX = (rotation & 1) ? halfV : halfU;
-    placement.halfZ = (rotation & 1) ? halfU : halfV;
+    StructurePlacement placement = unvalidatedPlacement(random_, regionX, regionZ);
 
     // Terrain adaptation: probe the corners + center, require dry and
     // near-flat ground (ruins tolerate rougher sites, half-buried).
@@ -150,7 +156,6 @@ const StructurePlacement& StructurePlacer::regionPlacement(int64_t regionX, int6
 }
 
 bool StructurePlacer::insideStructure(int64_t x, int64_t z, int64_t chunkX, int64_t chunkZ,
-                                      const ChunkGenerator& gen, GenScratch& scratch,
                                       int margin) const {
     int64_t minRegionX = floorDiv(chunkX - 1, STRUCTURE_REGION_CHUNKS);
     int64_t maxRegionX = floorDiv(chunkX + 1, STRUCTURE_REGION_CHUNKS);
@@ -158,12 +163,16 @@ bool StructurePlacer::insideStructure(int64_t x, int64_t z, int64_t chunkX, int6
     int64_t maxRegionZ = floorDiv(chunkZ + 1, STRUCTURE_REGION_CHUNKS);
     for (int64_t rz = minRegionZ; rz <= maxRegionZ; ++rz) {
         for (int64_t rx = minRegionX; rx <= maxRegionX; ++rx) {
-            const StructurePlacement& p = regionPlacement(rx, rz, gen, scratch);
-            if (!p.valid) continue;
-            if (std::abs(x - p.anchorX) <= p.halfX + margin &&
-                std::abs(z - p.anchorZ) <= p.halfZ + margin) {
-                return true;
+            const StructurePlacement candidate = unvalidatedPlacement(random_, rx, rz);
+            if (std::abs(x - candidate.anchorX) > candidate.halfX + margin ||
+                std::abs(z - candidate.anchorZ) > candidate.halfZ + margin) {
+                continue;
             }
+            // Reserve every deterministic candidate footprint. Whether the
+            // terrain probe ultimately emits the structure does not alter
+            // large-plant ownership, so exact cubes and far canopy pages can
+            // agree without constructing distant ColumnPlans.
+            return true;
         }
     }
     return false;
