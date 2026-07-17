@@ -377,6 +377,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
     // ---- UIOverlay (screen-space HUD rendering) ----
     _uiOverlay = std::make_unique<UIOverlay>(_device, shaderLibrary, _displayWidth, _displayHeight);
+    _uiOverlay->setIconAtlas(_blockTextures->texture(), _blockTextures->sampler());
 
     // ---- Cloud pipeline state (Phase 8) ----
     id<MTLFunction> cloudVertexFunc = [shaderLibrary newFunctionWithName:@"cloudVertexMain"];

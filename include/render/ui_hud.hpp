@@ -24,3 +24,7 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
 // The current menu (title/pause/settings), with hover highlighting.
 void drawMenu(UIOverlay& ui, const MenuLayout& layout, int hoveredButton, uint32_t displayWidth,
               uint32_t displayHeight);
+
+// One stack inside a slot rectangle: isometric mini-cube for cube blocks,
+// flat texture layer for flora and non-block items (ui_item_icon.cpp).
+void drawItemIcon(UIOverlay& ui, const ItemStack& stack, float x, float y, float w, float h);

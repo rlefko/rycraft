@@ -2,6 +2,7 @@
 
 #include "render/vertex.hpp"
 #include "world/chunk.hpp"
+#include "world/item.hpp"
 
 #include <cstdint>
 
@@ -27,6 +28,20 @@ inline constexpr uint8_t TEXTURE_LAYER_SANDSTONE_TOP = TEXTURE_LAYER_CACTUS_TOP 
 inline constexpr uint8_t TEXTURE_LAYER_CRAFTING_TABLE_TOP = TEXTURE_LAYER_SANDSTONE_TOP + 1;
 inline constexpr uint8_t TEXTURE_LAYER_FURNACE_TOP = TEXTURE_LAYER_CRAFTING_TABLE_TOP + 1;
 inline constexpr uint8_t TEXTURE_LAYER_COUNT = TEXTURE_LAYER_FURNACE_TOP + 1;
+
+// UI item-icon layers append after every block-face layer. Only the overlay
+// samples them; faceAttr packing never sees these indices. The non-block
+// item range is contiguous, so a layer is a constexpr offset.
+inline constexpr uint8_t TEXTURE_LAYER_ITEM_FIRST = TEXTURE_LAYER_COUNT;
+inline constexpr size_t ITEM_ICON_COUNT = NON_BLOCK_ITEM_COUNT;
+inline constexpr uint16_t TEXTURE_LAYER_TOTAL =
+    static_cast<uint16_t>(TEXTURE_LAYER_ITEM_FIRST) + static_cast<uint16_t>(ITEM_ICON_COUNT);
+static_assert(TEXTURE_LAYER_TOTAL <= 255, "texture array layers must stay 8-bit addressable");
+
+constexpr uint8_t itemIconLayer(ItemType type) {
+    return static_cast<uint8_t>(TEXTURE_LAYER_ITEM_FIRST +
+                                (static_cast<uint16_t>(type) - ITEM_ID_BASE));
+}
 
 // Which array layer a given face of a block samples.
 constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {

@@ -593,6 +593,17 @@ struct FlareState {
     float visibility; // 0 sun fully occluded .. 1 fully visible
 };
 
+// UI icon vertex — textured block/item icons in the LDR UI overlay pass.
+// tint.rgb multiplies the sample (isometric face shading), tint.a scales
+// alpha; layer selects the block/item texture array slice.
+struct UIIconVertex {
+    simd_float2 position; // normalized [0,1] screen space
+    simd_float2 uv;
+    simd_float4 tint;
+    unsigned int layer;
+    unsigned int pad0;
+};
+
 #ifndef __METAL_VERSION__
 #include <cstddef>
 
@@ -676,6 +687,11 @@ static_assert(offsetof(SsaoUniforms, invProjection) == 64);
 static_assert(offsetof(SsaoUniforms, resolution) == 128);
 static_assert(offsetof(SsaoUniforms, radius) == 136);
 static_assert(offsetof(SsaoUniforms, frameIndex) == 148);
+
+static_assert(sizeof(UIIconVertex) == 48);
+static_assert(offsetof(UIIconVertex, uv) == 8);
+static_assert(offsetof(UIIconVertex, tint) == 16);
+static_assert(offsetof(UIIconVertex, layer) == 32);
 
 static_assert(sizeof(VolumetricUniforms) == 144);
 static_assert(offsetof(VolumetricUniforms, cameraPosition) == 64);

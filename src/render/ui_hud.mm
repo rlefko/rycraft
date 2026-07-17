@@ -48,19 +48,27 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
 
         ui.drawQuad(slotX, hotbarY, slotSize, slotSize, 0.3f, 0.3f, 0.3f, 0.6f);
 
-        // Item indicator: the registry swatch color, empty slots stay bare
+        // Item indicator: the real block/item texture, empty slots stay bare
         const ItemStack& stack = frame.hotbar.slots[static_cast<size_t>(i)];
         if (stack.empty())
             continue;
-        const uint32_t swatch = itemSwatchColor(stack.type);
-        const float r = static_cast<float>((swatch >> 16) & 0xFF) / 255.0f;
-        const float g = static_cast<float>((swatch >> 8) & 0xFF) / 255.0f;
-        const float b = static_cast<float>(swatch & 0xFF) / 255.0f;
-
-        float innerSize = slotSize * 0.7f;
+        float innerSize = slotSize * 0.72f;
         float innerOffset = (slotSize - innerSize) * 0.5f;
-        ui.drawQuad(slotX + innerOffset, hotbarY + innerOffset, innerSize, innerSize, r, g, b,
-                    0.9f);
+        const float innerW = innerSize * (h / w);
+        const float innerX = slotX + (slotSize * (h / w) - innerW) * 0.5f;
+        drawItemIcon(ui, stack, innerX, hotbarY + innerOffset, innerW, innerSize);
+
+        if (stack.count > 1) {
+            char count[8];
+            UIOverlay::intToString(stack.count, count, sizeof(count));
+            const float countScale = 1.5f * (h / 768.0f);
+            const float countWidth = ui.measureString(count, countScale);
+            const float countX = slotX + slotSize * (h / w) - countWidth - 2.0f / w;
+            const float countY = hotbarY + 3.0f / h;
+            ui.drawStringTop(count, countX + 1.0f / w, countY - 1.0f / h, countScale, 0.05f, 0.05f,
+                             0.05f);
+            ui.drawStringTop(count, countX, countY, countScale, 1.0f, 1.0f, 1.0f);
+        }
     }
 }
 
