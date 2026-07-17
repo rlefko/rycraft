@@ -5,6 +5,7 @@ engine_sources = files(
     'camera.cpp',
     'inventory.cpp',
     'slot_interaction.cpp',
+    'mining.cpp',
 )
 
 libengine = static_library('engine',

@@ -10,6 +10,7 @@
 #include <engine/game_state.hpp>
 #include <engine/input_bindings.hpp>
 #include <engine/inventory.hpp>
+#include <engine/mining.hpp>
 #include <engine/slot_interaction.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
@@ -1456,4 +1457,71 @@ TEST_CASE("Container layouts expose every slot with correct references", "[ui][c
         uiHitTest(survival, probe.rect.x + probe.rect.w * 0.5f, probe.rect.y + probe.rect.h * 0.5f);
     REQUIRE(hit.kind == UIHitKind::SLOT);
     REQUIRE(hit.index == 0);
+}
+
+TEST_CASE("Mining accumulates over time and completes on a stable target", "[mining]") {
+    MiningState state;
+    // Stone by hand needs blockBreakTicks(STONE, NONE) = 150 ticks.
+    const int needed = blockBreakTicks(BlockType::STONE, ItemType::NONE);
+    REQUIRE(needed == 150);
+
+    for (int tick = 0; tick < needed - 1; ++tick) {
+        REQUIRE_FALSE(tickMining(state, true, true, 1, 2, 3, BlockType::STONE, ItemType::NONE));
+        REQUIRE(state.active);
+    }
+    REQUIRE(state.progress > 0.9f);
+    // The final tick completes and resets.
+    REQUIRE(tickMining(state, true, true, 1, 2, 3, BlockType::STONE, ItemType::NONE));
+    REQUIRE_FALSE(state.active);
+}
+
+TEST_CASE("Mining resets on release and on a new target", "[mining]") {
+    MiningState state;
+    for (int tick = 0; tick < 20; ++tick) {
+        tickMining(state, true, true, 1, 2, 3, BlockType::STONE, ItemType::NONE);
+    }
+    REQUIRE(state.ticksElapsed == 20);
+
+    // Releasing the button clears progress.
+    tickMining(state, false, true, 1, 2, 3, BlockType::STONE, ItemType::NONE);
+    REQUIRE_FALSE(state.active);
+    REQUIRE(state.progress == 0.f);
+
+    // Looking at a new block restarts from zero.
+    for (int tick = 0; tick < 20; ++tick) {
+        tickMining(state, true, true, 1, 2, 3, BlockType::STONE, ItemType::NONE);
+    }
+    tickMining(state, true, true, 9, 9, 9, BlockType::DIRT, ItemType::NONE);
+    REQUIRE(state.x == 9);
+    REQUIRE(state.block == BlockType::DIRT);
+    REQUIRE(state.ticksElapsed == 1);
+}
+
+TEST_CASE("Mining respects tool speed and never breaks bedrock", "[mining]") {
+    // A stone pickaxe finishes stone far faster than a bare hand.
+    MiningState hand;
+    int handTicks = 0;
+    while (!tickMining(hand, true, true, 0, 0, 0, BlockType::STONE, ItemType::NONE) &&
+           handTicks < 1000) {
+        ++handTicks;
+    }
+    MiningState pick;
+    int pickTicks = 0;
+    while (!tickMining(pick, true, true, 0, 0, 0, BlockType::STONE, ItemType::STONE_PICKAXE) &&
+           pickTicks < 1000) {
+        ++pickTicks;
+    }
+    REQUIRE(pickTicks < handTicks);
+
+    // Bedrock never completes, whatever the tool.
+    MiningState bedrock;
+    for (int tick = 0; tick < 500; ++tick) {
+        REQUIRE_FALSE(
+            tickMining(bedrock, true, true, 0, 0, 0, BlockType::BEDROCK, ItemType::IRON_PICKAXE));
+    }
+    REQUIRE(bedrock.progress == 0.f);
+
+    // Instant-break flora completes the first settled tick.
+    MiningState grass;
+    REQUIRE(tickMining(grass, true, true, 0, 0, 0, BlockType::TALL_GRASS, ItemType::NONE));
 }

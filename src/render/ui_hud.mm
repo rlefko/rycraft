@@ -30,6 +30,18 @@ void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth
                     1.0f, 0.9f);
     }
 
+    // ---- Break progress bar (survival mining, under the crosshair) ----
+    if (frame.screen == GameScreen::PLAYING && frame.miningProgress > 0.f) {
+        const float barW = 60.0f / w;
+        const float barH = 6.0f / h;
+        const float barX = 0.5f - barW * 0.5f;
+        const float barY = 0.5f - 40.0f / h;
+        ui.drawQuad(barX - 1.0f / w, barY - 1.0f / h, barW + 2.0f / w, barH + 2.0f / h, 0.05f,
+                    0.05f, 0.05f, 0.85f);
+        ui.drawQuad(barX, barY, barW * std::clamp(frame.miningProgress, 0.f, 1.f), barH, 0.9f, 0.9f,
+                    0.9f, 0.95f);
+    }
+
     // ---- Hotbar (9 slots at bottom of screen) ----
     const int slotCount = static_cast<int>(frame.hotbar.slots.size());
     float slotSize = 48.0f / h;

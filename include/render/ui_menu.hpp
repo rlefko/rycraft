@@ -201,7 +201,8 @@ struct UIFrameState {
     ItemStack cursorStack{};
     float mouseX = 0.f; // normalized, for the held stack and tooltip
     float mouseY = 0.f;
-    std::string tooltipText; // hovered-slot display name, empty = none
+    float miningProgress = 0.f; // 0 = not mining, drives the break bar
+    std::string tooltipText;    // hovered-slot display name, empty = none
     bool showDebugHud = false;
     bool cameraUnderwater = false; // drives the underwater veil + god rays
     PerformanceStats stats{};

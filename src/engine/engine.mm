@@ -12,6 +12,7 @@
 #include <engine/game_state.hpp>
 #include <engine/input_bindings.hpp>
 #include <engine/inventory.hpp>
+#include <engine/mining.hpp>
 #include <engine/slot_interaction.hpp>
 #include <entity/ai.hpp>
 #include <entity/item_entity.hpp>
@@ -322,6 +323,7 @@ struct EngineState {
     std::optional<BlockPos> openFurnace; // the furnace the FURNACE screen edits
     ItemEntityManager itemEntities;
     int pickupSoundCooldown = 0;
+    MiningState miningState;
 
     // ---- Container screens ----
     std::array<ItemStack, 9> craftGrid{}; // first 4 used on the inventory screen
@@ -547,6 +549,7 @@ static std::string defaultWorldDirectory() {
     state->openFurnace.reset();
     state->itemEntities.clear();
     state->pickupSoundCooldown = 0;
+    state->miningState.reset();
     state->craftGrid.fill(ItemStack{});
     state->craftResult.clear();
     state->cursorStack.clear();
@@ -627,6 +630,7 @@ static std::string defaultWorldDirectory() {
     state->furnaces.clear();
     state->openFurnace.reset();
     state->itemEntities.clear();
+    state->miningState.reset();
     state->inventory.clear();
     state->hasHighlightedBlock = false;
     state->worldName.clear();
@@ -1911,9 +1915,34 @@ static std::string defaultWorldDirectory() {
         state->hasHighlightedBlock = false;
     }
 
-    // Block breaking (left mouse click)
-    if (input.isPressedForTick(Key::MouseLeft)) {
-        [self breakBlock:state hit:rayHit];
+    // Block breaking. Creative is instant on the click edge; survival mines
+    // held-left over time, its speed set by hardness and the held tool.
+    if (modeInstantBreak(state->gameMode)) {
+        state->miningState.reset();
+        if (input.isPressedForTick(Key::MouseLeft)) {
+            [self breakBlock:state hit:rayHit withDrops:NO];
+        }
+    } else {
+        bool hasTarget = NO;
+        int64_t tx = 0;
+        int32_t ty = 0;
+        int64_t tz = 0;
+        BlockType targetBlock = BlockType::AIR;
+        if (rayHit.has_value()) {
+            tx = static_cast<int64_t>(std::floor(rayHit->first.x));
+            ty = static_cast<int32_t>(std::floor(rayHit->first.y));
+            tz = static_cast<int64_t>(std::floor(rayHit->first.z));
+            const std::optional<BlockType> block = state->world->findBlockIfLoaded(tx, ty, tz);
+            if (block && *block != BlockType::AIR) {
+                hasTarget = YES;
+                targetBlock = *block;
+            }
+        }
+        const ItemType held = state->inventory.getSelectedStack().type;
+        if (tickMining(state->miningState, input.mouseLeftDown, hasTarget, tx, ty, tz, targetBlock,
+                       held)) {
+            [self breakBlock:state hit:rayHit withDrops:YES];
+        }
     }
 
     // Right click: an interactable block opens its screen (unless sneaking
@@ -1979,7 +2008,7 @@ static std::string defaultWorldDirectory() {
 
 // ---- Block Breaking (Task 6.1) ----
 
-- (void)breakBlock:(EngineState*)state hit:(BlockRayHit)hit {
+- (void)breakBlock:(EngineState*)state hit:(BlockRayHit)hit withDrops:(BOOL)withDrops {
     if (!hit.has_value())
         return;
 
@@ -1992,19 +2021,26 @@ static std::string defaultWorldDirectory() {
     if (!current || *current == BlockType::BEDROCK)
         return;
 
-    // A broken furnace loses its state entry; its contents return to the
-    // player so nothing is silently lost before dropped items exist.
+    // A broken furnace loses its state entry; its contents scatter (survival)
+    // or return to the player (creative-instant, which never drops).
     if (*current == BlockType::FURNACE || *current == BlockType::FURNACE_LIT) {
         auto it = state->furnaces.find(BlockPos{hitX, hitY, hitZ});
         if (it != state->furnaces.end()) {
             for (const ItemStack& stack : {it->second.input, it->second.fuel, it->second.output}) {
-                if (!stack.empty()) {
+                if (stack.empty())
+                    continue;
+                if (withDrops) {
+                    [self spawnDrop:state stack:stack atX:hitX y:hitY z:hitZ];
+                } else {
                     state->inventory.add(stack);
                 }
             }
             state->furnaces.erase(it);
         }
     }
+
+    const BlockType broken = *current;
+    const ItemStack heldStack = state->inventory.getSelectedStack();
 
     // Set block to air
     state->world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
@@ -2013,7 +2049,30 @@ static std::string defaultWorldDirectory() {
     // (same column → same chunk → the dirty/save below covers it)
     const std::optional<BlockType> flora = state->world->findBlockIfLoaded(hitX, hitY + 1, hitZ);
     if (flora && isFlora(*flora)) {
+        const BlockType floraBlock = *flora;
         state->world->setBlock(hitX, hitY + 1, hitZ, BlockType::AIR);
+        if (withDrops) {
+            const BlockDrop floraDrop = blockDrop(floraBlock);
+            if (floraDrop.count > 0) {
+                [self spawnDrop:state
+                          stack:ItemStack{floraDrop.item, floraDrop.count, 0}
+                            atX:hitX
+                              y:hitY + 1
+                              z:hitZ];
+            }
+        }
+    }
+
+    // Survival loot: the block's drop, gated by the tool tier, plus one point
+    // of tool wear.
+    if (withDrops) {
+        const BlockDrop drop = blockDrop(broken);
+        if (drop.count > 0 && toolCanHarvest(broken, heldStack.type)) {
+            [self spawnDrop:state stack:ItemStack{drop.item, drop.count, 0} atX:hitX y:hitY z:hitZ];
+        }
+        if (isTool(heldStack.type)) {
+            state->inventory.damageSelectedTool();
+        }
     }
 
     // World::setBlock marks the chunk (and boundary neighbors) dirty and
@@ -2023,6 +2082,23 @@ static std::string defaultWorldDirectory() {
     state->hasHighlightedBlock = false;
 
     [self playSfx:state->sfxBlockBreak gain:0.8f];
+}
+
+// Spawn a dropped item at the center of a broken block with a small random
+// pop so drops do not stack into a single point.
+- (void)spawnDrop:(EngineState*)state
+            stack:(ItemStack)stack
+              atX:(int64_t)x
+                y:(int32_t)y
+                z:(int64_t)z {
+    const Vec3 center{static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.25f,
+                      static_cast<float>(z) + 0.5f};
+    const uint64_t h =
+        hash64(static_cast<uint64_t>(x) * 6364136223846793005ull +
+               static_cast<uint64_t>(z) * 1442695040888963407ull + static_cast<uint64_t>(y));
+    const float vx = (static_cast<float>(h & 0xFF) / 255.f - 0.5f) * 0.1f;
+    const float vz = (static_cast<float>((h >> 8) & 0xFF) / 255.f - 0.5f) * 0.1f;
+    state->itemEntities.spawn(stack, center, Vec3{vx, 0.15f, vz}, 10);
 }
 
 // ---- Block Placing (Task 6.2) ----
@@ -2223,6 +2299,7 @@ static std::string defaultWorldDirectory() {
     }
     uiFrame.hoveredSlot = state->hoveredSlot;
     uiFrame.cursorStack = state->cursorStack;
+    uiFrame.miningProgress = state->miningState.active ? state->miningState.progress : 0.f;
     if (state->inputManager && _view) {
         const Vec2 mouse = state->inputManager->state().mousePosition;
         const float boundsW = static_cast<float>(_view.bounds.size.width);
