@@ -12,6 +12,7 @@
 #include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
+#include <entity/entity_picking.hpp>
 #include <entity/item_entity.hpp>
 #include <entity/physics.hpp>
 #include <entity/player.hpp>
@@ -2715,4 +2716,48 @@ TEST_CASE("Aged-out items despawn", "[item-entity]") {
     manager.items().front().ageTicks = ItemEntity::DESPAWN_TICKS - 1;
     manager.tick(*world, Vec3{0.f, 101.f, 0.f});
     REQUIRE(manager.items().empty());
+}
+
+// ============================================================================
+// Entity picking (melee targeting)
+// ============================================================================
+
+TEST_CASE("Entity picking hits along the ray and prefers the nearest", "[entity-picking]") {
+    std::vector<std::shared_ptr<Entity>> entities;
+    auto near = std::make_shared<Entity>(1, EntityType::PIG, Vec3{0.f, 0.f, 3.f});
+    auto far = std::make_shared<Entity>(2, EntityType::COW, Vec3{0.f, 0.f, 6.f});
+    entities.push_back(near);
+    entities.push_back(far);
+
+    // Looking +Z from the origin at eye height hits the pig first.
+    const Vec3 origin{0.f, near->aabb.min.y + 0.5f, 0.f};
+    auto hit = pickEntity(origin, Vec3{0.f, 0.f, 1.f}, 8.f, entities);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->entityId == 1);
+    REQUIRE(hit->distance == Catch::Approx(3.f).margin(0.6f));
+
+    // Looking away misses entirely.
+    REQUIRE_FALSE(pickEntity(origin, Vec3{0.f, 0.f, -1.f}, 8.f, entities).has_value());
+
+    // Short reach cannot touch the farther cow through the pig.
+    REQUIRE(pickEntity(origin, Vec3{0.f, 0.f, 1.f}, 3.5f, entities)->entityId == 1);
+
+    // A dead entity is skipped even when it is nearer.
+    near->alive = false;
+    auto through = pickEntity(origin, Vec3{0.f, 0.f, 1.f}, 8.f, entities);
+    REQUIRE(through.has_value());
+    REQUIRE(through->entityId == 2);
+}
+
+TEST_CASE("Entity health initializes from the per-type config", "[entity-picking]") {
+    for (int type = 0; type < static_cast<int>(EntityType::COUNT); ++type) {
+        auto entity =
+            std::make_shared<Entity>(1, static_cast<EntityType>(type), Vec3{0.f, 0.f, 0.f});
+        REQUIRE(entity->health == Entity::getConfig(static_cast<EntityType>(type)).maxHealth);
+        REQUIRE(entity->health > 0);
+    }
+    // Chickens and rabbits are the frail ones; cows are sturdier.
+    auto chicken = std::make_shared<Entity>(1, EntityType::CHICKEN, Vec3{0.f, 0.f, 0.f});
+    auto cow = std::make_shared<Entity>(2, EntityType::COW, Vec3{0.f, 0.f, 0.f});
+    REQUIRE(chicken->health < cow->health);
 }

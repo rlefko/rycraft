@@ -16,6 +16,7 @@
 #include <engine/slot_interaction.hpp>
 #include <engine/survival.hpp>
 #include <entity/ai.hpp>
+#include <entity/entity_picking.hpp>
 #include <entity/item_entity.hpp>
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
@@ -1141,6 +1142,56 @@ static std::string defaultWorldDirectory() {
     }
 }
 
+// Strike an animal: subtract the held item's damage, apply knockback, and on
+// death scatter its meat drops and remove it. Works in both modes so the
+// hunger loop can close from a fresh creative test too.
+- (void)attackEntity:(EngineState*)state entityId:(uint64_t)entityId {
+    if (!state->spawner)
+        return;
+    for (auto& entity : state->spawner->getEntities()) {
+        if (!entity || entity->id != entityId || !entity->alive)
+            continue;
+
+        const ItemStack held = state->inventory.getSelectedStack();
+        const int damage = static_cast<int>(itemDefinition(held.type).attackDamage);
+        entity->health -= damage;
+
+        // Minimal knockback away from the player, plus a small hop.
+        Vec3 away{entity->position.x - state->player.position.x, 0.f,
+                  entity->position.z - state->player.position.z};
+        const float length = away.length();
+        if (length > 1e-4f) {
+            away.x /= length;
+            away.z /= length;
+        }
+        entity->velocity.x += away.x * 0.3f;
+        entity->velocity.z += away.z * 0.3f;
+        entity->velocity.y += 0.2f;
+
+        if (modeDrainsHunger(state->gameMode)) {
+            state->survival.exhaustion += SurvivalStats::EXHAUST_ATTACK;
+        }
+        if (isTool(held.type) && modeConsumesItems(state->gameMode)) {
+            state->inventory.damageSelectedTool();
+        }
+        [self playSfx:state->sfxHurt gain:0.5f];
+
+        if (entity->health <= 0) {
+            const EntityConfig config = Entity::getConfig(entity->type);
+            if (config.drop != ItemType::NONE && config.dropCount > 0) {
+                [self spawnDrop:state
+                          stack:ItemStack{config.drop, config.dropCount, 0}
+                            atX:static_cast<int64_t>(std::floor(entity->position.x))
+                              y:static_cast<int32_t>(std::floor(entity->position.y))
+                              z:static_cast<int64_t>(std::floor(entity->position.z))];
+            }
+            entity->alive = false;
+            state->spawner->removeEntity(entityId);
+        }
+        return;
+    }
+}
+
 // Apply damage in survival, playing a rate-limited hurt sound and recording
 // the cause for the death screen. Never drops health below zero.
 - (void)damagePlayer:(EngineState*)state amount:(int)amount message:(const char*)message {
@@ -2032,9 +2083,31 @@ static std::string defaultWorldDirectory() {
         state->hasHighlightedBlock = false;
     }
 
+    // Attack precedence: a left-click edge on an animal nearer than the block
+    // target hits it instead of mining. Reach is shorter than block reach.
+    bool attackedEntity = NO;
+    if (input.isPressedForTick(Key::MouseLeft) && state->spawner) {
+        const auto entityHit = pickEntity(cameraPos, forward, 3.0f, state->spawner->getEntities());
+        if (entityHit) {
+            float blockDistance = 1e9f;
+            if (rayHit.has_value()) {
+                const Vec3 center{static_cast<float>(std::floor(rayHit->first.x)) + 0.5f,
+                                  static_cast<float>(std::floor(rayHit->first.y)) + 0.5f,
+                                  static_cast<float>(std::floor(rayHit->first.z)) + 0.5f};
+                blockDistance = (center - cameraPos).length();
+            }
+            if (entityHit->distance <= blockDistance) {
+                [self attackEntity:state entityId:entityHit->entityId];
+                attackedEntity = YES;
+            }
+        }
+    }
+
     // Block breaking. Creative is instant on the click edge; survival mines
     // held-left over time, its speed set by hardness and the held tool.
-    if (modeInstantBreak(state->gameMode)) {
+    if (attackedEntity) {
+        // Attacking suppresses mining this tick but keeps any held progress.
+    } else if (modeInstantBreak(state->gameMode)) {
         state->miningState.reset();
         if (input.isPressedForTick(Key::MouseLeft)) {
             [self breakBlock:state hit:rayHit withDrops:NO];

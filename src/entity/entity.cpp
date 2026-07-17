@@ -79,6 +79,7 @@ Entity::Entity(uint64_t entityId, EntityType entityType, const Vec3& spawnPos)
     , type(entityType)
     , position(spawnPos)
     , velocity(Vec3::zero())
+    , health(getConfig(entityType).maxHealth)
     , homePosition(spawnPos) {
     aabb = computeAABB();
 }

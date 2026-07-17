@@ -7,6 +7,7 @@ entity_sources = files(
   'spatial_hash.cpp',
   'spawner.cpp',
   'item_entity.cpp',
+  'entity_picking.cpp',
 )
 
 libentity = static_library('entity',

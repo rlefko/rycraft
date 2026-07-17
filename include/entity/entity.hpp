@@ -90,6 +90,7 @@ public:
     // State flags
     bool onGround = false;
     bool alive = true;
+    int health = 0; // set from EntityConfig::maxHealth at construction
 
     // AI timers
     int hungerTimer = 0;   // ticks since last eat
