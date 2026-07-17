@@ -172,7 +172,61 @@ TEST_CASE("Persisted block identifiers retain their original values", "[block]")
     REQUIRE(static_cast<int>(BlockType::ACACIA_LOG) == 41);
     REQUIRE(static_cast<int>(BlockType::FERN) == 51);
     REQUIRE(static_cast<int>(BlockType::ANDESITE) == 57);
-    REQUIRE(static_cast<int>(BlockType::COUNT) == 58);
+    REQUIRE(static_cast<int>(BlockType::CRAFTING_TABLE) == 58);
+    REQUIRE(static_cast<int>(BlockType::FURNACE) == 59);
+    REQUIRE(static_cast<int>(BlockType::FURNACE_LIT) == 60);
+    REQUIRE(static_cast<int>(BlockType::TORCH) == 61);
+    REQUIRE(static_cast<int>(BlockType::COUNT) == 62);
+}
+
+TEST_CASE("Block survival data gates mining by hardness tool and tier", "[block][survival]") {
+    for (size_t index = 0; index < BLOCK_TYPE_COUNT; ++index) {
+        const BlockType type = static_cast<BlockType>(index);
+        const BlockDefinition& definition = blockDefinition(type);
+        REQUIRE(blockHardness(type) == definition.hardness);
+        if (type == BlockType::BEDROCK) {
+            REQUIRE(definition.hardness < 0.0f);
+        } else {
+            REQUIRE(definition.hardness >= 0.0f);
+        }
+        if (definition.solid && definition.targetable && type != BlockType::BEDROCK) {
+            REQUIRE(definition.hardness > 0.0f);
+        }
+        if (definition.minimumTier != ToolTier::NONE) {
+            REQUIRE(definition.tool != ToolClass::NONE);
+        }
+        if (definition.interactable) {
+            REQUIRE(definition.solid);
+        }
+    }
+
+    REQUIRE(blockDefinition(BlockType::STONE).tool == ToolClass::PICKAXE);
+    REQUIRE(blockDefinition(BlockType::STONE).minimumTier == ToolTier::WOOD);
+    REQUIRE(blockDefinition(BlockType::IRON_ORE).minimumTier == ToolTier::STONE);
+    REQUIRE(blockDefinition(BlockType::GOLD_ORE).minimumTier == ToolTier::IRON);
+    REQUIRE(blockDefinition(BlockType::DIAMOND_ORE).minimumTier == ToolTier::IRON);
+    REQUIRE(blockDefinition(BlockType::OBSIDIAN).hardness == 50.0f);
+    REQUIRE(blockDefinition(BlockType::DIRT).tool == ToolClass::SHOVEL);
+    REQUIRE(blockDefinition(BlockType::LOG).tool == ToolClass::AXE);
+    REQUIRE(blockDefinition(BlockType::TALL_GRASS).hardness == 0.0f);
+    REQUIRE(isInteractable(BlockType::CRAFTING_TABLE));
+    REQUIRE(isInteractable(BlockType::FURNACE));
+    REQUIRE(isInteractable(BlockType::FURNACE_LIT));
+    REQUIRE_FALSE(isInteractable(BlockType::STONE));
+}
+
+TEST_CASE("New workshop blocks render light and break like their materials", "[block]") {
+    REQUIRE(rendersAsCube(BlockType::CRAFTING_TABLE));
+    REQUIRE(rendersAsCube(BlockType::FURNACE));
+    REQUIRE(rendersAsCube(BlockType::FURNACE_LIT));
+    REQUIRE(blockDefinition(BlockType::CRAFTING_TABLE).material == BlockMaterial::WOOD);
+    REQUIRE(blockDefinition(BlockType::FURNACE).material == BlockMaterial::ROCK);
+    REQUIRE(blockLightEmission(BlockType::FURNACE) == 0);
+    REQUIRE(blockLightEmission(BlockType::FURNACE_LIT) == 13);
+    REQUIRE(isFlora(BlockType::TORCH));
+    REQUIRE_FALSE(isSolid(BlockType::TORCH));
+    REQUIRE(blockLightEmission(BlockType::TORCH) == 14);
+    REQUIRE(isEmissive(BlockType::TORCH));
 }
 
 TEST_CASE("Block properties distinguish flora liquids and cubes", "[block]") {

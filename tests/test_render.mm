@@ -6485,6 +6485,22 @@ TEST_CASE("Block textures: grass uses per-face layers", "[render][textures]") {
     REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::MINUS_Z) == TEXTURE_LAYER_GRASS_SIDE);
 }
 
+TEST_CASE("Block textures: workshop blocks use per-face layers", "[render][textures]") {
+    REQUIRE(textureLayerFor(BlockType::CRAFTING_TABLE, FaceNormal::PLUS_Y) ==
+            TEXTURE_LAYER_CRAFTING_TABLE_TOP);
+    REQUIRE(textureLayerFor(BlockType::CRAFTING_TABLE, FaceNormal::MINUS_Y) ==
+            static_cast<uint8_t>(BlockType::PLANKS));
+    REQUIRE(textureLayerFor(BlockType::CRAFTING_TABLE, FaceNormal::PLUS_X) ==
+            static_cast<uint8_t>(BlockType::CRAFTING_TABLE));
+    for (BlockType furnace : {BlockType::FURNACE, BlockType::FURNACE_LIT}) {
+        REQUIRE(textureLayerFor(furnace, FaceNormal::PLUS_Y) == TEXTURE_LAYER_FURNACE_TOP);
+        REQUIRE(textureLayerFor(furnace, FaceNormal::MINUS_Y) == TEXTURE_LAYER_FURNACE_TOP);
+        REQUIRE(textureLayerFor(furnace, FaceNormal::MINUS_X) == static_cast<uint8_t>(furnace));
+    }
+    REQUIRE(textureLayerFor(BlockType::TORCH, FaceNormal::PLUS_X) ==
+            static_cast<uint8_t>(BlockType::TORCH));
+}
+
 TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][textures]") {
     for (int f = 0; f < 6; ++f) {
         for (uint8_t layer :
@@ -7088,7 +7104,7 @@ TEST_CASE("Block textures upload a complete deterministic mip chain", "[render][
 
     const uint64_t firstHash = blockTextureHash(first);
     REQUIRE(blockTextureHash(second) == firstHash);
-    REQUIRE(firstHash == 0x3c3f105249a0d97eULL);
+    REQUIRE(firstHash == 0x69733e9701d8885cULL);
 }
 
 TEST_CASE("Block texture mips preserve alpha-tested flora coverage", "[render][textures][mip]") {

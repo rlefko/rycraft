@@ -24,7 +24,9 @@ inline constexpr uint8_t TEXTURE_LAYER_LOG_TOP = TEXTURE_LAYER_WHITE + 1;
 inline constexpr uint8_t TEXTURE_LAYER_BIRCH_LOG_TOP = TEXTURE_LAYER_LOG_TOP + 1;
 inline constexpr uint8_t TEXTURE_LAYER_CACTUS_TOP = TEXTURE_LAYER_BIRCH_LOG_TOP + 1;
 inline constexpr uint8_t TEXTURE_LAYER_SANDSTONE_TOP = TEXTURE_LAYER_CACTUS_TOP + 1;
-inline constexpr uint8_t TEXTURE_LAYER_COUNT = TEXTURE_LAYER_SANDSTONE_TOP + 1;
+inline constexpr uint8_t TEXTURE_LAYER_CRAFTING_TABLE_TOP = TEXTURE_LAYER_SANDSTONE_TOP + 1;
+inline constexpr uint8_t TEXTURE_LAYER_FURNACE_TOP = TEXTURE_LAYER_CRAFTING_TABLE_TOP + 1;
+inline constexpr uint8_t TEXTURE_LAYER_COUNT = TEXTURE_LAYER_FURNACE_TOP + 1;
 
 // Which array layer a given face of a block samples.
 constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
@@ -57,6 +59,15 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
         case BlockType::SANDSTONE:
             if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
                 return TEXTURE_LAYER_SANDSTONE_TOP;
+            return static_cast<uint8_t>(type);
+        case BlockType::CRAFTING_TABLE:
+            if (face == FaceNormal::PLUS_Y) return TEXTURE_LAYER_CRAFTING_TABLE_TOP;
+            if (face == FaceNormal::MINUS_Y) return static_cast<uint8_t>(BlockType::PLANKS);
+            return static_cast<uint8_t>(type);
+        case BlockType::FURNACE:     // the mouth is painted on every side face —
+        case BlockType::FURNACE_LIT: // the block format carries no facing bits
+            if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
+                return TEXTURE_LAYER_FURNACE_TOP;
             return static_cast<uint8_t>(type);
         default:
             return static_cast<uint8_t>(type);

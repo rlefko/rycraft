@@ -199,6 +199,24 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                 fillTilePixel(&getTilePixel(x, y), 0.82, 0.74, 0.52, n, 0.05);
             }
         }
+    } else if (layer == TEXTURE_LAYER_CRAFTING_TABLE_TOP) {
+        // Plank base scored by a dark 2x2 work-grid
+        for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+            for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                double n = noise.noise2D(x * 0.15, y * 0.15);
+                bool grid = (x == 0 || x == 7 || x == 8 || x == 15 || y == 0 || y == 7 || y == 8 ||
+                             y == 15);
+                double f = grid ? 0.55 : 1.0;
+                fillTilePixel(&getTilePixel(x, y), 0.6 * f, 0.45 * f, 0.28 * f, n, 0.06);
+            }
+        }
+    } else if (layer == TEXTURE_LAYER_FURNACE_TOP) {
+        for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+            for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                double n = noise.noise2D(x * 0.3, y * 0.3);
+                fillTilePixel(&getTilePixel(x, y), 0.42, 0.42, 0.44, n, 0.12);
+            }
+        }
     } else {
         switch (static_cast<BlockType>(layer)) {
             case BlockType::STONE: {
@@ -812,6 +830,69 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                         double streak = noise.noise2D(x * 0.5 + 70.0, y * 0.15 + 70.0);
                         double f = streak > 0.5 ? 1.1 : 1.0;
                         fillTilePixel(&getTilePixel(x, y), 0.72 * f, 0.84 * f, 0.95 * f, n, 0.04);
+                    }
+                }
+                break;
+            }
+
+            case BlockType::CRAFTING_TABLE: {
+                // Plank side with a dark tool band across the top rows
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.15, y * 0.15);
+                        bool band = y < 4;
+                        bool slot = band && (x % 5 == 2);
+                        double f = slot ? 0.35 : (band ? 0.7 : 1.0);
+                        fillTilePixel(&getTilePixel(x, y), 0.6 * f, 0.45 * f, 0.28 * f, n, 0.06);
+                    }
+                }
+                break;
+            }
+
+            case BlockType::FURNACE:
+            case BlockType::FURNACE_LIT: {
+                // Cobble-style speckle with the mouth cut into the lower half
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.3, y * 0.3);
+                        fillTilePixel(&getTilePixel(x, y), 0.42, 0.42, 0.44, n, 0.14);
+                    }
+                }
+                const bool lit = static_cast<BlockType>(layer) == BlockType::FURNACE_LIT;
+                for (uint32_t y = 6; y < 13; ++y) {
+                    for (uint32_t x = 3; x < 13; ++x) {
+                        auto& p = getTilePixel(x, y);
+                        if (lit) {
+                            double flame = noise.noise2D(x * 0.6 + 30.0, y * 0.6 + 30.0);
+                            p.r = 255;
+                            p.g = clampToByte(0.55 + flame * 0.25);
+                            p.b = clampToByte(0.08);
+                        } else {
+                            p.r = p.g = p.b = clampToByte(0.12);
+                        }
+                        p.a = 255;
+                    }
+                }
+                break;
+            }
+
+            case BlockType::TORCH: {
+                // Cutout cross: a glowing tip (row 0 is the tile top) over a
+                // thin stick column; everything else stays transparent
+                for (uint32_t y = 5; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 7; x < 9; ++x) {
+                        double n = noise.noise2D(x * 0.4, y * 0.4);
+                        fillTilePixel(&getTilePixel(x, y), 0.45, 0.3, 0.15, n, 0.1);
+                    }
+                }
+                for (uint32_t y = 1; y < 5; ++y) {
+                    for (uint32_t x = 6; x < 10; ++x) {
+                        auto& p = getTilePixel(x, y);
+                        double flame = noise.noise2D(x * 0.7, y * 0.7);
+                        p.r = 255;
+                        p.g = clampToByte(0.85 + flame * 0.1);
+                        p.b = clampToByte(0.35);
+                        p.a = 255;
                     }
                 }
                 break;
