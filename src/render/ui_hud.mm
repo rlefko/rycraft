@@ -1,10 +1,10 @@
 #include "render/ui_hud.hpp"
 
 #include "render/ui_overlay.hpp"
-#include "world/block_properties.hpp"
+#include "world/item.hpp"
 
-void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
-                 uint32_t displayWidth, uint32_t displayHeight) {
+void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
+                 uint32_t displayHeight) {
     if (frame.screen == GameScreen::TITLE)
         return;
 
@@ -29,15 +29,16 @@ void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
     }
 
     // ---- Hotbar (9 slots at bottom of screen) ----
+    const int slotCount = static_cast<int>(frame.hotbar.slots.size());
     float slotSize = 48.0f / h;
     float slotGap = 2.0f / h;
     float hotbarY = 6.0f / h;
-    float totalWidth = Hotbar::SLOTS * slotSize + (Hotbar::SLOTS - 1) * slotGap;
+    float totalWidth = slotCount * slotSize + (slotCount - 1) * slotGap;
     float hotbarX = (1.0f - totalWidth) * 0.5f;
 
-    int selectedIndex = hotbar.getSelectedIndex();
+    int selectedIndex = frame.hotbar.selected;
 
-    for (int i = 0; i < Hotbar::SLOTS; ++i) {
+    for (int i = 0; i < slotCount; ++i) {
         float slotX = hotbarX + i * (slotSize + slotGap);
 
         if (i == selectedIndex) {
@@ -47,196 +48,14 @@ void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
 
         ui.drawQuad(slotX, hotbarY, slotSize, slotSize, 0.3f, 0.3f, 0.3f, 0.6f);
 
-        // Block type indicator (simplified: color per block type)
-        BlockType type = hotbar.getSlot(i);
-        float r = 0.5f, g = 0.5f, b = 0.5f;
-        switch (type) {
-            case BlockType::STONE:
-                r = 0.5f;
-                g = 0.5f;
-                b = 0.5f;
-                break;
-            case BlockType::DIRT:
-                r = 0.55f;
-                g = 0.35f;
-                b = 0.2f;
-                break;
-            case BlockType::GRASS:
-                r = 0.2f;
-                g = 0.6f;
-                b = 0.2f;
-                break;
-            case BlockType::LOG:
-                r = 0.4f;
-                g = 0.25f;
-                b = 0.15f;
-                break;
-            case BlockType::SAND:
-                r = 0.85f;
-                g = 0.78f;
-                b = 0.55f;
-                break;
-            case BlockType::PLANKS:
-                r = 0.65f;
-                g = 0.45f;
-                b = 0.25f;
-                break;
-            case BlockType::BEDROCK:
-                r = 0.2f;
-                g = 0.2f;
-                b = 0.2f;
-                break;
-            case BlockType::COAL_ORE:
-                r = 0.15f;
-                g = 0.15f;
-                b = 0.15f;
-                break;
-            case BlockType::IRON_ORE:
-                r = 0.6f;
-                g = 0.5f;
-                b = 0.45f;
-                break;
-            case BlockType::GLASS:
-                r = 0.85f;
-                g = 0.9f;
-                b = 0.95f;
-                break;
-            case BlockType::COBBLESTONE:
-                r = 0.45f;
-                g = 0.45f;
-                b = 0.47f;
-                break;
-            case BlockType::MOSSY_COBBLESTONE:
-                r = 0.35f;
-                g = 0.45f;
-                b = 0.3f;
-                break;
-            case BlockType::SANDSTONE:
-                r = 0.8f;
-                g = 0.72f;
-                b = 0.5f;
-                break;
-            case BlockType::BIRCH_LOG:
-                r = 0.85f;
-                g = 0.83f;
-                b = 0.75f;
-                break;
-            case BlockType::BIRCH_LEAVES:
-                r = 0.35f;
-                g = 0.55f;
-                b = 0.25f;
-                break;
-            case BlockType::SPRUCE_LOG:
-                r = 0.3f;
-                g = 0.2f;
-                b = 0.1f;
-                break;
-            case BlockType::SPRUCE_LEAVES:
-                r = 0.12f;
-                g = 0.35f;
-                b = 0.18f;
-                break;
-            case BlockType::CACTUS:
-                r = 0.2f;
-                g = 0.45f;
-                b = 0.15f;
-                break;
-            case BlockType::DEAD_BUSH:
-                r = 0.55f;
-                g = 0.4f;
-                b = 0.22f;
-                break;
-            case BlockType::TALL_GRASS:
-                r = 0.35f;
-                g = 0.65f;
-                b = 0.25f;
-                break;
-            case BlockType::FLOWER_YELLOW:
-                r = 0.9f;
-                g = 0.85f;
-                b = 0.2f;
-                break;
-            case BlockType::FLOWER_RED:
-                r = 0.85f;
-                g = 0.2f;
-                b = 0.2f;
-                break;
-            case BlockType::MUSHROOM_BROWN:
-                r = 0.55f;
-                g = 0.4f;
-                b = 0.3f;
-                break;
-            case BlockType::MUSHROOM_RED:
-                r = 0.8f;
-                g = 0.15f;
-                b = 0.15f;
-                break;
-            case BlockType::REED:
-                r = 0.5f;
-                g = 0.75f;
-                b = 0.35f;
-                break;
-            case BlockType::LAVA:
-                r = 0.9f;
-                g = 0.4f;
-                b = 0.1f;
-                break;
-            case BlockType::ICE:
-                r = 0.7f;
-                g = 0.85f;
-                b = 0.95f;
-                break;
-            case BlockType::WATER:
-                r = 0.25f;
-                g = 0.45f;
-                b = 0.85f;
-                break;
-            case BlockType::MUD:
-                r = 0.30f;
-                g = 0.23f;
-                b = 0.17f;
-                break;
-            case BlockType::CLAY:
-                r = 0.56f;
-                g = 0.58f;
-                b = 0.60f;
-                break;
-            case BlockType::SILT:
-                r = 0.50f;
-                g = 0.43f;
-                b = 0.31f;
-                break;
-            case BlockType::BASALT:
-                r = 0.20f;
-                g = 0.21f;
-                b = 0.22f;
-                break;
-            case BlockType::VOLCANIC_ASH:
-                r = 0.27f;
-                g = 0.26f;
-                b = 0.25f;
-                break;
-            case BlockType::LIMESTONE:
-                r = 0.72f;
-                g = 0.70f;
-                b = 0.62f;
-                break;
-            case BlockType::OBSIDIAN:
-                r = 0.12f;
-                g = 0.08f;
-                b = 0.17f;
-                break;
-            case BlockType::ANDESITE:
-                r = 0.42f;
-                g = 0.43f;
-                b = 0.42f;
-                break;
-            default:
-                r = 0.5f;
-                g = 0.5f;
-                b = 0.5f;
-                break;
-        }
+        // Item indicator: the registry swatch color, empty slots stay bare
+        const ItemStack& stack = frame.hotbar.slots[static_cast<size_t>(i)];
+        if (stack.empty())
+            continue;
+        const uint32_t swatch = itemSwatchColor(stack.type);
+        const float r = static_cast<float>((swatch >> 16) & 0xFF) / 255.0f;
+        const float g = static_cast<float>((swatch >> 8) & 0xFF) / 255.0f;
+        const float b = static_cast<float>(swatch & 0xFF) / 255.0f;
 
         float innerSize = slotSize * 0.7f;
         float innerOffset = (slotSize - innerSize) * 0.5f;

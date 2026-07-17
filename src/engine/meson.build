@@ -3,7 +3,7 @@ engine_sources = files(
     'input.mm',
     'input_bindings.cpp',
     'camera.cpp',
-    'hotbar.cpp',
+    'inventory.cpp',
 )
 
 libengine = static_library('engine',

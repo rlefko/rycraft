@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/game_state.hpp"
+#include "world/item.hpp"
 #include "world/macro_generation.hpp"
 #include "world/view_distance.hpp"
 
@@ -143,6 +144,14 @@ struct UIFrameState {
     bool cameraUnderwater = false; // drives the underwater veil + god rays
     PerformanceStats stats{};
     MenuLayout menu;
+
+    // Hotbar snapshot the HUD draws; the engine copies it from the live
+    // Inventory each frame so the render layer never touches engine state.
+    struct HudHotbar {
+        std::array<ItemStack, 9> slots{};
+        int selected = 0;
+    };
+    HudHotbar hotbar;
 };
 
 // Normalized width of a string at the given glyph scale (8px glyphs plus

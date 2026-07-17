@@ -10,8 +10,8 @@
 #include <common/random.hpp>
 #include <engine/camera.hpp>
 #include <engine/game_state.hpp>
-#include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
@@ -300,7 +300,7 @@ struct EngineState {
     static constexpr float DRY_SECONDS = 45.0f;
 
     // ---- Block Interaction ----
-    Hotbar hotbar;
+    Inventory inventory;
     Vec3 highlightedBlock; // Block currently targeted by crosshair
     bool hasHighlightedBlock = false;
 
@@ -409,20 +409,26 @@ static EngineState* _engineGetState(Engine* engine) {
                                                           std::numeric_limits<uint64_t>::max());
         _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
 
-        // Resume the saved world when one exists; otherwise start fresh
+        // Resume the saved world when one exists; otherwise start fresh with
+        // the default hotbar palette.
         uint32_t seed = 42;
         Vec3 spawnPos{0.f, 100.f, 0.f};
+        SaveManager::PlayerMetadata playerMeta{};
         if (auto meta = _state->saveManager->loadMetadata()) {
             seed = meta->seed;
             spawnPos = meta->spawnPos;
             _state->worldTime = meta->worldTime;
-            _state->player.yaw = meta->player.yaw;
-            _state->player.pitch = meta->player.pitch;
-            _state->player.health = meta->player.health;
-            _state->hotbar.selectSlot(meta->player.selectedSlot);
-            for (int slot = 0; slot < Hotbar::SLOTS; ++slot) {
-                _state->hotbar.setSlot(slot, meta->player.inventory[static_cast<size_t>(slot)]);
-            }
+            playerMeta = meta->player;
+        }
+        _state->player.yaw = playerMeta.yaw;
+        _state->player.pitch = playerMeta.pitch;
+        _state->player.health = playerMeta.health;
+        _state->inventory.selectSlot(playerMeta.selectedSlot);
+        for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
+            const BlockType block = playerMeta.inventory[slot];
+            _state->inventory.setSlot(
+                static_cast<int>(slot),
+                block == BlockType::AIR ? ItemStack{} : ItemStack{itemFromBlock(block), 1, 0});
         }
         if (const char* seedEnv = std::getenv("RYCRAFT_WORLD_SEED")) {
             seed = static_cast<uint32_t>(std::strtoull(seedEnv, nullptr, 0));
@@ -923,11 +929,11 @@ static EngineState* _engineGetState(Engine* engine) {
         // Hotbar: scroll wheel cycles slots (frame-level, gameplay only)
         _scrollAccumulator += input.scrollDelta;
         while (_scrollAccumulator >= 10.0f) {
-            state->hotbar.selectNext();
+            state->inventory.selectNext();
             _scrollAccumulator -= 10.0f;
         }
         while (_scrollAccumulator <= -10.0f) {
-            state->hotbar.selectPrev();
+            state->inventory.selectPrev();
             _scrollAccumulator += 10.0f;
         }
     }
@@ -961,9 +967,10 @@ static EngineState* _engineGetState(Engine* engine) {
         playerMetadata.yaw = state->player.yaw;
         playerMetadata.pitch = state->player.pitch;
         playerMetadata.health = state->player.health;
-        playerMetadata.selectedSlot = state->hotbar.getSelectedIndex();
-        for (int slot = 0; slot < Hotbar::SLOTS; ++slot) {
-            playerMetadata.inventory[static_cast<size_t>(slot)] = state->hotbar.getSlot(slot);
+        playerMetadata.selectedSlot = state->inventory.getSelectedIndex();
+        for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
+            playerMetadata.inventory[slot] =
+                blockFromItem(state->inventory.getSlot(static_cast<int>(slot)).type);
         }
         const bool metadataSaved = state->saveManager->saveMetadata(
             state->world->getSeed(), state->player.position, state->worldTime, playerMetadata);
@@ -1166,10 +1173,10 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 2. Hotbar input: keys 1-9 select slots
-    for (int i = 0; i < Hotbar::SLOTS; ++i) {
+    for (int i = 0; i < Inventory::HOTBAR_SLOTS; ++i) {
         Key key = static_cast<Key>(static_cast<int>(Key::One) + i);
         if (input.isPressedForTick(key)) {
-            state->hotbar.selectSlot(i);
+            state->inventory.selectSlot(i);
             break;
         }
     }
@@ -1422,8 +1429,11 @@ static EngineState* _engineGetState(Engine* engine) {
         return;
 
     // Place block (World::setBlock marks the chunk and boundary neighbors
-    // dirty and flags the chunk for save-on-unload)
-    BlockType selectedType = state->hotbar.getSelectedBlockType();
+    // dirty and flags the chunk for save-on-unload). An empty slot or a
+    // non-block item has nothing to place.
+    BlockType selectedType = state->inventory.getSelectedBlockType();
+    if (selectedType == BlockType::AIR)
+        return;
     state->world->setBlock(placeX, placeY, placeZ, selectedType);
 
     [self playSfx:state->sfxBlockPlace gain:0.8f];
@@ -1561,6 +1571,10 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.screen = state->flow.screen;
     uiFrame.hoveredButton = state->hoveredButton;
     uiFrame.showDebugHud = state->showDebugHud;
+    uiFrame.hotbar.selected = state->inventory.getSelectedIndex();
+    for (int slot = 0; slot < Inventory::HOTBAR_SLOTS; ++slot) {
+        uiFrame.hotbar.slots[static_cast<size_t>(slot)] = state->inventory.getSlot(slot);
+    }
     // Underwater view (veil, god rays, dense fog): the camera cell is water.
     // Non-generating read — a streaming lag must never stall the frame.
     {
@@ -1659,7 +1673,7 @@ static EngineState* _engineGetState(Engine* engine) {
         _queue, drawable, viewMatrix, state->projectionMatrix, *state->world, state->camera,
         state->worldTime, state->deltaTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
-        state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
+        uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
 
     if (updatePerformanceCapture(state->performance, state->frameCount, state->deltaTime * 1000.0,
                                  state->cachedChunkCount, state->autopilotStopFrame, *state->world,

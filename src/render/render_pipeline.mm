@@ -12,7 +12,6 @@
 #include "render/volumetrics.hpp"
 
 #include "engine/camera.hpp"
-#include "engine/hotbar.hpp"
 #include "render/particles.hpp"
 #include "render/ui_hud.hpp"
 #include "render/ui_overlay.hpp"
@@ -520,7 +519,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                             const Mat4& viewMatrix, const Mat4& projectionMatrix,
                             const World& world, const Camera& camera, uint64_t worldTime,
                             double deltaSeconds, std::optional<Vec3> highlightedBlock,
-                            const Hotbar& hotbar, const UIFrameState& uiFrame,
+                            const UIFrameState& uiFrame,
                             const std::vector<std::shared_ptr<Entity>>* entities) {
     if (!drawable || !queue)
         return;
@@ -803,7 +802,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     id<MTLRenderCommandEncoder> uiEncoder =
         [commandBuffer renderCommandEncoderWithDescriptor:uiPassDesc];
     if (uiEncoder) {
-        renderUIOverlay(uiEncoder, hotbar, uiFrame);
+        renderUIOverlay(uiEncoder, uiFrame);
         [uiEncoder endEncoding];
     }
 
@@ -2890,10 +2889,10 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, c
 // ---------------------------------------------------------------------------
 // renderUIOverlay (Task 6.10 + hotbar)
 // ---------------------------------------------------------------------------
-void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
+void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
                                      const UIFrameState& uiFrame) {
     _uiOverlay->beginFrame();
-    drawGameHud(*_uiOverlay, hotbar, uiFrame, _displayWidth, _displayHeight);
+    drawGameHud(*_uiOverlay, uiFrame, _displayWidth, _displayHeight);
     if (uiFrame.screen != GameScreen::PLAYING) {
         drawMenu(*_uiOverlay, uiFrame.menu, uiFrame.hoveredButton, _displayWidth, _displayHeight);
     }

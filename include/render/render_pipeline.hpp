@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "common/math.hpp"
-#include "engine/hotbar.hpp"
 #include "render/block_texture_array.hpp"
 #include "render/far_terrain.hpp"
 #include "render/frame_ring.hpp"
@@ -139,7 +138,7 @@ public:
                 const Mat4& projectionMatrix, const World& world, const Camera& camera,
                 uint64_t worldTime = 0, double deltaSeconds = 0.0,
                 std::optional<Vec3> highlightedBlock = std::nullopt,
-                const Hotbar& hotbar = Hotbar(), const UIFrameState& uiFrame = UIFrameState{},
+                const UIFrameState& uiFrame = UIFrameState{},
                 const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
 
     // Reallocate MSAA and resolve textures for new viewport size.
@@ -472,8 +471,7 @@ private:
                      bool cameraUnderwater, const SkyUniforms& skyUniforms,
                      const float fogColor[3]);
 
-    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
-                         const UIFrameState& uiFrame);
+    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const UIFrameState& uiFrame);
 
     void renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera, uint64_t worldTime,
                       const float sunDirection[3], float sunIntensity);

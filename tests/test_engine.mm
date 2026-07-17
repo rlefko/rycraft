@@ -8,8 +8,8 @@
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
 #include <engine/game_state.hpp>
-#include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -588,100 +588,104 @@ TEST_CASE("UIOverlay quad index order forms two triangles", "[render][ui]") {
     REQUIRE(indices[5] == 3); // TR
 }
 
-// ---- Hotbar Tests (Task 6.3) ----
+// ---- Inventory Tests ----
 
-TEST_CASE("Hotbar: initial slot selection is 0", "[phase6][hotbar]") {
-    Hotbar hotbar;
-    REQUIRE(hotbar.getSelectedIndex() == 0);
+TEST_CASE("Inventory: hotbar selection clamps and wraps", "[inventory]") {
+    Inventory inventory;
+    REQUIRE(inventory.getSelectedIndex() == 0);
+
+    inventory.selectSlot(-5);
+    REQUIRE(inventory.getSelectedIndex() == 0);
+    inventory.selectSlot(100);
+    REQUIRE(inventory.getSelectedIndex() == 8);
+    inventory.selectSlot(4);
+    REQUIRE(inventory.getSelectedIndex() == 4);
+
+    inventory.selectSlot(8);
+    inventory.selectNext();
+    REQUIRE(inventory.getSelectedIndex() == 0);
+    inventory.selectPrev();
+    REQUIRE(inventory.getSelectedIndex() == 8);
 }
 
-TEST_CASE("Hotbar: selectSlot clamps to valid range", "[phase6][hotbar]") {
-    Hotbar hotbar;
+TEST_CASE("Inventory: slots read and write with range guards", "[inventory]") {
+    Inventory inventory;
+    REQUIRE(inventory.getSlot(0).empty());
 
-    // Negative index clamps to 0
-    hotbar.selectSlot(-5);
-    REQUIRE(hotbar.getSelectedIndex() == 0);
+    inventory.setSlot(0, ItemStack{itemFromBlock(BlockType::DIAMOND_ORE), 3, 0});
+    REQUIRE(inventory.getSlot(0).type == itemFromBlock(BlockType::DIAMOND_ORE));
+    REQUIRE(inventory.getSlot(0).count == 3);
 
-    // Out-of-range index clamps to 8
-    hotbar.selectSlot(100);
-    REQUIRE(hotbar.getSelectedIndex() == 8);
+    // Main-grid slots exist beyond the hotbar.
+    inventory.setSlot(35, ItemStack{ItemType::STICK, 5, 0});
+    REQUIRE(inventory.getSlot(35).count == 5);
 
-    // Valid index works
-    hotbar.selectSlot(4);
-    REQUIRE(hotbar.getSelectedIndex() == 4);
+    // Out-of-range reads return empty; writes drop.
+    REQUIRE(inventory.getSlot(-1).empty());
+    REQUIRE(inventory.getSlot(Inventory::SLOTS).empty());
+    inventory.setSlot(-1, ItemStack{ItemType::COAL, 1, 0});
+    REQUIRE(inventory.getSlot(0).type == itemFromBlock(BlockType::DIAMOND_ORE));
 }
 
-TEST_CASE("Hotbar: selectNext wraps around", "[phase6][hotbar]") {
-    Hotbar hotbar;
-    hotbar.selectSlot(0);
+TEST_CASE("Inventory: selected block resolves through the item registry", "[inventory]") {
+    Inventory inventory;
+    inventory.setSlot(0, ItemStack{itemFromBlock(BlockType::STONE), 1, 0});
+    inventory.setSlot(1, ItemStack{ItemType::IRON_PICKAXE, 1, 250});
+    inventory.selectSlot(0);
+    REQUIRE(inventory.getSelectedBlockType() == BlockType::STONE);
+    // Tools and empty slots place nothing.
+    inventory.selectSlot(1);
+    REQUIRE(inventory.getSelectedBlockType() == BlockType::AIR);
+    inventory.selectSlot(2);
+    REQUIRE(inventory.getSelectedBlockType() == BlockType::AIR);
+}
 
-    for (int i = 1; i <= 8; ++i) {
-        hotbar.selectNext();
-        REQUIRE(hotbar.getSelectedIndex() == i);
+TEST_CASE("Inventory: add merges into stacks hotbar first", "[inventory]") {
+    Inventory inventory;
+    inventory.setSlot(9, ItemStack{ItemType::COAL, 60, 0});
+
+    // Merging tops off the existing main-grid stack, then opens hotbar slot 0.
+    REQUIRE(inventory.add(ItemStack{ItemType::COAL, 10, 0}) == 10);
+    REQUIRE(inventory.getSlot(9).count == 64);
+    REQUIRE(inventory.getSlot(0).type == ItemType::COAL);
+    REQUIRE(inventory.getSlot(0).count == 6);
+
+    // A full inventory absorbs nothing.
+    Inventory full;
+    for (int slot = 0; slot < Inventory::SLOTS; ++slot) {
+        full.setSlot(slot, ItemStack{ItemType::STICK, 64, 0});
     }
+    REQUIRE(full.add(ItemStack{ItemType::STICK, 1, 0}) == 0);
+    REQUIRE(full.add(ItemStack{ItemType::COAL, 1, 0}) == 0);
 
-    // Wrap around: 8 → 0
-    hotbar.selectNext();
-    REQUIRE(hotbar.getSelectedIndex() == 0);
+    // Tools never merge (stack limit one) but fill empty slots.
+    Inventory tools;
+    REQUIRE(tools.add(ItemStack{ItemType::IRON_AXE, 1, 250}) == 1);
+    REQUIRE(tools.getSlot(0).type == ItemType::IRON_AXE);
+    REQUIRE(tools.getSlot(0).durability == 250);
 }
 
-TEST_CASE("Hotbar: selectPrev wraps around", "[phase6][hotbar]") {
-    Hotbar hotbar;
-    hotbar.selectSlot(8);
+TEST_CASE("Inventory: consume and tool damage empty the selected slot", "[inventory]") {
+    Inventory inventory;
+    inventory.setSlot(0, ItemStack{itemFromBlock(BlockType::DIRT), 2, 0});
+    inventory.selectSlot(0);
+    inventory.consumeSelected();
+    REQUIRE(inventory.getSlot(0).count == 1);
+    inventory.consumeSelected();
+    REQUIRE(inventory.getSlot(0).empty());
+    inventory.consumeSelected();
+    REQUIRE(inventory.getSlot(0).empty());
 
-    for (int i = 7; i >= 0; --i) {
-        hotbar.selectPrev();
-        REQUIRE(hotbar.getSelectedIndex() == i);
-    }
+    inventory.setSlot(0, ItemStack{ItemType::WOODEN_PICKAXE, 1, 2});
+    REQUIRE_FALSE(inventory.damageSelectedTool());
+    REQUIRE(inventory.getSlot(0).durability == 1);
+    REQUIRE(inventory.damageSelectedTool());
+    REQUIRE(inventory.getSlot(0).empty());
 
-    // Wrap around: 0 → 8
-    hotbar.selectPrev();
-    REQUIRE(hotbar.getSelectedIndex() == 8);
-}
-
-TEST_CASE("Hotbar: getSelectedBlockType returns correct type", "[phase6][hotbar]") {
-    Hotbar hotbar;
-
-    // Default slot 0 is STONE
-    hotbar.selectSlot(0);
-    REQUIRE(hotbar.getSelectedBlockType() == BlockType::STONE);
-
-    // Slot 1 is DIRT
-    hotbar.selectSlot(1);
-    REQUIRE(hotbar.getSelectedBlockType() == BlockType::DIRT);
-
-    // Slot 2 is GRASS
-    hotbar.selectSlot(2);
-    REQUIRE(hotbar.getSelectedBlockType() == BlockType::GRASS);
-}
-
-TEST_CASE("Hotbar: setSlot and getSlot", "[phase6][hotbar]") {
-    Hotbar hotbar;
-
-    hotbar.setSlot(0, BlockType::DIAMOND_ORE);
-    REQUIRE(hotbar.getSlot(0) == BlockType::DIAMOND_ORE);
-
-    // Out-of-range returns AIR
-    REQUIRE(hotbar.getSlot(-1) == BlockType::AIR);
-    REQUIRE(hotbar.getSlot(9) == BlockType::AIR);
-
-    // setSlot on out-of-range does nothing
-    hotbar.setSlot(-1, BlockType::STONE);
-    REQUIRE(hotbar.getSlot(0) == BlockType::DIAMOND_ORE);
-}
-
-TEST_CASE("Hotbar: default slot contents", "[phase6][hotbar]") {
-    Hotbar hotbar;
-
-    REQUIRE(hotbar.getSlot(0) == BlockType::STONE);
-    REQUIRE(hotbar.getSlot(1) == BlockType::DIRT);
-    REQUIRE(hotbar.getSlot(2) == BlockType::GRASS);
-    REQUIRE(hotbar.getSlot(3) == BlockType::LOG);
-    REQUIRE(hotbar.getSlot(4) == BlockType::PLANKS);
-    REQUIRE(hotbar.getSlot(5) == BlockType::SAND);
-    REQUIRE(hotbar.getSlot(6) == BlockType::SANDSTONE);
-    REQUIRE(hotbar.getSlot(7) == BlockType::GLASS);
-    REQUIRE(hotbar.getSlot(8) == BlockType::FLOWER_RED);
+    // Non-tools never wear.
+    inventory.setSlot(0, ItemStack{ItemType::COAL, 4, 0});
+    REQUIRE_FALSE(inventory.damageSelectedTool());
+    REQUIRE(inventory.getSlot(0).count == 4);
 }
 
 // ---- Performance HUD Tests ----

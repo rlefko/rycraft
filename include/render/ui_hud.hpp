@@ -2,7 +2,6 @@
 
 #import <Metal/Metal.h>
 
-#include "engine/hotbar.hpp"
 #include "render/ui_menu.hpp"
 
 class UIOverlay;
@@ -17,9 +16,10 @@ class UIOverlay;
 // ---------------------------------------------------------------------------
 
 // Gameplay chrome: crosshair (only while playing), hotbar, and the F3 debug
-// HUD. Skipped entirely on the title screen.
-void drawGameHud(UIOverlay& ui, const Hotbar& hotbar, const UIFrameState& frame,
-                 uint32_t displayWidth, uint32_t displayHeight);
+// HUD. Skipped entirely on the title screen. The hotbar draws from the
+// snapshot inside UIFrameState.
+void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
+                 uint32_t displayHeight);
 
 // The current menu (title/pause/settings), with hover highlighting.
 void drawMenu(UIOverlay& ui, const MenuLayout& layout, int hoveredButton, uint32_t displayWidth,

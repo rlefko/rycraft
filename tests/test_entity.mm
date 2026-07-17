@@ -8,7 +8,7 @@
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
 #include <engine/game_state.hpp>
-#include <engine/hotbar.hpp>
+#include <engine/inventory.hpp>
 #include <engine/input_bindings.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
