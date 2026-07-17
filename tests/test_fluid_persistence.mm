@@ -25,7 +25,7 @@ FluidCell residentCell(BlockType block = BlockType::AIR, FluidState state = Flui
 }
 
 std::filesystem::path regionPath(const std::string& worldPath, ColumnPos column) {
-    return std::filesystem::path(worldPath) / "regions" /
+    return std::filesystem::path(worldPath) / SaveManager::CURRENT_REGIONS_DIRECTORY /
            ("r." + std::to_string(world_coord::floorDiv(column.x, int64_t{32})) + "." +
             std::to_string(world_coord::floorDiv(column.z, int64_t{32})));
 }
@@ -314,6 +314,123 @@ TEST_CASE("Atomic metadata and manifest replacement preserve prior durable state
     SaveManager reopened(directory.path());
     REQUIRE(reopened.loadMetadata()->seed == 11);
     REQUIRE(reopened.loadDeferredFluidFrontiers() == std::vector<FluidBoundaryFrontier>{original});
+}
+
+TEST_CASE("Generator version three preserves metadata and isolates legacy cube data",
+          "[save][migration][generator-version]") {
+    TempDir directory("generator_v3_migration");
+    constexpr ChunkPos position{7, 5, -9};
+    {
+        SaveManager current(directory.path());
+        SaveManager::PlayerMetadata player;
+        player.yaw = 37.0F;
+        player.inventory[2] = BlockType::OBSIDIAN;
+        REQUIRE(current.saveMetadata(9182, Vec3{12.0F, 91.0F, -33.0F}, 4455, player));
+        Chunk edited(position);
+        edited.setBlock(3, 4, 5, BlockType::DIAMOND_ORE);
+        current.saveChunk(edited);
+        REQUIRE(current.flush());
+    }
+
+    const std::filesystem::path currentRegions =
+        std::filesystem::path(directory.path()) / SaveManager::CURRENT_REGIONS_DIRECTORY;
+    const std::filesystem::path legacyRegions = std::filesystem::path(directory.path()) / "regions";
+    std::filesystem::rename(currentRegions, legacyRegions);
+    const std::filesystem::path metadataPath =
+        std::filesystem::path(directory.path()) / "metadata.json";
+    {
+        std::ifstream input(metadataPath);
+        REQUIRE(input.is_open());
+        std::string metadata((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+        const std::string currentVersion =
+            "\"generatorVersion\": " + std::to_string(SaveManager::CURRENT_GENERATOR_VERSION);
+        const size_t version = metadata.find(currentVersion);
+        REQUIRE(version != std::string::npos);
+        metadata.replace(version, currentVersion.size(), "\"generatorVersion\": 2");
+        std::ofstream output(metadataPath, std::ios::trunc);
+        REQUIRE(output.is_open());
+        output << metadata;
+        REQUIRE(output.good());
+    }
+
+    {
+        SaveManager upgraded(directory.path());
+        const auto metadata = upgraded.loadMetadata();
+        REQUIRE(metadata.has_value());
+        REQUIRE(metadata->generatorVersion == 2);
+        REQUIRE(metadata->seed == 9182);
+        REQUIRE(metadata->spawnPos == Vec3{12.0F, 91.0F, -33.0F});
+        REQUIRE(metadata->worldTime == 4455);
+        REQUIRE(metadata->player.yaw == 37.0F);
+        REQUIRE(metadata->player.inventory[2] == BlockType::OBSIDIAN);
+        REQUIRE_FALSE(upgraded.loadChunk(position).has_value());
+        REQUIRE(upgraded.savedSections({position.x, position.z}).empty());
+        REQUIRE(upgraded.saveMetadata(metadata->seed, metadata->spawnPos, metadata->worldTime,
+                                      metadata->player));
+    }
+
+    REQUIRE(std::filesystem::exists(legacyRegions));
+    REQUIRE(std::filesystem::exists(std::filesystem::path(directory.path()) /
+                                    SaveManager::CURRENT_REGIONS_DIRECTORY));
+    SaveManager reopened(directory.path());
+    REQUIRE(reopened.loadMetadata()->generatorVersion == SaveManager::CURRENT_GENERATOR_VERSION);
+}
+
+TEST_CASE("Generated rapid and waterfall states survive cubic persistence",
+          "[worldgen][save][fluid-persistence][waterfall][regression]") {
+    TempDir directory("generated_flowing_water");
+    ChunkGenerator generator(42);
+    constexpr std::array<ChunkPos, 3> POSITIONS = {
+        ChunkPos{-516, 5, 193},
+        ChunkPos{-515, 5, 193},
+        ChunkPos{-515, 4, 193},
+    };
+
+    std::array<std::vector<uint8_t>, POSITIONS.size()> expectedFluidStates;
+    std::array<std::vector<BlockType>, POSITIONS.size()> expectedBlocks;
+    std::array<bool, 8> flowingLevels{};
+    size_t fallingCells = 0;
+    {
+        SaveManager saves(directory.path());
+        for (size_t index = 0; index < POSITIONS.size(); ++index) {
+            Chunk cube(POSITIONS[index]);
+            generator.generateCube(cube);
+            expectedBlocks[index] = cube.copyBlocks();
+            expectedFluidStates[index] = cube.explicitFluidStates();
+            for (int localY = 0; localY < CHUNK_EDGE; ++localY) {
+                for (int localZ = 0; localZ < CHUNK_EDGE; ++localZ) {
+                    for (int localX = 0; localX < CHUNK_EDGE; ++localX) {
+                        if (cube.getBlock(localX, localY, localZ) != BlockType::WATER)
+                            continue;
+                        const FluidState state = cube.getFluidState(localX, localY, localZ);
+                        if (state.isFalling()) {
+                            ++fallingCells;
+                        } else if (!state.isSource()) {
+                            flowingLevels[state.level()] = true;
+                        }
+                    }
+                }
+            }
+            saves.saveChunk(cube);
+        }
+        REQUIRE(saves.flush());
+    }
+
+    REQUIRE(fallingCells > 0);
+    for (uint8_t level = 1; level <= 7; ++level) {
+        CAPTURE(level);
+        REQUIRE(flowingLevels[level]);
+    }
+
+    SaveManager reopened(directory.path());
+    for (size_t index = 0; index < POSITIONS.size(); ++index) {
+        CAPTURE(POSITIONS[index].x, POSITIONS[index].y, POSITIONS[index].z);
+        const std::optional<Chunk> restored = reopened.loadChunk(POSITIONS[index]);
+        REQUIRE(restored.has_value());
+        REQUIRE(restored->copyBlocks() == expectedBlocks[index]);
+        REQUIRE(restored->explicitFluidStates() == expectedFluidStates[index]);
+    }
 }
 
 TEST_CASE("Valid orphaned v4 cube filenames rebuild the edited section manifest",

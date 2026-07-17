@@ -2,6 +2,7 @@ world_sources = files(
   'world.cpp',
   'noise.cpp',
   'climate.cpp',
+  'alpine_morphology.cpp',
   'macro_generation.cpp',
   'basin_solver.cpp',
   'column_plan.cpp',

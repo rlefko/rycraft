@@ -9,12 +9,6 @@
 
 namespace {
 
-bool shouldReplace(const MeshResult& existing, const MeshResult& incoming) {
-    if (existing.snapshotOk != incoming.snapshotOk) return incoming.snapshotOk;
-    if (!incoming.snapshotOk) return true;
-    return static_cast<int32_t>(incoming.builtVersion - existing.builtVersion) >= 0;
-}
-
 auto findResult(std::vector<MeshResult>& results, ChunkPos pos) {
     return std::find_if(results.begin(), results.end(),
                         [pos](const MeshResult& result) { return result.pos == pos; });
@@ -59,11 +53,11 @@ void MeshScheduler::shutdown() {
     consumerPending_.store(0, std::memory_order_relaxed);
 }
 
-bool MeshScheduler::reserveSlot() {
+bool MeshScheduler::reserveSlot(MeshPriorityLane lane) {
     size_t owned = inFlight_.load(std::memory_order_relaxed);
     for (;;) {
         const size_t consumer = consumerPending_.load(std::memory_order_relaxed);
-        if (owned + consumer >= MAX_INFLIGHT_MESH) return false;
+        if (!meshLaneCanReserve(owned, consumer, lane)) return false;
         if (inFlight_.compare_exchange_weak(owned, owned + 1, std::memory_order_relaxed)) {
             const size_t total = owned + 1 + consumer;
             size_t high = highWater_.load(std::memory_order_relaxed);
@@ -75,15 +69,21 @@ bool MeshScheduler::reserveSlot() {
     }
 }
 
-bool MeshScheduler::enqueue(ChunkPos pos) {
-    if (!running_.load(std::memory_order_relaxed) || !reserveSlot()) return false;
+bool MeshScheduler::enqueue(ChunkPos pos, uint32_t requestedVersion, MeshPriorityLane lane,
+                            uint64_t distanceSquared) {
+    if (!running_.load(std::memory_order_relaxed) || !reserveSlot(lane)) return false;
     {
         std::lock_guard<std::mutex> lock(jobMutex_);
         if (!running_.load(std::memory_order_relaxed)) {
             inFlight_.fetch_sub(1, std::memory_order_relaxed);
             return false;
         }
-        jobs_.push_back(pos);
+        const MeshJob job{pos, requestedVersion, lane, distanceSquared, nextSequence_++};
+        const auto insertion = std::find_if(jobs_.begin(), jobs_.end(), [&](const MeshJob& queued) {
+            return meshJobRanksBefore(job.lane, job.distanceSquared, job.sequence, queued.lane,
+                                      queued.distanceSquared, queued.sequence);
+        });
+        jobs_.insert(insertion, job);
     }
     jobCv_.notify_one();
     return true;
@@ -103,7 +103,7 @@ void MeshScheduler::drainCompleted(std::vector<MeshResult>& out) {
         MeshResult& result = completed_[index];
         auto existing = findResult(out, result.pos);
         if (existing != out.end()) {
-            if (shouldReplace(*existing, result)) {
+            if (meshResultSupersedes(*existing, result)) {
                 *existing = std::move(result);
                 coalesced_.fetch_add(1, std::memory_order_relaxed);
             } else {
@@ -140,7 +140,7 @@ void MeshScheduler::publishCompleted(MeshResult result) {
         completed_.push_back(std::move(result));
         return;
     }
-    if (shouldReplace(*existing, result)) {
+    if (meshResultSupersedes(*existing, result)) {
         *existing = std::move(result);
         coalesced_.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -156,23 +156,24 @@ void MeshScheduler::workerLoop() {
     thread_local MeshScratch scratch;
 
     while (true) {
-        ChunkPos pos;
+        MeshJob job;
         {
             std::unique_lock<std::mutex> lock(jobMutex_);
             jobCv_.wait(lock, [this] { return !jobs_.empty() || !running_.load(); });
             if (!running_.load()) {
                 return;
             }
-            pos = jobs_.front();
+            job = jobs_.front();
             jobs_.pop_front();
         }
 
         MeshResult result;
-        result.pos = pos;
+        result.pos = job.pos;
+        result.requestedVersion = job.requestedVersion;
         // snapshotForMeshing reads immutable column metadata, then takes
         // chunksMutex_ for one bounded copy. It never nests that lock with
         // the scheduler's own leaf locks.
-        if (world_.snapshotForMeshing(pos, snapshot)) {
+        if (world_.snapshotForMeshing(job.pos, snapshot)) {
             result.snapshotOk = true;
             result.builtVersion = snapshot.version;
             auto start = std::chrono::steady_clock::now();

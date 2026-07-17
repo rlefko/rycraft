@@ -13,31 +13,24 @@
 namespace {
 
 constexpr int MAX_TREE_SPACING = 14;
+constexpr int TREE_COMPETITOR_CELL_RADIUS =
+    (MAX_TREE_SPACING + feature_generation::TREE_CELL_EDGE - 1) /
+        feature_generation::TREE_CELL_EDGE +
+    1;
 constexpr uint64_t TREE_CANDIDATE_STREAM = 0x5452454543414E44ULL;
 constexpr uint64_t TREE_PRIORITY_STREAM = 0x545245455052494FULL;
 constexpr uint64_t TREE_SHAPE_STREAM = 0x5452454553484150ULL;
-constexpr uint64_t TREE_BIOME_STREAM = 0x5452454542494F4DULL;
 constexpr uint64_t FAR_CANOPY_CLUSTER_STREAM = 0x46415243414E4F50ULL;
 constexpr uint64_t FLORA_STREAM = 0x464C4F524143454CULL;
 constexpr uint64_t FLORA_BIOME_STREAM = 0x464C4F524142494FULL;
 
-enum class TreeKind : uint8_t {
-    OAK,
-    LARGE_OAK,
-    BIRCH,
-    SPRUCE,
-    ACACIA,
-    JUNGLE,
-    MANGROVE,
-    PALM,
-    WILLOW,
-    ALPINE_SCRUB,
-    FALLEN_LOG,
-};
+using TreeKind = feature_generation::TreeSpecies;
 
 struct SpeciesTraits {
     double minimumTemperatureC;
     double maximumTemperatureC;
+    double minimumPrecipitationMm;
+    double maximumPrecipitationMm;
     double minimumMoisture;
     double minimumFertility;
     double maximumSlope;
@@ -45,6 +38,7 @@ struct SpeciesTraits {
     double maximumAltitude;
     double minimumLight;
     bool toleratesFlooding;
+    int maximumFloodDepth;
     int spacing;
 };
 
@@ -52,26 +46,29 @@ constexpr SpeciesTraits traitsFor(TreeKind kind) {
     switch (kind) {
         case TreeKind::OAK:
         case TreeKind::LARGE_OAK:
-            return {-8.0, 29.0, 0.28, 0.22, 1.20, 48.0, 190.0, 0.45, false, 9};
+            return {-8.0, 29.0, 450.0, 2800.0, 0.28, 0.22, 1.20, 48.0, 190.0, 0.45, false, 0, 9};
         case TreeKind::BIRCH:
-            return {-14.0, 22.0, 0.30, 0.18, 1.30, 50.0, 210.0, 0.52, false, 8};
+            return {-14.0, 22.0, 380.0, 2400.0, 0.30, 0.18, 1.30, 50.0, 210.0, 0.52, false, 0, 8};
         case TreeKind::SPRUCE:
-            return {-24.0, 31.0, 0.30, 0.12, 1.45, 45.0, 285.0, 0.35, false, 8};
+            return {-24.0, 31.0, 280.0, 2800.0, 0.30, 0.12, 1.45, 45.0, 285.0, 0.35, false, 0, 8};
         case TreeKind::ACACIA:
-            return {15.0, 38.0, 0.12, 0.12, 1.10, 48.0, 170.0, 0.70, false, 11};
+            return {15.0, 38.0, 180.0, 1700.0, 0.12, 0.12, 1.10, 48.0, 170.0, 0.70, false, 0, 11};
         case TreeKind::JUNGLE:
-            return {18.0, 38.0, 0.65, 0.35, 1.05, 48.0, 175.0, 0.28, true, 12};
+            return {18.0, 38.0, 1250.0, 3800.0, 0.65, 0.35, 1.05, 48.0, 175.0, 0.28, false, 0, 12};
         case TreeKind::MANGROVE:
-            return {16.0, 36.0, 0.72, 0.24, 0.75, 48.0, 82.0, 0.42, true, 9};
+            return {16.0, 36.0, 1000.0, 3800.0, 0.68, 0.22, 0.75, 48.0, 84.0, 0.38, true, 3, 9};
         case TreeKind::PALM:
-            return {17.0, 39.0, 0.24, 0.10, 0.85, 48.0, 105.0, 0.64, true, 12};
+            return {17.0, 39.0, 350.0, 3300.0, 0.24, 0.10, 0.85, 48.0, 105.0, 0.64, false, 0, 12};
         case TreeKind::WILLOW:
-            return {-2.0, 29.0, 0.58, 0.24, 0.85, 48.0, 115.0, 0.34, true, 10};
+            return {-2.0, 29.0, 650.0, 3500.0, 0.54, 0.22, 0.85, 48.0, 125.0, 0.32, true, 2, 10};
         case TreeKind::ALPINE_SCRUB:
-            return {-24.0, 13.0, 0.10, 0.05, 1.55, 82.0, 350.0, 0.58, false, 7};
+            return {-24.0, 13.0, 120.0, 1900.0, 0.10, 0.05, 1.55, 82.0, 350.0, 0.58, false, 0, 7};
         case TreeKind::FALLEN_LOG:
-            return {-12.0, 34.0, 0.25, 0.10, 0.70, 48.0, 190.0, 0.18, true, 14};
+            return {-12.0, 34.0, 350.0, 3300.0, 0.25, 0.10, 0.70, 48.0, 190.0, 0.18, false, 0, 14};
+        case TreeKind::COUNT:
+            break;
     }
+    return {};
 }
 
 static_assert(traitsFor(TreeKind::SPRUCE).minimumTemperatureC <= 22.0 &&
@@ -135,86 +132,383 @@ double blendedTreeDensity(const worldgen::SurfaceSample& surface) {
     return primaryDensity * (1.0 - secondaryWeight) + secondaryDensity * secondaryWeight;
 }
 
-std::pair<BlockType, BlockType> canopyBlocks(Biome biome) {
-    switch (biome) {
-        case Biome::TROPICAL_RAINFOREST:
-        case Biome::TROPICAL_CONIFER_FOREST:
-            return {BlockType::JUNGLE_LOG, BlockType::JUNGLE_LEAVES};
-        case Biome::TEMPERATE_RAINFOREST:
-        case Biome::SWAMP:
-        case Biome::FLOODED_GRASSLAND:
-            return {BlockType::WILLOW_LOG, BlockType::WILLOW_LEAVES};
-        case Biome::MANGROVE:
-            return {BlockType::MANGROVE_LOG, BlockType::MANGROVE_LEAVES};
-        case Biome::SAVANNA:
-        case Biome::TROPICAL_DRY_FOREST:
-            return {BlockType::ACACIA_LOG, BlockType::ACACIA_LEAVES};
-        case Biome::BEACH:
-            return {BlockType::PALM_LOG, BlockType::PALM_LEAVES};
-        case Biome::TAIGA:
-        case Biome::TEMPERATE_CONIFER_FOREST:
-        case Biome::MONTANE_GRASSLAND:
-            return {BlockType::SPRUCE_LOG, BlockType::SPRUCE_LEAVES};
-        case Biome::BIRCH_FOREST:
-            return {BlockType::BIRCH_LOG, BlockType::BIRCH_LEAVES};
+double maximumBiomeSuitability(const worldgen::SurfaceSample& surface) {
+    return static_cast<double>(
+        *std::max_element(surface.suitability.scores.begin(), surface.suitability.scores.end()));
+}
+
+double normalizedBiomeSuitability(const worldgen::SurfaceSample& surface, Biome biome,
+                                  double maximum) {
+    if (!(maximum > 1.0e-6)) return 0.0;
+    return std::clamp(static_cast<double>(surface.suitability.scores[static_cast<size_t>(biome)]) /
+                          maximum,
+                      0.0, 1.0);
+}
+
+double biomeSignal(const worldgen::SurfaceSample& surface, Biome biome, double maximumSuitability) {
+    return std::max(normalizedBiomeSuitability(surface, biome, maximumSuitability),
+                    worldgen::biomeBlendWeight(surface.biome, biome));
+}
+
+double continuousTreeDensity(const worldgen::SurfaceSample& surface) {
+    double maximumScore = 0.0;
+    double forestScore = 0.0;
+    for (size_t index = 0; index < surface.suitability.scores.size(); ++index) {
+        const double score = std::max(0.0, static_cast<double>(surface.suitability.scores[index]));
+        maximumScore = std::max(maximumScore, score);
+        forestScore = std::max(forestScore, score * biomeTreeDensity(static_cast<Biome>(index)));
+    }
+    const double suitabilityDensity = maximumScore > 1.0e-9 ? forestScore / maximumScore : 0.0;
+    const double biomeDensity = std::max(blendedTreeDensity(surface), suitabilityDensity * 0.94);
+    const double moistureCover = std::clamp((surface.soil.moisture - 0.08) / 0.52, 0.0, 1.0);
+    const double fertilityCover = std::clamp((surface.soil.fertility - 0.05) / 0.48, 0.0, 1.0);
+    const double precipitationCover =
+        std::clamp((surface.climate.annualPrecipitationMm - 180.0) / 1350.0, 0.0, 1.0);
+    const double slopeCover =
+        std::clamp(1.0 - std::max(0.0, surface.slope - 0.18) / 1.55, 0.08, 1.0);
+    const double floodplain =
+        worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::FLOODPLAIN);
+    const double riparian = std::max(
+        {worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::RIVERBANK),
+         worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::LAKESHORE),
+         floodplain});
+    const double volcanicStress =
+        std::clamp((surface.geology.volcanicActivity - 0.24) / 0.50, 0.0, 1.0);
+    const double tectonicStress =
+        std::clamp(volcanicStress * 0.82 + surface.geology.faultStrength * 0.18 +
+                       std::max(0.0, surface.geology.uplift - 0.65) * 0.20,
+                   0.0, 0.97);
+    const double resourceFit =
+        0.42 + moistureCover * 0.24 + fertilityCover * 0.20 + precipitationCover * 0.14;
+    return std::clamp((biomeDensity * resourceFit + riparian * 0.10) * slopeCover *
+                          (1.0 - tectonicStress),
+                      0.0, 1.0);
+}
+
+double speciesBiomeAffinity(TreeKind kind, const worldgen::SurfaceSample& surface,
+                            double maximumSuitability) {
+    const auto signal = [&](Biome biome, double weight = 1.0) {
+        return biomeSignal(surface, biome, maximumSuitability) * weight;
+    };
+    switch (kind) {
+        case TreeKind::OAK:
+            return std::max({signal(Biome::FOREST), signal(Biome::MEDITERRANEAN_WOODLAND, 0.88),
+                             signal(Biome::TEMPERATE_RAINFOREST, 0.78), signal(Biome::PLAINS, 0.22),
+                             signal(Biome::FLOWER_FIELD, 0.18)});
+        case TreeKind::LARGE_OAK:
+            return std::max({signal(Biome::FOREST, 0.92), signal(Biome::TEMPERATE_RAINFOREST),
+                             signal(Biome::MEDITERRANEAN_WOODLAND, 0.42)});
+        case TreeKind::BIRCH:
+            return std::max({signal(Biome::BIRCH_FOREST), signal(Biome::FOREST, 0.48),
+                             signal(Biome::TAIGA, 0.28)});
+        case TreeKind::SPRUCE:
+            return std::max({signal(Biome::TAIGA), signal(Biome::TEMPERATE_CONIFER_FOREST),
+                             signal(Biome::TROPICAL_CONIFER_FOREST, 0.72),
+                             signal(Biome::MONTANE_GRASSLAND, 0.52)});
+        case TreeKind::ACACIA:
+            return std::max({signal(Biome::SAVANNA), signal(Biome::TROPICAL_DRY_FOREST),
+                             signal(Biome::MEDITERRANEAN_WOODLAND, 0.62),
+                             signal(Biome::SHRUBLAND, 0.25)});
+        case TreeKind::JUNGLE:
+            return std::max({signal(Biome::TROPICAL_RAINFOREST),
+                             signal(Biome::TROPICAL_CONIFER_FOREST, 0.66),
+                             signal(Biome::TROPICAL_DRY_FOREST, 0.38)});
+        case TreeKind::MANGROVE:
+            return std::max({signal(Biome::MANGROVE), signal(Biome::SWAMP, 0.48),
+                             signal(Biome::FLOODED_GRASSLAND, 0.42)});
+        case TreeKind::PALM:
+            return std::max({signal(Biome::BEACH), signal(Biome::TROPICAL_DRY_FOREST, 0.58),
+                             signal(Biome::TROPICAL_RAINFOREST, 0.38)});
+        case TreeKind::WILLOW:
+            return std::max({signal(Biome::TEMPERATE_RAINFOREST), signal(Biome::SWAMP),
+                             signal(Biome::FLOODED_GRASSLAND, 0.82), signal(Biome::FOREST, 0.30)});
+        case TreeKind::ALPINE_SCRUB:
+            return std::max({signal(Biome::ALPINE), signal(Biome::MONTANE_GRASSLAND),
+                             signal(Biome::TUNDRA, 0.36)});
+        case TreeKind::FALLEN_LOG:
+            return std::max({signal(Biome::FOREST), signal(Biome::TEMPERATE_RAINFOREST),
+                             signal(Biome::TAIGA, 0.74),
+                             signal(Biome::TEMPERATE_CONIFER_FOREST, 0.82)});
+        case TreeKind::COUNT:
+            return 0.0;
+    }
+    return 0.0;
+}
+
+double lithologyRootFit(const worldgen::SurfaceSample& surface) {
+    double fit = 1.0;
+    switch (surface.geology.rock) {
+        case worldgen::RockType::LIMESTONE:
+            fit = 1.08;
+            break;
+        case worldgen::RockType::BASALT:
+            fit = 1.04;
+            break;
+        case worldgen::RockType::SANDSTONE:
+            fit = 0.82;
+            break;
+        case worldgen::RockType::VOLCANIC:
+            fit = 0.76;
+            break;
         default:
+            break;
+    }
+    const double contactStress =
+        std::clamp((28.0 - std::abs(surface.geology.lithology.contactDistance)) / 28.0, 0.0, 1.0);
+    return std::clamp(fit - contactStress * surface.geology.faultStrength * 0.16, 0.55, 1.10);
+}
+
+std::pair<BlockType, BlockType> canopyBlocks(TreeKind kind) {
+    switch (kind) {
+        case TreeKind::BIRCH:
+            return {BlockType::BIRCH_LOG, BlockType::BIRCH_LEAVES};
+        case TreeKind::SPRUCE:
+        case TreeKind::ALPINE_SCRUB:
+            return {BlockType::SPRUCE_LOG, BlockType::SPRUCE_LEAVES};
+        case TreeKind::ACACIA:
+            return {BlockType::ACACIA_LOG, BlockType::ACACIA_LEAVES};
+        case TreeKind::JUNGLE:
+            return {BlockType::JUNGLE_LOG, BlockType::JUNGLE_LEAVES};
+        case TreeKind::MANGROVE:
+            return {BlockType::MANGROVE_LOG, BlockType::MANGROVE_LEAVES};
+        case TreeKind::PALM:
+            return {BlockType::PALM_LOG, BlockType::PALM_LEAVES};
+        case TreeKind::WILLOW:
+            return {BlockType::WILLOW_LOG, BlockType::WILLOW_LEAVES};
+        case TreeKind::OAK:
+        case TreeKind::LARGE_OAK:
+        case TreeKind::FALLEN_LOG:
+        case TreeKind::COUNT:
             return {BlockType::LOG, BlockType::LEAVES};
+    }
+    return {BlockType::LOG, BlockType::LEAVES};
+}
+
+struct CoarseCanopyDimensions {
+    int topOffset = 0;
+    int crownBottomOffset = 0;
+    uint8_t radius = 0;
+};
+
+CoarseCanopyDimensions coarseCanopyDimensions(BlockType leafBlock, int heightVariation) {
+    switch (leafBlock) {
+        case BlockType::SPRUCE_LEAVES:
+            return {.topOffset = 10 + heightVariation, .crownBottomOffset = 2, .radius = 3};
+        case BlockType::ACACIA_LEAVES:
+            return {.topOffset = 8 + heightVariation,
+                    .crownBottomOffset = 7 + heightVariation,
+                    .radius = 3};
+        case BlockType::JUNGLE_LEAVES:
+            return {.topOffset = 11 + heightVariation,
+                    .crownBottomOffset = 8 + heightVariation,
+                    .radius = 3};
+        case BlockType::MANGROVE_LEAVES:
+            return {.topOffset = 8 + heightVariation,
+                    .crownBottomOffset = 5 + heightVariation,
+                    .radius = 3};
+        case BlockType::PALM_LEAVES:
+            return {.topOffset = 10 + heightVariation,
+                    .crownBottomOffset = 8 + heightVariation,
+                    .radius = 3};
+        case BlockType::WILLOW_LEAVES:
+            return {.topOffset = 8 + heightVariation,
+                    .crownBottomOffset = 4 + heightVariation,
+                    .radius = 3};
+        case BlockType::BIRCH_LEAVES:
+        case BlockType::LEAVES:
+        default:
+            return {.topOffset = 7 + heightVariation,
+                    .crownBottomOffset = 4 + heightVariation,
+                    .radius = 2};
     }
 }
 
 Biome ditheredBiome(const worldgen::SurfaceSample& surface, const CounterRng& random,
-                    uint64_t stream, int64_t x, int32_t y, int64_t z, uint32_t index = 0) {
-    (void)y;
+                    uint64_t stream, int64_t x, int64_t z, uint32_t index = 0) {
     const double secondaryWeight = std::clamp(surface.biome.transition, 0.0, 0.5);
     return worldgen::multiscaleDitherThreshold(random, stream, x, z, index) < secondaryWeight
                ? surface.biome.secondary
                : surface.biome.primary;
 }
 
-TreeKind pickKind(Biome biome, double roll) {
-    if (roll > 0.975 && biomeTreeDensity(biome) > 0.2) return TreeKind::FALLEN_LOG;
-    switch (biome) {
-        case Biome::TROPICAL_RAINFOREST:
-            return roll < 0.82 ? TreeKind::JUNGLE : TreeKind::PALM;
-        case Biome::TROPICAL_CONIFER_FOREST:
-            return roll < 0.58 ? TreeKind::SPRUCE : TreeKind::JUNGLE;
-        case Biome::TROPICAL_DRY_FOREST:
-            return roll < 0.58 ? TreeKind::ACACIA : TreeKind::JUNGLE;
-        case Biome::TEMPERATE_RAINFOREST:
-            return roll < 0.62 ? TreeKind::WILLOW : TreeKind::LARGE_OAK;
-        case Biome::MANGROVE:
-            return TreeKind::MANGROVE;
-        case Biome::SAVANNA:
-            return TreeKind::ACACIA;
-        case Biome::BEACH:
-            return TreeKind::PALM;
-        case Biome::TAIGA:
-        case Biome::TEMPERATE_CONIFER_FOREST:
-            return TreeKind::SPRUCE;
-        case Biome::BIRCH_FOREST:
-            return roll < 0.86 ? TreeKind::BIRCH : TreeKind::OAK;
-        case Biome::SWAMP:
-        case Biome::FLOODED_GRASSLAND:
-            return roll < 0.72 ? TreeKind::WILLOW : TreeKind::OAK;
-        case Biome::ALPINE:
-        case Biome::MONTANE_GRASSLAND:
-            return TreeKind::ALPINE_SCRUB;
-        case Biome::MEDITERRANEAN_WOODLAND:
-            return roll < 0.18 ? TreeKind::ACACIA : TreeKind::OAK;
-        case Biome::FOREST:
-            return roll < 0.08   ? TreeKind::LARGE_OAK
-                   : roll < 0.78 ? TreeKind::OAK
-                                 : TreeKind::BIRCH;
-        default:
-            return roll < 0.12 ? TreeKind::LARGE_OAK : TreeKind::OAK;
-    }
-}
-
-double availableSurfaceLight(const worldgen::SurfaceSample& surface) {
-    const double canopyShade = blendedTreeDensity(surface) * 0.55;
+double availableSurfaceLight(const worldgen::SurfaceSample& surface, double treeCover) {
+    const double canopyShade = treeCover * 0.55;
     const double cloudShade = surface.climate.relativeHumidity * 0.10;
     const double terrainShade = std::min(surface.slope, 2.0) * 0.07;
     return std::clamp(1.0 - canopyShade - cloudShade - terrainShade, 0.18, 1.0);
+}
+
+double availableSurfaceLight(const worldgen::SurfaceSample& surface) {
+    return availableSurfaceLight(surface, continuousTreeDensity(surface));
+}
+
+int generatedWaterDepth(const worldgen::SurfaceSample& surface, int groundSurfaceY) {
+    if (!(surface.hydrology.ocean || surface.hydrology.river || surface.hydrology.lake) ||
+        !std::isfinite(surface.waterSurface)) {
+        return 0;
+    }
+    const double boundedWater = std::clamp(surface.waterSurface, static_cast<double>(WORLD_MIN_Y),
+                                           static_cast<double>(WORLD_MAX_Y + 1));
+    const int waterTopY = static_cast<int>(std::ceil(boundedWater)) - 1;
+    return std::max(0, waterTopY - groundSurfaceY);
+}
+
+double floodHabitatAffinity(TreeKind kind, const worldgen::SurfaceSample& surface,
+                            double speciesAffinity) {
+    const double riverbank =
+        worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::RIVERBANK);
+    const double lakeshore =
+        worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::LAKESHORE);
+    const double floodplain =
+        worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::FLOODPLAIN);
+    const double delta =
+        worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::DELTA);
+    const double coast =
+        worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::COAST);
+    if (kind == TreeKind::MANGROVE) {
+        return std::max({speciesAffinity, delta, coast * 0.78, lakeshore * 0.55, riverbank * 0.46});
+    }
+    if (kind == TreeKind::WILLOW) {
+        if (surface.hydrology.ocean) return 0.0;
+        return std::max({speciesAffinity, riverbank, lakeshore, floodplain * 0.82});
+    }
+    return 0.0;
+}
+
+int habitatGroundSurfaceY(const worldgen::SurfaceSample& surface) {
+    // Final block-footprint samples report the emitted top face. The rooting
+    // block is the voxel immediately below that face for dry and wet terrain.
+    return static_cast<int>(std::ceil(surface.terrainHeight)) - 1;
+}
+
+feature_generation::TreeHabitatEvaluation
+evaluateTreeHabitatWithContext(TreeKind species, const worldgen::SurfaceSample& surface,
+                               int groundSurfaceY, double cover, double maximumSuitability) {
+    const SpeciesTraits traits = traitsFor(species);
+    feature_generation::TreeHabitatEvaluation result;
+    result.waterDepthBlocks = generatedWaterDepth(surface, groundSurfaceY);
+    result.submerged = result.waterDepthBlocks > 0;
+
+    const double affinity = speciesBiomeAffinity(species, surface, maximumSuitability);
+    result.spacing =
+        std::clamp(traits.spacing - static_cast<int>(std::lround(cover * 2.0 + affinity * 0.45)), 6,
+                   MAX_TREE_SPACING);
+
+    if (species == TreeKind::COUNT || surface.hydrology.waterfall ||
+        worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::GEOTHERMAL) ||
+        surface.geology.volcanicActivity > 0.78 || surface.slope > traits.maximumSlope ||
+        groundSurfaceY < traits.minimumAltitude || groundSurfaceY > traits.maximumAltitude ||
+        surface.soil.moisture < traits.minimumMoisture ||
+        surface.soil.fertility < traits.minimumFertility ||
+        surface.climate.temperatureC < traits.minimumTemperatureC ||
+        surface.climate.temperatureC > traits.maximumTemperatureC ||
+        surface.climate.annualPrecipitationMm < traits.minimumPrecipitationMm ||
+        surface.climate.annualPrecipitationMm > traits.maximumPrecipitationMm ||
+        availableSurfaceLight(surface, cover) < traits.minimumLight || affinity < 0.055) {
+        return result;
+    }
+
+    double hydrologyFit = 1.0;
+    if (result.submerged) {
+        const double floodedAffinity = floodHabitatAffinity(species, surface, affinity);
+        if (!traits.toleratesFlooding || result.waterDepthBlocks > traits.maximumFloodDepth ||
+            floodedAffinity < 0.22) {
+            return result;
+        }
+        hydrologyFit = std::clamp(0.55 + floodedAffinity * 0.45, 0.0, 1.0);
+    } else if (species == TreeKind::MANGROVE || species == TreeKind::WILLOW) {
+        hydrologyFit =
+            std::clamp(0.45 + floodHabitatAffinity(species, surface, affinity) * 0.55, 0.0, 1.0);
+    } else {
+        const double floodplain = worldgen::MacroGenerationSampler::ecotopeInfluence(
+            surface, worldgen::Ecotope::FLOODPLAIN);
+        hydrologyFit = std::clamp(1.0 - floodplain * 0.38, 0.0, 1.0);
+    }
+
+    const double climateFit = rangeSuitability(
+        surface.climate.temperatureC, traits.minimumTemperatureC, traits.maximumTemperatureC);
+    const double precipitationFit =
+        rangeSuitability(surface.climate.annualPrecipitationMm, traits.minimumPrecipitationMm,
+                         traits.maximumPrecipitationMm);
+    const double moistureFit =
+        std::clamp((surface.soil.moisture - traits.minimumMoisture) * 1.55 + 0.52, 0.0, 1.0);
+    const double fertilityFit =
+        std::clamp((surface.soil.fertility - traits.minimumFertility) * 1.70 + 0.50, 0.0, 1.0);
+    const double slopeFit =
+        std::clamp(1.0 - surface.slope / std::max(0.01, traits.maximumSlope) * 0.62, 0.0, 1.0);
+    const double volcanicStress =
+        std::clamp((surface.geology.volcanicActivity - 0.22) / 0.56, 0.0, 1.0);
+    const double tectonicStress =
+        std::clamp(volcanicStress * 0.72 + surface.geology.faultStrength * 0.18 +
+                       std::max(0.0, surface.geology.uplift - 0.62) * 0.22,
+                   0.0, 0.94);
+    const double resourceFit =
+        0.46 + moistureFit * 0.20 + fertilityFit * 0.18 + precipitationFit * 0.16;
+    result.suitability =
+        std::clamp(affinity * (0.62 + climateFit * 0.38) * resourceFit * (0.58 + slopeFit * 0.42) *
+                       hydrologyFit * lithologyRootFit(surface) * (1.0 - tectonicStress),
+                   0.0, 1.0);
+    result.allowed = result.suitability > 0.035;
+    return result;
+}
+
+} // namespace
+
+double feature_generation::treeCoverDensity(const worldgen::SurfaceSample& surface) {
+    return continuousTreeDensity(surface);
+}
+
+feature_generation::TreeHabitatEvaluation
+feature_generation::evaluateTreeHabitat(TreeSpecies species, const worldgen::SurfaceSample& surface,
+                                        int groundSurfaceY) {
+    const double cover = treeCoverDensity(surface);
+    return evaluateTreeHabitatWithContext(species, surface, groundSurfaceY, cover,
+                                          maximumBiomeSuitability(surface));
+}
+
+namespace {
+
+struct SelectedTreeKind {
+    TreeKind kind = TreeKind::OAK;
+    feature_generation::TreeHabitatEvaluation habitat;
+};
+
+std::optional<SelectedTreeKind> selectTreeKind(const worldgen::SurfaceSample& surface,
+                                               int groundSurfaceY, double roll,
+                                               bool includeGroundForms = true) {
+    constexpr size_t SPECIES_COUNT = static_cast<size_t>(TreeKind::COUNT);
+    std::array<double, SPECIES_COUNT> weights{};
+    std::array<feature_generation::TreeHabitatEvaluation, SPECIES_COUNT> habitats{};
+    const double cover = continuousTreeDensity(surface);
+    const double maximumSuitability = maximumBiomeSuitability(surface);
+    double total = 0.0;
+    for (size_t index = 0; index < SPECIES_COUNT; ++index) {
+        const TreeKind kind = static_cast<TreeKind>(index);
+        if (!includeGroundForms &&
+            (kind == TreeKind::FALLEN_LOG || kind == TreeKind::ALPINE_SCRUB)) {
+            continue;
+        }
+        const feature_generation::TreeHabitatEvaluation habitat = evaluateTreeHabitatWithContext(
+            kind, surface, groundSurfaceY, cover, maximumSuitability);
+        if (!habitat.allowed) continue;
+        double formWeight = 1.0;
+        if (kind == TreeKind::LARGE_OAK) formWeight = 0.22;
+        if (kind == TreeKind::FALLEN_LOG) formWeight = 0.025;
+        habitats[index] = habitat;
+        weights[index] = habitat.suitability * formWeight;
+        total += weights[index];
+    }
+    if (!(total > 1.0e-9)) return std::nullopt;
+    double threshold = std::clamp(roll, 0.0, std::nextafter(1.0, 0.0)) * total;
+    for (size_t index = 0; index < SPECIES_COUNT; ++index) {
+        if (threshold < weights[index]) {
+            return SelectedTreeKind{.kind = static_cast<TreeKind>(index),
+                                    .habitat = habitats[index]};
+        }
+        threshold -= weights[index];
+    }
+    const size_t fallback = SPECIES_COUNT - 1;
+    return SelectedTreeKind{.kind = static_cast<TreeKind>(fallback), .habitat = habitats[fallback]};
 }
 
 struct TreeCandidate {
@@ -228,81 +522,95 @@ struct TreeCandidate {
     int spacing = 8;
 };
 
-std::optional<TreeCandidate> makeCandidate(const CounterRng& random, int64_t cellX, int64_t cellZ,
-                                           const ChunkGenerator& generator) {
+ColumnPos candidatePosition(const CounterRng& random, int64_t cellX, int64_t cellZ) {
     const int offsetX = random.uniformInt(TREE_CANDIDATE_STREAM, cellX, 0, cellZ, 0, 0,
                                           feature_generation::TREE_CELL_EDGE - 1);
     const int offsetZ = random.uniformInt(TREE_CANDIDATE_STREAM, cellX, 0, cellZ, 1, 0,
                                           feature_generation::TREE_CELL_EDGE - 1);
-    const int64_t x = cellX * feature_generation::TREE_CELL_EDGE + offsetX;
-    const int64_t z = cellZ * feature_generation::TREE_CELL_EDGE + offsetZ;
-    const worldgen::SurfaceSample surface = generator.sampleSurface(x, z);
-    const Biome biome = ditheredBiome(surface, random, TREE_BIOME_STREAM, x, 0, z);
-    const Biome substrateBiome = worldgen::surface_material::materialBiome(surface, random, x, z);
-    const double density = blendedTreeDensity(surface);
-    if (density <= 0.0 || substrateBiome == Biome::VOLCANIC_BARREN ||
-        worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::GEOTHERMAL)) {
+    return ColumnPos{cellX * feature_generation::TREE_CELL_EDGE + offsetX,
+                     cellZ * feature_generation::TREE_CELL_EDGE + offsetZ};
+}
+
+std::optional<TreeCandidate> makeCandidateFromSurface(const CounterRng& random, int64_t cellX,
+                                                      int64_t cellZ,
+                                                      const worldgen::SurfaceSample& surface,
+                                                      BlockType rootMaterial) {
+    const ColumnPos position = candidatePosition(random, cellX, cellZ);
+    const int64_t x = position.x;
+    const int64_t z = position.z;
+    const double density = feature_generation::treeCoverDensity(surface);
+    const double barrenWeight = worldgen::biomeBlendWeight(surface.biome, Biome::VOLCANIC_BARREN);
+    if (density <= 0.0 || barrenWeight >= 0.7 ||
+        worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::GEOTHERMAL) ||
+        !worldgen::surface_material::supportsTreeRooting(rootMaterial)) {
         return std::nullopt;
     }
 
+    const int groundSurfaceY = habitatGroundSurfaceY(surface);
+    const int habitatGroundY = habitatGroundSurfaceY(surface);
     const double kindRoll = random.uniform01(TREE_CANDIDATE_STREAM, cellX, 0, cellZ, 2);
-    const TreeKind kind = pickKind(biome, kindRoll);
-    const SpeciesTraits traits = traitsFor(kind);
-    const bool flooded =
-        surface.hydrology.ocean || surface.hydrology.river || surface.hydrology.lake;
-    if (flooded && !traits.toleratesFlooding) return std::nullopt;
-    if (surface.slope > traits.maximumSlope || surface.terrainHeight < traits.minimumAltitude ||
-        surface.terrainHeight > traits.maximumAltitude ||
-        surface.soil.moisture < traits.minimumMoisture ||
-        surface.soil.fertility < traits.minimumFertility ||
-        availableSurfaceLight(surface) < traits.minimumLight) {
-        return std::nullopt;
-    }
-
-    const double climateFit = rangeSuitability(
-        surface.climate.temperatureC, traits.minimumTemperatureC, traits.maximumTemperatureC);
-    const double fertilityFit =
-        std::clamp((surface.soil.fertility - traits.minimumFertility) * 1.8 + 0.35, 0.0, 1.0);
-    const double moistureFit =
-        std::clamp((surface.soil.moisture - traits.minimumMoisture) * 1.5 + 0.4, 0.0, 1.0);
-    const double floodplainInfluence =
-        worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::FLOODPLAIN);
-    const double floodingFit =
-        traits.toleratesFlooding ? 1.0 : std::clamp(1.0 - floodplainInfluence * 0.72, 0.0, 1.0);
-    const double volcanicStress =
-        std::clamp((surface.geology.volcanicActivity - 0.32) / 0.42, 0.0, 1.0);
-    const double acceptance =
-        density * climateFit * fertilityFit * moistureFit * floodingFit * (1.0 - volcanicStress);
+    const std::optional<SelectedTreeKind> selectedKind =
+        selectTreeKind(surface, habitatGroundY, kindRoll);
+    if (!selectedKind.has_value()) return std::nullopt;
+    const TreeKind kind = selectedKind->kind;
+    const feature_generation::TreeHabitatEvaluation& habitat = selectedKind->habitat;
+    if (!habitat.allowed) return std::nullopt;
+    const double acceptance = std::clamp(density * (0.62 + habitat.suitability * 0.55), 0.0, 1.0);
     if (random.uniform01(TREE_CANDIDATE_STREAM, cellX, 0, cellZ, 3) >= acceptance) {
         return std::nullopt;
     }
-    if (!worldgen::surface_material::supportsTreeRooting(generator.surfaceMaterialAt(x, z))) {
-        return std::nullopt;
-    }
-
     return TreeCandidate{
         .cellX = cellX,
         .cellZ = cellZ,
         .x = x,
         .z = z,
         .kind = kind,
-        .sampledSurfaceY = static_cast<int>(std::floor(surface.terrainHeight)),
+        .sampledSurfaceY = groundSurfaceY,
         .priority = random.uniform01(TREE_PRIORITY_STREAM, cellX, 0, cellZ),
-        .spacing = traits.spacing,
+        .spacing = habitat.spacing,
     };
 }
 
-bool candidateWins(const TreeCandidate& candidate, const CounterRng& random,
-                   const ChunkGenerator& generator,
-                   std::unordered_map<ColumnPos, std::optional<TreeCandidate>>& cache) {
-    const int search = (MAX_TREE_SPACING + feature_generation::TREE_CELL_EDGE - 1) /
-                           feature_generation::TREE_CELL_EDGE +
-                       1;
-    for (int offsetZ = -search; offsetZ <= search; ++offsetZ) {
-        for (int offsetX = -search; offsetX <= search; ++offsetX) {
+using TreeCandidateCache = std::unordered_map<ColumnPos, std::optional<TreeCandidate>>;
+
+void populateCandidateCache(const CounterRng& random, const ChunkGenerator& generator,
+                            int64_t minimumCellX, int64_t minimumCellZ, int64_t maximumCellX,
+                            int64_t maximumCellZ, TreeCandidateCache& cache) {
+    if (minimumCellX > maximumCellX || minimumCellZ > maximumCellZ) return;
+    const int64_t width = maximumCellX - minimumCellX + 1;
+    const int64_t height = maximumCellZ - minimumCellZ + 1;
+    std::vector<ColumnPos> rootPositions;
+    rootPositions.reserve(static_cast<size_t>(width * height));
+    for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
+        for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX)
+            rootPositions.push_back(candidatePosition(random, cellX, cellZ));
+    }
+    std::vector<worldgen::SurfaceSample> rootSurfaces(rootPositions.size());
+    generator.sampleFarHabitatPoints(rootPositions, rootSurfaces);
+    cache.reserve(cache.size() + static_cast<size_t>(width * height));
+    for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
+        for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
+            const size_t rootIndex =
+                static_cast<size_t>((cellZ - minimumCellZ) * width + cellX - minimumCellX);
+            const ColumnPos root = rootPositions[rootIndex];
+            const worldgen::SurfaceSample& surface = rootSurfaces[rootIndex];
+            const BlockType material = generator.farSurfaceMaterialAt(root.x, root.z, surface);
+            cache.emplace(ColumnPos{cellX, cellZ},
+                          makeCandidateFromSurface(random, cellX, cellZ, surface, material));
+        }
+    }
+}
+
+bool candidateWins(const TreeCandidate& candidate, const TreeCandidateCache& cache) {
+    for (int offsetZ = -TREE_COMPETITOR_CELL_RADIUS; offsetZ <= TREE_COMPETITOR_CELL_RADIUS;
+         ++offsetZ) {
+        for (int offsetX = -TREE_COMPETITOR_CELL_RADIUS; offsetX <= TREE_COMPETITOR_CELL_RADIUS;
+             ++offsetX) {
             const ColumnPos cell{candidate.cellX + offsetX, candidate.cellZ + offsetZ};
-            auto [found, inserted] = cache.try_emplace(cell);
-            if (inserted) found->second = makeCandidate(random, cell.x, cell.z, generator);
+            const auto found = cache.find(cell);
+            if (found == cache.end()) {
+                throw std::logic_error("tree competitor cache does not cover the priority radius");
+            }
             if (!found->second.has_value()) continue;
             const TreeCandidate& competitor = *found->second;
             if (competitor.cellX == candidate.cellX && competitor.cellZ == candidate.cellZ)
@@ -327,6 +635,7 @@ struct TreeWriter {
     int64_t baseX;
     int baseY;
     int64_t baseZ;
+    bool replaceGeneratedWater = false;
 
     void log(int64_t x, int y, int64_t z, BlockType block) const {
         const int lx = static_cast<int>(x - baseX);
@@ -337,7 +646,8 @@ struct TreeWriter {
             return;
         }
         const BlockType current = chunk.getBlock(lx, ly, lz);
-        if (current == BlockType::AIR || isLeafBlock(current) || isFlora(current)) {
+        if (current == BlockType::AIR || isLeafBlock(current) || isFlora(current) ||
+            (replaceGeneratedWater && current == BlockType::WATER)) {
             chunk.setBlock(lx, ly, lz, block);
         }
     }
@@ -361,13 +671,27 @@ struct TreeBoundsWriter {
     int maximumLeafY = std::numeric_limits<int>::min();
     int64_t minimumLeafZ = std::numeric_limits<int64_t>::max();
     int64_t maximumLeafZ = std::numeric_limits<int64_t>::min();
+    int64_t minimumLogX = std::numeric_limits<int64_t>::max();
+    int64_t maximumLogX = std::numeric_limits<int64_t>::min();
+    int minimumLogY = std::numeric_limits<int>::max();
+    int maximumLogY = std::numeric_limits<int>::min();
+    int64_t minimumLogZ = std::numeric_limits<int64_t>::max();
+    int64_t maximumLogZ = std::numeric_limits<int64_t>::min();
     int topY = std::numeric_limits<int>::min();
     BlockType logBlock = BlockType::AIR;
     BlockType leafBlock = BlockType::AIR;
+    bool hasLog = false;
     bool hasFoliage = false;
 
-    void log(int64_t, int y, int64_t, BlockType block) {
+    void log(int64_t x, int y, int64_t z, BlockType block) {
         if (logBlock == BlockType::AIR) logBlock = block;
+        hasLog = true;
+        minimumLogX = std::min(minimumLogX, x);
+        maximumLogX = std::max(maximumLogX, x);
+        minimumLogY = std::min(minimumLogY, y);
+        maximumLogY = std::max(maximumLogY, y);
+        minimumLogZ = std::min(minimumLogZ, z);
+        maximumLogZ = std::max(maximumLogZ, z);
         topY = std::max(topY, y);
     }
 
@@ -425,6 +749,64 @@ void flatCanopy(Writer& out, int64_t x, int y, int64_t z, int radius, BlockType 
     }
 }
 
+// Voxel limbs must advance through one face at a time. Moving laterally and
+// vertically in a single emitted sample leaves logs touching only along an
+// edge or corner, which reads as a floating staircase once exact cubes take
+// ownership from a far silhouette.
+template <typename Writer>
+void connectedLogStep(Writer& out, int64_t fromX, int fromY, int64_t fromZ, int64_t toX, int toY,
+                      int64_t toZ, BlockType block, bool horizontalBeforeVertical = false) {
+    const auto emit = [&](int64_t x, int y, int64_t z) { out.log(x, y, z, block); };
+    int64_t x = fromX;
+    int y = fromY;
+    int64_t z = fromZ;
+    emit(x, y, z);
+    const auto moveHorizontal = [&] {
+        while (x != toX) {
+            x += x < toX ? 1 : -1;
+            emit(x, y, z);
+        }
+        while (z != toZ) {
+            z += z < toZ ? 1 : -1;
+            emit(x, y, z);
+        }
+    };
+    const auto moveVertical = [&] {
+        while (y != toY) {
+            y += y < toY ? 1 : -1;
+            emit(x, y, z);
+        }
+    };
+    if (horizontalBeforeVertical) {
+        moveHorizontal();
+        moveVertical();
+    } else {
+        moveVertical();
+        moveHorizontal();
+    }
+}
+
+template <typename Writer>
+void connectedLeafStep(Writer& out, int64_t fromX, int fromY, int64_t fromZ, int64_t toX, int toY,
+                       int64_t toZ, BlockType block) {
+    int64_t x = fromX;
+    int y = fromY;
+    int64_t z = fromZ;
+    out.leaves(x, y, z, block);
+    while (x != toX) {
+        x += x < toX ? 1 : -1;
+        out.leaves(x, y, z, block);
+    }
+    while (z != toZ) {
+        z += z < toZ ? 1 : -1;
+        out.leaves(x, y, z, block);
+    }
+    while (y != toY) {
+        y += y < toY ? 1 : -1;
+        out.leaves(x, y, z, block);
+    }
+}
+
 template <typename Writer>
 void buildTree(const TreeCandidate& candidate, const CounterRng& random, int baseY, Writer& out) {
     const TreeKind kind = candidate.kind;
@@ -452,10 +834,11 @@ void buildTree(const TreeCandidate& candidate, const CounterRng& random, int bas
                         continue;
                     }
                     const int branchY = top - 3 + static_cast<int>(index & 1U);
-                    out.log(x + branches[index][0], branchY, z + branches[index][1],
-                            BlockType::LOG);
-                    out.log(x + branches[index][0] * 2, branchY + 1, z + branches[index][1] * 2,
-                            BlockType::LOG);
+                    connectedLogStep(out, x, branchY, z, x + branches[index][0], branchY,
+                                     z + branches[index][1], BlockType::LOG);
+                    connectedLogStep(out, x + branches[index][0], branchY, z + branches[index][1],
+                                     x + branches[index][0] * 2, branchY + 1,
+                                     z + branches[index][1] * 2, BlockType::LOG);
                 }
             }
             break;
@@ -491,14 +874,25 @@ void buildTree(const TreeCandidate& candidate, const CounterRng& random, int bas
             const int height = shapeInt(random, candidate, 0, 6, 9);
             const int bendX = shapeUnit(random, candidate, 1) < 0.5 ? -1 : 1;
             const int bendZ = shapeUnit(random, candidate, 2) < 0.5 ? -1 : 1;
+            int64_t previousX = x;
+            int previousY = baseY;
+            int64_t previousZ = z;
             for (int y = 0; y < height; ++y) {
                 const int step = y > height / 2 ? (y - height / 2 + 1) / 2 : 0;
-                out.log(x + bendX * step, baseY + y, z + bendZ * step, BlockType::ACACIA_LOG);
+                const int64_t trunkX = x + bendX * step;
+                const int trunkY = baseY + y;
+                const int64_t trunkZ = z + bendZ * step;
+                connectedLogStep(out, previousX, previousY, previousZ, trunkX, trunkY, trunkZ,
+                                 BlockType::ACACIA_LOG);
+                previousX = trunkX;
+                previousY = trunkY;
+                previousZ = trunkZ;
             }
             const int64_t crownX = x + bendX * ((height - height / 2) / 2);
             const int64_t crownZ = z + bendZ * ((height - height / 2) / 2);
             flatCanopy(out, crownX, baseY + height, crownZ, 3, BlockType::ACACIA_LEAVES);
-            out.log(crownX - bendZ, baseY + height - 1, crownZ + bendX, BlockType::ACACIA_LOG);
+            connectedLogStep(out, crownX, baseY + height - 1, crownZ, crownX - bendZ,
+                             baseY + height - 1, crownZ + bendX, BlockType::ACACIA_LOG);
             flatCanopy(out, crownX - bendZ * 2, baseY + height, crownZ + bendX * 2, 2,
                        BlockType::ACACIA_LEAVES);
             break;
@@ -514,12 +908,23 @@ void buildTree(const TreeCandidate& candidate, const CounterRng& random, int bas
             for (int direction = 0; direction < 4; ++direction) {
                 const int dx = direction == 0 ? 1 : direction == 1 ? -1 : 0;
                 const int dz = direction == 2 ? 1 : direction == 3 ? -1 : 0;
-                out.log(x + dx, baseY, z + dz, BlockType::JUNGLE_LOG);
-                out.log(x + dx * 2, baseY - 1, z + dz * 2, BlockType::JUNGLE_LOG);
+                connectedLogStep(out, x, baseY, z, x + dx, baseY, z + dz, BlockType::JUNGLE_LOG,
+                                 true);
+                connectedLogStep(out, x + dx, baseY, z + dz, x + dx * 2, baseY - 1, z + dz * 2,
+                                 BlockType::JUNGLE_LOG, true);
                 const int branchY = baseY + height - 3 - (direction & 1);
+                int64_t branchX = x;
+                int branchCurrentY = branchY;
+                int64_t branchZ = z;
                 for (int step = 1; step <= 3; ++step) {
-                    out.log(x + dx * step, branchY + step / 2, z + dz * step,
-                            BlockType::JUNGLE_LOG);
+                    const int64_t nextX = x + dx * step;
+                    const int nextY = branchY + step / 2;
+                    const int64_t nextZ = z + dz * step;
+                    connectedLogStep(out, branchX, branchCurrentY, branchZ, nextX, nextY, nextZ,
+                                     BlockType::JUNGLE_LOG);
+                    branchX = nextX;
+                    branchCurrentY = nextY;
+                    branchZ = nextZ;
                 }
                 flatCanopy(out, x + dx * 3, branchY + 2, z + dz * 3, 2, BlockType::JUNGLE_LEAVES);
             }
@@ -541,8 +946,10 @@ void buildTree(const TreeCandidate& candidate, const CounterRng& random, int bas
                 {{-1, -1}},
             }};
             for (const auto& root : roots) {
-                out.log(x + root[0], baseY, z + root[1], BlockType::MANGROVE_LOG);
-                out.log(x + root[0] * 2, baseY - 1, z + root[1] * 2, BlockType::MANGROVE_LOG);
+                connectedLogStep(out, x, baseY, z, x + root[0], baseY, z + root[1],
+                                 BlockType::MANGROVE_LOG, true);
+                connectedLogStep(out, x + root[0], baseY, z + root[1], x + root[0] * 2, baseY - 1,
+                                 z + root[1] * 2, BlockType::MANGROVE_LOG, true);
             }
             roundedCanopy(out, random, candidate, x, baseY + height, z, 3,
                           BlockType::MANGROVE_LEAVES);
@@ -551,12 +958,20 @@ void buildTree(const TreeCandidate& candidate, const CounterRng& random, int bas
         case TreeKind::PALM: {
             const int height = shapeInt(random, candidate, 0, 8, 12);
             const int leanX = shapeUnit(random, candidate, 1) < 0.5 ? -1 : 1;
+            int64_t previousX = x;
+            int previousY = baseY;
             for (int y = 0; y < height; ++y) {
                 const int bend = y > height * 2 / 3 ? 1 : 0;
-                out.log(x + leanX * bend, baseY + y, z, BlockType::PALM_LOG);
+                const int64_t trunkX = x + leanX * bend;
+                const int trunkY = baseY + y;
+                connectedLogStep(out, previousX, previousY, z, trunkX, trunkY, z,
+                                 BlockType::PALM_LOG);
+                previousX = trunkX;
+                previousY = trunkY;
             }
             const int64_t topX = x + leanX;
             const int topY = baseY + height;
+            out.log(topX, topY, z, BlockType::PALM_LOG);
             out.leaves(topX, topY + 1, z, BlockType::PALM_LEAVES);
             constexpr std::array<std::array<int, 2>, 8> fronds{{
                 {{1, 0}},
@@ -569,10 +984,19 @@ void buildTree(const TreeCandidate& candidate, const CounterRng& random, int bas
                 {{-1, -1}},
             }};
             for (const auto& frond : fronds) {
+                int64_t previousX = topX;
+                int previousY = topY;
+                int64_t previousZ = z;
                 for (int step = 1; step <= 4; ++step) {
                     const int drop = step >= 3 ? 1 : 0;
-                    out.leaves(topX + frond[0] * step, topY - drop, z + frond[1] * step,
-                               BlockType::PALM_LEAVES);
+                    const int64_t nextX = topX + frond[0] * step;
+                    const int nextY = topY - drop;
+                    const int64_t nextZ = z + frond[1] * step;
+                    connectedLeafStep(out, previousX, previousY, previousZ, nextX, nextY, nextZ,
+                                      BlockType::PALM_LEAVES);
+                    previousX = nextX;
+                    previousY = nextY;
+                    previousZ = nextZ;
                 }
             }
             break;
@@ -594,11 +1018,14 @@ void buildTree(const TreeCandidate& candidate, const CounterRng& random, int bas
                 {{-1, -1}},
             }};
             for (const auto& direction : directions) {
-                out.log(x + direction[0], top - 2, z + direction[1], BlockType::WILLOW_LOG);
-                for (int drop = 0; drop < 4; ++drop) {
-                    out.leaves(x + direction[0] * 3, top - drop, z + direction[1] * 3,
-                               BlockType::WILLOW_LEAVES);
-                }
+                connectedLogStep(out, x, top - 2, z, x + direction[0], top - 2, z + direction[1],
+                                 BlockType::WILLOW_LOG);
+                // The diagonal curtain begins beyond the rounded edge of the
+                // crown. Bridge it through faces so a willow never contains
+                // a visually floating column of leaves.
+                connectedLeafStep(out, x + direction[0] * 2, top, z + direction[1] * 2,
+                                  x + direction[0] * 3, top - 3, z + direction[1] * 3,
+                                  BlockType::WILLOW_LEAVES);
             }
             break;
         }
@@ -627,6 +1054,8 @@ void buildTree(const TreeCandidate& candidate, const CounterRng& random, int bas
             }
             break;
         }
+        case TreeKind::COUNT:
+            break;
     }
 }
 
@@ -634,14 +1063,9 @@ std::optional<int> acceptedTreeBaseY(const TreeCandidate& candidate,
                                      const ChunkGenerator& generator,
                                      const StructurePlacer& structures, GenScratch& scratch) {
     const int surfaceY = generator.surfaceYAt(candidate.x, candidate.z, scratch);
-    if (std::abs(surfaceY - candidate.sampledSurfaceY) >
-        feature_generation::TREE_MAXIMUM_SURFACE_DEVIATION) {
-        return std::nullopt;
-    }
     const int64_t anchorChunkX = Chunk::worldToChunk(candidate.x);
     const int64_t anchorChunkZ = Chunk::worldToChunk(candidate.z);
-    if (structures.insideStructure(candidate.x, candidate.z, anchorChunkX, anchorChunkZ, generator,
-                                   scratch, 1)) {
+    if (structures.insideStructure(candidate.x, candidate.z, anchorChunkX, anchorChunkZ, 1)) {
         return std::nullopt;
     }
     return surfaceY + 1;
@@ -659,15 +1083,34 @@ std::optional<DescribedFarCanopy> describeFarCanopy(const TreeCandidate& candida
                                                     const CounterRng& random, int baseY) {
     TreeBoundsWriter bounds;
     buildTree(candidate, random, baseY, bounds);
-    if (!bounds.hasFoliage) return std::nullopt;
+    if (!bounds.hasFoliage && !bounds.hasLog) return std::nullopt;
 
     const int64_t canopyCenterX =
-        bounds.minimumLeafX + (bounds.maximumLeafX - bounds.minimumLeafX) / 2;
+        bounds.hasFoliage ? bounds.minimumLeafX + (bounds.maximumLeafX - bounds.minimumLeafX) / 2
+                          : candidate.x;
     const int64_t canopyCenterZ =
-        bounds.minimumLeafZ + (bounds.maximumLeafZ - bounds.minimumLeafZ) / 2;
+        bounds.hasFoliage ? bounds.minimumLeafZ + (bounds.maximumLeafZ - bounds.minimumLeafZ) / 2
+                          : candidate.z;
     const int64_t radius =
-        std::max({canopyCenterX - bounds.minimumLeafX, bounds.maximumLeafX - canopyCenterX,
-                  canopyCenterZ - bounds.minimumLeafZ, bounds.maximumLeafZ - canopyCenterZ});
+        bounds.hasFoliage
+            ? std::max({canopyCenterX - bounds.minimumLeafX, bounds.maximumLeafX - canopyCenterX,
+                        canopyCenterZ - bounds.minimumLeafZ, bounds.maximumLeafZ - canopyCenterZ})
+            : 0;
+
+    int formX = 0;
+    int formZ = 0;
+    int formExtent = 0;
+    if (candidate.kind == TreeKind::ACACIA) {
+        formX = shapeUnit(random, candidate, 1) < 0.5 ? -1 : 1;
+        formZ = shapeUnit(random, candidate, 2) < 0.5 ? -1 : 1;
+    } else if (candidate.kind == TreeKind::PALM) {
+        formX = shapeUnit(random, candidate, 1) < 0.5 ? -1 : 1;
+    } else if (candidate.kind == TreeKind::FALLEN_LOG) {
+        const bool alongX = shapeUnit(random, candidate, 0) < 0.5;
+        formX = alongX ? 1 : 0;
+        formZ = alongX ? 0 : 1;
+        formExtent = shapeInt(random, candidate, 1, 4, 7);
+    }
 
     DescribedFarCanopy result;
     result.canopy = {
@@ -675,19 +1118,23 @@ std::optional<DescribedFarCanopy> describeFarCanopy(const TreeCandidate& candida
         .z = candidate.z,
         .baseY = baseY,
         .topY = bounds.topY,
-        .canopyMinimumY = bounds.minimumLeafY,
-        .canopyMaximumY = bounds.maximumLeafY,
+        .canopyMinimumY = bounds.hasFoliage ? bounds.minimumLeafY : bounds.minimumLogY,
+        .canopyMaximumY = bounds.hasFoliage ? bounds.maximumLeafY : bounds.maximumLogY,
         .canopyOffsetX = static_cast<int8_t>(canopyCenterX - candidate.x),
         .canopyOffsetZ = static_cast<int8_t>(canopyCenterZ - candidate.z),
         .canopyRadius = static_cast<uint8_t>(radius),
         .logBlock = bounds.logBlock,
         .leafBlock = bounds.leafBlock,
         .anchorId = random.u64(TREE_PRIORITY_STREAM, candidate.cellX, 0, candidate.cellZ),
+        .species = candidate.kind,
+        .formX = static_cast<int8_t>(formX),
+        .formZ = static_cast<int8_t>(formZ),
+        .formExtent = static_cast<uint8_t>(formExtent),
     };
-    result.minimumX = bounds.minimumLeafX;
-    result.maximumX = bounds.maximumLeafX;
-    result.minimumZ = bounds.minimumLeafZ;
-    result.maximumZ = bounds.maximumLeafZ;
+    result.minimumX = bounds.hasFoliage ? bounds.minimumLeafX : bounds.minimumLogX;
+    result.maximumX = bounds.hasFoliage ? bounds.maximumLeafX : bounds.maximumLogX;
+    result.minimumZ = bounds.hasFoliage ? bounds.minimumLeafZ : bounds.minimumLogZ;
+    result.maximumZ = bounds.hasFoliage ? bounds.maximumLeafZ : bounds.maximumLogZ;
     return result;
 }
 
@@ -727,8 +1174,7 @@ void FeaturePlacer::placeTrees(Chunk& chunk, const ChunkGenerator& generator,
     const int64_t baseX = chunk.chunkX * CHUNK_EDGE;
     const int baseY = chunk.chunkY * CHUNK_EDGE;
     const int64_t baseZ = chunk.chunkZ * CHUNK_EDGE;
-    TreeWriter writer{chunk, baseX, baseY, baseZ};
-    std::unordered_map<ColumnPos, std::optional<TreeCandidate>> cache;
+    TreeCandidateCache cache;
 
     const int64_t minimumCellX =
         world_coord::floorDiv(baseX - feature_generation::TREE_MAXIMUM_HORIZONTAL_REACH,
@@ -742,30 +1188,38 @@ void FeaturePlacer::placeTrees(Chunk& chunk, const ChunkGenerator& generator,
     const int64_t maximumCellZ = world_coord::floorDiv(
         baseZ + CHUNK_EDGE - 1 + feature_generation::TREE_MAXIMUM_HORIZONTAL_REACH,
         static_cast<int64_t>(feature_generation::TREE_CELL_EDGE));
+    populateCandidateCache(random_, generator, minimumCellX - TREE_COMPETITOR_CELL_RADIUS,
+                           minimumCellZ - TREE_COMPETITOR_CELL_RADIUS,
+                           maximumCellX + TREE_COMPETITOR_CELL_RADIUS,
+                           maximumCellZ + TREE_COMPETITOR_CELL_RADIUS, cache);
 
     for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
         for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
             const ColumnPos cell{cellX, cellZ};
-            auto [found, inserted] = cache.try_emplace(cell);
-            if (inserted) found->second = makeCandidate(random_, cellX, cellZ, generator);
+            const auto found = cache.find(cell);
+            if (found == cache.end()) {
+                throw std::logic_error("tree candidate cache does not cover the emission range");
+            }
             if (!found->second.has_value()) continue;
             const TreeCandidate candidate = *found->second;
-            if (!candidateWins(candidate, random_, generator, cache)) continue;
+            if (!candidateWins(candidate, cache)) continue;
 
             const std::optional<int> treeBaseY =
                 acceptedTreeBaseY(candidate, generator, structures, scratch);
             if (!treeBaseY.has_value()) continue;
             if (!intersectsCubeVertically(candidate.kind, *treeBaseY, baseY)) continue;
+            TreeWriter writer{chunk, baseX, baseY, baseZ,
+                              traitsFor(candidate.kind).toleratesFlooding};
             buildTree(candidate, random_, *treeBaseY, writer);
         }
     }
 }
 
-std::vector<FarCanopy> FeaturePlacer::collectFarCanopies(int64_t minimumX, int64_t minimumZ,
-                                                         int64_t maximumX, int64_t maximumZ,
-                                                         const ChunkGenerator& generator,
-                                                         const StructurePlacer& structures,
-                                                         GenScratch& scratch) const {
+std::vector<FarCanopy> FeaturePlacer::collectFarCanopyAnchors(int64_t minimumX, int64_t minimumZ,
+                                                              int64_t maximumX, int64_t maximumZ,
+                                                              const ChunkGenerator& generator,
+                                                              const StructurePlacer& structures,
+                                                              GenScratch&) const {
     std::vector<FarCanopy> result;
     if (minimumX >= maximumX || minimumZ >= maximumZ) return result;
 
@@ -794,21 +1248,30 @@ std::vector<FarCanopy> FeaturePlacer::collectFarCanopies(int64_t minimumX, int64
     const int64_t maximumCellZ = world_coord::floorDiv(
         expandedMaximumZ, static_cast<int64_t>(feature_generation::TREE_CELL_EDGE));
 
-    std::unordered_map<ColumnPos, std::optional<TreeCandidate>> cache;
+    TreeCandidateCache cache;
+    populateCandidateCache(random_, generator, minimumCellX - TREE_COMPETITOR_CELL_RADIUS,
+                           minimumCellZ - TREE_COMPETITOR_CELL_RADIUS,
+                           maximumCellX + TREE_COMPETITOR_CELL_RADIUS,
+                           maximumCellZ + TREE_COMPETITOR_CELL_RADIUS, cache);
     for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
         for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
             const ColumnPos cell{cellX, cellZ};
-            auto [found, inserted] = cache.try_emplace(cell);
-            if (inserted) found->second = makeCandidate(random_, cellX, cellZ, generator);
+            const auto found = cache.find(cell);
+            if (found == cache.end()) {
+                throw std::logic_error("tree candidate cache does not cover the far canopy range");
+            }
             if (!found->second.has_value()) continue;
             const TreeCandidate candidate = *found->second;
-            if (!candidateWins(candidate, random_, generator, cache)) continue;
+            if (!candidateWins(candidate, cache)) continue;
 
-            const std::optional<int> treeBaseY =
-                acceptedTreeBaseY(candidate, generator, structures, scratch);
-            if (!treeBaseY.has_value()) continue;
+            const int64_t anchorChunkX = Chunk::worldToChunk(candidate.x);
+            const int64_t anchorChunkZ = Chunk::worldToChunk(candidate.z);
+            const bool insideStructure =
+                structures.insideStructure(candidate.x, candidate.z, anchorChunkX, anchorChunkZ, 1);
+            if (insideStructure) continue;
+            const int treeBaseY = candidate.sampledSurfaceY + 1;
             const std::optional<DescribedFarCanopy> described =
-                describeFarCanopy(candidate, random_, *treeBaseY);
+                describeFarCanopy(candidate, random_, treeBaseY);
             if (!described.has_value()) continue;
             if (described->maximumX < minimumX || described->minimumX >= maximumX ||
                 described->maximumZ < minimumZ || described->minimumZ >= maximumZ) {
@@ -820,66 +1283,183 @@ std::vector<FarCanopy> FeaturePlacer::collectFarCanopies(int64_t minimumX, int64
     return result;
 }
 
+std::vector<FarCanopy> FeaturePlacer::collectFarCanopies(int64_t minimumX, int64_t minimumZ,
+                                                         int64_t maximumX, int64_t maximumZ,
+                                                         const ChunkGenerator& generator,
+                                                         const StructurePlacer& structures,
+                                                         GenScratch& scratch) const {
+    std::vector<FarCanopy> result = collectFarCanopyAnchors(minimumX, minimumZ, maximumX, maximumZ,
+                                                            generator, structures, scratch);
+    for (FarCanopy& canopy : result) {
+        const int exactBaseY = generator.surfaceYAt(canopy.x, canopy.z, scratch) + 1;
+        const int verticalOffset = exactBaseY - canopy.baseY;
+        canopy.baseY = exactBaseY;
+        canopy.topY += verticalOffset;
+        canopy.canopyMinimumY += verticalOffset;
+        canopy.canopyMaximumY += verticalOffset;
+    }
+    return result;
+}
+
 std::vector<FarCanopy>
 FeaturePlacer::collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ, int64_t maximumX,
                                         int64_t maximumZ, int lodStep,
                                         const ChunkGenerator& generator) const {
     std::vector<FarCanopy> result;
     if (minimumX >= maximumX || minimumZ >= maximumZ) return result;
-    const int64_t cellEdge = lodStep >= 16 ? 64 : 32;
+    constexpr int64_t CELL_EDGE = 64;
+    constexpr int CANDIDATE_COUNT = 6;
+    const auto crownLimitForStep = [](int step) -> size_t {
+        if (step <= 2) return 6;
+        if (step <= 4) return 5;
+        if (step <= 8) return 4;
+        if (step <= 16) return 3;
+        return 2;
+    };
+    const int64_t cellEdge = CELL_EDGE;
     const int64_t minimumCellX = world_coord::floorDiv(minimumX, cellEdge);
     const int64_t maximumCellX = world_coord::floorDiv(maximumX - 1, cellEdge);
     const int64_t minimumCellZ = world_coord::floorDiv(minimumZ, cellEdge);
     const int64_t maximumCellZ = world_coord::floorDiv(maximumZ - 1, cellEdge);
-    result.reserve(
-        static_cast<size_t>((maximumCellX - minimumCellX + 1) * (maximumCellZ - minimumCellZ + 1)));
+    result.reserve(static_cast<size_t>((maximumCellX - minimumCellX + 1) *
+                                       (maximumCellZ - minimumCellZ + 1) * CANDIDATE_COUNT));
+
+    struct RankedCanopy {
+        FarCanopy canopy;
+        uint64_t retentionRank = 0;
+        int slot = 0;
+    };
+
+    const int64_t cellCountX = maximumCellX - minimumCellX + 1;
+    const int64_t cellCountZ = maximumCellZ - minimumCellZ + 1;
+    const size_t candidateCount = static_cast<size_t>(cellCountX * cellCountZ * CANDIDATE_COUNT);
+    std::vector<ColumnPos> candidatePositions(candidateCount);
+    const auto candidateIndex = [&](int64_t cellX, int64_t cellZ, int slot) {
+        return (static_cast<size_t>(cellZ - minimumCellZ) * static_cast<size_t>(cellCountX) +
+                static_cast<size_t>(cellX - minimumCellX)) *
+                   CANDIDATE_COUNT +
+               static_cast<size_t>(slot);
+    };
+    for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
+        for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
+            for (int slot = 0; slot < CANDIDATE_COUNT; ++slot) {
+                const int offsetX =
+                    12 + (slot % 3) * 20 +
+                    random_.uniformInt(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 0, -4, 4);
+                const int offsetZ =
+                    18 + (slot / 3) * 28 +
+                    random_.uniformInt(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 1, -5, 5);
+                candidatePositions[candidateIndex(cellX, cellZ, slot)] = {
+                    cellX * cellEdge + offsetX, cellZ * cellEdge + offsetZ};
+            }
+        }
+    }
+    std::vector<worldgen::SurfaceSample> candidateSurfaces(candidatePositions.size());
+    generator.sampleFarHabitatPoints(candidatePositions, candidateSurfaces);
 
     for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
         for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
-            const int offsetX = random_.uniformInt(FAR_CANOPY_CLUSTER_STREAM, cellX, 0, cellZ, 0, 3,
-                                                   static_cast<int>(cellEdge) - 4);
-            const int offsetZ = random_.uniformInt(FAR_CANOPY_CLUSTER_STREAM, cellX, 0, cellZ, 1, 3,
-                                                   static_cast<int>(cellEdge) - 4);
-            const int64_t x = cellX * cellEdge + offsetX;
-            const int64_t z = cellZ * cellEdge + offsetZ;
-            if (x < minimumX || x >= maximumX || z < minimumZ || z >= maximumZ) continue;
+            std::array<RankedCanopy, CANDIDATE_COUNT> cellCanopies{};
+            size_t cellCanopyCount = 0;
+            for (int slot = 0; slot < CANDIDATE_COUNT; ++slot) {
+                const size_t index = candidateIndex(cellX, cellZ, slot);
+                const int64_t x = candidatePositions[index].x;
+                const int64_t z = candidatePositions[index].z;
 
-            const worldgen::SurfaceSample surface = generator.sampleFarSurface(x, z);
-            const Biome biome = ditheredBiome(surface, random_, TREE_BIOME_STREAM, x, 0, z);
-            const Biome substrateBiome =
-                worldgen::surface_material::materialBiome(surface, random_, x, z);
-            const double density = blendedTreeDensity(surface);
-            if (density <= 0.0 || surface.hydrology.ocean || surface.hydrology.river ||
-                surface.hydrology.lake || surface.slope > 1.55 ||
-                substrateBiome == Biome::VOLCANIC_BARREN ||
-                worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::GEOTHERMAL) ||
-                random_.uniform01(FAR_CANOPY_CLUSTER_STREAM, cellX, 0, cellZ, 2) >=
-                    std::min(1.0, density * 1.18) ||
-                !worldgen::surface_material::supportsTreeRooting(
-                    generator.farSurfaceMaterialAt(x, z))) {
-                continue;
+                // Every coarse tier evaluates the same candidates against
+                // block-resolution habitat authority. More distant tiers
+                // retain strict subsets without moving or resizing surviving
+                // crowns, and filtered terrain cannot introduce a tree that
+                // exact ecology rejects at a shoreline or material contact.
+                const worldgen::SurfaceSample& surface = candidateSurfaces[index];
+                const Biome substrateBiome =
+                    worldgen::surface_material::materialBiome(surface, random_, x, z);
+                const double density = feature_generation::treeCoverDensity(surface);
+                const int groundSurfaceY = habitatGroundSurfaceY(surface);
+                const int habitatGroundY = habitatGroundSurfaceY(surface);
+                const std::optional<SelectedTreeKind> selectedKind = selectTreeKind(
+                    surface, habitatGroundY,
+                    random_.uniform01(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 6), false);
+                if (density <= 0.0 || !selectedKind.has_value() ||
+                    substrateBiome == Biome::VOLCANIC_BARREN ||
+                    !worldgen::surface_material::supportsTreeRooting(
+                        generator.farSurfaceMaterialAt(x, z, surface))) {
+                    continue;
+                }
+                const TreeKind kind = selectedKind->kind;
+                const feature_generation::TreeHabitatEvaluation& habitat = selectedKind->habitat;
+                const double acceptance =
+                    std::clamp(density * (0.70 + habitat.suitability * 0.52), 0.0, 1.0);
+                if (!habitat.allowed || random_.uniform01(FAR_CANOPY_CLUSTER_STREAM, cellX, slot,
+                                                          cellZ, 2) >= acceptance) {
+                    continue;
+                }
+
+                const auto [logBlock, leafBlock] = canopyBlocks(kind);
+                const int heightVariation =
+                    random_.uniformInt(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 3, 0, 1);
+                const CoarseCanopyDimensions dimensions =
+                    coarseCanopyDimensions(leafBlock, heightVariation);
+                const int baseY = groundSurfaceY + 1;
+                const int formX =
+                    kind == TreeKind::ACACIA || kind == TreeKind::PALM
+                        ? (random_.uniform01(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 7) < 0.5
+                               ? -1
+                               : 1)
+                        : 0;
+                const int formZ =
+                    kind == TreeKind::ACACIA
+                        ? (random_.uniform01(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 8) < 0.5
+                               ? -1
+                               : 1)
+                        : 0;
+                cellCanopies[cellCanopyCount++] = {
+                    .canopy =
+                        {
+                            .x = x,
+                            .z = z,
+                            .baseY = baseY,
+                            .topY = baseY + dimensions.topOffset,
+                            .canopyMinimumY = baseY + dimensions.crownBottomOffset,
+                            .canopyMaximumY = baseY + dimensions.topOffset,
+                            .canopyOffsetX = 0,
+                            .canopyOffsetZ = 0,
+                            .canopyRadius = dimensions.radius,
+                            .logBlock = logBlock,
+                            .leafBlock = leafBlock,
+                            .anchorId =
+                                random_.u64(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 4),
+                            .aggregate = true,
+                            .species = kind,
+                            .formX = static_cast<int8_t>(formX),
+                            .formZ = static_cast<int8_t>(formZ),
+                        },
+                    .retentionRank = random_.u64(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 5),
+                    .slot = slot,
+                };
             }
 
-            const auto [logBlock, leafBlock] = canopyBlocks(biome);
-            const int baseY = static_cast<int>(std::floor(surface.terrainHeight)) + 1;
-            const int height = lodStep >= 16 ? 12 : 9;
-            const int radius = static_cast<int>(
-                std::lround((lodStep >= 16 ? 8.0 : 4.5) + density * (lodStep >= 16 ? 5.0 : 3.0)));
-            result.push_back({
-                .x = x,
-                .z = z,
-                .baseY = baseY,
-                .topY = baseY + height,
-                .canopyMinimumY = baseY + height / 3,
-                .canopyMaximumY = baseY + height,
-                .canopyOffsetX = 0,
-                .canopyOffsetZ = 0,
-                .canopyRadius = static_cast<uint8_t>(radius),
-                .logBlock = logBlock,
-                .leafBlock = leafBlock,
-                .anchorId = random_.u64(FAR_CANOPY_CLUSTER_STREAM, cellX, 0, cellZ, 3),
-                .aggregate = true,
-            });
+            const size_t crownLimit = crownLimitForStep(lodStep);
+            if (cellCanopyCount > crownLimit) {
+                std::sort(cellCanopies.begin(), cellCanopies.begin() + cellCanopyCount,
+                          [](const RankedCanopy& first, const RankedCanopy& second) {
+                              return first.retentionRank < second.retentionRank;
+                          });
+                cellCanopyCount = crownLimit;
+                std::sort(cellCanopies.begin(), cellCanopies.begin() + cellCanopyCount,
+                          [](const RankedCanopy& first, const RankedCanopy& second) {
+                              return first.slot < second.slot;
+                          });
+            }
+            for (size_t index = 0; index < cellCanopyCount; ++index) {
+                const RankedCanopy& ranked = cellCanopies[index];
+                const FarCanopy& canopy = ranked.canopy;
+                if (canopy.x < minimumX || canopy.x >= maximumX || canopy.z < minimumZ ||
+                    canopy.z >= maximumZ) {
+                    continue;
+                }
+                result.push_back(canopy);
+            }
         }
     }
     return result;
@@ -900,7 +1480,7 @@ void FeaturePlacer::placeFlora(Chunk& chunk, const ChunkGenerator& generator,
             const int terrainY = generator.surfaceYAt(x, z, scratch);
             const double roll = random_.uniform01(FLORA_STREAM, x, terrainY, z, 0);
             const double kindRoll = random_.uniform01(FLORA_STREAM, x, terrainY, z, 1);
-            const Biome biome = ditheredBiome(surface, random_, FLORA_BIOME_STREAM, x, terrainY, z);
+            const Biome biome = ditheredBiome(surface, random_, FLORA_BIOME_STREAM, x, z);
             const Biome substrateBiome =
                 worldgen::surface_material::materialBiome(surface, random_, x, z);
             const double barrenWeight =

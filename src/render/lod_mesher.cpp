@@ -217,8 +217,7 @@ static void meshFaceGeneric(int faceHeight, int faceWidth, uint32_t* faceKeys, F
 }
 
 // The six directional passes for one visibility predicate. topDrop lowers
-// the +Y face plane (the water surface sits 0.125 below the cell top —
-// fp16-exact at every chunk-local magnitude, so no cracks).
+// the +Y face plane when a caller has an explicit partial fluid height.
 template <typename Access, typename LightAccess, typename Visible>
 static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBlock,
                             const LightAccess& getBlockLight, const Visible& visible,
@@ -608,9 +607,111 @@ static void emitFlatFlora(int x, int y, int z, BlockType bt, uint8_t skyLight, u
                         blockLight);
 }
 
-static void emitMissingNeighborCaps(const MeshSnapshot& snapshot, MeshOutput& output) {
+static void markExteriorAir(const MeshSnapshot& snapshot, MeshScratch& scratch) {
+    auto& exteriorAir = scratch.exteriorAir;
+    auto& frontier = scratch.exteriorFrontier;
+    exteriorAir.fill(0);
+    size_t frontierRead = 0;
+    size_t frontierWrite = 0;
+    const int32_t cubeBaseY = snapshot.pos.y * CHUNK_EDGE;
+
+    const auto enqueue = [&](int x, int y, int z) {
+        const int index = MeshSnapshot::index(x, y, z);
+        if (exteriorAir[static_cast<size_t>(index)] != 0 || isOpaque(snapshot.at(x, y, z))) {
+            return;
+        }
+        exteriorAir[static_cast<size_t>(index)] = 1;
+        frontier[frontierWrite++] = static_cast<uint16_t>(index);
+    };
+
+    // Generated cutoffs identify air with a direct path to the sky. Starting
+    // from every such cell in the padded snapshot also admits outdoor air
+    // through a loaded side halo, which is important beneath arches and
+    // overhangs where a column-only cutoff would misclassify a cliff face as
+    // an underground wall.
+    for (int y = -1; y <= CHUNK_EDGE; ++y) {
+        const int32_t worldY = cubeBaseY + y;
+        for (int z = -1; z <= CHUNK_EDGE; ++z) {
+            for (int x = -1; x <= CHUNK_EDGE; ++x) {
+                int32_t cutoff = snapshot.generatedSurfaceCutoffAt(x, z);
+                const int32_t skyCutoff = snapshot.skyCutoffAt(x, z);
+                // A real edited or structure roof raises skyCutoff above the
+                // generated surface and must remain an opaque barrier. The
+                // SKY_CUTOFF_INCOMPLETE is instead the conservative marker for
+                // an incomplete vertical load; use generated authority in that
+                // case so outdoor streaming caps do not turn black.
+                if (skyCutoff != MeshSnapshot::SKY_CUTOFF_UNKNOWN &&
+                    skyCutoff != MeshSnapshot::SKY_CUTOFF_INCOMPLETE) {
+                    cutoff = skyCutoff;
+                }
+                if (cutoff != MeshSnapshot::SKY_CUTOFF_UNKNOWN && worldY >= cutoff) {
+                    enqueue(x, y, z);
+                }
+            }
+        }
+    }
+
+    constexpr int directions[6][3] = {
+        {-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1},
+    };
+    while (frontierRead < frontierWrite) {
+        const int linear = frontier[frontierRead++];
+        const int paddedY = linear / (MeshSnapshot::PADDED_EDGE * MeshSnapshot::PADDED_EDGE);
+        const int remainder = linear % (MeshSnapshot::PADDED_EDGE * MeshSnapshot::PADDED_EDGE);
+        const int paddedZ = remainder / MeshSnapshot::PADDED_EDGE;
+        const int paddedX = remainder % MeshSnapshot::PADDED_EDGE;
+        const int x = paddedX - 1;
+        const int y = paddedY - 1;
+        const int z = paddedZ - 1;
+        for (const auto& direction : directions) {
+            const int nextX = x + direction[0];
+            const int nextY = y + direction[1];
+            const int nextZ = z + direction[2];
+            if (nextX < -1 || nextX > CHUNK_EDGE || nextY < -1 || nextY > CHUNK_EDGE ||
+                nextZ < -1 || nextZ > CHUNK_EDGE) {
+                continue;
+            }
+            enqueue(nextX, nextY, nextZ);
+        }
+    }
+}
+
+static bool hasMissingLateralCapCandidate(const MeshSnapshot& snapshot) {
+    const int32_t cubeBaseY = snapshot.pos.y * CHUNK_EDGE;
+    const auto candidate = [&](uint8_t mask, int selfX, int selfZ, int neighborX, int neighborZ,
+                               int y) {
+        if ((snapshot.missingNeighborFaces & mask) == 0 || isOpaque(snapshot.at(selfX, y, selfZ))) {
+            return false;
+        }
+        const int32_t neighborCutoff = snapshot.generatedSurfaceCutoffAt(neighborX, neighborZ);
+        return neighborCutoff == MeshSnapshot::SKY_CUTOFF_UNKNOWN || cubeBaseY + y < neighborCutoff;
+    };
+    for (int y = 0; y < CHUNK_EDGE; ++y) {
+        for (int coordinate = 0; coordinate < CHUNK_EDGE; ++coordinate) {
+            if (candidate(MeshSnapshot::MISSING_PLUS_X, CHUNK_EDGE - 1, coordinate, CHUNK_EDGE,
+                          coordinate, y) ||
+                candidate(MeshSnapshot::MISSING_MINUS_X, 0, coordinate, -1, coordinate, y) ||
+                candidate(MeshSnapshot::MISSING_PLUS_Z, coordinate, CHUNK_EDGE - 1, coordinate,
+                          CHUNK_EDGE, y) ||
+                candidate(MeshSnapshot::MISSING_MINUS_Z, coordinate, 0, coordinate, -1, y)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void emitMissingNeighborCaps(const MeshSnapshot& snapshot, MeshScratch& scratch,
+                                    MeshOutput& output) {
+    if (snapshot.missingNeighborFaces == 0) return;
     constexpr float edge = static_cast<float>(CHUNK_EDGE);
     const int32_t cubeBaseY = snapshot.pos.y * CHUNK_EDGE;
+    constexpr uint8_t lateralFaces = MeshSnapshot::MISSING_PLUS_X | MeshSnapshot::MISSING_MINUS_X |
+                                     MeshSnapshot::MISSING_PLUS_Z | MeshSnapshot::MISSING_MINUS_Z;
+    if ((snapshot.missingNeighborFaces & lateralFaces) != 0 &&
+        hasMissingLateralCapCandidate(snapshot)) {
+        markExteriorAir(snapshot, scratch);
+    }
     auto emit = [&](uint8_t mask, FaceNormal inwardFace, BlockType current, int32_t worldY,
                     int selfX, int selfZ, int neighborX, int neighborZ,
                     const QuadCorner(&corners)[4]) {
@@ -620,17 +721,20 @@ static void emitMissingNeighborCaps(const MeshSnapshot& snapshot, MeshOutput& ou
             neighborCutoff == MeshSnapshot::SKY_CUTOFF_UNKNOWN || worldY < neighborCutoff;
         if (!neighborIsPlannedSolid) return;
 
-        const int32_t selfCutoff = snapshot.generatedSurfaceCutoffAt(selfX, selfZ);
+        const bool lateralFace =
+            inwardFace == FaceNormal::MINUS_X || inwardFace == FaceNormal::PLUS_X ||
+            inwardFace == FaceNormal::MINUS_Z || inwardFace == FaceNormal::PLUS_Z;
+        const int localY = worldY - cubeBaseY;
         const bool surfaceOpening =
-            selfCutoff != MeshSnapshot::SKY_CUTOFF_UNKNOWN && worldY >= selfCutoff &&
-            (inwardFace == FaceNormal::MINUS_X || inwardFace == FaceNormal::PLUS_X ||
-             inwardFace == FaceNormal::MINUS_Z || inwardFace == FaceNormal::PLUS_Z);
+            lateralFace && localY >= 0 && localY < CHUNK_EDGE &&
+            scratch.exteriorAir[static_cast<size_t>(MeshSnapshot::index(selfX, localY, selfZ))] !=
+                0;
         BlockType material = surfaceOpening
                                  ? snapshot.generatedSurfaceMaterialAt(neighborX, neighborZ)
-                                 : BlockType::BEDROCK;
+                                 : (lateralFace ? BlockType::STONE : BlockType::BEDROCK);
         if (!rendersAsCube(material) || material == BlockType::WATER) material = BlockType::STONE;
         const uint8_t skyLight = surfaceOpening ? 15 : 0;
-        const uint8_t occlusion = surfaceOpening ? AO_ALL_OPEN : 0;
+        const uint8_t occlusion = surfaceOpening || lateralFace ? AO_ALL_OPEN : 0;
         const uint8_t blockLight =
             surfaceOpening ? snapshot.lightAt(selfX, worldY - cubeBaseY, selfZ) : 0;
         pushQuad(output.vertices, output.indices, inwardFace, material, skyLight, corners,
@@ -919,7 +1023,7 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
             }
         }
     }
-    if (partialWater != nullptr) emitMissingNeighborCaps(*partialWater, output);
+    if (partialWater != nullptr) emitMissingNeighborCaps(*partialWater, scratch, output);
 
     // ---- Water section: everything after this index draws in the water
     // pass. Padded builds read real neighbor water; unpadded builds assume
@@ -931,16 +1035,18 @@ static MeshOutput buildGenericMesh(int gridW, int gridH, int gridD, const Access
         return output;
     }
     if (!emitGreedyWater) return output;
+    constexpr float SOURCE_TOP_DROP = 1.0F - fluidSurfaceHeight(FluidState::source());
     if (padded) {
         runGreedyPasses(gridW, gridH, gridD, getBlock, getBlockLight, waterFaceVisible, lightAt,
-                        0.125f, /*bakeAO=*/false, scratch, output.vertices, output.indices);
+                        SOURCE_TOP_DROP, /*bakeAO=*/false, scratch, output.vertices,
+                        output.indices);
     } else {
         auto waterEdgeBlock = [&getBlock, gridW, gridD](int x, int y, int z) -> BlockType {
             if (x < 0 || x >= gridW || z < 0 || z >= gridD) return BlockType::WATER;
             return getBlock(x, y, z);
         };
         runGreedyPasses(gridW, gridH, gridD, waterEdgeBlock, getBlockLight, waterFaceVisible,
-                        lightAt, 0.125f, /*bakeAO=*/false, scratch, output.vertices,
+                        lightAt, SOURCE_TOP_DROP, /*bakeAO=*/false, scratch, output.vertices,
                         output.indices);
     }
 

@@ -63,13 +63,13 @@ MegaBuffer::MegaBuffer(id<MTLDevice> device, uint64_t vertexSize, uint64_t index
     _vertexBuffer = [device newBufferWithLength:static_cast<NSUInteger>(vertexSize)
                                         options:MTLResourceStorageModeShared];
     if (!_vertexBuffer) {
-        std::terminate();
+        throw std::runtime_error("Metal vertex buffer allocation failed");
     }
 
     _indexBuffer = [device newBufferWithLength:static_cast<NSUInteger>(indexSize)
                                        options:MTLResourceStorageModeShared];
     if (!_indexBuffer) {
-        std::terminate();
+        throw std::runtime_error("Metal index buffer allocation failed");
     }
 }
 
@@ -257,4 +257,102 @@ uint64_t MegaBuffer::indexUsed() const {
         freeBytes += size;
     }
     return _indexPtr - freeBytes;
+}
+
+SegmentedMegaBuffer::SegmentedMegaBuffer(id<MTLDevice> device, uint64_t vertexCapacity,
+                                         uint64_t indexCapacity, uint64_t vertexSlabSize,
+                                         uint64_t indexSlabSize)
+    : _device(device), _vertexCapacity(vertexCapacity), _indexCapacity(indexCapacity),
+      _vertexSlabSize(vertexSlabSize), _indexSlabSize(indexSlabSize) {
+    if (!_device || vertexCapacity == 0 || indexCapacity == 0 || vertexSlabSize == 0 ||
+        indexSlabSize == 0) {
+        throw std::invalid_argument("segmented mega buffer capacities must be positive");
+    }
+    const uint64_t vertexSegments = (vertexCapacity + vertexSlabSize - 1) / vertexSlabSize;
+    const uint64_t indexSegments = (indexCapacity + indexSlabSize - 1) / indexSlabSize;
+    if (vertexSegments != indexSegments) {
+        throw std::invalid_argument("segmented mega buffer slab counts must match");
+    }
+    _segments.reserve(static_cast<size_t>(vertexSegments));
+}
+
+bool SegmentedMegaBuffer::canCreateSegment() const {
+    return _createdVertexCapacity < _vertexCapacity && _createdIndexCapacity < _indexCapacity;
+}
+
+MegaBuffer& SegmentedMegaBuffer::createSegment() {
+    if (!canCreateSegment()) {
+        throw std::runtime_error("segmented mega buffer capacity exhausted");
+    }
+    const uint64_t vertexSize = std::min(_vertexSlabSize, _vertexCapacity - _createdVertexCapacity);
+    const uint64_t indexSize = std::min(_indexSlabSize, _indexCapacity - _createdIndexCapacity);
+    auto segment = std::make_unique<MegaBuffer>(_device, vertexSize, indexSize);
+    _createdVertexCapacity += vertexSize;
+    _createdIndexCapacity += indexSize;
+    _segments.push_back(std::move(segment));
+    return *_segments.back();
+}
+
+MegaBuffer::ChunkAllocation SegmentedMegaBuffer::allocate(uint32_t vertexCount,
+                                                          uint32_t indexCount) {
+    const uint64_t vertexBytes = static_cast<uint64_t>(vertexCount) * sizeof(Vertex);
+    const uint64_t indexBytes = static_cast<uint64_t>(indexCount) * sizeof(uint32_t);
+    if (vertexBytes > _vertexSlabSize || indexBytes > _indexSlabSize) {
+        throw std::runtime_error("far mesh exceeds one segmented arena slab");
+    }
+    for (const auto& segment : _segments) {
+        try {
+            return segment->allocate(vertexCount, indexCount);
+        } catch (const std::runtime_error&) {
+            // A full or fragmented slab is expected during horizon churn.
+        }
+    }
+    return createSegment().allocate(vertexCount, indexCount);
+}
+
+MegaBuffer& SegmentedMegaBuffer::owner(const ChunkAllocation& alloc) const {
+    for (const auto& segment : _segments) {
+        if (segment->owns(alloc)) {
+            return *segment;
+        }
+    }
+    throw std::invalid_argument("allocation does not belong to segmented mega buffer");
+}
+
+void SegmentedMegaBuffer::uploadVertices(const void* data, size_t size,
+                                         const ChunkAllocation& alloc) {
+    owner(alloc).uploadVertices(data, size, alloc.vertexOffset);
+}
+
+void SegmentedMegaBuffer::uploadIndices(const void* data, size_t size,
+                                        const ChunkAllocation& alloc) {
+    owner(alloc).uploadIndices(data, size, alloc.indexOffset);
+}
+
+void SegmentedMegaBuffer::free(ChunkAllocation& alloc) {
+    owner(alloc).free(alloc);
+}
+
+void SegmentedMegaBuffer::deferFree(ChunkAllocation& alloc, uint64_t frame) {
+    owner(alloc).deferFree(alloc, frame);
+}
+
+void SegmentedMegaBuffer::drainDeferredFrees(uint64_t completedFrame) {
+    for (const auto& segment : _segments) {
+        segment->drainDeferredFrees(completedFrame);
+    }
+}
+
+uint64_t SegmentedMegaBuffer::vertexUsed() const {
+    uint64_t total = 0;
+    for (const auto& segment : _segments)
+        total += segment->vertexUsed();
+    return total;
+}
+
+uint64_t SegmentedMegaBuffer::indexUsed() const {
+    uint64_t total = 0;
+    for (const auto& segment : _segments)
+        total += segment->indexUsed();
+    return total;
 }

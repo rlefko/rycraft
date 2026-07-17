@@ -9,7 +9,7 @@ int main() {
     Engine* engine = [Engine sharedEngine];
 
     if (![engine initialize]) {
-        RY_LOG_FATAL("Engine initialization failed");
+        RY_LOG_ERROR("Engine initialization failed");
         return 1;
     }
 

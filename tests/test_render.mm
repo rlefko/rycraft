@@ -23,6 +23,7 @@
 #include <render/lod_mesher.hpp>
 #include <render/mega_buffer.hpp>
 #include <render/mesh_scheduler.hpp>
+#include <render/render_pipeline.hpp>
 #include <render/shader_types.hpp>
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
@@ -39,6 +40,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -46,8 +48,12 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <set>
+#include <span>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ============================================================================
@@ -77,19 +83,66 @@ TEST_CASE("Vertex fields have expected sizes", "[render][vertex]") {
 
 namespace {
 
-FarTerrainSource farTerrainTestSource() {
+worldgen::surface_material::SurfaceMaterialPalette testMaterialPalette(BlockType material) {
+    worldgen::surface_material::SurfaceMaterialPalette palette;
+    palette.count = 1;
+    palette.entries[0] = {.material = material, .weight = 255};
+    return palette;
+}
+
+bool sameMaterialPalette(const worldgen::surface_material::SurfaceMaterialPalette& first,
+                         const worldgen::surface_material::SurfaceMaterialPalette& second) {
+    if (first.count != second.count)
+        return false;
+    return std::equal(first.entries.begin(), first.entries.begin() + first.count,
+                      second.entries.begin(), [](const auto& lhs, const auto& rhs) {
+                          return lhs.material == rhs.material && lhs.weight == rhs.weight;
+                      });
+}
+
+using TestFarGeometryFunction =
+    std::function<FarTerrainGeometrySample(int64_t worldX, int64_t worldZ)>;
+using TestFarMaterialFunction = std::function<BlockType(int64_t worldX, int64_t worldZ,
+                                                        const FarTerrainGeometrySample& geometry)>;
+
+FarTerrainSource testFarTerrainSource(TestFarGeometryFunction geometry,
+                                      TestFarMaterialFunction material) {
     FarTerrainSource source;
-    source.geometry = [](int64_t x, int64_t z) {
-        FarTerrainGeometrySample sample;
-        const int64_t variation = world_coord::floorMod(x + z * 3, 29);
-        sample.terrainHeight = 72.0 + static_cast<double>(variation) * 0.25;
-        sample.waterSurface = SEA_LEVEL;
-        return sample;
-    };
-    source.material = [](int64_t x, int64_t z, const FarTerrainGeometrySample&) {
-        return world_coord::floorMod(x / 64 + z / 64, 2) == 0 ? BlockType::GRASS : BlockType::STONE;
+    source.sample = [geometry = std::move(geometry), material = std::move(material)](
+                        int64_t x, int64_t z, worldgen::SurfaceFootprint) {
+        FarTerrainGeometrySample surface = geometry(x, z);
+        if (surface.lake && surface.waterBodyId == worldgen::NO_WATER_BODY) {
+            surface.waterBodyId = 0x5445'5354'4C41'4B45ULL;
+        }
+        return FarSurfaceSample{
+            .geometry = surface,
+            .footprintMinimumTerrainHeight = surface.terrainHeight,
+            .footprintMaximumTerrainHeight = surface.terrainHeight,
+            .materialPalette = testMaterialPalette(material(x, z, surface)),
+        };
     };
     return source;
+}
+
+FarTerrainGeometrySample
+testFarGeometry(const FarTerrainSource& source, int64_t x, int64_t z,
+                worldgen::SurfaceFootprint footprint = worldgen::SurfaceFootprint::BLOCK_1) {
+    return source.sample(x, z, footprint).geometry;
+}
+
+FarTerrainSource farTerrainTestSource() {
+    return testFarTerrainSource(
+        [](int64_t x, int64_t z) {
+            FarTerrainGeometrySample sample;
+            const int64_t variation = world_coord::floorMod(x + z * 3, 29);
+            sample.terrainHeight = 72.0 + static_cast<double>(variation) * 0.25;
+            sample.waterSurface = SEA_LEVEL;
+            return sample;
+        },
+        [](int64_t x, int64_t z, const FarTerrainGeometrySample&) {
+            return world_coord::floorMod(x / 64 + z / 64, 2) == 0 ? BlockType::GRASS
+                                                                  : BlockType::STONE;
+        });
 }
 
 std::map<int, float> farTerrainEdge(const FarTerrainMesh& mesh, bool eastEdge) {
@@ -106,53 +159,297 @@ std::map<int, float> farTerrainEdge(const FarTerrainMesh& mesh, bool eastEdge) {
     return result;
 }
 
+bool farTerrainTopsAreVoxelFlat(const FarTerrainMesh& mesh) {
+    for (uint32_t offset = 0; offset + 5 < mesh.opaqueIndexCount; offset += 6) {
+        const Vertex& first = mesh.vertices[mesh.indices[offset]];
+        if (unpackFace(first.faceAttr) != FaceNormal::PLUS_Y ||
+            (first.faceAttr &
+             (FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK | FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK)) != 0U) {
+            continue;
+        }
+        const float height = static_cast<float>(first.py);
+        if (height != std::round(height))
+            return false;
+        for (const uint32_t corner : {offset + 1, offset + 2, offset + 5}) {
+            if (static_cast<float>(mesh.vertices[mesh.indices[corner]].py) != height)
+                return false;
+        }
+    }
+    return true;
+}
+
+bool farTerrainUsesVoxelFaces(const FarTerrainMesh& mesh, int step) {
+    for (uint32_t offset = 0; offset + 5 < mesh.opaqueIndexCount; offset += 6) {
+        const Vertex& first = mesh.vertices[mesh.indices[offset]];
+        if ((first.faceAttr &
+             (FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK | FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK)) != 0U) {
+            continue;
+        }
+        const FaceNormal face = unpackFace(first.faceAttr);
+        std::array<float, 4> xs{};
+        std::array<float, 4> ys{};
+        std::array<float, 4> zs{};
+        constexpr std::array<uint32_t, 4> QUAD_CORNERS = {0, 1, 2, 5};
+        for (size_t corner = 0; corner < QUAD_CORNERS.size(); ++corner) {
+            const Vertex& vertex = mesh.vertices[mesh.indices[offset + QUAD_CORNERS[corner]]];
+            xs[corner] = static_cast<float>(vertex.px);
+            ys[corner] = static_cast<float>(vertex.py);
+            zs[corner] = static_cast<float>(vertex.pz);
+            if (ys[corner] != std::round(ys[corner]))
+                return false;
+        }
+        const auto allEqual = [](const auto& values) {
+            return std::all_of(values.begin() + 1, values.end(),
+                               [&](float value) { return value == values.front(); });
+        };
+        if (face == FaceNormal::PLUS_Y) {
+            if (!allEqual(ys))
+                return false;
+            for (float x : xs) {
+                if (world_coord::floorMod(static_cast<int64_t>(std::llround(x)),
+                                          static_cast<int64_t>(step)) != 0) {
+                    return false;
+                }
+            }
+            for (float z : zs) {
+                if (world_coord::floorMod(static_cast<int64_t>(std::llround(z)),
+                                          static_cast<int64_t>(step)) != 0) {
+                    return false;
+                }
+            }
+        } else if (face == FaceNormal::PLUS_X || face == FaceNormal::MINUS_X) {
+            if (!allEqual(xs))
+                return false;
+        } else if (face == FaceNormal::PLUS_Z || face == FaceNormal::MINUS_Z) {
+            if (!allEqual(zs))
+                return false;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+float expectedVoxelCellHeight(const FarTerrainSource& source, int64_t worldX, int64_t worldZ,
+                              FarTerrainStep step) {
+    const int width = farTerrainStepSize(step);
+    const worldgen::SurfaceFootprint footprint = farTerrainSurfaceFootprint(step);
+    if (step == FarTerrainStep::ONE) {
+        const FarSurfaceSample sample = source.sample(worldX, worldZ, footprint);
+        return static_cast<float>(std::floor(sample.geometry.terrainHeight + 0.5));
+    }
+    double height = 0.0;
+    for (const auto [dx, dz] :
+         std::array<std::pair<int, int>, 4>{{{0, 0}, {width, 0}, {width, width}, {0, width}}}) {
+        const FarSurfaceSample sample = source.sample(worldX + dx, worldZ + dz, footprint);
+        height += sample.geometry.terrainHeight;
+    }
+    return static_cast<float>(std::ceil(height / 4.0));
+}
+
+std::optional<float> farTerrainHeightAt(const FarTerrainMesh& mesh, float x, float z) {
+    for (uint32_t offset = 0; offset + 5 < mesh.opaqueIndexCount; offset += 6) {
+        const Vertex& first = mesh.vertices[mesh.indices[offset]];
+        if (unpackFace(first.faceAttr) != FaceNormal::PLUS_Y ||
+            (first.faceAttr &
+             (FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK | FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK)) != 0U) {
+            continue;
+        }
+        std::array<float, 4> xs{};
+        std::array<float, 4> zs{};
+        constexpr std::array<uint32_t, 4> QUAD_CORNERS = {0, 1, 2, 5};
+        for (size_t corner = 0; corner < QUAD_CORNERS.size(); ++corner) {
+            const Vertex& vertex = mesh.vertices[mesh.indices[offset + QUAD_CORNERS[corner]]];
+            xs[corner] = static_cast<float>(vertex.px);
+            zs[corner] = static_cast<float>(vertex.pz);
+        }
+        const auto [minimumX, maximumX] = std::minmax_element(xs.begin(), xs.end());
+        const auto [minimumZ, maximumZ] = std::minmax_element(zs.begin(), zs.end());
+        if (x >= *minimumX && x <= *maximumX && z >= *minimumZ && z <= *maximumZ)
+            return static_cast<float>(first.py);
+    }
+    return std::nullopt;
+}
+
+std::vector<float> farTerrainHeightRaster(const FarTerrainMesh& mesh, int spacing) {
+    const int edge = FAR_TERRAIN_TILE_EDGE / spacing;
+    std::vector<float> result(static_cast<size_t>(edge * edge),
+                              std::numeric_limits<float>::quiet_NaN());
+    for (uint32_t offset = 0; offset + 5 < mesh.opaqueIndexCount; offset += 6) {
+        const Vertex& first = mesh.vertices[mesh.indices[offset]];
+        if (unpackFace(first.faceAttr) != FaceNormal::PLUS_Y ||
+            (first.faceAttr &
+             (FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK | FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK)) != 0U) {
+            continue;
+        }
+        std::array<float, 4> xs{};
+        std::array<float, 4> zs{};
+        constexpr std::array<uint32_t, 4> QUAD_CORNERS = {0, 1, 2, 5};
+        for (size_t corner = 0; corner < QUAD_CORNERS.size(); ++corner) {
+            const Vertex& vertex = mesh.vertices[mesh.indices[offset + QUAD_CORNERS[corner]]];
+            xs[corner] = static_cast<float>(vertex.px);
+            zs[corner] = static_cast<float>(vertex.pz);
+        }
+        const auto [minimumX, maximumX] = std::minmax_element(xs.begin(), xs.end());
+        const auto [minimumZ, maximumZ] = std::minmax_element(zs.begin(), zs.end());
+        const int firstX = std::clamp(static_cast<int>(std::floor(*minimumX / spacing)), 0, edge);
+        const int lastX = std::clamp(static_cast<int>(std::ceil(*maximumX / spacing)), 0, edge);
+        const int firstZ = std::clamp(static_cast<int>(std::floor(*minimumZ / spacing)), 0, edge);
+        const int lastZ = std::clamp(static_cast<int>(std::ceil(*maximumZ / spacing)), 0, edge);
+        for (int z = firstZ; z < lastZ; ++z) {
+            for (int x = firstX; x < lastX; ++x) {
+                result[static_cast<size_t>(z * edge + x)] = static_cast<float>(first.py);
+            }
+        }
+    }
+    return result;
+}
+
+std::optional<float> farWaterTopHeightAt(const FarTerrainMesh& mesh, float x, float z) {
+    const auto signedArea = [](float ax, float az, float bx, float bz, float px, float pz) {
+        return (px - bx) * (az - bz) - (ax - bx) * (pz - bz);
+    };
+    for (size_t offset = mesh.opaqueIndexCount; offset + 2 < mesh.indices.size(); offset += 3) {
+        const Vertex& first = mesh.vertices[mesh.indices[offset]];
+        if (unpackFace(first.faceAttr) != FaceNormal::PLUS_Y)
+            continue;
+        const Vertex& second = mesh.vertices[mesh.indices[offset + 1]];
+        const Vertex& third = mesh.vertices[mesh.indices[offset + 2]];
+        const float firstSign =
+            signedArea(static_cast<float>(first.px), static_cast<float>(first.pz),
+                       static_cast<float>(second.px), static_cast<float>(second.pz), x, z);
+        const float secondSign =
+            signedArea(static_cast<float>(second.px), static_cast<float>(second.pz),
+                       static_cast<float>(third.px), static_cast<float>(third.pz), x, z);
+        const float thirdSign =
+            signedArea(static_cast<float>(third.px), static_cast<float>(third.pz),
+                       static_cast<float>(first.px), static_cast<float>(first.pz), x, z);
+        constexpr float EPSILON = 0.001F;
+        const bool hasNegative =
+            firstSign < -EPSILON || secondSign < -EPSILON || thirdSign < -EPSILON;
+        const bool hasPositive = firstSign > EPSILON || secondSign > EPSILON || thirdSign > EPSILON;
+        if (!(hasNegative && hasPositive))
+            return static_cast<float>(first.py);
+    }
+    return std::nullopt;
+}
+
+bool farWaterTopCovers(const FarTerrainMesh& mesh, float x, float z) {
+    return farWaterTopHeightAt(mesh, x, z).has_value();
+}
+
+bool hasTerrainBoundaryRiser(const FarTerrainMesh& mesh, FaceNormal face, float fixedCoordinate,
+                             float alongStart, float alongEnd, float bottom, float top) {
+    for (uint32_t offset = 0; offset + 5 < mesh.opaqueIndexCount; offset += 6) {
+        const Vertex& first = mesh.vertices[mesh.indices[offset]];
+        if (unpackFace(first.faceAttr) != face ||
+            (first.faceAttr &
+             (FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK | FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK)) != 0U) {
+            continue;
+        }
+        std::array<float, 4> fixed{};
+        std::array<float, 4> along{};
+        std::array<float, 4> heights{};
+        constexpr std::array<uint32_t, 4> QUAD_CORNERS = {0, 1, 2, 5};
+        for (size_t corner = 0; corner < QUAD_CORNERS.size(); ++corner) {
+            const Vertex& vertex = mesh.vertices[mesh.indices[offset + QUAD_CORNERS[corner]]];
+            const bool xFace = face == FaceNormal::PLUS_X || face == FaceNormal::MINUS_X;
+            fixed[corner] = xFace ? static_cast<float>(vertex.px) : static_cast<float>(vertex.pz);
+            along[corner] = xFace ? static_cast<float>(vertex.pz) : static_cast<float>(vertex.px);
+            heights[corner] = static_cast<float>(vertex.py);
+        }
+        const auto [minimumAlong, maximumAlong] = std::minmax_element(along.begin(), along.end());
+        const auto [minimumY, maximumY] = std::minmax_element(heights.begin(), heights.end());
+        if (std::all_of(fixed.begin(), fixed.end(),
+                        [&](float value) { return value == fixedCoordinate; }) &&
+            *minimumAlong == alongStart && *maximumAlong == alongEnd && *minimumY == bottom &&
+            *maximumY == top) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 TEST_CASE("Far terrain chooses globally specified LOD rings", "[render][far-terrain]") {
     REQUIRE_FALSE(farTerrainStepForChunkDistance(31.999).has_value());
     REQUIRE(farTerrainStepForChunkDistance(32.0) == FarTerrainStep::TWO);
-    REQUIRE(farTerrainStepForChunkDistance(47.999) == FarTerrainStep::TWO);
-    REQUIRE(farTerrainStepForChunkDistance(48.0) == FarTerrainStep::FOUR);
-    REQUIRE(farTerrainStepForChunkDistance(71.999) == FarTerrainStep::FOUR);
-    REQUIRE(farTerrainStepForChunkDistance(72.0) == FarTerrainStep::EIGHT);
-    REQUIRE(farTerrainStepForChunkDistance(135.999) == FarTerrainStep::EIGHT);
-    REQUIRE(farTerrainStepForChunkDistance(136.0) == FarTerrainStep::SIXTEEN);
-    REQUIRE(farTerrainStepForChunkDistance(255.999) == FarTerrainStep::SIXTEEN);
-    REQUIRE_FALSE(farTerrainStepForChunkDistance(256.0).has_value());
+    REQUIRE(farTerrainStepForChunkDistance(63.999) == FarTerrainStep::TWO);
+    REQUIRE(farTerrainStepForChunkDistance(127.999) == FarTerrainStep::TWO);
+    REQUIRE(farTerrainStepForChunkDistance(128.0) == FarTerrainStep::FOUR);
+    REQUIRE(farTerrainStepForChunkDistance(223.999) == FarTerrainStep::FOUR);
+    REQUIRE(farTerrainStepForChunkDistance(224.0) == FarTerrainStep::EIGHT);
+    REQUIRE(farTerrainStepForChunkDistance(351.999) == FarTerrainStep::EIGHT);
+    REQUIRE(farTerrainStepForChunkDistance(352.0) == FarTerrainStep::SIXTEEN);
+    REQUIRE(farTerrainStepForChunkDistance(511.999) == FarTerrainStep::SIXTEEN);
+    REQUIRE_FALSE(farTerrainStepForChunkDistance(512.0).has_value());
+    REQUIRE(FAR_TERRAIN_STEP_TWO_LIMIT_CHUNKS - FAR_TERRAIN_NEAR_CHUNK_RADIUS == 96.0);
+    REQUIRE(FAR_TERRAIN_STEP_FOUR_LIMIT_CHUNKS - FAR_TERRAIN_STEP_TWO_LIMIT_CHUNKS == 96.0);
+    REQUIRE(FAR_TERRAIN_STEP_EIGHT_LIMIT_CHUNKS - FAR_TERRAIN_STEP_FOUR_LIMIT_CHUNKS == 128.0);
+    REQUIRE(FAR_TERRAIN_STEP_SIXTEEN_LIMIT_CHUNKS - FAR_TERRAIN_STEP_EIGHT_LIMIT_CHUNKS == 160.0);
+    REQUIRE(FAR_TERRAIN_MAX_CHUNK_RADIUS == FAR_TERRAIN_STEP_SIXTEEN_LIMIT_CHUNKS);
+    STATIC_REQUIRE(FAR_TERRAIN_MAX_CHUNK_RADIUS == MAX_RENDER_DISTANCE_CHUNKS);
 }
 
-TEST_CASE("Far terrain samples exact material regions on a shared global lattice",
+TEST_CASE("Far terrain tiers map explicitly to surface footprints",
+          "[render][far-terrain][lod][sampling][contract]") {
+    constexpr std::array steps = {
+        FarTerrainStep::ONE,   FarTerrainStep::TWO,     FarTerrainStep::FOUR,
+        FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO,
+    };
+    constexpr std::array footprints = {
+        worldgen::SurfaceFootprint::BLOCK_1,  worldgen::SurfaceFootprint::BLOCK_2,
+        worldgen::SurfaceFootprint::BLOCK_4,  worldgen::SurfaceFootprint::BLOCK_8,
+        worldgen::SurfaceFootprint::BLOCK_16, worldgen::SurfaceFootprint::BLOCK_32,
+    };
+    for (size_t index = 0; index < steps.size(); ++index) {
+        CAPTURE(index);
+        REQUIRE(farTerrainSurfaceFootprint(steps[index]) == footprints[index]);
+        REQUIRE(farTerrainStepForSize(worldgen::surfaceFootprintWidth(footprints[index])) ==
+                steps[index]);
+    }
+    REQUIRE_FALSE(farTerrainStepForSize(3).has_value());
+}
+
+TEST_CASE("Far terrain samples one material palette per active LOD cell",
           "[render][far-terrain][material][lod][seam]") {
-    std::set<std::pair<int64_t, int64_t>> sampledExactMaterials;
-    std::set<std::pair<int64_t, int64_t>> sampledCoarseMaterials;
+    std::array<std::set<std::pair<int64_t, int64_t>>, 6> sampledFootprints;
     FarTerrainSource source;
-    source.geometry = [](int64_t, int64_t) {
+    source.sample = [&](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
+        sampledFootprints[static_cast<size_t>(std::countr_zero(static_cast<unsigned int>(
+                              worldgen::surfaceFootprintWidth(footprint))))]
+            .emplace(x, z);
         FarTerrainGeometrySample sample;
         sample.terrainHeight = 72.0;
-        return sample;
-    };
-    source.nearGeometry = source.geometry;
-    source.material = [&](int64_t x, int64_t z, const FarTerrainGeometrySample&) {
-        REQUIRE(world_coord::floorMod(x, int64_t{FAR_TERRAIN_COARSE_MATERIAL_SAMPLE_EDGE}) == 0);
-        REQUIRE(world_coord::floorMod(z, int64_t{FAR_TERRAIN_COARSE_MATERIAL_SAMPLE_EDGE}) == 0);
-        sampledCoarseMaterials.emplace(x, z);
-        return BlockType::STONE;
-    };
-    source.nearMaterial = [&](int64_t x, int64_t z, const FarTerrainGeometrySample&) {
-        REQUIRE(world_coord::floorMod(x, int64_t{FAR_TERRAIN_FINE_MATERIAL_SAMPLE_EDGE}) == 0);
-        REQUIRE(world_coord::floorMod(z, int64_t{FAR_TERRAIN_FINE_MATERIAL_SAMPLE_EDGE}) == 0);
-        sampledExactMaterials.emplace(x, z);
-        const int64_t cellX =
-            world_coord::floorDiv(x, int64_t{FAR_TERRAIN_FINE_MATERIAL_SAMPLE_EDGE});
-        const int64_t cellZ =
-            world_coord::floorDiv(z, int64_t{FAR_TERRAIN_FINE_MATERIAL_SAMPLE_EDGE});
-        return world_coord::floorMod(cellX + cellZ, int64_t{2}) == 0 ? BlockType::LIMESTONE
-                                                                     : BlockType::ANDESITE;
+        const int64_t cellX = world_coord::floorDiv(
+            x, static_cast<int64_t>(worldgen::surfaceFootprintWidth(footprint)));
+        const int64_t cellZ = world_coord::floorDiv(
+            z, static_cast<int64_t>(worldgen::surfaceFootprintWidth(footprint)));
+        const BlockType material = world_coord::floorMod(cellX + cellZ, int64_t{2}) == 0
+                                       ? BlockType::LIMESTONE
+                                       : BlockType::ANDESITE;
+        return FarSurfaceSample{
+            .geometry = sample,
+            .footprintMinimumTerrainHeight = sample.terrainHeight,
+            .footprintMaximumTerrainHeight = sample.terrainHeight,
+            .materialPalette = testMaterialPalette(material),
+        };
     };
 
     const auto mesh = FarTerrainMesher::build(FarTerrainKey{-1, -1, FarTerrainStep::TWO}, source);
-    REQUIRE(sampledExactMaterials.size() == 64);
-    REQUIRE(sampledCoarseMaterials.empty());
+    const auto& stepTwoSamples = sampledFootprints[1];
+    // Boundary risers inspect one neighboring control ring, but the active
+    // cell grid must still contain every footprint sample exactly once.
+    REQUIRE(stepTwoSamples.size() >= 129 * 129);
+    for (int z = 0; z <= 128; ++z) {
+        for (int x = 0; x <= 128; ++x)
+            REQUIRE(stepTwoSamples.contains({-256 + x * 2, -256 + z * 2}));
+    }
+    REQUIRE(std::any_of(stepTwoSamples.begin(), stepTwoSamples.end(), [](const auto& coordinate) {
+        return world_coord::floorMod(coordinate.first, int64_t{32}) != 0 ||
+               world_coord::floorMod(coordinate.second, int64_t{32}) != 0;
+    }));
     bool sawLimestone = false;
     bool sawAndesite = false;
     for (const Vertex& vertex : mesh->vertices) {
@@ -165,30 +462,27 @@ TEST_CASE("Far terrain samples exact material regions on a shared global lattice
     REQUIRE(sawLimestone);
     REQUIRE(sawAndesite);
 
-    sampledExactMaterials.clear();
-    source.nearMaterial = [&](int64_t x, int64_t z, const FarTerrainGeometrySample&) {
-        REQUIRE(world_coord::floorMod(x, int64_t{FAR_TERRAIN_COARSE_MATERIAL_SAMPLE_EDGE}) == 0);
-        REQUIRE(world_coord::floorMod(z, int64_t{FAR_TERRAIN_COARSE_MATERIAL_SAMPLE_EDGE}) == 0);
-        sampledExactMaterials.emplace(x, z);
-        return BlockType::LIMESTONE;
-    };
     FarTerrainMesher::build(FarTerrainKey{-1, -1, FarTerrainStep::FOUR}, source);
-    REQUIRE(sampledExactMaterials.size() == 16);
-    REQUIRE(sampledCoarseMaterials.empty());
+    REQUIRE(sampledFootprints[2].size() >= 65 * 65);
 
     FarTerrainMesher::build(FarTerrainKey{-1, -1, FarTerrainStep::SIXTEEN}, source);
-    REQUIRE(sampledCoarseMaterials.size() == 16);
-    REQUIRE(sampledExactMaterials.size() == 16);
+    REQUIRE(sampledFootprints[4].size() >= 17 * 17);
 }
 
-TEST_CASE("Fine scheduler terrain uses the exact submerged cube material",
+TEST_CASE("Fine scheduler terrain follows its filtered footprint material palette",
           "[render][far-terrain][scheduler][material][water][lod][seam][regression]") {
     FarTerrainSchedulerLimits limits;
     limits.maxPending = 4;
     limits.maxCompleted = 4;
     limits.maxCacheEntries = 4;
     limits.maxCacheBytes = 32 * 1024 * 1024;
-    FarTerrainScheduler scheduler(42, limits);
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    // Canopy ownership has its own scheduler coverage. Keep this palette
+    // regression focused on terrain so cold tree-habitat basins cannot consume
+    // its bounded completion window.
+    source.canopies = {};
+    FarTerrainScheduler scheduler(std::move(source), limits);
     constexpr FarTerrainKey KEY{-54, 3, FarTerrainStep::FOUR};
     REQUIRE(scheduler.enqueue(KEY));
 
@@ -204,44 +498,646 @@ TEST_CASE("Fine scheduler terrain uses the exact submerged cube material",
     REQUIRE_FALSE(completed.front().failed);
     REQUIRE(completed.front().mesh);
 
-    // The 64-block material cell rooted at world (-13,760, 832) is a lake
-    // threshold where macro relief is dry but the exact emitted cube is
-    // submerged clay. Inspect the open interior so adjacent material cells
-    // cannot contribute a shared boundary vertex.
-    bool foundExactClay = false;
-    bool foundCoarseSilt = false;
+    // This patch is a lake threshold where block-resolution density and the
+    // step-four filtered surface disagree about submersion. The far sample's
+    // footprint owns geometry and its palette together, so derive expected
+    // materials from that contract instead of pinning a former palette entry.
+    std::set<BlockType> expectedMaterials;
+    bool sawSubmerged = false;
+    bool sawDry = false;
+    bool sawFilteredSubmersionDifference = false;
+    constexpr int64_t ORIGIN_X = KEY.tileX * FAR_TERRAIN_TILE_EDGE;
+    constexpr int64_t ORIGIN_Z = KEY.tileZ * FAR_TERRAIN_TILE_EDGE;
+    constexpr int STEP = static_cast<int>(FarTerrainStep::FOUR);
+    for (int localZ = 64; localZ < 128; localZ += STEP) {
+        for (int localX = 64; localX < 128; localX += STEP) {
+            const int64_t worldX = ORIGIN_X + localX;
+            const int64_t worldZ = ORIGIN_Z + localZ;
+            const worldgen::SurfaceSample exact = generator->sampleExactSurface(worldX, worldZ);
+            worldgen::SurfaceSample canonical =
+                generator->sampleFarSurface(worldX, worldZ, worldgen::SurfaceFootprint::BLOCK_1);
+            canonical.terrainHeight = exact.terrainHeight;
+            canonical.hydrology.surfaceElevation = exact.terrainHeight;
+            const worldgen::SurfaceSample filtered =
+                generator->sampleFarSurface(worldX, worldZ, worldgen::SurfaceFootprint::BLOCK_4);
+            const bool filteredSubmerged = worldgen::surface_material::submerged(filtered);
+            sawSubmerged = sawSubmerged || filteredSubmerged;
+            sawDry = sawDry || !filteredSubmerged;
+            sawFilteredSubmersionDifference =
+                sawFilteredSubmersionDifference ||
+                filteredSubmerged != worldgen::surface_material::submerged(canonical);
+            const auto palette = generator->farSurfaceMaterialPaletteAt(worldX, worldZ, filtered);
+            expectedMaterials.insert(worldgen::surface_material::selectMaterial(
+                palette,
+                generator->farSurfaceMaterialRankAt(worldX + STEP / 2, worldZ + STEP / 2)));
+        }
+    }
+
+    std::set<BlockType> observedMaterials;
     for (const Vertex& vertex : completed.front().mesh->vertices) {
         if (unpackFace(vertex.faceAttr) != FaceNormal::PLUS_Y || vertex.px <= 64 ||
             vertex.px >= 128 || vertex.pz <= 64 || vertex.pz >= 128) {
             continue;
         }
         const BlockType material = static_cast<BlockType>(unpackTextureLayer(vertex.faceAttr));
-        foundExactClay = foundExactClay || material == BlockType::CLAY;
-        foundCoarseSilt = foundCoarseSilt || material == BlockType::SILT;
+        if (material != BlockType::WATER)
+            observedMaterials.insert(material);
     }
-    REQUIRE(foundExactClay);
-    REQUIRE_FALSE(foundCoarseSilt);
+    REQUIRE(sawSubmerged);
+    REQUIRE(sawDry);
+    REQUIRE(sawFilteredSubmersionDifference);
+    REQUIRE(expectedMaterials.size() >= 2);
+    // Canopy top faces can share this horizontal window, so the mesh may
+    // contain additional leaf materials alongside every terrain material.
+    REQUIRE(std::ranges::includes(observedMaterials, expectedMaterials));
+}
+
+TEST_CASE("Coverage parents separate filtered voxel tops from conservative bounds",
+          "[render][far-terrain][coverage][lod][bounds]") {
+    FarTerrainSource source;
+    source.sample = [](int64_t, int64_t, worldgen::SurfaceFootprint footprint) {
+        FarTerrainGeometrySample geometry;
+        geometry.terrainHeight = 80.0;
+        const bool coverageParent = worldgen::surfaceFootprintWidth(footprint) >= 16;
+        return FarSurfaceSample{
+            .geometry = geometry,
+            .footprintMinimumTerrainHeight = coverageParent ? 72.0 : 80.0,
+            .footprintMaximumTerrainHeight = coverageParent ? 91.0 : 80.0,
+            .materialPalette = testMaterialPalette(BlockType::STONE),
+        };
+    };
+
+    const auto exact = FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source);
+    const auto coverage = FarTerrainMesher::build({0, 0, FAR_TERRAIN_BASE_STEP}, source);
+    const auto terrainHeights = [](const FarTerrainMesh& mesh) {
+        std::set<float> result;
+        for (const Vertex& vertex : mesh.vertices) {
+            if (unpackFace(vertex.faceAttr) == FaceNormal::PLUS_Y &&
+                unpackTextureLayer(vertex.faceAttr) != static_cast<uint8_t>(BlockType::WATER)) {
+                result.insert(static_cast<float>(vertex.py));
+            }
+        }
+        return result;
+    };
+    REQUIRE(terrainHeights(*exact) == std::set<float>{80.0F});
+    REQUIRE(terrainHeights(*coverage) == std::set<float>{80.0F});
+    REQUIRE(coverage->surfaceBounds.minY == 72.0F);
+    REQUIRE(exact->surfaceBounds.maxY == 80.0F);
+    REQUIRE(coverage->surfaceBounds.maxY == 91.0F);
+}
+
+TEST_CASE("Batched far cell bounds cover subcell relief and shorelines at every LOD",
+          "[render][far-terrain][coverage][lod][bounds][water][seam][regression]") {
+    constexpr std::array STEPS = {
+        FarTerrainStep::TWO,     FarTerrainStep::FOUR,       FarTerrainStep::EIGHT,
+        FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO,
+    };
+    for (const FarTerrainStep terrainStep : STEPS) {
+        const int step = farTerrainStepSize(terrainStep);
+        const int cellEdge = FAR_TERRAIN_TILE_EDGE / step;
+        constexpr FarTerrainKey BASE_KEY{-2, -3, FarTerrainStep::TWO};
+        const FarTerrainKey key{BASE_KEY.tileX, BASE_KEY.tileZ, terrainStep};
+        const int64_t originX = key.tileX * FAR_TERRAIN_TILE_EDGE;
+        const int64_t originZ = key.tileZ * FAR_TERRAIN_TILE_EDGE;
+        const int64_t shorelineX = originX + FAR_TERRAIN_TILE_EDGE / 2 + step / 2;
+        const int peakCellX = cellEdge * 3 / 4;
+        const int peakCellZ = cellEdge * 3 / 4;
+        const int trenchCellX = 0;
+        const int trenchCellZ = cellEdge / 4;
+        const int64_t peakWorldX = originX + static_cast<int64_t>(peakCellX * step);
+        const int64_t peakWorldZ = originZ + static_cast<int64_t>(peakCellZ * step);
+        const int64_t trenchWorldX = originX;
+        const int64_t trenchWorldZ = originZ + static_cast<int64_t>(trenchCellZ * step);
+        int callbackCalls = 0;
+        int64_t callbackOriginX = 0;
+        int64_t callbackOriginZ = 0;
+        int callbackWidth = 0;
+        int callbackHeight = 0;
+        worldgen::SurfaceFootprint callbackFootprint = worldgen::SurfaceFootprint::BLOCK_1;
+        FarTerrainSource source = testFarTerrainSource(
+            [shorelineX](int64_t x, int64_t) {
+                FarTerrainGeometrySample sample;
+                sample.terrainHeight = x < shorelineX ? 40.0 : 96.0;
+                sample.waterSurface = SEA_LEVEL;
+                sample.lake = x < shorelineX;
+                return sample;
+            },
+            [](int64_t, int64_t, const FarTerrainGeometrySample& sample) {
+                return sample.lake ? BlockType::CLAY : BlockType::STONE;
+            });
+        source.cellBoundsGrid = [&](int64_t gridOriginX, int64_t gridOriginZ, int gridStep,
+                                    int cellWidth, int cellHeight,
+                                    worldgen::SurfaceFootprint footprint,
+                                    std::span<FarTerrainCellBounds> output) {
+            ++callbackCalls;
+            callbackOriginX = gridOriginX;
+            callbackOriginZ = gridOriginZ;
+            callbackWidth = cellWidth;
+            callbackHeight = cellHeight;
+            callbackFootprint = footprint;
+            if (gridStep != step || output.size() != static_cast<size_t>(cellWidth * cellHeight)) {
+                throw std::invalid_argument("unexpected test cell bounds grid");
+            }
+            for (int z = 0; z < cellHeight; ++z) {
+                for (int x = 0; x < cellWidth; ++x) {
+                    const int64_t worldX = gridOriginX + static_cast<int64_t>(x * gridStep);
+                    const int64_t worldZ = gridOriginZ + static_cast<int64_t>(z * gridStep);
+                    const int64_t maximumX = worldX + gridStep;
+                    double minimum = maximumX <= shorelineX ? 40.0 : 96.0;
+                    double maximum = minimum;
+                    if (worldX < shorelineX && maximumX > shorelineX) {
+                        minimum = 40.0;
+                        maximum = 96.0;
+                    }
+                    double skirtBottom = minimum - FAR_TERRAIN_SKIRT_DEPTH;
+                    if (worldX == peakWorldX && worldZ == peakWorldZ) {
+                        minimum = 88.9;
+                        maximum = 221.25;
+                        skirtBottom = 4.5;
+                    }
+                    if (worldX == trenchWorldX && worldZ == trenchWorldZ) {
+                        minimum = -33.2;
+                        maximum = 102.1;
+                        skirtBottom = -110.4;
+                    }
+                    output[static_cast<size_t>(z * cellWidth + x)] = {
+                        .terrainHeight = minimum,
+                        .minimumTerrainHeight = minimum,
+                        .maximumTerrainHeight = maximum,
+                        .skirtBottom = skirtBottom,
+                    };
+                }
+            }
+        };
+
+        const auto mesh = FarTerrainMesher::build(key, source);
+        CAPTURE(step);
+        REQUIRE(callbackCalls == 1);
+        REQUIRE(callbackOriginX == originX - step);
+        REQUIRE(callbackOriginZ == originZ - step);
+        REQUIRE(callbackWidth == cellEdge + 2);
+        REQUIRE(callbackHeight == cellEdge + 2);
+        REQUIRE(worldgen::surfaceFootprintWidth(callbackFootprint) == step);
+        REQUIRE(farTerrainHeightAt(*mesh, static_cast<float>(peakCellX * step + step / 2),
+                                   static_cast<float>(peakCellZ * step + step / 2)) == 89.0F);
+        REQUIRE(farTerrainHeightAt(*mesh, static_cast<float>(trenchCellX * step + step / 2),
+                                   static_cast<float>(trenchCellZ * step + step / 2)) == -33.0F);
+        REQUIRE(mesh->surfaceBounds.minY == -34.0F);
+        REQUIRE(mesh->surfaceBounds.maxY == 222.0F);
+        REQUIRE(mesh->bounds.minY == -111.0F);
+        REQUIRE(mesh->bounds.maxY < mesh->surfaceBounds.maxY);
+        REQUIRE(
+            farWaterTopCovers(*mesh, FAR_TERRAIN_TILE_EDGE * 0.25F, FAR_TERRAIN_TILE_EDGE * 0.5F));
+        REQUIRE_FALSE(farWaterTopCovers(*mesh, static_cast<float>(peakCellX * step + step / 2),
+                                        static_cast<float>(peakCellZ * step + step / 2)));
+
+        constexpr int PATCHES_PER_EDGE = FAR_TERRAIN_TILE_EDGE / FAR_TERRAIN_OCCLUDER_PATCH_EDGE;
+        const int peakPatchX = peakCellX * step / FAR_TERRAIN_OCCLUDER_PATCH_EDGE;
+        const int peakPatchZ = peakCellZ * step / FAR_TERRAIN_OCCLUDER_PATCH_EDGE;
+        const FarTerrainBounds& peakPatch =
+            mesh->occluderPatches[static_cast<size_t>(peakPatchZ * PATCHES_PER_EDGE + peakPatchX)];
+        REQUIRE(peakPatch.maxY == 222.0F);
+        const int trenchPatchX = trenchCellX * step / FAR_TERRAIN_OCCLUDER_PATCH_EDGE;
+        const int trenchPatchZ = trenchCellZ * step / FAR_TERRAIN_OCCLUDER_PATCH_EDGE;
+        const FarTerrainBounds& trenchPatch = mesh->occluderPatches[static_cast<size_t>(
+            trenchPatchZ * PATCHES_PER_EDGE + trenchPatchX)];
+        REQUIRE(trenchPatch.minY == -34.0F);
+    }
+}
+
+TEST_CASE("Far cell bounds stitch negative tile faces independent of build order",
+          "[render][far-terrain][coverage][lod][bounds][seam][determinism][regression]") {
+    constexpr std::array STEPS = {
+        FarTerrainStep::TWO,     FarTerrainStep::FOUR,       FarTerrainStep::EIGHT,
+        FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO,
+    };
+    for (const FarTerrainStep terrainStep : STEPS) {
+        const int step = farTerrainStepSize(terrainStep);
+        size_t boundsCalls = 0;
+        FarTerrainSource source = testFarTerrainSource(
+            [](int64_t, int64_t) {
+                FarTerrainGeometrySample sample;
+                sample.terrainHeight = 90.0;
+                return sample;
+            },
+            [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::ANDESITE; });
+        source.cellBoundsGrid = [&](int64_t originX, int64_t originZ, int gridStep, int cellWidth,
+                                    int cellHeight, worldgen::SurfaceFootprint,
+                                    std::span<FarTerrainCellBounds> output) {
+            ++boundsCalls;
+            for (int z = 0; z < cellHeight; ++z) {
+                for (int x = 0; x < cellWidth; ++x) {
+                    const int64_t worldX = originX + static_cast<int64_t>(x * gridStep);
+                    const int64_t worldZ = originZ + static_cast<int64_t>(z * gridStep);
+                    const int64_t cellX = world_coord::floorDiv(worldX, int64_t{gridStep});
+                    const int64_t cellZ = world_coord::floorDiv(worldZ, int64_t{gridStep});
+                    const double minimum =
+                        70.0 + world_coord::floorMod(cellX + cellZ * 3, int64_t{9});
+                    output[static_cast<size_t>(z * cellWidth + x)] = {
+                        .terrainHeight = minimum,
+                        .minimumTerrainHeight = minimum,
+                        .maximumTerrainHeight = minimum + 0.25,
+                        .skirtBottom = minimum - 72.0,
+                    };
+                }
+            }
+        };
+        const FarTerrainKey leftKey{-1, -1, terrainStep};
+        const FarTerrainKey rightKey{0, -1, terrainStep};
+        const auto rightFirst = FarTerrainMesher::build(rightKey, source);
+        const auto leftSecond = FarTerrainMesher::build(leftKey, source);
+        const auto leftFirst = FarTerrainMesher::build(leftKey, source);
+        const auto rightSecond = FarTerrainMesher::build(rightKey, source);
+        CAPTURE(step);
+        REQUIRE(boundsCalls == 4);
+        REQUIRE(leftFirst->deterministicHash == leftSecond->deterministicHash);
+        REQUIRE(rightFirst->deterministicHash == rightSecond->deterministicHash);
+        REQUIRE(leftFirst->surfaceBounds.minY == leftSecond->surfaceBounds.minY);
+        REQUIRE(leftFirst->surfaceBounds.maxY == leftSecond->surfaceBounds.maxY);
+        REQUIRE(rightFirst->surfaceBounds.minY == rightSecond->surfaceBounds.minY);
+        REQUIRE(rightFirst->surfaceBounds.maxY == rightSecond->surfaceBounds.maxY);
+
+        bool sawOwnedRiser = false;
+        for (int cellZ = 0; cellZ < FAR_TERRAIN_TILE_EDGE / step; ++cellZ) {
+            const int64_t worldZ = -FAR_TERRAIN_TILE_EDGE + static_cast<int64_t>(cellZ * step);
+            const int64_t globalZ = world_coord::floorDiv(worldZ, int64_t{step});
+            const float leftHeight = static_cast<float>(
+                70 + world_coord::floorMod(int64_t{-1} + globalZ * 3, int64_t{9}));
+            const float rightHeight = static_cast<float>(
+                70 + world_coord::floorMod(int64_t{0} + globalZ * 3, int64_t{9}));
+            if (leftHeight > rightHeight) {
+                sawOwnedRiser =
+                    sawOwnedRiser || hasTerrainBoundaryRiser(
+                                         *leftFirst, FaceNormal::PLUS_X, FAR_TERRAIN_TILE_EDGE,
+                                         cellZ * step, (cellZ + 1) * step, rightHeight, leftHeight);
+            } else if (rightHeight > leftHeight) {
+                sawOwnedRiser =
+                    sawOwnedRiser ||
+                    hasTerrainBoundaryRiser(*rightFirst, FaceNormal::MINUS_X, 0.0F, cellZ * step,
+                                            (cellZ + 1) * step, leftHeight, rightHeight);
+            }
+        }
+        REQUIRE(sawOwnedRiser);
+    }
+}
+
+TEST_CASE("Far cell bounds remain stable after scheduler cache eviction",
+          "[render][far-terrain][coverage][bounds][scheduler][cache][determinism][regression]") {
+    auto boundsCalls = std::make_shared<std::atomic<size_t>>(0);
+    FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 80.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::BASALT; });
+    source.cellBoundsGrid = [boundsCalls](int64_t originX, int64_t originZ, int step, int cellWidth,
+                                          int cellHeight, worldgen::SurfaceFootprint,
+                                          std::span<FarTerrainCellBounds> output) {
+        boundsCalls->fetch_add(1, std::memory_order_relaxed);
+        for (int z = 0; z < cellHeight; ++z) {
+            for (int x = 0; x < cellWidth; ++x) {
+                const int64_t worldX = originX + static_cast<int64_t>(x * step);
+                const int64_t worldZ = originZ + static_cast<int64_t>(z * step);
+                const int64_t rank =
+                    world_coord::floorMod(world_coord::floorDiv(worldX, int64_t{step}) * 5 +
+                                              world_coord::floorDiv(worldZ, int64_t{step}) * 7,
+                                          int64_t{13});
+                const double minimum = 64.0 + rank;
+                output[static_cast<size_t>(z * cellWidth + x)] = {
+                    .terrainHeight = minimum,
+                    .minimumTerrainHeight = minimum,
+                    .maximumTerrainHeight = minimum + 8.25,
+                    .skirtBottom = minimum - 70.0,
+                };
+            }
+        }
+    };
+    FarTerrainSchedulerLimits limits;
+    limits.maxPending = 4;
+    limits.maxCompleted = 4;
+    limits.maxCacheEntries = 4;
+    limits.maxCacheBytes = 64 * 1024 * 1024;
+    FarTerrainScheduler scheduler(source, limits);
+    constexpr FarTerrainKey LEFT{-1, -1, FarTerrainStep::EIGHT};
+    constexpr FarTerrainKey RIGHT{0, -1, FarTerrainStep::EIGHT};
+    const auto buildPass = [&](std::array<FarTerrainKey, 2> keys) {
+        for (const FarTerrainKey key : keys)
+            REQUIRE(scheduler.enqueue(key));
+        std::vector<FarTerrainResult> results;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (results.size() < keys.size() && std::chrono::steady_clock::now() < deadline) {
+            scheduler.drainCompleted(results);
+            if (results.size() < keys.size())
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        REQUIRE(results.size() == keys.size());
+        std::unordered_map<FarTerrainKey, std::shared_ptr<const FarTerrainMesh>, FarTerrainKeyHash>
+            meshes;
+        for (const FarTerrainResult& result : results) {
+            REQUIRE_FALSE(result.failed);
+            REQUIRE(result.mesh);
+            meshes.emplace(result.key, result.mesh);
+        }
+        return meshes;
+    };
+
+    const auto first = buildPass({LEFT, RIGHT});
+    REQUIRE(scheduler.findCached(LEFT));
+    REQUIRE(scheduler.findCached(RIGHT));
+    scheduler.clearCache();
+    REQUIRE_FALSE(scheduler.findCached(LEFT));
+    REQUIRE_FALSE(scheduler.findCached(RIGHT));
+    const auto second = buildPass({RIGHT, LEFT});
+    scheduler.shutdown();
+    for (const FarTerrainKey key : {LEFT, RIGHT}) {
+        REQUIRE(first.at(key)->deterministicHash == second.at(key)->deterministicHash);
+        REQUIRE(first.at(key)->surfaceBounds.minY == second.at(key)->surfaceBounds.minY);
+        REQUIRE(first.at(key)->surfaceBounds.maxY == second.at(key)->surfaceBounds.maxY);
+        REQUIRE(first.at(key)->bounds.minY == second.at(key)->bounds.minY);
+        REQUIRE(first.at(key)->indices == second.at(key)->indices);
+    }
+    REQUIRE(boundsCalls->load(std::memory_order_relaxed) == 4);
+}
+
+TEST_CASE("Production far terrain exposes batched conservative cell bounds",
+          "[render][far-terrain][coverage][bounds][production][regression]") {
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    const FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    REQUIRE(static_cast<bool>(source.cellBoundsGrid));
+    REQUIRE(static_cast<bool>(source.sampleGrid));
+    std::array<FarSurfaceSample, 9> samples;
+    source.sampleGrid(-32, -32, 32, 3, worldgen::SurfaceFootprint::BLOCK_32, samples);
+    for (const FarSurfaceSample& sample : samples) {
+        REQUIRE(std::isfinite(sample.footprintMinimumTerrainHeight));
+        REQUIRE(std::isfinite(sample.footprintMaximumTerrainHeight));
+        REQUIRE(sample.footprintMinimumTerrainHeight <= sample.geometry.terrainHeight);
+        REQUIRE(sample.footprintMaximumTerrainHeight >= sample.geometry.terrainHeight);
+    }
+    std::array<FarTerrainCellBounds, 16> bounds;
+    source.cellBoundsGrid(-64, -64, 32, 4, 4, worldgen::SurfaceFootprint::BLOCK_32, bounds);
+    for (const FarTerrainCellBounds& cell : bounds) {
+        REQUIRE(std::isfinite(cell.terrainHeight));
+        REQUIRE(std::isfinite(cell.minimumTerrainHeight));
+        REQUIRE(std::isfinite(cell.maximumTerrainHeight));
+        REQUIRE(std::isfinite(cell.skirtBottom));
+        REQUIRE(cell.minimumTerrainHeight <= cell.maximumTerrainHeight);
+        REQUIRE(cell.minimumTerrainHeight <= cell.terrainHeight);
+        REQUIRE(cell.terrainHeight <= cell.maximumTerrainHeight);
+        REQUIRE(cell.skirtBottom <= cell.minimumTerrainHeight);
+    }
+}
+
+TEST_CASE("Production cell bounds enclose interior emitted terrain and water floors",
+          "[render][far-terrain][coverage][bounds][worldgen][hydrology][regression]") {
+    struct Fixture {
+        uint32_t seed;
+        int64_t x;
+        int64_t z;
+        const char* name;
+    };
+    constexpr std::array FIXTURES = {
+        Fixture{42, -12'289, 2'649, "negative river boundary"},
+        Fixture{42, -8'240, 3'088, "waterfall receiver"},
+        Fixture{764891, 23'029, -111'486, "caldera interior"},
+    };
+    constexpr int STEP = 16;
+    for (const Fixture& fixture : FIXTURES) {
+        auto generator = std::make_shared<ChunkGenerator>(fixture.seed);
+        const FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+        const int64_t originX = world_coord::floorDiv(fixture.x, int64_t{STEP}) * STEP;
+        const int64_t originZ = world_coord::floorDiv(fixture.z, int64_t{STEP}) * STEP;
+        std::array<FarTerrainCellBounds, 1> bounds{};
+        source.cellBoundsGrid(originX, originZ, STEP, 1, 1, worldgen::SurfaceFootprint::BLOCK_16,
+                              bounds);
+        double exactMinimum = std::numeric_limits<double>::max();
+        double exactMaximum = std::numeric_limits<double>::lowest();
+        bool sawGeneratedWater = false;
+        bool sawWaterfall = false;
+        for (int z = 0; z < STEP; ++z) {
+            for (int x = 0; x < STEP; ++x) {
+                const worldgen::SurfaceSample exact =
+                    generator->sampleExactSurface(originX + x, originZ + z);
+                exactMinimum = std::min(exactMinimum, exact.terrainHeight);
+                exactMaximum = std::max(exactMaximum, exact.terrainHeight);
+                sawGeneratedWater = sawGeneratedWater || exact.hydrology.ocean ||
+                                    exact.hydrology.river || exact.hydrology.lake;
+                sawWaterfall = sawWaterfall || exact.hydrology.waterfall;
+            }
+        }
+        CAPTURE(fixture.name, originX, originZ, exactMinimum, exactMaximum,
+                bounds.front().minimumTerrainHeight, bounds.front().maximumTerrainHeight);
+        REQUIRE(bounds.front().minimumTerrainHeight <= exactMinimum);
+        REQUIRE(bounds.front().maximumTerrainHeight >= exactMaximum);
+        if (std::string_view(fixture.name) == "waterfall receiver") {
+            REQUIRE(sawGeneratedWater);
+            REQUIRE(sawWaterfall);
+        }
+    }
+}
+
+TEST_CASE("Production bounds retain negative step thirty-two parents after cache eviction",
+          "[render][far-terrain][coverage][bounds][negative][determinism][cache]") {
+    constexpr int64_t ORIGIN_X = -66;
+    constexpr int64_t ORIGIN_Z = -34;
+    constexpr int CELL_EDGE = 4;
+    const auto sampleFineBounds = [](const std::shared_ptr<ChunkGenerator>& generator) {
+        const FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+        std::array<FarTerrainCellBounds, CELL_EDGE * CELL_EDGE> bounds{};
+        source.cellBoundsGrid(ORIGIN_X, ORIGIN_Z, 2, CELL_EDGE, CELL_EDGE,
+                              worldgen::SurfaceFootprint::BLOCK_2, bounds);
+        return bounds;
+    };
+    auto firstGenerator = std::make_shared<ChunkGenerator>(42);
+    const auto first = sampleFineBounds(firstGenerator);
+    firstGenerator->clearMacroCaches();
+    auto rebuiltGenerator = std::make_shared<ChunkGenerator>(42);
+    const auto rebuilt = sampleFineBounds(rebuiltGenerator);
+    for (size_t index = 0; index < first.size(); ++index) {
+        CAPTURE(index);
+        REQUIRE(first[index].terrainHeight == rebuilt[index].terrainHeight);
+        REQUIRE(first[index].minimumTerrainHeight == rebuilt[index].minimumTerrainHeight);
+        REQUIRE(first[index].maximumTerrainHeight == rebuilt[index].maximumTerrainHeight);
+        REQUIRE(first[index].skirtBottom == rebuilt[index].skirtBottom);
+        REQUIRE(first[index].minimumTerrainHeight <= first[index].terrainHeight);
+        REQUIRE(first[index].terrainHeight <= first[index].maximumTerrainHeight);
+        REQUIRE(first[index].skirtBottom <= first[index].minimumTerrainHeight);
+    }
+
+    const FarTerrainSource coarseSource =
+        FarTerrainMesher::generatorGeometrySource(rebuiltGenerator);
+    std::array<FarTerrainCellBounds, 16> parents{};
+    coarseSource.cellBoundsGrid(-128, -96, 32, 4, 4, worldgen::SurfaceFootprint::BLOCK_32, parents);
+    const double adjacentParentMinimum =
+        std::ranges::min(parents, {}, &FarTerrainCellBounds::minimumTerrainHeight)
+            .minimumTerrainHeight;
+    for (const FarTerrainCellBounds& cell : rebuilt) {
+        REQUIRE(cell.skirtBottom <= adjacentParentMinimum);
+    }
+}
+
+TEST_CASE("Production cell top authority stitches overlapping negative query aprons",
+          "[render][far-terrain][coverage][bounds][negative][seam][regression]") {
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    source.canopies = {};
+    constexpr int STEP = 2;
+    constexpr int EDGE = 4;
+    std::array<FarTerrainCellBounds, EDGE * EDGE> crossing{};
+    std::array<FarTerrainCellBounds, EDGE * EDGE> nonnegative{};
+    source.cellBoundsGrid(-4, -4, STEP, EDGE, EDGE, worldgen::SurfaceFootprint::BLOCK_2, crossing);
+    source.cellBoundsGrid(0, -4, STEP, EDGE, EDGE, worldgen::SurfaceFootprint::BLOCK_2,
+                          nonnegative);
+    for (int z = 0; z < EDGE; ++z) {
+        for (int x = 0; x < 2; ++x) {
+            const FarTerrainCellBounds& left = crossing[static_cast<size_t>(z * EDGE + x + 2)];
+            const FarTerrainCellBounds& right = nonnegative[static_cast<size_t>(z * EDGE + x)];
+            CAPTURE(x, z);
+            REQUIRE(left.terrainHeight == right.terrainHeight);
+            REQUIRE(left.minimumTerrainHeight == right.minimumTerrainHeight);
+            REQUIRE(left.maximumTerrainHeight == right.maximumTerrainHeight);
+            REQUIRE(left.skirtBottom == right.skirtBottom);
+        }
+    }
+}
+
+TEST_CASE("Partially faded coverage and LOD parents never establish an occluder",
+          "[render][far-terrain][coverage][occlusion][lod][transition][regression]") {
+    FarTerrainCoverageFrontier frontier;
+    frontier.complete = false;
+    frontier.distanceBlocks = 1024.0F;
+    frontier.distanceSquaredBlocks = 1024.0 * 1024.0;
+    frontier.missingBaseTiles = 1;
+    const TerrainHorizonViewpoint viewpoint{};
+    constexpr double FADE_BLOCKS = 256.0;
+    const FarTerrainBounds opaquePatch{600, 700, -16, 16, 40.0F, 80.0F};
+    const FarTerrainBounds fadingPatch{700, 800, -16, 16, 40.0F, 80.0F};
+    REQUIRE(
+        farTerrainCoveragePatchMayOcclude(opaquePatch, viewpoint, frontier, FADE_BLOCKS, false));
+    REQUIRE_FALSE(
+        farTerrainCoveragePatchMayOcclude(fadingPatch, viewpoint, frontier, FADE_BLOCKS, false));
+    REQUIRE_FALSE(
+        farTerrainCoveragePatchMayOcclude(opaquePatch, viewpoint, frontier, FADE_BLOCKS, true));
+    frontier.complete = true;
+    REQUIRE(
+        farTerrainCoveragePatchMayOcclude(fadingPatch, viewpoint, frontier, FADE_BLOCKS, false));
+    REQUIRE_FALSE(
+        farTerrainCoveragePatchMayOcclude(fadingPatch, viewpoint, frontier, FADE_BLOCKS, true));
+}
+
+TEST_CASE("Cross-tile canopy crowns expand horizontal surface bounds",
+          "[render][far-terrain][canopy][bounds][frustum][seam][regression]") {
+    FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 64.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::GRASS; });
+    constexpr FarTerrainKey KEY{1, -2, FarTerrainStep::FOUR};
+    constexpr int64_t ORIGIN_X = KEY.tileX * FAR_TERRAIN_TILE_EDGE;
+    constexpr int64_t ORIGIN_Z = KEY.tileZ * FAR_TERRAIN_TILE_EDGE;
+    source.canopies = [](int64_t minimumX, int64_t minimumZ, int64_t, int64_t, FarTerrainStep) {
+        FarCanopy canopy;
+        canopy.x = minimumX + 1;
+        canopy.z = minimumZ + FAR_TERRAIN_TILE_EDGE / 2;
+        canopy.baseY = 64;
+        canopy.topY = 75;
+        canopy.canopyMinimumY = 67;
+        canopy.canopyMaximumY = 75;
+        canopy.canopyRadius = 8;
+        canopy.logBlock = BlockType::LOG;
+        canopy.leafBlock = BlockType::LEAVES;
+        canopy.anchorId = 17;
+        return std::vector<FarCanopy>{canopy};
+    };
+
+    const auto mesh = FarTerrainMesher::build(KEY, source);
+    REQUIRE(mesh->canopyAnchorCount == 1);
+    REQUIRE(mesh->surfaceBounds.minX < ORIGIN_X);
+    REQUIRE(mesh->surfaceBounds.maxX == ORIGIN_X + FAR_TERRAIN_TILE_EDGE);
+    REQUIRE(mesh->surfaceBounds.minZ == ORIGIN_Z);
+    REQUIRE(mesh->surfaceBounds.maxZ == ORIGIN_Z + FAR_TERRAIN_TILE_EDGE);
+    // Tile-local vertices still draw from the canonical tile origin. Only the
+    // conservative frustum bounds expand around the crossing crown.
+    REQUIRE(mesh->bounds.minX == ORIGIN_X);
+    REQUIRE(mesh->bounds.maxX == ORIGIN_X + FAR_TERRAIN_TILE_EDGE);
+}
+
+TEST_CASE("Dynamic fine skirts cover a lower adjacent step-thirty-two parent",
+          "[render][far-terrain][coverage][lod][bounds][skirt][seam][regression]") {
+    FarTerrainSource source = testFarTerrainSource(
+        [](int64_t x, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = x < 0 ? 20.0 : 100.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::STONE; });
+    source.cellBoundsGrid = [](int64_t originX, int64_t, int step, int cellWidth, int cellHeight,
+                               worldgen::SurfaceFootprint, std::span<FarTerrainCellBounds> output) {
+        for (int z = 0; z < cellHeight; ++z) {
+            for (int x = 0; x < cellWidth; ++x) {
+                const int64_t worldX = originX + static_cast<int64_t>(x * step);
+                const double minimum = worldX < 0 ? 20.0 : 100.0;
+                output[static_cast<size_t>(z * cellWidth + x)] = {
+                    .terrainHeight = minimum,
+                    .minimumTerrainHeight = minimum,
+                    .maximumTerrainHeight = minimum,
+                    .skirtBottom = worldX < 0 ? -44.0 : 10.0,
+                };
+            }
+        }
+    };
+
+    const auto parent = FarTerrainMesher::build({-1, 0, FarTerrainStep::THIRTY_TWO}, source);
+    const auto fine = FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source);
+    REQUIRE(parent->surfaceBounds.minY == 20.0F);
+    REQUIRE(fine->surfaceBounds.maxY == 100.0F);
+    REQUIRE(100.0F - FAR_TERRAIN_SKIRT_DEPTH > parent->surfaceBounds.maxY);
+    REQUIRE(fine->bounds.minY == 10.0F);
+    bool sawCoveringWestSkirt = false;
+    for (uint32_t offset = 0; offset + 5 < fine->opaqueIndexCount; offset += 6) {
+        const Vertex& first = fine->vertices[fine->indices[offset]];
+        if ((first.faceAttr & FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK) == 0U ||
+            unpackFace(first.faceAttr) != FaceNormal::MINUS_X) {
+            continue;
+        }
+        std::array<float, 4> heights{};
+        constexpr std::array<uint32_t, 4> QUAD_CORNERS = {0, 1, 2, 5};
+        for (size_t corner = 0; corner < QUAD_CORNERS.size(); ++corner) {
+            heights[corner] =
+                static_cast<float>(fine->vertices[fine->indices[offset + QUAD_CORNERS[corner]]].py);
+        }
+        sawCoveringWestSkirt =
+            sawCoveringWestSkirt ||
+            *std::min_element(heights.begin(), heights.end()) <= parent->surfaceBounds.minY;
+    }
+    REQUIRE(sawCoveringWestSkirt);
 }
 
 TEST_CASE("Far terrain LOD responds to complexity with stable hysteresis",
           "[render][far-terrain][selection]") {
-    REQUIRE(farTerrainStepForMetrics(80.0, 0.0F) == FarTerrainStep::EIGHT);
-    REQUIRE(farTerrainStepForMetrics(80.0, 1.0F) == FarTerrainStep::FOUR);
-    REQUIRE(farTerrainStepForMetrics(150.0, 0.0F) == FarTerrainStep::SIXTEEN);
-    REQUIRE(farTerrainStepForMetrics(150.0, 1.0F) == FarTerrainStep::EIGHT);
+    REQUIRE(farTerrainStepForMetrics(100.0, 0.0F) == FarTerrainStep::TWO);
+    REQUIRE(farTerrainStepForMetrics(100.0, 1.0F) == FarTerrainStep::TWO);
+    REQUIRE(farTerrainStepForMetrics(80.0, 1.0F) == FarTerrainStep::TWO);
+    REQUIRE(farTerrainStepForMetrics(300.0, 0.0F) == FarTerrainStep::EIGHT);
+    REQUIRE(farTerrainStepForMetrics(300.0, 1.0F) == FarTerrainStep::FOUR);
+    REQUIRE(farTerrainStepForMetrics(450.0, 0.0F) == FarTerrainStep::SIXTEEN);
+    REQUIRE(farTerrainStepForMetrics(450.0, 1.0F) == FarTerrainStep::EIGHT);
 
-    REQUIRE(farTerrainStepForMetrics(49.0, 0.0F, FarTerrainStep::TWO) == FarTerrainStep::TWO);
-    REQUIRE(farTerrainStepForMetrics(49.0, 0.0F, FarTerrainStep::FOUR) == FarTerrainStep::FOUR);
-    REQUIRE(farTerrainStepForMetrics(70.0, 0.0F, FarTerrainStep::FOUR) == FarTerrainStep::FOUR);
-    REQUIRE(farTerrainStepForMetrics(70.0, 0.0F, FarTerrainStep::EIGHT) == FarTerrainStep::EIGHT);
-    REQUIRE(farTerrainStepForMetrics(40.0, 0.0F, FarTerrainStep::EIGHT) == FarTerrainStep::TWO);
-    REQUIRE(farTerrainStepForMetrics(140.0, 0.0F, FarTerrainStep::SIXTEEN) ==
+    REQUIRE(farTerrainStepForMetrics(68.0, 0.0F, FarTerrainStep::ONE) == FarTerrainStep::TWO);
+    REQUIRE(farTerrainStepForMetrics(68.0, 0.0F, FarTerrainStep::TWO) == FarTerrainStep::TWO);
+    REQUIRE(farTerrainStepForMetrics(120.0, 0.0F, FarTerrainStep::FOUR) == FarTerrainStep::FOUR);
+    REQUIRE(farTerrainStepForMetrics(220.0, 0.0F, FarTerrainStep::EIGHT) == FarTerrainStep::EIGHT);
+    REQUIRE(farTerrainStepForMetrics(70.0, 0.0F, FarTerrainStep::EIGHT) == FarTerrainStep::TWO);
+    REQUIRE(farTerrainStepForMetrics(400.0, 0.0F, FarTerrainStep::THIRTY_TWO) ==
             FarTerrainStep::SIXTEEN);
-    REQUIRE(farTerrainStepForMetrics(120.0, 0.0F, FarTerrainStep::SIXTEEN) ==
+    REQUIRE(farTerrainStepForMetrics(350.0, 0.0F, FarTerrainStep::THIRTY_TWO) ==
             FarTerrainStep::EIGHT);
+    REQUIRE(farTerrainStepForMetrics(210.0, 0.0F, FarTerrainStep::SIXTEEN) == FarTerrainStep::FOUR);
 }
 
-TEST_CASE("Far terrain topology replacement is fog-continuous and ABI-neutral",
+TEST_CASE("Far terrain topology swaps atomically beneath a narrow fog pulse",
           "[render][far-terrain][transition]") {
     const auto start = sampleFarTerrainTransition(0.0F);
     const auto quarter = sampleFarTerrainTransition(FAR_TERRAIN_LOD_TRANSITION_SECONDS * 0.25F);
@@ -252,63 +1148,124 @@ TEST_CASE("Far terrain topology replacement is fog-continuous and ABI-neutral",
 
     REQUIRE_FALSE(start.drawTarget);
     REQUIRE(start.fogBlend == 0.0F);
+    REQUIRE(start.progress == 0.0F);
     REQUIRE_FALSE(quarter.drawTarget);
-    REQUIRE(quarter.fogBlend == Catch::Approx(0.5F));
+    REQUIRE(quarter.fogBlend == 0.0F);
+    REQUIRE(quarter.progress == Catch::Approx(0.15625F));
     REQUIRE(midpoint.drawTarget);
-    REQUIRE(midpoint.fogBlend == 1.0F);
+    REQUIRE(midpoint.fogBlend == 0.0F);
+    REQUIRE(midpoint.progress == Catch::Approx(0.5F));
     REQUIRE(threeQuarter.drawTarget);
-    REQUIRE(threeQuarter.fogBlend == Catch::Approx(0.5F));
+    REQUIRE(threeQuarter.fogBlend == 0.0F);
+    REQUIRE(threeQuarter.progress == Catch::Approx(0.84375F));
     REQUIRE(complete.drawTarget);
     REQUIRE(complete.complete);
     REQUIRE(complete.fogBlend == 0.0F);
+    REQUIRE(complete.progress == 1.0F);
+
+    constexpr unsigned int SOURCE = FAR_TERRAIN_DRAW_FLAG | FAR_TERRAIN_LOD_TRANSITION_FLAG;
+    constexpr unsigned int TARGET = SOURCE | FAR_TERRAIN_LOD_TARGET_FLAG;
+    REQUIRE(farTerrainLodTerrainVisible(0.0F, SOURCE));
+    REQUIRE_FALSE(farTerrainLodTerrainVisible(0.0F, TARGET));
+    REQUIRE(farTerrainLodTerrainVisible(std::nextafter(0.5F, 0.0F), SOURCE));
+    REQUIRE_FALSE(farTerrainLodTerrainVisible(std::nextafter(0.5F, 0.0F), TARGET));
+    REQUIRE_FALSE(farTerrainLodTerrainVisible(0.5F, SOURCE));
+    REQUIRE(farTerrainLodTerrainVisible(0.5F, TARGET));
+    REQUIRE(farTerrainLodTerrainFog(0.42F, SOURCE) == Catch::Approx(0.0F).margin(1.0e-6F));
+    REQUIRE(farTerrainLodTerrainFog(0.5F, SOURCE) == Catch::Approx(1.0F));
+    REQUIRE(farTerrainLodTerrainFog(0.58F, TARGET) == Catch::Approx(0.0F).margin(1.0e-6F));
+    REQUIRE(farTerrainLodConnectedGeometryVisible(SOURCE));
+    REQUIRE_FALSE(farTerrainLodConnectedGeometryVisible(TARGET));
+
+    constexpr unsigned int EMERGENCY_SOURCE = SOURCE | FAR_TERRAIN_LOD_EMERGENCY_FLAG;
+    constexpr unsigned int EMERGENCY_TARGET = TARGET | FAR_TERRAIN_LOD_EMERGENCY_FLAG;
+    const FarTerrainTransitionSample beforeEmergencySwap =
+        sampleFarTerrainTransition(FAR_TERRAIN_LOD_EMERGENCY_SWAP_SECONDS - 0.001F);
+    const FarTerrainTransitionSample afterEmergencySwap =
+        sampleFarTerrainTransition(FAR_TERRAIN_LOD_EMERGENCY_SWAP_SECONDS + 0.001F);
+    REQUIRE(farTerrainLodTerrainVisible(beforeEmergencySwap.progress, EMERGENCY_SOURCE));
+    REQUIRE_FALSE(farTerrainLodTerrainVisible(beforeEmergencySwap.progress, EMERGENCY_TARGET));
+    REQUIRE_FALSE(farTerrainLodTerrainVisible(afterEmergencySwap.progress, EMERGENCY_SOURCE));
+    REQUIRE(farTerrainLodTerrainVisible(afterEmergencySwap.progress, EMERGENCY_TARGET));
+    const float emergencySwapProgress =
+        farTerrainLodTransitionProgressAtSeconds(FAR_TERRAIN_LOD_EMERGENCY_SWAP_SECONDS);
+    REQUIRE(farTerrainLodTerrainSwapProgress(EMERGENCY_SOURCE) ==
+            Catch::Approx(emergencySwapProgress));
+    REQUIRE(farTerrainLodTerrainFog(emergencySwapProgress, EMERGENCY_SOURCE) ==
+            Catch::Approx(1.0F));
+    REQUIRE(farTerrainLodTerrainFog(emergencySwapProgress - 0.030F, EMERGENCY_SOURCE) ==
+            Catch::Approx(0.0F).margin(1.0e-6F));
+    REQUIRE(farTerrainLodTerrainFog(emergencySwapProgress + 0.030F, EMERGENCY_TARGET) ==
+            Catch::Approx(0.0F).margin(1.0e-6F));
+    REQUIRE_FALSE(farTerrainLodTerrainVisible(1.0F, SOURCE));
+    REQUIRE(farTerrainLodTerrainVisible(1.0F, TARGET));
     REQUIRE(sizeof(Vertex) == 16);
 }
 
-TEST_CASE("Far terrain water and canopy share exact handoff coverage",
-          "[render][far-terrain][shader][transition]") {
-    STATIC_REQUIRE(FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS == CHUNK_EDGE);
-    constexpr float EXACT_RADIUS = FAR_TERRAIN_NEAR_CHUNK_RADIUS * CHUNK_EDGE;
-    constexpr float MIDPOINT = EXACT_RADIUS + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS * 0.5F;
-    constexpr float OUTSIDE = EXACT_RADIUS + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
+TEST_CASE("Water keeps one owner through far LOD and exact handoffs",
+          "[render][far-terrain][water][transition][ownership][flicker][regression]") {
+    constexpr unsigned int SOURCE = FAR_TERRAIN_DRAW_FLAG | FAR_TERRAIN_LOD_TRANSITION_FLAG;
+    constexpr unsigned int TARGET = SOURCE | FAR_TERRAIN_LOD_TARGET_FLAG;
+    STATIC_REQUIRE(sizeof(Vertex) == 16);
 
-    auto requireSharedHandoff = [] {
-        REQUIRE(farTerrainHandoffCoverage(EXACT_RADIUS - 0.001F, EXACT_RADIUS) == 0.0F);
-        REQUIRE_FALSE(farTerrainHandoffVisible(EXACT_RADIUS - 0.001F, EXACT_RADIUS, 0.0F));
-        REQUIRE_FALSE(farTerrainHandoffVisible(EXACT_RADIUS, EXACT_RADIUS, 0.0F));
-        REQUIRE(farTerrainHandoffCoverage(MIDPOINT, EXACT_RADIUS) == Catch::Approx(0.5F));
-        REQUIRE(farTerrainHandoffVisible(MIDPOINT, EXACT_RADIUS, 0.49F));
-        REQUIRE_FALSE(farTerrainHandoffVisible(MIDPOINT, EXACT_RADIUS, 0.51F));
-        REQUIRE(farTerrainHandoffCoverage(OUTSIDE, EXACT_RADIUS) == 1.0F);
-        REQUIRE(farTerrainHandoffVisible(OUTSIDE, EXACT_RADIUS, 1.0F));
+    const auto requireSingleOwner = [=](bool exactOwned, float progress) {
+        const bool sourceFarWater = !exactOwned && farTerrainLodConnectedGeometryVisible(SOURCE);
+        const bool targetFarWater = !exactOwned && farTerrainLodConnectedGeometryVisible(TARGET);
+        const unsigned int ownerCount = static_cast<unsigned int>(exactOwned) +
+                                        static_cast<unsigned int>(sourceFarWater) +
+                                        static_cast<unsigned int>(targetFarWater);
+        CAPTURE(exactOwned, progress, sourceFarWater, targetFarWater);
+        REQUIRE(ownerCount == 1U);
+        if (!exactOwned) {
+            REQUIRE(sourceFarWater);
+            REQUIRE_FALSE(targetFarWater);
+        }
     };
 
-    SECTION("standing water") {
-        requireSharedHandoff();
-    }
-    SECTION("far canopies") {
-        requireSharedHandoff();
+    for (int sample = 0; sample <= 64; ++sample) {
+        const float progress = static_cast<float>(sample) / 64.0F;
+        requireSingleOwner(false, progress);
     }
 
-    // Exact draws carry radius zero and must never be clipped by the shared
-    // shader path. Far LOD selection changes topology, not handoff coverage.
-    REQUIRE(farTerrainHandoffVisible(0.0F, 0.0F, 1.0F));
-    for (const FarTerrainStep step : {FarTerrainStep::TWO, FarTerrainStep::FOUR,
-                                      FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN}) {
-        CAPTURE(step);
-        REQUIRE(farTerrainHandoffVisible(OUTSIDE, EXACT_RADIUS, 0.99F));
+    bool exactOwned = false;
+    for (const auto [builtRevision, currentRevision] :
+         {std::pair{4U, 5U}, std::pair{5U, 5U}, std::pair{5U, 6U}, std::pair{6U, 6U}}) {
+        exactOwned = farTerrainExactSectionOwnsSurface(exactOwned, builtRevision, currentRevision);
+        for (const float progress : {0.0F, 0.25F, 0.5F, 0.75F, 1.0F}) {
+            CAPTURE(builtRevision, currentRevision);
+            requireSingleOwner(exactOwned, progress);
+        }
     }
+    REQUIRE(exactOwned);
+
+    // Once the replacement completes, the scheduler submits only the new
+    // regular draw. The transition helper must admit that sole owner.
+    REQUIRE(farTerrainLodConnectedGeometryVisible(FAR_TERRAIN_DRAW_FLAG));
 }
 
-TEST_CASE("Far terrain skirts stay hidden throughout the exact handoff",
+TEST_CASE("Far terrain skirts require both far owners",
           "[render][far-terrain][shader][transition][skirt][regression]") {
-    constexpr float EXACT_RADIUS = FAR_TERRAIN_NEAR_CHUNK_RADIUS * CHUNK_EDGE;
-    constexpr float MIDPOINT = EXACT_RADIUS + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS * 0.5F;
-    constexpr float OUTSIDE = EXACT_RADIUS + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
+    REQUIRE(farTerrainSkirtOwnersVisible(false, false));
+    REQUIRE_FALSE(farTerrainSkirtOwnersVisible(true, false));
+    REQUIRE_FALSE(farTerrainSkirtOwnersVisible(false, true));
+    REQUIRE_FALSE(farTerrainSkirtOwnersVisible(true, true));
 
-    REQUIRE_FALSE(farTerrainSkirtVisible(EXACT_RADIUS, EXACT_RADIUS));
-    REQUIRE_FALSE(farTerrainSkirtVisible(MIDPOINT, EXACT_RADIUS));
-    REQUIRE(farTerrainSkirtVisible(OUTSIDE, EXACT_RADIUS));
-    REQUIRE(farTerrainSkirtVisible(0.0F, 0.0F));
+    const simd_float2 negativeEdge = simd_make_float2(0.0F, 0.0F);
+    const simd_float2 negativeXReceiver =
+        farTerrainSkirtReceivingOwnershipSamplePosition(negativeEdge, FAR_TERRAIN_FACE_MINUS_X);
+    const simd_float2 negativeZReceiver =
+        farTerrainSkirtReceivingOwnershipSamplePosition(negativeEdge, FAR_TERRAIN_FACE_MINUS_Z);
+    REQUIRE(negativeXReceiver.x < 0.0F);
+    REQUIRE(negativeXReceiver.y == 0.0F);
+    REQUIRE(negativeZReceiver.x == 0.0F);
+    REQUIRE(negativeZReceiver.y < 0.0F);
+
+    constexpr unsigned int SOURCE = FAR_TERRAIN_DRAW_FLAG | FAR_TERRAIN_LOD_TRANSITION_FLAG;
+    constexpr unsigned int TARGET = SOURCE | FAR_TERRAIN_LOD_TARGET_FLAG;
+    REQUIRE(farTerrainLodSkirtVisible(0.25F, SOURCE));
+    REQUIRE_FALSE(farTerrainLodSkirtVisible(0.25F, TARGET));
+    REQUIRE_FALSE(farTerrainLodSkirtVisible(0.75F, SOURCE));
+    REQUIRE(farTerrainLodSkirtVisible(0.75F, TARGET));
 
     std::array<std::optional<FarTerrainStep>, 4> neighbors = {
         FarTerrainStep::FOUR, FarTerrainStep::TWO, std::nullopt, FarTerrainStep::EIGHT};
@@ -319,15 +1276,13 @@ TEST_CASE("Far terrain skirts stay hidden throughout the exact handoff",
             (1U << static_cast<uint8_t>(FaceNormal::MINUS_Z)));
     REQUIRE(farTerrainSkirtEdgeMask(FarTerrainStep::SIXTEEN, neighbors) == 0U);
 
-    FarTerrainSource source;
-    source.geometry = [](int64_t, int64_t) {
-        FarTerrainGeometrySample sample;
-        sample.terrainHeight = 80.0;
-        return sample;
-    };
-    source.material = [](int64_t, int64_t, const FarTerrainGeometrySample&) {
-        return BlockType::STONE;
-    };
+    const FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 80.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::STONE; });
     const auto mesh = FarTerrainMesher::build({-98, -39, FarTerrainStep::TWO}, source);
     const auto markedVertices =
         std::count_if(mesh->vertices.begin(), mesh->vertices.end(), [](const Vertex& vertex) {
@@ -340,22 +1295,85 @@ TEST_CASE("Far terrain skirts stay hidden throughout the exact handoff",
     }));
 }
 
+TEST_CASE("Pinned seed forty-two handoff never leaves an orphan tile skirt",
+          "[render][far-terrain][skirt][ownership][exact][regression]") {
+    constexpr FarTerrainKey KEY{2, -6, FarTerrainStep::TWO};
+    constexpr float CAMERA_X = 576.537F;
+    constexpr float CAMERA_Z = -1528.19F;
+    constexpr float EDGE_WORLD_X = 768.0F;
+    constexpr float EDGE_WORLD_Z = -1518.0F;
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    source.canopies = {};
+    const auto mesh = FarTerrainMesher::build(KEY, source);
+
+    bool foundPinnedSkirt = false;
+    for (uint32_t offset = 0; offset + 5 < mesh->opaqueIndexCount; offset += 6) {
+        const Vertex& first = mesh->vertices[mesh->indices[offset]];
+        if ((first.faceAttr & FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK) == 0U ||
+            unpackFace(first.faceAttr) != FaceNormal::PLUS_X) {
+            continue;
+        }
+        float minimumZ = std::numeric_limits<float>::max();
+        float maximumZ = std::numeric_limits<float>::lowest();
+        float minimumY = std::numeric_limits<float>::max();
+        float maximumY = std::numeric_limits<float>::lowest();
+        for (const uint32_t corner : {offset, offset + 1, offset + 2, offset + 5}) {
+            const Vertex& vertex = mesh->vertices[mesh->indices[corner]];
+            REQUIRE(static_cast<float>(vertex.px) == FAR_TERRAIN_TILE_EDGE);
+            minimumZ = std::min(minimumZ, static_cast<float>(vertex.pz));
+            maximumZ = std::max(maximumZ, static_cast<float>(vertex.pz));
+            minimumY = std::min(minimumY, static_cast<float>(vertex.py));
+            maximumY = std::max(maximumY, static_cast<float>(vertex.py));
+        }
+        const float localSceneZ = EDGE_WORLD_Z - static_cast<float>(mesh->originZ);
+        if (localSceneZ < minimumZ || localSceneZ > maximumZ)
+            continue;
+        foundPinnedSkirt = true;
+        REQUIRE(maximumY - minimumY >= FAR_TERRAIN_SKIRT_DEPTH);
+        break;
+    }
+    REQUIRE(foundPinnedSkirt);
+    REQUIRE(std::abs(EDGE_WORLD_X - CAMERA_X) < 192.0F);
+    REQUIRE(std::abs(EDGE_WORLD_Z - CAMERA_Z) < 16.0F);
+
+    const simd_float2 edge =
+        simd_make_float2(FAR_TERRAIN_TILE_EDGE, EDGE_WORLD_Z - static_cast<float>(mesh->originZ));
+    const simd_float2 emitting =
+        farTerrainExactOwnershipSamplePosition(edge, FAR_TERRAIN_FACE_PLUS_X, true);
+    const simd_float2 receiving =
+        farTerrainExactOwnershipSamplePosition(edge, FAR_TERRAIN_FACE_PLUS_X, false);
+    REQUIRE(static_cast<int>(std::floor(emitting.x / CHUNK_EDGE)) == 15);
+    REQUIRE(static_cast<int>(std::floor(receiving.x / CHUNK_EDGE)) == 16);
+
+    double maximumExactSurface = std::numeric_limits<double>::lowest();
+    for (int64_t x = 576; x <= 800; x += 8) {
+        const int64_t z = static_cast<int64_t>(
+            std::llround(static_cast<double>(CAMERA_Z) + static_cast<double>(x - 576) * 0.05275));
+        maximumExactSurface =
+            std::max(maximumExactSurface, generator->sampleExactSurface(x, z).terrainHeight);
+    }
+    REQUIRE(maximumExactSurface < 110.0);
+    REQUIRE_FALSE(farTerrainSkirtOwnersVisible(true, false));
+}
+
 TEST_CASE("Far terrain view selection is circular ordered and negative-coordinate safe",
           "[render][far-terrain][selection]") {
     constexpr double cameraX = -320.5;
     constexpr double cameraZ = -511.25;
     constexpr int exactRadius = 32;
-    constexpr int visibleRadius = 256;
+    constexpr int visibleRadius = 512;
     const double exactSquared = std::pow(exactRadius * CHUNK_EDGE, 2.0);
     const double visibleSquared = std::pow(visibleRadius * CHUNK_EDGE, 2.0);
 
     std::vector<FarTerrainViewTile> selected;
-    selectFarTerrainView(cameraX, cameraZ, exactRadius, visibleRadius, selected);
+    selectFarTerrainView(cameraX, cameraZ, visibleRadius, selected);
     REQUIRE_FALSE(selected.empty());
 
     std::array<bool, 4> reachedStep{};
     bool sawNegativeTile = false;
     bool sawExactBoundaryOverlap = false;
+    bool sawTileWhollyInsideExactDisk = false;
     double previousDistance = -1.0;
     for (const FarTerrainViewTile& tile : selected) {
         REQUIRE(tile.distanceSquared >= previousDistance);
@@ -386,41 +1404,1696 @@ TEST_CASE("Far terrain view selection is circular ordered and negative-coordinat
                                                   std::pow(static_cast<double>(z) - cameraZ, 2.0));
             }
         }
-        REQUIRE(farthestSquared > exactSquared);
+        sawTileWhollyInsideExactDisk =
+            sawTileWhollyInsideExactDisk || farthestSquared <= exactSquared;
     }
 
     REQUIRE(sawNegativeTile);
     REQUIRE(sawExactBoundaryOverlap);
+    REQUIRE(sawTileWhollyInsideExactDisk);
     REQUIRE(
         std::all_of(reachedStep.begin(), reachedStep.end(), [](bool reached) { return reached; }));
 }
 
-TEST_CASE("The first far LOD shares the exact emitted cubic surface",
-          "[render][far-terrain][seam][exact]") {
+TEST_CASE("Far terrain coverage stops before the nearest absent base",
+          "[render][far-terrain][coverage][residency]") {
+    std::vector<FarTerrainViewTile> selected;
+    selectFarTerrainView(128.0, 128.0, 64, selected);
+    REQUIRE(selected.size() > 8);
+
+    std::unordered_set<FarTerrainKey, FarTerrainKeyHash> resident;
+    for (const FarTerrainViewTile& tile : selected) {
+        resident.insert({tile.key.tileX, tile.key.tileZ, FAR_TERRAIN_BASE_STEP});
+    }
+    const auto isResident = [&](const FarTerrainKey& key) { return resident.contains(key); };
+    const FarTerrainCoverageFrontier complete = farTerrainCoverageFrontier(selected, isResident);
+    REQUIRE(complete.complete);
+    REQUIRE(complete.missingBaseTiles == 0);
+    REQUIRE(complete.distanceBlocks == 0.0F);
+
+    const FarTerrainViewTile& missing = selected[selected.size() / 3];
+    resident.erase({missing.key.tileX, missing.key.tileZ, FAR_TERRAIN_BASE_STEP});
+    const FarTerrainCoverageFrontier incomplete = farTerrainCoverageFrontier(selected, isResident);
+    REQUIRE_FALSE(incomplete.complete);
+    REQUIRE(incomplete.missingBaseTiles == 1);
+    REQUIRE(incomplete.distanceBlocks == Catch::Approx(std::sqrt(missing.distanceSquared)));
+    REQUIRE(incomplete.distanceSquaredBlocks == missing.distanceSquared);
+    REQUIRE(farTerrainCoverageFog(incomplete.distanceBlocks, incomplete.distanceBlocks) == 1.0F);
+    REQUIRE_FALSE(farTerrainCoverageVisible(incomplete.distanceBlocks, incomplete.distanceBlocks));
+    REQUIRE(farTerrainCoverageVisible(incomplete.distanceBlocks - 1.0F, incomplete.distanceBlocks));
+
+    for (const FarTerrainViewTile& tile : selected) {
+        CAPTURE(tile.key.tileX, tile.key.tileZ, tile.distanceSquared,
+                incomplete.distanceSquaredBlocks);
+        REQUIRE(farTerrainCoverageDrawEligible(tile.distanceSquared, incomplete) ==
+                (tile.distanceSquared < missing.distanceSquared));
+    }
+}
+
+TEST_CASE("A nearby cold coverage frontier preserves a clear camera neighborhood",
+          "[render][far-terrain][coverage][fog][cold-start][regression]") {
+    constexpr float NEAR_FRONTIER = 64.0F;
+    STATIC_REQUIRE(FAR_TERRAIN_COVERAGE_MIN_FADE_BLOCKS == 16.0F);
+    STATIC_REQUIRE(FAR_TERRAIN_COVERAGE_FADE_FRACTION == 0.125F);
+    REQUIRE(farTerrainCoverageFadeBlocks(NEAR_FRONTIER) == 16.0F);
+    REQUIRE(farTerrainCoverageFog(0.0F, NEAR_FRONTIER) == 0.0F);
+    REQUIRE(farTerrainCoverageFog(48.0F, NEAR_FRONTIER) == 0.0F);
+    REQUIRE(farTerrainCoverageFog(56.0F, NEAR_FRONTIER) == Catch::Approx(0.5F));
+    REQUIRE(farTerrainCoverageFog(NEAR_FRONTIER, NEAR_FRONTIER) == 1.0F);
+
+    // Once the connected prefix is at least eight tiles deep, retain the full
+    // 256-block horizon taper used by settled long-distance coverage.
+    constexpr float DISTANT_FRONTIER = 2048.0F;
+    REQUIRE(farTerrainCoverageFadeBlocks(DISTANT_FRONTIER) == FAR_TERRAIN_COVERAGE_FADE_BLOCKS);
+    REQUIRE(farTerrainCoverageFog(1792.0F, DISTANT_FRONTIER) == 0.0F);
+    REQUIRE(farTerrainCoverageFog(1920.0F, DISTANT_FRONTIER) == Catch::Approx(0.5F));
+}
+
+TEST_CASE("Connected parents refine every distance tier before full horizon coverage",
+          "[render][far-terrain][coverage][lod][priority][cold-start][camera-jump][regression]") {
+    FarTerrainViewTile near;
+    near.key = {0, 0, FarTerrainStep::TWO};
+    near.distanceSquared = 560.0 * 560.0;
+    near.distanceChunks = 35.0;
+
+    FarTerrainCoverageFrontier incomplete;
+    incomplete.complete = false;
+    incomplete.missingBaseTiles = 12;
+    incomplete.distanceBlocks = 900.0F;
+    incomplete.distanceSquaredBlocks = 900.0 * 900.0;
+    REQUIRE(farTerrainConnectedRefinementEligible(near, 512.0F, incomplete, true));
+    REQUIRE_FALSE(farTerrainConnectedRefinementEligible(near, 512.0F, incomplete, false));
+
+    // The camera target may build alongside its missing parent. It remains
+    // undisplayable until the parent is resident, so this reduces cold
+    // latency without exposing an isolated refinement.
+    near.distanceSquared = 0.0;
+    REQUIRE(farTerrainConnectedRefinementEligible(near, 0.0F, incomplete, false, true));
+    REQUIRE_FALSE(
+        farTerrainInitialDisplayedStep(near.key.step, farTerrainStepMask(FarTerrainStep::TWO)));
+
+    // A camera jump can contract the exact handoff to zero. Every connected
+    // parent remains eligible, independent of that exact-residency radius.
+    near.distanceSquared = 500.0 * 500.0;
+    REQUIRE(farTerrainConnectedRefinementEligible(near, 0.0F, incomplete, true));
+    near.distanceSquared = 513.0 * 513.0;
+    REQUIRE(farTerrainConnectedRefinementEligible(near, 0.0F, incomplete, true));
+
+    // No target may appear at or beyond the nearest missing base, even when
+    // the tile is inside the urgent distance band and its own parent exists.
+    near.distanceSquared = incomplete.distanceSquaredBlocks;
+    REQUIRE_FALSE(farTerrainConnectedRefinementEligible(near, 512.0F, incomplete, true));
+    near.distanceSquared = std::nextafter(incomplete.distanceSquaredBlocks, 0.0);
+    REQUIRE(farTerrainConnectedRefinementEligible(near, 512.0F, incomplete, true));
+
+    near.key.step = FarTerrainStep::FOUR;
+    REQUIRE(farTerrainConnectedRefinementEligible(near, 512.0F, incomplete, true));
+    near.key.step = FarTerrainStep::EIGHT;
+    REQUIRE(farTerrainConnectedRefinementEligible(near, 512.0F, incomplete, true));
+    near.key.step = FarTerrainStep::SIXTEEN;
+    REQUIRE(farTerrainConnectedRefinementEligible(near, 512.0F, incomplete, true));
+    near.key.step = FarTerrainStep::THIRTY_TWO;
+    REQUIRE_FALSE(farTerrainConnectedRefinementEligible(near, 512.0F, incomplete, true));
+    near.key.step = FarTerrainStep::TWO;
+    REQUIRE_FALSE(farTerrainConnectedRefinementEligible(
+        near, std::numeric_limits<float>::infinity(), incomplete, true));
+    REQUIRE_FALSE(farTerrainConnectedRefinementEligible(near, -1.0F, incomplete, true));
+
+    STATIC_REQUIRE(FAR_TERRAIN_MAX_URGENT_REFINEMENTS_IN_FLIGHT == 4);
+    STATIC_REQUIRE(FAR_TERRAIN_MIN_BASE_WORKERS_DURING_COVERAGE == 4);
+    STATIC_REQUIRE(FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME == 4);
+    STATIC_REQUIRE(FAR_TERRAIN_MAX_URGENT_REFINEMENT_UPLOADS_PER_FRAME == 4);
+    STATIC_REQUIRE(farTerrainBaseWorkerReservation(1, true) == 1);
+    STATIC_REQUIRE(farTerrainBaseWorkerReservation(2, true) == 2);
+    STATIC_REQUIRE(farTerrainBaseWorkerReservation(4, true) == 4);
+    STATIC_REQUIRE(farTerrainBaseWorkerReservation(8, true) == 4);
+    STATIC_REQUIRE(farTerrainBaseWorkerReservation(4, false) == 0);
+    STATIC_REQUIRE(farTerrainUrgentWorkerLimit(1, true) == 0);
+    STATIC_REQUIRE(farTerrainUrgentWorkerLimit(2, true) == 0);
+    STATIC_REQUIRE(farTerrainUrgentWorkerLimit(4, true) == 0);
+    STATIC_REQUIRE(farTerrainUrgentWorkerLimit(5, true) == 1);
+    STATIC_REQUIRE(farTerrainUrgentWorkerLimit(8, true) == 4);
+    STATIC_REQUIRE(farTerrainUrgentWorkerLimit(4, false) == 4);
+}
+
+TEST_CASE("Full horizon residency orders every coarse parent before refinements",
+          "[render][far-terrain][coverage][residency][priority]") {
+    std::vector<FarTerrainViewTile> selected;
+    selectFarTerrainView(-257.25, 513.75, 512, selected);
+    REQUIRE(selected.size() > 3'000);
+
+    std::vector<FarTerrainKey> order;
+    buildFarTerrainResidencyOrder(selected, order);
+    REQUIRE(farTerrainResidencyOrderMatches(selected, order));
+    REQUIRE(order.size() >= selected.size());
+    for (size_t index = 0; index < selected.size(); ++index) {
+        INFO("base index " << index);
+        REQUIRE(order[index].tileX == selected[index].key.tileX);
+        REQUIRE(order[index].tileZ == selected[index].key.tileZ);
+        REQUIRE(farTerrainIsBaseStep(order[index].step));
+        if (index > 0) {
+            REQUIRE(selected[index - 1].distanceSquared <= selected[index].distanceSquared);
+        }
+    }
+    for (size_t index = selected.size(); index < order.size(); ++index) {
+        INFO("refinement index " << index);
+        REQUIRE_FALSE(farTerrainIsBaseStep(order[index].step));
+    }
+
+    std::unordered_set<FarTerrainKey, FarTerrainKeyHash> unique(order.begin(), order.end());
+    REQUIRE(unique.size() == order.size());
+    REQUIRE(farTerrainResidencyMembershipMatches(selected, unique));
+    for (size_t index = 0; index < selected.size(); ++index) {
+        CAPTURE(index, selected[index].key.tileX, selected[index].key.tileZ,
+                farTerrainStepSize(selected[index].key.step));
+        REQUIRE(order[selected.size() + index] == selected[index].key);
+    }
+    REQUIRE(farTerrainNextDisplayedStep(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO) ==
+            FarTerrainStep::TWO);
+    REQUIRE(farTerrainNextDisplayedStep(FarTerrainStep::SIXTEEN, FarTerrainStep::TWO) ==
+            FarTerrainStep::TWO);
+    REQUIRE(farTerrainNextDisplayedStep(FarTerrainStep::EIGHT, FarTerrainStep::TWO) ==
+            FarTerrainStep::TWO);
+    REQUIRE(farTerrainNextDisplayedStep(FarTerrainStep::FOUR, FarTerrainStep::TWO) ==
+            FarTerrainStep::TWO);
+
+    std::reverse(selected.begin(), selected.end());
+    REQUIRE_FALSE(farTerrainResidencyOrderMatches(selected, order));
+    REQUIRE(farTerrainResidencyMembershipMatches(selected, unique));
+
+    selected.front().key.step = selected.front().key.step == FarTerrainStep::TWO
+                                    ? FarTerrainStep::FOUR
+                                    : FarTerrainStep::TWO;
+    REQUIRE_FALSE(farTerrainResidencyOrderMatches(selected, order));
+    REQUIRE_FALSE(farTerrainResidencyMembershipMatches(selected, unique));
+}
+
+TEST_CASE("Cold near fallback distributes step eight before the selected step two target",
+          "[render][far-terrain][coverage][lod][priority][cold-start][regression]") {
+    constexpr ColumnPos CAMERA{0, 0};
+    constexpr ColumnPos NEAR_A{1, 0};
+    constexpr ColumnPos NEAR_B{0, 1};
+    constexpr ColumnPos DISTANT{8, 0};
+    constexpr ColumnPos TRANSITIONING{2, 0};
+    std::array<FarTerrainRefinementCacheRequest, 5> requests{{
+        {CAMERA, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO},
+        {NEAR_A, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO},
+        {NEAR_B, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO},
+        {DISTANT, FarTerrainStep::THIRTY_TWO, FarTerrainStep::SIXTEEN},
+        {TRANSITIONING, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, 0, true},
+    }};
+    std::vector<FarTerrainKey> order;
+    buildFarTerrainProgressiveSubmissionOrder(requests, order);
+    const std::vector<FarTerrainKey> expected = {
+        {CAMERA.x, CAMERA.z, FarTerrainStep::EIGHT},
+        {NEAR_A.x, NEAR_A.z, FarTerrainStep::EIGHT},
+        {NEAR_B.x, NEAR_B.z, FarTerrainStep::EIGHT},
+        {CAMERA.x, CAMERA.z, FarTerrainStep::TWO},
+        {CAMERA.x, CAMERA.z, FarTerrainStep::FOUR},
+        {NEAR_A.x, NEAR_A.z, FarTerrainStep::FOUR},
+        {NEAR_B.x, NEAR_B.z, FarTerrainStep::FOUR},
+        {NEAR_A.x, NEAR_A.z, FarTerrainStep::TWO},
+        {NEAR_B.x, NEAR_B.z, FarTerrainStep::TWO},
+        {DISTANT.x, DISTANT.z, FarTerrainStep::SIXTEEN},
+    };
+    REQUIRE(order == expected);
+    REQUIRE(std::ranges::none_of(order, [](FarTerrainKey key) {
+        return key.tileX == TRANSITIONING.x && key.tileZ == TRANSITIONING.z;
+    }));
+
+    auto oneSlot = requests;
+    REQUIRE(reserveFarTerrainIntermediateTransitionSlots(
+                oneSlot, FAR_TERRAIN_MAX_SIMULTANEOUS_LOD_TRANSITIONS - 1) == 1);
+    REQUIRE_FALSE(oneSlot[0].deferIntermediate);
+    for (size_t index = 1; index < 4; ++index)
+        REQUIRE(oneSlot[index].deferIntermediate);
+
+    auto noSlots = requests;
+    REQUIRE(reserveFarTerrainIntermediateTransitionSlots(
+                noSlots, FAR_TERRAIN_MAX_SIMULTANEOUS_LOD_TRANSITIONS) == 0);
+    for (size_t index = 0; index < 4; ++index)
+        REQUIRE(noSlots[index].deferIntermediate);
+}
+
+TEST_CASE("Far terrain parent lane outranks every refinement priority",
+          "[render][far-terrain][coverage][scheduler][priority]") {
+    const FarTerrainKey parent{12, -7, FAR_TERRAIN_BASE_STEP};
+    const FarTerrainKey nearTarget{0, 0, FarTerrainStep::TWO};
+    const FarTerrainKey fartherTarget{3, 4, FarTerrainStep::EIGHT};
+
+    REQUIRE(farTerrainSubmissionBefore(parent, 10'000, nearTarget, 0));
+    REQUIRE_FALSE(farTerrainSubmissionBefore(nearTarget, 0, parent, 10'000));
+    REQUIRE(farTerrainSubmissionBefore(nearTarget, 4, fartherTarget, 8));
+
+    FarTerrainCoverageFrontier frontier;
+    frontier.complete = false;
+    frontier.missingBaseTiles = 1;
+    REQUIRE_FALSE(farTerrainRefinementLaneOpen(frontier, true));
+    frontier.complete = true;
+    frontier.missingBaseTiles = 0;
+    REQUIRE_FALSE(farTerrainRefinementLaneOpen(frontier, false));
+    REQUIRE(farTerrainRefinementLaneOpen(frontier, true));
+}
+
+TEST_CASE("Urgent nearby refinement shares all eight utility workers with parents",
+          "[render][far-terrain][scheduler][priority][cold-start][camera-jump][performance]"
+          "[regression]") {
+    constexpr std::array<FarTerrainKey, 10> BASES{{
+        {100, 0, FarTerrainStep::THIRTY_TWO},
+        {200, 0, FarTerrainStep::THIRTY_TWO},
+        {300, 0, FarTerrainStep::THIRTY_TWO},
+        {400, 0, FarTerrainStep::THIRTY_TWO},
+        {500, 0, FarTerrainStep::THIRTY_TWO},
+        {600, 0, FarTerrainStep::THIRTY_TWO},
+        {700, 0, FarTerrainStep::THIRTY_TWO},
+        {800, 0, FarTerrainStep::THIRTY_TWO},
+        {900, 0, FarTerrainStep::THIRTY_TWO},
+        {1'000, 0, FarTerrainStep::THIRTY_TWO},
+    }};
+    constexpr std::array<FarTerrainKey, 5> URGENT{{
+        {1'100, 0, FarTerrainStep::TWO},
+        {1'200, 0, FarTerrainStep::FOUR},
+        {1'300, 0, FarTerrainStep::EIGHT},
+        {1'400, 0, FarTerrainStep::SIXTEEN},
+        {1'500, 0, FarTerrainStep::TWO},
+    }};
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    std::unordered_set<int64_t> started;
+    bool releaseInitialBases = false;
+    bool releaseUrgent = false;
+
+    FarTerrainSource source = farTerrainTestSource();
+    const auto sample = source.sample;
+    source.sample = [&](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
+        if (z == 0 && world_coord::floorMod(x, int64_t{FAR_TERRAIN_TILE_EDGE}) == 0) {
+            const int64_t tileX = world_coord::floorDiv(x, int64_t{FAR_TERRAIN_TILE_EDGE});
+            const bool known =
+                std::ranges::any_of(BASES, [&](FarTerrainKey key) { return key.tileX == tileX; }) ||
+                std::ranges::any_of(URGENT, [&](FarTerrainKey key) { return key.tileX == tileX; });
+            if (known) {
+                std::unique_lock lock(gateMutex);
+                if (started.insert(tileX).second) {
+                    gateCv.notify_all();
+                    if (std::find_if(BASES.begin(), BASES.begin() + 8, [&](FarTerrainKey key) {
+                            return key.tileX == tileX;
+                        }) != BASES.begin() + 8) {
+                        gateCv.wait(lock, [&] { return releaseInitialBases; });
+                    } else if (std::find_if(URGENT.begin(), URGENT.begin() + 4,
+                                            [&](FarTerrainKey key) {
+                                                return key.tileX == tileX;
+                                            }) != URGENT.begin() + 4) {
+                        gateCv.wait(lock, [&] { return releaseUrgent; });
+                    }
+                }
+            }
+        }
+        return sample(x, z, footprint);
+    };
+
+    FarTerrainSchedulerLimits limits;
+    limits.maxPending = 16;
+    limits.maxCompleted = 16;
+    limits.maxCacheEntries = 16;
+    limits.maxCacheBytes = 64 * 1024 * 1024;
+    FarTerrainScheduler scheduler(source, limits);
+    struct GateRelease {
+        std::mutex& mutex;
+        std::condition_variable& condition;
+        bool& releaseInitial;
+        bool& releaseUrgent;
+        ~GateRelease() {
+            {
+                std::lock_guard lock(mutex);
+                releaseInitial = true;
+                releaseUrgent = true;
+            }
+            condition.notify_all();
+        }
+    } releaseOnExit{gateMutex, gateCv, releaseInitialBases, releaseUrgent};
+    scheduler.setWorkerBudget(FarTerrainScheduler::WORKER_COUNT);
+    for (const FarTerrainKey base : BASES)
+        REQUIRE(scheduler.enqueue(base));
+
+    bool initialBasesStarted = false;
+    {
+        std::unique_lock lock(gateMutex);
+        initialBasesStarted = gateCv.wait_for(lock, std::chrono::seconds(2), [&] {
+            return std::all_of(BASES.begin(), BASES.begin() + 8,
+                               [&](FarTerrainKey key) { return started.contains(key.tileX); });
+        });
+    }
+    if (!initialBasesStarted) {
+        {
+            std::lock_guard lock(gateMutex);
+            releaseInitialBases = true;
+            releaseUrgent = true;
+        }
+        gateCv.notify_all();
+        scheduler.shutdown();
+    }
+    REQUIRE(initialBasesStarted);
+
+    REQUIRE(scheduler.hasUrgentRefinementCapacity());
+    REQUIRE(scheduler.enqueueUrgentRefinement(URGENT[0], 0));
+    REQUIRE(scheduler.enqueueUrgentRefinement(URGENT[1], 1));
+    REQUIRE(scheduler.enqueueUrgentRefinement(URGENT[2], 2));
+    REQUIRE(scheduler.enqueueUrgentRefinement(URGENT[3], 3));
+    REQUIRE_FALSE(scheduler.hasUrgentRefinementCapacity());
+    REQUIRE_FALSE(scheduler.enqueueUrgentRefinement(URGENT[4], 4));
+    REQUIRE_FALSE(scheduler.enqueueUrgentRefinement(BASES[0], 0));
+    {
+        const FarTerrainSchedulerStats queued = scheduler.stats();
+        REQUIRE(queued.urgentRefinementInFlight == FAR_TERRAIN_MAX_URGENT_REFINEMENTS_IN_FLIGHT);
+        REQUIRE(queued.queuedUrgentRefinement == FAR_TERRAIN_MAX_URGENT_REFINEMENTS_IN_FLIGHT);
+        REQUIRE(queued.queuedBase >= 2);
+        REQUIRE(queued.activeBaseWorkers == 8);
+        REQUIRE(queued.reservedBaseWorkers == 4);
+        REQUIRE(queued.activeUrgentRefinement == 0);
+        REQUIRE(queued.workerBudget == FarTerrainScheduler::WORKER_COUNT);
+    }
+
+    {
+        std::lock_guard lock(gateMutex);
+        releaseInitialBases = true;
+    }
+    gateCv.notify_all();
+
+    bool nearbyAndParentAdvancedTogether = false;
+    {
+        std::unique_lock lock(gateMutex);
+        nearbyAndParentAdvancedTogether = gateCv.wait_for(lock, std::chrono::seconds(2), [&] {
+            const bool urgentStarted =
+                std::all_of(URGENT.begin(), URGENT.begin() + 4,
+                            [&](FarTerrainKey key) { return started.contains(key.tileX); });
+            const bool nextBaseStarted =
+                started.contains(BASES[8].tileX) || started.contains(BASES[9].tileX);
+            return urgentStarted && nextBaseStarted;
+        });
+        releaseUrgent = true;
+    }
+    gateCv.notify_all();
+    REQUIRE(nearbyAndParentAdvancedTogether);
+
+    for (int attempt = 0; attempt < 500 && scheduler.stats().inFlight != 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    const FarTerrainSchedulerStats finished = scheduler.stats();
+    scheduler.shutdown();
+    REQUIRE(finished.inFlight == 0);
+    REQUIRE(finished.urgentRefinementInFlight == 0);
+    REQUIRE(finished.activeBaseWorkers == 0);
+    REQUIRE(finished.reservedBaseWorkers == 0);
+    REQUIRE(finished.activeUrgentRefinement == 0);
+    REQUIRE(std::all_of(URGENT.begin(), URGENT.begin() + 4,
+                        [&](FarTerrainKey key) { return started.contains(key.tileX); }));
+    REQUIRE(started.contains(BASES[8].tileX));
+    REQUIRE(started.contains(BASES[9].tileX));
+}
+
+TEST_CASE("Cold selected step two publishes a near step eight fallback first",
+          "[render][far-terrain][scheduler][lod][cold-start][priority][regression]") {
+    constexpr ColumnPos CAMERA{0, 0};
+    std::array<FarTerrainRefinementCacheRequest, 3> requests{{
+        {CAMERA, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO},
+        {ColumnPos{1, 0}, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO},
+        {ColumnPos{0, 1}, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO},
+    }};
+    std::vector<FarTerrainKey> order;
+    buildFarTerrainProgressiveSubmissionOrder(requests, order);
+    REQUIRE(order.size() >= FAR_TERRAIN_MAX_URGENT_REFINEMENTS_IN_FLIGHT);
+
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool stepTwoStarted = false;
+    bool releaseStepTwo = false;
+    FarTerrainSource source = farTerrainTestSource();
+    const auto sample = source.sample;
+    source.sample = [&](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
+        if (footprint == worldgen::SurfaceFootprint::BLOCK_2) {
+            std::unique_lock lock(gateMutex);
+            if (!stepTwoStarted) {
+                stepTwoStarted = true;
+                gateCv.notify_all();
+            }
+            gateCv.wait(lock, [&] { return releaseStepTwo; });
+        }
+        return sample(x, z, footprint);
+    };
+
+    FarTerrainSchedulerLimits limits;
+    limits.maxPending = 8;
+    limits.maxCompleted = 8;
+    limits.maxCacheEntries = 8;
+    limits.maxCacheBytes = 64 * 1024 * 1024;
+    FarTerrainScheduler scheduler(source, limits);
+    struct GateRelease {
+        std::mutex& mutex;
+        std::condition_variable& condition;
+        bool& release;
+        ~GateRelease() {
+            {
+                std::lock_guard lock(mutex);
+                release = true;
+            }
+            condition.notify_all();
+        }
+    } releaseOnExit{gateMutex, gateCv, releaseStepTwo};
+    for (const FarTerrainKey key :
+         std::span(order).first(FAR_TERRAIN_MAX_URGENT_REFINEMENTS_IN_FLIGHT)) {
+        REQUIRE(scheduler.enqueueUrgentRefinement(key));
+    }
+
+    {
+        std::unique_lock lock(gateMutex);
+        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(2), [&] { return stepTwoStarted; }));
+    }
+    for (int attempt = 0; attempt < 400 && scheduler.stats().completedRefinement < 3; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(scheduler.stats().completedRefinement >= 3);
+    FarTerrainRefinementCacheRequest cameraRequest{
+        CAMERA, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, 0, false, true};
+    std::vector<std::shared_ptr<const FarTerrainMesh>> cached;
+    scheduler.findFinestCachedBatch(std::span(&cameraRequest, 1), 1, cached);
+    REQUIRE(cached.empty());
+    cameraRequest.residentSteps = farTerrainStepMask(FarTerrainStep::THIRTY_TWO);
+    cameraRequest.deferIntermediate = false;
+    scheduler.findFinestCachedBatch(std::span(&cameraRequest, 1), 1, cached);
+    REQUIRE(cached.size() == 1);
+    REQUIRE(cached.front()->key.step == FarTerrainStep::EIGHT);
+
+    {
+        std::lock_guard lock(gateMutex);
+        releaseStepTwo = true;
+    }
+    gateCv.notify_all();
+    for (int attempt = 0; attempt < 400 && scheduler.stats().inFlight != 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(scheduler.stats().inFlight == 0);
+    cameraRequest.residentSteps = 0;
+    cameraRequest.deferIntermediate = true;
+    scheduler.findFinestCachedBatch(std::span(&cameraRequest, 1), 1, cached);
+    REQUIRE(cached.size() == 1);
+    REQUIRE(cached.front()->key.step == FarTerrainStep::TWO);
+    scheduler.shutdown();
+}
+
+TEST_CASE("Camera jumps reset obsolete urgent refinement quota",
+          "[render][far-terrain][scheduler][priority][camera-jump][cancellation][regression]") {
+    constexpr FarTerrainKey BLOCKING_BASE{900, 0, FarTerrainStep::THIRTY_TWO};
+    constexpr FarTerrainKey OLD_FIRST{901, 0, FarTerrainStep::TWO};
+    constexpr FarTerrainKey OLD_SECOND{902, 0, FarTerrainStep::FOUR};
+    constexpr FarTerrainKey CURRENT{903, 0, FarTerrainStep::TWO};
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool baseStarted = false;
+    bool releaseBase = false;
+    FarTerrainSource source = farTerrainTestSource();
+    const auto sample = source.sample;
+    source.sample = [&](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
+        if (x == BLOCKING_BASE.tileX * FAR_TERRAIN_TILE_EDGE && z == 0) {
+            std::unique_lock lock(gateMutex);
+            if (!baseStarted) {
+                baseStarted = true;
+                gateCv.notify_all();
+                gateCv.wait(lock, [&] { return releaseBase; });
+            }
+        }
+        return sample(x, z, footprint);
+    };
+
+    FarTerrainSchedulerLimits limits;
+    limits.maxPending = 8;
+    limits.maxCompleted = 8;
+    limits.maxCacheEntries = 8;
+    limits.maxCacheBytes = 64 * 1024 * 1024;
+    FarTerrainScheduler scheduler(source, limits);
+    struct BaseRelease {
+        std::mutex& mutex;
+        std::condition_variable& condition;
+        bool& release;
+        ~BaseRelease() {
+            {
+                std::lock_guard lock(mutex);
+                release = true;
+            }
+            condition.notify_all();
+        }
+    } releaseOnExit{gateMutex, gateCv, releaseBase};
+    scheduler.setWorkerBudget(1);
+    REQUIRE(scheduler.enqueue(BLOCKING_BASE));
+    {
+        std::unique_lock lock(gateMutex);
+        const bool started =
+            gateCv.wait_for(lock, std::chrono::seconds(2), [&] { return baseStarted; });
+        if (!started)
+            releaseBase = true;
+        REQUIRE(started);
+    }
+    REQUIRE(scheduler.enqueueUrgentRefinement(OLD_FIRST));
+    REQUIRE(scheduler.enqueueUrgentRefinement(OLD_SECOND));
+    REQUIRE(scheduler.stats().urgentRefinementInFlight == 2);
+
+    const uint64_t currentEpoch = scheduler.advanceEpoch();
+    REQUIRE(scheduler.stats().urgentRefinementInFlight == 0);
+    REQUIRE(scheduler.hasUrgentRefinementCapacity());
+    REQUIRE(scheduler.enqueueUrgentRefinement(CURRENT));
+    REQUIRE(scheduler.stats().urgentRefinementInFlight == 1);
+    {
+        std::lock_guard lock(gateMutex);
+        releaseBase = true;
+    }
+    gateCv.notify_all();
+
+    for (int attempt = 0; attempt < 500 && scheduler.stats().inFlight != 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::vector<FarTerrainResult> completed;
+    scheduler.drainCompleted(completed);
+    const FarTerrainSchedulerStats finished = scheduler.stats();
+    scheduler.shutdown();
+    REQUIRE(finished.inFlight == 0);
+    REQUIRE(finished.urgentRefinementInFlight == 0);
+    REQUIRE(finished.canceled >= 3);
+    REQUIRE(completed.size() == 1);
+    REQUIRE(completed.front().key == CURRENT);
+    REQUIRE(completed.front().epoch == currentEpoch);
+}
+
+TEST_CASE("Full horizon wanted keys fit the CPU cache across tile offsets",
+          "[render][far-terrain][coverage][residency][cache][capacity][regression]") {
+    std::vector<double> offsets{0.0, std::nextafter(0.0, 1.0), 1.0};
+    for (int offset = 8; offset < FAR_TERRAIN_TILE_EDGE; offset += 8)
+        offsets.push_back(static_cast<double>(offset));
+    offsets.push_back(static_cast<double>(FAR_TERRAIN_TILE_EDGE - 1));
+    offsets.push_back(std::nextafter(static_cast<double>(FAR_TERRAIN_TILE_EDGE), 0.0));
+
+    const size_t cacheCapacity = FarTerrainSchedulerLimits{}.maxCacheEntries;
+    size_t maximumWanted = 0;
+    double maximumCameraX = 0.0;
+    double maximumCameraZ = 0.0;
+    std::vector<FarTerrainViewTile> selected;
+    std::vector<FarTerrainKey> wanted;
+    for (const double cameraX : offsets) {
+        for (const double cameraZ : offsets) {
+            selectFarTerrainView(cameraX, cameraZ, FAR_TERRAIN_MAX_CHUNK_RADIUS, selected);
+            buildFarTerrainResidencyOrder(selected, wanted);
+            CAPTURE(cameraX, cameraZ, selected.size(), wanted.size(), cacheCapacity);
+            REQUIRE(farTerrainResidencyOrderMatches(selected, wanted));
+            if (wanted.size() > maximumWanted) {
+                maximumWanted = wanted.size();
+                maximumCameraX = cameraX;
+                maximumCameraZ = cameraZ;
+            }
+        }
+    }
+    CAPTURE(maximumCameraX, maximumCameraZ, maximumWanted, cacheCapacity);
+    constexpr size_t MINIMUM_ENTRY_MARGIN = 32;
+    REQUIRE(maximumWanted + MINIMUM_ENTRY_MARGIN <= cacheCapacity);
+    REQUIRE(maximumWanted > 9'000);
+}
+
+TEST_CASE("Cold parent uploads fit the startup envelope without consuming refinement budget",
+          "[render][far-terrain][coverage][upload][budget]") {
+    std::vector<FarTerrainViewTile> selected;
+    selectFarTerrainView(0.0, 0.0, FAR_TERRAIN_MAX_CHUNK_RADIUS, selected);
+    const size_t referenceColdBaseCount = selected.size();
+    constexpr size_t SIXTY_FPS_FRAMES_IN_TWO_SECONDS = 120;
+    const size_t parentFrames =
+        (referenceColdBaseCount + FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME - 1) /
+        FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME;
+    REQUIRE(referenceColdBaseCount > 3'000);
+    REQUIRE(parentFrames < SIXTY_FPS_FRAMES_IN_TWO_SECONDS);
+    REQUIRE(FAR_TERRAIN_MAX_REFINEMENT_UPLOADS_PER_FRAME == 12);
+    REQUIRE(FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME == 32 * 1024 * 1024);
+}
+
+TEST_CASE("Exact handoff handles large snapshots empty meshes and stale revisions",
+          "[render][far-terrain][coverage][exact][revision]") {
+    std::vector<ChunkPos> required;
+    for (int32_t y = -8; y <= -4; ++y) {
+        for (int64_t z = -32; z <= 32; ++z) {
+            for (int64_t x = -32; x <= 32; ++x) {
+                required.push_back({x, y, z});
+            }
+        }
+    }
+    REQUIRE(required.size() > 16'384);
+
+    std::unordered_set<ChunkPos> ready(required.begin(), required.end());
+    const auto isReady = [&](ChunkPos position) { return ready.contains(position); };
+    const FarTerrainExactHandoff complete =
+        farTerrainExactHandoff(0.0, 0.0, 32, required, {}, isReady);
+    REQUIRE(complete.requiredSections == required.size());
+    REQUIRE(complete.readySections == required.size());
+    REQUIRE(complete.unresolvedColumns == 0);
+    REQUIRE(complete.distanceBlocks == 32 * CHUNK_EDGE);
+
+    // Empty completed meshes own no GPU allocation, but their matching
+    // revision still closes the exact coverage requirement.
+    REQUIRE(farTerrainExactSectionReady(7, 7));
+    REQUIRE_FALSE(farTerrainExactSectionReady(6, 7));
+
+    constexpr ChunkPos STALE{4, -8, 0};
+    ready.erase(STALE);
+    const FarTerrainExactHandoff stale =
+        farTerrainExactHandoff(0.0, 0.0, 32, required, {}, isReady);
+    REQUIRE(stale.readySections + 1 == stale.requiredSections);
+    REQUIRE(stale.distanceBlocks == 4 * CHUNK_EDGE);
+
+    const std::array unresolved{ColumnPos{-3, 0}};
+    const FarTerrainExactHandoff unresolvedResult =
+        farTerrainExactHandoff(0.0, 0.0, 32, required, unresolved, isReady);
+    REQUIRE(unresolvedResult.unresolvedColumns == 1);
+    REQUIRE(unresolvedResult.distanceBlocks == 2 * CHUNK_EDGE);
+
+    size_t readinessProbes = 0;
+    FarTerrainExactCoverageCache cache;
+    cache.rebuild(73, 32, required, {}, [&](ChunkPos position) {
+        ++readinessProbes;
+        return position != STALE;
+    });
+    REQUIRE(cache.matches(73, 32));
+    REQUIRE_FALSE(cache.matches(74, 32));
+    REQUIRE(readinessProbes == required.size());
+    REQUIRE(cache.sample(0.0, 0.0).distanceBlocks == 4 * CHUNK_EDGE);
+    REQUIRE(cache.lastSampleColumnVisits() == 1);
+    REQUIRE(cache.sample(80.0, 0.0).distanceBlocks == 0.0F);
+    REQUIRE(cache.lastSampleColumnVisits() == 1);
+    REQUIRE(readinessProbes == required.size());
+
+    REQUIRE(cache.setSectionReady(STALE, true));
+    REQUIRE_FALSE(cache.setSectionReady(STALE, true));
+    REQUIRE(cache.sample(0.0, 0.0).readySections == required.size());
+    REQUIRE(cache.lastSampleColumnVisits() == 0);
+    REQUIRE(cache.sample(0.0, 0.0).distanceBlocks == 32 * CHUNK_EDGE);
+    REQUIRE(cache.setSectionReady(STALE, false));
+    REQUIRE(cache.sample(0.0, 0.0).readySections + 1 == required.size());
+    REQUIRE(cache.lastSampleColumnVisits() == 1);
+    REQUIRE(readinessProbes == required.size());
+}
+
+TEST_CASE("Far refinement stays bounded until all exact streaming lanes drain",
+          "[render][far-terrain][coverage][exact][priority][regression]") {
+    REQUIRE_FALSE(farTerrainExactStreamingBusy(0, 0, 0, 24, 24, 0));
+
+    REQUIRE(farTerrainExactStreamingBusy(1, 0, 0, 24, 24, 0));
+    REQUIRE(farTerrainExactStreamingBusy(0, 1, 0, 24, 24, 0));
+    REQUIRE(farTerrainExactStreamingBusy(0, 0, 1, 24, 24, 0));
+    REQUIRE(farTerrainExactStreamingBusy(0, 0, 0, 24, 23, 0));
+    REQUIRE(farTerrainExactStreamingBusy(0, 0, 0, 24, 24, 1));
+
+    // A duplicate publication can make an observational ready count exceed
+    // its requirement, but cannot manufacture pending exact work.
+    REQUIRE_FALSE(farTerrainExactStreamingBusy(0, 0, 0, 24, 25, 0));
+}
+
+TEST_CASE("Published exact sections retain ownership while replacement meshes build",
+          "[render][far-terrain][coverage][exact][ownership][latch][regression]") {
+    REQUIRE(farTerrainExactSectionOwnsSurface(false, 12, 12));
+    REQUIRE_FALSE(farTerrainExactSectionOwnsSurface(false, 12, 13));
+    REQUIRE(farTerrainExactSectionOwnsSurface(true, 12, 13));
+}
+
+TEST_CASE("Exact mesh registry waits when every capacity slot owns terrain",
+          "[render][coverage][exact][ownership][capacity][regression]") {
+    REQUIRE(chunkMeshRegistryCanAdmit(MAX_MESH_RESIDENT_CUBES - 1, MAX_MESH_RESIDENT_CUBES, false,
+                                      false));
+    REQUIRE(
+        chunkMeshRegistryCanAdmit(MAX_MESH_RESIDENT_CUBES, MAX_MESH_RESIDENT_CUBES, true, false));
+    REQUIRE(
+        chunkMeshRegistryCanAdmit(MAX_MESH_RESIDENT_CUBES, MAX_MESH_RESIDENT_CUBES, false, true));
+    REQUIRE_FALSE(
+        chunkMeshRegistryCanAdmit(MAX_MESH_RESIDENT_CUBES, MAX_MESH_RESIDENT_CUBES, false, false));
+    REQUIRE_FALSE(chunkMeshRegistryCanAdmit(MAX_MESH_RESIDENT_CUBES + 1, MAX_MESH_RESIDENT_CUBES,
+                                            false, true));
+}
+
+TEST_CASE("One unresolved exact section preserves refinement in every ready column",
+          "[render][far-terrain][coverage][exact][ownership][column][regression]") {
+    std::vector<ChunkPos> required;
+    required.reserve(16 * 16);
+    for (int64_t z = 0; z < 16; ++z) {
+        for (int64_t x = 0; x < 16; ++x)
+            required.push_back({x, 4, z});
+    }
+    constexpr ChunkPos UNRESOLVED{7, 4, 9};
+    const FarTerrainExactHandoff handoff =
+        farTerrainExactHandoff(128.0, 128.0, 32, required, {},
+                               [UNRESOLVED](ChunkPos section) { return section != UNRESOLVED; });
+
+    REQUIRE_FALSE(handoff.tileFullyReady({0, 0}));
+    size_t exactOwnedColumns = 0;
+    for (int64_t z = 0; z < 16; ++z) {
+        for (int64_t x = 0; x < 16; ++x) {
+            const bool ready = handoff.columnFullyReady({x, z});
+            CAPTURE(x, z);
+            REQUIRE(ready == (ChunkPos{x, 4, z} != UNRESOLVED));
+            exactOwnedColumns += ready ? 1 : 0;
+        }
+    }
+    REQUIRE(exactOwnedColumns == 255);
+}
+
+TEST_CASE("Active far LOD transitions complete before selecting another target",
+          "[render][far-terrain][lod][transition][monotonic][regression]") {
+    const FarTerrainLodAdvance started =
+        advanceFarTerrainLod(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO);
+    REQUIRE(started.displayed == FarTerrainStep::THIRTY_TWO);
+    REQUIRE(started.transitionTarget == FarTerrainStep::TWO);
+    REQUIRE_FALSE(started.completedTransition);
+
+    const FarTerrainLodAdvance redirected =
+        advanceFarTerrainLod(started.displayed, FarTerrainStep::FOUR, started.transitionTarget,
+                             FAR_TERRAIN_LOD_TRANSITION_SECONDS * 0.75F);
+    REQUIRE(redirected.displayed == FarTerrainStep::THIRTY_TWO);
+    REQUIRE(redirected.transitionTarget == FarTerrainStep::TWO);
+    REQUIRE_FALSE(redirected.completedTransition);
+
+    const FarTerrainLodAdvance completed =
+        advanceFarTerrainLod(redirected.displayed, FarTerrainStep::FOUR,
+                             redirected.transitionTarget, FAR_TERRAIN_LOD_TRANSITION_SECONDS);
+    REQUIRE(completed.displayed == FarTerrainStep::TWO);
+    REQUIRE_FALSE(completed.transitionTarget.has_value());
+    REQUIRE(completed.completedTransition);
+
+    const FarTerrainLodAdvance next =
+        advanceFarTerrainLod(completed.displayed, FarTerrainStep::FOUR);
+    REQUIRE(next.displayed == FarTerrainStep::TWO);
+    REQUIRE(next.transitionTarget == FarTerrainStep::FOUR);
+}
+
+TEST_CASE("Nearby far fallback chooses its finest ready tier without regressing",
+          "[render][far-terrain][lod][residency][exact][priority][regression]") {
+    FarTerrainStepMask ready = farTerrainStepMask(FarTerrainStep::THIRTY_TWO);
+    REQUIRE(farTerrainFinestReadyStep(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, ready) ==
+            FarTerrainStep::THIRTY_TWO);
+
+    ready |= farTerrainStepMask(FarTerrainStep::SIXTEEN);
+    REQUIRE(farTerrainFinestReadyStep(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, ready) ==
+            FarTerrainStep::SIXTEEN);
+    REQUIRE_FALSE(farTerrainReadyTransitionTarget(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO,
+                                                  ready, true));
+    REQUIRE(farTerrainReadyTransitionTarget(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, ready,
+                                            false) == FarTerrainStep::SIXTEEN);
+    ready |= farTerrainStepMask(FarTerrainStep::FOUR);
+    REQUIRE(farTerrainFinestReadyStep(FarTerrainStep::SIXTEEN, FarTerrainStep::TWO, ready) ==
+            FarTerrainStep::FOUR);
+    ready |= farTerrainStepMask(FarTerrainStep::TWO);
+    REQUIRE(farTerrainFinestReadyStep(FarTerrainStep::FOUR, FarTerrainStep::TWO, ready) ==
+            FarTerrainStep::TWO);
+
+    // A step-16 replacement can finish while finer CPU work completes. The
+    // active pair remains stable, then the next replacement skips directly
+    // to the finest ready tier without serially dwelling at steps 8 and 4.
+    ready |= farTerrainStepMask(FarTerrainStep::EIGHT);
+    REQUIRE_FALSE(farTerrainReadyTransitionTarget(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO,
+                                                  ready, true));
+    REQUIRE(farTerrainReadyTransitionTarget(FarTerrainStep::SIXTEEN, FarTerrainStep::TWO, ready,
+                                            false) == FarTerrainStep::TWO);
+
+    // A transient cache observation cannot make an already displayed nearby
+    // refinement fall back to an emergency parent.
+    ready = farTerrainStepMask(FarTerrainStep::THIRTY_TWO) |
+            farTerrainStepMask(FarTerrainStep::SIXTEEN);
+    REQUIRE(farTerrainFinestReadyStep(FarTerrainStep::TWO, FarTerrainStep::TWO, ready) ==
+            FarTerrainStep::TWO);
+
+    // Distance-selected coarsening remains intentional and requires the
+    // requested replacement to be resident.
+    REQUIRE(farTerrainFinestReadyStep(FarTerrainStep::TWO, FarTerrainStep::EIGHT, ready) ==
+            FarTerrainStep::TWO);
+    ready |= farTerrainStepMask(FarTerrainStep::EIGHT);
+    REQUIRE(farTerrainFinestReadyStep(FarTerrainStep::TWO, FarTerrainStep::EIGHT, ready) ==
+            FarTerrainStep::EIGHT);
+}
+
+TEST_CASE("Resident nearby refinement initializes without displaying its coarse parent",
+          "[render][far-terrain][lod][residency][camera-jump][flicker][regression]") {
+    FarTerrainStepMask ready = farTerrainStepMask(FarTerrainStep::TWO);
+    REQUIRE_FALSE(farTerrainInitialDisplayedStep(FarTerrainStep::TWO, ready));
+
+    ready |= farTerrainStepMask(FarTerrainStep::THIRTY_TWO);
+    REQUIRE(farTerrainInitialDisplayedStep(FarTerrainStep::TWO, ready) == FarTerrainStep::TWO);
+
+    ready = farTerrainStepMask(FarTerrainStep::THIRTY_TWO) |
+            farTerrainStepMask(FarTerrainStep::SIXTEEN) | farTerrainStepMask(FarTerrainStep::FOUR);
+    REQUIRE(farTerrainInitialDisplayedStep(FarTerrainStep::TWO, ready) == FarTerrainStep::FOUR);
+
+    ready = farTerrainStepMask(FarTerrainStep::THIRTY_TWO);
+    REQUIRE(farTerrainInitialDisplayedStep(FarTerrainStep::TWO, ready) ==
+            FarTerrainStep::THIRTY_TWO);
+
+    REQUIRE_FALSE(
+        farTerrainInitialDisplayedStep(FarTerrainStep::TWO, ready, FarTerrainStep::EIGHT));
+    ready |= farTerrainStepMask(FarTerrainStep::SIXTEEN);
+    REQUIRE_FALSE(
+        farTerrainInitialDisplayedStep(FarTerrainStep::TWO, ready, FarTerrainStep::EIGHT));
+    ready |= farTerrainStepMask(FarTerrainStep::EIGHT);
+    REQUIRE(farTerrainInitialDisplayedStep(FarTerrainStep::TWO, ready, FarTerrainStep::EIGHT) ==
+            FarTerrainStep::EIGHT);
+    REQUIRE_FALSE(
+        farTerrainDisplayedStepAllowed(FarTerrainStep::THIRTY_TWO, FarTerrainStep::EIGHT));
+    REQUIRE_FALSE(farTerrainDisplayedStepAllowed(FarTerrainStep::SIXTEEN, FarTerrainStep::EIGHT));
+    REQUIRE(farTerrainDisplayedStepAllowed(FarTerrainStep::EIGHT, FarTerrainStep::EIGHT));
+    REQUIRE_FALSE(farTerrainDisplayedStepAllowed(FarTerrainStep::EIGHT, FarTerrainStep::TWO));
+    REQUIRE(farTerrainDisplayedStepAllowed(FarTerrainStep::THIRTY_TWO, FarTerrainStep::THIRTY_TWO));
+
+    ready |= farTerrainStepMask(FarTerrainStep::TWO);
+    REQUIRE(farTerrainInitialDisplayedStep(FarTerrainStep::TWO, ready, FarTerrainStep::TWO) ==
+            FarTerrainStep::TWO);
+}
+
+TEST_CASE("Every unresolved exact-loading tile receives a fine temporary LOD",
+          "[render][far-terrain][coverage][lod][priority][exact][regression]") {
+    constexpr size_t PROTECTED_TILE_COUNT = 24;
+    constexpr size_t BLOCK_SCALE_TILE_COUNT = 4;
+    std::array<FarTerrainRefinementCacheRequest, PROTECTED_TILE_COUNT> requests{};
+    for (size_t index = 0; index < requests.size(); ++index) {
+        requests[index] = {{static_cast<int64_t>(index), 0},
+                           FarTerrainStep::THIRTY_TWO,
+                           FarTerrainStep::TWO,
+                           0,
+                           false,
+                           false,
+                           true,
+                           index < BLOCK_SCALE_TILE_COUNT};
+    }
+    std::vector<FarTerrainKey> order;
+    buildFarTerrainProgressiveSubmissionOrder(requests, order);
+
+    REQUIRE(order.size() >= PROTECTED_TILE_COUNT);
+    for (size_t index = 0; index < PROTECTED_TILE_COUNT; ++index) {
+        CAPTURE(index, static_cast<int>(order[index].step));
+        REQUIRE(order[index].tileX == static_cast<int64_t>(index));
+        REQUIRE(order[index].step ==
+                (index < BLOCK_SCALE_TILE_COUNT ? FarTerrainStep::TWO : FarTerrainStep::EIGHT));
+    }
+
+    auto transitionLimited = requests;
+    REQUIRE(reserveFarTerrainIntermediateTransitionSlots(
+                transitionLimited, FAR_TERRAIN_MAX_SIMULTANEOUS_LOD_TRANSITIONS) == 0);
+    REQUIRE(std::ranges::none_of(transitionLimited,
+                                 [](const auto& request) { return request.deferIntermediate; }));
+
+    std::vector<FarTerrainViewTile> selected{
+        {{0, 0, FarTerrainStep::TWO}, {}, 0.0, 32.0},
+        {{1, 0, FarTerrainStep::TWO}, {}, 256.0 * 256.0, 32.0},
+        {{2, 0, FarTerrainStep::TWO}, {}, 512.0 * 512.0, 32.0},
+    };
+    std::unordered_set<FarTerrainKey, FarTerrainKeyHash> resident;
+    for (const FarTerrainViewTile& tile : selected) {
+        resident.insert({tile.key.tileX, tile.key.tileZ, FarTerrainStep::THIRTY_TWO});
+    }
+    const auto drawable = [&](FarTerrainKey base) {
+        if (!resident.contains(base))
+            return false;
+        if (base.tileX != 0)
+            return true;
+        return resident.contains({base.tileX, base.tileZ, FarTerrainStep::TWO});
+    };
+    FarTerrainCoverageFrontier frontier = farTerrainCoverageFrontier(selected, drawable);
+    REQUIRE(frontier.missingBaseTiles == 1);
+    REQUIRE_FALSE(farTerrainCoverageDrawEligible(selected[1].distanceSquared, frontier));
+    resident.insert({0, 0, FarTerrainStep::TWO});
+    frontier = farTerrainCoverageFrontier(selected, drawable);
+    REQUIRE(frontier.complete);
+}
+
+TEST_CASE("Cold nearby parents coalesce refinements for a bounded interval",
+          "[render][far-terrain][lod][residency][priority][cold-start][camera-jump][regression]") {
+    REQUIRE(FAR_TERRAIN_NEAR_REFINEMENT_GRACE_SECONDS <= 0.12F);
+    REQUIRE(FAR_TERRAIN_NEAR_REFINEMENT_GRACE_SECONDS < FAR_TERRAIN_LOD_TRANSITION_SECONDS);
+    REQUIRE(farTerrainDeferNearIntermediate(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO,
+                                            FarTerrainStep::SIXTEEN, 0.0F));
+    REQUIRE(farTerrainDeferNearIntermediate(
+        FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, FarTerrainStep::FOUR,
+        std::nextafter(FAR_TERRAIN_NEAR_REFINEMENT_GRACE_SECONDS, 0.0F)));
+    REQUIRE_FALSE(farTerrainDeferNearIntermediate(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO,
+                                                  FarTerrainStep::SIXTEEN,
+                                                  FAR_TERRAIN_NEAR_REFINEMENT_GRACE_SECONDS));
+
+    // The final requested tier bypasses the grace, and a tile that has
+    // already refined never regresses to a coarser placeholder after travel.
+    REQUIRE_FALSE(farTerrainDeferNearIntermediate(FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO,
+                                                  FarTerrainStep::TWO, 0.0F));
+    REQUIRE_FALSE(farTerrainDeferNearIntermediate(FarTerrainStep::SIXTEEN, FarTerrainStep::TWO,
+                                                  FarTerrainStep::FOUR, 0.0F));
+    REQUIRE_FALSE(farTerrainDeferNearIntermediate(FarTerrainStep::THIRTY_TWO, FarTerrainStep::FOUR,
+                                                  FarTerrainStep::SIXTEEN, 0.0F));
+}
+
+TEST_CASE("Far trees exchange monotonically through exact and LOD transitions",
+          "[render][far-terrain][canopy][lod][transition][ownership][flicker][regression]") {
+    constexpr unsigned int SOURCE = FAR_TERRAIN_DRAW_FLAG | FAR_TERRAIN_LOD_TRANSITION_FLAG;
+    constexpr unsigned int TARGET = SOURCE | FAR_TERRAIN_LOD_TARGET_FLAG;
+    for (const float threshold : {0.1F, 0.33F, 0.67F, 0.9F}) {
+        bool sourcePreviouslyVisible = true;
+        bool targetPreviouslyVisible = false;
+        size_t sourceChanges = 0;
+        size_t targetChanges = 0;
+        for (int tick = 0; tick <= 100; ++tick) {
+            const float elapsed =
+                FAR_TERRAIN_LOD_TRANSITION_SECONDS * static_cast<float>(tick) / 100.0F;
+            const float progress = sampleFarTerrainTransition(elapsed).progress;
+            const bool sourceVisible = farTerrainLodCanopyVisible(progress, threshold, SOURCE);
+            const bool targetVisible = farTerrainLodCanopyVisible(progress, threshold, TARGET);
+            CAPTURE(threshold, tick, progress, sourceVisible, targetVisible);
+            REQUIRE((sourceVisible || targetVisible));
+            REQUIRE_FALSE((!sourcePreviouslyVisible && sourceVisible));
+            REQUIRE_FALSE((targetPreviouslyVisible && !targetVisible));
+            sourceChanges += sourceVisible != sourcePreviouslyVisible ? 1 : 0;
+            targetChanges += targetVisible != targetPreviouslyVisible ? 1 : 0;
+            sourcePreviouslyVisible = sourceVisible;
+            targetPreviouslyVisible = targetVisible;
+        }
+        REQUIRE(sourceChanges == 1);
+        REQUIRE(targetChanges == 1);
+        REQUIRE_FALSE(farTerrainLodCanopyVisible(1.0F, threshold, SOURCE));
+        REQUIRE(farTerrainLodCanopyVisible(1.0F, threshold, TARGET));
+        REQUIRE(farTerrainLodCanopyVisible(0.5F, threshold, SOURCE));
+        REQUIRE(farTerrainLodCanopyVisible(0.5F, threshold, TARGET));
+    }
+
+    // The nearby step-32 emergency parent swaps its terrain earlier, but its
+    // canopy still uses the same overlap contract for the full transition.
+    constexpr unsigned int EMERGENCY_SOURCE = SOURCE | FAR_TERRAIN_LOD_EMERGENCY_FLAG;
+    constexpr unsigned int EMERGENCY_TARGET = TARGET | FAR_TERRAIN_LOD_EMERGENCY_FLAG;
+    for (const float threshold : {0.05F, 0.25F, 0.5F, 0.75F, 0.95F}) {
+        bool sourceVisibleLast = true;
+        bool targetVisibleLast = false;
+        for (int tick = 0; tick <= 100; ++tick) {
+            const float progress = sampleFarTerrainTransition(FAR_TERRAIN_LOD_TRANSITION_SECONDS *
+                                                              static_cast<float>(tick) / 100.0F)
+                                       .progress;
+            const bool sourceVisible =
+                farTerrainLodCanopyVisible(progress, threshold, EMERGENCY_SOURCE);
+            const bool targetVisible =
+                farTerrainLodCanopyVisible(progress, threshold, EMERGENCY_TARGET);
+            CAPTURE(threshold, tick, progress, sourceVisible, targetVisible);
+            REQUIRE((sourceVisible || targetVisible));
+            REQUIRE_FALSE((!sourceVisibleLast && sourceVisible));
+            REQUIRE_FALSE((targetVisibleLast && !targetVisible));
+            sourceVisibleLast = sourceVisible;
+            targetVisibleLast = targetVisible;
+        }
+    }
+
+    bool exactOwned = false;
+    bool previouslyExactOwned = false;
+    for (const auto [built, current] :
+         {std::pair{4U, 5U}, std::pair{5U, 5U}, std::pair{5U, 6U}, std::pair{6U, 7U}}) {
+        exactOwned = farTerrainExactSectionOwnsSurface(exactOwned, built, current);
+        const bool farOwned = !exactOwned;
+        CAPTURE(built, current, exactOwned, farOwned);
+        REQUIRE(exactOwned != farOwned);
+        REQUIRE(static_cast<unsigned int>(exactOwned) + static_cast<unsigned int>(farOwned) == 1U);
+        REQUIRE_FALSE((previouslyExactOwned && !exactOwned));
+        if (built == current)
+            REQUIRE(exactOwned);
+        previouslyExactOwned = exactOwned;
+    }
+    REQUIRE(exactOwned);
+}
+
+TEST_CASE("Far ownership requires every exact surface section in a column",
+          "[render][far-terrain][coverage][exact][ownership][revision]") {
+    constexpr std::array required{
+        ChunkPos{0, 3, 0},   ChunkPos{0, 4, 0},   ChunkPos{1, 3, 0},     ChunkPos{1, 4, 0},
+        ChunkPos{15, 3, 15}, ChunkPos{-1, 3, -1}, ChunkPos{-16, 3, -16}, ChunkPos{-17, 3, -17},
+    };
+    std::unordered_set<ChunkPos> ready(required.begin(), required.end());
+    ready.erase(ChunkPos{1, 4, 0});
+    constexpr std::array unresolved{ColumnPos{15, 15}};
+    const FarTerrainExactHandoff handoff =
+        farTerrainExactHandoff(0.0, 0.0, 32, required, unresolved,
+                               [&](ChunkPos position) { return ready.contains(position); });
+
+    REQUIRE(handoff.columnFullyReady({0, 0}));
+    REQUIRE_FALSE(handoff.columnFullyReady({1, 0}));
+    REQUIRE_FALSE(handoff.columnFullyReady({15, 15}));
+    REQUIRE(handoff.columnFullyReady({-1, -1}));
+    REQUIRE(handoff.columnFullyReady({-16, -16}));
+    REQUIRE(handoff.columnFullyReady({-17, -17}));
+
+    const FarTerrainExactHandoff::ColumnMask positive = handoff.readyColumnMask({0, 0});
+    REQUIRE((positive[0] & 1U) != 0U);
+    REQUIRE((positive[0] & (1U << 1U)) == 0U);
+    REQUIRE((positive[7] & (1U << 31U)) == 0U);
+
+    // Floor division maps negative boundaries to the same far tile and mask
+    // bit used by generation, streaming, and the fragment lookup.
+    const FarTerrainExactHandoff::ColumnMask negativeOne = handoff.readyColumnMask({-1, -1});
+    REQUIRE((negativeOne[7] & (1U << 31U)) != 0U);
+    REQUIRE((negativeOne[0] & 1U) != 0U);
+    const FarTerrainExactHandoff::ColumnMask negativeTwo = handoff.readyColumnMask({-2, -2});
+    REQUIRE((negativeTwo[7] & (1U << 31U)) != 0U);
+}
+
+TEST_CASE("Submerged exact columns retain their parent until floor and water are ready",
+          "[render][far-terrain][coverage][exact][ownership][water][floor][regression]") {
+    // Keep the fixture pinned to a genuinely deep generated-water column so
+    // the test exercises independent floor and water readiness.
+    constexpr int64_t WORLD_X = -8'348;
+    constexpr int64_t WORLD_Z = 2'281;
+    const ColumnPos column{Chunk::worldToChunk(WORLD_X), Chunk::worldToChunk(WORLD_Z)};
     ChunkGenerator generator(42);
-    constexpr int64_t WORLD_X = 16;
-    constexpr int64_t WORLD_Z = 84;
-    const worldgen::SurfaceSample provisional = generator.sampleSurface(WORLD_X, WORLD_Z);
+    const auto plan = generator.getColumnPlan(column);
+    const int localX = Chunk::worldToLocal(WORLD_X);
+    const int localZ = Chunk::worldToLocal(WORLD_Z);
+    const int32_t floorSection = Chunk::worldToChunkY(plan->surfaceY(localX, localZ));
+    const worldgen::SurfaceSample surface = generator.sampleSurface(WORLD_X, WORLD_Z);
+    REQUIRE((surface.hydrology.ocean || surface.hydrology.river || surface.hydrology.lake));
+    const int32_t waterSection =
+        Chunk::worldToChunkY(static_cast<int>(std::ceil(surface.waterSurface)) - 1);
+    REQUIRE(waterSection > floorSection);
+    REQUIRE(plan->exposesSection(floorSection));
+    REQUIRE(plan->exposesSection(waterSection));
+
+    std::vector<ChunkPos> required;
+    required.reserve(plan->exposedSections().size());
+    for (const int32_t section : plan->exposedSections()) {
+        required.push_back({column.x, section, column.z});
+    }
+    const auto handoffWithMissing = [&](int32_t missingSection) {
+        return farTerrainExactHandoff(
+            static_cast<double>(WORLD_X), static_cast<double>(WORLD_Z), 32, required, {},
+            [&](ChunkPos position) { return position.y != missingSection; });
+    };
+    REQUIRE_FALSE(handoffWithMissing(floorSection).columnFullyReady(column));
+    REQUIRE_FALSE(handoffWithMissing(waterSection).columnFullyReady(column));
+    REQUIRE(farTerrainExactHandoff(static_cast<double>(WORLD_X), static_cast<double>(WORLD_Z), 32,
+                                   required, {}, [](ChunkPos) { return true; })
+                .columnFullyReady(column));
+}
+
+TEST_CASE("Exact and far ownership select one surface per ready column",
+          "[render][far-terrain][coverage][exact][ownership]") {
+    std::vector<ChunkPos> required;
+    required.reserve(16 * 16 * 2);
+    for (int64_t z = 0; z < 16; ++z) {
+        for (int64_t x = 0; x < 16; ++x) {
+            required.push_back({x, 3, z});
+            required.push_back({x, 4, z});
+        }
+    }
+    const FarTerrainExactHandoff handoff =
+        farTerrainExactHandoff(128.0, 128.0, 32, required, {}, [](ChunkPos) { return true; });
+    for (int64_t z = 0; z < 16; ++z) {
+        for (int64_t x = 0; x < 16; ++x) {
+            const bool exactOwner = handoff.columnFullyReady({x, z});
+            const bool farOwner = !exactOwner;
+            CAPTURE(x, z);
+            REQUIRE(exactOwner);
+            REQUIRE(exactOwner != farOwner);
+        }
+    }
+}
+
+TEST_CASE("The ready camera column masks every far LOD underfoot",
+          "[render][far-terrain][coverage][exact][ownership][camera][lod][regression]") {
+    constexpr double CAMERA_X = -198.692;
+    constexpr double CAMERA_Z = 63.7348;
+    constexpr ColumnPos CAMERA_COLUMN{-13, 3};
+    constexpr ColumnPos CAMERA_TILE{-1, 0};
+    constexpr std::array REQUIRED{
+        ChunkPos{CAMERA_COLUMN.x, 4, CAMERA_COLUMN.z},
+        ChunkPos{CAMERA_COLUMN.x, 5, CAMERA_COLUMN.z},
+        ChunkPos{CAMERA_COLUMN.x + 1, 4, CAMERA_COLUMN.z},
+    };
+    const FarTerrainExactHandoff handoff =
+        farTerrainExactHandoff(CAMERA_X, CAMERA_Z, 32, REQUIRED, {}, [](ChunkPos) { return true; });
+    REQUIRE(handoff.columnFullyReady(CAMERA_COLUMN));
+
+    const FarTerrainExactHandoff::ColumnMask mask = handoff.readyColumnMask(CAMERA_TILE);
+    constexpr uint32_t LOCAL_X = 3;
+    constexpr uint32_t LOCAL_Z = 3;
+    constexpr uint32_t BIT = LOCAL_Z * FAR_TERRAIN_EXACT_COLUMNS_PER_TILE + LOCAL_X;
+    REQUIRE((mask[BIT / FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD] &
+             (1U << (BIT % FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD))) != 0U);
+
+    // Match the shader's half-open lookup at the camera's horizontal sample.
+    // Every far tier shares this ownership mask, so step 32 cannot overwrite
+    // a published exact surface in the chunk the player occupies.
+    const float localX = static_cast<float>(CAMERA_X - CAMERA_TILE.x * FAR_TERRAIN_TILE_EDGE);
+    const float localZ = static_cast<float>(CAMERA_Z - CAMERA_TILE.z * FAR_TERRAIN_TILE_EDGE);
+    const uint32_t sampledColumnX = static_cast<uint32_t>(std::floor(localX / CHUNK_EDGE));
+    const uint32_t sampledColumnZ = static_cast<uint32_t>(std::floor(localZ / CHUNK_EDGE));
+    REQUIRE(sampledColumnX == LOCAL_X);
+    REQUIRE(sampledColumnZ == LOCAL_Z);
+    const bool farTierVisibleAtCamera = !handoff.columnFullyReady(CAMERA_COLUMN);
+    REQUIRE_FALSE(farTierVisibleAtCamera);
+}
+
+TEST_CASE("Far terrain risers query exact ownership from their emitting column",
+          "[render][far-terrain][coverage][exact][ownership][riser][shader-contract][regression]") {
+    STATIC_REQUIRE(static_cast<uint8_t>(FaceNormal::PLUS_X) == FAR_TERRAIN_FACE_PLUS_X);
+    STATIC_REQUIRE(static_cast<uint8_t>(FaceNormal::MINUS_X) == FAR_TERRAIN_FACE_MINUS_X);
+    STATIC_REQUIRE(static_cast<uint8_t>(FaceNormal::PLUS_Z) == FAR_TERRAIN_FACE_PLUS_Z);
+    STATIC_REQUIRE(static_cast<uint8_t>(FaceNormal::MINUS_Z) == FAR_TERRAIN_FACE_MINUS_Z);
+
+    struct OwnershipCell {
+        int tileX;
+        int tileZ;
+        int columnX;
+        int columnZ;
+
+        bool operator==(const OwnershipCell&) const = default;
+    };
+    const auto lookup = [](simd_float2 position) {
+        const int tileX = static_cast<int>(
+            std::floor(position.x / static_cast<float>(FAR_TERRAIN_TILE_EDGE_BLOCKS)));
+        const int tileZ = static_cast<int>(
+            std::floor(position.y / static_cast<float>(FAR_TERRAIN_TILE_EDGE_BLOCKS)));
+        const float tileLocalX =
+            position.x - static_cast<float>(tileX) * FAR_TERRAIN_TILE_EDGE_BLOCKS;
+        const float tileLocalZ =
+            position.y - static_cast<float>(tileZ) * FAR_TERRAIN_TILE_EDGE_BLOCKS;
+        return OwnershipCell{
+            tileX,
+            tileZ,
+            std::clamp(
+                static_cast<int>(std::floor(tileLocalX / FAR_TERRAIN_EXACT_COLUMN_EDGE_BLOCKS)), 0,
+                FAR_TERRAIN_EXACT_COLUMNS_PER_TILE - 1),
+            std::clamp(
+                static_cast<int>(std::floor(tileLocalZ / FAR_TERRAIN_EXACT_COLUMN_EDGE_BLOCKS)), 0,
+                FAR_TERRAIN_EXACT_COLUMNS_PER_TILE - 1),
+        };
+    };
+    struct Fixture {
+        FaceNormal face;
+        simd_float2 position;
+        OwnershipCell emittingCell;
+        OwnershipCell halfOpenCell;
+    };
+    const std::array fixtures = {
+        Fixture{FaceNormal::PLUS_X, simd_make_float2(16.0F, 8.0F), {0, 0, 0, 0}, {0, 0, 1, 0}},
+        Fixture{FaceNormal::MINUS_X, simd_make_float2(16.0F, 8.0F), {0, 0, 1, 0}, {0, 0, 1, 0}},
+        Fixture{FaceNormal::PLUS_X, simd_make_float2(256.0F, 8.0F), {0, 0, 15, 0}, {1, 0, 0, 0}},
+        Fixture{FaceNormal::MINUS_X, simd_make_float2(256.0F, 8.0F), {1, 0, 0, 0}, {1, 0, 0, 0}},
+        Fixture{FaceNormal::PLUS_Z, simd_make_float2(8.0F, 16.0F), {0, 0, 0, 0}, {0, 0, 0, 1}},
+        Fixture{FaceNormal::MINUS_Z, simd_make_float2(8.0F, 16.0F), {0, 0, 0, 1}, {0, 0, 0, 1}},
+        Fixture{FaceNormal::PLUS_Z, simd_make_float2(8.0F, 256.0F), {0, 0, 0, 15}, {0, 1, 0, 0}},
+        Fixture{FaceNormal::MINUS_Z, simd_make_float2(8.0F, 256.0F), {0, 1, 0, 0}, {0, 1, 0, 0}},
+    };
+
+    for (const Fixture& fixture : fixtures) {
+        const unsigned int face = static_cast<unsigned int>(fixture.face);
+        CAPTURE(face, fixture.position.x, fixture.position.y);
+        REQUIRE(farTerrainOpaqueRiserUsesEmittingColumn(face, false, false));
+        const simd_float2 emittingSample =
+            farTerrainExactOwnershipSamplePosition(fixture.position, face, true);
+        REQUIRE(lookup(emittingSample) == fixture.emittingCell);
+
+        // Tops and water pass false directly. Canopies and skirts are excluded
+        // by the shared classifier, so all four retain half-open destination
+        // ownership at chunk and tile boundaries.
+        const simd_float2 halfOpenSample =
+            farTerrainExactOwnershipSamplePosition(fixture.position, face, false);
+        REQUIRE(halfOpenSample.x == fixture.position.x);
+        REQUIRE(halfOpenSample.y == fixture.position.y);
+        REQUIRE(lookup(halfOpenSample) == fixture.halfOpenCell);
+        REQUIRE_FALSE(farTerrainOpaqueRiserUsesEmittingColumn(face, true, false));
+        REQUIRE_FALSE(farTerrainOpaqueRiserUsesEmittingColumn(face, false, true));
+    }
+
+    constexpr unsigned int TOP_FACE = static_cast<unsigned int>(FaceNormal::PLUS_Y);
+    REQUIRE_FALSE(farTerrainOpaqueRiserUsesEmittingColumn(TOP_FACE, false, false));
+    const simd_float2 topPosition = simd_make_float2(16.0F, 256.0F);
+    const simd_float2 topSample = farTerrainExactOwnershipSamplePosition(
+        topPosition, TOP_FACE, farTerrainOpaqueRiserUsesEmittingColumn(TOP_FACE, false, false));
+    REQUIRE(topSample.x == topPosition.x);
+    REQUIRE(topSample.y == topPosition.y);
+}
+
+TEST_CASE("Seed 764891 coarse protrusions are hidden by exact column ownership",
+          "[render][far-terrain][coverage][exact][ownership][regression]") {
+    constexpr FarTerrainKey KEY{91, -437, FarTerrainStep::SIXTEEN};
+    constexpr int64_t TILE_ORIGIN_X = KEY.tileX * FAR_TERRAIN_TILE_EDGE;
+    constexpr int64_t TILE_ORIGIN_Z = KEY.tileZ * FAR_TERRAIN_TILE_EDGE;
+    auto generator = std::make_shared<ChunkGenerator>(764891);
+    const FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    std::array<float, 17 * 17> heights{};
+    for (int sampleZ = 0; sampleZ <= 16; ++sampleZ) {
+        for (int sampleX = 0; sampleX <= 16; ++sampleX) {
+            const FarSurfaceSample sample =
+                source.sample(TILE_ORIGIN_X + sampleX * 16, TILE_ORIGIN_Z + sampleZ * 16,
+                              worldgen::SurfaceFootprint::BLOCK_16);
+            heights[static_cast<size_t>(sampleZ * 17 + sampleX)] =
+                static_cast<float>(static_cast<float16_t>(sample.footprintMinimumTerrainHeight));
+        }
+    }
+
+    std::vector<ChunkPos> required;
+    required.reserve(16 * 16);
+    for (int64_t z = 0; z < 16; ++z) {
+        for (int64_t x = 0; x < 16; ++x) {
+            required.push_back({KEY.tileX * 16 + x, 14, KEY.tileZ * 16 + z});
+        }
+    }
+    const FarTerrainExactHandoff handoff = farTerrainExactHandoff(
+        23'029.0, -111'726.0, 32, required, {}, [](ChunkPos) { return true; });
+
+    size_t rawProtrusions = 0;
+    size_t visibleProtrusions = 0;
+    for (int cellZ = 0; cellZ < 16; ++cellZ) {
+        for (int cellX = 0; cellX < 16; ++cellX) {
+            const float northwest = heights[static_cast<size_t>(cellZ * 17 + cellX)];
+            const float northeast = heights[static_cast<size_t>(cellZ * 17 + cellX + 1)];
+            const float southwest = heights[static_cast<size_t>((cellZ + 1) * 17 + cellX)];
+            const float southeast = heights[static_cast<size_t>((cellZ + 1) * 17 + cellX + 1)];
+            const ColumnPos chunkColumn{KEY.tileX * 16 + cellX, KEY.tileZ * 16 + cellZ};
+            for (int blockZ = 0; blockZ < 16; ++blockZ) {
+                for (int blockX = 0; blockX < 16; ++blockX) {
+                    const float u = (static_cast<float>(blockX) + 0.5F) / 16.0F;
+                    const float v = (static_cast<float>(blockZ) + 0.5F) / 16.0F;
+                    const float coarse =
+                        u <= v
+                            ? northwest + v * (southwest - northwest) + u * (southeast - southwest)
+                            : northwest + u * (northeast - northwest) + v * (southeast - northeast);
+                    const int64_t worldX = TILE_ORIGIN_X + cellX * 16 + blockX;
+                    const int64_t worldZ = TILE_ORIGIN_Z + cellZ * 16 + blockZ;
+                    const double exact =
+                        generator->sampleExactSurface(worldX, worldZ).terrainHeight;
+                    if (coarse <= exact + 1.0e-5)
+                        continue;
+                    ++rawProtrusions;
+                    if (!handoff.columnFullyReady(chunkColumn))
+                        ++visibleProtrusions;
+                }
+            }
+        }
+    }
+    INFO("raw coarse protrusions " << rawProtrusions);
+    REQUIRE(visibleProtrusions == 0);
+}
+
+TEST_CASE("Far terrain exact handoff uses unresolved column AABBs",
+          "[render][far-terrain][coverage][exact]") {
+    REQUIRE(farTerrainColumnDistanceSquared(8.0, 8.0, {0, 0}) == 0.0);
+    REQUIRE(farTerrainColumnDistanceSquared(-1.0, -1.0, {0, 0}) == Catch::Approx(2.0));
+    REQUIRE(farTerrainColumnDistanceSquared(40.0, 8.0, {1, 0}) == Catch::Approx(64.0));
+    REQUIRE(farTerrainColumnDistanceSquared(-40.0, -8.0, {-2, -1}) == Catch::Approx(64.0));
+}
+
+TEST_CASE("Ready exact tiles retain ownership when another tile is stale",
+          "[render][far-terrain][coverage][exact][flicker][regression]") {
+    constexpr std::array required = {
+        ChunkPos{0, 4, 0},  ChunkPos{1, 4, 0},  ChunkPos{-1, 4, -1},
+        ChunkPos{16, 4, 0}, ChunkPos{17, 4, 0}, ChunkPos{32, 4, 0},
+    };
+    const std::unordered_set<ChunkPos> ready = {
+        required[0], required[1], required[2], required[3], required[5],
+    };
+    constexpr std::array unresolved = {ColumnPos{48, 0}};
+    const FarTerrainExactHandoff handoff =
+        farTerrainExactHandoff(0.0, 0.0, 32, required, unresolved,
+                               [&](ChunkPos position) { return ready.contains(position); });
+
+    REQUIRE(handoff.tileFullyReady({0, 0}));
+    REQUIRE(handoff.tileFullyReady({-1, -1}));
+    REQUIRE_FALSE(handoff.tileFullyReady({1, 0}));
+    REQUIRE(handoff.tileFullyReady({2, 0}));
+    REQUIRE_FALSE(handoff.tileFullyReady({3, 0}));
+    REQUIRE_FALSE(handoff.tileFullyReady({4, 0}));
+
+    constexpr float NOMINAL = 32.0F * CHUNK_EDGE;
+    REQUIRE(handoff.distanceBlocksForTile({0, 0}, NOMINAL) == NOMINAL);
+    REQUIRE(handoff.distanceBlocksForTile({2, 0}, NOMINAL) == NOMINAL);
+    REQUIRE(handoff.distanceBlocksForTile({1, 0}, NOMINAL) == handoff.distanceBlocks);
+    REQUIRE(handoff.distanceBlocksForTile({3, 0}, NOMINAL) == 48.0F * CHUNK_EDGE);
+    REQUIRE(handoff.distanceBlocksForTile({4, 0}, NOMINAL) == handoff.distanceBlocks);
+
+    REQUIRE_FALSE(handoff.tileFullyOwned({0, 0}));
+    REQUIRE_FALSE(handoff.tileFullyOwned({2, 0}));
+    REQUIRE(farTerrainRequiresCoverageParent(0.0, 0.0, {0, 0}, NOMINAL, handoff));
+    REQUIRE(farTerrainRequiresCoverageParent(0.0, 0.0, {1, 0}, NOMINAL, handoff));
+    REQUIRE(farTerrainRequiresCoverageParent(0.0, 0.0, {2, 0}, NOMINAL, handoff));
+    REQUIRE_FALSE(farTerrainRequiresCoverageParent(0.0, 0.0, {4, 0}, NOMINAL, handoff));
+    REQUIRE_FALSE(farTerrainRequiresCoverageParent(0.0, 0.0, {1, 0}, 0.0F, handoff));
+}
+
+TEST_CASE("Only complete exact tile ownership releases fine boundary fallback",
+          "[render][far-terrain][coverage][exact][lod][flicker][regression]") {
+    std::vector<ChunkPos> completeTile;
+    completeTile.reserve(FAR_TERRAIN_EXACT_COLUMNS_PER_TILE * FAR_TERRAIN_EXACT_COLUMNS_PER_TILE);
+    for (int64_t z = 0; z < FAR_TERRAIN_EXACT_COLUMNS_PER_TILE; ++z) {
+        for (int64_t x = 0; x < FAR_TERRAIN_EXACT_COLUMNS_PER_TILE; ++x) {
+            completeTile.push_back({x, 4, z});
+        }
+    }
+    const FarTerrainExactHandoff complete =
+        farTerrainExactHandoff(0.0, 0.0, 32, completeTile, {}, [](ChunkPos) { return true; });
+    REQUIRE(complete.tileFullyReady({0, 0}));
+    REQUIRE(complete.tileFullyOwned({0, 0}));
+    REQUIRE_FALSE(farTerrainRequiresCoverageParent(0.0, 0.0, {0, 0}, 32.0F * CHUNK_EDGE, complete));
+
+    constexpr std::array partialBoundary{ChunkPos{31, 4, 0}};
+    const FarTerrainExactHandoff partial =
+        farTerrainExactHandoff(0.0, 0.0, 32, partialBoundary, {}, [](ChunkPos) { return true; });
+    REQUIRE(partial.tileFullyReady({1, 0}));
+    REQUIRE_FALSE(partial.tileFullyOwned({1, 0}));
+    REQUIRE(farTerrainRequiresCoverageParent(0.0, 0.0, {1, 0}, 32.0F * CHUNK_EDGE, partial));
+}
+
+TEST_CASE("Far terrain scheduler defaults retain the full base and refinement set",
+          "[render][far-terrain][scheduler][coverage]") {
+    STATIC_REQUIRE(FarTerrainScheduler::WORKER_COUNT == 8);
+    STATIC_REQUIRE(FarTerrainScheduler::LATENCY_WORKER_COUNT == 4);
+    const FarTerrainSchedulerLimits limits;
+    REQUIRE(limits.maxPending == 64);
+    REQUIRE(limits.maxCompleted == 32);
+    REQUIRE(limits.maxCacheEntries == 9280);
+    REQUIRE(limits.maxCacheBytes == 3ull * 1024 * 1024 * 1024);
+}
+
+TEST_CASE("Far terrain scheduler exposes the finest useful cached refinement",
+          "[render][far-terrain][scheduler][cache][lod][priority][regression]") {
+    FarTerrainScheduler scheduler(farTerrainTestSource());
+    constexpr ColumnPos COORDINATE{0, 0};
+    for (FarTerrainStep step :
+         {FarTerrainStep::SIXTEEN, FarTerrainStep::FOUR, FarTerrainStep::TWO}) {
+        REQUIRE(scheduler.enqueue({COORDINATE.x, COORDINATE.z, step}));
+    }
+    for (int attempt = 0; attempt < 400 && scheduler.stats().inFlight != 0; ++attempt)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE(scheduler.stats().inFlight == 0);
+
+    constexpr FarTerrainStepMask BASE_READY = farTerrainStepMask(FarTerrainStep::THIRTY_TWO);
+    REQUIRE_FALSE(scheduler.findFinestCached(COORDINATE, FarTerrainStep::THIRTY_TWO,
+                                             FarTerrainStep::TWO, BASE_READY, true));
+    const auto finest = scheduler.findFinestCached(COORDINATE, FarTerrainStep::THIRTY_TWO,
+                                                   FarTerrainStep::TWO, BASE_READY);
+    REQUIRE(finest);
+    REQUIRE(finest->key.step == FarTerrainStep::TWO);
+
+    const auto distanceTier = scheduler.findFinestCached(COORDINATE, FarTerrainStep::THIRTY_TWO,
+                                                         FarTerrainStep::FOUR, BASE_READY);
+    REQUIRE(distanceTier);
+    REQUIRE(distanceTier->key.step == FarTerrainStep::FOUR);
+
+    REQUIRE_FALSE(scheduler.findFinestCached(COORDINATE, FarTerrainStep::TWO, FarTerrainStep::TWO,
+                                             BASE_READY));
+}
+
+TEST_CASE("Production coverage minima stay below exact emitted surfaces",
+          "[render][far-terrain][coverage][bounds][worldgen]") {
+    struct Fixture {
+        std::shared_ptr<ChunkGenerator> generator;
+        int64_t centerX;
+        int64_t centerZ;
+        const char* name;
+    };
+    auto ordinary = std::make_shared<ChunkGenerator>(42);
+    auto volcanic = std::make_shared<ChunkGenerator>(764891);
+    const std::array fixtures{
+        Fixture{ordinary, -513, -257, "negative dry terrain"},
+        Fixture{ordinary, -8'352, 2'160, "negative lake shoreline"},
+        Fixture{ordinary, -12'289, 2'653, "negative river"},
+        Fixture{volcanic, 23'029, -111'486, "caldera lake"},
+    };
+
+    bool sawSurfaceWater = false;
+    bool sawVolcanicTerrain = false;
+    for (const Fixture& fixture : fixtures) {
+        const FarTerrainSource source =
+            FarTerrainMesher::generatorGeometrySource(fixture.generator);
+        for (int64_t dz = -4; dz <= 4; dz += 2) {
+            for (int64_t dx = -4; dx <= 4; dx += 2) {
+                const int64_t x = fixture.centerX + dx;
+                const int64_t z = fixture.centerZ + dz;
+                const worldgen::SurfaceSample exact = fixture.generator->sampleExactSurface(x, z);
+                const worldgen::SurfaceSample filtered =
+                    fixture.generator->sampleFarSurface(x, z, worldgen::SurfaceFootprint::BLOCK_16);
+                const worldgen::SurfaceSample canonicalWater =
+                    fixture.generator->sampleFarGeometrySurface(
+                        x, z, worldgen::SurfaceFootprint::BLOCK_1);
+                const FarSurfaceSample coverage =
+                    source.sample(x, z, worldgen::SurfaceFootprint::BLOCK_16);
+                CAPTURE(fixture.name, x, z, exact.terrainHeight, filtered.terrainHeight,
+                        coverage.footprintMinimumTerrainHeight);
+                double expectedMinimum = filtered.terrainHeight -
+                                         FAR_TERRAIN_STEP16_RELIEF_ENVELOPE -
+                                         ChunkGenerator::emittedSurfaceDetailAmplitude(
+                                             filtered, FAR_TERRAIN_STEP16_RELIEF_SLOPE_ENVELOPE) -
+                                         FAR_TERRAIN_EMITTED_SURFACE_ENVELOPE;
+                const bool standingWater = canonicalWater.hydrology.ocean ||
+                                           canonicalWater.hydrology.river ||
+                                           canonicalWater.hydrology.lake;
+                if (standingWater) {
+                    expectedMinimum =
+                        std::min(expectedMinimum, canonicalWater.hydrology.surfaceElevation);
+                    expectedMinimum = std::min(
+                        expectedMinimum, std::ceil(canonicalWater.hydrology.waterSurface) - 1.0);
+                }
+                if (canonicalWater.hydrology.waterfall &&
+                    canonicalWater.hydrology.waterfallTop >=
+                        canonicalWater.hydrology.waterfallBottom + 0.5) {
+                    expectedMinimum = std::min(
+                        expectedMinimum, std::ceil(canonicalWater.hydrology.waterfallBottom) - 1.0);
+                }
+                expectedMinimum = std::min(expectedMinimum, exact.terrainHeight);
+                REQUIRE(coverage.footprintMinimumTerrainHeight == Catch::Approx(expectedMinimum));
+                REQUIRE(coverage.footprintMinimumTerrainHeight <= exact.terrainHeight + 1.0e-6);
+                sawSurfaceWater = sawSurfaceWater || exact.hydrology.ocean ||
+                                  exact.hydrology.river || exact.hydrology.lake;
+                sawVolcanicTerrain = sawVolcanicTerrain || exact.geology.volcanicActivity > 0.5;
+            }
+        }
+    }
+    REQUIRE(sawSurfaceWater);
+    REQUIRE(sawVolcanicTerrain);
+}
+
+TEST_CASE("Production far terrain uses generator-owned material palettes and ranks",
+          "[render][far-terrain][material][worldgen][determinism]") {
+    auto generator = std::make_shared<ChunkGenerator>(764891);
+    const FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    REQUIRE(source.materialRank);
+
+    constexpr int64_t WORLD_X = 23'029;
+    constexpr int64_t WORLD_Z = -111'486;
+    const worldgen::SurfaceSample surface =
+        generator->sampleFarSurface(WORLD_X, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_8);
+    const FarSurfaceSample sampled =
+        source.sample(WORLD_X, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_8);
+    REQUIRE(sameMaterialPalette(sampled.materialPalette,
+                                generator->farSurfaceMaterialPaletteAt(WORLD_X, WORLD_Z, surface)));
+    REQUIRE(source.materialRank(WORLD_X, WORLD_Z) ==
+            Catch::Approx(generator->farSurfaceMaterialRankAt(WORLD_X, WORLD_Z)));
+
+    std::array<FarSurfaceSample, 9> grid{};
+    source.sampleGrid(WORLD_X - 8, WORLD_Z - 8, 8, 3, worldgen::SurfaceFootprint::BLOCK_8, grid);
+    for (int z = 0; z < 3; ++z) {
+        for (int x = 0; x < 3; ++x) {
+            const int64_t sampleX = WORLD_X - 8 + x * 8;
+            const int64_t sampleZ = WORLD_Z - 8 + z * 8;
+            const worldgen::SurfaceSample expectedSurface =
+                generator->sampleFarSurface(sampleX, sampleZ, worldgen::SurfaceFootprint::BLOCK_8);
+            CAPTURE(sampleX, sampleZ);
+            REQUIRE(sameMaterialPalette(
+                grid[static_cast<size_t>(z * 3 + x)].materialPalette,
+                generator->farSurfaceMaterialPaletteAt(sampleX, sampleZ, expectedSurface)));
+        }
+    }
+}
+
+TEST_CASE("The first far LOD reduces exact terrain to flat voxel terraces",
+          "[render][far-terrain][seam][exact][voxel]") {
+    ChunkGenerator generator(42);
+    constexpr int64_t WORLD_X = -81'792;
+    constexpr int64_t WORLD_Z = 126'976;
+    const worldgen::SurfaceSample planned = generator.sampleSurface(WORLD_X, WORLD_Z);
+    const worldgen::SurfaceSample coarse =
+        generator.sampleFarSurface(WORLD_X, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_16);
     const worldgen::SurfaceSample exact = generator.sampleExactSurface(WORLD_X, WORLD_Z);
-    REQUIRE(std::abs(provisional.terrainHeight - exact.terrainHeight) > 20.0);
+    // This fixture must resolve to a different emitted density voxel so the
+    // test can distinguish the exact handoff callback from its macro parent.
+    // The bounded density detail contract now caps that displacement well
+    // below the former twenty-block fixture delta.
+    REQUIRE(std::abs(coarse.terrainHeight - exact.terrainHeight) > 2.0);
+    // The public two-coordinate wrapper is block-resolution authority and
+    // therefore agrees with exact cube emission. Only the explicit far
+    // sampler returns the filtered macro parent used beyond exact residency.
+    REQUIRE(planned.terrainHeight == Catch::Approx(exact.terrainHeight).margin(1.0e-4));
     REQUIRE(exact.terrainHeight == generator.surfaceYAt(WORLD_X, WORLD_Z) + 1.0);
 
     const FarTerrainSource source = FarTerrainMesher::tieredSurfaceGeometrySource(
         [&generator](int64_t x, int64_t z) { return generator.sampleExactSurface(x, z); },
-        [&generator](int64_t x, int64_t z) { return generator.sampleFarSurface(x, z); });
-    const auto mesh = FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source);
-    bool foundSharedVertex = false;
-    for (const Vertex& vertex : mesh->vertices) {
-        if (unpackFace(vertex.faceAttr) != FaceNormal::PLUS_Y ||
-            unpackTextureLayer(vertex.faceAttr) == static_cast<uint8_t>(BlockType::WATER) ||
-            static_cast<float>(vertex.px) != static_cast<float>(WORLD_X) ||
-            static_cast<float>(vertex.pz) != static_cast<float>(WORLD_Z)) {
-            continue;
-        }
-        REQUIRE(static_cast<float>(vertex.py) == static_cast<float>(exact.terrainHeight));
-        foundSharedVertex = true;
+        [&generator](int64_t x, int64_t z) {
+            return generator.sampleFarSurface(x, z, worldgen::SurfaceFootprint::BLOCK_16);
+        });
+    REQUIRE(source.sample(WORLD_X, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_1)
+                .geometry.terrainHeight == exact.terrainHeight);
+    REQUIRE(source.sample(WORLD_X, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_8)
+                .geometry.terrainHeight == coarse.terrainHeight);
+    constexpr FarTerrainKey KEY{world_coord::floorDiv(WORLD_X, int64_t{FAR_TERRAIN_TILE_EDGE}),
+                                world_coord::floorDiv(WORLD_Z, int64_t{FAR_TERRAIN_TILE_EDGE}),
+                                FarTerrainStep::ONE};
+    const auto mesh = FarTerrainMesher::build(KEY, source);
+    REQUIRE(farTerrainTopsAreVoxelFlat(*mesh));
+    const int64_t localCellX = WORLD_X - KEY.tileX * FAR_TERRAIN_TILE_EDGE;
+    const int64_t localCellZ = WORLD_Z - KEY.tileZ * FAR_TERRAIN_TILE_EDGE;
+    const float expectedHeight =
+        expectedVoxelCellHeight(source, WORLD_X, WORLD_Z, FarTerrainStep::ONE);
+    const std::optional<float> emittedHeight = farTerrainHeightAt(
+        *mesh, static_cast<float>(localCellX) + 0.5F, static_cast<float>(localCellZ) + 0.5F);
+    REQUIRE(emittedHeight);
+    REQUIRE(*emittedHeight == expectedHeight);
+}
+
+TEST_CASE("Far LOD reduces horizontal voxel resolution without sloped faces",
+          "[render][far-terrain][lod][voxel][regression]") {
+    const FarTerrainSource source = farTerrainTestSource();
+    for (const FarTerrainStep step :
+         {FarTerrainStep::ONE, FarTerrainStep::TWO, FarTerrainStep::FOUR, FarTerrainStep::EIGHT,
+          FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO}) {
+        const int width = farTerrainStepSize(step);
+        const auto mesh = FarTerrainMesher::build({-1, 2, step}, source);
+        CAPTURE(width, mesh->terrainQuadCount, mesh->mergedTerrainCellCount);
+        REQUIRE(farTerrainUsesVoxelFaces(*mesh, width));
+        REQUIRE(mesh->mergedTerrainCellCount ==
+                static_cast<uint32_t>((FAR_TERRAIN_TILE_EDGE / width) *
+                                      (FAR_TERRAIN_TILE_EDGE / width)));
     }
-    REQUIRE(foundSharedVertex);
+}
+
+TEST_CASE("Fallback voxel tops remain independent of conservative footprint minima",
+          "[render][far-terrain][lod][voxel][transition][bounds][regression]") {
+    FarTerrainSource source;
+    source.sample = [](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
+        const double height = 92.0 + std::sin(static_cast<double>(x) * 0.071) * 7.0 +
+                              std::cos(static_cast<double>(z) * 0.053) * 5.0;
+        const double support = static_cast<double>(worldgen::surfaceFootprintWidth(footprint));
+        FarTerrainGeometrySample geometry;
+        geometry.terrainHeight = height;
+        return FarSurfaceSample{
+            .geometry = geometry,
+            .footprintMinimumTerrainHeight = height - support * 0.75,
+            .footprintMaximumTerrainHeight = height + support * 0.75,
+            .materialPalette = testMaterialPalette(BlockType::STONE),
+        };
+    };
+
+    constexpr std::array TIERS = {FarTerrainStep::ONE,     FarTerrainStep::TWO,
+                                  FarTerrainStep::FOUR,    FarTerrainStep::EIGHT,
+                                  FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO};
+    std::array<std::shared_ptr<const FarTerrainMesh>, TIERS.size()> meshes;
+    for (size_t index = 0; index < TIERS.size(); ++index) {
+        meshes[index] = FarTerrainMesher::build({0, 0, TIERS[index]}, source);
+    }
+    bool sawSeparatedCoverageMinimum = false;
+    for (size_t tierIndex = 1; tierIndex < TIERS.size(); ++tierIndex) {
+        const FarTerrainStep tier = TIERS[tierIndex];
+        const int step = farTerrainStepSize(tier);
+        for (int cellZ = 0; cellZ < FAR_TERRAIN_TILE_EDGE; cellZ += step) {
+            for (int cellX = 0; cellX < FAR_TERRAIN_TILE_EDGE; cellX += step) {
+                const float x = static_cast<float>(cellX) + 0.5F;
+                const float z = static_cast<float>(cellZ) + 0.5F;
+                const auto top = farTerrainHeightAt(*meshes[tierIndex], x, z);
+                const float expected = expectedVoxelCellHeight(source, cellX, cellZ, tier);
+                REQUIRE(top);
+                CAPTURE(step, x, z, *top, expected);
+                REQUIRE(*top == expected);
+                const FarSurfaceSample sample =
+                    source.sample(cellX, cellZ, farTerrainSurfaceFootprint(tier));
+                sawSeparatedCoverageMinimum = sawSeparatedCoverageMinimum ||
+                                              *top - sample.footprintMinimumTerrainHeight > 10.0;
+            }
+        }
+    }
+    REQUIRE(sawSeparatedCoverageMinimum);
+}
+
+TEST_CASE("Production terrain keeps filtered voxel tops through atomic LOD swaps",
+          "[render][far-terrain][lod][voxel][transition][worldgen][regression]") {
+    struct Fixture {
+        uint64_t seed;
+        int64_t tileX;
+        int64_t tileZ;
+        const char* name;
+    };
+    constexpr std::array fixtures{
+        Fixture{42, -33, 8, "lake shoreline"},
+        Fixture{42, 0, -6, "ocean river exact handoff"},
+        Fixture{764891, 89, -436, "volcanic caldera"},
+    };
+    constexpr std::array TIERS = {FarTerrainStep::TWO, FarTerrainStep::FOUR, FarTerrainStep::EIGHT,
+                                  FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO};
+    constexpr int RASTER_SPACING = 2;
+    for (const Fixture& fixture : fixtures) {
+        auto generator = std::make_shared<ChunkGenerator>(fixture.seed);
+        FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+        source.canopies = {};
+        std::array<std::vector<float>, TIERS.size()> heights;
+        std::array<double, TIERS.size()> means{};
+        for (size_t tier = 0; tier < TIERS.size(); ++tier) {
+            const auto mesh =
+                FarTerrainMesher::build({fixture.tileX, fixture.tileZ, TIERS[tier]}, source);
+            heights[tier] = farTerrainHeightRaster(*mesh, RASTER_SPACING);
+            REQUIRE(std::ranges::none_of(heights[tier],
+                                         [](float value) { return !std::isfinite(value); }));
+            means[tier] = std::accumulate(heights[tier].begin(), heights[tier].end(), 0.0) /
+                          static_cast<double>(heights[tier].size());
+        }
+        for (size_t tier = 1; tier < TIERS.size(); ++tier) {
+            CAPTURE(fixture.name, farTerrainStepSize(TIERS[tier]), means[0], means[tier]);
+            REQUIRE(std::abs(means[tier] - means[0]) <= 2.0);
+        }
+    }
+    constexpr unsigned int SOURCE = FAR_TERRAIN_DRAW_FLAG | FAR_TERRAIN_LOD_TRANSITION_FLAG;
+    constexpr unsigned int TARGET = SOURCE | FAR_TERRAIN_LOD_TARGET_FLAG;
+    for (const float progress : {0.0F, 0.25F, 0.499F, 0.5F, 0.75F, 1.0F}) {
+        CAPTURE(progress);
+        REQUIRE(farTerrainLodTerrainVisible(progress, SOURCE) !=
+                farTerrainLodTerrainVisible(progress, TARGET));
+    }
+}
+
+TEST_CASE("Seed forty-two coverage parents retain their filtered lowland surface",
+          "[render][far-terrain][coverage][bounds][lod][regression]") {
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    source.canopies = {};
+    constexpr int PARENT_STEP = 32;
+    constexpr int CHILD_STEP = 2;
+    constexpr int CHILD_SCALE = PARENT_STEP / CHILD_STEP;
+    struct Fixture {
+        int64_t x;
+        int64_t z;
+    };
+    constexpr std::array FIXTURES = {Fixture{64, -1'632}, Fixture{192, -1'472}};
+    for (const Fixture fixture : FIXTURES) {
+        std::array<FarTerrainCellBounds, 1> parents{};
+        source.cellBoundsGrid(fixture.x, fixture.z, PARENT_STEP, 1, 1,
+                              worldgen::SurfaceFootprint::BLOCK_32, parents);
+        std::array<worldgen::SurfaceSample, CHILD_SCALE * CHILD_SCALE> children{};
+        generator->sampleExactSurfaceGrid(fixture.x, fixture.z, CHILD_STEP, CHILD_SCALE, children);
+        const FarTerrainCellBounds& parent = parents.front();
+        double maximumAbsoluteError = 0.0;
+        for (const worldgen::SurfaceSample& child : children) {
+            REQUIRE(child.terrainHeight > SEA_LEVEL + 1.0);
+            maximumAbsoluteError = std::max(maximumAbsoluteError,
+                                            std::abs(child.terrainHeight - parent.terrainHeight));
+        }
+        CAPTURE(fixture.x, fixture.z, parent.terrainHeight, parent.minimumTerrainHeight,
+                maximumAbsoluteError);
+        REQUIRE(parent.minimumTerrainHeight <= SEA_LEVEL);
+        REQUIRE(parent.terrainHeight > SEA_LEVEL);
+        REQUIRE(maximumAbsoluteError <= 6.0);
+
+        const int64_t tileX = world_coord::floorDiv(fixture.x, int64_t{FAR_TERRAIN_TILE_EDGE});
+        const int64_t tileZ = world_coord::floorDiv(fixture.z, int64_t{FAR_TERRAIN_TILE_EDGE});
+        const auto mesh =
+            FarTerrainMesher::build({tileX, tileZ, FarTerrainStep::THIRTY_TWO}, source);
+        const float localX = static_cast<float>(fixture.x - mesh->originX + PARENT_STEP / 2);
+        const float localZ = static_cast<float>(fixture.z - mesh->originZ + PARENT_STEP / 2);
+        const std::optional<float> meshTop = farTerrainHeightAt(*mesh, localX, localZ);
+        REQUIRE(meshTop);
+        REQUIRE(*meshTop == static_cast<float>(std::ceil(parent.terrainHeight)));
+    }
 }
 
 TEST_CASE("Far generated water uses the exact source-block surface plane",
@@ -432,11 +3105,341 @@ TEST_CASE("Far generated water uses the exact source-block surface plane",
     REQUIRE(exact.hydrology.lake);
     const FarTerrainSource source = FarTerrainMesher::surfaceGeometrySource(
         [&generator](int64_t x, int64_t z) { return generator.sampleExactSurface(x, z); });
-    const FarTerrainGeometrySample geometry = source.geometry(LAKE_X, LAKE_Z);
+    const FarTerrainGeometrySample geometry = testFarGeometry(source, LAKE_X, LAKE_Z);
     REQUIRE(geometry.lake);
-    REQUIRE(geometry.waterSurface == std::ceil(exact.waterSurface) - 0.125);
+    REQUIRE(geometry.waterSurface == std::ceil(exact.waterSurface));
     REQUIRE(geometry.waterSurface ==
             std::ceil(exact.waterSurface) - 1.0 + fluidSurfaceHeight(FluidState::source()));
+}
+
+TEST_CASE("Seed 42 far ocean coverage has no eight-block grid gaps",
+          "[render][far-terrain][water][regression][seed-42]") {
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    const FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    constexpr int64_t CENTER_X = -557;
+    constexpr int64_t CENTER_Z = 379;
+    constexpr int RADIUS = 32;
+    constexpr int SAMPLE_EDGE = RADIUS * 2 + 3;
+    constexpr int64_t SAMPLE_ORIGIN_X = CENTER_X - RADIUS - 1;
+    constexpr int64_t SAMPLE_ORIGIN_Z = CENTER_Z - RADIUS - 1;
+    std::array<FarTerrainGeometrySample, SAMPLE_EDGE * SAMPLE_EDGE> exact{};
+    for (int z = 0; z < SAMPLE_EDGE; ++z) {
+        for (int x = 0; x < SAMPLE_EDGE; ++x) {
+            exact[static_cast<size_t>(z * SAMPLE_EDGE + x)] =
+                source
+                    .sample(SAMPLE_ORIGIN_X + x, SAMPLE_ORIGIN_Z + z,
+                            worldgen::SurfaceFootprint::BLOCK_1)
+                    .geometry;
+        }
+    }
+    const auto wetAt = [&](int x, int z) {
+        const FarTerrainGeometrySample& sample =
+            exact[static_cast<size_t>((z + RADIUS + 1) * SAMPLE_EDGE + x + RADIUS + 1)];
+        return (sample.ocean || sample.river || sample.lake) &&
+               sample.waterSurface > sample.terrainHeight + 0.01;
+    };
+
+    constexpr FarTerrainKey TILE{-3, 1, FarTerrainStep::TWO};
+    // Step 32 intentionally uses one exact authority representative per
+    // aligned 8x8 coverage cell and has dedicated ownership tests below.
+    for (const FarTerrainStep step :
+         {FarTerrainStep::ONE, FarTerrainStep::TWO, FarTerrainStep::FOUR, FarTerrainStep::EIGHT,
+          FarTerrainStep::SIXTEEN}) {
+        const auto mesh = FarTerrainMesher::build({TILE.tileX, TILE.tileZ, step}, source);
+        size_t expectedWet = 0;
+        size_t missing = 0;
+        std::array<size_t, 64> missingByEightBlockPhase{};
+        for (int dz = -RADIUS; dz <= RADIUS; ++dz) {
+            for (int dx = -RADIUS; dx <= RADIUS; ++dx) {
+                bool broadWater = true;
+                for (int neighborZ = -1; neighborZ <= 1; ++neighborZ) {
+                    for (int neighborX = -1; neighborX <= 1; ++neighborX)
+                        broadWater = broadWater && wetAt(dx + neighborX, dz + neighborZ);
+                }
+                if (!broadWater)
+                    continue;
+                ++expectedWet;
+                const int64_t worldX = CENTER_X + dx;
+                const int64_t worldZ = CENTER_Z + dz;
+                const float localX = static_cast<float>(worldX - mesh->originX) + 0.5F;
+                const float localZ = static_cast<float>(worldZ - mesh->originZ) + 0.5F;
+                if (farWaterTopCovers(*mesh, localX, localZ))
+                    continue;
+                ++missing;
+                const size_t phaseX =
+                    static_cast<size_t>(world_coord::floorMod(worldX, int64_t{8}));
+                const size_t phaseZ =
+                    static_cast<size_t>(world_coord::floorMod(worldZ, int64_t{8}));
+                ++missingByEightBlockPhase[phaseZ * 8 + phaseX];
+            }
+        }
+        CAPTURE(farTerrainStepSize(step), expectedWet, missing, missingByEightBlockPhase);
+        REQUIRE(expectedWet > 1'000);
+        REQUIRE(missing == 0);
+    }
+}
+
+TEST_CASE("Seed 42 step 32 water respects exact ownership through a cold handoff",
+          "[render][far-terrain][water][coverage][ownership][regression][seed-42]") {
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    source.canopies = {};
+    const auto geometryPointCount = std::make_shared<size_t>(0);
+    const auto authorityPointCount = std::make_shared<size_t>(0);
+    const auto authorityGridCount = std::make_shared<size_t>(0);
+    const auto geometryPoints = source.geometryPoints;
+    source.geometryPoints = [geometryPointCount,
+                             geometryPoints](std::span<const ColumnPos> positions,
+                                             worldgen::SurfaceFootprint footprint,
+                                             std::span<FarTerrainGeometrySample> output) {
+        if (footprint == worldgen::SurfaceFootprint::BLOCK_1)
+            *geometryPointCount += positions.size();
+        geometryPoints(positions, footprint, output);
+    };
+    const auto authorityPoints = source.waterAuthorityPoints;
+    source.waterAuthorityPoints = [authorityPointCount,
+                                   authorityPoints](std::span<const ColumnPos> positions,
+                                                    worldgen::SurfaceFootprint footprint,
+                                                    std::span<FarTerrainGeometrySample> output) {
+        *authorityPointCount += positions.size();
+        authorityPoints(positions, footprint, output);
+    };
+    const auto authorityGrid = source.waterAuthorityGrid;
+    source.waterAuthorityGrid = [authorityGridCount,
+                                 authorityGrid](int64_t originX, int64_t originZ, int spacingX,
+                                                int spacingZ, int sampleWidth, int sampleHeight,
+                                                worldgen::SurfaceFootprint footprint,
+                                                std::span<FarTerrainGeometrySample> output) {
+        *authorityGridCount += output.size();
+        authorityGrid(originX, originZ, spacingX, spacingZ, sampleWidth, sampleHeight, footprint,
+                      output);
+    };
+
+    constexpr FarTerrainKey LEFT{-1, -6, FarTerrainStep::THIRTY_TWO};
+    constexpr FarTerrainKey RIGHT{0, -6, FarTerrainStep::THIRTY_TWO};
+    const auto left = FarTerrainMesher::build(LEFT, source);
+    const auto right = FarTerrainMesher::build(RIGHT, source);
+
+    constexpr int SAMPLE_STEP = 8;
+    constexpr int SAMPLE_EDGE = FAR_TERRAIN_TILE_EDGE / SAMPLE_STEP + 2;
+    constexpr int64_t SAMPLE_ORIGIN_X = -SAMPLE_STEP;
+    constexpr int64_t SAMPLE_ORIGIN_Z = RIGHT.tileZ * FAR_TERRAIN_TILE_EDGE - SAMPLE_STEP;
+    std::array<worldgen::SurfaceSample, SAMPLE_EDGE * SAMPLE_EDGE> exact{};
+    generator->sampleExactSurfaceGrid(SAMPLE_ORIGIN_X, SAMPLE_ORIGIN_Z, SAMPLE_STEP, SAMPLE_EDGE,
+                                      exact);
+    const auto exactWet = [&](int x, int z) {
+        const worldgen::SurfaceSample& sample = exact[static_cast<size_t>(z * SAMPLE_EDGE + x)];
+        return (sample.hydrology.ocean || sample.hydrology.river || sample.hydrology.lake) &&
+               sample.hydrology.waterSurface > sample.terrainHeight + 0.01;
+    };
+    size_t broadDry = 0;
+    size_t broadWet = 0;
+    size_t falseWater = 0;
+    size_t missingWater = 0;
+    for (int z = 1; z + 1 < SAMPLE_EDGE; ++z) {
+        for (int x = 1; x + 1 < SAMPLE_EDGE; ++x) {
+            bool neighborhoodDry = true;
+            bool neighborhoodWet = true;
+            for (int dz = -1; dz <= 1; ++dz) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    neighborhoodDry = neighborhoodDry && !exactWet(x + dx, z + dz);
+                    neighborhoodWet = neighborhoodWet && exactWet(x + dx, z + dz);
+                }
+            }
+            const float localX = static_cast<float>((x - 1) * SAMPLE_STEP) + 0.5F;
+            const float localZ = static_cast<float>((z - 1) * SAMPLE_STEP) + 0.5F;
+            const bool meshWet = farWaterTopCovers(*right, localX, localZ);
+            broadDry += neighborhoodDry;
+            broadWet += neighborhoodWet;
+            falseWater += neighborhoodDry && meshWet;
+            missingWater += neighborhoodWet && !meshWet;
+        }
+    }
+    CAPTURE(broadDry, broadWet, falseWater, missingWater, *geometryPointCount, *authorityPointCount,
+            *authorityGridCount, right->waterQuadCount, right->waterContourTriangleCount);
+    REQUIRE(broadDry > 100);
+    REQUIRE(broadWet > 100);
+    REQUIRE(falseWater == 0);
+    REQUIRE(missingWater == 0);
+    for (int z = 1; z + 1 < SAMPLE_EDGE; ++z) {
+        for (int x = 1; x + 1 < SAMPLE_EDGE; ++x) {
+            const float localX = static_cast<float>((x - 1) * SAMPLE_STEP) + 0.5F;
+            const float localZ = static_cast<float>((z - 1) * SAMPLE_STEP) + 0.5F;
+            CAPTURE(x, z, localX, localZ);
+            REQUIRE(farWaterTopCovers(*right, localX, localZ) == exactWet(x, z));
+        }
+    }
+    REQUIRE(left->waterContourTriangleCount == 0);
+    REQUIRE(right->waterContourTriangleCount == 0);
+
+    size_t sharedWet = 0;
+    size_t sharedDry = 0;
+    for (int z = 1; z + 1 < SAMPLE_EDGE; ++z) {
+        bool neighborhoodDry = true;
+        bool neighborhoodWet = true;
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int x = 0; x <= 2; ++x) {
+                neighborhoodDry = neighborhoodDry && !exactWet(x, z + dz);
+                neighborhoodWet = neighborhoodWet && exactWet(x, z + dz);
+            }
+        }
+        if (!neighborhoodDry && !neighborhoodWet)
+            continue;
+        const int localZ = (z - 1) * SAMPLE_STEP;
+        const float sampleZ = static_cast<float>(localZ) + 0.5F;
+        const bool leftWet =
+            farWaterTopCovers(*left, static_cast<float>(FAR_TERRAIN_TILE_EDGE), sampleZ);
+        const bool rightWet = farWaterTopCovers(*right, 0.0F, sampleZ);
+        CAPTURE(localZ, neighborhoodDry, neighborhoodWet, leftWet, rightWet);
+        REQUIRE((leftWet || rightWet) == neighborhoodWet);
+        sharedWet += neighborhoodWet;
+        sharedDry += neighborhoodDry;
+    }
+    REQUIRE(sharedWet > 4);
+    REQUIRE(sharedDry > 0);
+    REQUIRE(*authorityGridCount == 2 * 33 * 33);
+    REQUIRE(*authorityPointCount == 0);
+    REQUIRE(*geometryPointCount + *authorityPointCount + *authorityGridCount < 4'096);
+}
+
+TEST_CASE("Seed 42 step 32 water cells retain phase zero authority across twenty five tiles",
+          "[render][far-terrain][water][coverage][ownership][seam][voxel][regression][seed-42]") {
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    source.canopies = {};
+    constexpr int64_t FIRST_TILE_X = -1;
+    constexpr int64_t FIRST_TILE_Z = -8;
+    constexpr int TILE_EDGE = 5;
+    constexpr int WATER_STEP = 8;
+    constexpr int WATER_CELLS = FAR_TERRAIN_TILE_EDGE / WATER_STEP;
+    constexpr int AUTHORITY_EDGE = TILE_EDGE * WATER_CELLS + 1;
+    constexpr int64_t AUTHORITY_ORIGIN_X = FIRST_TILE_X * FAR_TERRAIN_TILE_EDGE;
+    constexpr int64_t AUTHORITY_ORIGIN_Z = FIRST_TILE_Z * FAR_TERRAIN_TILE_EDGE;
+    std::vector<worldgen::HydrologySample> authority(
+        static_cast<size_t>(AUTHORITY_EDGE * AUTHORITY_EDGE));
+    generator->sampleGeneratedWaterAuthorityGrid(AUTHORITY_ORIGIN_X, AUTHORITY_ORIGIN_Z, WATER_STEP,
+                                                 AUTHORITY_EDGE, authority);
+    const auto authorityAt = [&](int tileX, int tileZ, int cellX, int cellZ) {
+        const int sampleX = (tileX - FIRST_TILE_X) * WATER_CELLS + cellX;
+        const int sampleZ = (tileZ - FIRST_TILE_Z) * WATER_CELLS + cellZ;
+        return authority[static_cast<size_t>(sampleZ * AUTHORITY_EDGE + sampleX)];
+    };
+    size_t wetCells = 0;
+    size_t dryCells = 0;
+    for (int tileZ = FIRST_TILE_Z; tileZ < FIRST_TILE_Z + TILE_EDGE; ++tileZ) {
+        for (int tileX = FIRST_TILE_X; tileX < FIRST_TILE_X + TILE_EDGE; ++tileX) {
+            const auto mesh =
+                FarTerrainMesher::build({tileX, tileZ, FarTerrainStep::THIRTY_TWO}, source);
+            CAPTURE(tileX, tileZ, mesh->waterQuadCount, mesh->waterContourTriangleCount);
+            REQUIRE(mesh->waterContourTriangleCount == 0);
+            for (int cellZ = 0; cellZ < WATER_CELLS; ++cellZ) {
+                for (int cellX = 0; cellX < WATER_CELLS; ++cellX) {
+                    const worldgen::HydrologySample hydrology =
+                        authorityAt(tileX, tileZ, cellX, cellZ);
+                    const bool expectedWet =
+                        (hydrology.ocean || hydrology.river || hydrology.lake) &&
+                        hydrology.waterSurface > hydrology.surfaceElevation + 0.01;
+                    const float localX = static_cast<float>(cellX * WATER_STEP) + 0.5F;
+                    const float localZ = static_cast<float>(cellZ * WATER_STEP) + 0.5F;
+                    CAPTURE(cellX, cellZ, localX, localZ, expectedWet, hydrology.waterBodyId,
+                            hydrology.waterSurface, hydrology.surfaceElevation);
+                    REQUIRE(farWaterTopCovers(*mesh, localX, localZ) == expectedWet);
+                    wetCells += expectedWet;
+                    dryCells += !expectedWet;
+                }
+            }
+            for (size_t offset = mesh->opaqueIndexCount; offset + 2 < mesh->indices.size();
+                 offset += 3) {
+                const Vertex& first = mesh->vertices[mesh->indices[offset]];
+                if (unpackFace(first.faceAttr) != FaceNormal::PLUS_Y ||
+                    unpackFluidFalling(first.faceAttr)) {
+                    continue;
+                }
+                const Vertex& second = mesh->vertices[mesh->indices[offset + 1]];
+                const Vertex& third = mesh->vertices[mesh->indices[offset + 2]];
+                CAPTURE(tileX, tileZ, static_cast<float>(first.px), static_cast<float>(first.py),
+                        static_cast<float>(first.pz));
+                REQUIRE(static_cast<float>(first.py) == static_cast<float>(second.py));
+                REQUIRE(static_cast<float>(first.py) == static_cast<float>(third.py));
+                REQUIRE(std::fmod(static_cast<float>(first.py) * 8.0F, 1.0F) ==
+                        Catch::Approx(0.0F).margin(1.0e-4F));
+                const float signedArea =
+                    (static_cast<float>(second.px) - static_cast<float>(first.px)) *
+                        (static_cast<float>(third.pz) - static_cast<float>(first.pz)) -
+                    (static_cast<float>(second.pz) - static_cast<float>(first.pz)) *
+                        (static_cast<float>(third.px) - static_cast<float>(first.px));
+                REQUIRE(std::abs(signedArea) == Catch::Approx(64.0F).margin(1.0e-4F));
+            }
+        }
+    }
+    REQUIRE(wetCells > 1'000);
+    REQUIRE(dryCells > 1'000);
+
+    constexpr std::array REPORTED_COLUMNS = {
+        ColumnPos{-8, -1'896},  ColumnPos{8, -1'896},  ColumnPos{368, -1'880},
+        ColumnPos{360, -1'864}, ColumnPos{-8, -1'264}, ColumnPos{248, -1'608},
+    };
+    for (const ColumnPos position : REPORTED_COLUMNS) {
+        const worldgen::HydrologySample direct =
+            generator->sampleGeneratedWaterAuthority(position.x, position.z);
+        const worldgen::SurfaceSample exact = generator->sampleExactSurface(position.x, position.z);
+        CAPTURE(position.x, position.z, direct.waterBodyId, exact.hydrology.waterBodyId);
+        REQUIRE(direct.waterBodyId == exact.hydrology.waterBodyId);
+        REQUIRE(direct.ocean == exact.hydrology.ocean);
+        REQUIRE(direct.river == exact.hydrology.river);
+        REQUIRE(direct.lake == exact.hydrology.lake);
+    }
+}
+
+TEST_CASE("Step 32 shared water risers have one positive-side owner",
+          "[render][far-terrain][water][coverage][seam][riser][negative][regression]") {
+    const auto boundaryRisers = [](const FarTerrainMesh& mesh, FaceNormal face, float localX) {
+        size_t result = 0;
+        for (size_t offset = mesh.opaqueIndexCount; offset + 5 < mesh.indices.size(); offset += 6) {
+            const Vertex& first = mesh.vertices[mesh.indices[offset]];
+            if (unpackFace(first.faceAttr) != face || static_cast<float>(first.px) != localX) {
+                continue;
+            }
+            ++result;
+        }
+        return result;
+    };
+    const auto flowingSource = testFarTerrainSource(
+        [](int64_t x, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 48.0;
+            sample.waterSurface = x < 0 ? 64.875 : 64.625;
+            sample.river = true;
+            sample.generatedFluidLevel = x < 0 ? 1 : 3;
+            sample.transitionOwnerKind = worldgen::WaterTransitionKind::RASTER_CHANNEL;
+            sample.transitionOwnerId = 0x5154'4147'4552'4953ULL;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::STONE; });
+    const auto left = FarTerrainMesher::build({-1, -1, FarTerrainStep::THIRTY_TWO}, flowingSource);
+    const auto right = FarTerrainMesher::build({0, -1, FarTerrainStep::THIRTY_TWO}, flowingSource);
+    REQUIRE(left->waterContourTriangleCount == 0);
+    REQUIRE(right->waterContourTriangleCount == 0);
+    REQUIRE(boundaryRisers(*left, FaceNormal::PLUS_X, static_cast<float>(FAR_TERRAIN_TILE_EDGE)) ==
+            0);
+    REQUIRE(boundaryRisers(*right, FaceNormal::PLUS_X, 0.0F) == 32);
+    REQUIRE(boundaryRisers(*right, FaceNormal::MINUS_X, 0.0F) == 0);
+
+    const auto shorelineSource = testFarTerrainSource(
+        [](int64_t x, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 48.0;
+            sample.waterSurface = 64.0;
+            sample.ocean = x < 0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::SAND; });
+    const auto wet = FarTerrainMesher::build({-1, -1, FarTerrainStep::THIRTY_TWO}, shorelineSource);
+    const auto dry = FarTerrainMesher::build({0, -1, FarTerrainStep::THIRTY_TWO}, shorelineSource);
+    REQUIRE(boundaryRisers(*wet, FaceNormal::PLUS_X, static_cast<float>(FAR_TERRAIN_TILE_EDGE)) ==
+            0);
+    REQUIRE(boundaryRisers(*dry, FaceNormal::PLUS_X, 0.0F) == 0);
+    REQUIRE(boundaryRisers(*dry, FaceNormal::MINUS_X, 0.0F) == 0);
 }
 
 TEST_CASE("Canonical lake contours agree through every far LOD",
@@ -445,19 +3448,20 @@ TEST_CASE("Canonical lake contours agree through every far LOD",
     const FarTerrainSource source = FarTerrainMesher::tieredSurfaceGeometrySource(
         [&generator](int64_t x, int64_t z) { return generator.sampleExactSurface(x, z); },
         [&generator](int64_t x, int64_t z) { return generator.sampleFarSurface(x, z); });
-    constexpr FarTerrainKey BASE_KEY{-33, 8, FarTerrainStep::TWO};
+    constexpr FarTerrainKey BASE_KEY{-32, 8, FarTerrainStep::TWO};
     constexpr int64_t WORLD_Z = 2'288;
-    constexpr int64_t WET_X = -8'256;
-    constexpr int64_t SCAN_END_X = -8'224;
+    constexpr int64_t WET_X = -8'192;
+    constexpr int64_t SCAN_END_X = -8'160;
     constexpr float LOCAL_Z = 240.0F;
-    constexpr float MINIMUM_LOCAL_X = 192.0F;
-    constexpr float MAXIMUM_LOCAL_X = 224.0F;
+    constexpr float MINIMUM_LOCAL_X = 0.0F;
+    constexpr float MAXIMUM_LOCAL_X = 32.0F;
     constexpr int64_t TILE_ORIGIN_X = BASE_KEY.tileX * FAR_TERRAIN_TILE_EDGE;
 
     bool foundWetReference = false;
     int64_t firstDryReferenceX = std::numeric_limits<int64_t>::max();
     for (int64_t x = WET_X; x <= SCAN_END_X; ++x) {
-        const FarTerrainGeometrySample sample = source.nearGeometry(x, WORLD_Z);
+        const FarTerrainGeometrySample sample =
+            testFarGeometry(source, x, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_2);
         if (sample.lake) {
             foundWetReference = true;
         } else if (foundWetReference) {
@@ -469,7 +3473,9 @@ TEST_CASE("Canonical lake contours agree through every far LOD",
     REQUIRE(firstDryReferenceX != std::numeric_limits<int64_t>::max());
     const float expectedEdgeX = static_cast<float>(firstDryReferenceX - TILE_ORIGIN_X) - 0.5F;
     const float expectedWaterY =
-        static_cast<float>(source.nearGeometry(firstDryReferenceX - 1, WORLD_Z).waterSurface);
+        static_cast<float>(testFarGeometry(source, firstDryReferenceX - 1, WORLD_Z,
+                                           worldgen::SurfaceFootprint::BLOCK_2)
+                               .waterSurface);
 
     for (const FarTerrainStep step : {FarTerrainStep::TWO, FarTerrainStep::FOUR,
                                       FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN}) {
@@ -480,8 +3486,17 @@ TEST_CASE("Canonical lake contours agree through every far LOD",
                                       static_cast<int64_t>(spacing)) == 0);
     }
     for (int64_t x = WET_X; x <= SCAN_END_X; ++x) {
-        const FarTerrainGeometrySample exact = source.nearGeometry(x, WORLD_Z);
-        const FarTerrainGeometrySample coarse = source.geometry(x, WORLD_Z);
+        const worldgen::SurfaceSample exactAuthority = generator.sampleExactSurface(x, WORLD_Z);
+        const worldgen::SurfaceSample coarseAuthority =
+            generator.sampleFarSurface(x, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_16);
+        REQUIRE(exactAuthority.hydrology.lake == coarseAuthority.hydrology.lake);
+        REQUIRE(exactAuthority.hydrology.waterBodyId == coarseAuthority.hydrology.waterBodyId);
+        REQUIRE(exactAuthority.waterSurface ==
+                Catch::Approx(coarseAuthority.waterSurface).margin(1.0e-5));
+        const FarTerrainGeometrySample exact =
+            testFarGeometry(source, x, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_2);
+        const FarTerrainGeometrySample coarse =
+            testFarGeometry(source, x, WORLD_Z, worldgen::SurfaceFootprint::BLOCK_16);
         REQUIRE(exact.lake == coarse.lake);
         REQUIRE(exact.waterSurface == Catch::Approx(coarse.waterSurface).margin(1.0e-5));
     }
@@ -538,25 +3553,28 @@ TEST_CASE("Canonical lake contours agree through every far LOD",
 
 TEST_CASE("Far lake outlets use narrow explicit falling prisms at every LOD",
           "[render][far-terrain][water][lake][waterfall][seam][lod]") {
-    constexpr int64_t FALL_X = -8'256;
-    constexpr int64_t FALL_Z = 3'072;
+    constexpr int64_t FALL_X = -8'240;
+    constexpr int64_t FALL_Z = 3'088;
     constexpr FarTerrainKey BASE_KEY{-33, 12, FarTerrainStep::TWO};
-    constexpr float LOCAL_FALL_X = 192.0F;
-    constexpr float LOCAL_FALL_Z = 0.0F;
+    constexpr float LOCAL_FALL_X = 208.0F;
+    constexpr float LOCAL_FALL_Z = 16.0F;
     ChunkGenerator generator(42);
     const FarTerrainSource source = FarTerrainMesher::tieredSurfaceGeometrySource(
         [&generator](int64_t x, int64_t z) { return generator.sampleExactSurface(x, z); },
         [&generator](int64_t x, int64_t z) { return generator.sampleFarSurface(x, z); });
 
-    const FarTerrainGeometrySample near = source.nearGeometry(FALL_X, FALL_Z);
-    const FarTerrainGeometrySample coarse = source.geometry(FALL_X, FALL_Z);
+    const FarTerrainGeometrySample near =
+        testFarGeometry(source, FALL_X, FALL_Z, worldgen::SurfaceFootprint::BLOCK_2);
+    const FarTerrainGeometrySample coarse =
+        testFarGeometry(source, FALL_X, FALL_Z, worldgen::SurfaceFootprint::BLOCK_16);
     for (const FarTerrainGeometrySample* sample : {&near, &coarse}) {
-        REQUIRE_FALSE(sample->ocean);
-        REQUIRE(sample->river);
+        REQUIRE(sample->ocean);
+        REQUIRE_FALSE(sample->river);
         REQUIRE(sample->waterfall);
         REQUIRE(sample->waterfallAnchor);
-        REQUIRE(sample->waterSurface == Catch::Approx(72.875));
-        REQUIRE(sample->waterfallBottom == Catch::Approx(73.0));
+        REQUIRE(sample->waterSurface == Catch::Approx(std::ceil(sample->waterfallBottom) - 1.0 +
+                                                      fluidSurfaceHeight(FluidState::source())));
+        REQUIRE(sample->waterfallBottom == Catch::Approx(SEA_LEVEL).margin(1.0e-4));
         REQUIRE(sample->waterfallTop == Catch::Approx(81.14503479).margin(1.0e-4));
         REQUIRE(sample->waterfallWidth >= 4.0);
     }
@@ -568,10 +3586,12 @@ TEST_CASE("Far lake outlets use narrow explicit falling prisms at every LOD",
     const int outsideOffset = static_cast<int>(std::ceil(coarse.waterfallWidth + 4.0));
     const int64_t outsideX = FALL_X + static_cast<int64_t>(std::llround(-flowZ * outsideOffset));
     const int64_t outsideZ = FALL_Z + static_cast<int64_t>(std::llround(flowX * outsideOffset));
-    const FarTerrainGeometrySample outside = source.geometry(outsideX, outsideZ);
+    const FarTerrainGeometrySample outside =
+        testFarGeometry(source, outsideX, outsideZ, worldgen::SurfaceFootprint::BLOCK_16);
     REQUIRE_FALSE(outside.waterfall);
-    if (outside.waterSurface > SEA_LEVEL)
-        REQUIRE(outside.lake);
+    REQUIRE(outside.ocean);
+    REQUIRE_FALSE(outside.lake);
+    REQUIRE_FALSE(outside.river);
 
     for (const FarTerrainStep step : {FarTerrainStep::TWO, FarTerrainStep::FOUR,
                                       FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN}) {
@@ -619,20 +3639,37 @@ TEST_CASE("Far lake outlets use narrow explicit falling prisms at every LOD",
 
 TEST_CASE("Far terrain retains deterministic forests through every LOD",
           "[render][far-terrain][canopy][lod]") {
-    FarTerrainSource source;
-    source.geometry = [](int64_t, int64_t) {
-        FarTerrainGeometrySample sample;
-        sample.terrainHeight = 64.0;
-        return sample;
-    };
-    source.material = [](int64_t, int64_t, const FarTerrainGeometrySample&) {
-        return BlockType::GRASS;
-    };
-    source.canopies = [](int64_t, int64_t, int64_t, int64_t, FarTerrainStep) {
+    FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 64.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::GRASS; });
+    source.canopies = [](int64_t, int64_t, int64_t, int64_t, FarTerrainStep step) {
         std::vector<FarCanopy> canopies;
-        for (uint64_t index = 0; index < 4; ++index) {
+        size_t retained = 2;
+        switch (step) {
+            case FarTerrainStep::ONE:
+            case FarTerrainStep::TWO:
+                retained = 6;
+                break;
+            case FarTerrainStep::FOUR:
+                retained = 5;
+                break;
+            case FarTerrainStep::EIGHT:
+                retained = 4;
+                break;
+            case FarTerrainStep::SIXTEEN:
+                retained = 3;
+                break;
+            case FarTerrainStep::THIRTY_TWO:
+                retained = 2;
+                break;
+        }
+        for (uint64_t index = 0; index < retained; ++index) {
             FarCanopy canopy;
-            canopy.x = 24 + static_cast<int64_t>(index) * 48;
+            canopy.x = 20 + static_cast<int64_t>(index) * 40;
             canopy.z = 96;
             canopy.baseY = 64;
             canopy.topY = 70;
@@ -655,13 +3692,15 @@ TEST_CASE("Far terrain retains deterministic forests through every LOD",
     const auto four = FarTerrainMesher::build({0, 0, FarTerrainStep::FOUR}, source);
     const auto eight = FarTerrainMesher::build({0, 0, FarTerrainStep::EIGHT}, source);
     const auto sixteen = FarTerrainMesher::build({0, 0, FarTerrainStep::SIXTEEN}, source);
-    REQUIRE(two->canopyAnchorCount == 4);
-    REQUIRE(four->canopyAnchorCount == two->canopyAnchorCount);
-    REQUIRE(eight->canopyAnchorCount == 3);
-    REQUIRE(sixteen->canopyAnchorCount == 2);
+    const auto thirtyTwo = FarTerrainMesher::build({0, 0, FarTerrainStep::THIRTY_TWO}, source);
+    REQUIRE(two->canopyAnchorCount == 6);
+    REQUIRE(four->canopyAnchorCount == 5);
+    REQUIRE(eight->canopyAnchorCount == 4);
+    REQUIRE(sixteen->canopyAnchorCount == 3);
+    REQUIRE(thirtyTwo->canopyAnchorCount == 2);
 
-    for (const auto& mesh : {two, four, eight, sixteen}) {
-        REQUIRE(mesh->canopyImpostorQuadCount == mesh->canopyAnchorCount * 9);
+    for (const auto& mesh : {two, four, eight, sixteen, thirtyTwo}) {
+        REQUIRE(mesh->canopyImpostorQuadCount == mesh->canopyAnchorCount * 19);
         const size_t canopyVertexCount = static_cast<size_t>(mesh->canopyImpostorQuadCount) * 4;
         REQUIRE(
             std::count_if(mesh->vertices.begin(), mesh->vertices.end(), [](const Vertex& vertex) {
@@ -673,18 +3712,605 @@ TEST_CASE("Far terrain retains deterministic forests through every LOD",
             FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source)->deterministicHash);
 }
 
-TEST_CASE("Far terrain greedily merges flat terrain and water", "[render][far-terrain]") {
+TEST_CASE("Step-two exact-anchor canopies reuse their resident voxel ground",
+          "[render][far-terrain][canopy][lod][grounding][performance][regression]") {
+    size_t blockTwoSamples = 0;
     FarTerrainSource source;
-    source.geometry = [](int64_t, int64_t) {
-        FarTerrainGeometrySample sample;
-        sample.terrainHeight = 40.0;
-        sample.waterSurface = 64.0;
-        sample.ocean = true;
-        return sample;
+    source.sample = [&](int64_t x, int64_t, worldgen::SurfaceFootprint footprint) {
+        if (footprint == worldgen::SurfaceFootprint::BLOCK_2)
+            ++blockTwoSamples;
+        const double terrainHeight = 64.0 + static_cast<double>(x) * 0.5;
+        FarTerrainGeometrySample geometry;
+        geometry.terrainHeight = terrainHeight;
+        geometry.waterSurface = SEA_LEVEL;
+        return FarSurfaceSample{
+            .geometry = geometry,
+            .footprintMinimumTerrainHeight = terrainHeight,
+            .footprintMaximumTerrainHeight = terrainHeight,
+            .materialPalette = testMaterialPalette(BlockType::GRASS),
+        };
     };
-    source.material = [](int64_t, int64_t, const FarTerrainGeometrySample&) {
-        return BlockType::SAND;
+    FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source);
+    const size_t baselineBlockTwoSamples = blockTwoSamples;
+    blockTwoSamples = 0;
+
+    source.canopies = [](int64_t, int64_t, int64_t, int64_t, FarTerrainStep) {
+        return std::vector{FarCanopy{
+            .x = 5,
+            .z = 5,
+            .baseY = 65,
+            .topY = 73,
+            .canopyMinimumY = 69,
+            .canopyMaximumY = 73,
+            .canopyRadius = 2,
+            .logBlock = BlockType::LOG,
+            .leafBlock = BlockType::LEAVES,
+            .anchorId = 1,
+            .aggregate = false,
+        }};
     };
+
+    const auto mesh = FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source);
+    REQUIRE(blockTwoSamples == baselineBlockTwoSamples);
+    REQUIRE(mesh->canopyAnchorCount == 1);
+
+    float minimumCanopyY = std::numeric_limits<float>::max();
+    for (const Vertex& vertex : mesh->vertices) {
+        if ((vertex.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) == 0U)
+            continue;
+        minimumCanopyY = std::min(minimumCanopyY, static_cast<float>(vertex.py));
+    }
+    // The anchor lies in the [4, 6) voxel cell, whose filtered center-equivalent
+    // top is 67. Conservative bounds do not lower its visible ground.
+    REQUIRE(minimumCanopyY == 67.0F);
+}
+
+TEST_CASE("Far canopies keep one half-open owner across signed tile boundaries",
+          "[render][far-terrain][canopy][ownership][seam][lod][flicker][regression]") {
+    FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 64.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::GRASS; });
+    const auto canopy = [](int64_t x, BlockType logBlock, BlockType leafBlock, uint64_t anchorId) {
+        return FarCanopy{
+            .x = x,
+            .z = 96,
+            .baseY = 65,
+            .topY = 74,
+            .canopyMinimumY = 69,
+            .canopyMaximumY = 74,
+            .canopyRadius = 3,
+            .logBlock = logBlock,
+            .leafBlock = leafBlock,
+            .anchorId = anchorId,
+            .aggregate = true,
+        };
+    };
+    const std::array canopies = {
+        canopy(-257, BlockType::SPRUCE_LOG, BlockType::SPRUCE_LEAVES, 1),
+        canopy(-256, BlockType::ACACIA_LOG, BlockType::ACACIA_LEAVES, 2),
+        canopy(-1, BlockType::PALM_LOG, BlockType::PALM_LEAVES, 3),
+        canopy(0, BlockType::SPRUCE_LOG, BlockType::SPRUCE_LEAVES, 4),
+        canopy(255, BlockType::ACACIA_LOG, BlockType::ACACIA_LEAVES, 5),
+        canopy(256, BlockType::PALM_LOG, BlockType::PALM_LEAVES, 6),
+    };
+    source.canopies = [canopies](int64_t, int64_t, int64_t, int64_t, FarTerrainStep) {
+        return std::vector<FarCanopy>(canopies.begin(), canopies.end());
+    };
+
+    const auto canopyVertices = [](const FarTerrainMesh& mesh) {
+        std::vector<Vertex> result;
+        for (const Vertex& vertex : mesh.vertices) {
+            if ((vertex.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) != 0U)
+                result.push_back(vertex);
+        }
+        return result;
+    };
+    const auto sameVertices = [](std::span<const Vertex> first, std::span<const Vertex> second) {
+        return first.size() == second.size() &&
+               std::equal(first.begin(), first.end(), second.begin(),
+                          [](const Vertex& lhs, const Vertex& rhs) {
+                              return lhs.faceAttr == rhs.faceAttr &&
+                                     static_cast<float>(lhs.px) == static_cast<float>(rhs.px) &&
+                                     static_cast<float>(lhs.py) == static_cast<float>(rhs.py) &&
+                                     static_cast<float>(lhs.pz) == static_cast<float>(rhs.pz) &&
+                                     static_cast<float>(lhs.u) == static_cast<float>(rhs.u) &&
+                                     static_cast<float>(lhs.v) == static_cast<float>(rhs.v);
+                          });
+    };
+
+    constexpr std::array TILE_X = {-2LL, -1LL, 0LL, 1LL};
+    constexpr std::array EXPECTED_OWNERS = {1U, 2U, 2U, 1U};
+    size_t fineOwners = 0;
+    size_t coarseOwners = 0;
+    for (size_t index = 0; index < TILE_X.size(); ++index) {
+        const auto fine = FarTerrainMesher::build({TILE_X[index], 0, FarTerrainStep::TWO}, source);
+        const auto coarse =
+            FarTerrainMesher::build({TILE_X[index], 0, FarTerrainStep::THIRTY_TWO}, source);
+        CAPTURE(TILE_X[index]);
+        REQUIRE(fine->canopyAnchorCount == EXPECTED_OWNERS[index]);
+        REQUIRE(coarse->canopyAnchorCount == EXPECTED_OWNERS[index]);
+        fineOwners += fine->canopyAnchorCount;
+        coarseOwners += coarse->canopyAnchorCount;
+
+        // Each owner emits the complete species silhouette even when its crown
+        // crosses the tile face. The adjacent loaded tile does not emit a
+        // replacement, and changing far tiers does not resize or relocate it.
+        const std::vector<Vertex> fineCanopyVertices = canopyVertices(*fine);
+        const std::vector<Vertex> coarseCanopyVertices = canopyVertices(*coarse);
+        REQUIRE_FALSE(fineCanopyVertices.empty());
+        REQUIRE(sameVertices(fineCanopyVertices, coarseCanopyVertices));
+        for (const Vertex& vertex : fineCanopyVertices) {
+            const unsigned int face = static_cast<unsigned int>(unpackFace(vertex.faceAttr));
+            REQUIRE_FALSE(farTerrainOpaqueRiserUsesEmittingColumn(face, true, false));
+            const simd_float2 position =
+                simd_make_float2(static_cast<float>(vertex.px), static_cast<float>(vertex.pz));
+            const simd_float2 ownershipSample = farTerrainExactOwnershipSamplePosition(
+                position, face, farTerrainOpaqueRiserUsesEmittingColumn(face, true, false));
+            REQUIRE(ownershipSample.x == position.x);
+            REQUIRE(ownershipSample.y == position.y);
+        }
+        const auto [minimumX, maximumX] =
+            std::minmax_element(fineCanopyVertices.begin(), fineCanopyVertices.end(),
+                                [](const Vertex& lhs, const Vertex& rhs) {
+                                    return static_cast<float>(lhs.px) < static_cast<float>(rhs.px);
+                                });
+        REQUIRE((static_cast<float>(minimumX->px) < 0.0F ||
+                 static_cast<float>(maximumX->px) > FAR_TERRAIN_TILE_EDGE_BLOCKS));
+    }
+    REQUIRE(fineOwners == canopies.size());
+    REQUIRE(coarseOwners == canopies.size());
+}
+
+TEST_CASE("Far canopy leaf materials produce distinct voxel silhouettes",
+          "[render][far-terrain][canopy][species][regression]") {
+    FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 64.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::GRASS; });
+    source.canopies = [](int64_t, int64_t, int64_t, int64_t, FarTerrainStep) {
+        const auto canopy = [](int64_t x, BlockType logBlock, BlockType leafBlock,
+                               feature_generation::TreeSpecies species, uint64_t anchorId) {
+            return FarCanopy{
+                .x = x,
+                .z = 96,
+                .baseY = 64,
+                .topY = 73,
+                .canopyMinimumY = 68,
+                .canopyMaximumY = 73,
+                .canopyRadius = 3,
+                .logBlock = logBlock,
+                .leafBlock = leafBlock,
+                .anchorId = anchorId,
+                .species = species,
+            };
+        };
+        return std::vector{
+            canopy(32, BlockType::SPRUCE_LOG, BlockType::SPRUCE_LEAVES,
+                   feature_generation::TreeSpecies::SPRUCE, 1),
+            canopy(96, BlockType::ACACIA_LOG, BlockType::ACACIA_LEAVES,
+                   feature_generation::TreeSpecies::ACACIA, 5),
+            canopy(160, BlockType::PALM_LOG, BlockType::PALM_LEAVES,
+                   feature_generation::TreeSpecies::PALM, 9),
+            // Species is authoritative even when a material differs. This
+            // deliberately mismatched fixture must keep an oak silhouette
+            // while using jungle leaves as its texture layer.
+            canopy(224, BlockType::LOG, BlockType::JUNGLE_LEAVES,
+                   feature_generation::TreeSpecies::OAK, 13),
+        };
+    };
+
+    const auto mesh = FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source);
+    struct TopSpan {
+        float width = 0.0F;
+        float depth = 0.0F;
+    };
+    const auto topSpans = [&](BlockType leafBlock) {
+        struct Extents {
+            float minimumX = std::numeric_limits<float>::max();
+            float maximumX = std::numeric_limits<float>::lowest();
+            float minimumZ = std::numeric_limits<float>::max();
+            float maximumZ = std::numeric_limits<float>::lowest();
+        };
+        std::map<float, Extents> byHeight;
+        for (const Vertex& vertex : mesh->vertices) {
+            if ((vertex.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) == 0U ||
+                unpackTextureLayer(vertex.faceAttr) != static_cast<uint8_t>(leafBlock) ||
+                unpackFace(vertex.faceAttr) != FaceNormal::PLUS_Y) {
+                continue;
+            }
+            Extents& extents = byHeight[static_cast<float>(vertex.py)];
+            extents.minimumX = std::min(extents.minimumX, static_cast<float>(vertex.px));
+            extents.maximumX = std::max(extents.maximumX, static_cast<float>(vertex.px));
+            extents.minimumZ = std::min(extents.minimumZ, static_cast<float>(vertex.pz));
+            extents.maximumZ = std::max(extents.maximumZ, static_cast<float>(vertex.pz));
+        }
+        std::vector<TopSpan> result;
+        for (const auto& [height, extents] : byHeight) {
+            (void)height;
+            result.push_back({.width = extents.maximumX - extents.minimumX,
+                              .depth = extents.maximumZ - extents.minimumZ});
+        }
+        return result;
+    };
+
+    const std::vector<TopSpan> spruce = topSpans(BlockType::SPRUCE_LEAVES);
+    REQUIRE(spruce.size() == 4);
+    REQUIRE(spruce[0].width > spruce[1].width);
+    REQUIRE(spruce[1].width > spruce[2].width);
+    REQUIRE(spruce[2].width > spruce[3].width);
+    REQUIRE(std::ranges::all_of(spruce, [](TopSpan span) { return span.width == span.depth; }));
+
+    const std::vector<TopSpan> acacia = topSpans(BlockType::ACACIA_LEAVES);
+    REQUIRE(acacia.size() == 2);
+    REQUIRE(acacia[0].width > acacia[1].width);
+    REQUIRE(acacia[0].width == acacia[0].depth);
+    REQUIRE(acacia[1].width == acacia[1].depth);
+
+    const std::vector<TopSpan> palm = topSpans(BlockType::PALM_LEAVES);
+    REQUIRE(palm.size() == 3);
+    REQUIRE(palm[0].width > palm[0].depth);
+    REQUIRE(palm[1].width < palm[1].depth);
+    REQUIRE(palm[2].width == palm[2].depth);
+    REQUIRE(palm[2].width < palm[0].width);
+
+    const std::vector<TopSpan> authoritativeOak = topSpans(BlockType::JUNGLE_LEAVES);
+    REQUIRE(authoritativeOak.size() == 3);
+    REQUIRE(authoritativeOak[0].width < authoritativeOak[1].width);
+    REQUIRE(authoritativeOak[1].width > authoritativeOak[2].width);
+    REQUIRE(authoritativeOak[0].width == authoritativeOak[2].width);
+    REQUIRE(std::ranges::all_of(authoritativeOak,
+                                [](TopSpan span) { return span.width == span.depth; }));
+    REQUIRE(mesh->canopyImpostorQuadCount == 76);
+    REQUIRE(mesh->deterministicHash ==
+            FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source)->deterministicHash);
+}
+
+TEST_CASE("Step-two fallen logs retain their exact horizontal morphology",
+          "[render][far-terrain][canopy][species][fallen-log][lod][regression]") {
+    FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 64.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::GRASS; });
+    source.canopies = [](int64_t, int64_t, int64_t, int64_t, FarTerrainStep) {
+        return std::vector{FarCanopy{
+            .x = 32,
+            .z = 48,
+            .baseY = 65,
+            .topY = 65,
+            .canopyMinimumY = 65,
+            .canopyMaximumY = 65,
+            .logBlock = BlockType::WILLOW_LOG,
+            .anchorId = 17,
+            .species = feature_generation::TreeSpecies::FALLEN_LOG,
+            .formX = 1,
+            .formExtent = 7,
+        }};
+    };
+
+    const auto fine = FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source);
+    const auto coarse = FarTerrainMesher::build({0, 0, FarTerrainStep::THIRTY_TWO}, source);
+    REQUIRE(fine->canopyAnchorCount == 1);
+    REQUIRE(fine->canopyImpostorQuadCount == 5);
+    REQUIRE(fine->canopyImpostorQuadCount == coarse->canopyImpostorQuadCount);
+
+    float minimumX = std::numeric_limits<float>::max();
+    float maximumX = std::numeric_limits<float>::lowest();
+    float minimumY = std::numeric_limits<float>::max();
+    float maximumY = std::numeric_limits<float>::lowest();
+    float minimumZ = std::numeric_limits<float>::max();
+    float maximumZ = std::numeric_limits<float>::lowest();
+    for (const Vertex& vertex : fine->vertices) {
+        if ((vertex.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) == 0U)
+            continue;
+        minimumX = std::min(minimumX, static_cast<float>(vertex.px));
+        maximumX = std::max(maximumX, static_cast<float>(vertex.px));
+        minimumY = std::min(minimumY, static_cast<float>(vertex.py));
+        maximumY = std::max(maximumY, static_cast<float>(vertex.py));
+        minimumZ = std::min(minimumZ, static_cast<float>(vertex.pz));
+        maximumZ = std::max(maximumZ, static_cast<float>(vertex.pz));
+    }
+    REQUIRE(maximumX - minimumX == 7.0F);
+    REQUIRE(maximumY - minimumY == 1.0F);
+    REQUIRE(maximumZ - minimumZ == 1.0F);
+    REQUIRE(fine->deterministicHash ==
+            FarTerrainMesher::build({0, 0, FarTerrainStep::TWO}, source)->deterministicHash);
+}
+
+TEST_CASE("Production step-two meshing uses shared exact tree roots without scalar basin work",
+          "[render][far-terrain][canopy][worldgen][performance][handoff][regression]") {
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    const uint64_t scalarCallsBefore = generator->basinCacheMetrics().scalarSampleCalls;
+    const FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    const auto mesh = FarTerrainMesher::build({-1, 0, FarTerrainStep::TWO}, source);
+    const std::vector<FarCanopy> canopies = generator->collectFarCanopiesForLod(-256, 0, 0, 256, 2);
+    const size_t owned = std::ranges::count_if(canopies, [](const FarCanopy& canopy) {
+        return canopy.x >= -256 && canopy.x < 0 && canopy.z >= 0 && canopy.z < 256;
+    });
+    REQUIRE(owned > 0);
+    REQUIRE(mesh->canopyAnchorCount == owned);
+    REQUIRE(generator->cachedColumnPlanCount() == 0);
+    REQUIRE(generator->basinCacheMetrics().scalarSampleCalls == scalarCallsBefore);
+
+    generator->clearMacroCaches();
+    const auto rebuilt = FarTerrainMesher::build({-1, 0, FarTerrainStep::TWO}, source);
+    REQUIRE(rebuilt->deterministicHash == mesh->deterministicHash);
+    REQUIRE(rebuilt->canopyAnchorCount == mesh->canopyAnchorCount);
+}
+
+TEST_CASE("Step-thirty-two coverage batches water and aggregate forest authority",
+          "[render][far-terrain][coverage][water][canopy][batch][performance][determinism]") {
+    auto generator = std::make_shared<ChunkGenerator>(42);
+    FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    REQUIRE(source.geometryPoints);
+    // The reported seed-42 camera tile contains a mixed coastal forest. Use
+    // it to prove the coverage preview keeps both land canopies and canonical
+    // water without invoking scalar basin sampling.
+    constexpr FarTerrainKey KEY{-1, 0, FarTerrainStep::THIRTY_TWO};
+    size_t expectedCanopyCount = 0;
+    const auto collectCanopies = source.canopies;
+    source.canopies = [&](int64_t minimumX, int64_t minimumZ, int64_t maximumX, int64_t maximumZ,
+                          FarTerrainStep step) {
+        std::vector<FarCanopy> canopies =
+            collectCanopies(minimumX, minimumZ, maximumX, maximumZ, step);
+        expectedCanopyCount = std::ranges::count_if(canopies, [&](const FarCanopy& canopy) {
+            return canopy.x >= minimumX && canopy.x < maximumX && canopy.z >= minimumZ &&
+                   canopy.z < maximumZ;
+        });
+        return canopies;
+    };
+    const uint64_t scalarCallsBefore = generator->basinCacheMetrics().scalarSampleCalls;
+    const auto first = FarTerrainMesher::build(KEY, source);
+    REQUIRE(first->canopyAnchorCount > 0);
+    REQUIRE(first->canopyAnchorCount == expectedCanopyCount);
+    REQUIRE(first->waterQuadCount + first->waterContourTriangleCount > 0);
+    REQUIRE(generator->basinCacheMetrics().scalarSampleCalls == scalarCallsBefore);
+
+    generator->clearMacroCaches();
+    const auto rebuilt = FarTerrainMesher::build(KEY, source);
+    REQUIRE(rebuilt->deterministicHash == first->deterministicHash);
+    REQUIRE(rebuilt->vertices.size() == first->vertices.size());
+    REQUIRE(std::equal(first->vertices.begin(), first->vertices.end(), rebuilt->vertices.begin(),
+                       [](const Vertex& left, const Vertex& right) {
+                           return left.faceAttr == right.faceAttr && left.px == right.px &&
+                                  left.py == right.py && left.pz == right.pz && left.u == right.u &&
+                                  left.v == right.v;
+                       }));
+    REQUIRE(rebuilt->indices == first->indices);
+    REQUIRE(generator->basinCacheMetrics().scalarSampleCalls == scalarCallsBefore);
+}
+
+TEST_CASE("Step-eight and step-sixteen canonical water probes stay in bulk batches",
+          "[render][far-terrain][water][batch][performance][regression]") {
+    FarTerrainSource source = testFarTerrainSource(
+        [](int64_t x, int64_t z) {
+            FarTerrainGeometrySample sample;
+            const int64_t shoreline =
+                128 + static_cast<int64_t>(std::lround(std::sin(z * 0.075) * 13.0));
+            sample.lake = x < shoreline;
+            sample.waterBodyId = sample.lake ? 0x4255'4C4B'5741'5445ULL : worldgen::NO_WATER_BODY;
+            sample.terrainHeight = sample.lake ? 60.0 : 70.0;
+            sample.waterSurface = 64.0;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::STONE; });
+    const auto sample = source.sample;
+    std::vector<size_t> pointBatchSizes;
+    source.geometryPoints = [&](std::span<const ColumnPos> positions,
+                                worldgen::SurfaceFootprint footprint,
+                                std::span<FarTerrainGeometrySample> output) {
+        REQUIRE(output.size() == positions.size());
+        pointBatchSizes.push_back(positions.size());
+        for (size_t index = 0; index < positions.size(); ++index) {
+            output[index] = sample(positions[index].x, positions[index].z, footprint).geometry;
+        }
+    };
+
+    for (const FarTerrainStep step : {FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN}) {
+        const auto mesh = FarTerrainMesher::build({0, 0, step}, source);
+        REQUIRE(mesh->waterQuadCount + mesh->waterContourTriangleCount > 0);
+    }
+    REQUIRE_FALSE(pointBatchSizes.empty());
+    REQUIRE(std::ranges::none_of(pointBatchSizes, [](size_t size) { return size <= 1; }));
+}
+
+TEST_CASE("Far canopy layers stay inside exact bounds without LOD inflation",
+          "[render][far-terrain][canopy][lod][bounds][regression]") {
+    FarTerrainSource source;
+    source.sample = [](int64_t, int64_t, worldgen::SurfaceFootprint footprint) {
+        FarTerrainGeometrySample geometry;
+        geometry.terrainHeight = 60.0 + worldgen::surfaceFootprintWidth(footprint);
+        return FarSurfaceSample{
+            .geometry = geometry,
+            .footprintMinimumTerrainHeight = geometry.terrainHeight,
+            .footprintMaximumTerrainHeight = geometry.terrainHeight,
+            .materialPalette = testMaterialPalette(BlockType::GRASS),
+        };
+    };
+    source.canopies = [](int64_t, int64_t, int64_t, int64_t, FarTerrainStep step) {
+        return std::vector{FarCanopy{
+            .x = 64,
+            .z = 64,
+            .baseY = 64,
+            .topY = 72,
+            .canopyMinimumY = 67,
+            .canopyMaximumY = 72,
+            .canopyRadius = 3,
+            .logBlock = BlockType::LOG,
+            .leafBlock = BlockType::LEAVES,
+            .anchorId = 1,
+            .aggregate = farTerrainStepSize(step) >= 8,
+        }};
+    };
+
+    const auto leafVertices = [](const FarTerrainMesh& mesh) {
+        std::vector<Vertex> result;
+        std::ranges::copy_if(mesh.vertices, std::back_inserter(result), [](const Vertex& vertex) {
+            return (vertex.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) != 0U &&
+                   unpackTextureLayer(vertex.faceAttr) == static_cast<uint8_t>(BlockType::LEAVES);
+        });
+        return result;
+    };
+    const auto requireSameVertices = [](const std::vector<Vertex>& first,
+                                        const std::vector<Vertex>& second) {
+        REQUIRE(first.size() == second.size());
+        const auto minimumY = [](const std::vector<Vertex>& vertices) {
+            return std::ranges::min(
+                vertices, {}, [](const Vertex& vertex) { return static_cast<float>(vertex.py); });
+        };
+        const float firstMinimumY = static_cast<float>(minimumY(first).py);
+        const float secondMinimumY = static_cast<float>(minimumY(second).py);
+        for (size_t index = 0; index < first.size(); ++index) {
+            CAPTURE(index);
+            REQUIRE(first[index].faceAttr == second[index].faceAttr);
+            REQUIRE(static_cast<float>(first[index].px) == static_cast<float>(second[index].px));
+            REQUIRE(static_cast<float>(first[index].py) - firstMinimumY ==
+                    static_cast<float>(second[index].py) - secondMinimumY);
+            REQUIRE(static_cast<float>(first[index].pz) == static_cast<float>(second[index].pz));
+            REQUIRE(static_cast<float>(first[index].u) == static_cast<float>(second[index].u));
+            REQUIRE(static_cast<float>(first[index].v) == static_cast<float>(second[index].v));
+        }
+    };
+
+    std::vector<std::vector<Vertex>> verticesByLod;
+    for (FarTerrainStep step : {FarTerrainStep::TWO, FarTerrainStep::FOUR, FarTerrainStep::EIGHT,
+                                FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO}) {
+        const auto mesh = FarTerrainMesher::build({0, 0, step}, source);
+        const std::vector<Vertex> vertices = leafVertices(*mesh);
+        REQUIRE(vertices.size() == 15 * 4);
+        float minimumX = std::numeric_limits<float>::max();
+        float maximumX = std::numeric_limits<float>::lowest();
+        float minimumY = std::numeric_limits<float>::max();
+        float maximumY = std::numeric_limits<float>::lowest();
+        float minimumZ = std::numeric_limits<float>::max();
+        float maximumZ = std::numeric_limits<float>::lowest();
+        for (const Vertex& vertex : vertices) {
+            minimumX = std::min(minimumX, static_cast<float>(vertex.px));
+            maximumX = std::max(maximumX, static_cast<float>(vertex.px));
+            minimumY = std::min(minimumY, static_cast<float>(vertex.py));
+            maximumY = std::max(maximumY, static_cast<float>(vertex.py));
+            minimumZ = std::min(minimumZ, static_cast<float>(vertex.pz));
+            maximumZ = std::max(maximumZ, static_cast<float>(vertex.pz));
+        }
+        REQUIRE(maximumX - minimumX == 7.0F);
+        REQUIRE(maximumY - minimumY == 6.0F);
+        REQUIRE(maximumZ - minimumZ == 7.0F);
+
+        for (size_t offset = 0; offset < vertices.size(); offset += 4) {
+            float quadMinimumY = std::numeric_limits<float>::max();
+            float quadMaximumY = std::numeric_limits<float>::lowest();
+            float quadMinimumHorizontal = std::numeric_limits<float>::max();
+            float quadMaximumHorizontal = std::numeric_limits<float>::lowest();
+            const FaceNormal face = unpackFace(vertices[offset].faceAttr);
+            for (size_t corner = 0; corner < 4; ++corner) {
+                const Vertex& vertex = vertices[offset + corner];
+                quadMinimumY = std::min(quadMinimumY, static_cast<float>(vertex.py));
+                quadMaximumY = std::max(quadMaximumY, static_cast<float>(vertex.py));
+                const float horizontal = face == FaceNormal::PLUS_X || face == FaceNormal::MINUS_X
+                                             ? static_cast<float>(vertex.pz)
+                                             : static_cast<float>(vertex.px);
+                quadMinimumHorizontal = std::min(quadMinimumHorizontal, horizontal);
+                quadMaximumHorizontal = std::max(quadMaximumHorizontal, horizontal);
+            }
+            const bool giantSide = quadMaximumY - quadMinimumY == 6.0F &&
+                                   quadMaximumHorizontal - quadMinimumHorizontal == 7.0F;
+            REQUIRE_FALSE(giantSide);
+        }
+        verticesByLod.push_back(vertices);
+    }
+    requireSameVertices(verticesByLod[0], verticesByLod[1]);
+    requireSameVertices(verticesByLod[2], verticesByLod[3]);
+    requireSameVertices(verticesByLod[3], verticesByLod[4]);
+}
+
+TEST_CASE("Coarse far forests retain hierarchical compact anchors",
+          "[render][far-terrain][canopy][lod][worldgen][determinism][regression]") {
+    constexpr int64_t MINIMUM_X = -27'136;
+    constexpr int64_t MINIMUM_Z = -16'896;
+    constexpr int64_t MAXIMUM_X = MINIMUM_X + 256;
+    constexpr int64_t MAXIMUM_Z = MINIMUM_Z + 256;
+    ChunkGenerator generator(42);
+
+    const std::vector<FarCanopy> nearAnchors =
+        generator.collectFarCanopiesForLod(MINIMUM_X, MINIMUM_Z, MAXIMUM_X, MAXIMUM_Z, 2);
+    REQUIRE_FALSE(nearAnchors.empty());
+    REQUIRE(generator.collectFarCanopiesForLod(MINIMUM_X, MINIMUM_Z, MAXIMUM_X, MAXIMUM_Z, 2) ==
+            nearAnchors);
+    for (const FarCanopy& canopy : nearAnchors) {
+        REQUIRE_FALSE(canopy.aggregate);
+        REQUIRE(canopy.anchorId != 0);
+        REQUIRE((canopy.logBlock != BlockType::AIR || canopy.leafBlock != BlockType::AIR));
+    }
+
+    // Step two preserves exact accepted roots for a stable near handoff.
+    // Aggregate cover begins at step four, then each coarser tier retains a
+    // strict subset of the same fixed forest-cell candidates.
+    constexpr std::array LOD_STEPS = {4, 8, 16, 32};
+    constexpr std::array CROWN_LIMITS = {5U, 4U, 3U, 2U};
+    using Cell = std::pair<int64_t, int64_t>;
+    std::array<std::vector<FarCanopy>, LOD_STEPS.size()> tiers;
+    std::array<std::map<Cell, size_t>, LOD_STEPS.size()> counts;
+
+    for (size_t tierIndex = 0; tierIndex < LOD_STEPS.size(); ++tierIndex) {
+        const int step = LOD_STEPS[tierIndex];
+        tiers[tierIndex] =
+            generator.collectFarCanopiesForLod(MINIMUM_X, MINIMUM_Z, MAXIMUM_X, MAXIMUM_Z, step);
+        REQUIRE_FALSE(tiers[tierIndex].empty());
+        REQUIRE(generator.collectFarCanopiesForLod(MINIMUM_X, MINIMUM_Z, MAXIMUM_X, MAXIMUM_Z,
+                                                   step) == tiers[tierIndex]);
+        for (const FarCanopy& canopy : tiers[tierIndex]) {
+            REQUIRE(canopy.aggregate);
+            REQUIRE(canopy.canopyRadius <= 3);
+            REQUIRE(static_cast<int>(canopy.canopyRadius) * 2 + 1 <= 7);
+            ++counts[tierIndex][{world_coord::floorDiv(canopy.x, int64_t{64}),
+                                 world_coord::floorDiv(canopy.z, int64_t{64})}];
+        }
+        if (tierIndex == 0)
+            continue;
+        REQUIRE(tiers[tierIndex].size() <= tiers[tierIndex - 1].size());
+        std::unordered_map<uint64_t, FarCanopy> nearer;
+        for (const FarCanopy& canopy : tiers[tierIndex - 1]) {
+            REQUIRE(nearer.emplace(canopy.anchorId, canopy).second);
+        }
+        for (const FarCanopy& canopy : tiers[tierIndex]) {
+            const auto matching = nearer.find(canopy.anchorId);
+            REQUIRE(matching != nearer.end());
+            REQUIRE(matching->second == canopy);
+        }
+    }
+
+    bool sawSeveralCrowns = false;
+    for (const auto& [cell, finestCount] : counts.front()) {
+        REQUIRE(finestCount <= CROWN_LIMITS.front());
+        for (size_t tierIndex = 1; tierIndex < counts.size(); ++tierIndex) {
+            REQUIRE(counts[tierIndex][cell] ==
+                    std::min<size_t>(finestCount, CROWN_LIMITS[tierIndex]));
+        }
+        sawSeveralCrowns = sawSeveralCrowns || counts.back()[cell] >= 2;
+    }
+    REQUIRE(sawSeveralCrowns);
+    REQUIRE(generator.cachedColumnPlanCount() == 0);
+}
+
+TEST_CASE("Far terrain greedily merges flat terrain and water", "[render][far-terrain]") {
+    const FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 40.0;
+            sample.waterSurface = 64.0;
+            sample.ocean = true;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::SAND; });
     const auto mesh = FarTerrainMesher::build(FarTerrainKey{-2, 3, FarTerrainStep::FOUR}, source);
     REQUIRE(sizeof(Vertex) == 16);
     REQUIRE(mesh->originX == -512);
@@ -750,17 +4376,15 @@ TEST_CASE("Far terrain greedily merges flat terrain and water", "[render][far-te
 
 TEST_CASE("Far terrain water follows deterministic shoreline contours",
           "[render][far-terrain][water][seam]") {
-    FarTerrainSource source;
-    source.geometry = [](int64_t x, int64_t) {
-        FarTerrainGeometrySample sample;
-        sample.terrainHeight = 40.0;
-        sample.waterSurface = 64.0;
-        sample.ocean = x < FAR_TERRAIN_TILE_EDGE / 2;
-        return sample;
-    };
-    source.material = [](int64_t, int64_t, const FarTerrainGeometrySample&) {
-        return BlockType::SAND;
-    };
+    const FarTerrainSource source = testFarTerrainSource(
+        [](int64_t x, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 40.0;
+            sample.waterSurface = 64.0;
+            sample.ocean = x < FAR_TERRAIN_TILE_EDGE / 2;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::SAND; });
 
     const FarTerrainKey key{0, 0, FarTerrainStep::SIXTEEN};
     const auto first = FarTerrainMesher::build(key, source);
@@ -794,17 +4418,15 @@ TEST_CASE("Far terrain water follows deterministic shoreline contours",
 
 TEST_CASE("Coarse lake contours stop at the supported shoreline",
           "[render][far-terrain][water][lake][support]") {
-    FarTerrainSource source;
-    source.geometry = [](int64_t x, int64_t) {
-        FarTerrainGeometrySample sample;
-        sample.terrainHeight = x < 100 ? 74.0 : 84.0;
-        sample.waterSurface = x < 100 ? 80.0 : SEA_LEVEL;
-        sample.lake = x < 100;
-        return sample;
-    };
-    source.material = [](int64_t, int64_t, const FarTerrainGeometrySample&) {
-        return BlockType::CLAY;
-    };
+    const FarTerrainSource source = testFarTerrainSource(
+        [](int64_t x, int64_t) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = x < 100 ? 74.0 : 84.0;
+            sample.waterSurface = x < 100 ? 80.0 : SEA_LEVEL;
+            sample.lake = x < 100;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::CLAY; });
 
     const auto mesh = FarTerrainMesher::build(FarTerrainKey{0, 0, FarTerrainStep::SIXTEEN}, source);
     float easternmostWater = 0.0F;
@@ -817,19 +4439,150 @@ TEST_CASE("Coarse lake contours stop at the supported shoreline",
     REQUIRE(easternmostWater <= 99.5F);
 }
 
+TEST_CASE("Far water never triangulates between distinct standing bodies",
+          "[render][far-terrain][water][authority][seam][lod][regression]") {
+    const FarTerrainSource source = testFarTerrainSource(
+        [](int64_t x, int64_t z) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 40.0;
+            sample.lake = true;
+            if (x + z < 400) {
+                sample.waterBodyId = 0xA11CE;
+                sample.waterSurface = 307.875;
+            } else {
+                sample.waterBodyId = 0xB0B;
+                sample.waterSurface = 106.875;
+            }
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::CLAY; });
+
+    const auto coarse = FarTerrainMesher::build({0, 0, FarTerrainStep::SIXTEEN}, source);
+    const auto fine = FarTerrainMesher::build({1, 0, FarTerrainStep::FOUR}, source);
+    const auto requireNoWaterBridge = [](const FarTerrainMesh& mesh) {
+        bool sawUpperBody = false;
+        bool sawLowerBody = false;
+        for (size_t offset = mesh.opaqueIndexCount; offset + 2 < mesh.indices.size(); offset += 3) {
+            std::array<float, 3> heights{};
+            for (size_t corner = 0; corner < heights.size(); ++corner) {
+                heights[corner] =
+                    static_cast<float>(mesh.vertices[mesh.indices[offset + corner]].py);
+                sawUpperBody = sawUpperBody || heights[corner] > 300.0F;
+                sawLowerBody = sawLowerBody || heights[corner] < 110.0F;
+            }
+            const auto [minimum, maximum] = std::minmax_element(heights.begin(), heights.end());
+            CAPTURE(mesh.key.tileX, mesh.key.tileZ, static_cast<int>(mesh.key.step), *minimum,
+                    *maximum);
+            REQUIRE(*maximum - *minimum <= 0.25F);
+        }
+        REQUIRE(sawUpperBody);
+        REQUIRE(sawLowerBody);
+    };
+    requireNoWaterBridge(*coarse);
+    requireNoWaterBridge(*fine);
+
+    const auto seamVertices = [](const FarTerrainMesh& mesh, float localX) {
+        std::set<std::pair<float, float>> result;
+        for (size_t offset = mesh.opaqueIndexCount; offset < mesh.indices.size(); ++offset) {
+            const Vertex& vertex = mesh.vertices[mesh.indices[offset]];
+            if (static_cast<float>(vertex.px) == localX) {
+                result.emplace(static_cast<float>(vertex.pz), static_cast<float>(vertex.py));
+            }
+        }
+        return result;
+    };
+    const auto coarseSeam = seamVertices(*coarse, static_cast<float>(FAR_TERRAIN_TILE_EDGE));
+    const auto fineSeam = seamVertices(*fine, 0.0F);
+    REQUIRE_FALSE(coarseSeam.empty());
+    REQUIRE_FALSE(fineSeam.empty());
+    for (int z = 0; z <= FAR_TERRAIN_TILE_EDGE; z += 2) {
+        const float expectedHeight =
+            static_cast<float>(static_cast<float16_t>(256 + z < 400 ? 307.875F : 106.875F));
+        CAPTURE(z, expectedHeight);
+        REQUIRE(coarseSeam.contains({static_cast<float>(z), expectedHeight}));
+        REQUIRE(fineSeam.contains({static_cast<float>(z), expectedHeight}));
+    }
+}
+
+TEST_CASE("Seed 764891 caldera water has no coarse interpolation wall",
+          "[render][far-terrain][water][authority][caldera][regression]") {
+    auto generator = std::make_shared<ChunkGenerator>(764891);
+    const FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    const FarTerrainGeometrySample caldera =
+        testFarGeometry(source, 23'029, -111'486, worldgen::SurfaceFootprint::BLOCK_16);
+    REQUIRE(caldera.lake);
+    REQUIRE(caldera.waterBodyId != worldgen::NO_WATER_BODY);
+    REQUIRE(caldera.waterSurface > 250.0);
+
+    const auto mesh = FarTerrainMesher::build({89, -436, FarTerrainStep::SIXTEEN}, source);
+    bool sawCalderaSurface = false;
+    for (size_t offset = mesh->opaqueIndexCount; offset + 2 < mesh->indices.size(); offset += 3) {
+        std::array<float, 3> heights{};
+        bool topSurface = true;
+        for (size_t corner = 0; corner < heights.size(); ++corner) {
+            const Vertex& vertex = mesh->vertices[mesh->indices[offset + corner]];
+            topSurface = topSurface && unpackFace(vertex.faceAttr) == FaceNormal::PLUS_Y &&
+                         !unpackFluidFalling(vertex.faceAttr);
+            heights[corner] = static_cast<float>(vertex.py);
+        }
+        if (!topSurface)
+            continue;
+        const auto [minimum, maximum] = std::minmax_element(heights.begin(), heights.end());
+        sawCalderaSurface = sawCalderaSurface || *maximum > 250.0F;
+        CAPTURE(*minimum, *maximum);
+        REQUIRE(*maximum - *minimum <= 8.0F);
+    }
+    REQUIRE(sawCalderaSurface);
+}
+
+TEST_CASE("Step 32 keeps caldera water and volcanic island land on canonical cells",
+          "[render][far-terrain][water][coverage][caldera][volcanic][ownership][regression]") {
+    auto generator = std::make_shared<ChunkGenerator>(764891);
+    FarTerrainSource source = FarTerrainMesher::generatorGeometrySource(generator);
+    source.canopies = {};
+    struct Fixture {
+        ColumnPos position;
+        bool wet;
+        const char* name;
+    };
+    constexpr std::array FIXTURES = {
+        Fixture{{23'024, -111'488}, true, "caldera lake"},
+        Fixture{{17'576, -9'632}, false, "volcanic island"},
+    };
+    for (const Fixture& fixture : FIXTURES) {
+        const int64_t tileX =
+            world_coord::floorDiv(fixture.position.x, int64_t{FAR_TERRAIN_TILE_EDGE});
+        const int64_t tileZ =
+            world_coord::floorDiv(fixture.position.z, int64_t{FAR_TERRAIN_TILE_EDGE});
+        const auto mesh =
+            FarTerrainMesher::build({tileX, tileZ, FarTerrainStep::THIRTY_TWO}, source);
+        const worldgen::SurfaceSample exact =
+            generator->sampleExactSurface(fixture.position.x, fixture.position.z);
+        const bool exactWet =
+            (exact.hydrology.ocean || exact.hydrology.river || exact.hydrology.lake) &&
+            exact.waterSurface > exact.terrainHeight + 0.01;
+        const float localX = static_cast<float>(fixture.position.x - mesh->originX) + 0.5F;
+        const float localZ = static_cast<float>(fixture.position.z - mesh->originZ) + 0.5F;
+        CAPTURE(fixture.name, tileX, tileZ, exactWet, exact.hydrology.waterBodyId, localX, localZ);
+        REQUIRE(exactWet == fixture.wet);
+        REQUIRE(farWaterTopCovers(*mesh, localX, localZ) == exactWet);
+        REQUIRE(mesh->waterContourTriangleCount == 0);
+        if (fixture.wet)
+            REQUIRE(exact.hydrology.waterBodyId != worldgen::NO_WATER_BODY);
+    }
+}
+
 TEST_CASE("Far terrain shoreline contours stitch across tile faces",
           "[render][far-terrain][water][seam]") {
-    FarTerrainSource source;
-    source.geometry = [](int64_t x, int64_t z) {
-        FarTerrainGeometrySample sample;
-        sample.terrainHeight = 40.0;
-        sample.waterSurface = 64.0;
-        sample.ocean = z < x - FAR_TERRAIN_TILE_EDGE / 2;
-        return sample;
-    };
-    source.material = [](int64_t, int64_t, const FarTerrainGeometrySample&) {
-        return BlockType::SAND;
-    };
+    const FarTerrainSource source = testFarTerrainSource(
+        [](int64_t x, int64_t z) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 40.0;
+            sample.waterSurface = 64.0;
+            sample.ocean = z < x - FAR_TERRAIN_TILE_EDGE / 2;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::SAND; });
     const auto left = FarTerrainMesher::build(FarTerrainKey{0, 0, FarTerrainStep::SIXTEEN}, source);
     const auto right =
         FarTerrainMesher::build(FarTerrainKey{1, 0, FarTerrainStep::SIXTEEN}, source);
@@ -871,17 +4624,15 @@ TEST_CASE("Far terrain shoreline contours stitch across tile faces",
 
 TEST_CASE("Narrow rivers retain identical coverage across mixed LOD tile faces",
           "[render][far-terrain][water][seam][lod]") {
-    FarTerrainSource source;
-    source.geometry = [](int64_t, int64_t z) {
-        FarTerrainGeometrySample sample;
-        sample.terrainHeight = 40.0;
-        sample.waterSurface = 64.0;
-        sample.river = z >= 5 && z <= 7;
-        return sample;
-    };
-    source.material = [](int64_t, int64_t, const FarTerrainGeometrySample&) {
-        return BlockType::CLAY;
-    };
+    const FarTerrainSource source = testFarTerrainSource(
+        [](int64_t, int64_t z) {
+            FarTerrainGeometrySample sample;
+            sample.terrainHeight = 40.0;
+            sample.waterSurface = 64.0;
+            sample.river = z >= 5 && z <= 7;
+            return sample;
+        },
+        [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::CLAY; });
     const auto fine = FarTerrainMesher::build({0, 0, FarTerrainStep::FOUR}, source);
     const auto coarse = FarTerrainMesher::build({1, 0, FarTerrainStep::SIXTEEN}, source);
 
@@ -915,6 +4666,87 @@ TEST_CASE("Narrow rivers retain identical coverage across mixed LOD tile faces",
     REQUIRE(coarse->complexity == 1.0F);
 }
 
+TEST_CASE("Orthogonal water boundary refinement owns each corner once",
+          "[render][far-terrain][water][seam][ownership][regression]") {
+    constexpr uint8_t WEST_EDGE = 1U << 0U;
+    constexpr uint8_t EAST_EDGE = 1U << 1U;
+    constexpr uint8_t NORTH_EDGE = 1U << 2U;
+    constexpr uint8_t SOUTH_EDGE = 1U << 3U;
+    for (uint8_t edgeMask = 0; edgeMask < 16; ++edgeMask) {
+        CAPTURE(static_cast<unsigned>(edgeMask));
+        const FarTerrainSource source = testFarTerrainSource(
+            [edgeMask](int64_t x, int64_t z) {
+                FarTerrainGeometrySample sample;
+                sample.terrainHeight = 40.0;
+                sample.waterSurface = 64.0;
+                const auto active = [edgeMask](uint8_t edge) { return (edgeMask & edge) != 0; };
+                bool wet = false;
+                wet = wet || (active(WEST_EDGE) && x <= 16 && z >= 48 && z <= 64);
+                wet = wet ||
+                      (active(EAST_EDGE) && x >= FAR_TERRAIN_TILE_EDGE - 16 && z >= 48 && z <= 64);
+                wet = wet || (active(NORTH_EDGE) && z <= 16 && x >= 48 && x <= 64);
+                wet = wet ||
+                      (active(SOUTH_EDGE) && z >= FAR_TERRAIN_TILE_EDGE - 16 && x >= 48 && x <= 64);
+                wet = wet || (active(WEST_EDGE) && active(NORTH_EDGE) && x <= 32 && z <= 32);
+                wet = wet || (active(EAST_EDGE) && active(NORTH_EDGE) &&
+                              x >= FAR_TERRAIN_TILE_EDGE - 32 && z <= 32);
+                wet = wet || (active(WEST_EDGE) && active(SOUTH_EDGE) && x <= 32 &&
+                              z >= FAR_TERRAIN_TILE_EDGE - 32);
+                wet = wet || (active(EAST_EDGE) && active(SOUTH_EDGE) &&
+                              x >= FAR_TERRAIN_TILE_EDGE - 32 && z >= FAR_TERRAIN_TILE_EDGE - 32);
+                sample.ocean = wet;
+                return sample;
+            },
+            [](int64_t, int64_t, const FarTerrainGeometrySample&) { return BlockType::SAND; });
+        const auto mesh = FarTerrainMesher::build({0, 0, FarTerrainStep::SIXTEEN}, source);
+
+        std::array<double, 4> cornerAreas{};
+        for (size_t offset = mesh->opaqueIndexCount; offset + 2 < mesh->indices.size();
+             offset += 3) {
+            std::array<const Vertex*, 3> vertices{};
+            for (size_t corner = 0; corner < vertices.size(); ++corner) {
+                vertices[corner] = &mesh->vertices[mesh->indices[offset + corner]];
+            }
+            const double x0 = static_cast<float>(vertices[0]->px);
+            const double z0 = static_cast<float>(vertices[0]->pz);
+            const double x1 = static_cast<float>(vertices[1]->px);
+            const double z1 = static_cast<float>(vertices[1]->pz);
+            const double x2 = static_cast<float>(vertices[2]->px);
+            const double z2 = static_cast<float>(vertices[2]->pz);
+            const double area = std::abs((x0 * (z1 - z2) + x1 * (z2 - z0) + x2 * (z0 - z1)) * 0.5);
+            constexpr float TILE_EDGE = static_cast<float>(FAR_TERRAIN_TILE_EDGE);
+            constexpr std::array<std::array<float, 4>, 4> CORNERS = {{
+                {{0.0F, 16.0F, 0.0F, 16.0F}},
+                {{TILE_EDGE - 16.0F, TILE_EDGE, 0.0F, 16.0F}},
+                {{0.0F, 16.0F, TILE_EDGE - 16.0F, TILE_EDGE}},
+                {{TILE_EDGE - 16.0F, TILE_EDGE, TILE_EDGE - 16.0F, TILE_EDGE}},
+            }};
+            for (size_t corner = 0; corner < CORNERS.size(); ++corner) {
+                const auto [minimumX, maximumX, minimumZ, maximumZ] = CORNERS[corner];
+                const bool inside = std::ranges::all_of(vertices, [&](const Vertex* vertex) {
+                    const float x = static_cast<float>(vertex->px);
+                    const float z = static_cast<float>(vertex->pz);
+                    return x >= minimumX && x <= maximumX && z >= minimumZ && z <= maximumZ;
+                });
+                if (inside)
+                    cornerAreas[corner] += area;
+            }
+        }
+        constexpr std::array<std::pair<uint8_t, uint8_t>, 4> INCIDENT_EDGES = {{
+            {WEST_EDGE, NORTH_EDGE},
+            {EAST_EDGE, NORTH_EDGE},
+            {WEST_EDGE, SOUTH_EDGE},
+            {EAST_EDGE, SOUTH_EDGE},
+        }};
+        for (size_t corner = 0; corner < cornerAreas.size(); ++corner) {
+            const auto [first, second] = INCIDENT_EDGES[corner];
+            const double expected =
+                (edgeMask & first) != 0 && (edgeMask & second) != 0 ? 16.0 * 16.0 : 0.0;
+            REQUIRE(cornerAreas[corner] == Catch::Approx(expected));
+        }
+    }
+}
+
 TEST_CASE("Far terrain meshes are order independent and stitch tile edges",
           "[render][far-terrain][determinism]") {
     const FarTerrainSource source = farTerrainTestSource();
@@ -932,7 +4764,34 @@ TEST_CASE("Far terrain meshes are order independent and stitch tile edges",
     const std::map<int, float> leftEdge = farTerrainEdge(*leftFirst, true);
     const std::map<int, float> rightEdge = farTerrainEdge(*rightFirst, false);
     REQUIRE_FALSE(leftEdge.empty());
-    REQUIRE(leftEdge == rightEdge);
+    REQUIRE_FALSE(rightEdge.empty());
+    REQUIRE(farTerrainTopsAreVoxelFlat(*leftFirst));
+    REQUIRE(farTerrainTopsAreVoxelFlat(*rightFirst));
+
+    bool sawHeightDifference = false;
+    constexpr int STEP = 4;
+    const int64_t sharedWorldX = rightKey.tileX * FAR_TERRAIN_TILE_EDGE;
+    for (int cellZ = 0; cellZ < FAR_TERRAIN_TILE_EDGE / STEP; ++cellZ) {
+        const int64_t worldZ = leftKey.tileZ * FAR_TERRAIN_TILE_EDGE + cellZ * STEP;
+        const float leftHeight =
+            expectedVoxelCellHeight(source, sharedWorldX - STEP, worldZ, FarTerrainStep::FOUR);
+        const float rightHeight =
+            expectedVoxelCellHeight(source, sharedWorldX, worldZ, FarTerrainStep::FOUR);
+        if (leftHeight == rightHeight)
+            continue;
+        sawHeightDifference = true;
+        if (leftHeight > rightHeight) {
+            REQUIRE(hasTerrainBoundaryRiser(
+                *leftFirst, FaceNormal::PLUS_X, static_cast<float>(FAR_TERRAIN_TILE_EDGE),
+                static_cast<float>(cellZ * STEP), static_cast<float>((cellZ + 1) * STEP),
+                rightHeight, leftHeight));
+        } else {
+            REQUIRE(hasTerrainBoundaryRiser(
+                *rightFirst, FaceNormal::MINUS_X, 0.0F, static_cast<float>(cellZ * STEP),
+                static_cast<float>((cellZ + 1) * STEP), leftHeight, rightHeight));
+        }
+    }
+    REQUIRE(sawHeightDifference);
 }
 
 TEST_CASE("Far terrain LOD edges share aligned samples and carry downward skirts",
@@ -943,14 +4802,22 @@ TEST_CASE("Far terrain LOD edges share aligned samples and carry downward skirts
         FarTerrainMesher::build(FarTerrainKey{1, 0, FarTerrainStep::SIXTEEN}, source);
     const std::map<int, float> fineEdge = farTerrainEdge(*fine, true);
     const std::map<int, float> coarseEdge = farTerrainEdge(*coarse, false);
-    for (const auto& [z, height] : coarseEdge) {
-        REQUIRE(fineEdge.contains(z));
-        REQUIRE(fineEdge.at(z) == height);
+    REQUIRE_FALSE(fineEdge.empty());
+    REQUIRE_FALSE(coarseEdge.empty());
+    for (const auto& [z, height] : fineEdge) {
+        CAPTURE(z);
+        REQUIRE(height == std::round(height));
     }
+    for (const auto& [z, height] : coarseEdge) {
+        CAPTURE(z);
+        REQUIRE(height == std::round(height));
+    }
+    REQUIRE(farTerrainTopsAreVoxelFlat(*fine));
+    REQUIRE(farTerrainTopsAreVoxelFlat(*coarse));
     REQUIRE(fine->skirtQuadCount == 256);
     REQUIRE(coarse->skirtQuadCount == 64);
     REQUIRE(fine->bounds.minY >= static_cast<float>(WORLD_MIN_Y));
-    REQUIRE(fine->bounds.minY <= fine->surfaceBounds.minY - FAR_TERRAIN_SKIRT_DEPTH + 0.01F);
+    REQUIRE(fine->bounds.minY <= fine->surfaceBounds.maxY - FAR_TERRAIN_SKIRT_DEPTH + 0.01F);
 }
 
 TEST_CASE("Terrain horizon culling is conservative", "[render][far-terrain][occlusion]") {
@@ -1016,8 +4883,8 @@ TEST_CASE("Far terrain scheduler bounds work and never builds on the caller",
     bool workersReleased = false;
     bool workerGateTimedOut = false;
     FarTerrainSource source = farTerrainTestSource();
-    const auto geometry = source.geometry;
-    source.geometry = [&](int64_t x, int64_t z) {
+    const auto sample = source.sample;
+    source.sample = [&](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
         {
             std::unique_lock lock(threadMutex);
             workerThreads.insert(std::this_thread::get_id());
@@ -1031,7 +4898,7 @@ TEST_CASE("Far terrain scheduler bounds work and never builds on the caller",
                 threadCv.notify_all();
             }
         }
-        return geometry(x, z);
+        return sample(x, z, footprint);
     };
     FarTerrainSchedulerLimits limits;
     constexpr int JOB_COUNT = static_cast<int>(FarTerrainScheduler::WORKER_COUNT * 2);
@@ -1045,7 +4912,9 @@ TEST_CASE("Far terrain scheduler bounds work and never builds on the caller",
     }
     REQUIRE_FALSE(scheduler.enqueue({JOB_COUNT, 0, FarTerrainStep::SIXTEEN}));
     REQUIRE_FALSE(scheduler.enqueue({0, 0, FarTerrainStep::SIXTEEN}));
-    for (int attempt = 0; attempt < 400 && scheduler.stats().inFlight != 0; ++attempt) {
+    for (int attempt = 0; attempt < 400 && (scheduler.stats().inFlight != 0 ||
+                                            scheduler.stats().maintenancePending != 0);
+         ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     const FarTerrainSchedulerStats stats = scheduler.stats();
@@ -1077,8 +4946,8 @@ TEST_CASE("Far terrain scheduler discards canceled epochs",
     bool entered = false;
     bool released = false;
     FarTerrainSource source = farTerrainTestSource();
-    const auto geometry = source.geometry;
-    source.geometry = [&](int64_t x, int64_t z) {
+    const auto sample = source.sample;
+    source.sample = [&](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
         {
             std::unique_lock lock(gateMutex);
             if (!entered) {
@@ -1087,7 +4956,7 @@ TEST_CASE("Far terrain scheduler discards canceled epochs",
                 gateCv.wait(lock, [&] { return released; });
             }
         }
-        return geometry(x, z);
+        return sample(x, z, footprint);
     };
     FarTerrainScheduler scheduler(source);
     REQUIRE(scheduler.enqueue({0, 0, FarTerrainStep::SIXTEEN}));
@@ -1135,7 +5004,14 @@ TEST_CASE("Far terrain scheduler retains only the current view",
 
     const std::unordered_set<FarTerrainKey, FarTerrainKeyHash> wanted{keys[1], keys[3]};
     scheduler.retainWanted(wanted);
+    for (int attempt = 0; attempt < 400; ++attempt) {
+        const FarTerrainSchedulerStats current = scheduler.stats();
+        if (current.maintenancePending == 0 && current.cacheEntries == wanted.size())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     const FarTerrainSchedulerStats retained = scheduler.stats();
+    REQUIRE(retained.maintenancePending == 0);
     REQUIRE(retained.cacheEntries == wanted.size());
     REQUIRE(retained.completed == wanted.size());
     REQUIRE(scheduler.findCached(keys[1]));
@@ -1145,6 +5021,202 @@ TEST_CASE("Far terrain scheduler retains only the current view",
     REQUIRE_FALSE(scheduler.enqueue(keys[0]));
 }
 
+TEST_CASE("Far terrain scheduler reuses stable wanted state",
+          "[render][far-terrain][scheduler][residency][performance]") {
+    FarTerrainScheduler scheduler(farTerrainTestSource());
+    const std::vector<FarTerrainKey> order{
+        {0, 0, FarTerrainStep::SIXTEEN},
+        {1, 0, FarTerrainStep::SIXTEEN},
+        {0, 0, FarTerrainStep::FOUR},
+    };
+    const std::unordered_set<FarTerrainKey, FarTerrainKeyHash> wanted(order.begin(), order.end());
+
+    REQUIRE(scheduler.retainWanted(wanted, order));
+    const FarTerrainSchedulerStats first = scheduler.stats();
+    REQUIRE(first.wantedUpdates == 1);
+    REQUIRE(first.wantedNoops == 0);
+
+    REQUIRE_FALSE(scheduler.retainWanted(wanted, order));
+    const FarTerrainSchedulerStats second = scheduler.stats();
+    REQUIRE(second.wantedUpdates == first.wantedUpdates);
+    REQUIRE(second.wantedNoops == first.wantedNoops + 1);
+
+    std::vector<FarTerrainKey> reprioritized = order;
+    std::swap(reprioritized[0], reprioritized[1]);
+    REQUIRE_FALSE(scheduler.retainWanted(wanted, reprioritized));
+    const FarTerrainSchedulerStats reprioritizedStats = scheduler.stats();
+    REQUIRE(reprioritizedStats.wantedUpdates == first.wantedUpdates);
+    REQUIRE(reprioritizedStats.wantedNoops == second.wantedNoops + 1);
+}
+
+TEST_CASE("Far terrain cache residency retires obsolete meshes in bounded worker passes",
+          "[render][far-terrain][scheduler][cache][performance][concurrency][regression]") {
+    FarTerrainSchedulerLimits limits;
+    limits.maxPending = 8;
+    limits.maxCompleted = 8;
+    limits.maxCacheEntries = 8;
+    limits.maxCacheBytes = 64 * 1024 * 1024;
+    limits.maxMaintenanceEntries = 1;
+    limits.maxMaintenanceBytes = 16 * 1024 * 1024;
+    FarTerrainScheduler scheduler(farTerrainTestSource(), limits);
+    std::array<FarTerrainKey, 6> keys{};
+    for (size_t index = 0; index < keys.size(); ++index) {
+        keys[index] = {static_cast<int64_t>(index), 0, FarTerrainStep::SIXTEEN};
+        REQUIRE(scheduler.enqueue(keys[index]));
+    }
+    for (int attempt = 0; attempt < 400 && scheduler.stats().inFlight != 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    REQUIRE(scheduler.stats().cacheEntries == keys.size());
+
+    const std::vector<FarTerrainKey> order{keys[1], keys[4]};
+    const std::unordered_set<FarTerrainKey, FarTerrainKeyHash> wanted(order.begin(), order.end());
+    REQUIRE(scheduler.retainWanted(wanted, order));
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        const FarTerrainSchedulerStats current = scheduler.stats();
+        if (current.maintenancePending == 0 && current.cacheEntries == wanted.size())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const FarTerrainSchedulerStats maintained = scheduler.stats();
+    REQUIRE(maintained.maintenancePending == 0);
+    REQUIRE(maintained.cacheEntries == wanted.size());
+    REQUIRE(maintained.maintenanceEvicted == keys.size() - wanted.size());
+    REQUIRE(maintained.maintenanceScanned >= keys.size());
+    REQUIRE(maintained.maintenancePasses >= keys.size());
+    REQUIRE(maintained.maximumMaintenanceScanned <= limits.maxMaintenanceEntries);
+    REQUIRE(maintained.maximumMaintenanceBytes <= limits.maxMaintenanceBytes);
+    REQUIRE(scheduler.findCached(keys[1]));
+    REQUIRE(scheduler.findCached(keys[4]));
+}
+
+TEST_CASE("Far terrain cache batches preserve nearest useful refinement selection",
+          "[render][far-terrain][scheduler][cache][batch][performance]") {
+    FarTerrainSchedulerLimits limits;
+    limits.maxPending = 8;
+    limits.maxCompleted = 8;
+    limits.maxCacheEntries = 8;
+    limits.maxCacheBytes = 64 * 1024 * 1024;
+    FarTerrainScheduler scheduler(farTerrainTestSource(), limits);
+    constexpr std::array keys{
+        FarTerrainKey{0, 0, FarTerrainStep::THIRTY_TWO},
+        FarTerrainKey{0, 0, FarTerrainStep::SIXTEEN},
+        FarTerrainKey{0, 0, FarTerrainStep::EIGHT},
+        FarTerrainKey{1, 0, FarTerrainStep::THIRTY_TWO},
+        FarTerrainKey{1, 0, FarTerrainStep::SIXTEEN},
+        FarTerrainKey{1, 0, FarTerrainStep::FOUR},
+    };
+    for (const FarTerrainKey key : keys)
+        REQUIRE(scheduler.enqueue(key));
+    for (int attempt = 0; attempt < 400 && scheduler.stats().inFlight != 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    REQUIRE(scheduler.stats().inFlight == 0);
+    REQUIRE(scheduler.stats().cacheEntries == keys.size());
+    REQUIRE(scheduler.stats().cacheBaseEntries == 2);
+
+    const std::array baseRequests{
+        FarTerrainKey{-1, 0, FarTerrainStep::THIRTY_TWO},
+        FarTerrainKey{0, 0, FarTerrainStep::THIRTY_TWO},
+        FarTerrainKey{1, 0, FarTerrainStep::THIRTY_TWO},
+    };
+    std::vector<std::shared_ptr<const FarTerrainMesh>> batch;
+    scheduler.findCachedBatch(baseRequests, 1, batch);
+    REQUIRE(batch.size() == 1);
+    REQUIRE(batch.front()->key == baseRequests[1]);
+
+    constexpr FarTerrainStepMask BASE_RESIDENT = farTerrainStepMask(FarTerrainStep::THIRTY_TWO);
+    const std::array refinementRequests{
+        FarTerrainRefinementCacheRequest{
+            {0, 0}, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, BASE_RESIDENT, false},
+        FarTerrainRefinementCacheRequest{
+            {1, 0}, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, BASE_RESIDENT, false},
+        FarTerrainRefinementCacheRequest{
+            {2, 0}, FarTerrainStep::THIRTY_TWO, FarTerrainStep::TWO, BASE_RESIDENT, true},
+    };
+    auto deferredRequests = refinementRequests;
+    deferredRequests[0].deferIntermediate = true;
+    deferredRequests[1].deferIntermediate = true;
+    scheduler.findFinestCachedBatch(deferredRequests, 2, batch);
+    REQUIRE(batch.empty());
+
+    scheduler.findFinestCachedBatch(refinementRequests, 2, batch);
+    REQUIRE(batch.size() == 2);
+    REQUIRE((batch[0]->key == FarTerrainKey{0, 0, FarTerrainStep::EIGHT}));
+    REQUIRE((batch[1]->key == FarTerrainKey{1, 0, FarTerrainStep::FOUR}));
+    REQUIRE(batch[0] == scheduler.findFinestCached({0, 0}, FarTerrainStep::THIRTY_TWO,
+                                                   FarTerrainStep::TWO, BASE_RESIDENT));
+    REQUIRE(batch[1] == scheduler.findFinestCached({1, 0}, FarTerrainStep::THIRTY_TWO,
+                                                   FarTerrainStep::TWO, BASE_RESIDENT));
+}
+
+TEST_CASE("Far terrain submission scans pass cache hits and stop at capacity",
+          "[render][far-terrain][scheduler][capacity][cache][performance]") {
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    bool blockBuilds = false;
+    bool releaseBuilds = false;
+    FarTerrainSource source = farTerrainTestSource();
+    const auto sample = source.sample;
+    source.sample = [&](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
+        {
+            std::unique_lock lock(gateMutex);
+            if (blockBuilds)
+                gateCv.wait(lock, [&] { return releaseBuilds; });
+        }
+        return sample(x, z, footprint);
+    };
+
+    FarTerrainSchedulerLimits limits;
+    limits.maxPending = 8;
+    limits.maxCompleted = 32;
+    limits.maxCacheEntries = 32;
+    limits.maxCacheBytes = 64 * 1024 * 1024;
+    FarTerrainScheduler scheduler(source, limits);
+
+    std::vector<FarTerrainKey> scanOrder;
+    for (int64_t x = 0; x < 4; ++x) {
+        scanOrder.push_back({x, 0, FarTerrainStep::SIXTEEN});
+        REQUIRE(scheduler.enqueue(scanOrder.back(), static_cast<uint32_t>(x)));
+    }
+    for (int attempt = 0; attempt < 400 && scheduler.stats().inFlight != 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    REQUIRE(scheduler.stats().inFlight == 0);
+    REQUIRE(scheduler.stats().cacheEntries == 4);
+
+    for (int64_t x = 4; x < 13; ++x)
+        scanOrder.push_back({x, 0, FarTerrainStep::SIXTEEN});
+    const std::unordered_set<FarTerrainKey, FarTerrainKeyHash> wanted(scanOrder.begin(),
+                                                                      scanOrder.end());
+    REQUIRE(scheduler.retainWanted(wanted, scanOrder));
+    {
+        std::lock_guard lock(gateMutex);
+        blockBuilds = true;
+    }
+
+    size_t scanned = 0;
+    size_t submitted = 0;
+    for (size_t index = 0; index < scanOrder.size(); ++index) {
+        if (!scheduler.hasSubmissionCapacity())
+            break;
+        ++scanned;
+        if (scheduler.enqueue(scanOrder[index], static_cast<uint32_t>(index)))
+            ++submitted;
+    }
+    REQUIRE(scanned == 12);
+    REQUIRE(submitted == limits.maxPending);
+    REQUIRE_FALSE(scheduler.hasSubmissionCapacity());
+    REQUIRE(scheduler.stats().inFlight == limits.maxPending);
+
+    {
+        std::lock_guard lock(gateMutex);
+        releaseBuilds = true;
+    }
+    gateCv.notify_all();
+    scheduler.shutdown();
+}
+
 TEST_CASE("Far terrain scheduler cancels obsolete view work",
           "[render][far-terrain][scheduler][cancellation][priority]") {
     std::mutex gateMutex;
@@ -1152,15 +5224,15 @@ TEST_CASE("Far terrain scheduler cancels obsolete view work",
     size_t enteredWorkers = 0;
     bool released = false;
     FarTerrainSource source = farTerrainTestSource();
-    const auto geometry = source.geometry;
-    source.geometry = [&](int64_t x, int64_t z) {
+    const auto sample = source.sample;
+    source.sample = [&](int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) {
         {
             std::unique_lock lock(gateMutex);
             ++enteredWorkers;
             gateCv.notify_all();
             gateCv.wait(lock, [&] { return released; });
         }
-        return geometry(x, z);
+        return sample(x, z, footprint);
     };
 
     FarTerrainSchedulerLimits limits;
@@ -1523,13 +5595,19 @@ TEST_CASE("Mesher: water surfaces land in the water section", "[render][mesher][
     REQUIRE(output.opaqueIndexCount == 36);
     REQUIRE(output.indices.size() == 66);
 
-    // The water top surface sits 0.125 below the cell top (fp16-exact)
-    bool foundDroppedTop = false;
-    for (const Vertex& v : output.vertices) {
-        if (static_cast<float>(v.py) == 5.875f)
-            foundDroppedTop = true;
+    // Implicit generated water is a full source block in every meshing path.
+    // Animation belongs to the fragment normal, not vertex displacement, so
+    // exact and far ownership can exchange this planar top without exposing
+    // a triangle diagonal.
+    size_t topIndexCount = 0;
+    for (size_t offset = output.opaqueIndexCount; offset < output.indices.size(); ++offset) {
+        const Vertex& vertex = output.vertices[output.indices[offset]];
+        if (unpackFace(vertex.faceAttr) != FaceNormal::PLUS_Y)
+            continue;
+        REQUIRE(static_cast<float>(vertex.py) == 6.0F);
+        ++topIndexCount;
     }
-    REQUIRE(foundDroppedTop);
+    REQUIRE(topIndexCount == 6);
 }
 
 TEST_CASE("Mesher: interior water-water faces are culled", "[render][mesher][water]") {
@@ -1569,6 +5647,30 @@ TEST_CASE("Snapshot mesher uses runtime water levels and falling metadata",
         }
     }
     REQUIRE(foundShallowTop);
+
+    STATIC_REQUIRE(fluidSurfaceHeight(FluidState::source()) == 1.0F);
+    snapshot.fluidStates[MeshSnapshot::index(8, 8, 8)] = FluidState::source().packed();
+    MeshOutput source = LODMesher::buildMesh(snapshot, scratch);
+    size_t sourceTopIndexCount = 0;
+    for (size_t offset = source.opaqueIndexCount; offset + 2 < source.indices.size(); offset += 3) {
+        const Vertex& first = source.vertices[source.indices[offset]];
+        if (unpackFace(first.faceAttr) != FaceNormal::PLUS_Y)
+            continue;
+        std::array<Vec3, 3> triangle{};
+        for (size_t corner = 0; corner < triangle.size(); ++corner) {
+            const Vertex& vertex = source.vertices[source.indices[offset + corner]];
+            REQUIRE(unpackFace(vertex.faceAttr) == FaceNormal::PLUS_Y);
+            REQUIRE(static_cast<float>(vertex.py) == 9.0F);
+            triangle[corner] = {static_cast<float>(vertex.px), static_cast<float>(vertex.py),
+                                static_cast<float>(vertex.pz)};
+            ++sourceTopIndexCount;
+        }
+        const Vec3 normal = (triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]);
+        REQUIRE(std::abs(normal.x) <= 1.0e-6F);
+        REQUIRE(std::abs(normal.z) <= 1.0e-6F);
+        REQUIRE(std::abs(normal.y) > 0.0F);
+    }
+    REQUIRE(sourceTopIndexCount == 6);
 
     snapshot.fluidStates[MeshSnapshot::index(8, 8, 8)] = FluidState::falling(3).packed();
     MeshOutput falling = LODMesher::buildMesh(snapshot, scratch);
@@ -1625,8 +5727,8 @@ TEST_CASE("Snapshot water sides are exclusive to falling columns",
 TEST_CASE("Generated incised rivers mesh continuously across exact cube faces",
           "[render][mesher][water][river][seam][regression]") {
     ChunkGenerator generator(42);
-    constexpr int64_t RIVER_X = -12'289;
-    constexpr int64_t RIVER_Z = 2'653;
+    constexpr int64_t RIVER_X = -12'801;
+    constexpr int64_t RIVER_Z = 2'759;
     const std::array<worldgen::SurfaceSample, 4> riverSamples = {
         generator.sampleExactSurface(RIVER_X, RIVER_Z),
         generator.sampleExactSurface(RIVER_X + 1, RIVER_Z),
@@ -1679,7 +5781,7 @@ TEST_CASE("Generated incised rivers mesh continuously across exact cube faces",
     }
 
     const int WATER_LOCAL_Y = Chunk::worldToLocalY(WATER_Y);
-    constexpr int RIVER_LOCAL_Z = static_cast<int>(RIVER_Z - 2'640);
+    const int RIVER_LOCAL_Z = Chunk::worldToLocal(RIVER_Z);
     REQUIRE(snapshot.at(15, WATER_LOCAL_Y, RIVER_LOCAL_Z) == BlockType::WATER);
     REQUIRE(snapshot.at(16, WATER_LOCAL_Y, RIVER_LOCAL_Z) == BlockType::WATER);
     REQUIRE(snapshot.at(15, WATER_LOCAL_Y, RIVER_LOCAL_Z + 1) == BlockType::WATER);
@@ -1870,6 +5972,43 @@ TEST_CASE("MegaBuffer free-list coalescing is bounds-safe and lossless", "[rende
     REQUIRE(empty.empty());
 }
 
+TEST_CASE("Segmented far arena grows lazily and routes allocations to their slab",
+          "[render][megabuffer][far-terrain][residency]") {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    REQUIRE(device != nil);
+    constexpr uint64_t SLAB_BYTES = 4 * 1024;
+    SegmentedMegaBuffer arena(device, SLAB_BYTES * 2, SLAB_BYTES * 2, SLAB_BYTES, SLAB_BYTES);
+    REQUIRE(arena.segmentCount() == 0);
+
+    constexpr uint32_t VERTEX_COUNT = 200;
+    constexpr uint32_t INDEX_COUNT = 400;
+    std::vector<Vertex> vertices(VERTEX_COUNT);
+    std::vector<uint32_t> indices(INDEX_COUNT);
+    auto first = arena.allocate(VERTEX_COUNT, INDEX_COUNT);
+    REQUIRE(arena.segmentCount() == 1);
+    arena.uploadVertices(vertices.data(), vertices.size() * sizeof(Vertex), first);
+    arena.uploadIndices(indices.data(), indices.size() * sizeof(uint32_t), first);
+
+    auto second = arena.allocate(VERTEX_COUNT, INDEX_COUNT);
+    REQUIRE(arena.segmentCount() == 2);
+    REQUIRE(second.vertexBuffer != first.vertexBuffer);
+    REQUIRE(second.indexBuffer != first.indexBuffer);
+    const uint64_t usedBeforeDeferred = arena.vertexUsed() + arena.indexUsed();
+    arena.deferFree(first, 7);
+    arena.drainDeferredFrees(6);
+    REQUIRE(arena.vertexUsed() + arena.indexUsed() == usedBeforeDeferred);
+    arena.drainDeferredFrees(7);
+    REQUIRE(arena.vertexUsed() + arena.indexUsed() < usedBeforeDeferred);
+
+    auto reused = arena.allocate(VERTEX_COUNT, INDEX_COUNT);
+    REQUIRE(arena.segmentCount() == 2);
+    REQUIRE(reused.vertexBuffer != second.vertexBuffer);
+    arena.free(reused);
+    arena.free(second);
+    REQUIRE(arena.vertexUsed() == 0);
+    REQUIRE(arena.indexUsed() == 0);
+}
+
 TEST_CASE("MeshScheduler: builds off-thread with version stamps", "[render][scheduler]") {
     World world(42, 2);
     constexpr ChunkPos center{0, 4, 0};
@@ -1921,6 +6060,28 @@ TEST_CASE("MeshScheduler: builds off-thread with version stamps", "[render][sche
     scheduler.shutdown();
     scheduler.shutdown();
     REQUIRE(!scheduler.enqueue(center));
+}
+
+TEST_CASE("Exact mesh scheduling reserves capacity and ordering for the camera band",
+          "[render][scheduler][priority][cold-start][regression]") {
+    STATIC_REQUIRE(EXACT_MESH_CAMERA_RESERVED_SLOTS == 32);
+    STATIC_REQUIRE(EXACT_MESH_MAX_INFLIGHT == 64);
+
+    REQUIRE(meshLaneCanReserve(31, 0, MeshPriorityLane::BROAD_SURFACE));
+    REQUIRE_FALSE(meshLaneCanReserve(32, 0, MeshPriorityLane::BROAD_SURFACE));
+    REQUIRE(meshLaneCanReserve(32, 0, MeshPriorityLane::CAMERA_BAND));
+    REQUIRE(meshLaneCanReserve(32, 0, MeshPriorityLane::CAMERA_COLUMN));
+    REQUIRE(meshLaneCanReserve(63, 0, MeshPriorityLane::CAMERA_BAND));
+    REQUIRE_FALSE(meshLaneCanReserve(63, 1, MeshPriorityLane::CAMERA_BAND));
+
+    REQUIRE(meshJobRanksBefore(MeshPriorityLane::CAMERA_BAND, 4'096, 8,
+                               MeshPriorityLane::BROAD_SURFACE, 0, 0));
+    REQUIRE(meshJobRanksBefore(MeshPriorityLane::CAMERA_COLUMN, 4'096, 8,
+                               MeshPriorityLane::CAMERA_BAND, 0, 0));
+    REQUIRE(meshJobRanksBefore(MeshPriorityLane::CAMERA_BAND, 4, 9, MeshPriorityLane::CAMERA_BAND,
+                               64, 0));
+    REQUIRE(meshJobRanksBefore(MeshPriorityLane::CAMERA_BAND, 4, 9, MeshPriorityLane::CAMERA_BAND,
+                               4, 10));
 }
 
 TEST_CASE("World snapshotForMeshing seals missing neighbors until the real halo arrives",
@@ -1998,17 +6159,21 @@ TEST_CASE("Missing surface halos stay lit while underground openings remain dark
 
     // The loaded column ends at world Y=67 while the arriving uphill column
     // continues through Y=71. Its four-block exposed silhouette should use a
-    // normally lit terrain material. The four blocks below the local surface
-    // still represent a cave opening and must remain sealed and dark.
-    for (int z = 0; z < CHUNK_EDGE; ++z) {
+    // normally lit terrain material. A solid roof isolates the three air
+    // blocks below it, which still represent a cave opening and must remain
+    // sealed and dark.
+    for (int z = -1; z <= CHUNK_EDGE; ++z) {
         snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, z)] = 68;
         snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = 72;
         snapshot.generatedSurfaceMaterial[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = BlockType::GRASS;
+        for (int x = -1; x <= CHUNK_EDGE; ++x) {
+            snapshot.blocks[MeshSnapshot::index(x, 3, z)] = BlockType::STONE;
+        }
     }
 
     MeshScratch scratch;
     const MeshOutput mesh = LODMesher::buildMesh(snapshot, scratch);
-    size_t darkVertices = 0;
+    size_t sealedVertices = 0;
     size_t litSurfaceVertices = 0;
     float highestCapY = 0.0F;
     for (const Vertex& vertex : mesh.vertices) {
@@ -2017,18 +6182,177 @@ TEST_CASE("Missing surface halos stay lit while underground openings remain dark
             continue;
         }
         highestCapY = std::max(highestCapY, static_cast<float>(vertex.py));
-        if (unpackTextureLayer(vertex.faceAttr) == static_cast<uint8_t>(BlockType::BEDROCK)) {
+        if (unpackTextureLayer(vertex.faceAttr) == static_cast<uint8_t>(BlockType::STONE)) {
             REQUIRE(unpackSkyLight(vertex.faceAttr) == 0);
-            ++darkVertices;
+            REQUIRE(unpackCornerAO(vertex.faceAttr) == 3);
+            ++sealedVertices;
         } else if (unpackTextureLayer(vertex.faceAttr) == TEXTURE_LAYER_GRASS_SIDE) {
             REQUIRE(unpackSkyLight(vertex.faceAttr) == 15);
+            REQUIRE(unpackCornerAO(vertex.faceAttr) == 3);
             ++litSurfaceVertices;
         }
     }
-    REQUIRE(darkVertices == 4 * CHUNK_EDGE * 4);
+    REQUIRE(sealedVertices == 3 * CHUNK_EDGE * 4);
     REQUIRE(litSurfaceVertices == 4 * CHUNK_EDGE * 4);
     REQUIRE(highestCapY == 8.0F);
-    REQUIRE(darkVertices + litSurfaceVertices < CHUNK_EDGE * CHUNK_EDGE * 4);
+    REQUIRE(sealedVertices + litSurfaceVertices < CHUNK_EDGE * CHUNK_EDGE * 4);
+}
+
+TEST_CASE("Missing caps recognize outdoor air beneath a generated overhang",
+          "[world][mesher][border][streaming][surface][overhang]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.pos = {0, 4, 0};
+    snapshot.missingNeighborFaces = MeshSnapshot::MISSING_PLUS_X;
+
+    for (int z = -1; z <= CHUNK_EDGE; ++z) {
+        snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, z)] = 68;
+        snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = 72;
+        snapshot.generatedSurfaceMaterial[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = BlockType::GRASS;
+    }
+    for (int z = -1; z <= CHUNK_EDGE; ++z) {
+        for (int x = -1; x <= CHUNK_EDGE; ++x) {
+            snapshot.blocks[MeshSnapshot::index(x, 3, z)] = BlockType::STONE;
+        }
+    }
+
+    // This column's generated top describes an overhang at world Y=71. Its
+    // undercut air joins the neighboring outdoor column inside the snapshot,
+    // so the three cells beneath the roof and four above it all need outdoor
+    // lighting even though the undercut lies below its column cutoff.
+    constexpr int overhangZ = 8;
+    snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, overhangZ)] = 72;
+    snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, overhangZ)] = 76;
+    snapshot.generatedSurfaceMaterial[MeshSnapshot::skyIndex(CHUNK_EDGE, overhangZ)] =
+        BlockType::LIMESTONE;
+    snapshot.blocks[MeshSnapshot::index(CHUNK_EDGE - 1, 7, overhangZ)] = BlockType::STONE;
+
+    MeshScratch scratch;
+    const MeshOutput mesh = LODMesher::buildMesh(snapshot, scratch);
+    size_t litOverhangVertices = 0;
+    for (const Vertex& vertex : mesh.vertices) {
+        if (unpackFace(vertex.faceAttr) != FaceNormal::MINUS_X ||
+            static_cast<float>(vertex.px) != static_cast<float>(CHUNK_EDGE) ||
+            unpackTextureLayer(vertex.faceAttr) != static_cast<uint8_t>(BlockType::LIMESTONE)) {
+            continue;
+        }
+        REQUIRE(unpackSkyLight(vertex.faceAttr) == 15);
+        REQUIRE(unpackCornerAO(vertex.faceAttr) == 3);
+        ++litOverhangVertices;
+    }
+    REQUIRE(litOverhangVertices == 7 * 4);
+}
+
+TEST_CASE("Edited roofs keep enclosed missing-neighbor caps dark",
+          "[world][mesher][border][streaming][surface][roof][underground]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.pos = {0, 4, 0};
+    snapshot.missingNeighborFaces = MeshSnapshot::MISSING_PLUS_X;
+
+    for (int z = -1; z <= CHUNK_EDGE; ++z) {
+        snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, z)] = 68;
+        snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = 72;
+        snapshot.skyCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, z)] = 73;
+        snapshot.skyCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = 72;
+        for (int x = -1; x <= CHUNK_EDGE; ++x) {
+            for (int y = -1; y <= 3; ++y) {
+                snapshot.blocks[MeshSnapshot::index(x, y, z)] = BlockType::STONE;
+            }
+            snapshot.blocks[MeshSnapshot::index(x, 8, z)] = BlockType::STONE;
+        }
+    }
+
+    MeshScratch scratch;
+    const MeshOutput mesh = LODMesher::buildMesh(snapshot, scratch);
+    size_t enclosedVertices = 0;
+    size_t litVertices = 0;
+    for (const Vertex& vertex : mesh.vertices) {
+        if (unpackFace(vertex.faceAttr) != FaceNormal::MINUS_X ||
+            static_cast<float>(vertex.px) != static_cast<float>(CHUNK_EDGE)) {
+            continue;
+        }
+        if (unpackSkyLight(vertex.faceAttr) == 0) {
+            REQUIRE(unpackTextureLayer(vertex.faceAttr) == static_cast<uint8_t>(BlockType::STONE));
+            REQUIRE(unpackCornerAO(vertex.faceAttr) == 3);
+            ++enclosedVertices;
+        } else {
+            ++litVertices;
+        }
+    }
+    REQUIRE(enclosedVertices == 4 * CHUNK_EDGE * 4);
+    REQUIRE(litVertices == 0);
+}
+
+TEST_CASE("Top-of-world roofs remain distinct from incomplete sky paths",
+          "[world][mesher][border][streaming][surface][roof][limit]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.pos = {0, WORLD_MAX_CHUNK_Y, 0};
+    snapshot.missingNeighborFaces = MeshSnapshot::MISSING_PLUS_X;
+
+    for (int z = -1; z <= CHUNK_EDGE; ++z) {
+        snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, z)] = 500;
+        snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = WORLD_MAX_Y + 1;
+        snapshot.skyCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, z)] = WORLD_MAX_Y + 1;
+        snapshot.skyCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = WORLD_MAX_Y + 1;
+        for (int x = -1; x <= CHUNK_EDGE; ++x) {
+            for (int y = -1; y <= 3; ++y) {
+                snapshot.blocks[MeshSnapshot::index(x, y, z)] = BlockType::STONE;
+            }
+            snapshot.blocks[MeshSnapshot::index(x, CHUNK_EDGE - 1, z)] = BlockType::STONE;
+        }
+    }
+
+    MeshScratch scratch;
+    const MeshOutput mesh = LODMesher::buildMesh(snapshot, scratch);
+    size_t enclosedVertices = 0;
+    for (const Vertex& vertex : mesh.vertices) {
+        if (unpackFace(vertex.faceAttr) != FaceNormal::MINUS_X ||
+            static_cast<float>(vertex.px) != static_cast<float>(CHUNK_EDGE)) {
+            continue;
+        }
+        REQUIRE(unpackSkyLight(vertex.faceAttr) == 0);
+        REQUIRE(unpackCornerAO(vertex.faceAttr) == 3);
+        ++enclosedVertices;
+    }
+    REQUIRE(enclosedVertices == 11 * CHUNK_EDGE * 4);
+}
+
+TEST_CASE("Lowered exact sky cutoffs light opened missing-neighbor caps",
+          "[world][mesher][border][streaming][surface][edit]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.pos = {0, 4, 0};
+    snapshot.missingNeighborFaces = MeshSnapshot::MISSING_PLUS_X;
+
+    for (int z = -1; z <= CHUNK_EDGE; ++z) {
+        snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, z)] = 96;
+        snapshot.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = 80;
+        snapshot.skyCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE - 1, z)] = 68;
+        snapshot.skyCutoffY[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = 80;
+        snapshot.generatedSurfaceMaterial[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] =
+            BlockType::LIMESTONE;
+        for (int x = -1; x <= CHUNK_EDGE; ++x) {
+            for (int y = -1; y <= 3; ++y) {
+                snapshot.blocks[MeshSnapshot::index(x, y, z)] = BlockType::STONE;
+            }
+        }
+    }
+
+    MeshScratch scratch;
+    const MeshOutput mesh = LODMesher::buildMesh(snapshot, scratch);
+    size_t litVertices = 0;
+    for (const Vertex& vertex : mesh.vertices) {
+        if (unpackFace(vertex.faceAttr) != FaceNormal::MINUS_X ||
+            static_cast<float>(vertex.px) != static_cast<float>(CHUNK_EDGE)) {
+            continue;
+        }
+        REQUIRE(unpackSkyLight(vertex.faceAttr) == 15);
+        REQUIRE(unpackCornerAO(vertex.faceAttr) == 3);
+        ++litVertices;
+    }
+    REQUIRE(litVertices == 12 * CHUNK_EDGE * 4);
 }
 
 TEST_CASE("World setBlock marks boundary neighbors for remeshing", "[world][mesher][border]") {
@@ -2548,27 +6872,40 @@ TEST_CASE("Underground skylight stays dark across unloaded vertical sections",
 
     MeshSnapshot separated;
     REQUIRE(world.snapshotForMeshing(target, separated));
-    REQUIRE(separated.skyCutoffAt(8, 8) == WORLD_MAX_Y + 1);
+    REQUIRE(separated.skyCutoffAt(8, 8) == MeshSnapshot::SKY_CUTOFF_INCOMPLETE);
 
     for (int32_t section = targetSection + 2; section <= surfaceSection; ++section) {
         REQUIRE(world.getChunk({0, section, 0}));
     }
     MeshSnapshot connected;
     REQUIRE(world.snapshotForMeshing(target, connected));
-    REQUIRE(connected.skyCutoffAt(8, 8) < WORLD_MAX_Y + 1);
+    REQUIRE(connected.skyCutoffAt(8, 8) <= WORLD_MAX_Y + 1);
 }
 
 TEST_CASE("Generated opaque features extend the exact density sky cutoff",
           "[render][mesher][light][skylight][feature]") {
     World world(42, 4);
-    constexpr ChunkPos target{-1707, 4, -1064};
-    constexpr int64_t worldX = -27297;
-    constexpr int64_t worldZ = -17021;
-    for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+    constexpr int64_t MINIMUM_X = -27'392;
+    constexpr int64_t MINIMUM_Z = -17'152;
+    constexpr int64_t MAXIMUM_X = MINIMUM_X + 512;
+    constexpr int64_t MAXIMUM_Z = MINIMUM_Z + 512;
+    const std::vector<FarCanopy> canopies =
+        world.generator().collectFarCanopies(MINIMUM_X, MINIMUM_Z, MAXIMUM_X, MAXIMUM_Z);
+    const auto selected = std::ranges::find_if(canopies, [](const FarCanopy& canopy) {
+        return canopy.logBlock != BlockType::AIR &&
+               canopy.species != feature_generation::TreeSpecies::FALLEN_LOG;
+    });
+    REQUIRE(selected != canopies.end());
+    const int64_t worldX = selected->x;
+    const int64_t worldZ = selected->z;
+    const ChunkPos target{Chunk::worldToChunk(worldX), Chunk::worldToChunkY(selected->baseY - 1),
+                          Chunk::worldToChunk(worldZ)};
+    const int32_t maximumTreeSection = Chunk::worldToChunkY(selected->topY);
+    for (int32_t chunkY = target.y - 1; chunkY <= std::max(target.y + 1, maximumTreeSection);
+         ++chunkY) {
         for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
             for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-                REQUIRE(
-                    world.getChunk({target.x + offsetX, target.y + offsetY, target.z + offsetZ}));
+                REQUIRE(world.getChunk({target.x + offsetX, chunkY, target.z + offsetZ}));
             }
         }
     }
@@ -2579,7 +6916,7 @@ TEST_CASE("Generated opaque features extend the exact density sky cutoff",
     const std::optional<int> loadedTop = world.surfaceHeightIfLoaded(worldX, worldZ);
     REQUIRE(loadedTop);
     REQUIRE(*loadedTop > plannedSurface);
-    REQUIRE(world.getBlockIfLoaded(worldX, *loadedTop, worldZ) == BlockType::LOG);
+    REQUIRE(world.getBlockIfLoaded(worldX, *loadedTop, worldZ) == selected->logBlock);
 
     MeshSnapshot snapshot;
     REQUIRE(world.snapshotForMeshing(target, snapshot));
@@ -3187,6 +7524,20 @@ TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]")
     REQUIRE(alignof(Uniforms) == 16);
     REQUIRE(sizeof(ChunkOrigin) == 48);
     REQUIRE(offsetof(ChunkOrigin, farMetadata) == 32);
+    REQUIRE(sizeof(FarTerrainOwnershipUniforms) == 288);
+    REQUIRE(offsetof(FarTerrainOwnershipUniforms, readyColumnMasks) == 0);
+    STATIC_REQUIRE(FAR_TERRAIN_EXACT_MASK_WORD_COUNT * FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD ==
+                   FAR_TERRAIN_EXACT_COLUMNS_PER_TILE * FAR_TERRAIN_EXACT_COLUMNS_PER_TILE);
+    STATIC_REQUIRE(FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE *
+                       FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR ==
+                   FAR_TERRAIN_EXACT_MASK_WORD_COUNT);
+    STATIC_REQUIRE(FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE * FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE ==
+                   FAR_TERRAIN_EXACT_MASK_NEIGHBOR_COUNT);
+    STATIC_REQUIRE(sizeof(FarTerrainOwnershipUniforms) ==
+                   FAR_TERRAIN_EXACT_MASK_NEIGHBOR_COUNT * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE *
+                       sizeof(simd_uint4));
+    STATIC_REQUIRE(FarTerrainExactHandoff::COLUMN_MASK_WORD_COUNT ==
+                   FAR_TERRAIN_EXACT_MASK_WORD_COUNT);
 }
 
 TEST_CASE("Shader types: ShadowUniforms layout matches MSL", "[render][shader-types]") {
@@ -3233,6 +7584,24 @@ TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-typ
     REQUIRE(offsetof(WaterUniforms, ssrStrength) == 244);
     REQUIRE(offsetof(WaterUniforms, skyExposure) == 248);
     REQUIRE(offsetof(WaterUniforms, waterSurfaceY) == 252);
+}
+
+TEST_CASE("Water procedural bands fade before their phase aliases",
+          "[render][water][shader-types][antialiasing]") {
+    REQUIRE(waterBandVisibility(0.0F) == Catch::Approx(1.0F));
+    REQUIRE(waterBandVisibility(0.45F) == Catch::Approx(1.0F));
+    REQUIRE(waterBandVisibility(1.125F) == Catch::Approx(0.5F));
+    REQUIRE(waterBandVisibility(1.8F) <= 1.0e-6F);
+    REQUIRE(waterBandVisibility(4.0F) <= 1.0e-6F);
+
+    float previous = waterBandVisibility(0.0F);
+    for (int sample = 1; sample <= 64; ++sample) {
+        const float current = waterBandVisibility(static_cast<float>(sample) / 16.0F);
+        REQUIRE(current <= previous);
+        REQUIRE(current >= 0.0F);
+        REQUIRE(current <= 1.0F);
+        previous = current;
+    }
 }
 
 TEST_CASE("Camera-relative water depth stays continuous at large world coordinates",

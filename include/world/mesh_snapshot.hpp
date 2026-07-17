@@ -22,6 +22,10 @@ struct MeshSnapshot {
     static constexpr int PADDED_VOLUME = PADDED_EDGE * PADDED_EDGE * PADDED_EDGE;
     static constexpr int SKY_COLUMNS = PADDED_EDGE * PADDED_EDGE;
     static constexpr int32_t SKY_CUTOFF_UNKNOWN = std::numeric_limits<int32_t>::min();
+    // A real opaque block at WORLD_MAX_Y has cutoff WORLD_MAX_Y + 1. Keep the
+    // conservative incomplete-load marker distinct so top-of-world roofs do
+    // not become indistinguishable from a missing vertical section.
+    static constexpr int32_t SKY_CUTOFF_INCOMPLETE = WORLD_MAX_Y + 2;
 
     enum MissingFace : uint8_t {
         MISSING_PLUS_X = 1U << 0U,

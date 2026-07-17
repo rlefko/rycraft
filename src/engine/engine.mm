@@ -442,7 +442,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
         // Persisted settings load before the World exists (view distance
         // feeds its constructor); env overrides win over the file for
-        // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..256>.
+        // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..512>.
         // An env-overridden session never saves settings — a playtest run
         // must not rewrite the user's file with its overrides.
         LoadedSettings loaded = loadSettings(settingsPath());
@@ -474,7 +474,7 @@ static EngineState* _engineGetState(Engine* engine) {
     // 1. Create NSApplication
     _app = [NSApplication sharedApplication];
     if (!_app) {
-        RY_LOG_FATAL("Failed to create NSApplication");
+        RY_LOG_ERROR("Failed to create NSApplication");
         return NO;
     }
     [_app setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -484,14 +484,14 @@ static EngineState* _engineGetState(Engine* engine) {
     // 2. Create Metal device
     _device = MTLCreateSystemDefaultDevice();
     if (!_device) {
-        RY_LOG_FATAL("No Metal-capable device found — Metal is not supported on this hardware");
+        RY_LOG_ERROR("No Metal-capable device found; Metal is not supported on this hardware");
         return NO;
     }
 
     // 3. Create command queue
     _queue = [_device newCommandQueue];
     if (!_queue) {
-        RY_LOG_FATAL("Failed to create Metal command queue");
+        RY_LOG_ERROR("Failed to create Metal command queue");
         return NO;
     }
 
@@ -517,7 +517,7 @@ static EngineState* _engineGetState(Engine* engine) {
                                             backing:NSBackingStoreBuffered
                                               defer:false];
     if (!_window) {
-        RY_LOG_FATAL("Failed to create NSWindow");
+        RY_LOG_ERROR("Failed to create NSWindow");
         return NO;
     }
     [_window setTitle:@"rycraft"];
@@ -528,7 +528,7 @@ static EngineState* _engineGetState(Engine* engine) {
     _view = [[MTKView alloc] initWithFrame:NSMakeRect(0.0, 0.0, windowWidth, windowHeight)
                                     device:_device];
     if (!_view) {
-        RY_LOG_FATAL("Failed to create MTKView");
+        RY_LOG_ERROR("Failed to create MTKView");
         return NO;
     }
 
@@ -558,10 +558,11 @@ static EngineState* _engineGetState(Engine* engine) {
     NSURL* libURL = [NSURL fileURLWithPath:libPath];
     NSError* libError = nil;
     id<MTLLibrary> library = [_device newLibraryWithURL:libURL error:&libError];
-    if (libError) {
+    if (!library || libError) {
         NSString* msg = [NSString
             stringWithFormat:@"Failed to load shader library: %@", libError.localizedDescription];
-        RY_LOG_FATAL([msg UTF8String]);
+        RY_LOG_ERROR([msg UTF8String]);
+        return NO;
     }
 
     _renderPipeline = std::make_unique<RenderPipeline>(
@@ -1493,6 +1494,30 @@ static EngineState* _engineGetState(Engine* engine) {
                  static_cast<unsigned long long>(streaming.activeSetRequestsCoalesced),
                  static_cast<unsigned long long>(streaming.activeSetBuildsCanceled));
         RY_LOG_INFO(line);
+        static const bool captureDiagnostics = [] {
+            const char* capture = std::getenv("RYCRAFT_CAPTURE");
+            return capture != nullptr && *capture != '\0';
+        }();
+        if (state->showDebugHud || state->performance.enabled() || captureDiagnostics) {
+            char coverageLine[640];
+            snprintf(coverageLine, sizeof(coverageLine),
+                     "Coverage: exact %u/%u ready unresolved %u handoff %.0f blocks | base "
+                     "%u/%u/%u wanted/resident/drawn missing %u cached %u | refine %u/%u/%u "
+                     "wanted/resident/drawn | frontier %.0f blocks queues %u/%u base/refine | "
+                     "workers %u/%u/%u base/reserved/budget urgent %u",
+                     chunkStats.exactSurfaceReadyCount, chunkStats.exactSurfaceRequiredCount,
+                     chunkStats.exactSurfaceUnresolvedColumnCount,
+                     chunkStats.exactSurfaceHandoffBlocks, chunkStats.farBaseWantedTileCount,
+                     chunkStats.farBaseResidentTileCount, chunkStats.farBaseDrawnTileCount,
+                     chunkStats.farBaseMissingTileCount, chunkStats.farCachedBaseTileCount,
+                     chunkStats.farRefinementWantedTileCount,
+                     chunkStats.farRefinementResidentTileCount,
+                     chunkStats.farRefinementDrawnTileCount, chunkStats.farCoverageFrontierBlocks,
+                     chunkStats.farQueuedBaseTileCount, chunkStats.farQueuedRefinementTileCount,
+                     chunkStats.farActiveBaseWorkerCount, chunkStats.farReservedBaseWorkerCount,
+                     chunkStats.farWorkerBudget, chunkStats.farActiveUrgentRefinementCount);
+            RY_LOG_INFO(coverageLine);
+        }
         // Per-pass GPU breakdown (RYCRAFT_GPU_COUNTERS=1) mirrors to the log
         // so headless runs can attribute frame cost to individual passes.
         std::string passes = _renderPipeline->gpuPassBreakdown();
@@ -1562,12 +1587,31 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.stats.megaUsedMB = chunkStats.megaUsedMB;
     uiFrame.stats.megaCapMB = chunkStats.megaCapMB;
     uiFrame.stats.meshedCubeCount = chunkStats.meshCubeCount;
+    uiFrame.stats.exactSurfaceRequired = chunkStats.exactSurfaceRequiredCount;
+    uiFrame.stats.exactSurfaceReady = chunkStats.exactSurfaceReadyCount;
+    uiFrame.stats.exactSurfaceUnresolvedColumns = chunkStats.exactSurfaceUnresolvedColumnCount;
+    uiFrame.stats.exactSurfaceHandoffBlocks = chunkStats.exactSurfaceHandoffBlocks;
     uiFrame.stats.farWantedTiles = chunkStats.farWantedTileCount;
     uiFrame.stats.farResidentTiles = chunkStats.farResidentTileCount;
     uiFrame.stats.farDrawnTiles = chunkStats.farDrawnTileCount;
+    uiFrame.stats.farBaseWantedTiles = chunkStats.farBaseWantedTileCount;
+    uiFrame.stats.farBaseResidentTiles = chunkStats.farBaseResidentTileCount;
+    uiFrame.stats.farBaseDrawnTiles = chunkStats.farBaseDrawnTileCount;
+    uiFrame.stats.farBaseMissingTiles = chunkStats.farBaseMissingTileCount;
+    uiFrame.stats.farRefinementWantedTiles = chunkStats.farRefinementWantedTileCount;
+    uiFrame.stats.farRefinementResidentTiles = chunkStats.farRefinementResidentTileCount;
+    uiFrame.stats.farRefinementDrawnTiles = chunkStats.farRefinementDrawnTileCount;
     uiFrame.stats.farFrustumCulledTiles = chunkStats.farFrustumCulledTileCount;
     uiFrame.stats.farOcclusionCulledTiles = chunkStats.farOcclusionCulledTileCount;
     uiFrame.stats.farPendingTiles = chunkStats.farPendingTileCount;
+    uiFrame.stats.farQueuedBaseTiles = chunkStats.farQueuedBaseTileCount;
+    uiFrame.stats.farQueuedRefinementTiles = chunkStats.farQueuedRefinementTileCount;
+    uiFrame.stats.farActiveBaseWorkers = chunkStats.farActiveBaseWorkerCount;
+    uiFrame.stats.farReservedBaseWorkers = chunkStats.farReservedBaseWorkerCount;
+    uiFrame.stats.farActiveUrgentRefinements = chunkStats.farActiveUrgentRefinementCount;
+    uiFrame.stats.farWorkerBudget = chunkStats.farWorkerBudget;
+    uiFrame.stats.farCachedBaseTiles = chunkStats.farCachedBaseTileCount;
+    uiFrame.stats.farCoverageFrontierBlocks = chunkStats.farCoverageFrontierBlocks;
     uiFrame.stats.farCacheMB = chunkStats.farCacheMB;
     uiFrame.stats.farMeshMB = chunkStats.farMegaUsedMB;
     const int64_t playerX = static_cast<int64_t>(std::floor(state->player.position.x));
@@ -1576,24 +1620,38 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.stats.cubeX = Chunk::worldToChunk(playerX);
     uiFrame.stats.cubeY = Chunk::worldToChunkY(playerY);
     uiFrame.stats.cubeZ = Chunk::worldToChunk(playerZ);
-    const size_t planEntries = state->world->cachedColumnPlanCount();
-    const worldgen::BasinCacheMetrics basinCache = state->world->generator().basinCacheMetrics();
-    uiFrame.stats.macroCacheEntries = static_cast<uint32_t>(planEntries + basinCache.entries);
-    uiFrame.stats.macroCacheMB =
-        static_cast<float>(planEntries * sizeof(ColumnPlan) + basinCache.bytes) /
-        (1024.0f * 1024.0f);
+    if (state->showDebugHud) {
+        const size_t planEntries = state->world->cachedColumnPlanCount();
+        const worldgen::BasinCacheMetrics basinCache =
+            state->world->generator().basinCacheMetrics();
+        const worldgen::MacroControlCacheMetrics macroControlCache =
+            state->world->generator().macroControlCacheMetrics();
+        const FarTerrainGenerationCacheStats farGenerationCache =
+            _renderPipeline->farGenerationCacheStats();
+        uiFrame.stats.macroCacheEntries =
+            static_cast<uint32_t>(planEntries + basinCache.entries + basinCache.shorelineEntries +
+                                  macroControlCache.entries + farGenerationCache.entries);
+        uiFrame.stats.macroCacheMB =
+            static_cast<float>(planEntries * sizeof(ColumnPlan) + basinCache.bytes +
+                               basinCache.shorelineBytes + macroControlCache.bytes +
+                               farGenerationCache.bytes) /
+            (1024.0f * 1024.0f);
+    }
     uiFrame.stats.pendingFluids = static_cast<uint32_t>(state->world->getPendingFluidCount());
     uiFrame.stats.droppedFluidUpdates = state->world->getDroppedFluidUpdateCount();
     uiFrame.stats.droppedFluidFrontiers = state->world->getDroppedFluidFrontierCount();
-    if (const auto surface = state->world->findSurfaceSample(playerX, playerZ)) {
-        uiFrame.stats.plateId = surface->geology.plateId;
-        uiFrame.stats.boundary = surface->geology.boundary;
-        uiFrame.stats.temperatureC = static_cast<float>(surface->climate.temperatureC);
-        uiFrame.stats.precipitationMm = static_cast<float>(surface->climate.annualPrecipitationMm);
-        uiFrame.stats.primaryBiome = surface->biome.primary;
-        uiFrame.stats.secondaryBiome = surface->biome.secondary;
-        uiFrame.stats.biomeTransition = static_cast<float>(surface->biome.transition);
-        uiFrame.stats.riverOrder = surface->hydrology.streamOrder;
+    if (state->showDebugHud) {
+        if (const auto surface = state->world->findSurfaceSample(playerX, playerZ)) {
+            uiFrame.stats.plateId = surface->geology.plateId;
+            uiFrame.stats.boundary = surface->geology.boundary;
+            uiFrame.stats.temperatureC = static_cast<float>(surface->climate.temperatureC);
+            uiFrame.stats.precipitationMm =
+                static_cast<float>(surface->climate.annualPrecipitationMm);
+            uiFrame.stats.primaryBiome = surface->biome.primary;
+            uiFrame.stats.secondaryBiome = surface->biome.secondary;
+            uiFrame.stats.biomeTransition = static_cast<float>(surface->biome.transition);
+            uiFrame.stats.riverOrder = surface->hydrology.streamOrder;
+        }
     }
     uiFrame.menu = state->menuLayout;
 

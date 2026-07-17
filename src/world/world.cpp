@@ -73,18 +73,29 @@ loadedSurfaceHeight(const std::unordered_map<ChunkPos, std::shared_ptr<Chunk>>& 
     return hasLoadedCube ? std::optional<int>(WORLD_MIN_Y - 1) : std::nullopt;
 }
 
+void recordLoadedCubeHighWater(std::atomic<size_t>& highWater, size_t candidate) {
+    size_t previous = highWater.load(std::memory_order_relaxed);
+    while (previous < candidate &&
+           !highWater.compare_exchange_weak(previous, candidate, std::memory_order_relaxed)) {
+    }
+}
+
 } // namespace
 
-World::World(uint32_t seed, int viewDistance)
+World::World(uint32_t seed, int viewDistance, size_t loadedCubeLimit)
     : seed_(seed)
     , viewDistance_(
           std::clamp(viewDistance, MIN_RENDER_DISTANCE_CHUNKS, MAX_RENDER_DISTANCE_CHUNKS))
+    , loadedCubeLimit_(std::clamp<size_t>(loadedCubeLimit, 1, MAX_LOADED_CUBES))
     , generator_(seed) {
     std::atomic_store_explicit(&loadedSnapshot_,
                                std::make_shared<const std::vector<std::shared_ptr<Chunk>>>(),
                                std::memory_order_release);
     std::atomic_store_explicit(&meshCandidateSnapshot_,
                                std::make_shared<const std::unordered_set<ChunkPos>>(),
+                               std::memory_order_release);
+    std::atomic_store_explicit(&exactSurfaceCoverageSnapshot_,
+                               std::make_shared<const ExactSurfaceCoverageSnapshot>(),
                                std::memory_order_release);
 }
 
@@ -94,6 +105,49 @@ void sortChunksByDistance(std::vector<ChunkPos>& chunks, int64_t centerChunkX, i
         return distanceSq(a, centerChunkX, centerChunkY, centerChunkZ) >
                distanceSq(b, centerChunkX, centerChunkY, centerChunkZ);
     });
+}
+
+std::unordered_set<ChunkPos>
+selectStableMeshCandidates(const std::unordered_map<ChunkPos, uint8_t>& candidatePriorities,
+                           const std::unordered_set<ChunkPos>& previousCandidates, ChunkPos center,
+                           size_t capacity) {
+    struct RankedCandidate {
+        ChunkPos position;
+        uint8_t priority = 0;
+        bool previouslyResident = false;
+        int64_t distanceSquared = 0;
+    };
+
+    std::vector<RankedCandidate> ranked;
+    ranked.reserve(candidatePriorities.size());
+    for (const auto& [position, priority] : candidatePriorities) {
+        ranked.push_back({
+            .position = position,
+            .priority = priority,
+            .previouslyResident = previousCandidates.contains(position),
+            .distanceSquared = distanceSq(position, center.x, center.y, center.z),
+        });
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const RankedCandidate& left, const RankedCandidate& right) {
+                  if (left.priority != right.priority) return left.priority > right.priority;
+                  if (left.previouslyResident != right.previouslyResident)
+                      return left.previouslyResident;
+                  if (left.distanceSquared != right.distanceSquared)
+                      return left.distanceSquared < right.distanceSquared;
+                  if (left.position.x != right.position.x)
+                      return left.position.x < right.position.x;
+                  if (left.position.z != right.position.z)
+                      return left.position.z < right.position.z;
+                  return left.position.y < right.position.y;
+              });
+    if (ranked.size() > capacity) ranked.resize(capacity);
+
+    std::unordered_set<ChunkPos> selected;
+    selected.reserve(ranked.size());
+    for (const RankedCandidate& candidate : ranked)
+        selected.insert(candidate.position);
+    return selected;
 }
 
 World::~World() {
@@ -113,7 +167,7 @@ World::~World() {
         size_t activePlans = 0;
         {
             std::lock_guard<std::mutex> lock(pendingMutex_);
-            genBacklog_.clear();
+            genBacklog_ = decltype(genBacklog_){};
             genBacklogSet_.clear();
             columnPlanBacklog_.clear();
             planDependents_.clear();
@@ -156,7 +210,7 @@ void World::generateChunk(const std::shared_ptr<Chunk>& chunk) {
     generator_.generateCube(*chunk);
 }
 
-void World::generateChunkAsync(ChunkPos pos) {
+void World::generateChunkAsync(ChunkPos pos, int64_t priority) {
     if (shuttingDown_.load()) return;
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
@@ -177,18 +231,30 @@ void World::generateChunkAsync(ChunkPos pos) {
     }
 
     auto pool = genPool_;
-    auto future = pool->submit([this, pool, pos]() {
+    auto work = [this, pool, pos]() {
+        bool stale = false;
+        {
+            std::lock_guard<std::mutex> lock(chunksMutex_);
+            stale = !retainedChunks_.contains(pos) || shuttingDown_.load();
+        }
+        if (stale) {
+            pumpGeneration();
+            return;
+        }
         bool loadedFromSave = false;
         auto chunk = loadOrGenerateChunk(pos, &loadedFromSave);
         bool inserted = false;
         {
             std::lock_guard<std::mutex> lock(chunksMutex_);
-            if (retainedChunks_.contains(pos) && !shuttingDown_.load()) {
+            if (retainedChunks_.contains(pos) && !shuttingDown_.load() &&
+                chunks_.size() < loadedCubeLimit_) {
                 const auto [it, didInsert] = chunks_.try_emplace(pos, std::move(chunk));
                 inserted = didInsert;
                 if (inserted) {
                     loadedSectionMasks_[{pos.x, pos.z}] |= sectionBit(pos.y);
-                    loadedCubeCount_.fetch_add(1, std::memory_order_relaxed);
+                    const size_t loaded =
+                        loadedCubeCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+                    recordLoadedCubeHighWater(loadedCubeHighWater_, loaded);
                     loadedSnapshotDirty_.store(true, std::memory_order_release);
                     if (loadedFromSave) {
                         refreshSavedSkyCutoffsLocked(pos);
@@ -200,6 +266,8 @@ void World::generateChunkAsync(ChunkPos pos) {
                     markHaloNeighborMeshesDirtyLocked(pos);
                     markSkyContinuityBelowLocked({pos.x, pos.z}, pos.y);
                 }
+            } else if (retainedChunks_.contains(pos) && !shuttingDown_.load()) {
+                loadedCubeAdmissionsRejected_.fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (inserted) {
@@ -207,47 +275,85 @@ void World::generateChunkAsync(ChunkPos pos) {
             queueLightReconcileWithNeighbors(pos);
         }
         pumpGeneration();
-    });
+    };
 
     std::lock_guard<std::mutex> lock(pendingMutex_);
-    pendingGenerations_[pos] = std::move(future);
+    if (pendingGenerations_.contains(pos)) return;
+    if (const auto lane = exactPriorityByCube_.find(pos); lane != exactPriorityByCube_.end()) {
+        const int64_t squared =
+            distanceSq(pos, exactPriorityCenter_.x, exactPriorityCenter_.y, exactPriorityCenter_.z);
+        priority = exactStreamingTaskPriority(activeSetEpoch_, lane->second,
+                                              static_cast<uint64_t>(squared));
+    }
+    pendingGenerations_[pos] = pool->submitWithPriority(priority, std::move(work));
 }
 
-void World::generateColumnPlanAsync(ColumnPos pos) {
+void World::generateColumnPlanAsync(ColumnPos pos, int64_t priority) {
     auto pool = genPool_;
-    auto future = pool->submit([this, pool, pos]() {
-        try {
-            generator_.getColumnPlan(pos);
-        } catch (const std::exception& error) {
-            RY_LOG_ERROR((std::string("Column plan generation failed: ") + error.what()).c_str());
+    auto work = [this, pool, pos]() {
+        bool requiredAtStart = false;
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex_);
+            requiredAtStart = exactPriorityByPlan_.contains(pos) && !shuttingDown_.load();
+        }
+        bool planAvailable = false;
+        if (requiredAtStart) {
+            try {
+                planAvailable = generator_.getColumnPlan(pos) != nullptr;
+            } catch (const std::exception& error) {
+                RY_LOG_ERROR(
+                    (std::string("Column plan generation failed: ") + error.what()).c_str());
+            }
         }
         bool notifyActiveSet = false;
         size_t fullRetainedScanEquivalent = 0;
+        ColumnPlanCompletionAction completionAction = ColumnPlanCompletionAction::DROP;
         {
             std::lock_guard<std::mutex> lock(pendingMutex_);
             columnPlansInFlight_.erase(pos);
             if (activeColumnPlanJobs_ > 0) --activeColumnPlanJobs_;
-            ++completedPlansSinceRebuild_;
+            completionAction = columnPlanCompletionAction(
+                planAvailable, shuttingDown_.load(), exactPriorityByPlan_.contains(pos),
+                std::ranges::find(columnPlanBacklog_, pos) != columnPlanBacklog_.end());
+            if (completionAction == ColumnPlanCompletionAction::PUBLISH) {
+                ++completedPlansSinceRebuild_;
+            } else if (completionAction == ColumnPlanCompletionAction::REQUEUE) {
+                // The camera can leave and reenter this plan while an old
+                // queued task is starting. Put the still-required plan back
+                // at the next-pop end instead of falsely waking cube
+                // dependents without immutable authority.
+                columnPlanBacklog_.push_back(pos);
+            }
             const bool drained = activeColumnPlanJobs_ == 0 && columnPlanBacklog_.empty();
-            if (completedPlansSinceRebuild_ >= COLUMN_PLAN_REBUILD_BATCH || drained) {
+            if (completedPlansSinceRebuild_ >= COLUMN_PLAN_REBUILD_BATCH ||
+                (drained && completedPlansSinceRebuild_ != 0)) {
                 completedPlansSinceRebuild_ = 0;
                 notifyActiveSet = true;
             }
             fullRetainedScanEquivalent = retainedCubeCountForStats_;
         }
-        completedColumnPlans_.fetch_add(1, std::memory_order_relaxed);
-        fullRetainedScanEquivalent_.fetch_add(fullRetainedScanEquivalent,
-                                              std::memory_order_relaxed);
-        wakePlanDependents(pos);
+        if (completionAction == ColumnPlanCompletionAction::PUBLISH) {
+            completedColumnPlans_.fetch_add(1, std::memory_order_relaxed);
+            fullRetainedScanEquivalent_.fetch_add(fullRetainedScanEquivalent,
+                                                  std::memory_order_relaxed);
+            wakePlanDependents(pos);
+        }
         if (notifyActiveSet) {
             columnPlansChanged_.store(true, std::memory_order_release);
             activeSetRebuildNotifications_.fetch_add(1, std::memory_order_relaxed);
         }
         pumpGeneration();
-    });
+    };
 
     std::lock_guard<std::mutex> lock(pendingMutex_);
-    pendingColumnPlans_[pos] = std::move(future);
+    if (pendingColumnPlans_.contains(pos)) return;
+    if (const auto lane = exactPriorityByPlan_.find(pos); lane != exactPriorityByPlan_.end()) {
+        const int64_t dx = pos.x - exactPriorityCenter_.x;
+        const int64_t dz = pos.z - exactPriorityCenter_.z;
+        priority = exactStreamingTaskPriority(activeSetEpoch_, lane->second,
+                                              static_cast<uint64_t>(dx * dx + dz * dz));
+    }
+    pendingColumnPlans_[pos] = pool->submitWithPriority(priority, std::move(work));
 }
 
 std::shared_ptr<Chunk> World::loadOrGenerateChunk(ChunkPos pos, bool* loadedFromSave) {
@@ -286,6 +392,10 @@ std::shared_ptr<Chunk> World::getChunk(ChunkPos pos) {
         std::lock_guard<std::mutex> lock(chunksMutex_);
         auto it = chunks_.find(pos);
         if (it != chunks_.end()) return it->second;
+        if (chunks_.size() >= loadedCubeLimit_) {
+            loadedCubeAdmissionsRejected_.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
     }
 
     bool loadedFromSave = false;
@@ -294,23 +404,31 @@ std::shared_ptr<Chunk> World::getChunk(ChunkPos pos) {
     bool inserted = false;
     {
         std::lock_guard<std::mutex> lock(chunksMutex_);
-        const auto [it, didInsert] = chunks_.try_emplace(pos, std::move(chunk));
-        inserted = didInsert;
-        if (inserted) {
-            loadedSectionMasks_[{pos.x, pos.z}] |= sectionBit(pos.y);
-            loadedCubeCount_.fetch_add(1, std::memory_order_relaxed);
-            loadedSnapshotDirty_.store(true, std::memory_order_release);
-            if (loadedFromSave) {
-                refreshSavedSkyCutoffsLocked(pos);
-            } else {
-                if (extendGeneratedSkyCutoffsLocked(*it->second)) {
-                    markSkyColumnMeshesDirtyLocked({pos.x, pos.z});
+        if (const auto existing = chunks_.find(pos); existing != chunks_.end()) {
+            result = existing->second;
+        } else if (chunks_.size() >= loadedCubeLimit_) {
+            loadedCubeAdmissionsRejected_.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        } else {
+            const auto [it, didInsert] = chunks_.try_emplace(pos, std::move(chunk));
+            inserted = didInsert;
+            if (inserted) {
+                loadedSectionMasks_[{pos.x, pos.z}] |= sectionBit(pos.y);
+                const size_t loaded = loadedCubeCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+                recordLoadedCubeHighWater(loadedCubeHighWater_, loaded);
+                loadedSnapshotDirty_.store(true, std::memory_order_release);
+                if (loadedFromSave) {
+                    refreshSavedSkyCutoffsLocked(pos);
+                } else {
+                    if (extendGeneratedSkyCutoffsLocked(*it->second)) {
+                        markSkyColumnMeshesDirtyLocked({pos.x, pos.z});
+                    }
                 }
+                markHaloNeighborMeshesDirtyLocked(pos);
+                markSkyContinuityBelowLocked({pos.x, pos.z}, pos.y);
             }
-            markHaloNeighborMeshesDirtyLocked(pos);
-            markSkyContinuityBelowLocked({pos.x, pos.z}, pos.y);
+            result = it->second;
         }
-        result = it->second;
     }
     if (inserted) {
         queueFluidResume(pos);
@@ -323,7 +441,8 @@ BlockType World::getBlock(int64_t x, int32_t y, int64_t z) {
     if (y < WORLD_MIN_Y) return BlockType::BEDROCK;
     if (y > WORLD_MAX_Y) return BlockType::AIR;
     const ChunkPos pos{Chunk::worldToChunk(x), Chunk::worldToChunkY(y), Chunk::worldToChunk(z)};
-    return getChunk(pos)->getBlockWorld(x, y, z);
+    const std::shared_ptr<Chunk> chunk = getChunk(pos);
+    return chunk ? chunk->getBlockWorld(x, y, z) : BlockType::STONE;
 }
 
 BlockType World::getBlockIfLoaded(int64_t x, int32_t y, int64_t z) const {
@@ -845,7 +964,8 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
                 const bool completeSkyPath = loadedMask != loadedSectionMasks_.end() &&
                                              (loadedMask->second & requiredMask) == requiredMask;
                 if (!completeSkyPath) {
-                    out.skyCutoffY[MeshSnapshot::skyIndex(x, z)] = WORLD_MAX_Y + 1;
+                    out.skyCutoffY[MeshSnapshot::skyIndex(x, z)] =
+                        MeshSnapshot::SKY_CUTOFF_INCOMPLETE;
                 }
             }
         }
@@ -915,53 +1035,37 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
         }
     }
 
-    // Material lookup stays outside chunksMutex_. It runs only for a missing
-    // lateral halo, touches at most 64 cached plan columns, and gives an
-    // aboveground provisional cliff the same top palette as the arriving
-    // terrain instead of an unlit bedrock patch.
-    const auto cacheSurfaceMaterial = [&](int x, int z) {
-        const int64_t worldX = pos.x * CHUNK_EDGE + x;
-        const int64_t worldZ = pos.z * CHUNK_EDGE + z;
-        out.generatedSurfaceMaterial[MeshSnapshot::skyIndex(x, z)] =
-            generator_.surfaceMaterialAt(worldX, worldZ);
-    };
-    const auto needsLitSurfaceCap = [&](int selfX, int selfZ, int neighborX, int neighborZ) {
-        const int32_t selfCutoff = out.generatedSurfaceCutoffAt(selfX, selfZ);
-        const int32_t neighborCutoff = out.generatedSurfaceCutoffAt(neighborX, neighborZ);
-        if (selfCutoff == MeshSnapshot::SKY_CUTOFF_UNKNOWN ||
-            neighborCutoff == MeshSnapshot::SKY_CUTOFF_UNKNOWN || neighborCutoff <= selfCutoff) {
-            return false;
-        }
-        const int32_t minimumY = std::max(pos.y * CHUNK_EDGE, selfCutoff);
-        const int32_t maximumY = std::min(pos.y * CHUNK_EDGE + CHUNK_EDGE - 1, neighborCutoff - 1);
-        for (int32_t worldY = minimumY; worldY <= maximumY; ++worldY) {
-            if (!isOpaque(out.at(selfX, worldY - pos.y * CHUNK_EDGE, selfZ))) return true;
-        }
-        return false;
+    // Material lookup stays outside chunksMutex_. A missing face gets one
+    // representative arriving-terrain material, then reuses it across its 16
+    // transient caps. This bounds cold frontier work to four nonlinear surface
+    // samples per mesh instead of 64 while avoiding a dark default material.
+    // The real neighbor mesh replaces this provisional face once it arrives.
+    const auto cacheFaceMaterial = [&](int sampleX, int sampleZ, auto assign) {
+        const int64_t worldX = pos.x * CHUNK_EDGE + sampleX;
+        const int64_t worldZ = pos.z * CHUNK_EDGE + sampleZ;
+        const BlockType material = generator_.surfaceMaterialAt(worldX, worldZ);
+        for (int coordinate = 0; coordinate < CHUNK_EDGE; ++coordinate)
+            assign(coordinate, material);
     };
     if ((out.missingNeighborFaces & MeshSnapshot::MISSING_PLUS_X) != 0) {
-        for (int z = 0; z < CHUNK_EDGE; ++z) {
-            if (needsLitSurfaceCap(CHUNK_EDGE - 1, z, CHUNK_EDGE, z)) {
-                cacheSurfaceMaterial(CHUNK_EDGE, z);
-            }
-        }
+        cacheFaceMaterial(CHUNK_EDGE, CHUNK_EDGE / 2, [&](int z, BlockType material) {
+            out.generatedSurfaceMaterial[MeshSnapshot::skyIndex(CHUNK_EDGE, z)] = material;
+        });
     }
     if ((out.missingNeighborFaces & MeshSnapshot::MISSING_MINUS_X) != 0) {
-        for (int z = 0; z < CHUNK_EDGE; ++z) {
-            if (needsLitSurfaceCap(0, z, -1, z)) cacheSurfaceMaterial(-1, z);
-        }
+        cacheFaceMaterial(-1, CHUNK_EDGE / 2, [&](int z, BlockType material) {
+            out.generatedSurfaceMaterial[MeshSnapshot::skyIndex(-1, z)] = material;
+        });
     }
     if ((out.missingNeighborFaces & MeshSnapshot::MISSING_PLUS_Z) != 0) {
-        for (int x = 0; x < CHUNK_EDGE; ++x) {
-            if (needsLitSurfaceCap(x, CHUNK_EDGE - 1, x, CHUNK_EDGE)) {
-                cacheSurfaceMaterial(x, CHUNK_EDGE);
-            }
-        }
+        cacheFaceMaterial(CHUNK_EDGE / 2, CHUNK_EDGE, [&](int x, BlockType material) {
+            out.generatedSurfaceMaterial[MeshSnapshot::skyIndex(x, CHUNK_EDGE)] = material;
+        });
     }
     if ((out.missingNeighborFaces & MeshSnapshot::MISSING_MINUS_Z) != 0) {
-        for (int x = 0; x < CHUNK_EDGE; ++x) {
-            if (needsLitSurfaceCap(x, 0, x, -1)) cacheSurfaceMaterial(x, -1);
-        }
+        cacheFaceMaterial(CHUNK_EDGE / 2, -1, [&](int x, BlockType material) {
+            out.generatedSurfaceMaterial[MeshSnapshot::skyIndex(x, -1)] = material;
+        });
     }
 
     return true;
@@ -992,6 +1096,10 @@ std::shared_ptr<const std::vector<std::shared_ptr<Chunk>>> World::getLoadedSnaps
 
 std::shared_ptr<const std::unordered_set<ChunkPos>> World::getMeshCandidateSnapshot() const {
     return std::atomic_load_explicit(&meshCandidateSnapshot_, std::memory_order_acquire);
+}
+
+std::shared_ptr<const ExactSurfaceCoverageSnapshot> World::getExactSurfaceCoverageSnapshot() const {
+    return std::atomic_load_explicit(&exactSurfaceCoverageSnapshot_, std::memory_order_acquire);
 }
 
 void World::publishLoadedSnapshot() {
@@ -1079,7 +1187,12 @@ bool World::shouldRetain(ChunkPos pos) const {
 
 void World::queueGenerationLocked(ChunkPos pos) {
     if (generationsInFlight_.contains(pos) || !genBacklogSet_.insert(pos).second) return;
-    genBacklog_.push_back(pos);
+    const auto lane = exactPriorityByCube_.find(pos);
+    const uint8_t priorityLane = lane == exactPriorityByCube_.end() ? 0 : lane->second;
+    const int64_t squared =
+        distanceSq(pos, exactPriorityCenter_.x, exactPriorityCenter_.y, exactPriorityCenter_.z);
+    genBacklog_.push({pos, exactStreamingTaskPriority(activeSetEpoch_, priorityLane,
+                                                      static_cast<uint64_t>(squared))});
 }
 
 void World::registerPlanDependenciesLocked(ChunkPos pos) {
@@ -1300,7 +1413,8 @@ void World::generateAroundPlayer(int64_t playerX, int32_t playerY, int64_t playe
 void World::ensureStreamingWorkers() {
     std::lock_guard<std::mutex> lock(activeSetRequestMutex_);
     if (!genPool_) {
-        genPool_ = std::make_shared<ThreadPool>(4, ThreadPriority::UTILITY);
+        genPool_ = std::make_shared<ThreadPool>(
+            EXACT_GENERATION_WORKER_COUNT, ThreadPriority::UTILITY, EXACT_LATENCY_WORKER_COUNT);
     }
     if (!activeSetThread_.joinable()) {
         activeSetThread_ = std::thread([this] { activeSetWorkerLoop(); });
@@ -1345,13 +1459,9 @@ void World::activeSetWorkerLoop() {
         }
 
         try {
-            bool published = false;
             {
                 std::lock_guard<std::mutex> buildLock(activeSetBuildMutex_);
-                published = rebuildActiveSet(request);
-            }
-            if (published && !activeSetRequestIsStale(request.id)) {
-                unloadDistantChunks();
+                (void)rebuildActiveSet(request);
             }
         } catch (const std::exception& error) {
             RY_LOG_ERROR((std::string("Active-set rebuild failed: ") + error.what()).c_str());
@@ -1382,10 +1492,14 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
     const int64_t centerZ = Chunk::worldToChunk(request.playerZ);
     // Exact cubes carry edits, collision, entities, flora, and runtime fluids.
     // The renderer extends the visible horizon with immutable far-terrain LOD
-    // tiles, so a 256-chunk view never expands cubic simulation to 4 km.
+    // tiles, so a 512-chunk view never expands cubic simulation to 8 km.
     const int exactViewDistance = std::min(request.viewDistance, MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
     const int radius = std::max(exactViewDistance + 1, EXPLORATION_RADIUS_CHUNKS);
-    constexpr uint8_t EXPLORATION_PRIORITY = 5;
+    constexpr uint8_t SURFACE_PRIORITY = 3;
+    constexpr uint8_t PRIMARY_SURFACE_PRIORITY = 4;
+    constexpr uint8_t EDITED_PRIORITY = 5;
+    constexpr uint8_t EXPLORATION_PRIORITY = 6;
+    constexpr uint8_t CAMERA_COLUMN_PRIORITY = 7;
     auto cancelIfStale = [&] {
         if (!activeSetRequestIsStale(request.id)) return false;
         activeSetBuildsCanceled_.fetch_add(1, std::memory_order_relaxed);
@@ -1413,14 +1527,22 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
 
     std::unordered_set<ChunkPos> wantedSet;
     std::unordered_map<ChunkPos, uint8_t> wantedPriority;
+    std::unordered_set<ChunkPos> surfaceRequirements;
+    std::vector<ColumnPos> unresolvedSurfaceColumns;
     wantedSet.reserve(
-        std::min<size_t>(MAX_LOADED_CUBES * 2, static_cast<size_t>(radius * radius * 8)));
+        std::min<size_t>(loadedCubeLimit_ * 2, static_cast<size_t>(radius * radius * 8)));
     wantedPriority.reserve(wantedSet.bucket_count());
+    surfaceRequirements.reserve(visibleColumns.size() * 2);
+    unresolvedSurfaceColumns.reserve(visibleColumns.size());
     auto addWanted = [&](ChunkPos pos, uint8_t priority) {
         if (!validChunkY(pos.y)) return;
         wantedSet.insert(pos);
         auto [iterator, inserted] = wantedPriority.try_emplace(pos, priority);
         if (!inserted) iterator->second = std::max(iterator->second, priority);
+    };
+    auto addSurfaceRequirement = [&](ChunkPos pos, uint8_t priority) {
+        addWanted(pos, priority);
+        if (validChunkY(pos.y)) surfaceRequirements.insert(pos);
     };
     for (ColumnPos column : visibleColumns) {
         const int dx = static_cast<int>(column.x - centerX);
@@ -1429,8 +1551,11 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
         const int64_t chunkZ = column.z;
         if (const auto plan = generator_.findColumnPlan(column)) {
             for (int32_t section : plan->exposedSections()) {
-                addWanted({chunkX, section, chunkZ}, 4);
+                addSurfaceRequirement({chunkX, section, chunkZ}, SURFACE_PRIORITY);
             }
+            const int32_t primarySection =
+                Chunk::worldToChunkY(plan->surfaceY(CHUNK_EDGE / 2, CHUNK_EDGE / 2));
+            addSurfaceRequirement({chunkX, primarySection, chunkZ}, PRIMARY_SURFACE_PRIORITY);
 
             // Each east and south face has one deterministic owner. When
             // exact density surfaces straddle several vertical sections,
@@ -1453,19 +1578,21 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
                     const int32_t first = Chunk::worldToChunkY(minimumY);
                     const int32_t last = Chunk::worldToChunkY(maximumY);
                     for (int32_t section = first; section <= last; ++section) {
-                        addWanted({higher.x, section, higher.z}, 4);
+                        addSurfaceRequirement({higher.x, section, higher.z}, SURFACE_PRIORITY);
                     }
                 }
             };
             exposeBoundaryWall({chunkX + 1, chunkZ}, true);
             exposeBoundaryWall({chunkX, chunkZ + 1}, false);
         } else {
-            addWanted({chunkX, Chunk::worldToChunkY(SEA_LEVEL), chunkZ}, 4);
+            unresolvedSurfaceColumns.push_back(column);
+            addSurfaceRequirement({chunkX, Chunk::worldToChunkY(SEA_LEVEL), chunkZ},
+                                  PRIMARY_SURFACE_PRIORITY);
         }
 
         if (const auto saved = savedSections.find(column); saved != savedSections.end()) {
             for (int32_t section : saved->second) {
-                addWanted({chunkX, section, chunkZ}, 2);
+                addWanted({chunkX, section, chunkZ}, EDITED_PRIORITY);
             }
         }
 
@@ -1475,36 +1602,50 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
             for (int oy = -EXPLORATION_VERTICAL_RADIUS_CUBES;
                  oy <= EXPLORATION_VERTICAL_RADIUS_CUBES; ++oy) {
                 const int32_t y = centerY + oy;
-                addWanted({chunkX, y, chunkZ}, EXPLORATION_PRIORITY);
+                addWanted({chunkX, y, chunkZ},
+                          dx == 0 && dz == 0 ? CAMERA_COLUMN_PRIORITY : EXPLORATION_PRIORITY);
             }
         }
     }
     if (cancelIfStale()) return false;
 
-    std::vector<ChunkPos> wanted(wantedSet.begin(), wantedSet.end());
-    std::sort(wanted.begin(), wanted.end(), [&](ChunkPos left, ChunkPos right) {
-        const uint8_t leftPriority = wantedPriority.at(left);
-        const uint8_t rightPriority = wantedPriority.at(right);
-        if (leftPriority != rightPriority) return leftPriority < rightPriority;
-        return distanceSq(left, centerX, centerY, centerZ) >
-               distanceSq(right, centerX, centerY, centerZ);
-    });
-    if (wanted.size() > MAX_MESH_RESIDENT_CUBES) {
-        wanted.erase(wanted.begin(), wanted.begin() + (wanted.size() - MAX_MESH_RESIDENT_CUBES));
-        wantedSet.clear();
-        wantedSet.insert(wanted.begin(), wanted.end());
-    }
+    auto coverageSnapshot = std::make_shared<ExactSurfaceCoverageSnapshot>();
+    coverageSnapshot->nominalRadiusChunks = exactViewDistance;
+    coverageSnapshot->requiredSections.assign(surfaceRequirements.begin(),
+                                              surfaceRequirements.end());
+    std::sort(coverageSnapshot->requiredSections.begin(), coverageSnapshot->requiredSections.end(),
+              [](ChunkPos left, ChunkPos right) {
+                  if (left.x != right.x) return left.x < right.x;
+                  if (left.z != right.z) return left.z < right.z;
+                  return left.y < right.y;
+              });
+    std::sort(unresolvedSurfaceColumns.begin(), unresolvedSurfaceColumns.end(),
+              [](ColumnPos left, ColumnPos right) {
+                  if (left.x != right.x) return left.x < right.x;
+                  return left.z < right.z;
+              });
+    unresolvedSurfaceColumns.erase(
+        std::unique(unresolvedSurfaceColumns.begin(), unresolvedSurfaceColumns.end()),
+        unresolvedSurfaceColumns.end());
+    coverageSnapshot->unresolvedColumns = std::move(unresolvedSurfaceColumns);
 
-    std::unordered_set<ChunkPos> retained = wantedSet;
+    std::unordered_set<ChunkPos> previousMeshCandidates;
+    {
+        std::lock_guard<std::mutex> chunksLock(chunksMutex_);
+        previousMeshCandidates = meshCandidateChunks_;
+    }
+    wantedSet = selectStableMeshCandidates(wantedPriority, previousMeshCandidates,
+                                           {centerX, centerY, centerZ},
+                                           std::min(MAX_MESH_RESIDENT_CUBES, loadedCubeLimit_));
+
     std::unordered_map<ChunkPos, uint8_t> haloPriority;
-    retained.reserve(wantedSet.size() * 2);
+    haloPriority.reserve(wantedSet.size() * 2);
     for (ChunkPos pos : wantedSet) {
         for (int offsetY = -1; offsetY <= 1; ++offsetY) {
             for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
                 for (int offsetX = -1; offsetX <= 1; ++offsetX) {
                     ChunkPos neighbor{pos.x + offsetX, pos.y + offsetY, pos.z + offsetZ};
                     if (!validChunkY(neighbor.y)) continue;
-                    retained.insert(neighbor);
                     if (wantedSet.contains(neighbor)) continue;
                     auto [iterator, inserted] =
                         haloPriority.try_emplace(neighbor, wantedPriority.at(pos));
@@ -1514,27 +1655,25 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
             }
         }
     }
-
-    if (retained.size() > MAX_LOADED_CUBES) {
-        std::vector<ChunkPos> halo;
-        halo.reserve(retained.size() - wantedSet.size());
-        for (ChunkPos pos : retained) {
-            if (!wantedSet.contains(pos)) halo.push_back(pos);
+    const size_t haloBudget = loadedCubeLimit_ - wantedSet.size();
+    std::unordered_set<ChunkPos> previousMeshHalos;
+    previousMeshHalos.reserve(previousMeshCandidates.size() * 2);
+    for (ChunkPos position : previousMeshCandidates) {
+        for (int offsetY = -1; offsetY <= 1; ++offsetY) {
+            for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+                for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+                    const ChunkPos neighbor{position.x + offsetX, position.y + offsetY,
+                                            position.z + offsetZ};
+                    if (validChunkY(neighbor.y)) previousMeshHalos.insert(neighbor);
+                }
+            }
         }
-        std::sort(halo.begin(), halo.end(), [&](ChunkPos left, ChunkPos right) {
-            const uint8_t leftPriority = haloPriority.at(left);
-            const uint8_t rightPriority = haloPriority.at(right);
-            if (leftPriority != rightPriority) return leftPriority < rightPriority;
-            return distanceSq(left, centerX, centerY, centerZ) >
-                   distanceSq(right, centerX, centerY, centerZ);
-        });
-        const size_t haloBudget = MAX_LOADED_CUBES - wantedSet.size();
-        if (halo.size() > haloBudget) {
-            halo.erase(halo.begin(), halo.begin() + (halo.size() - haloBudget));
-        }
-        retained = wantedSet;
-        retained.insert(halo.begin(), halo.end());
     }
+    const std::unordered_set<ChunkPos> selectedHalos = selectStableMeshCandidates(
+        haloPriority, previousMeshHalos, {centerX, centerY, centerZ}, haloBudget);
+    std::unordered_set<ChunkPos> retained = wantedSet;
+    retained.reserve(wantedSet.size() + selectedHalos.size());
+    retained.insert(selectedHalos.begin(), selectedHalos.end());
     if (cancelIfStale()) return false;
 
     for (auto iterator = wantedSet.begin(); iterator != wantedSet.end();) {
@@ -1558,40 +1697,80 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
         }
     }
 
-    std::unordered_set<ColumnPos> planCenters;
-    planCenters.reserve(retained.size());
-    for (ChunkPos pos : retained)
-        planCenters.insert({pos.x, pos.z});
+    std::unordered_map<ChunkPos, uint8_t> retainedPriority;
+    retainedPriority.reserve(retained.size());
+    for (ChunkPos position : retained) {
+        if (const auto wanted = wantedPriority.find(position); wanted != wantedPriority.end()) {
+            retainedPriority.emplace(position, wanted->second);
+        } else {
+            retainedPriority.emplace(position, haloPriority.at(position));
+        }
+    }
 
-    std::unordered_set<ColumnPos> requestedPlans;
-    requestedPlans.reserve(planCenters.size() * 2 + 64);
-    for (ColumnPos center : planCenters) {
+    std::unordered_map<ColumnPos, uint8_t> planCenterPriority;
+    planCenterPriority.reserve(retained.size());
+    for (ChunkPos cube : retained) {
+        auto [iterator, inserted] =
+            planCenterPriority.try_emplace({cube.x, cube.z}, retainedPriority.at(cube));
+        if (!inserted) iterator->second = std::max(iterator->second, retainedPriority.at(cube));
+    }
+
+    std::unordered_map<ColumnPos, uint8_t> requestedPlanPriority;
+    requestedPlanPriority.reserve(planCenterPriority.size() * 2 + 64);
+    for (const auto& [center, priority] : planCenterPriority) {
         for (int apronZ = -2; apronZ <= 2; ++apronZ) {
             for (int apronX = -2; apronX <= 2; ++apronX) {
-                requestedPlans.insert({center.x + apronX, center.z + apronZ});
+                const ColumnPos plan{center.x + apronX, center.z + apronZ};
+                auto [iterator, inserted] = requestedPlanPriority.try_emplace(plan, priority);
+                if (!inserted) iterator->second = std::max(iterator->second, priority);
             }
         }
     }
     if (cancelIfStale()) return false;
-    planApronCenters_.fetch_add(planCenters.size(), std::memory_order_relaxed);
-    planApronExpansionAttempts_.fetch_add(planCenters.size() * 25, std::memory_order_relaxed);
+    planApronCenters_.fetch_add(planCenterPriority.size(), std::memory_order_relaxed);
+    planApronExpansionAttempts_.fetch_add(planCenterPriority.size() * 25,
+                                          std::memory_order_relaxed);
     planApronCubeExpansionEquivalent_.fetch_add(retained.size() * 25, std::memory_order_relaxed);
 
     std::vector<ChunkPos> loadOrder(retained.begin(), retained.end());
-    sortChunksByDistance(loadOrder, centerX, centerY, centerZ);
-    std::vector<ColumnPos> planOrder(requestedPlans.begin(), requestedPlans.end());
+    std::sort(loadOrder.begin(), loadOrder.end(), [&](ChunkPos left, ChunkPos right) {
+        const int64_t leftDistance = distanceSq(left, centerX, centerY, centerZ);
+        const int64_t rightDistance = distanceSq(right, centerX, centerY, centerZ);
+        const int64_t leftPriority = exactStreamingTaskPriority(
+            0, retainedPriority.at(left), static_cast<uint64_t>(leftDistance));
+        const int64_t rightPriority = exactStreamingTaskPriority(
+            0, retainedPriority.at(right), static_cast<uint64_t>(rightDistance));
+        if (leftPriority != rightPriority) return leftPriority < rightPriority;
+        if (left.x != right.x) return left.x > right.x;
+        if (left.z != right.z) return left.z > right.z;
+        return left.y > right.y;
+    });
+    std::vector<ColumnPos> planOrder;
+    planOrder.reserve(requestedPlanPriority.size());
+    for (const auto& [position, priority] : requestedPlanPriority) {
+        (void)priority;
+        planOrder.push_back(position);
+    }
     std::sort(planOrder.begin(), planOrder.end(), [&](ColumnPos left, ColumnPos right) {
         const int64_t leftX = left.x - centerX;
         const int64_t leftZ = left.z - centerZ;
         const int64_t rightX = right.x - centerX;
         const int64_t rightZ = right.z - centerZ;
-        return leftX * leftX + leftZ * leftZ > rightX * rightX + rightZ * rightZ;
+        const uint64_t leftDistance = static_cast<uint64_t>(leftX * leftX + leftZ * leftZ);
+        const uint64_t rightDistance = static_cast<uint64_t>(rightX * rightX + rightZ * rightZ);
+        const int64_t leftPriority =
+            exactStreamingTaskPriority(0, requestedPlanPriority.at(left), leftDistance);
+        const int64_t rightPriority =
+            exactStreamingTaskPriority(0, requestedPlanPriority.at(right), rightDistance);
+        if (leftPriority != rightPriority) return leftPriority < rightPriority;
+        if (left.x != right.x) return left.x > right.x;
+        return left.z > right.z;
     });
 
     // Snapshot only cubes with work or storage to preserve. The bounded
     // neighborhood probes and ordering then run without either world lock.
     std::vector<ChunkPos> priorRetentionCandidates;
-    if (retained.size() < MAX_LOADED_CUBES) {
+    if (retained.size() < loadedCubeLimit_) {
         std::lock_guard<std::mutex> pendingLock(pendingMutex_);
         std::lock_guard<std::mutex> chunksLock(chunksMutex_);
         priorRetentionCandidates.reserve(retainedChunks_.size());
@@ -1635,7 +1814,7 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
                   if (left.y != right.y) return left.y < right.y;
                   return left.z < right.z;
               });
-    const size_t hysteresisBudget = MAX_LOADED_CUBES - retained.size();
+    const size_t hysteresisBudget = loadedCubeLimit_ - retained.size();
     if (hysteresisCandidates.size() > hysteresisBudget) {
         hysteresisCandidates.resize(hysteresisBudget);
     }
@@ -1664,14 +1843,21 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
             }
         }
         ++activeSetEpoch_;
+        coverageSnapshot->epoch = activeSetEpoch_;
+        std::shared_ptr<const ExactSurfaceCoverageSnapshot> immutableCoverage = coverageSnapshot;
+        std::atomic_store_explicit(&exactSurfaceCoverageSnapshot_, std::move(immutableCoverage),
+                                   std::memory_order_release);
         retainedCubeCountForStats_ = retainedCubeCount;
-        genBacklog_.clear();
+        genBacklog_ = decltype(genBacklog_){};
         genBacklogSet_.clear();
         columnPlanBacklog_.clear();
         planDependents_.clear();
         missingPlanDependencies_.clear();
+        exactPriorityByCube_ = std::move(retainedPriority);
+        exactPriorityByPlan_ = std::move(requestedPlanPriority);
+        exactPriorityCenter_ = {centerX, centerY, centerZ};
         genBacklogSet_.reserve(loadOrder.size());
-        planDependents_.reserve(requestedPlans.size());
+        planDependents_.reserve(exactPriorityByPlan_.size());
         missingPlanDependencies_.reserve(loadOrder.size());
         for (ColumnPos pos : planOrder) {
             if (!generator_.findColumnPlan(pos) && !columnPlansInFlight_.contains(pos)) {
@@ -1681,6 +1867,10 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
         for (ChunkPos pos : dependencyCandidates)
             registerPlanDependenciesLocked(pos);
     }
+    // The newly published retention set owns capacity before any replacement
+    // job can insert. A camera jump therefore cannot overlap an old full set
+    // with one additional generation queue of new cubes.
+    unloadDistantChunks();
     pumpGeneration();
     activeSetBuildMs_.record(
         std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - rebuildStart)
@@ -1690,16 +1880,24 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
 
 void World::pumpGeneration() {
     if (!genPool_ || shuttingDown_.load()) return;
-    std::vector<ChunkPos> toSubmit;
-    std::vector<ColumnPos> plansToSubmit;
+    std::vector<std::pair<ChunkPos, int64_t>> toSubmit;
+    std::vector<std::pair<ColumnPos, int64_t>> plansToSubmit;
     bool notifyDrainedPlans = false;
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         for (auto it = pendingGenerations_.begin(); it != pendingGenerations_.end();) {
             if (!it->second.valid() ||
                 it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-                generationsInFlight_.erase(it->first);
+                const ChunkPos completed = it->first;
+                generationsInFlight_.erase(completed);
                 it = pendingGenerations_.erase(it);
+                bool stillRequired = false;
+                {
+                    std::lock_guard<std::mutex> chunksLock(chunksMutex_);
+                    stillRequired =
+                        retainedChunks_.contains(completed) && !chunks_.contains(completed);
+                }
+                if (stillRequired) registerPlanDependenciesLocked(completed);
             } else {
                 ++it;
             }
@@ -1718,14 +1916,22 @@ void World::pumpGeneration() {
             if (generator_.findColumnPlan(pos) || columnPlansInFlight_.contains(pos)) continue;
             columnPlansInFlight_.insert(pos);
             ++activeColumnPlanJobs_;
-            plansToSubmit.push_back(pos);
+            const auto lane = exactPriorityByPlan_.find(pos);
+            const uint8_t priorityLane = lane == exactPriorityByPlan_.end() ? 0 : lane->second;
+            const int64_t dx = pos.x - exactPriorityCenter_.x;
+            const int64_t dz = pos.z - exactPriorityCenter_.z;
+            plansToSubmit.emplace_back(
+                pos, exactStreamingTaskPriority(activeSetEpoch_, priorityLane,
+                                                static_cast<uint64_t>(dx * dx + dz * dz)));
         }
-        while (generationsInFlight_.size() < MAX_INFLIGHT_GEN && !genBacklog_.empty()) {
-            const ChunkPos pos = genBacklog_.back();
-            genBacklog_.pop_back();
+        while (generationsInFlight_.size() < EXACT_GENERATION_SUBMISSION_LIMIT &&
+               !genBacklog_.empty()) {
+            const GenerationBacklogEntry entry = genBacklog_.top();
+            const ChunkPos pos = entry.position;
+            genBacklog_.pop();
             genBacklogSet_.erase(pos);
             if (!generationsInFlight_.insert(pos).second) continue;
-            toSubmit.push_back(pos);
+            toSubmit.emplace_back(pos, entry.priority);
         }
         if (activeColumnPlanJobs_ == 0 && columnPlanBacklog_.empty() &&
             completedPlansSinceRebuild_ != 0) {
@@ -1737,10 +1943,10 @@ void World::pumpGeneration() {
         columnPlansChanged_.store(true, std::memory_order_release);
         activeSetRebuildNotifications_.fetch_add(1, std::memory_order_relaxed);
     }
-    for (ColumnPos pos : plansToSubmit)
-        generateColumnPlanAsync(pos);
-    for (ChunkPos pos : toSubmit)
-        generateChunkAsync(pos);
+    for (const auto& [pos, priority] : plansToSubmit)
+        generateColumnPlanAsync(pos, priority);
+    for (const auto& [pos, priority] : toSubmit)
+        generateChunkAsync(pos, priority);
 }
 
 size_t World::getPendingChunkCount() const {
@@ -1770,6 +1976,9 @@ StreamingWorkStats World::getStreamingWorkStats() const {
         .activeSetRequests = activeSetRequests_.load(std::memory_order_relaxed),
         .activeSetRequestsCoalesced = activeSetRequestsCoalesced_.load(std::memory_order_relaxed),
         .activeSetBuildsCanceled = activeSetBuildsCanceled_.load(std::memory_order_relaxed),
+        .loadedCubeAdmissionsRejected =
+            loadedCubeAdmissionsRejected_.load(std::memory_order_relaxed),
+        .loadedCubeHighWater = loadedCubeHighWater_.load(std::memory_order_relaxed),
         .activeSetBuildMs = activeSetBuildMs_.value(),
     };
 }

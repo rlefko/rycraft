@@ -10,6 +10,15 @@ A concept gets exactly one definition, in one header, and everyone imports it. C
 |---------|------|
 | Block types + solidity/opacity/transparency | `world/block_properties.hpp` |
 | Chunk keys | `world/chunk_pos.hpp` (`ChunkPos`) |
+| Surface sampling support | `world/macro_generation.hpp` (`SurfaceFootprint`) |
+| Water-body identity | `world/basin_solver.hpp` (`WaterBodyId`) |
+| Lithology transition data | `world/macro_generation.hpp` (`LithologyBlend`) |
+| Weighted surface materials | `world/surface_material.hpp` (`SurfaceMaterialPalette`) |
+| Tree species and habitat evaluation | `world/features.hpp` (`TreeSpecies`, `evaluateTreeHabitat`, `treeCoverDensity`) |
+| Exact coverage requirements | `world/world.hpp` (`ExactSurfaceCoverageSnapshot`) |
+| Per-column far ownership data | `render/far_terrain.hpp` (`FarTerrainExactHandoff`) |
+| Far fragment and paired skirt visibility | `render/shader_types.hpp` |
+| Far LOD tiers, parent residency, and transition timing | `render/far_terrain.hpp` |
 | Coordinate-addressed generation randomness | `common/counter_rng.hpp` (`CounterRng`) |
 | Seed hashing and serial visual-effect randomness | `common/random.hpp` |
 | GPU-shared struct layouts | `render/shader_types.hpp` |
@@ -17,7 +26,7 @@ A concept gets exactly one definition, in one header, and everyone imports it. C
 | Menu geometry (drawn AND hit-tested) | `render/ui_menu.hpp` |
 | Yaw/pitch → look direction | `common/math.hpp` (`directionFromYawPitch`) |
 
-**Why:** this codebase once had four `isSolid` definitions (glass rendered solid, entities fell through it), three chunk-key schemes (one allocating strings per block access), six RNG implementations (one seeded from `random_device` in a deterministic game), five copies of GPU structs (all drifted), and a hand-copied camera basis whose inverted signs walked W backwards. Duplicated definitions don't stay in sync; they diverge and each divergence is a bug.
+**Why:** this codebase once had four `isSolid` definitions (glass rendered solid, entities fell through it), three chunk-key schemes (one allocating strings per block access), six RNG implementations (one seeded from `random_device` in a deterministic game), five copies of GPU structs (all drifted), a hand-copied camera basis whose inverted signs walked W backwards, and separate exact and far field rules that exposed straight handoff boundaries. Duplicated definitions do not stay in sync; they diverge and each divergence is a bug.
 
 ## Naming
 

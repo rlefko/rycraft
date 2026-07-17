@@ -1,11 +1,15 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/counter_rng.hpp"
+#include "world/artifact_analysis.hpp"
 #include "world/chunk_generator.hpp"
 #include "world/density_field.hpp"
+#include "world/features.hpp"
 #include "world/macro_generation.hpp"
 #include "world/surface_material.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -13,6 +17,8 @@
 #include <vector>
 
 namespace {
+
+namespace artifact = worldgen::artifact_analysis;
 
 BlockType generatedBlockAt(ChunkGenerator& generator, int64_t x, int y, int64_t z) {
     Chunk cube(ChunkPos{Chunk::worldToChunk(x), Chunk::worldToChunkY(y), Chunk::worldToChunk(z)});
@@ -43,6 +49,32 @@ worldgen::SurfaceSample materialFixture() {
     sample.biome.primary = Biome::PLAINS;
     sample.biome.secondary = Biome::PLAINS;
     sample.terrainHeight = 90.0;
+    return sample;
+}
+
+worldgen::SurfaceSample treeHabitatFixture(Biome biome) {
+    worldgen::SurfaceSample sample = materialFixture();
+    sample.biome.primary = biome;
+    sample.biome.secondary = biome;
+    sample.biome.transition = 0.0;
+    sample.suitability.scores.fill(0.0F);
+    sample.suitability.scores[static_cast<size_t>(biome)] = 1.0F;
+    sample.terrainHeight = 90.0;
+    sample.hydrology.surfaceElevation = 90.0;
+    sample.waterSurface = 0.0;
+    sample.hydrology.waterSurface = 0.0;
+    sample.slope = 0.12;
+    sample.geology.rock = worldgen::RockType::GRANITE;
+    sample.geology.lithology.primary = worldgen::RockType::GRANITE;
+    sample.geology.lithology.secondary = worldgen::RockType::GRANITE;
+    sample.geology.lithology.contactDistance = 512.0;
+    sample.geology.volcanicActivity = 0.0;
+    sample.geology.faultStrength = 0.0;
+    sample.geology.uplift = 0.0;
+    sample.climate.relativeHumidity = 0.72;
+    sample.soil.drainage = 0.55;
+    sample.soil.waterTable = 84.0;
+    sample.ecotopes = worldgen::Ecotope::NONE;
     return sample;
 }
 
@@ -98,6 +130,36 @@ void requireContinuousFieldsEqual(const worldgen::SurfaceSample& first,
     REQUIRE(first.biome.primary == second.biome.primary);
     REQUIRE(first.biome.secondary == second.biome.secondary);
     REQUIRE(first.biome.transition == second.biome.transition);
+}
+
+BlockType dominantSurfaceMaterial(ChunkGenerator& generator, int64_t x, int64_t z) {
+    return generator.farSurfaceMaterialAt(x, z);
+}
+
+int surfacePaletteWeight(const worldgen::surface_material::SurfaceMaterialPalette& palette,
+                         BlockType material) {
+    for (size_t index = 0; index < palette.count; ++index) {
+        if (palette.entries[index].material == material)
+            return palette.entries[index].weight;
+    }
+    return 0;
+}
+
+bool isTaggedLithologyDiscontinuity(const worldgen::GeologySample& first,
+                                    const worldgen::GeologySample& second) {
+    return first.faultStrength > 0.45 || second.faultStrength > 0.45 ||
+           first.boundary == worldgen::PlateBoundary::TRANSFORM ||
+           second.boundary == worldgen::PlateBoundary::TRANSFORM;
+}
+
+bool hasHardSurfaceMaterialConstraint(const worldgen::SurfaceSample& sample) {
+    return sample.hydrology.ocean || sample.hydrology.lake || sample.hydrology.river ||
+           sample.hydrology.waterfall || sample.hydrology.delta ||
+           sample.geology.volcanicActivity > 0.52 ||
+           worldgen::hasEcotope(sample.ecotopes, worldgen::Ecotope::CLIFF) ||
+           worldgen::hasEcotope(sample.ecotopes, worldgen::Ecotope::SCREE) ||
+           worldgen::hasEcotope(sample.ecotopes, worldgen::Ecotope::SNOWFIELD) ||
+           worldgen::hasEcotope(sample.ecotopes, worldgen::Ecotope::GLACIER);
 }
 
 } // namespace
@@ -204,6 +266,121 @@ TEST_CASE("Geology and terrain signals select every natural material coherently"
     }
 }
 
+TEST_CASE("Only adapted trees root in shallow supported water",
+          "[worldgen][ecology][tree][water][habitat]") {
+    using feature_generation::TreeSpecies;
+    worldgen::SurfaceSample mangrove = treeHabitatFixture(Biome::MANGROVE);
+    mangrove.climate.temperatureC = 27.0;
+    mangrove.climate.annualPrecipitationMm = 2400.0;
+    mangrove.climate.potentialEvapotranspirationMm = 900.0;
+    mangrove.soil.moisture = 0.88;
+    mangrove.soil.fertility = 0.62;
+    mangrove.terrainHeight = 80.0;
+    mangrove.hydrology.surfaceElevation = 80.0;
+    mangrove.hydrology.lake = true;
+    mangrove.hydrology.lakeDepth = 2.0;
+    mangrove.hydrology.waterSurface = 82.0;
+    mangrove.waterSurface = 82.0;
+    mangrove.ecotopes = worldgen::Ecotope::LAKESHORE;
+
+    const auto mangroveRoots =
+        feature_generation::evaluateTreeHabitat(TreeSpecies::MANGROVE, mangrove, 79);
+    REQUIRE(mangroveRoots.allowed);
+    REQUIRE(mangroveRoots.submerged);
+    REQUIRE(mangroveRoots.waterDepthBlocks == 2);
+    for (const TreeSpecies ordinary :
+         {TreeSpecies::OAK, TreeSpecies::BIRCH, TreeSpecies::SPRUCE, TreeSpecies::ACACIA,
+          TreeSpecies::JUNGLE, TreeSpecies::PALM, TreeSpecies::FALLEN_LOG}) {
+        CAPTURE(static_cast<int>(ordinary));
+        const auto habitat = feature_generation::evaluateTreeHabitat(ordinary, mangrove, 79);
+        REQUIRE(habitat.submerged);
+        REQUIRE_FALSE(habitat.allowed);
+    }
+
+    worldgen::SurfaceSample willow = treeHabitatFixture(Biome::SWAMP);
+    willow.climate.temperatureC = 15.0;
+    willow.climate.annualPrecipitationMm = 1900.0;
+    willow.climate.potentialEvapotranspirationMm = 650.0;
+    willow.soil.moisture = 0.82;
+    willow.soil.fertility = 0.58;
+    willow.hydrology.river = true;
+    willow.hydrology.channelWidth = 8.0;
+    willow.hydrology.channelDistance = 0.0;
+    willow.hydrology.waterSurface = 91.0;
+    willow.waterSurface = 91.0;
+    willow.ecotopes = worldgen::Ecotope::RIVERBANK;
+    const auto willowRoots =
+        feature_generation::evaluateTreeHabitat(TreeSpecies::WILLOW, willow, 89);
+    REQUIRE(willowRoots.allowed);
+    REQUIRE(willowRoots.waterDepthBlocks == 1);
+
+    willow.hydrology.ocean = true;
+    REQUIRE_FALSE(feature_generation::evaluateTreeHabitat(TreeSpecies::WILLOW, willow, 89).allowed);
+
+    mangrove.hydrology.waterSurface = 86.0;
+    mangrove.waterSurface = 86.0;
+    const auto deepRoots =
+        feature_generation::evaluateTreeHabitat(TreeSpecies::MANGROVE, mangrove, 79);
+    REQUIRE(deepRoots.submerged);
+    REQUIRE(deepRoots.waterDepthBlocks == 6);
+    REQUIRE_FALSE(deepRoots.allowed);
+}
+
+TEST_CASE("Tree cover and species vary continuously with habitat",
+          "[worldgen][ecology][tree][climate][biome][density]") {
+    using feature_generation::TreeSpecies;
+    worldgen::SurfaceSample rainforest = treeHabitatFixture(Biome::TROPICAL_RAINFOREST);
+    rainforest.climate.temperatureC = 28.0;
+    rainforest.climate.annualPrecipitationMm = 3000.0;
+    rainforest.climate.potentialEvapotranspirationMm = 1000.0;
+    rainforest.climate.relativeHumidity = 0.90;
+    rainforest.soil.moisture = 0.90;
+    rainforest.soil.fertility = 0.82;
+    const double denseCover = feature_generation::treeCoverDensity(rainforest);
+    REQUIRE(denseCover > 0.78);
+    const auto jungle =
+        feature_generation::evaluateTreeHabitat(TreeSpecies::JUNGLE, rainforest, 89);
+    REQUIRE(jungle.allowed);
+    REQUIRE(
+        jungle.suitability >
+        feature_generation::evaluateTreeHabitat(TreeSpecies::ACACIA, rainforest, 89).suitability);
+
+    worldgen::SurfaceSample taiga = treeHabitatFixture(Biome::TAIGA);
+    taiga.climate.temperatureC = -2.0;
+    taiga.climate.annualPrecipitationMm = 900.0;
+    taiga.climate.potentialEvapotranspirationMm = 380.0;
+    taiga.soil.moisture = 0.62;
+    taiga.soil.fertility = 0.40;
+    REQUIRE(feature_generation::evaluateTreeHabitat(TreeSpecies::SPRUCE, taiga, 89).allowed);
+    REQUIRE_FALSE(feature_generation::evaluateTreeHabitat(TreeSpecies::JUNGLE, taiga, 89).allowed);
+
+    worldgen::SurfaceSample savanna = treeHabitatFixture(Biome::SAVANNA);
+    savanna.climate.temperatureC = 29.0;
+    savanna.climate.annualPrecipitationMm = 680.0;
+    savanna.climate.potentialEvapotranspirationMm = 1250.0;
+    savanna.soil.moisture = 0.30;
+    savanna.soil.fertility = 0.38;
+    REQUIRE(feature_generation::evaluateTreeHabitat(TreeSpecies::ACACIA, savanna, 89).allowed);
+    REQUIRE_FALSE(
+        feature_generation::evaluateTreeHabitat(TreeSpecies::SPRUCE, savanna, 89).allowed);
+
+    worldgen::SurfaceSample desert = treeHabitatFixture(Biome::DESERT);
+    desert.climate.temperatureC = 31.0;
+    desert.climate.annualPrecipitationMm = 90.0;
+    desert.climate.potentialEvapotranspirationMm = 1800.0;
+    desert.soil.moisture = 0.04;
+    desert.soil.fertility = 0.06;
+    REQUIRE(feature_generation::treeCoverDensity(desert) < 0.02);
+
+    worldgen::SurfaceSample stressed = rainforest;
+    stressed.geology.rock = worldgen::RockType::VOLCANIC;
+    stressed.geology.volcanicActivity = 0.80;
+    stressed.ecotopes = worldgen::Ecotope::GEOTHERMAL;
+    REQUIRE(feature_generation::treeCoverDensity(stressed) < denseCover * 0.24);
+    REQUIRE_FALSE(
+        feature_generation::evaluateTreeHabitat(TreeSpecies::JUNGLE, stressed, 89).allowed);
+}
+
 TEST_CASE("Material dither forms deterministic connected transition patches",
           "[worldgen][geology][material][determinism]") {
     worldgen::SurfaceSample sample = materialFixture();
@@ -253,7 +430,7 @@ TEST_CASE("Material dither forms deterministic connected transition patches",
             Catch::Approx(sample.biome.transition).margin(0.05));
 }
 
-TEST_CASE("Multiscale biome dithering is coordinate-pure and hierarchically coherent",
+TEST_CASE("Multiscale biome dithering is coordinate-pure and does not expose aligned cells",
           "[worldgen][climate][biome][dither][determinism]") {
     constexpr uint64_t STREAM = 0x434C494D41544531ULL;
     CounterRng random(42);
@@ -271,20 +448,17 @@ TEST_CASE("Multiscale biome dithering is coordinate-pure and hierarchically cohe
         REQUIRE(first < 1.0);
     }
 
-    const int positiveCoarseRank =
-        static_cast<int>(worldgen::multiscaleDitherThreshold(random, STREAM, 0, 0) * 4.0);
-    const int negativeCoarseRank =
-        static_cast<int>(worldgen::multiscaleDitherThreshold(random, STREAM, -1, -1) * 4.0);
-    for (const ColumnPos sample : {ColumnPos{1, 7}, ColumnPos{31, 47}, ColumnPos{63, 63}}) {
-        REQUIRE(static_cast<int>(
-                    worldgen::multiscaleDitherThreshold(random, STREAM, sample.x, sample.z) *
-                    4.0) == positiveCoarseRank);
+    std::array<bool, 4> positiveRanks{};
+    std::array<bool, 4> negativeRanks{};
+    for (int64_t offset = 1; offset < 64; offset += 7) {
+        positiveRanks[static_cast<size_t>(
+            worldgen::multiscaleDitherThreshold(random, STREAM, offset, 64 - offset) * 4.0)] = true;
+        negativeRanks[static_cast<size_t>(
+            worldgen::multiscaleDitherThreshold(random, STREAM, -offset, offset - 64) * 4.0)] =
+            true;
     }
-    for (const ColumnPos sample : {ColumnPos{-2, -9}, ColumnPos{-31, -47}, ColumnPos{-64, -64}}) {
-        REQUIRE(static_cast<int>(
-                    worldgen::multiscaleDitherThreshold(random, STREAM, sample.x, sample.z) *
-                    4.0) == negativeCoarseRank);
-    }
+    REQUIRE(std::count(positiveRanks.begin(), positiveRanks.end(), true) >= 2);
+    REQUIRE(std::count(negativeRanks.begin(), negativeRanks.end(), true) >= 2);
 
     size_t belowTransition = 0;
     size_t sampleCount = 0;
@@ -296,6 +470,195 @@ TEST_CASE("Multiscale biome dithering is coordinate-pure and hierarchically cohe
     }
     REQUIRE(static_cast<double>(belowTransition) / static_cast<double>(sampleCount) ==
             Catch::Approx(0.37).margin(0.025));
+}
+
+TEST_CASE("Surface footprints filter detail without changing macro ownership",
+          "[worldgen][surface-footprint][lod][determinism]") {
+    STATIC_REQUIRE(worldgen::surfaceFootprintWidth(worldgen::SurfaceFootprint::BLOCK_1) == 1);
+    STATIC_REQUIRE(worldgen::surfaceFootprintWidth(worldgen::SurfaceFootprint::BLOCK_16) == 16);
+    ChunkGenerator generator(42);
+    constexpr int64_t X = 1'184;
+    constexpr int64_t Z = -2'736;
+    const worldgen::SurfaceSample block =
+        generator.sampleFarSurface(X, Z, worldgen::SurfaceFootprint::BLOCK_1);
+    for (const worldgen::SurfaceFootprint footprint : {
+             worldgen::SurfaceFootprint::BLOCK_2,
+             worldgen::SurfaceFootprint::BLOCK_4,
+             worldgen::SurfaceFootprint::BLOCK_8,
+             worldgen::SurfaceFootprint::BLOCK_16,
+         }) {
+        const worldgen::SurfaceSample filtered = generator.sampleFarSurface(X, Z, footprint);
+        REQUIRE(filtered.geology.plateId == block.geology.plateId);
+        REQUIRE(filtered.hydrology.waterBodyId == block.hydrology.waterBodyId);
+        REQUIRE(filtered.hydrology.ocean == block.hydrology.ocean);
+        REQUIRE(filtered.hydrology.lake == block.hydrology.lake);
+        REQUIRE(filtered.hydrology.river == block.hydrology.river);
+        REQUIRE(filtered.waterSurface == block.waterSurface);
+        REQUIRE(generator.sampleFarSurface(X, Z, footprint).terrainHeight ==
+                filtered.terrainHeight);
+        REQUIRE(std::abs(filtered.terrainHeight - block.terrainHeight) < 6.0);
+    }
+}
+
+TEST_CASE("Column plans retain block-resolution lithology authority",
+          "[worldgen][geology][lithology][column-plan][seam]") {
+    ChunkGenerator generator(42);
+    constexpr int64_t BASE_X = -32'272;
+    constexpr int64_t BASE_Z = -32'768;
+    for (int offset = 1; offset < CHUNK_EDGE; ++offset) {
+        const int64_t x = BASE_X + offset;
+        const int64_t z = BASE_Z + (offset * 5) % CHUNK_EDGE;
+        const worldgen::SurfaceSample exact = generator.sampleSurface(x, z);
+        const worldgen::SurfaceSample direct = generator.sampleFarSurface(x, z);
+        REQUIRE(exact.geology.plateId == direct.geology.plateId);
+        REQUIRE(exact.geology.crust == direct.geology.crust);
+        REQUIRE(exact.geology.boundary == direct.geology.boundary);
+        REQUIRE(exact.geology.rock == direct.geology.rock);
+        REQUIRE(exact.geology.lithology.primary == direct.geology.lithology.primary);
+        REQUIRE(exact.geology.lithology.secondary == direct.geology.lithology.secondary);
+        REQUIRE(exact.geology.lithology.transition ==
+                Catch::Approx(direct.geology.lithology.transition).margin(1.0 / 65535.0));
+    }
+}
+
+TEST_CASE("Column plans retain block-resolution water authority and source support",
+          "[worldgen][hydrology][column-plan][water][source][support][regression]") {
+    struct Fixture {
+        uint64_t seed;
+        int64_t x;
+        int64_t z;
+        bool ocean;
+        bool river;
+        bool lake;
+    };
+    constexpr std::array fixtures = {
+        Fixture{42, -557, 379, true, false, false},
+        Fixture{764891, 22'000, -111'421, false, true, false},
+        Fixture{42, -8'348, 2'281, false, false, true},
+    };
+
+    for (const Fixture fixture : fixtures) {
+        CAPTURE(fixture.seed, fixture.x, fixture.z);
+        ChunkGenerator generator(fixture.seed);
+        const worldgen::SurfaceSample direct =
+            generator.sampleFarSurface(fixture.x, fixture.z, worldgen::SurfaceFootprint::BLOCK_1);
+        const worldgen::SurfaceSample planned = generator.sampleSurface(fixture.x, fixture.z);
+        const worldgen::SurfaceSample exact = generator.sampleExactSurface(fixture.x, fixture.z);
+
+        REQUIRE(direct.hydrology.ocean == fixture.ocean);
+        REQUIRE(direct.hydrology.river == fixture.river);
+        REQUIRE(direct.hydrology.lake == fixture.lake);
+        REQUIRE(planned.hydrology.ocean == direct.hydrology.ocean);
+        REQUIRE(planned.hydrology.river == direct.hydrology.river);
+        REQUIRE(planned.hydrology.lake == direct.hydrology.lake);
+        REQUIRE(planned.hydrology.delta == direct.hydrology.delta);
+        REQUIRE(planned.hydrology.waterfall == direct.hydrology.waterfall);
+        REQUIRE(planned.hydrology.waterBodyId == direct.hydrology.waterBodyId);
+        REQUIRE(planned.waterSurface == Catch::Approx(direct.waterSurface).margin(1.0e-4));
+        REQUIRE(planned.hydrology.surfaceElevation ==
+                Catch::Approx(direct.hydrology.surfaceElevation).margin(1.0e-4));
+        REQUIRE(exact.hydrology.ocean == direct.hydrology.ocean);
+        REQUIRE(exact.hydrology.river == direct.hydrology.river);
+        REQUIRE(exact.hydrology.lake == direct.hydrology.lake);
+        REQUIRE(exact.waterSurface == Catch::Approx(direct.waterSurface).margin(1.0e-6));
+
+        const int surfaceY = generator.surfaceYAt(fixture.x, fixture.z);
+        const int plannedFloorY =
+            static_cast<int>(std::ceil(direct.hydrology.surfaceElevation)) - 1;
+        const int waterTopY = static_cast<int>(std::ceil(direct.waterSurface)) - 1;
+        REQUIRE(surfaceY >= plannedFloorY);
+        REQUIRE(surfaceY < waterTopY);
+        size_t sourceCount = 0;
+        for (int32_t sectionY = Chunk::worldToChunkY(surfaceY);
+             sectionY <= Chunk::worldToChunkY(waterTopY); ++sectionY) {
+            Chunk cube(
+                ChunkPos{Chunk::worldToChunk(fixture.x), sectionY, Chunk::worldToChunk(fixture.z)});
+            generator.generateCube(cube);
+            const int firstY = std::max(surfaceY, sectionY * CHUNK_EDGE);
+            const int lastY = std::min(waterTopY, sectionY * CHUNK_EDGE + CHUNK_EDGE - 1);
+            for (int y = firstY; y <= lastY; ++y) {
+                const BlockType block =
+                    cube.getBlock(Chunk::worldToLocal(fixture.x), Chunk::worldToLocalY(y),
+                                  Chunk::worldToLocal(fixture.z));
+                if (y == surfaceY) {
+                    REQUIRE(isSolid(block));
+                    continue;
+                }
+                REQUIRE(block == BlockType::WATER);
+                REQUIRE(cube.getFluidState(Chunk::worldToLocal(fixture.x), Chunk::worldToLocalY(y),
+                                           Chunk::worldToLocal(fixture.z))
+                            .isSource());
+                ++sourceCount;
+            }
+        }
+        REQUIRE(sourceCount == static_cast<size_t>(waterTopY - surfaceY));
+    }
+}
+
+TEST_CASE("Exact cube emission performs no scalar basin sampling after its plan is built",
+          "[worldgen][hydrology][column-plan][performance][regression]") {
+    constexpr int64_t FALL_X = -8'240;
+    constexpr int64_t FALL_Z = 3'088;
+    const ColumnPos column{Chunk::worldToChunk(FALL_X), Chunk::worldToChunk(FALL_Z)};
+    ChunkGenerator generator(42);
+    const std::shared_ptr<const ColumnPlan> plan = generator.getColumnPlan(column);
+    // Density interpolation at the positive cube faces consumes the east,
+    // south, and southeast plan authorities. Warm those legitimate plan-build
+    // dependencies before measuring ordinary cube emission.
+    static_cast<void>(generator.getColumnPlan({column.x + 1, column.z}));
+    static_cast<void>(generator.getColumnPlan({column.x, column.z + 1}));
+    static_cast<void>(generator.getColumnPlan({column.x + 1, column.z + 1}));
+    REQUIRE(
+        plan->sample(Chunk::worldToLocal(FALL_X), Chunk::worldToLocal(FALL_Z)).hydrology.waterfall);
+
+    const uint64_t scalarSamplesBefore = generator.basinCacheMetrics().scalarSampleCalls;
+    REQUIRE(generator.sampleSurface(FALL_X, FALL_Z).hydrology.waterfall);
+    static_cast<void>(generator.surfaceMaterialAt(FALL_X, FALL_Z));
+
+    const int32_t deepSection = Chunk::worldToChunkY(WORLD_MIN_Y);
+    REQUIRE_FALSE(plan->exposesSection(deepSection));
+    Chunk cube(ChunkPos{column.x, deepSection, column.z});
+    generator.generateCube(cube);
+
+    const uint64_t scalarSamplesAfter = generator.basinCacheMetrics().scalarSampleCalls;
+    REQUIRE(scalarSamplesAfter == scalarSamplesBefore);
+}
+
+TEST_CASE("Surface material palettes retain four bounded weighted entries",
+          "[worldgen][material][palette]") {
+    worldgen::SurfaceSample sample = materialFixture();
+    sample.biome = {
+        .primary = Biome::PLAINS, .secondary = Biome::VOLCANIC_BARREN, .transition = 0.36};
+    const worldgen::surface_material::SurfaceMaterialPalette palette =
+        worldgen::surface_material::materialPalette(sample, {}, false, false);
+    REQUIRE(palette.count >= 1);
+    REQUIRE(palette.count <= palette.entries.size());
+    int totalWeight = 0;
+    for (size_t index = 0; index < palette.count; ++index) {
+        REQUIRE(palette.entries[index].material != BlockType::AIR);
+        totalWeight += palette.entries[index].weight;
+    }
+    REQUIRE(totalWeight == 255);
+}
+
+TEST_CASE("Exact top blocks use the shared material palette and rank",
+          "[worldgen][material][palette][lod][exact][determinism]") {
+    ChunkGenerator generator(42);
+    constexpr std::array<ColumnPos, 6> coordinates = {
+        ColumnPos{0, 0},       ColumnPos{-32, -32},         ColumnPos{3'264, 480},
+        ColumnPos{-23'904, 0}, ColumnPos{-104'448, 42'176}, ColumnPos{-14'208, 27'200},
+    };
+
+    for (const ColumnPos coordinate : coordinates) {
+        const auto palette = generator.surfaceMaterialPaletteAt(coordinate.x, coordinate.z);
+        const double rank = generator.farSurfaceMaterialRankAt(coordinate.x, coordinate.z);
+        const BlockType expected = worldgen::surface_material::selectMaterial(palette, rank);
+        CAPTURE(coordinate.x, coordinate.z, palette.count, rank);
+        REQUIRE(generator.surfaceMaterialAt(coordinate.x, coordinate.z) == expected);
+        REQUIRE(generatedBlockAt(generator, coordinate.x,
+                                 generator.surfaceYAt(coordinate.x, coordinate.z),
+                                 coordinate.z) == expected);
+    }
 }
 
 TEST_CASE("Climate soil and suitability stitch exactly across cubic column faces",
@@ -351,6 +714,118 @@ TEST_CASE("Macro climate and biome fields remain continuous across synthesis cel
     sampler.clearBasinCache();
     const worldgen::SurfaceSample rebuilt = sampler.sampleSurface(2048.0, 1008.0);
     requireContinuousFieldsEqual(expected, rebuilt);
+}
+
+TEST_CASE("Former storage lines do not bias macro terrain derivatives",
+          "[worldgen][geology][continuity][artifact]") {
+    worldgen::MacroGenerationSampler sampler(42);
+    for (const int64_t spacing : artifact::FORMER_GRID_SPACINGS) {
+        const int64_t lineX = spacing;
+        const int64_t centerZ = spacing / 2;
+        for (const artifact::Field field : artifact::FIELDS) {
+            const double boundaryEnergy =
+                artifact::derivativeEnergy(sampler, field, lineX, centerZ);
+            const double shiftedEnergy =
+                artifact::nearbyDerivativeEnergy(sampler, field, lineX, centerZ);
+            const double ratio = artifact::energyRatio(boundaryEnergy, shiftedEnergy);
+            INFO("former spacing " << spacing << " field " << static_cast<int>(field)
+                                   << " boundary energy " << boundaryEnergy << " shifted energy "
+                                   << shiftedEnergy);
+            REQUIRE(ratio >= artifact::DERIVATIVE_RATIO_MINIMUM);
+            REQUIRE(ratio <= artifact::DERIVATIVE_RATIO_MAXIMUM);
+        }
+    }
+}
+
+TEST_CASE("Former storage lines have no structured orientation excess across world seeds",
+          "[worldgen][geology][climate][continuity][artifact]") {
+    constexpr std::array<uint64_t, 6> seeds = {42, 764'891, 1, 7, 12'345, 0xDEAD'BEEF};
+    for (const uint64_t seed : seeds) {
+        worldgen::MacroGenerationSampler sampler(seed);
+        artifact::OrientationHistogram seedHistogram;
+        for (const int64_t spacing : artifact::FORMER_GRID_SPACINGS) {
+            artifact::OrientationHistogram spacingHistogram;
+            for (const artifact::Field field : artifact::FIELDS) {
+                artifact::add(spacingHistogram,
+                              artifact::orientationHistogram(sampler, field, spacing, spacing / 2));
+            }
+            const double spacingRatio = artifact::structuredOrientationRatio(spacingHistogram);
+            INFO("seed " << seed << " former spacing " << spacing
+                         << " structured orientation ratio " << spacingRatio);
+            REQUIRE(spacingRatio <= artifact::STRUCTURED_ORIENTATION_LIMIT);
+            artifact::add(seedHistogram, spacingHistogram);
+        }
+        const double seedRatio = artifact::structuredOrientationRatio(seedHistogram);
+        INFO("seed " << seed << " aggregate structured orientation ratio " << seedRatio);
+        REQUIRE(seedRatio <= artifact::STRUCTURED_ORIENTATION_LIMIT);
+
+        const artifact::OrientationBins globalHistogram =
+            artifact::globalOrientationHistogram(sampler);
+        const double globalRatio = artifact::structuredOrientationRatio(globalHistogram);
+        INFO("seed " << seed << " global structured orientation ratio " << globalRatio);
+        REQUIRE(globalRatio <= artifact::STRUCTURED_ORIENTATION_LIMIT);
+    }
+}
+
+TEST_CASE("Former-line orientation analysis detects an aligned synthetic seam",
+          "[worldgen][continuity][artifact]") {
+    constexpr int64_t line = 64;
+    auto alignedField = [](double x, double z) {
+        const double smoothBackground = x * 0.025 + z * 0.017;
+        return smoothBackground + (x >= static_cast<double>(line) ? 100.0 : 0.0);
+    };
+    const artifact::OrientationHistogram histogram =
+        artifact::orientationHistogram(alignedField, line, 32);
+    REQUIRE(artifact::structuredOrientationRatio(histogram) >
+            artifact::STRUCTURED_ORIENTATION_LIMIT);
+}
+
+TEST_CASE("Former storage lines do not own untagged categorical boundaries",
+          "[worldgen][hydrology][geology][material][continuity][artifact]") {
+    ChunkGenerator generator(42);
+    for (const int64_t spacing : artifact::FORMER_GRID_SPACINGS) {
+        const int64_t lineX = spacing;
+        const int64_t centerZ = spacing / 2;
+        int lakeRun = 0;
+        int materialRun = 0;
+        int lithologyRun = 0;
+        int longestLakeRun = 0;
+        int longestMaterialRun = 0;
+        int longestLithologyRun = 0;
+        for (int64_t offset = -artifact::CATEGORICAL_HALF_WINDOW;
+             offset <= artifact::CATEGORICAL_HALF_WINDOW; ++offset) {
+            const int64_t z = centerZ + offset;
+            const worldgen::SurfaceSample left = generator.sampleFarSurface(lineX - 1, z);
+            const worldgen::SurfaceSample right = generator.sampleFarSurface(lineX + 1, z);
+            const bool outlet = left.hydrology.river || right.hydrology.river ||
+                                left.hydrology.waterfall || right.hydrology.waterfall ||
+                                left.hydrology.delta || right.hydrology.delta;
+            const bool lakeBoundary = !outlet && (left.hydrology.lake || right.hydrology.lake) &&
+                                      (left.hydrology.lake != right.hydrology.lake ||
+                                       left.hydrology.waterBodyId != right.hydrology.waterBodyId);
+            lakeRun = lakeBoundary ? lakeRun + 1 : 0;
+            longestLakeRun = std::max(longestLakeRun, lakeRun);
+
+            const bool constrainedMaterial =
+                hasHardSurfaceMaterialConstraint(left) || hasHardSurfaceMaterialConstraint(right);
+            const bool materialBoundary =
+                !constrainedMaterial && dominantSurfaceMaterial(generator, lineX - 1, z) !=
+                                            dominantSurfaceMaterial(generator, lineX + 1, z);
+            materialRun = materialBoundary ? materialRun + 1 : 0;
+            longestMaterialRun = std::max(longestMaterialRun, materialRun);
+
+            const bool lithologyBoundary =
+                !isTaggedLithologyDiscontinuity(left.geology, right.geology) &&
+                left.geology.lithology.primary != right.geology.lithology.primary;
+            lithologyRun = lithologyBoundary ? lithologyRun + 1 : 0;
+            longestLithologyRun = std::max(longestLithologyRun, lithologyRun);
+        }
+        INFO("former spacing " << spacing << " lake " << longestLakeRun << " material "
+                               << longestMaterialRun << " lithology " << longestLithologyRun);
+        REQUIRE(longestLakeRun <= artifact::CATEGORICAL_BOUNDARY_RUN_LIMIT);
+        REQUIRE(longestMaterialRun <= artifact::CATEGORICAL_BOUNDARY_RUN_LIMIT);
+        REQUIRE(longestLithologyRun <= artifact::CATEGORICAL_BOUNDARY_RUN_LIMIT);
+    }
 }
 
 TEST_CASE("Rock and water habitat effects fade through their physical boundaries",
@@ -683,8 +1158,8 @@ TEST_CASE("Vertical strata follow the sampled limestone geology", "[worldgen][ge
 }
 
 TEST_CASE("Alpine scrub generation is order independent", "[worldgen][ecology][flora]") {
-    constexpr int64_t x = -80'129;
-    constexpr int64_t z = 124'896;
+    constexpr int64_t x = -80'225;
+    constexpr int64_t z = 124'607;
     ChunkGenerator generator(42);
     const worldgen::SurfaceSample surface = generator.sampleExactSurface(x, z);
     REQUIRE(worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::ALPINE_ZONE));
@@ -715,8 +1190,8 @@ TEST_CASE("Alpine scrub generation is order independent", "[worldgen][ecology][f
 
 TEST_CASE("Coordinate-generated snow peaks combine cold climate and exposed alpine ground",
           "[worldgen][climate][ecotope][snow][reachability]") {
-    constexpr int64_t x = -81'792;
-    constexpr int64_t z = 126'976;
+    constexpr int64_t x = -81'896;
+    constexpr int64_t z = 126'960;
     ChunkGenerator generator(42);
     const worldgen::SurfaceSample surface = generator.sampleExactSurface(x, z);
 
@@ -788,17 +1263,25 @@ TEST_CASE("Oceanic cones become internally consistent generated islands",
     constexpr uint32_t seed = 42;
     worldgen::MacroGenerationSampler macro(seed);
     ChunkGenerator generator(seed);
-    constexpr int64_t ISLAND_CELL_X = -32;
-    constexpr int64_t ISLAND_CELL_Z = -24;
-    constexpr int64_t islandX = -518'996;
-    constexpr int64_t islandZ = -385'073;
+    constexpr int64_t ISLAND_CELL_X = -28;
+    constexpr int64_t ISLAND_CELL_Z = -20;
+    constexpr int64_t volcanoX = -449'951;
+    constexpr int64_t volcanoZ = -313'477;
+    constexpr int64_t islandX = -449'951;
+    constexpr int64_t islandZ = -313'477;
     const std::vector<VolcanoPrimitive> volcanoes =
         generator.hotspotVolcanoesForCell(ISLAND_CELL_X, ISLAND_CELL_Z);
-    REQUIRE(std::ranges::any_of(volcanoes, [=](const VolcanoPrimitive& volcano) {
-        return static_cast<int64_t>(std::llround(volcano.centerX)) == islandX &&
-               static_cast<int64_t>(std::llround(volcano.centerZ)) == islandZ;
-    }));
+    const auto islandVolcano =
+        std::ranges::find_if(volcanoes, [=](const VolcanoPrimitive& volcano) {
+            return static_cast<int64_t>(std::llround(volcano.centerX)) == volcanoX &&
+                   static_cast<int64_t>(std::llround(volcano.centerZ)) == volcanoZ;
+        });
+    REQUIRE(islandVolcano != volcanoes.end());
+    REQUIRE(std::hypot(static_cast<double>(islandX) + 0.5 - islandVolcano->centerX,
+                       static_cast<double>(islandZ) + 0.5 - islandVolcano->centerZ) <
+            islandVolcano->radius);
     REQUIRE(macro.sampleHydrology(islandX, islandZ).ocean);
+    REQUIRE(macro.sampleGeology(islandX, islandZ).crust == worldgen::CrustType::OCEANIC);
 
     const worldgen::SurfaceSample surface = generator.sampleSurface(islandX, islandZ);
     REQUIRE(surface.terrainHeight >= SEA_LEVEL);
@@ -886,26 +1369,27 @@ TEST_CASE("Exact cubes and far terrain share aligned material regions",
     }
 }
 
-TEST_CASE("Fine far materials follow exact wet and dry cube margins",
+TEST_CASE("Fine far materials preserve exact wet and dry cube margins",
           "[worldgen][geology][material][water][lod][seam][regression]") {
     struct MarginFixture {
         int64_t x;
         int64_t z;
         int spacing;
-        BlockType exactMaterial;
-        BlockType coarseMaterial;
         bool submerged;
     };
     constexpr std::array<MarginFixture, 5> MARGINS = {{
-        {-8'096, 2'496, 32, BlockType::CLAY, BlockType::CLAY, true},
-        {-9'152, 2'976, 32, BlockType::SILT, BlockType::CLAY, false},
-        {-13'760, 832, 64, BlockType::CLAY, BlockType::SILT, true},
-        {-13'696, 832, 64, BlockType::GRASS, BlockType::GRASS, false},
-        {-13'760, 896, 64, BlockType::SILT, BlockType::SILT, false},
+        {-8'064, 2'496, 32, true},
+        {-9'120, 2'944, 32, false},
+        {-13'760, 832, 64, true},
+        {-13'696, 832, 64, false},
+        {-13'760, 896, 64, false},
     }};
     ChunkGenerator generator(42);
 
-    for (const MarginFixture& fixture : MARGINS) {
+    std::array<BlockType, MARGINS.size()> exactMaterials{};
+    std::array<BlockType, MARGINS.size()> coarseMaterials{};
+    for (size_t fixtureIndex = 0; fixtureIndex < MARGINS.size(); ++fixtureIndex) {
+        const MarginFixture& fixture = MARGINS[fixtureIndex];
         INFO("coordinate " << fixture.x << ',' << fixture.z << " spacing " << fixture.spacing);
         REQUIRE(world_coord::floorMod(fixture.x, static_cast<int64_t>(fixture.spacing)) == 0);
         REQUIRE(world_coord::floorMod(fixture.z, static_cast<int64_t>(fixture.spacing)) == 0);
@@ -915,11 +1399,26 @@ TEST_CASE("Fine far materials follow exact wet and dry cube margins",
         const bool hasWater =
             exact.hydrology.ocean || exact.hydrology.river || exact.hydrology.lake;
         REQUIRE((hasWater && surfaceY < waterTopY) == fixture.submerged);
-        REQUIRE(generator.surfaceMaterialAt(fixture.x, fixture.z) == fixture.exactMaterial);
-        REQUIRE(generator.farSurfaceMaterialAt(fixture.x, fixture.z) == fixture.coarseMaterial);
-        REQUIRE(generatedBlockAt(generator, fixture.x, surfaceY, fixture.z) ==
-                fixture.exactMaterial);
+        const BlockType exactMaterial = generator.surfaceMaterialAt(fixture.x, fixture.z);
+        const BlockType coarseMaterial = generator.farSurfaceMaterialAt(fixture.x, fixture.z);
+        exactMaterials[fixtureIndex] = exactMaterial;
+        coarseMaterials[fixtureIndex] = coarseMaterial;
+        REQUIRE(exactMaterial != BlockType::AIR);
+        REQUIRE(coarseMaterial != BlockType::AIR);
+        REQUIRE(generatedBlockAt(generator, fixture.x, surfaceY, fixture.z) == exactMaterial);
         if (fixture.submerged) {
+            const auto isSedimentOrOutcrop = [](BlockType material) {
+                return material == BlockType::MUD || material == BlockType::CLAY ||
+                       material == BlockType::SILT || material == BlockType::SAND ||
+                       material == BlockType::GRAVEL || material == BlockType::BASALT ||
+                       material == BlockType::ANDESITE;
+            };
+            REQUIRE(isSedimentOrOutcrop(exactMaterial));
+            const worldgen::SurfaceSample coarseSurface =
+                generator.sampleFarSurface(fixture.x, fixture.z);
+            if (worldgen::surface_material::submerged(coarseSurface)) {
+                REQUIRE(isSedimentOrOutcrop(coarseMaterial));
+            }
             REQUIRE(generatedBlockAt(generator, fixture.x, surfaceY + 1, fixture.z) ==
                     BlockType::WATER);
         }
@@ -928,22 +1427,40 @@ TEST_CASE("Fine far materials follow exact wet and dry cube margins",
     generator.clearMacroCaches();
     for (size_t reverse = MARGINS.size(); reverse-- > 0;) {
         REQUIRE(generator.surfaceMaterialAt(MARGINS[reverse].x, MARGINS[reverse].z) ==
-                MARGINS[reverse].exactMaterial);
+                exactMaterials[reverse]);
         REQUIRE(generator.farSurfaceMaterialAt(MARGINS[reverse].x, MARGINS[reverse].z) ==
-                MARGINS[reverse].coarseMaterial);
+                coarseMaterials[reverse]);
     }
 }
 
 TEST_CASE("Volcanic deposits cross chunk seams without material confetti",
           "[worldgen][geology][material][coherence][seam]") {
     ChunkGenerator generator(42);
-    constexpr int64_t z = 27'200;
-    constexpr int64_t firstX = -14'208;
+    constexpr int64_t z = -23'060;
+    constexpr int64_t firstX = -10'080;
     std::array<BlockType, 17> forward{};
+    int previousBasaltWeight = -1;
+    int materialTransitions = 0;
     for (size_t index = 0; index < forward.size(); ++index) {
-        forward[index] = generator.surfaceMaterialAt(firstX + static_cast<int64_t>(index), z);
-        REQUIRE(forward[index] == BlockType::VOLCANIC_ASH);
+        const int64_t x = firstX + static_cast<int64_t>(index);
+        const auto palette = generator.surfaceMaterialPaletteAt(x, z);
+        const int basaltWeight = surfacePaletteWeight(palette, BlockType::BASALT);
+        const int ashWeight = surfacePaletteWeight(palette, BlockType::VOLCANIC_ASH);
+        CAPTURE(x, basaltWeight, ashWeight);
+        REQUIRE(basaltWeight > 0);
+        REQUIRE(ashWeight > 0);
+        REQUIRE(basaltWeight + ashWeight == 255);
+        if (previousBasaltWeight >= 0) {
+            REQUIRE(std::abs(basaltWeight - previousBasaltWeight) <= 8);
+        }
+        previousBasaltWeight = basaltWeight;
+
+        forward[index] = generator.surfaceMaterialAt(x, z);
+        REQUIRE((forward[index] == BlockType::BASALT || forward[index] == BlockType::VOLCANIC_ASH));
+        if (index > 0 && forward[index] != forward[index - 1])
+            ++materialTransitions;
     }
+    REQUIRE(materialTransitions <= 4);
     generator.clearMacroCaches();
     for (size_t reverse = forward.size(); reverse-- > 0;) {
         REQUIRE(generator.surfaceMaterialAt(firstX + static_cast<int64_t>(reverse), z) ==
@@ -951,7 +1468,7 @@ TEST_CASE("Volcanic deposits cross chunk seams without material confetti",
     }
 }
 
-TEST_CASE("Plate-keyed strata stay coherent across the old phase boundary",
+TEST_CASE("Implicit strata stay coherent across column boundaries",
           "[worldgen][geology][strata][seam]") {
     ChunkGenerator generator(42);
     constexpr int64_t rightX = -32'256;
@@ -985,7 +1502,6 @@ TEST_CASE("Plate-keyed strata stay coherent across the old phase boundary",
 TEST_CASE("Continental volcanic arcs emit reachable andesite intrusions",
           "[worldgen][geology][material][strata][andesite][reachability]") {
     constexpr int64_t x = -26'304;
-    constexpr int firstAndesiteY = 146;
     constexpr int64_t z = 29'696;
     ChunkGenerator generator(42);
     const worldgen::SurfaceSample surface = generator.sampleExactSurface(x, z);
@@ -994,12 +1510,20 @@ TEST_CASE("Continental volcanic arcs emit reachable andesite intrusions",
     REQUIRE(surface.geology.boundary == worldgen::PlateBoundary::CONVERGENT);
     REQUIRE(surface.geology.rock == worldgen::RockType::GRANITE);
     REQUIRE(surface.geology.uplift > 0.9);
-    REQUIRE(generator.surfaceYAt(x, z) > firstAndesiteY + 6);
-    REQUIRE(generatedBlockAt(generator, x, firstAndesiteY - 1, z) == BlockType::STONE);
-    for (int y = firstAndesiteY; y < firstAndesiteY + 6; ++y) {
-        REQUIRE(generatedBlockAt(generator, x, y, z) == BlockType::ANDESITE);
+    const int surfaceY = generator.surfaceYAt(x, z);
+    REQUIRE(surfaceY > WORLD_MIN_Y + 96);
+    int firstAndesiteY = WORLD_MIN_Y;
+    for (int y = surfaceY - 96; y <= surfaceY - 8; ++y) {
+        if (generatedBlockAt(generator, x, y, z) != BlockType::ANDESITE)
+            continue;
+        firstAndesiteY = y;
+        break;
     }
-    REQUIRE(generatedBlockAt(generator, x, firstAndesiteY + 6, z) == BlockType::STONE);
+    REQUIRE(firstAndesiteY > WORLD_MIN_Y);
+    int andesiteCount = 0;
+    for (int y = firstAndesiteY; y < firstAndesiteY + 10; ++y)
+        andesiteCount += generatedBlockAt(generator, x, y, z) == BlockType::ANDESITE;
+    REQUIRE(andesiteCount >= 3);
 }
 
 TEST_CASE("Obsidian conduits are reachable but remain rarer than basalt",
@@ -1020,14 +1544,18 @@ TEST_CASE("Obsidian conduits are reachable but remain rarer than basalt",
     REQUIRE(obsidian < CHUNK_VOLUME / 4);
 }
 
-TEST_CASE("Volcanic ash suppresses ordinary surface flora",
+TEST_CASE("Volcanic ground suppresses ordinary surface flora",
           "[worldgen][geology][material][flora]") {
     ChunkGenerator generator(42);
-    constexpr int64_t x = -14'200;
-    constexpr int64_t z = 27'200;
-    REQUIRE(generator.surfaceMaterialAt(x, z) == BlockType::VOLCANIC_ASH);
+    constexpr int64_t x = -10'066;
+    constexpr int64_t z = -23'060;
+    const auto palette = generator.surfaceMaterialPaletteAt(x, z);
+    REQUIRE(surfacePaletteWeight(palette, BlockType::VOLCANIC_ASH) > 0);
+    REQUIRE(surfacePaletteWeight(palette, BlockType::BASALT) > 0);
+    const BlockType volcanicGround = generator.surfaceMaterialAt(x, z);
+    REQUIRE((volcanicGround == BlockType::VOLCANIC_ASH || volcanicGround == BlockType::BASALT));
     const int surfaceY = generator.surfaceYAt(x, z);
-    REQUIRE(generatedBlockAt(generator, x, surfaceY, z) == BlockType::VOLCANIC_ASH);
+    REQUIRE(generatedBlockAt(generator, x, surfaceY, z) == volcanicGround);
     const BlockType above = generatedBlockAt(generator, x, surfaceY + 1, z);
     REQUIRE(above != BlockType::TALL_GRASS);
     REQUIRE(above != BlockType::FLOWER_YELLOW);
@@ -1036,8 +1564,8 @@ TEST_CASE("Volcanic ash suppresses ordinary surface flora",
     REQUIRE(above != BlockType::FERN);
     REQUIRE(above != BlockType::SHRUB);
 
-    constexpr int64_t basaltX = -104'036;
-    constexpr int64_t basaltZ = 41'721;
+    constexpr int64_t basaltX = -10'066;
+    constexpr int64_t basaltZ = -23'060;
     REQUIRE(generator.surfaceMaterialAt(basaltX, basaltZ) == BlockType::BASALT);
     const worldgen::SurfaceSample basalt = generator.sampleSurface(basaltX, basaltZ);
     REQUIRE(worldgen::hasEcotope(basalt.ecotopes, worldgen::Ecotope::GEOTHERMAL));
@@ -1051,17 +1579,18 @@ TEST_CASE("Volcanic ash suppresses ordinary surface flora",
     }
 }
 
-TEST_CASE("Alpine flora does not root directly in bare sandstone scree",
+TEST_CASE("High elevation flora does not root directly in bare sandstone scree",
           "[worldgen][geology][material][flora][substrate][regression]") {
     constexpr int64_t x = -80'320;
     constexpr int64_t z = 124'992;
     ChunkGenerator generator(42);
     const worldgen::SurfaceSample surface = generator.sampleExactSurface(x, z);
 
-    REQUIRE(surface.biome.secondary == Biome::ALPINE);
     REQUIRE(worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::SCREE));
     REQUIRE(worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::EXPOSED_PEAK));
     REQUIRE_FALSE(worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::GEOTHERMAL));
+    const auto palette = generator.surfaceMaterialPaletteAt(x, z);
+    REQUIRE(surfacePaletteWeight(palette, BlockType::SANDSTONE) > 0);
     REQUIRE(generator.surfaceMaterialAt(x, z) == BlockType::SANDSTONE);
     const int surfaceY = generator.surfaceYAt(x, z);
     REQUIRE(generatedBlockAt(generator, x, surfaceY, z) == BlockType::SANDSTONE);

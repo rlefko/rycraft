@@ -28,19 +28,23 @@ struct VertexOutput {
     float3 vNormal;
     float2 vUV;
     float vLight;
-    float vSkyLight;       // column skylight 0-1 (cast shade, cave darkness)
-    float vAO;             // baked corner AO 0.5-1 (per-vertex crease shading)
-    float vBlockLight;     // lava block light 0-1 (warm cave glow)
-    float vEmissive;       // 1 = self-lit block (lava), 0 = normally lit
-    float vFoliage;        // shading class: 0 solid, 1 = cross-quad flora
-                           // (two-sided facing + SSS), 2 = leaf cube (SSS only)
-    float3 vWorldPosition; // World-space position for fog calculation
+    float vSkyLight;          // column skylight 0-1 (cast shade, cave darkness)
+    float vAO;                // baked corner AO 0.5-1 (per-vertex crease shading)
+    float vBlockLight;        // lava block light 0-1 (warm cave glow)
+    float vEmissive;          // 1 = self-lit block (lava), 0 = normally lit
+    float vFoliage;           // shading class: 0 solid, 1 = cross-quad flora
+                              // (two-sided facing + SSS), 2 = leaf cube (SSS only)
+    float3 vWorldPosition;    // Displayed world-space position for fog and light
+    float2 vLodWorldPosition; // Unswung world X/Z for stable LOD ownership
+    float2 vFarLocalPosition;
     uint vTextureLayer [[flat]];
     uint vFace [[flat]];
     uint vFarCanopy [[flat]];
     uint vFarSkirt [[flat]];
     uint vFarSkirtMask [[flat]];
-    float vExactRadius [[flat]];
+    uint vFarTerrain [[flat]];
+    float vLodTransitionProgress [[flat]];
+    float vCoverageFrontier [[flat]];
     float4 vOverlayColor;
 };
 
@@ -57,24 +61,32 @@ static float3 applyFog(float3 color, float3 worldPos, float3 cameraPos, float de
     return mix(color, fogColor, fogFactor);
 }
 
-// The far mesh deliberately overlaps the exact-radius boundary by whole
-// 256-block tiles. Water and canopy summaries use this stable world-space
-// handoff. Opaque terrain tops remain available as depth-tested fallback while
-// exact surface meshes stream in.
-static bool keepFarTerrainFragment(float3 worldPosition, float3 cameraPosition, float exactRadius) {
-    if (exactRadius <= 0.0f) {
-        return true;
-    }
-    const float horizontalDistance = distance(worldPosition.xz, cameraPosition.xz);
-    if (horizontalDistance <= exactRadius) {
+// Far meshes deliberately overlap the exact radius by whole 256-block tiles.
+// Revision-matched column ownership below is the authority for that overlap:
+// a ready column clips immediately, while an unresolved or stale column keeps
+// complete coarse coverage even when it lies inside the nominal radius.
+static bool exactColumnOwnsFarFragment(float2 localPosition, uint face, bool useEmittingColumn,
+                                       constant FarTerrainOwnershipUniforms& ownership) {
+    localPosition = farTerrainExactOwnershipSamplePosition(localPosition, face, useEmittingColumn);
+    const int2 neighbor = int2(floor(localPosition / FAR_TERRAIN_TILE_EDGE_BLOCKS));
+    if (any(neighbor < int2(-FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS)) ||
+        any(neighbor > int2(FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS))) {
         return false;
     }
-    if (horizontalDistance >= exactRadius + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS) {
-        return true;
-    }
-    const float2 ditherCell = metal::floor(worldPosition.xz * 2.0f);
-    const float dither = interleavedGradientNoise(ditherCell);
-    return farTerrainHandoffVisible(horizontalDistance, exactRadius, dither);
+    const float2 neighborLocal = localPosition - float2(neighbor) * FAR_TERRAIN_TILE_EDGE_BLOCKS;
+    const int2 column = clamp(int2(floor(neighborLocal / FAR_TERRAIN_EXACT_COLUMN_EDGE_BLOCKS)),
+                              int2(0), int2(FAR_TERRAIN_EXACT_COLUMNS_PER_TILE - 1));
+    const uint bit = uint(column.y * FAR_TERRAIN_EXACT_COLUMNS_PER_TILE + column.x);
+    const uint word = bit / FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD;
+    const uint tileIndex = uint((neighbor.y + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS) *
+                                    FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE +
+                                neighbor.x + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS);
+    const uint4 packed =
+        ownership.readyColumnMasks[tileIndex * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE +
+                                   word / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR];
+    return ((packed[word % FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR] >>
+             (bit % FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD)) &
+            1u) != 0u;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,10 +122,13 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     // Restore world space from the chunk-local position, sway foliage in the
     // wind (bits 22-23; the shadow pass applies the same displacement), then MVP
     float4 worldPos = uniforms.modelMatrix * float4(in.position + chunkOrigin.origin.xyz, 1.0);
+    const float2 lodWorldPosition = worldPos.xz;
     uint sway = (in.faceAttr >> 22) & 3u;
     worldPos.xyz = applySway(worldPos.xyz, sway, in.uv.y, uniforms.time, uniforms.swayStrength);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
+    out.vLodWorldPosition = lodWorldPosition;
+    out.vFarLocalPosition = in.position.xz;
     out.vOverlayColor = chunkOrigin.overlayColorAndStrength;
 
     // Pass through UV
@@ -129,7 +144,9 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     out.vFarCanopy = (in.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) != 0u;
     out.vFarSkirt = (in.faceAttr & FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK) != 0u;
     out.vFarSkirtMask = chunkOrigin.farMetadata.x;
-    out.vExactRadius = chunkOrigin.origin.w;
+    out.vFarTerrain = chunkOrigin.farMetadata.w;
+    out.vLodTransitionProgress = as_type<float>(chunkOrigin.farMetadata.z);
+    out.vCoverageFrontier = as_type<float>(chunkOrigin.farMetadata.y);
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
     out.vAO = 0.5f + float((in.faceAttr >> 15) & 3u) * (1.0f / 6.0f);
     // Block light (bits 17-20) and the emissive flag (bit 21) — the lava glow.
@@ -280,16 +297,48 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
                              depth2d_array<float> shadowMap [[texture(1)]],
                              sampler shadowSampler [[sampler(1)]],
                              constant Uniforms& uniforms [[buffer(1)]],
-                             constant ShadowUniforms& shadow [[buffer(4)]]) {
-    if (in.vFarCanopy != 0u &&
-        !keepFarTerrainFragment(in.vWorldPosition, uniforms.cameraPosition, in.vExactRadius)) {
+                             constant ShadowUniforms& shadow [[buffer(4)]],
+                             constant FarTerrainOwnershipUniforms& ownership [[buffer(5)]]) {
+    const float horizontalDistance = distance(in.vLodWorldPosition, uniforms.cameraPosition.xz);
+    if (!farTerrainCoverageVisible(horizontalDistance, in.vCoverageFrontier)) {
         discard_fragment();
     }
-    const float horizontalDistance = distance(in.vWorldPosition.xz, uniforms.cameraPosition.xz);
+    const bool useEmittingColumn =
+        farTerrainOpaqueRiserUsesEmittingColumn(in.vFace, in.vFarCanopy != 0u, in.vFarSkirt != 0u);
+    if (in.vFarTerrain != 0u) {
+        bool exactOwnsFragment = exactColumnOwnsFarFragment(in.vFarLocalPosition, in.vFace,
+                                                            useEmittingColumn, ownership);
+        if (in.vFarSkirt != 0u) {
+            const bool emittingColumnOwnedByExact =
+                exactColumnOwnsFarFragment(in.vFarLocalPosition, in.vFace, true, ownership);
+            const float2 receivingPosition =
+                farTerrainSkirtReceivingOwnershipSamplePosition(in.vFarLocalPosition, in.vFace);
+            const bool receivingColumnOwnedByExact =
+                exactColumnOwnsFarFragment(receivingPosition, in.vFace, false, ownership);
+            exactOwnsFragment = !farTerrainSkirtOwnersVisible(emittingColumnOwnedByExact,
+                                                              receivingColumnOwnedByExact);
+        }
+        if (exactOwnsFragment) {
+            discard_fragment();
+        }
+    }
+    const float lodThreshold = interleavedGradientNoise(floor(in.vLodWorldPosition));
+    const bool lodVisible =
+        in.vFarSkirt != 0u ? farTerrainLodSkirtVisible(in.vLodTransitionProgress, in.vFarTerrain)
+        : in.vFarCanopy != 0u
+            ? farTerrainLodCanopyVisible(in.vLodTransitionProgress, lodThreshold, in.vFarTerrain)
+            : farTerrainLodTerrainVisible(in.vLodTransitionProgress, in.vFarTerrain);
+    if (!lodVisible) {
+        discard_fragment();
+    }
+    const float coverageFog = farTerrainCoverageFog(horizontalDistance, in.vCoverageFrontier);
+    const float lodTerrainFog =
+        in.vFarCanopy == 0u && in.vFarSkirt == 0u
+            ? farTerrainLodTerrainFog(in.vLodTransitionProgress, in.vFarTerrain)
+            : 0.0f;
     if (in.vFarSkirt != 0u) {
         const uint edgeBit = 1u << in.vFace;
-        if ((in.vFarSkirtMask & edgeBit) == 0u ||
-            !farTerrainSkirtVisible(horizontalDistance, in.vExactRadius)) {
+        if ((in.vFarSkirtMask & edgeBit) == 0u) {
             discard_fragment();
         }
     }
@@ -314,7 +363,7 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
         float3 glow = texColor.rgb * EMISSIVE_BOOST;
         glow = applyFog(glow, in.vWorldPosition, uniforms.cameraPosition, uniforms.fogDensity,
                         uniforms.fogColor);
-        glow = mix(glow, in.vOverlayColor.rgb, saturate(in.vOverlayColor.a));
+        glow = mix(glow, in.vOverlayColor.rgb, max(saturate(in.vOverlayColor.a), coverageFog));
         return float4(glow, 1.0f);
     }
 
@@ -382,7 +431,8 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);
-    finalColor = mix(finalColor, in.vOverlayColor.rgb, saturate(in.vOverlayColor.a));
+    finalColor = mix(finalColor, in.vOverlayColor.rgb,
+                     max(max(saturate(in.vOverlayColor.a), coverageFog), lodTerrainFog));
     return float4(finalColor, 1.0);
 }
 
@@ -396,13 +446,16 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
 struct WaterVertexOutput {
     float4 clipPosition [[position]];
     float3 vWorldPosition;
+    float2 vFarLocalPosition;
     float3 vCameraRelativePosition;
     float vSkyLight;
     float4 vOverlayColor;
     uint vFace [[flat]];
     uint vFlow [[flat]];
     uint vFalling [[flat]];
-    float vExactRadius [[flat]];
+    float vCoverageFrontier [[flat]];
+    uint vFarTerrain [[flat]];
+    float vLodTransitionProgress [[flat]];
 };
 
 // Fluid direction values are packed by the mesher as still, west, east,
@@ -431,34 +484,56 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
     uint normalIdx = in.faceAttr & 7u;
     uint flow = (in.faceAttr >> 24) & 7u;
     uint falling = (in.faceAttr >> 27) & 1u;
-    if (normalIdx == FACE_PLUS_Y) {
-        // Top surfaces ride the shared wave field (one definition with the
-        // fragment normal, see shader_types.hpp); world-space input keeps the
-        // waves continuous across chunk borders, and flow advects the phase in
-        // its packed cardinal direction so currents visibly travel while still
-        // water keeps the resting interference. The midline is biased DOWN so
-        // a full crest (rest plane 0.875 + peak ~0.21) stays below the block
-        // top instead of washing over adjacent shoreline blocks, and thin
-        // flowing sheets scale their swell by their own fluid level so a
-        // near-empty cell never displaces below its floor.
-        float levelFrac = fract(in.position.y);
-        float waveScale = saturate(levelFrac * 1.143f); // 0.875 (full cell) -> 1
-        float2 phase = pos.xz - waterFlowVector(flow) * water.time * 0.7f;
-        pos.y += (waterWaveHeight(phase, water.time) - 0.10f) * waveScale;
-    }
+    // Water geometry stays on the authored fluid plane. Motion remains in the
+    // analytic fragment normal below, so reflections animate without changing
+    // shoreline clearance or exposing mesh diagonals.
 
     WaterVertexOutput out;
     float4 worldPos = uniforms.modelMatrix * float4(pos, 1.0);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
+    out.vFarLocalPosition = in.position.xz;
     out.vCameraRelativePosition = worldPos.xyz - water.cameraPosition;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
     out.vOverlayColor = chunkOrigin.overlayColorAndStrength;
     out.vFace = normalIdx;
     out.vFlow = flow;
     out.vFalling = falling;
-    out.vExactRadius = chunkOrigin.origin.w;
+    out.vCoverageFrontier = as_type<float>(chunkOrigin.farMetadata.y);
+    out.vFarTerrain = chunkOrigin.farMetadata.w;
+    out.vLodTransitionProgress = as_type<float>(chunkOrigin.farMetadata.z);
     return out;
+}
+
+// Analytic normal of the shared water-wave field, filtered in screen space.
+// The geometry remains flat, but flow still advects the normal's phase. Each
+// band fades before it advances too far between neighboring pixels, preventing
+// distant ripple aliasing without changing the authored fluid surface.
+static float3 filteredWaterSurfaceNormal(float2 p, float t) {
+    float2 gradient = float2(0.0f);
+    for (int i = 0; i < 3; ++i) {
+        WaterWave wave = WATER_WAVES[i];
+        const float phase = dot(p, wave.dir) * wave.freq + t * wave.speed;
+        const float footprint = length(float2(dfdx(phase), dfdy(phase)));
+        gradient += wave.amp * wave.freq * wave.dir * cos(phase) *
+                    waterBandVisibility(footprint);
+    }
+
+    const float fineX = p.x * 1.9f + t * 2.3f;
+    const float fineZ = p.y * 2.2f - t * 2.0f;
+    const float diagonalX = (p.x + p.y) * 3.7f + t * 3.1f;
+    const float diagonalZ = (p.y - p.x) * 3.3f - t * 2.7f;
+    gradient.x += 0.014f * cos(fineX) *
+                  waterBandVisibility(length(float2(dfdx(fineX), dfdy(fineX))));
+    gradient.y += 0.014f * cos(fineZ) *
+                  waterBandVisibility(length(float2(dfdx(fineZ), dfdy(fineZ))));
+    gradient.x += 0.007f * cos(diagonalX) *
+                  waterBandVisibility(length(float2(dfdx(diagonalX), dfdy(diagonalX))));
+    gradient.y += 0.007f * cos(diagonalZ) *
+                  waterBandVisibility(length(float2(dfdx(diagonalZ), dfdy(diagonalZ))));
+
+    const float slope = 1.5f;
+    return normalize(float3(-gradient.x * slope, 1.0f, -gradient.y * slope));
 }
 
 // Water caustics: the flowing bright web sunlight focuses into as it refracts
@@ -497,7 +572,7 @@ static float causticPattern(float2 worldXZ, float t, float floorDepth) {
     // Warp the lookup by the wave gradient (unscaled world xz, so it uses the
     // real per-block wave frequencies), scaled up so the web arms visibly
     // wiggle with the same ripples that focus them.
-    float3 wn = waterSurfaceNormal(worldXZ, t);
+    float3 wn = filteredWaterSurfaceNormal(worldXZ, t);
     float2 warp = wn.xz * 3.0f;
     // One crisp web, MODULATED by a slow rotated octave. A single wrapped
     // octave is exactly periodic (a visible grid of identical ~2-block cells
@@ -511,8 +586,11 @@ static float causticPattern(float2 worldXZ, float t, float floorDepth) {
     float2 rot = float2(worldXZ.x * 0.7986f - worldXZ.y * 0.6018f,
                         worldXZ.x * 0.6018f + worldXZ.y * 0.7986f);
     float2 pB = rot * freqB + warp + float2(87.31f, -42.77f);
-    float web = causticOctave(pA, t, 5);
-    float modulation = saturate(causticOctave(pB, t * 0.7f, 3));
+    const float webFootprint = max(length(dfdx(pA)), length(dfdy(pA)));
+    const float modulationFootprint = max(length(dfdx(pB)), length(dfdy(pB)));
+    float web = causticOctave(pA, t, 5) * waterBandVisibility(webFootprint);
+    float modulation = saturate(causticOctave(pB, t * 0.7f, 3)) *
+                       waterBandVisibility(modulationFootprint);
     // Defocus with depth: the crisp ripple web washes out over ~8 blocks,
     // leaving the broad swell-scale patches.
     float defocus = saturate(floorDepth * 0.12f);
@@ -653,34 +731,46 @@ static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool under
 fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
                                   texture2d<float> sceneColor [[texture(0)]],
                                   depth2d<float> sceneDepth [[texture(1)]],
-                                  constant WaterUniforms& water [[buffer(3)]]) {
-    if (!keepFarTerrainFragment(in.vWorldPosition, water.cameraPosition, in.vExactRadius)) {
+                                  constant WaterUniforms& water [[buffer(3)]],
+                                  constant FarTerrainOwnershipUniforms& ownership [[buffer(5)]]) {
+    const float horizontalDistance = distance(in.vWorldPosition.xz, water.cameraPosition.xz);
+    if ((in.vFarTerrain != 0u &&
+         exactColumnOwnsFarFragment(in.vFarLocalPosition, in.vFace, false, ownership)) ||
+        !farTerrainCoverageVisible(horizontalDistance, in.vCoverageFrontier)) {
         discard_fragment();
     }
-    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    if (!farTerrainLodConnectedGeometryVisible(in.vFarTerrain)) {
+        discard_fragment();
+    }
+    const float coverageFog = farTerrainCoverageFog(horizontalDistance, in.vCoverageFrontier);
+    constexpr sampler depthPoint(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
+    constexpr sampler colorLinear(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float2 screenUV = in.clipPosition.xy / water.resolution;
 
-    // Manual depth test against the resolved opaque scene
-    float opaqueDepth = sceneDepth.sample(screenSampler, screenUV);
+    // Depth is point sampled throughout this pass. Linear depth interpolation
+    // invents a sloping floor at voxel silhouettes, which turns far greedy
+    // cells and exact/far ownership changes into rectangular absorption bands.
+    float opaqueDepth = sceneDepth.sample(depthPoint, screenUV);
     if (in.clipPosition.z > opaqueDepth) {
         discard_fragment();
     }
 
     float3 V = normalize(-in.vCameraRelativePosition);
-    // The fragment normal samples the same shared wave field the vertex stage
-    // displaced with, at the same flow-advected phase, so shading follows the
-    // moving geometry exactly.
+    // The fragment normal samples the shared wave field at a flow-advected
+    // phase. It supplies filtered motion while the authored voxel plane stays
+    // geometrically flat.
     float2 flowOffset = waterFlowVector(in.vFlow) * water.time * 0.7f;
     float3 N = in.vFace == FACE_PLUS_Y
-                   ? waterSurfaceNormal(in.vWorldPosition.xz - flowOffset, water.time)
+                   ? filteredWaterSurfaceNormal(in.vWorldPosition.xz - flowOffset, water.time)
                    : getFaceNormal(in.vFace);
     // Falling columns are the only water geometry allowed to expose vertical
     // sides. Give those faces a subtle downward streak normal so waterfalls
     // read as moving sheets while stable shorelines remain top surfaces only.
     if (in.vFalling != 0u && in.vFace != FACE_PLUS_Y && in.vFace != 5u) {
-        float streak = sin(in.vWorldPosition.y * 5.5f - water.time * 8.0f +
-                           dot(in.vWorldPosition.xz, float2(1.7f, 2.1f))) *
-                       0.08f;
+        const float streakPhase = in.vWorldPosition.y * 5.5f - water.time * 8.0f +
+                                  dot(in.vWorldPosition.xz, float2(1.7f, 2.1f));
+        const float streakFootprint = length(float2(dfdx(streakPhase), dfdy(streakPhase)));
+        float streak = sin(streakPhase) * 0.08f * waterBandVisibility(streakFootprint);
         N = normalize(N + float3(0.0f, streak, 0.0f));
     }
     // Which side of the interface this fragment shows is a per-fragment
@@ -707,14 +797,14 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // transmission samples straight through instead.
     float distortion = underside ? 0.0f : min(waterDepth, 4.0f) * 0.25f;
     float2 refractUV = clamp(screenUV + N.xz * 0.035f * distortion, 0.001f, 0.999f);
-    float refractDepth = sceneDepth.sample(screenSampler, refractUV);
+    float refractDepth = sceneDepth.sample(depthPoint, refractUV);
     if (refractDepth < in.clipPosition.z) {
         // The distorted tap landed on something in FRONT of the surface —
         // fall back to the undistorted sample
         refractUV = screenUV;
         refractDepth = opaqueDepth;
     }
-    float3 refracted = sceneColor.sample(screenSampler, refractUV).rgb;
+    float3 refracted = sceneColor.sample(colorLinear, refractUV).rgb;
 
     // Reconstruct the refracted floor camera-relatively. Add the camera only
     // after depth math to anchor the low-frequency caustic pattern globally.
@@ -815,7 +905,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
         color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * 0.45f * in.vSkyLight);
     }
 
-    color = mix(color, in.vOverlayColor.rgb, saturate(in.vOverlayColor.a));
+    color = mix(color, in.vOverlayColor.rgb, max(saturate(in.vOverlayColor.a), coverageFog));
     return float4(color, 1.0f);
 }
 
@@ -854,10 +944,11 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
     float t = water.time;
     float sunUp = saturate(water.sunDirection.y);
 
-    // Camera-relative reconstruction: absolute inverse matrices lose precision
-    // at large world coordinates (the same reason the water pass switched).
-    constexpr sampler screenSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
-    float depth = sceneDepth.sample(screenSampler, in.uv);
+    // Camera-relative reconstruction keeps the depth path precise at large
+    // world coordinates. Point sampling preserves voxel silhouettes instead
+    // of inventing sloped surfaces between adjacent depth values.
+    constexpr sampler depthPoint(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
+    float depth = sceneDepth.sample(depthPoint, in.uv);
     float3 relative = reconstructCameraRelative(in.uv, depth, water);
     float3 world = relative + water.cameraPosition;
     float dist = length(relative);
@@ -895,16 +986,16 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
     float2 texel = 1.0f / water.resolution;
     float3 pL = reconstructCameraRelative(
         in.uv - float2(texel.x, 0.0f),
-        sceneDepth.sample(screenSampler, in.uv - float2(texel.x, 0.0f)), water);
+        sceneDepth.sample(depthPoint, in.uv - float2(texel.x, 0.0f)), water);
     float3 pR = reconstructCameraRelative(
         in.uv + float2(texel.x, 0.0f),
-        sceneDepth.sample(screenSampler, in.uv + float2(texel.x, 0.0f)), water);
+        sceneDepth.sample(depthPoint, in.uv + float2(texel.x, 0.0f)), water);
     float3 pD = reconstructCameraRelative(
         in.uv - float2(0.0f, texel.y),
-        sceneDepth.sample(screenSampler, in.uv - float2(0.0f, texel.y)), water);
+        sceneDepth.sample(depthPoint, in.uv - float2(0.0f, texel.y)), water);
     float3 pU = reconstructCameraRelative(
         in.uv + float2(0.0f, texel.y),
-        sceneDepth.sample(screenSampler, in.uv + float2(0.0f, texel.y)), water);
+        sceneDepth.sample(depthPoint, in.uv + float2(0.0f, texel.y)), water);
     float spanL = abs(dist - length(pL)), spanR = abs(length(pR) - dist);
     float spanD = abs(dist - length(pD)), spanU = abs(length(pU) - dist);
     float3 ddxv = (spanR < spanL) ? (pR - relative) : (relative - pL);

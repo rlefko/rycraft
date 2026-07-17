@@ -2,10 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <future>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <numbers>
+#include <stdexcept>
+#include <unordered_map>
 
 namespace worldgen {
 namespace {
@@ -42,6 +48,17 @@ double smoothstep(double edge0, double edge1, double value) {
     return t * t * (3.0 - 2.0 * t);
 }
 
+double dryReliefDetailScale(const HydrologySample& hydrology) {
+    // A volcano or other final deformation can move a formerly dry coastal
+    // column below sea level. Blend its relief amplitude before that
+    // deformation so the new ocean floor meets the existing floor without a
+    // categorical dry-to-ocean detail seam.
+    constexpr double COASTAL_DETAIL_BLEND_HEIGHT = 16.0;
+    const double inland =
+        smoothstep(SEA_LEVEL, SEA_LEVEL + COASTAL_DETAIL_BLEND_HEIGHT, hydrology.surfaceElevation);
+    return std::lerp(OCEAN_FLOOR_DETAIL_SCALE, DRY_RELIEF_DETAIL_SCALE, inland);
+}
+
 double bell(double value, double center, double radius) {
     if (radius <= 0.0) return value == center ? 1.0 : 0.0;
     double normalized = (value - center) / radius;
@@ -63,43 +80,107 @@ double dot(Vector2d lhs, Vector2d rhs) {
 }
 
 int64_t floorToInt64(double value) {
-    constexpr double MIN_VALUE = static_cast<double>(std::numeric_limits<int64_t>::min());
-    constexpr double MAX_VALUE = static_cast<double>(std::numeric_limits<int64_t>::max());
-    return static_cast<int64_t>(std::floor(std::clamp(value, MIN_VALUE, MAX_VALUE)));
+    constexpr double MINIMUM = -0x1p63;
+    constexpr double MAXIMUM_EXCLUSIVE = 0x1p63;
+    if (std::isnan(value)) return 0;
+    // The positive int64 limit is not representable as a double: converting
+    // INT64_MAX rounds up to 2^63 and makes the subsequent cast undefined.
+    // Keep two cells of headroom because simplex and feature queries address
+    // neighboring lattice points after this conversion.
+    if (value <= MINIMUM) return std::numeric_limits<int64_t>::min() + 2;
+    if (value >= MAXIMUM_EXCLUSIVE) return std::numeric_limits<int64_t>::max() - 2;
+    return static_cast<int64_t>(std::floor(value));
 }
 
 uint32_t noiseSeed(uint64_t seed, uint64_t noiseStream) {
     return CounterRng(seed).u32(noiseStream, 0, 0, 0);
 }
 
-double counterValueNoise(const CounterRng& random, uint64_t noiseStream, double x, double z,
-                         double baseScale, int octaves) {
-    double result = 0.0;
-    double amplitude = 1.0;
-    double amplitudeSum = 0.0;
-    double scale = baseScale;
-    for (int octave = 0; octave < octaves; ++octave) {
-        const double scaledX = x / scale;
-        const double scaledZ = z / scale;
-        const int64_t cellX = floorToInt64(scaledX);
-        const int64_t cellZ = floorToInt64(scaledZ);
-        const double fractionX = scaledX - static_cast<double>(cellX);
-        const double fractionZ = scaledZ - static_cast<double>(cellZ);
-        const double blendX = fractionX * fractionX * (3.0 - 2.0 * fractionX);
-        const double blendZ = fractionZ * fractionZ * (3.0 - 2.0 * fractionZ);
-        const uint32_t counter = static_cast<uint32_t>(octave);
-        const double northwest = random.signedUnit(noiseStream, cellX, 0, cellZ, counter);
-        const double northeast = random.signedUnit(noiseStream, cellX + 1, 0, cellZ, counter);
-        const double southwest = random.signedUnit(noiseStream, cellX, 0, cellZ + 1, counter);
-        const double southeast = random.signedUnit(noiseStream, cellX + 1, 0, cellZ + 1, counter);
-        const double north = northwest + (northeast - northwest) * blendX;
-        const double south = southwest + (southeast - southwest) * blendX;
-        result += (north + (south - north) * blendZ) * amplitude;
-        amplitudeSum += amplitude;
-        amplitude *= 0.5;
-        scale *= 0.5;
+double counterSimplex(const CounterRng& random, uint64_t noiseStream, double x, double z,
+                      uint32_t index) {
+    constexpr double F2 = 0.36602540378443864676;
+    constexpr double G2 = 0.21132486540518711775;
+    constexpr std::array<Vector2d, 16> GRADIENTS = {{
+        {1.0, 0.0},
+        {0.9238795325, 0.3826834324},
+        {0.7071067812, 0.7071067812},
+        {0.3826834324, 0.9238795325},
+        {0.0, 1.0},
+        {-0.3826834324, 0.9238795325},
+        {-0.7071067812, 0.7071067812},
+        {-0.9238795325, 0.3826834324},
+        {-1.0, 0.0},
+        {-0.9238795325, -0.3826834324},
+        {-0.7071067812, -0.7071067812},
+        {-0.3826834324, -0.9238795325},
+        {0.0, -1.0},
+        {0.3826834324, -0.9238795325},
+        {0.7071067812, -0.7071067812},
+        {0.9238795325, -0.3826834324},
+    }};
+    const double skew = (x + z) * F2;
+    const int64_t cellX = floorToInt64(x + skew);
+    const int64_t cellZ = floorToInt64(z + skew);
+    const double unskew = (static_cast<double>(cellX) + static_cast<double>(cellZ)) * G2;
+    const double x0 = x - (static_cast<double>(cellX) - unskew);
+    const double z0 = z - (static_cast<double>(cellZ) - unskew);
+    const int64_t xStep = x0 > z0 ? 1 : 0;
+    const int64_t zStep = x0 > z0 ? 0 : 1;
+    const std::array<double, 3> offsetsX = {x0, x0 - static_cast<double>(xStep) + G2,
+                                            x0 - 1.0 + 2.0 * G2};
+    const std::array<double, 3> offsetsZ = {z0, z0 - static_cast<double>(zStep) + G2,
+                                            z0 - 1.0 + 2.0 * G2};
+    const std::array<int64_t, 3> latticeX = {cellX, cellX + xStep, cellX + 1};
+    const std::array<int64_t, 3> latticeZ = {cellZ, cellZ + zStep, cellZ + 1};
+    double value = 0.0;
+    for (size_t corner = 0; corner < 3; ++corner) {
+        double attenuation =
+            0.5 - offsetsX[corner] * offsetsX[corner] - offsetsZ[corner] * offsetsZ[corner];
+        if (attenuation <= 0.0) continue;
+        const uint32_t hash = random.u32(noiseStream, latticeX[corner], 0, latticeZ[corner],
+                                         index + static_cast<uint32_t>(corner));
+        const Vector2d gradient = GRADIENTS[hash & 15U];
+        attenuation *= attenuation;
+        value += attenuation * attenuation *
+                 (gradient.x * offsetsX[corner] + gradient.z * offsetsZ[corner]);
     }
-    return amplitudeSum > 0.0 ? result / amplitudeSum : 0.0;
+    return value * 70.0;
+}
+
+double rotatedCounterSimplex(const CounterRng& random, uint64_t noiseStream, double x, double z,
+                             double scale, double angle, uint32_t index) {
+    const double cosine = std::cos(angle);
+    const double sine = std::sin(angle);
+    const double rotatedX = (x * cosine - z * sine) / scale;
+    const double rotatedZ = (x * sine + z * cosine) / scale;
+    return counterSimplex(random, noiseStream, rotatedX, rotatedZ, index);
+}
+
+double tabulatedSimplexCdf(double value) {
+    constexpr std::array<double, 17> VALUES = {
+        -1.0,  -0.875, -0.75, -0.625, -0.5,  -0.375, -0.25, -0.125, 0.0,
+        0.125, 0.25,   0.375, 0.5,    0.625, 0.75,   0.875, 1.0,
+    };
+    constexpr std::array<double, 17> CDF = {
+        0.0003, 0.0013, 0.0049, 0.0155, 0.0420, 0.0980, 0.1940, 0.3330, 0.5000,
+        0.6670, 0.8060, 0.9020, 0.9580, 0.9845, 0.9951, 0.9987, 0.9997,
+    };
+    if (value <= VALUES.front()) return CDF.front();
+    if (value >= VALUES.back()) return CDF.back();
+    const double position = (value - VALUES.front()) / (VALUES.back() - VALUES.front()) *
+                            static_cast<double>(VALUES.size() - 1);
+    const size_t lower = static_cast<size_t>(std::floor(position));
+    const double fraction = position - static_cast<double>(lower);
+    return std::lerp(CDF[lower], CDF[lower + 1], fraction);
+}
+
+double rotatedSimplex(const SimplexNoise& noise, double x, double z, double scale, int octaves,
+                      double angle) {
+    const double cosine = std::cos(angle);
+    const double sine = std::sin(angle);
+    const double rotatedX = x * cosine - z * sine;
+    const double rotatedZ = x * sine + z * cosine;
+    return noise.octave2D(rotatedX / scale, rotatedZ / scale, octaves);
 }
 
 double distanceToSegment(double px, double pz, double ax, double az, double bx, double bz,
@@ -156,22 +237,119 @@ double biomeBlendWeight(const BiomeBlend& blend, Biome biome) noexcept {
 
 double multiscaleDitherThreshold(const CounterRng& random, uint64_t stream, int64_t x, int64_t z,
                                  uint32_t index) noexcept {
-    constexpr std::array<int64_t, 4> SCALES = {64, 16, 4, 1};
-    uint32_t rank = 0;
-    for (uint32_t level = 0; level < SCALES.size(); ++level) {
-        const int64_t cellX = world_coord::floorDiv(x, SCALES[level]);
-        const int64_t cellZ = world_coord::floorDiv(z, SCALES[level]);
-        const uint32_t digit =
-            random.u32(stream, cellX, static_cast<int32_t>(level), cellZ, index, level) & 3U;
-        rank = (rank << 2U) | digit;
-    }
-    return (static_cast<double>(rank) + 0.5) / 256.0;
+    // Independent rotated simplex-gradient bands make connected isotropic
+    // patches. Their weighted distribution is transformed through a compact
+    // symmetric CDF table so blend proportions remain unbiased.
+    const double broad =
+        rotatedCounterSimplex(random, stream ^ 0xA24BAED4963EE407ULL, static_cast<double>(x),
+                              static_cast<double>(z), 47.0, 0.6180339887498948, index * 3U);
+    const double medium =
+        rotatedCounterSimplex(random, stream ^ 0x9FB21C651E98DF25ULL, static_cast<double>(x),
+                              static_cast<double>(z), 17.0, 1.176005207095135, index * 3U + 1U);
+    const double fine =
+        rotatedCounterSimplex(random, stream ^ 0xC13FA9A902A6328FULL, static_cast<double>(x),
+                              static_cast<double>(z), 7.0, 2.0344439357957027, index * 3U + 2U);
+    const double rank = tabulatedSimplexCdf(broad * 0.58 + medium * 0.29 + fine * 0.13);
+    return std::clamp(rank, std::numeric_limits<double>::epsilon(),
+                      1.0 - std::numeric_limits<double>::epsilon());
 }
 
 double climateWaterInfluence(const HydrologySample& hydrology) noexcept {
     return std::max({oceanInfluence(hydrology), lakeInfluence(hydrology) * 0.65,
                      channelInfluence(hydrology) * 0.18});
 }
+
+double rockErosionResistance(RockType rock) noexcept {
+    switch (rock) {
+        case RockType::GRANITE:
+            return 0.92;
+        case RockType::BASALT:
+            return 1.12;
+        case RockType::LIMESTONE:
+            return 0.56;
+        case RockType::SANDSTONE:
+            return 0.42;
+        case RockType::VOLCANIC:
+            return 1.20;
+    }
+    return 0.90;
+}
+
+double lithologyErosionResistance(const GeologySample& geology) noexcept {
+    return std::clamp(geology.erosionResistance, 0.35, 1.25);
+}
+
+GeneratedFluidColumn generatedFluidColumn(const SurfaceSample& surface) noexcept {
+    GeneratedFluidColumn result;
+    result.visibleSurface = surface.waterSurface;
+    result.wet = (surface.hydrology.ocean || surface.hydrology.river || surface.hydrology.lake) &&
+                 std::isfinite(surface.waterSurface) &&
+                 surface.waterSurface > surface.terrainHeight + 0.01;
+    if (!result.wet) return result;
+
+    result.topY =
+        std::clamp(static_cast<int>(std::ceil(surface.waterSurface)) - 1, WORLD_MIN_Y, WORLD_MAX_Y);
+    result.standing = surface.hydrology.ocean || surface.hydrology.lake ||
+                      surface.hydrology.waterfall || surface.hydrology.generatedFluidLevel == 0;
+    if (surface.hydrology.river && surface.hydrology.generatedFluidLevel > 0) {
+        result.topState = FluidState::flowing(surface.hydrology.generatedFluidLevel);
+    }
+    result.visibleSurface = static_cast<double>(result.topY) + fluidSurfaceHeight(result.topState);
+    if (surface.hydrology.waterfall) {
+        result.fallingStartY =
+            std::clamp(static_cast<int>(std::ceil(surface.hydrology.waterfallBottom)), WORLD_MIN_Y,
+                       WORLD_MAX_Y + 1);
+    }
+    return result;
+}
+
+namespace {
+
+HydrologySample hydrologyFromBasin(const BasinSample& basin) {
+    HydrologySample result;
+    result.waterBodyId = basin.waterBodyId;
+    result.generatedFluidLevel = basin.generatedFluidLevel;
+    result.transitionOwnerKind = basin.transitionOwnerKind;
+    result.transitionOwnerId = basin.transitionOwnerId;
+    result.flowDirection = {basin.flowX, basin.flowZ};
+    result.surfaceElevation = basin.surfaceElevation;
+    result.waterSurface = basin.waterSurface;
+    result.discharge = basin.discharge;
+    result.sediment = basin.sediment;
+    result.channelDistance = basin.channelDistance;
+    result.channelWidth = basin.channelWidth;
+    result.channelDepth = basin.channelDepth;
+    result.channelGradient = basin.channelGradient;
+    result.erosionDepth = basin.erosionDepth;
+    result.lakeDepth = basin.lakeDepth;
+    result.lakeShoreDistance = basin.lakeShoreDistance;
+    result.shoreWaterSurface = basin.shoreWaterSurface;
+    result.lakeBankTarget = basin.lakeBankTarget;
+    result.lakeBankInfluence = basin.lakeBankInfluence;
+    result.lakeAreaSquareKilometers = basin.lakeAreaSquareKilometers;
+    result.lakeVolumeCubicMeters = basin.lakeVolumeCubicMeters;
+    result.lakeRunoffMmSquareKilometers = basin.lakeRunoffMmSquareKilometers;
+    result.lakeLossMm = basin.lakeLossMm;
+    result.lakeOverflowMmSquareKilometers = basin.lakeOverflowMmSquareKilometers;
+    result.lakeSpillSurface = basin.lakeSpillSurface;
+    result.waterfallTop = basin.waterfallTop;
+    result.waterfallBottom = basin.waterfallBottom;
+    result.waterfallWidth = basin.waterfallWidth;
+    result.streamOrder = basin.streamOrder;
+    result.distributaryCount = basin.distributaryCount;
+    result.ocean = basin.ocean;
+    result.river = basin.river;
+    result.lake = basin.lake;
+    result.lakeBank = basin.lakeBank;
+    result.channelBank = basin.channelBank;
+    result.endorheic = basin.endorheic;
+    result.waterfall = basin.waterfall;
+    result.waterfallAnchor = basin.waterfallAnchor;
+    result.delta = basin.delta;
+    return result;
+}
+
+} // namespace
 
 struct MacroGenerationSampler::PlateSite {
     int64_t cellX = 0;
@@ -199,15 +377,419 @@ struct MacroGenerationSampler::DrainageNode {
     bool ocean = false;
 };
 
-MacroGenerationSampler::MacroGenerationSampler(uint64_t worldSeed)
+struct MacroGenerationSampler::MacroControlTile {
+    ColumnPos key;
+    std::array<SurfaceSample, MACRO_CONTROL_SAMPLE_COUNT> controls;
+    SimplexNoise climateDetailNoise;
+
+    const SurfaceSample& at(int x, int z) const {
+        return controls[static_cast<size_t>(z * MACRO_CONTROL_GRID_EDGE + x)];
+    }
+
+    size_t byteSize() const noexcept { return sizeof(*this); }
+};
+
+struct MacroGenerationSampler::FarClimateControlTile {
+    struct Control {
+        ClimateFields climate;
+        double terrainHeight = 0.0;
+    };
+
+    ColumnPos key;
+    std::array<Control, FAR_CLIMATE_CONTROL_SAMPLE_COUNT> controls;
+    SimplexNoise climateDetailNoise;
+
+    const Control& at(int x, int z) const {
+        return controls[static_cast<size_t>(z * FAR_CLIMATE_CONTROL_GRID_EDGE + x)];
+    }
+
+    size_t byteSize() const noexcept { return sizeof(*this); }
+};
+
+struct MacroControlView::Impl {
+    std::shared_ptr<const MacroGenerationSampler::MacroControlTile> tile;
+};
+
+namespace {
+
+std::array<double, 4> cubicSplineBasis(double t) {
+    const double t2 = t * t;
+    const double t3 = t2 * t;
+    return {
+        (1.0 - 3.0 * t + 3.0 * t2 - t3) / 6.0,
+        (4.0 - 6.0 * t2 + 3.0 * t3) / 6.0,
+        (1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3) / 6.0,
+        t3 / 6.0,
+    };
+}
+
+std::array<double, 4> cubicSplineDerivative(double t) {
+    const double t2 = t * t;
+    return {
+        -0.5 * (1.0 - 2.0 * t + t2),
+        -2.0 * t + 1.5 * t2,
+        0.5 + t - 1.5 * t2,
+        0.5 * t2,
+    };
+}
+
+struct CubicControlStencil {
+    int cellX = 0;
+    int cellZ = 0;
+    double spacing = 1.0;
+    std::array<double, 4> weightsX{};
+    std::array<double, 4> weightsZ{};
+    std::array<double, 4> derivativeX{};
+    std::array<double, 4> derivativeZ{};
+
+    template <typename SampleAt>
+    double interpolate(SampleAt&& sampleAt) const {
+        double value = 0.0;
+        for (int offsetZ = 0; offsetZ < 4; ++offsetZ) {
+            for (int offsetX = 0; offsetX < 4; ++offsetX) {
+                value += weightsX[static_cast<size_t>(offsetX)] *
+                         weightsZ[static_cast<size_t>(offsetZ)] *
+                         sampleAt(cellX + offsetX, cellZ + offsetZ);
+            }
+        }
+        return value;
+    }
+
+    template <typename SampleAt>
+    Vector2d gradient(SampleAt&& sampleAt) const {
+        Vector2d result;
+        for (int offsetZ = 0; offsetZ < 4; ++offsetZ) {
+            for (int offsetX = 0; offsetX < 4; ++offsetX) {
+                const double sample = sampleAt(cellX + offsetX, cellZ + offsetZ);
+                result.x += derivativeX[static_cast<size_t>(offsetX)] *
+                            weightsZ[static_cast<size_t>(offsetZ)] * sample;
+                result.z += weightsX[static_cast<size_t>(offsetX)] *
+                            derivativeZ[static_cast<size_t>(offsetZ)] * sample;
+            }
+        }
+        result.x /= spacing;
+        result.z /= spacing;
+        return result;
+    }
+};
+
+CubicControlStencil cubicControlStencil(double x, double z, double originX, double originZ,
+                                        double spacing, int coreEdge) {
+    const double controlX =
+        std::clamp((x - originX) / spacing, 0.0, static_cast<double>(coreEdge - 1));
+    const double controlZ =
+        std::clamp((z - originZ) / spacing, 0.0, static_cast<double>(coreEdge - 1));
+    CubicControlStencil result;
+    result.cellX = std::clamp(static_cast<int>(std::floor(controlX)), 0, coreEdge - 2);
+    result.cellZ = std::clamp(static_cast<int>(std::floor(controlZ)), 0, coreEdge - 2);
+    result.spacing = spacing;
+    result.weightsX = cubicSplineBasis(controlX - result.cellX);
+    result.weightsZ = cubicSplineBasis(controlZ - result.cellZ);
+    result.derivativeX = cubicSplineDerivative(controlX - result.cellX);
+    result.derivativeZ = cubicSplineDerivative(controlZ - result.cellZ);
+    return result;
+}
+
+template <typename TerrainAt, typename ClimateAt>
+void reconstructClimate(SurfaceSample& result, const CubicControlStencil& stencil,
+                        TerrainAt&& terrainAt, ClimateAt&& climateAt) {
+    result.climate.wind = {
+        stencil.interpolate([&](int x, int z) { return climateAt(x, z).wind.x; }),
+        stencil.interpolate([&](int x, int z) { return climateAt(x, z).wind.z; }),
+    };
+    const double controlTerrain = stencil.interpolate(terrainAt);
+    const double controlTemperature =
+        stencil.interpolate([&](int x, int z) { return climateAt(x, z).temperatureC; });
+    result.climate.temperatureC =
+        controlTemperature - (result.terrainHeight - controlTerrain) * 8.0 * 0.0065;
+    result.climate.annualPrecipitationMm = std::clamp(
+        stencil.interpolate([&](int x, int z) { return climateAt(x, z).annualPrecipitationMm; }),
+        60.0, 3600.0);
+    result.climate.relativeHumidity = clamp01(
+        stencil.interpolate([&](int x, int z) { return climateAt(x, z).relativeHumidity; }));
+    result.climate.potentialEvapotranspirationMm =
+        std::clamp(stencil.interpolate([&](int x, int z) {
+            return climateAt(x, z).potentialEvapotranspirationMm;
+        }) + (result.climate.temperatureC - controlTemperature) * 31.0,
+                   120.0, 1800.0);
+    result.climate.aridity = result.climate.potentialEvapotranspirationMm /
+                             std::max(1.0, result.climate.annualPrecipitationMm);
+}
+
+template <typename Tile>
+void reconstructContinuousFields(const Tile& tile, double x, double z, SurfaceSample& result) {
+    const double originX = static_cast<double>(tile.key.x * MACRO_CONTROL_TILE_EDGE);
+    const double originZ = static_cast<double>(tile.key.z * MACRO_CONTROL_TILE_EDGE);
+    const CubicControlStencil stencil =
+        cubicControlStencil(x, z, originX, originZ, MACRO_CONTROL_SPACING, MACRO_CONTROL_CORE_EDGE);
+    const auto interpolate = [&](auto getter) {
+        return stencil.interpolate(
+            [&](int controlX, int controlZ) { return getter(tile.at(controlX, controlZ)); });
+    };
+
+    result.geology.plateVelocity = {
+        interpolate([](const SurfaceSample& sample) { return sample.geology.plateVelocity.x; }),
+        interpolate([](const SurfaceSample& sample) { return sample.geology.plateVelocity.z; }),
+    };
+    result.geology.continentalFraction = clamp01(interpolate(
+        [](const SurfaceSample& sample) { return sample.geology.continentalFraction; }));
+    result.geology.crustAge =
+        clamp01(interpolate([](const SurfaceSample& sample) { return sample.geology.crustAge; }));
+    result.geology.crustThickness =
+        interpolate([](const SurfaceSample& sample) { return sample.geology.crustThickness; });
+    result.geology.crustDensity =
+        interpolate([](const SurfaceSample& sample) { return sample.geology.crustDensity; });
+    result.geology.erosionResistance = std::clamp(
+        interpolate([](const SurfaceSample& sample) { return sample.geology.erosionResistance; }),
+        0.35, 1.25);
+    result.geology.distanceToBoundary = std::max(0.0, interpolate([](const SurfaceSample& sample) {
+                                                     return sample.geology.distanceToBoundary;
+                                                 }));
+    result.geology.uplift =
+        clamp01(interpolate([](const SurfaceSample& sample) { return sample.geology.uplift; }));
+    result.geology.rift =
+        clamp01(interpolate([](const SurfaceSample& sample) { return sample.geology.rift; }));
+    result.geology.faultStrength = clamp01(
+        interpolate([](const SurfaceSample& sample) { return sample.geology.faultStrength; }));
+    result.geology.hotspotInfluence = clamp01(
+        interpolate([](const SurfaceSample& sample) { return sample.geology.hotspotInfluence; }));
+    result.geology.volcanicActivity = clamp01(
+        interpolate([](const SurfaceSample& sample) { return sample.geology.volcanicActivity; }));
+
+    result.slope =
+        std::max(0.0, interpolate([](const SurfaceSample& sample) { return sample.slope; }));
+    reconstructClimate(
+        result, stencil,
+        [&](int controlX, int controlZ) { return tile.at(controlX, controlZ).terrainHeight; },
+        [&](int controlX, int controlZ) -> const ClimateFields& {
+            return tile.at(controlX, controlZ).climate;
+        });
+    // The C2 controls carry the broad moisture transport solution. Two
+    // oblique filtered bands restore local weather variation without making
+    // the eight-block control phase visible in final precipitation or biome
+    // suitability.
+    result.climate.annualPrecipitationMm =
+        std::clamp(result.climate.annualPrecipitationMm +
+                       rotatedSimplex(tile.climateDetailNoise, x, z, 96.0, 1, 0.619) * 90.0 +
+                       rotatedSimplex(tile.climateDetailNoise, x, z, 36.0, 1, 1.847) * 75.0,
+                   60.0, 3600.0);
+    const double temperatureDetail =
+        rotatedSimplex(tile.climateDetailNoise, x, z, 80.0, 1, 2.311) * 1.8 +
+        rotatedSimplex(tile.climateDetailNoise, x, z, 28.0, 1, 0.927) * 1.4;
+    result.climate.temperatureC += temperatureDetail;
+    result.climate.potentialEvapotranspirationMm = std::clamp(
+        result.climate.potentialEvapotranspirationMm + temperatureDetail * 31.0, 120.0, 1800.0);
+    result.climate.aridity = result.climate.potentialEvapotranspirationMm /
+                             std::max(1.0, result.climate.annualPrecipitationMm);
+    result.soil.moisture =
+        clamp01(interpolate([](const SurfaceSample& sample) { return sample.soil.moisture; }));
+    result.soil.fertility =
+        clamp01(interpolate([](const SurfaceSample& sample) { return sample.soil.fertility; }));
+    result.soil.drainage =
+        clamp01(interpolate([](const SurfaceSample& sample) { return sample.soil.drainage; }));
+    result.soil.waterTable =
+        interpolate([](const SurfaceSample& sample) { return sample.soil.waterTable; });
+    for (size_t index = 0; index < result.suitability.scores.size(); ++index) {
+        result.suitability.scores[index] = static_cast<float>(
+            std::max(0.0, interpolate([index](const SurfaceSample& sample) {
+                         return static_cast<double>(sample.suitability.scores[index]);
+                     })));
+    }
+    result.biome = MacroGenerationSampler::selectBiome(result.suitability);
+}
+
+template <typename Tile>
+class SingleFlightControlTileCache {
+public:
+    using TilePointer = std::shared_ptr<const Tile>;
+    using Builder = std::function<TilePointer()>;
+
+    SingleFlightControlTileCache(size_t capacity, size_t byteBudget)
+        : capacity_(std::max<size_t>(1, capacity))
+        , byteBudget_(std::max<size_t>(1, byteBudget)) {}
+
+    TilePointer getOrCreate(ColumnPos key, const Builder& builder) const {
+        std::shared_future<TilePointer> future;
+        std::shared_ptr<std::promise<TilePointer>> producer;
+        uint64_t token = 0;
+        constexpr size_t TILE_BYTES = sizeof(Tile);
+        const bool cacheable = TILE_BYTES <= byteBudget_;
+
+        while (true) {
+            std::shared_future<TilePointer> evictionWait;
+            {
+                std::lock_guard lock(mutex_);
+                auto found = entries_.find(key);
+                if (found != entries_.end()) {
+                    found->second.lastAccess = ++accessClock_;
+                    ++metrics_.hits;
+                    if (found->second.future.wait_for(std::chrono::seconds(0)) !=
+                        std::future_status::ready) {
+                        ++metrics_.singleFlightWaits;
+                    }
+                    future = found->second.future;
+                    break;
+                }
+
+                if (entries_.size() >= capacity_ ||
+                    (cacheable && bytes_ + TILE_BYTES > byteBudget_)) {
+                    auto oldestReady = entries_.end();
+                    auto oldestPending = entries_.end();
+                    for (auto entry = entries_.begin(); entry != entries_.end(); ++entry) {
+                        if (oldestPending == entries_.end() ||
+                            entry->second.lastAccess < oldestPending->second.lastAccess) {
+                            oldestPending = entry;
+                        }
+                        if (entry->second.future.wait_for(std::chrono::seconds(0)) ==
+                                std::future_status::ready &&
+                            (oldestReady == entries_.end() ||
+                             entry->second.lastAccess < oldestReady->second.lastAccess)) {
+                            oldestReady = entry;
+                        }
+                    }
+                    if (oldestReady != entries_.end()) {
+                        bytes_ -= oldestReady->second.bytes;
+                        entries_.erase(oldestReady);
+                        ++metrics_.evictions;
+                    } else if (oldestPending != entries_.end()) {
+                        evictionWait = oldestPending->second.future;
+                    }
+                }
+                if (!evictionWait.valid()) {
+                    producer = std::make_shared<std::promise<TilePointer>>();
+                    future = producer->get_future().share();
+                    token = ++tokenClock_;
+                    const size_t retainedBytes = cacheable ? TILE_BYTES : 0;
+                    entries_.emplace(key, Entry{future, ++accessClock_, token, retainedBytes});
+                    bytes_ += retainedBytes;
+                    ++metrics_.misses;
+                    ++metrics_.activeBuilds;
+                    metrics_.peakBuilds = std::max(metrics_.peakBuilds, metrics_.activeBuilds);
+                    break;
+                }
+            }
+            evictionWait.wait();
+        }
+
+        if (!producer) return future.get();
+
+        try {
+            TilePointer tile = builder();
+            if (!cacheable) {
+                std::lock_guard lock(mutex_);
+                ++metrics_.builds;
+                --metrics_.activeBuilds;
+                producer->set_value(tile);
+                auto found = entries_.find(key);
+                if (found != entries_.end() && found->second.token == token) {
+                    entries_.erase(found);
+                }
+                return tile;
+            }
+            producer->set_value(tile);
+            std::lock_guard lock(mutex_);
+            ++metrics_.builds;
+            --metrics_.activeBuilds;
+            return tile;
+        } catch (...) {
+            const std::exception_ptr exception = std::current_exception();
+            if (!cacheable) {
+                std::lock_guard lock(mutex_);
+                --metrics_.activeBuilds;
+                producer->set_exception(exception);
+                auto found = entries_.find(key);
+                if (found != entries_.end() && found->second.token == token) {
+                    entries_.erase(found);
+                }
+                throw;
+            }
+            producer->set_exception(exception);
+            std::lock_guard lock(mutex_);
+            --metrics_.activeBuilds;
+            auto found = entries_.find(key);
+            if (found != entries_.end() && found->second.token == token) {
+                bytes_ -= found->second.bytes;
+                entries_.erase(found);
+            }
+            throw;
+        }
+    }
+
+    MacroControlCacheMetrics metrics() const {
+        std::lock_guard lock(mutex_);
+        MacroControlCacheMetrics result = metrics_;
+        result.entries = entries_.size();
+        result.bytes = bytes_;
+        result.capacity = capacity_;
+        result.byteBudget = byteBudget_;
+        return result;
+    }
+
+    void clear() const {
+        std::lock_guard lock(mutex_);
+        entries_.clear();
+        bytes_ = 0;
+    }
+
+private:
+    struct Entry {
+        std::shared_future<TilePointer> future;
+        uint64_t lastAccess = 0;
+        uint64_t token = 0;
+        size_t bytes = 0;
+    };
+
+    mutable std::mutex mutex_;
+    mutable std::unordered_map<ColumnPos, Entry> entries_;
+    mutable uint64_t accessClock_ = 0;
+    mutable uint64_t tokenClock_ = 0;
+    mutable size_t bytes_ = 0;
+    mutable MacroControlCacheMetrics metrics_;
+    const size_t capacity_;
+    const size_t byteBudget_;
+};
+
+} // namespace
+
+class MacroGenerationSampler::MacroControlTileCache
+    : public SingleFlightControlTileCache<MacroControlTile> {
+public:
+    static_assert(sizeof(MacroControlTile) * MACRO_CONTROL_CACHE_CAPACITY <=
+                  MACRO_CONTROL_CACHE_BYTE_BUDGET);
+    using SingleFlightControlTileCache<MacroControlTile>::SingleFlightControlTileCache;
+};
+
+class MacroGenerationSampler::FarClimateControlTileCache
+    : public SingleFlightControlTileCache<FarClimateControlTile> {
+public:
+    static_assert(sizeof(FarClimateControlTile) * FAR_CLIMATE_CONTROL_CACHE_CAPACITY <=
+                  FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET);
+    using SingleFlightControlTileCache<FarClimateControlTile>::SingleFlightControlTileCache;
+};
+
+MacroGenerationSampler::MacroGenerationSampler(uint64_t worldSeed, size_t macroControlCacheCapacity,
+                                               size_t macroControlCacheByteBudget,
+                                               size_t farClimateControlCacheCapacity,
+                                               size_t farClimateControlCacheByteBudget)
     : cacheTag_(worldSeed)
     , random_(worldSeed)
+    , alpineMorphology_(worldSeed)
     , basinSolver_(worldSeed)
+    , macroControlCache_(std::make_unique<MacroControlTileCache>(macroControlCacheCapacity,
+                                                                 macroControlCacheByteBudget))
+    , farClimateControlCache_(std::make_unique<FarClimateControlTileCache>(
+          farClimateControlCacheCapacity, farClimateControlCacheByteBudget))
     , continentalNoise_(noiseSeed(worldSeed, stream::CONTINENTAL_NOISE))
     , warpXNoise_(noiseSeed(worldSeed, stream::WARP_X_NOISE))
     , warpZNoise_(noiseSeed(worldSeed, stream::WARP_Z_NOISE))
     , reliefNoise_(noiseSeed(worldSeed, stream::RELIEF_NOISE))
-    , soilNoise_(noiseSeed(worldSeed, stream::SOIL_NOISE)) {}
+    , pressureNoise_(noiseSeed(worldSeed, stream::PRESSURE_NOISE))
+    , insolationNoise_(noiseSeed(worldSeed, stream::INSOLATION_NOISE))
+    , soilNoise_(noiseSeed(worldSeed, stream::SOIL_NOISE))
+    , climateDetailNoise_(noiseSeed(worldSeed, stream::PRESSURE_NOISE ^ 0x434C'494D'4445'5441ULL)) {
+}
+
+MacroGenerationSampler::~MacroGenerationSampler() = default;
 
 MacroGenerationSampler::PlateSite MacroGenerationSampler::plateSite(int64_t cellX,
                                                                     int64_t cellZ) const {
@@ -363,10 +945,13 @@ GeologySample MacroGenerationSampler::sampleGeology(double x, double z) const {
     result.plateId = nearest.id;
     result.crust = nearest.crust;
     result.rock = nearest.rock;
+    result.lithology.primary = nearest.rock;
+    result.lithology.secondary = nearest.rock;
     result.plateVelocity = nearest.velocity;
     result.crustAge = nearest.age;
     result.crustThickness = nearest.thickness;
     result.crustDensity = nearest.density;
+    result.erosionResistance = rockErosionResistance(nearest.rock);
     result.distanceToBoundary =
         std::max(0.0, (std::sqrt(secondDistanceSquared) - std::sqrt(nearestDistanceSquared)) * 0.5);
 
@@ -377,17 +962,41 @@ GeologySample MacroGenerationSampler::sampleGeology(double x, double z) const {
     const double nearbyDistanceLimitSquared =
         (nearestDistance + 2700.0) * (nearestDistance + 2700.0);
     double oppositeCrustDistanceSquared = std::numeric_limits<double>::max();
+    double secondaryRockDistanceSquared = std::numeric_limits<double>::max();
+    RockType secondaryRock = nearest.rock;
     for (size_t index = 0; index < candidateCount; ++index) {
         const PlateSite& candidate = candidates[index];
         if (candidate.crust != nearest.crust) {
             oppositeCrustDistanceSquared =
                 std::min(oppositeCrustDistanceSquared, candidateDistanceSquared[index]);
         }
+        if (candidate.rock != nearest.rock &&
+            candidateDistanceSquared[index] < secondaryRockDistanceSquared) {
+            secondaryRockDistanceSquared = candidateDistanceSquared[index];
+            secondaryRock = candidate.rock;
+        }
         if (candidateDistanceSquared[index] <= nearbyDistanceLimitSquared) {
             candidateDistances[index] = std::sqrt(candidateDistanceSquared[index]);
             nearbyCandidates[nearbyCandidateCount++] = index;
         }
     }
+
+    // Blend every facies close enough to influence the nearest contact.
+    // Keeping one half-weight for the nearest site reproduces the ordinary
+    // two-facies transition, while equal secondary candidates participate
+    // symmetrically at triple points instead of introducing a rank seam.
+    double resistanceWeight = 0.5;
+    double weightedResistance = rockErosionResistance(nearest.rock) * resistanceWeight;
+    for (size_t index = 0; index < candidateCount; ++index) {
+        const PlateSite& candidate = candidates[index];
+        if (candidate.id == nearest.id) continue;
+        const double contactDistance =
+            std::max(0.0, (std::sqrt(candidateDistanceSquared[index]) - nearestDistance) * 0.5);
+        const double weight = 0.5 * (1.0 - smoothstep(0.0, 620.0, contactDistance));
+        weightedResistance += rockErosionResistance(candidate.rock) * weight;
+        resistanceWeight += weight;
+    }
+    result.erosionResistance = weightedResistance / resistanceWeight;
 
     double arcActivity = 0.0;
     for (size_t firstNearby = 0; firstNearby < nearbyCandidateCount; ++firstNearby) {
@@ -446,6 +1055,18 @@ GeologySample MacroGenerationSampler::sampleGeology(double x, double z) const {
                                      ? 0.5 + crustInterior * 0.5
                                      : 0.5 - crustInterior * 0.5;
 
+    if (secondaryRockDistanceSquared < std::numeric_limits<double>::max()) {
+        result.lithology.secondary = secondaryRock;
+        result.lithology.contactDistance = std::max(
+            0.0,
+            (std::sqrt(secondaryRockDistanceSquared) - std::sqrt(nearestDistanceSquared)) * 0.5);
+        result.lithology.transition =
+            0.5 * (1.0 - smoothstep(0.0, 620.0, result.lithology.contactDistance));
+        const double rank = multiscaleDitherThreshold(
+            random_, stream::PLATE_ROCK ^ 0x4C4954484F4C4F47ULL, floorToInt64(x), floorToInt64(z));
+        if (rank < result.lithology.transition) result.rock = secondaryRock;
+    }
+
     result.boundary = PlateBoundary::NONE;
     double dominantBoundaryStrength = 0.0;
     const auto retainDominantBoundary = [&](PlateBoundary boundary, double strength) {
@@ -476,7 +1097,15 @@ GeologySample MacroGenerationSampler::sampleGeology(double x, double z) const {
     }
 
     result.volcanicActivity = clamp01(std::max(result.hotspotInfluence, arcActivity));
-    if (result.volcanicActivity > 0.52) result.rock = RockType::VOLCANIC;
+    if (result.volcanicActivity > 0.52) {
+        result.rock = RockType::VOLCANIC;
+        result.lithology.primary = RockType::VOLCANIC;
+        result.lithology.secondary = RockType::VOLCANIC;
+        result.lithology.transition = 0.0;
+    }
+    result.erosionResistance =
+        std::lerp(result.erosionResistance, rockErosionResistance(RockType::VOLCANIC),
+                  smoothstep(0.52, 0.78, result.volcanicActivity));
     return result;
 }
 
@@ -491,7 +1120,31 @@ double MacroGenerationSampler::preliminaryElevation(double x, double z) const {
         tectonicSignal > 0.0 ? clamp01(reliefNoise_.ridged2D(x / 2800.0, z / 2800.0, 3)) : ridge;
     const double foldedPeak = smoothstep(0.38, 0.86, broadRidge);
 
-    const double oceanicBase = 47.0 + continentalness * 15.0;
+    // Continental fraction is reconstructed continuously across the warped
+    // plate contacts. Deriving the shelf and abyss from that field avoids a
+    // sea-floor step when the diagnostic nearest-plate crust ID changes.
+    const double oceanInterior = 1.0 - smoothstep(0.10, 0.58, geology.continentalFraction);
+    const double shelfProgress = smoothstep(0.05, 0.30, oceanInterior);
+    const double abyssProgress = smoothstep(0.22, 0.82, oceanInterior);
+    // Plate-site age remains useful as a diagnostic, but nearest-site age is
+    // categorical and would step the sea floor at Voronoi contacts. A smooth
+    // spreading-age field makes young divergent crust shallow and lets older
+    // oceanic crust subside continuously across plate ownership boundaries.
+    const double broadSpreadingAge =
+        clamp01(0.50 + rotatedSimplex(reliefNoise_, x, z, 14'000.0, 3, 2.173) * 0.36);
+    const double ridgeYouth = smoothstep(0.04, 0.72, geology.rift);
+    const double spreadingAge =
+        clamp01(std::lerp(broadSpreadingAge, 0.03, ridgeYouth) + geology.uplift * 0.12);
+    const double thermalSubsidence =
+        shelfProgress * 25.0 + abyssProgress * (80.0 + spreadingAge * 40.0);
+    const double abyssalUndulation =
+        rotatedSimplex(reliefNoise_, x, z, 3100.0, 2, 0.947) * (2.0 + abyssProgress * 6.0);
+    // The continuous shelf rolls through a continental slope into ordinary
+    // abyssal floors around Y=-55 through Y=-85. Young divergent crust rises
+    // above that floor, old crust subsides, and the existing subduction and
+    // hotspot terms add trenches, ridges, and rooted seamount chains.
+    const double oceanicBase = 49.0 + continentalness * (6.0 - abyssProgress * 3.0) -
+                               thermalSubsidence + abyssalUndulation;
     const double continentalBase = 73.0 + continentalness * 24.0;
     const double base = oceanicBase + (continentalBase - oceanicBase) * geology.continentalFraction;
     const double continentalWeight = clamp01(geology.continentalFraction);
@@ -513,6 +1166,27 @@ double MacroGenerationSampler::preliminaryElevation(double x, double z) const {
     double elevation = base + detail * 10.0 + ridge * 7.0 + upliftRelief - subductionTrench +
                        divergentRelief + faultRelief + volcanicRelief + boundaryFolds;
 
+    const AlpineTectonicSample alpine = alpineMorphology_.sampleTectonic({
+        .x = x,
+        .z = z,
+        .uplift = geology.uplift,
+        .rockResistance = lithologyErosionResistance(geology),
+        .continentalFraction = geology.continentalFraction,
+    });
+    // Hydrology sees the broad ridge and horn network. Finer glacial and
+    // crest detail is added only after routing, so it cannot move divides,
+    // lake ownership, channels, or shoreline elevations between footprints.
+    // Vertical exaggeration gives resistant convergent ranges a fantastical
+    // silhouette while the cap and smooth world-height compression preserve
+    // headroom and avoid flat clipping at the upper generation bound.
+    elevation += std::min(72.0, alpine.elevationOffset * 2.6);
+
+    if (oceanInterior > 0.58 && geology.hotspotInfluence < 0.24 && geology.uplift < 0.42) {
+        // Ordinary ridges and abyssal roughness remain submarine. Hotspots
+        // and sufficiently strong subduction arcs may still found islands.
+        elevation = std::min(elevation, SEA_LEVEL - 4.0 - oceanInterior * 6.0);
+    }
+
     // Unit slope at both knees keeps the bounded mapping smooth. The upper
     // asymptote preserves headroom for emitted volcanoes without flattening
     // ordinary mountain crests into a visible plateau.
@@ -521,11 +1195,52 @@ double MacroGenerationSampler::preliminaryElevation(double x, double z) const {
     return std::clamp(elevation, -112.0, 480.0);
 }
 
+double MacroGenerationSampler::reliefDetail(double x, double z, SurfaceFootprint footprint) const {
+    constexpr std::array<double, 4> WAVELENGTHS = {64.0, 32.0, 16.0, 8.0};
+    constexpr std::array<double, 4> AMPLITUDES = {2.20, 1.15, 1.10, 2.80};
+    constexpr std::array<double, 4> ROTATIONS = {0.381, 1.073, 1.917, 2.548};
+    const double support = static_cast<double>(surfaceFootprintWidth(footprint));
+    double result = 0.0;
+    for (size_t index = 0; index < WAVELENGTHS.size(); ++index) {
+        // The transition band avoids a topology pop when a tile refines from
+        // one supported footprint to the next.
+        const double retained = smoothstep(support, support * 2.0, WAVELENGTHS[index]);
+        if (retained <= 0.0) continue;
+        result += rotatedSimplex(reliefNoise_, x, z, WAVELENGTHS[index], 1, ROTATIONS[index]) *
+                  AMPLITUDES[index] * retained;
+    }
+    return result;
+}
+
 double MacroGenerationSampler::provisionalRainfall(double x, double z, double elevation) const {
-    double pressure = counterValueNoise(random_, stream::PRESSURE_NOISE, x, z, 5400.0, 3);
+    const double pressure = rotatedSimplex(pressureNoise_, x, z, 5400.0, 3, 0.7137243789);
     double maritime = 1.0 - smoothstep(SEA_LEVEL - 4.0, SEA_LEVEL + 80.0, elevation);
     double uplift = clamp01((elevation - SEA_LEVEL) / 180.0);
     return std::clamp(520.0 + pressure * 330.0 + maritime * 760.0 + uplift * 210.0, 80.0, 2400.0);
+}
+
+double MacroGenerationSampler::provisionalPotentialEvapotranspiration(double x, double z,
+                                                                      double elevation) const {
+    constexpr double PRESSURE_DELTA = 160.0;
+    const auto pressureAt = [this](double sampleX, double sampleZ) {
+        return rotatedSimplex(pressureNoise_, sampleX, sampleZ, 6200.0, 3, 0.7137243789);
+    };
+    const double pressureX =
+        (pressureAt(x + PRESSURE_DELTA, z) - pressureAt(x - PRESSURE_DELTA, z)) /
+        (2.0 * PRESSURE_DELTA);
+    const double pressureZ =
+        (pressureAt(x, z + PRESSURE_DELTA) - pressureAt(x, z - PRESSURE_DELTA)) /
+        (2.0 * PRESSURE_DELTA);
+    const double windSpeed = 0.45 + clamp01(std::hypot(pressureX, pressureZ) * 1800.0) * 0.55;
+    const double insolation = rotatedSimplex(insolationNoise_, x, z, 8800.0, 4, 1.3211187536);
+    const double temperature =
+        15.0 + insolation * 26.0 - std::max(0.0, elevation - SEA_LEVEL) * 8.0 * 0.0065;
+    return std::clamp(300.0 + std::max(-8.0, temperature) * 31.0 + windSpeed * 170.0, 120.0,
+                      1800.0);
+}
+
+double MacroGenerationSampler::sampleProvisionalRainfall(double x, double z) const {
+    return provisionalRainfall(x, z, preliminaryElevation(x, z));
 }
 
 MacroGenerationSampler::DrainageNode MacroGenerationSampler::drainageNode(int64_t cellX,
@@ -573,51 +1288,130 @@ HydrologySample MacroGenerationSampler::sampleHydrology(double x, double z) cons
             return provisionalRainfall(sampleX, sampleZ, elevation);
         },
         [this](double sampleX, double sampleZ) {
-            switch (sampleGeology(sampleX, sampleZ).rock) {
-                case RockType::GRANITE:
-                    return 0.92;
-                case RockType::BASALT:
-                    return 1.12;
-                case RockType::LIMESTONE:
-                    return 0.56;
-                case RockType::SANDSTONE:
-                    return 0.42;
-                case RockType::VOLCANIC:
-                    return 1.20;
-            }
-            return 0.90;
+            return lithologyErosionResistance(sampleGeology(sampleX, sampleZ));
+        },
+        [this](double sampleX, double sampleZ, double elevation) {
+            return provisionalPotentialEvapotranspiration(sampleX, sampleZ, elevation);
         });
     if (!basin.valid) return sampleHydrologyFallback(x, z);
+    return hydrologyFromBasin(basin);
+}
 
+void MacroGenerationSampler::sampleHydrologyGrid(int64_t originX, int64_t originZ, int spacingX,
+                                                 int spacingZ, int sampleWidth, int sampleHeight,
+                                                 std::span<HydrologySample> output) const {
+    std::vector<BasinSample> basins(output.size());
+    basinSolver_.sampleGrid(
+        originX, originZ, spacingX, spacingZ, sampleWidth, sampleHeight,
+        [this](double sampleX, double sampleZ) { return preliminaryElevation(sampleX, sampleZ); },
+        [this](double sampleX, double sampleZ, double elevation) {
+            return provisionalRainfall(sampleX, sampleZ, elevation);
+        },
+        [this](double sampleX, double sampleZ) {
+            return lithologyErosionResistance(sampleGeology(sampleX, sampleZ));
+        },
+        basins,
+        [this](double sampleX, double sampleZ, double elevation) {
+            return provisionalPotentialEvapotranspiration(sampleX, sampleZ, elevation);
+        });
+    for (size_t index = 0; index < output.size(); ++index) {
+        if (basins[index].valid) {
+            output[index] = hydrologyFromBasin(basins[index]);
+            continue;
+        }
+        const int sampleX = static_cast<int>(index % static_cast<size_t>(sampleWidth));
+        const int sampleZ = static_cast<int>(index / static_cast<size_t>(sampleWidth));
+        output[index] = sampleHydrologyFallback(
+            static_cast<double>(originX + static_cast<int64_t>(sampleX) * spacingX),
+            static_cast<double>(originZ + static_cast<int64_t>(sampleZ) * spacingZ));
+    }
+}
+
+void MacroGenerationSampler::sampleHydrologyPoints(std::span<const ColumnPos> positions,
+                                                   std::span<HydrologySample> output) const {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("invalid hydrology sample points");
+    }
+    std::vector<BasinSamplePosition> basinPositions;
+    basinPositions.reserve(positions.size());
+    for (const ColumnPos position : positions)
+        basinPositions.push_back(
+            {static_cast<double>(position.x), static_cast<double>(position.z)});
+    std::vector<BasinSample> basins(output.size());
+    basinSolver_.samplePoints(
+        basinPositions,
+        [this](double sampleX, double sampleZ) { return preliminaryElevation(sampleX, sampleZ); },
+        [this](double sampleX, double sampleZ, double elevation) {
+            return provisionalRainfall(sampleX, sampleZ, elevation);
+        },
+        [this](double sampleX, double sampleZ) {
+            return lithologyErosionResistance(sampleGeology(sampleX, sampleZ));
+        },
+        basins,
+        [this](double sampleX, double sampleZ, double elevation) {
+            return provisionalPotentialEvapotranspiration(sampleX, sampleZ, elevation);
+        });
+    for (size_t index = 0; index < output.size(); ++index) {
+        if (basins[index].valid) {
+            output[index] = hydrologyFromBasin(basins[index]);
+            continue;
+        }
+        output[index] = sampleHydrologyFallback(static_cast<double>(positions[index].x),
+                                                static_cast<double>(positions[index].z));
+    }
+}
+
+void MacroGenerationSampler::sampleSurfacePoints(std::span<const ColumnPos> positions,
+                                                 SurfaceFootprint footprint,
+                                                 std::span<SurfaceSample> output) const {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("invalid surface sample points");
+    }
+    if (positions.empty()) return;
+
+    std::vector<HydrologySample> hydrology(positions.size());
+    sampleHydrologyPoints(positions, hydrology);
+
+    std::unordered_map<ColumnPos, std::shared_ptr<const MacroControlTile>> retainedControlTiles;
+    std::unordered_map<ColumnPos, std::shared_ptr<const FarClimateControlTile>>
+        retainedFarClimateTiles;
+    retainedControlTiles.reserve(std::min(positions.size(), MACRO_CONTROL_CACHE_CAPACITY));
+    retainedFarClimateTiles.reserve(std::min(positions.size(), FAR_CLIMATE_CONTROL_CACHE_CAPACITY));
+
+    for (size_t index = 0; index < positions.size(); ++index) {
+        const ColumnPos position = positions[index];
+        if (surfaceFootprintWidth(footprint) >= 2) {
+            const ColumnPos key{
+                world_coord::floorDiv(position.x,
+                                      static_cast<int64_t>(FAR_CLIMATE_CONTROL_TILE_EDGE)),
+                world_coord::floorDiv(position.z,
+                                      static_cast<int64_t>(FAR_CLIMATE_CONTROL_TILE_EDGE)),
+            };
+            auto [tile, inserted] = retainedFarClimateTiles.try_emplace(key);
+            if (inserted) tile->second = farClimateControlTile(key.x, key.z);
+            output[index] = sampleSurfaceFromFarClimateControlTile(
+                *tile->second, static_cast<double>(position.x), static_cast<double>(position.z),
+                footprint, &hydrology[index]);
+            continue;
+        }
+
+        const ColumnPos key{
+            world_coord::floorDiv(position.x, static_cast<int64_t>(MACRO_CONTROL_TILE_EDGE)),
+            world_coord::floorDiv(position.z, static_cast<int64_t>(MACRO_CONTROL_TILE_EDGE)),
+        };
+        auto [tile, inserted] = retainedControlTiles.try_emplace(key);
+        if (inserted) tile->second = controlTile(key.x, key.z);
+        output[index] = sampleSurfaceFromControlTile(*tile->second, static_cast<double>(position.x),
+                                                     static_cast<double>(position.z), footprint,
+                                                     &hydrology[index]);
+    }
+}
+
+HydrologySample MacroGenerationSampler::sampleClimateHydrology(double x, double z) const {
     HydrologySample result;
-    result.flowDirection = {basin.flowX, basin.flowZ};
-    result.surfaceElevation = basin.surfaceElevation;
-    result.waterSurface = basin.waterSurface;
-    result.discharge = basin.discharge;
-    result.sediment = basin.sediment;
-    result.channelDistance = basin.channelDistance;
-    result.channelWidth = basin.channelWidth;
-    result.channelDepth = basin.channelDepth;
-    result.channelGradient = basin.channelGradient;
-    result.erosionDepth = basin.erosionDepth;
-    result.lakeDepth = basin.lakeDepth;
-    result.lakeShoreDistance = basin.lakeShoreDistance;
-    result.shoreWaterSurface = basin.shoreWaterSurface;
-    result.lakeBankTarget = basin.lakeBankTarget;
-    result.lakeBankInfluence = basin.lakeBankInfluence;
-    result.waterfallTop = basin.waterfallTop;
-    result.waterfallBottom = basin.waterfallBottom;
-    result.waterfallWidth = basin.waterfallWidth;
-    result.streamOrder = basin.streamOrder;
-    result.distributaryCount = basin.distributaryCount;
-    result.ocean = basin.ocean;
-    result.river = basin.river;
-    result.lake = basin.lake;
-    result.lakeBank = basin.lakeBank;
-    result.endorheic = basin.endorheic;
-    result.waterfall = basin.waterfall;
-    result.waterfallAnchor = basin.waterfallAnchor;
-    result.delta = basin.delta;
+    result.surfaceElevation = preliminaryElevation(x, z);
+    result.waterSurface = SEA_LEVEL;
+    result.ocean = result.surfaceElevation < SEA_LEVEL;
     return result;
 }
 
@@ -775,16 +1569,23 @@ HydrologySample MacroGenerationSampler::sampleHydrologyFallback(double x, double
 
 ClimateFields MacroGenerationSampler::sampleClimate(double x, double z,
                                                     double terrainHeight) const {
+    return sampleClimateWithHydrology(x, z, terrainHeight, true);
+}
+
+ClimateFields
+MacroGenerationSampler::sampleClimateWithHydrology(double x, double z, double terrainHeight,
+                                                   bool canonicalHydrology,
+                                                   const HydrologySample* localHydrology) const {
     ClimateFields result;
     constexpr double PRESSURE_DELTA = 96.0;
-    double pressureEast =
-        counterValueNoise(random_, stream::PRESSURE_NOISE, x + PRESSURE_DELTA, z, 6200.0, 3);
-    double pressureWest =
-        counterValueNoise(random_, stream::PRESSURE_NOISE, x - PRESSURE_DELTA, z, 6200.0, 3);
-    double pressureNorth =
-        counterValueNoise(random_, stream::PRESSURE_NOISE, x, z + PRESSURE_DELTA, 6200.0, 3);
-    double pressureSouth =
-        counterValueNoise(random_, stream::PRESSURE_NOISE, x, z - PRESSURE_DELTA, 6200.0, 3);
+    constexpr double PRESSURE_ROTATION = 0.7137243789;
+    const auto pressureAt = [this](double sampleX, double sampleZ) {
+        return rotatedSimplex(pressureNoise_, sampleX, sampleZ, 6200.0, 3, PRESSURE_ROTATION);
+    };
+    const double pressureEast = pressureAt(x + PRESSURE_DELTA, z);
+    const double pressureWest = pressureAt(x - PRESSURE_DELTA, z);
+    const double pressureNorth = pressureAt(x, z + PRESSURE_DELTA);
+    const double pressureSouth = pressureAt(x, z - PRESSURE_DELTA);
     Vector2d gradient = {(pressureEast - pressureWest) / (2.0 * PRESSURE_DELTA),
                          (pressureNorth - pressureSouth) / (2.0 * PRESSURE_DELTA)};
     Vector2d rotational = {-gradient.z, gradient.x};
@@ -800,7 +1601,11 @@ ClimateFields MacroGenerationSampler::sampleClimate(double x, double z,
         double distance = static_cast<double>(MOISTURE_STEPS - i) * MOISTURE_STEP_DISTANCE;
         double sampleX = x - windDirection.x * distance;
         double sampleZ = z - windDirection.z * distance;
-        const HydrologySample hydrology = sampleHydrology(sampleX, sampleZ);
+        const HydrologySample hydrology = canonicalHydrology
+                                              ? sampleHydrology(sampleX, sampleZ)
+                                              : (i == MOISTURE_STEPS && localHydrology != nullptr
+                                                     ? *localHydrology
+                                                     : sampleClimateHydrology(sampleX, sampleZ));
         elevations[static_cast<size_t>(i)] = hydrology.surfaceElevation;
         const double recharge = climateWaterInfluence(hydrology);
         waterRecharge[static_cast<size_t>(i)] = recharge;
@@ -822,12 +1627,12 @@ ClimateFields MacroGenerationSampler::sampleClimate(double x, double z,
         moisture *= std::max(0.72, 1.0 - descent * 0.0025);
     }
 
-    double localPressure = counterValueNoise(random_, stream::PRESSURE_NOISE, x, z, 6200.0, 3);
+    const double localPressure = pressureAt(x, z);
     result.annualPrecipitationMm =
         std::clamp(90.0 + precipitation * 3900.0 + (localPressure + 1.0) * 130.0, 60.0, 3600.0);
     result.relativeHumidity = clamp01(moisture + result.annualPrecipitationMm / 5200.0);
 
-    double insolation = counterValueNoise(random_, stream::INSOLATION_NOISE, x, z, 8800.0, 4);
+    const double insolation = rotatedSimplex(insolationNoise_, x, z, 8800.0, 4, 1.3211187536);
     double maritime = static_cast<double>(waterSteps) / (MOISTURE_STEPS + 1.0);
     double continentalTemperature = 15.0 + insolation * 26.0;
     double moderatedTemperature =
@@ -848,6 +1653,98 @@ double MacroGenerationSampler::terrainSlope(double x, double z) const {
     double north = sampleHydrology(x, z + DELTA).surfaceElevation;
     double south = sampleHydrology(x, z - DELTA).surfaceElevation;
     return std::hypot((east - west) / (2.0 * DELTA), (north - south) / (2.0 * DELTA));
+}
+
+double MacroGenerationSampler::alpineSurfaceDetail(double x, double z, SurfaceFootprint footprint,
+                                                   const GeologySample& geology,
+                                                   const HydrologySample& hydrology,
+                                                   const ClimateFields& climate) const {
+    if (hydrology.ocean || hydrology.lake || hydrology.river || hydrology.waterfall ||
+        hydrology.channelBank || hydrology.lakeBank || !std::isfinite(hydrology.surfaceElevation) ||
+        hydrology.waterSurface > hydrology.surfaceElevation + 0.01) {
+        return 0.0;
+    }
+
+    AlpineSurfaceContext context;
+    context.x = x;
+    context.z = z;
+    context.uplift = geology.uplift;
+    context.rockResistance = lithologyErosionResistance(geology);
+    context.continentalFraction = geology.continentalFraction;
+    context.terrainHeight = hydrology.surfaceElevation;
+    context.temperatureC = climate.temperatureC;
+    context.annualPrecipitationMm = climate.annualPrecipitationMm;
+    context.flowX = hydrology.flowDirection.x;
+    context.flowZ = hydrology.flowDirection.z;
+    context.channelDistance = hydrology.channelDistance;
+    context.channelWidth = hydrology.channelWidth;
+    context.channelGradient = hydrology.channelGradient;
+    context.discharge = hydrology.discharge;
+    context.erosionDepth = hydrology.erosionDepth;
+    context.footprintWidth = surfaceFootprintWidth(footprint);
+
+    const AlpineTectonicSample tectonic = alpineMorphology_.sampleTectonic(context);
+    const AlpineMorphologySample morphology = alpineMorphology_.sampleSurface(context, tectonic);
+    const double support = static_cast<double>(surfaceFootprintWidth(footprint));
+    const auto retained = [support](double wavelength) {
+        return smoothstep(support, support * 2.0, wavelength);
+    };
+
+    // Cirques and glacial valleys are broad enough to remain recognizable in
+    // coarse voxel tiers. Talus and crest corrugation taper sooner. The same
+    // analytical feature ownership is retained at every footprint.
+    const double valleyWavelength = std::clamp(96.0 + hydrology.channelWidth * 4.0, 96.0, 256.0);
+    const double hornAccent =
+        tectonic.hornStrength * morphology.glacialInfluence * 9.0 * retained(256.0);
+    const double morphologyDetail = morphology.ridgeDetail + hornAccent +
+                                    morphology.talusDeposit * retained(64.0) -
+                                    morphology.valleyCarve * retained(valleyWavelength) -
+                                    morphology.cirqueCarve * retained(160.0);
+
+    // Drainage is intentionally solved on a filtered 16-block routing
+    // surface. Narrow resistant summits can fall between those samples, so
+    // reconstruct the positive difference between the exact pre-erosion
+    // relief and the routed pre-erosion surface on dry alpine divides. The
+    // recorded erosion depth remains subtracted, which preserves incision,
+    // while the channel-clearance gate keeps the correction out of valleys.
+    const double routedPreErosion =
+        hydrology.surfaceElevation + std::max(0.0, hydrology.erosionDepth);
+    const double alpineGate = smoothstep(0.72, 0.94, geology.uplift) *
+                              smoothstep(0.55, 0.86, geology.continentalFraction) *
+                              smoothstep(150.0, 260.0, routedPreErosion);
+    const double channelClearance = hydrology.channelDistance - hydrology.channelWidth * 2.5;
+    const double channelDivideGate = smoothstep(12.0, 64.0, channelClearance);
+    const double shorelineClearance =
+        hydrology.shoreWaterSurface > 0.0 ? std::max(0.0, -hydrology.lakeShoreDistance) : 64.0;
+    const double shorelineDivideGate = smoothstep(12.0, 64.0, shorelineClearance);
+    double restoredRelief = 0.0;
+    if (alpineGate > 1.0e-6 && channelDivideGate > 1.0e-6 && shorelineDivideGate > 1.0e-6) {
+        const double preliminary = preliminaryElevation(x, z);
+        const double filteredReliefResidual = std::clamp(preliminary - routedPreErosion, 0.0, 64.0);
+        restoredRelief =
+            filteredReliefResidual * alpineGate * channelDivideGate * shorelineDivideGate;
+    }
+
+    return std::clamp(morphologyDetail + restoredRelief, -42.0, 72.0);
+}
+
+void MacroGenerationSampler::applyAlpineSurfaceDetail(double x, double z,
+                                                      SurfaceFootprint footprint,
+                                                      SurfaceSample& surface) const {
+    const double detail =
+        alpineSurfaceDetail(x, z, footprint, surface.geology, surface.hydrology, surface.climate);
+    if (std::abs(detail) <= 1.0e-12) return;
+
+    const double previousHeight = surface.terrainHeight;
+    surface.terrainHeight = std::clamp(previousHeight + detail, -112.0, 480.0);
+    surface.hydrology.surfaceElevation = surface.terrainHeight;
+    const double appliedDetail = surface.terrainHeight - previousHeight;
+    const double lapseDelta = appliedDetail * 8.0 * 0.0065;
+    surface.climate.temperatureC -= lapseDelta;
+    surface.climate.potentialEvapotranspirationMm = std::clamp(
+        surface.climate.potentialEvapotranspirationMm - lapseDelta * 31.0, 120.0, 1800.0);
+    surface.climate.aridity = surface.climate.potentialEvapotranspirationMm /
+                              std::max(1.0, surface.climate.annualPrecipitationMm);
 }
 
 SoilSample MacroGenerationSampler::sampleSoil(double x, double z, const GeologySample& geology,
@@ -1055,7 +1952,10 @@ double MacroGenerationSampler::ecotopeInfluence(const SurfaceSample& surface, Ec
             return bell(surface.terrainHeight, 214.0, 72.0) *
                    bell(surface.climate.temperatureC, 1.0, 17.0);
         case Ecotope::ALPINE_ZONE:
-            return bell(surface.terrainHeight, 278.0, 92.0) *
+            // Alpine exposure begins above the subalpine transition and
+            // persists onto summits. A bell centered at 278 incorrectly
+            // removed the alpine ecotope from the highest snow peaks.
+            return smoothstep(190.0, 300.0, surface.terrainHeight) *
                    bell(surface.climate.temperatureC, -5.0, 18.0);
         case Ecotope::SNOWFIELD:
             return smoothstep(118.0, 270.0, surface.terrainHeight) *
@@ -1112,14 +2012,30 @@ Ecotope MacroGenerationSampler::classifyEcotopes(const SurfaceSample& surface) {
     return result;
 }
 
-SurfaceSample MacroGenerationSampler::sampleSurface(double x, double z) const {
+SurfaceSample MacroGenerationSampler::sampleSurfaceDirect(double x, double z,
+                                                          SurfaceFootprint footprint) const {
     SurfaceSample result;
     result.geology = sampleGeology(x, z);
     result.hydrology = sampleHydrology(x, z);
     result.terrainHeight = result.hydrology.surfaceElevation;
     result.waterSurface = result.hydrology.waterSurface;
+    if (result.hydrology.ocean) {
+        result.terrainHeight = std::min(result.terrainHeight + reliefDetail(x, z, footprint) *
+                                                                   OCEAN_FLOOR_DETAIL_SCALE,
+                                        static_cast<double>(SEA_LEVEL) - 0.5);
+        result.hydrology.surfaceElevation = result.terrainHeight;
+    } else if (!result.hydrology.lake && !result.hydrology.river && !result.hydrology.channelBank &&
+               !result.hydrology.lakeBank) {
+        const double channelClearance =
+            result.hydrology.channelDistance - result.hydrology.channelWidth * 2.5;
+        const double dryInfluence = smoothstep(0.0, 32.0, channelClearance);
+        result.terrainHeight +=
+            reliefDetail(x, z, footprint) * dryInfluence * dryReliefDetailScale(result.hydrology);
+        result.hydrology.surfaceElevation = result.terrainHeight;
+    }
     result.slope = terrainSlope(x, z);
     result.climate = sampleClimate(x, z, result.terrainHeight);
+    applyAlpineSurfaceDetail(x, z, footprint, result);
     result.soil = sampleSoil(x, z, result.geology, result.hydrology, result.climate);
     result.suitability = biomeSuitability(result.geology, result.hydrology, result.climate,
                                           result.soil, result.terrainHeight, result.slope);
@@ -1127,6 +2043,582 @@ SurfaceSample MacroGenerationSampler::sampleSurface(double x, double z) const {
 
     result.ecotopes = classifyEcotopes(result);
     return result;
+}
+
+std::shared_ptr<const MacroGenerationSampler::MacroControlTile>
+MacroGenerationSampler::controlTile(int64_t tileX, int64_t tileZ) const {
+    const ColumnPos key{tileX, tileZ};
+    return macroControlCache_->getOrCreate(key, [this, key] {
+        auto tile = std::make_shared<MacroControlTile>();
+        tile->key = key;
+        tile->climateDetailNoise = climateDetailNoise_;
+        const int64_t originX = key.x * MACRO_CONTROL_TILE_EDGE;
+        const int64_t originZ = key.z * MACRO_CONTROL_TILE_EDGE;
+
+        // One exact control needs its own hydrology, four slope neighbors, and
+        // the complete canonical upwind moisture path. Retaining those points
+        // in one basin batch preserves the scalar BLOCK_1 result without
+        // repeating cache traversal thousands of times while nearby tree
+        // anchors and column plans warm the same immutable control tile.
+        constexpr size_t SLOPE_EAST = 1;
+        constexpr size_t SLOPE_WEST = 2;
+        constexpr size_t SLOPE_NORTH = 3;
+        constexpr size_t SLOPE_SOUTH = 4;
+        constexpr size_t MOISTURE_BEGIN = 5;
+        constexpr size_t DEPENDENCIES_PER_CONTROL = MOISTURE_BEGIN + MOISTURE_STEPS + 1;
+        std::vector<BasinSamplePosition> dependencyPositions(MACRO_CONTROL_SAMPLE_COUNT *
+                                                             DEPENDENCIES_PER_CONTROL);
+        std::array<Vector2d, MACRO_CONTROL_SAMPLE_COUNT> windDirections{};
+        std::array<double, MACRO_CONTROL_SAMPLE_COUNT> windSpeeds{};
+        const auto dependencyIndex = [](size_t controlIndex, size_t dependency) {
+            return controlIndex * DEPENDENCIES_PER_CONTROL + dependency;
+        };
+        constexpr double PRESSURE_DELTA = 96.0;
+        constexpr double PRESSURE_ROTATION = 0.7137243789;
+        const auto pressureAt = [this](double x, double z) {
+            return rotatedSimplex(pressureNoise_, x, z, 6200.0, 3, PRESSURE_ROTATION);
+        };
+
+        for (int controlZ = 0; controlZ < MACRO_CONTROL_GRID_EDGE; ++controlZ) {
+            for (int controlX = 0; controlX < MACRO_CONTROL_GRID_EDGE; ++controlX) {
+                const int64_t worldX =
+                    originX + static_cast<int64_t>(controlX - 1) * MACRO_CONTROL_SPACING;
+                const int64_t worldZ =
+                    originZ + static_cast<int64_t>(controlZ - 1) * MACRO_CONTROL_SPACING;
+                const size_t controlIndex =
+                    static_cast<size_t>(controlZ * MACRO_CONTROL_GRID_EDGE + controlX);
+                const double x = static_cast<double>(worldX);
+                const double z = static_cast<double>(worldZ);
+                const double pressureEast = pressureAt(x + PRESSURE_DELTA, z);
+                const double pressureWest = pressureAt(x - PRESSURE_DELTA, z);
+                const double pressureNorth = pressureAt(x, z + PRESSURE_DELTA);
+                const double pressureSouth = pressureAt(x, z - PRESSURE_DELTA);
+                const Vector2d gradient = {
+                    (pressureEast - pressureWest) / (2.0 * PRESSURE_DELTA),
+                    (pressureNorth - pressureSouth) / (2.0 * PRESSURE_DELTA),
+                };
+                const Vector2d rotational = {-gradient.z, gradient.x};
+                const Vector2d windDirection =
+                    normalized({-gradient.x + rotational.x * 0.62 + 0.00008,
+                                -gradient.z + rotational.z * 0.62 + 0.00003});
+                windDirections[controlIndex] = windDirection;
+                windSpeeds[controlIndex] = 0.45 + clamp01(length(gradient) * 1800.0) * 0.55;
+
+                dependencyPositions[dependencyIndex(controlIndex, 0)] = {x, z};
+                dependencyPositions[dependencyIndex(controlIndex, SLOPE_EAST)] = {x + 16.0, z};
+                dependencyPositions[dependencyIndex(controlIndex, SLOPE_WEST)] = {x - 16.0, z};
+                dependencyPositions[dependencyIndex(controlIndex, SLOPE_NORTH)] = {x, z + 16.0};
+                dependencyPositions[dependencyIndex(controlIndex, SLOPE_SOUTH)] = {x, z - 16.0};
+                for (int step = 0; step <= MOISTURE_STEPS; ++step) {
+                    const double distance =
+                        static_cast<double>(MOISTURE_STEPS - step) * MOISTURE_STEP_DISTANCE;
+                    dependencyPositions[dependencyIndex(
+                        controlIndex, MOISTURE_BEGIN + static_cast<size_t>(step))] = {
+                        x - windDirection.x * distance,
+                        z - windDirection.z * distance,
+                    };
+                }
+            }
+        }
+
+        std::vector<BasinSample> basinDependencies(dependencyPositions.size());
+        basinSolver_.samplePoints(
+            dependencyPositions, [this](double x, double z) { return preliminaryElevation(x, z); },
+            [this](double x, double z, double elevation) {
+                return provisionalRainfall(x, z, elevation);
+            },
+            [this](double x, double z) { return lithologyErosionResistance(sampleGeology(x, z)); },
+            basinDependencies,
+            [this](double x, double z, double elevation) {
+                return provisionalPotentialEvapotranspiration(x, z, elevation);
+            });
+        std::vector<HydrologySample> hydrologyDependencies(dependencyPositions.size());
+        for (size_t index = 0; index < dependencyPositions.size(); ++index) {
+            hydrologyDependencies[index] =
+                basinDependencies[index].valid
+                    ? hydrologyFromBasin(basinDependencies[index])
+                    : sampleHydrologyFallback(dependencyPositions[index].x,
+                                              dependencyPositions[index].z);
+        }
+
+        for (int controlZ = 0; controlZ < MACRO_CONTROL_GRID_EDGE; ++controlZ) {
+            for (int controlX = 0; controlX < MACRO_CONTROL_GRID_EDGE; ++controlX) {
+                const int64_t worldX =
+                    originX + static_cast<int64_t>(controlX - 1) * MACRO_CONTROL_SPACING;
+                const int64_t worldZ =
+                    originZ + static_cast<int64_t>(controlZ - 1) * MACRO_CONTROL_SPACING;
+                const size_t controlIndex =
+                    static_cast<size_t>(controlZ * MACRO_CONTROL_GRID_EDGE + controlX);
+                const double x = static_cast<double>(worldX);
+                const double z = static_cast<double>(worldZ);
+                SurfaceSample& result = tile->controls[controlIndex];
+                result.geology = sampleGeology(x, z);
+                result.hydrology = hydrologyDependencies[dependencyIndex(controlIndex, 0)];
+                result.terrainHeight = result.hydrology.surfaceElevation;
+                result.waterSurface = result.hydrology.waterSurface;
+                if (result.hydrology.ocean) {
+                    result.terrainHeight = std::min(
+                        result.terrainHeight + reliefDetail(x, z, SurfaceFootprint::BLOCK_1) *
+                                                   OCEAN_FLOOR_DETAIL_SCALE,
+                        static_cast<double>(SEA_LEVEL) - 0.5);
+                    result.hydrology.surfaceElevation = result.terrainHeight;
+                } else if (!result.hydrology.lake && !result.hydrology.river &&
+                           !result.hydrology.channelBank && !result.hydrology.lakeBank) {
+                    const double channelClearance =
+                        result.hydrology.channelDistance - result.hydrology.channelWidth * 2.5;
+                    const double dryInfluence = smoothstep(0.0, 32.0, channelClearance);
+                    result.terrainHeight += reliefDetail(x, z, SurfaceFootprint::BLOCK_1) *
+                                            dryInfluence * dryReliefDetailScale(result.hydrology);
+                    result.hydrology.surfaceElevation = result.terrainHeight;
+                }
+
+                const double east = hydrologyDependencies[dependencyIndex(controlIndex, SLOPE_EAST)]
+                                        .surfaceElevation;
+                const double west = hydrologyDependencies[dependencyIndex(controlIndex, SLOPE_WEST)]
+                                        .surfaceElevation;
+                const double north =
+                    hydrologyDependencies[dependencyIndex(controlIndex, SLOPE_NORTH)]
+                        .surfaceElevation;
+                const double south =
+                    hydrologyDependencies[dependencyIndex(controlIndex, SLOPE_SOUTH)]
+                        .surfaceElevation;
+                result.slope = std::hypot((east - west) / 32.0, (north - south) / 32.0);
+
+                const Vector2d windDirection = windDirections[controlIndex];
+                const double windSpeed = windSpeeds[controlIndex];
+                result.climate.wind = {windDirection.x * windSpeed, windDirection.z * windSpeed};
+                std::array<double, MOISTURE_STEPS + 1> elevations{};
+                std::array<double, MOISTURE_STEPS + 1> waterRecharge{};
+                double waterSteps = 0.0;
+                for (int step = 0; step <= MOISTURE_STEPS; ++step) {
+                    const HydrologySample& hydrology = hydrologyDependencies[dependencyIndex(
+                        controlIndex, MOISTURE_BEGIN + static_cast<size_t>(step))];
+                    elevations[static_cast<size_t>(step)] = hydrology.surfaceElevation;
+                    const double recharge = climateWaterInfluence(hydrology);
+                    waterRecharge[static_cast<size_t>(step)] = recharge;
+                    waterSteps += recharge;
+                }
+
+                double moisture = 0.22;
+                double precipitation = 0.0;
+                for (int step = 0; step <= MOISTURE_STEPS; ++step) {
+                    const double elevation = elevations[static_cast<size_t>(step)];
+                    moisture += (1.0 - moisture) * 0.34 * waterRecharge[static_cast<size_t>(step)];
+                    const double rise =
+                        step == 0
+                            ? 0.0
+                            : std::max(0.0, elevation - elevations[static_cast<size_t>(step - 1)]);
+                    const double descent =
+                        step == 0
+                            ? 0.0
+                            : std::max(0.0, elevations[static_cast<size_t>(step - 1)] - elevation);
+                    const double stepRain = moisture * (0.010 + std::min(0.32, rise * 0.010));
+                    precipitation += stepRain;
+                    moisture = std::max(0.02, moisture - stepRain);
+                    moisture *= std::max(0.72, 1.0 - descent * 0.0025);
+                }
+
+                const double localPressure = pressureAt(x, z);
+                result.climate.annualPrecipitationMm = std::clamp(
+                    90.0 + precipitation * 3900.0 + (localPressure + 1.0) * 130.0, 60.0, 3600.0);
+                result.climate.relativeHumidity =
+                    clamp01(moisture + result.climate.annualPrecipitationMm / 5200.0);
+                const double insolation =
+                    rotatedSimplex(insolationNoise_, x, z, 8800.0, 4, 1.3211187536);
+                const double maritime = waterSteps / (MOISTURE_STEPS + 1.0);
+                const double continentalTemperature = 15.0 + insolation * 26.0;
+                const double moderatedTemperature =
+                    continentalTemperature * (1.0 - maritime * 0.42) + 13.0 * maritime * 0.42;
+                const double lapseCooling =
+                    std::max(0.0, result.terrainHeight - SEA_LEVEL) * 8.0 * 0.0065;
+                result.climate.temperatureC = moderatedTemperature - lapseCooling;
+                result.climate.potentialEvapotranspirationMm = std::clamp(
+                    300.0 + std::max(-8.0, result.climate.temperatureC) * 31.0 + windSpeed * 170.0,
+                    120.0, 1800.0);
+                result.climate.aridity = result.climate.potentialEvapotranspirationMm /
+                                         std::max(1.0, result.climate.annualPrecipitationMm);
+
+                applyAlpineSurfaceDetail(x, z, SurfaceFootprint::BLOCK_1, result);
+                result.soil = sampleSoil(x, z, result.geology, result.hydrology, result.climate);
+                result.suitability =
+                    biomeSuitability(result.geology, result.hydrology, result.climate, result.soil,
+                                     result.terrainHeight, result.slope);
+                result.biome = selectBiome(result.suitability);
+                result.ecotopes = classifyEcotopes(result);
+            }
+        }
+        return std::shared_ptr<const MacroControlTile>(std::move(tile));
+    });
+}
+
+MacroControlView MacroGenerationSampler::controlView(ColumnPos chunkColumn) const {
+    constexpr int64_t CHUNK_COLUMNS_PER_CONTROL_TILE = MACRO_CONTROL_TILE_EDGE / CHUNK_EDGE;
+    const int64_t tileX = world_coord::floorDiv(chunkColumn.x, CHUNK_COLUMNS_PER_CONTROL_TILE);
+    const int64_t tileZ = world_coord::floorDiv(chunkColumn.z, CHUNK_COLUMNS_PER_CONTROL_TILE);
+    return MacroControlView(std::make_shared<MacroControlView::Impl>(
+        MacroControlView::Impl{.tile = controlTile(tileX, tileZ)}));
+}
+
+void MacroControlView::reconstructContinuous(double x, double z, SurfaceSample& destination) const {
+    if (!impl_ || !impl_->tile) return;
+    reconstructContinuousFields(*impl_->tile, x, z, destination);
+}
+
+SurfaceSample
+MacroGenerationSampler::sampleSurfaceFromControlTile(const MacroControlTile& tile, double x,
+                                                     double z, SurfaceFootprint footprint,
+                                                     const HydrologySample* hydrology) const {
+    // Ownership and hydrologic topology remain direct coordinate queries.
+    // Continuous geology, climate, soil, suitability, and slope fields share
+    // the immutable tile reconstruction used by exact ColumnPlans.
+    SurfaceSample result;
+    result.geology = sampleGeology(x, z);
+    result.hydrology = hydrology != nullptr ? *hydrology : sampleHydrology(x, z);
+    result.terrainHeight = result.hydrology.surfaceElevation;
+    result.waterSurface = result.hydrology.waterSurface;
+    if (result.hydrology.ocean) {
+        result.terrainHeight = std::min(result.terrainHeight + reliefDetail(x, z, footprint) *
+                                                                   OCEAN_FLOOR_DETAIL_SCALE,
+                                        static_cast<double>(SEA_LEVEL) - 0.5);
+        result.hydrology.surfaceElevation = result.terrainHeight;
+    } else if (!result.hydrology.lake && !result.hydrology.river && !result.hydrology.channelBank &&
+               !result.hydrology.lakeBank) {
+        const double channelClearance =
+            result.hydrology.channelDistance - result.hydrology.channelWidth * 2.5;
+        const double dryInfluence = smoothstep(0.0, 32.0, channelClearance);
+        result.terrainHeight +=
+            reliefDetail(x, z, footprint) * dryInfluence * dryReliefDetailScale(result.hydrology);
+        result.hydrology.surfaceElevation = result.terrainHeight;
+    }
+
+    reconstructContinuousFields(tile, x, z, result);
+    applyAlpineSurfaceDetail(x, z, footprint, result);
+    result.soil = sampleSoil(x, z, result.geology, result.hydrology, result.climate);
+    result.suitability = biomeSuitability(result.geology, result.hydrology, result.climate,
+                                          result.soil, result.terrainHeight, result.slope);
+    result.biome = selectBiome(result.suitability);
+    result.ecotopes = classifyEcotopes(result);
+    return result;
+}
+
+std::shared_ptr<const MacroGenerationSampler::FarClimateControlTile>
+MacroGenerationSampler::farClimateControlTile(int64_t tileX, int64_t tileZ) const {
+    const ColumnPos key{tileX, tileZ};
+    return farClimateControlCache_->getOrCreate(key, [this, key] {
+        auto tile = std::make_shared<FarClimateControlTile>();
+        tile->key = key;
+        tile->climateDetailNoise = climateDetailNoise_;
+        const int64_t originX = key.x * FAR_CLIMATE_CONTROL_TILE_EDGE;
+        const int64_t originZ = key.z * FAR_CLIMATE_CONTROL_TILE_EDGE;
+        std::array<HydrologySample, FAR_CLIMATE_CONTROL_SAMPLE_COUNT> hydrologyControls;
+        sampleHydrologyGrid(originX - FAR_CLIMATE_CONTROL_SPACING,
+                            originZ - FAR_CLIMATE_CONTROL_SPACING, FAR_CLIMATE_CONTROL_SPACING,
+                            FAR_CLIMATE_CONTROL_SPACING, FAR_CLIMATE_CONTROL_GRID_EDGE,
+                            FAR_CLIMATE_CONTROL_GRID_EDGE, hydrologyControls);
+        for (int controlZ = 0; controlZ < FAR_CLIMATE_CONTROL_GRID_EDGE; ++controlZ) {
+            for (int controlX = 0; controlX < FAR_CLIMATE_CONTROL_GRID_EDGE; ++controlX) {
+                const int64_t worldX =
+                    originX + static_cast<int64_t>(controlX - 1) * FAR_CLIMATE_CONTROL_SPACING;
+                const int64_t worldZ =
+                    originZ + static_cast<int64_t>(controlZ - 1) * FAR_CLIMATE_CONTROL_SPACING;
+                const double sampleX = static_cast<double>(worldX);
+                const double sampleZ = static_cast<double>(worldZ);
+                const HydrologySample& hydrology = hydrologyControls[static_cast<size_t>(
+                    controlZ * FAR_CLIMATE_CONTROL_GRID_EDGE + controlX)];
+                double terrainHeight = hydrology.surfaceElevation;
+                if (hydrology.ocean) {
+                    terrainHeight = std::min(
+                        terrainHeight + reliefDetail(sampleX, sampleZ, SurfaceFootprint::BLOCK_16) *
+                                            OCEAN_FLOOR_DETAIL_SCALE,
+                        static_cast<double>(SEA_LEVEL) - 0.5);
+                } else if (!hydrology.lake && !hydrology.river && !hydrology.channelBank &&
+                           !hydrology.lakeBank) {
+                    const double channelClearance =
+                        hydrology.channelDistance - hydrology.channelWidth * 2.5;
+                    terrainHeight += reliefDetail(sampleX, sampleZ, SurfaceFootprint::BLOCK_16) *
+                                     smoothstep(0.0, 32.0, channelClearance) *
+                                     dryReliefDetailScale(hydrology);
+                }
+                FarClimateControlTile::Control& control = tile->controls[static_cast<size_t>(
+                    controlZ * FAR_CLIMATE_CONTROL_GRID_EDGE + controlX)];
+                SurfaceSample surface;
+                surface.geology = sampleGeology(sampleX, sampleZ);
+                surface.hydrology = hydrology;
+                surface.terrainHeight = terrainHeight;
+                surface.waterSurface = hydrology.waterSurface;
+                surface.climate =
+                    sampleClimateWithHydrology(sampleX, sampleZ, terrainHeight, false, &hydrology);
+                applyAlpineSurfaceDetail(sampleX, sampleZ, SurfaceFootprint::BLOCK_16, surface);
+                control.terrainHeight = surface.terrainHeight;
+                control.climate = surface.climate;
+            }
+        }
+        return std::shared_ptr<const FarClimateControlTile>(std::move(tile));
+    });
+}
+
+SurfaceSample MacroGenerationSampler::sampleSurfaceFromFarClimateControlTile(
+    const FarClimateControlTile& tile, double x, double z, SurfaceFootprint footprint,
+    const HydrologySample* hydrology) const {
+    const double originX = static_cast<double>(tile.key.x * FAR_CLIMATE_CONTROL_TILE_EDGE);
+    const double originZ = static_cast<double>(tile.key.z * FAR_CLIMATE_CONTROL_TILE_EDGE);
+    const CubicControlStencil stencil = cubicControlStencil(
+        x, z, originX, originZ, FAR_CLIMATE_CONTROL_SPACING, FAR_CLIMATE_CONTROL_CORE_EDGE);
+
+    SurfaceSample result;
+    result.geology = sampleGeology(x, z);
+    result.hydrology = hydrology != nullptr ? *hydrology : sampleHydrology(x, z);
+    result.terrainHeight = result.hydrology.surfaceElevation;
+    result.waterSurface = result.hydrology.waterSurface;
+    if (result.hydrology.ocean) {
+        result.terrainHeight = std::min(result.terrainHeight + reliefDetail(x, z, footprint) *
+                                                                   OCEAN_FLOOR_DETAIL_SCALE,
+                                        static_cast<double>(SEA_LEVEL) - 0.5);
+        result.hydrology.surfaceElevation = result.terrainHeight;
+    } else if (!result.hydrology.lake && !result.hydrology.river && !result.hydrology.channelBank &&
+               !result.hydrology.lakeBank) {
+        const double channelClearance =
+            result.hydrology.channelDistance - result.hydrology.channelWidth * 2.5;
+        const double dryInfluence = smoothstep(0.0, 32.0, channelClearance);
+        result.terrainHeight +=
+            reliefDetail(x, z, footprint) * dryInfluence * dryReliefDetailScale(result.hydrology);
+        result.hydrology.surfaceElevation = result.terrainHeight;
+    }
+
+    const Vector2d terrainGradient = stencil.gradient(
+        [&](int controlX, int controlZ) { return tile.at(controlX, controlZ).terrainHeight; });
+    result.slope = std::hypot(terrainGradient.x, terrainGradient.z);
+    reconstructClimate(
+        result, stencil,
+        [&](int controlX, int controlZ) { return tile.at(controlX, controlZ).terrainHeight; },
+        [&](int controlX, int controlZ) -> const ClimateFields& {
+            return tile.at(controlX, controlZ).climate;
+        });
+    applyAlpineSurfaceDetail(x, z, footprint, result);
+    result.soil = sampleSoil(x, z, result.geology, result.hydrology, result.climate);
+    result.suitability = biomeSuitability(result.geology, result.hydrology, result.climate,
+                                          result.soil, result.terrainHeight, result.slope);
+    result.biome = selectBiome(result.suitability);
+    result.ecotopes = classifyEcotopes(result);
+    return result;
+}
+
+SurfaceSample MacroGenerationSampler::sampleSurface(double x, double z,
+                                                    SurfaceFootprint footprint) const {
+    if (surfaceFootprintWidth(footprint) >= 2) {
+        const int64_t tileX = floorToInt64(x / FAR_CLIMATE_CONTROL_TILE_EDGE);
+        const int64_t tileZ = floorToInt64(z / FAR_CLIMATE_CONTROL_TILE_EDGE);
+        std::array<HydrologySample, 1> hydrology;
+        const bool integerCoordinate =
+            static_cast<double>(floorToInt64(x)) == x && static_cast<double>(floorToInt64(z)) == z;
+        if (integerCoordinate) {
+            sampleHydrologyGrid(floorToInt64(x), floorToInt64(z), 1, 1, 1, 1, hydrology);
+        }
+        return sampleSurfaceFromFarClimateControlTile(
+            *farClimateControlTile(tileX, tileZ), x, z, footprint,
+            integerCoordinate ? hydrology.data() : nullptr);
+    }
+    const int64_t tileX = floorToInt64(x / MACRO_CONTROL_TILE_EDGE);
+    const int64_t tileZ = floorToInt64(z / MACRO_CONTROL_TILE_EDGE);
+    return sampleSurfaceFromControlTile(*controlTile(tileX, tileZ), x, z, footprint);
+}
+
+void MacroGenerationSampler::sampleSurfaceGrid(int64_t originX, int64_t originZ, int spacing,
+                                               int sampleEdge, SurfaceFootprint footprint,
+                                               std::span<SurfaceSample> output) const {
+    if (spacing <= 0 || sampleEdge <= 0 ||
+        output.size() != static_cast<size_t>(sampleEdge * sampleEdge)) {
+        throw std::invalid_argument("invalid macro surface grid");
+    }
+
+    std::unordered_map<ColumnPos, std::shared_ptr<const MacroControlTile>> retainedTiles;
+    std::unordered_map<ColumnPos, std::shared_ptr<const FarClimateControlTile>>
+        retainedFarClimateTiles;
+    // Group basin/page lookups once for every footprint. Calling the scalar
+    // hydrology path for each of the 16,641 samples in a step-2 tile repeated
+    // cache synchronization and made the nearest far ring take nearly a
+    // second even after terrain generation moved off the render thread.
+    std::vector<HydrologySample> gridHydrology(output.size());
+    sampleHydrologyGrid(originX, originZ, spacing, spacing, sampleEdge, sampleEdge, gridHydrology);
+    const int64_t gridWidth = static_cast<int64_t>(sampleEdge - 1) * spacing;
+    const size_t approximateTileSpan = static_cast<size_t>(gridWidth / MACRO_CONTROL_TILE_EDGE + 2);
+    retainedTiles.reserve(approximateTileSpan * approximateTileSpan);
+    for (int sampleZ = 0; sampleZ < sampleEdge; ++sampleZ) {
+        for (int sampleX = 0; sampleX < sampleEdge; ++sampleX) {
+            const int64_t worldX = originX + static_cast<int64_t>(sampleX) * spacing;
+            const int64_t worldZ = originZ + static_cast<int64_t>(sampleZ) * spacing;
+            SurfaceSample& destination =
+                output[static_cast<size_t>(sampleZ * sampleEdge + sampleX)];
+            if (surfaceFootprintWidth(footprint) >= 2) {
+                const ColumnPos key{
+                    world_coord::floorDiv(worldX,
+                                          static_cast<int64_t>(FAR_CLIMATE_CONTROL_TILE_EDGE)),
+                    world_coord::floorDiv(worldZ,
+                                          static_cast<int64_t>(FAR_CLIMATE_CONTROL_TILE_EDGE)),
+                };
+                auto [tile, inserted] = retainedFarClimateTiles.try_emplace(key);
+                if (inserted) tile->second = farClimateControlTile(key.x, key.z);
+                destination = sampleSurfaceFromFarClimateControlTile(
+                    *tile->second, static_cast<double>(worldX), static_cast<double>(worldZ),
+                    footprint, &gridHydrology[static_cast<size_t>(sampleZ * sampleEdge + sampleX)]);
+                continue;
+            }
+            const ColumnPos key{
+                world_coord::floorDiv(worldX, static_cast<int64_t>(MACRO_CONTROL_TILE_EDGE)),
+                world_coord::floorDiv(worldZ, static_cast<int64_t>(MACRO_CONTROL_TILE_EDGE)),
+            };
+            auto [tile, inserted] = retainedTiles.try_emplace(key);
+            if (inserted) tile->second = controlTile(key.x, key.z);
+            destination = sampleSurfaceFromControlTile(
+                *tile->second, static_cast<double>(worldX), static_cast<double>(worldZ), footprint,
+                &gridHydrology[static_cast<size_t>(sampleZ * sampleEdge + sampleX)]);
+        }
+    }
+}
+
+void MacroGenerationSampler::sampleGeometryGrid(int64_t originX, int64_t originZ, int spacingX,
+                                                int spacingZ, int sampleWidth, int sampleHeight,
+                                                SurfaceFootprint footprint,
+                                                std::span<SurfaceSample> output) const {
+    if (spacingX <= 0 || spacingZ <= 0 || sampleWidth <= 0 || sampleHeight <= 0 ||
+        output.size() != static_cast<size_t>(sampleWidth * sampleHeight)) {
+        throw std::invalid_argument("invalid macro geometry grid");
+    }
+    std::vector<HydrologySample> hydrology(output.size());
+    sampleHydrologyGrid(originX, originZ, spacingX, spacingZ, sampleWidth, sampleHeight, hydrology);
+    std::unordered_map<ColumnPos, std::shared_ptr<const FarClimateControlTile>> retainedTiles;
+    const int64_t gridWidth = static_cast<int64_t>(sampleWidth - 1) * spacingX;
+    const int64_t gridHeight = static_cast<int64_t>(sampleHeight - 1) * spacingZ;
+    const size_t tileSpanX = static_cast<size_t>(gridWidth / FAR_CLIMATE_CONTROL_TILE_EDGE + 2);
+    const size_t tileSpanZ = static_cast<size_t>(gridHeight / FAR_CLIMATE_CONTROL_TILE_EDGE + 2);
+    retainedTiles.reserve(tileSpanX * tileSpanZ);
+    for (int sampleZ = 0; sampleZ < sampleHeight; ++sampleZ) {
+        for (int sampleX = 0; sampleX < sampleWidth; ++sampleX) {
+            const size_t index = static_cast<size_t>(sampleZ * sampleWidth + sampleX);
+            const double x =
+                static_cast<double>(originX + static_cast<int64_t>(sampleX) * spacingX);
+            const double z =
+                static_cast<double>(originZ + static_cast<int64_t>(sampleZ) * spacingZ);
+            SurfaceSample& destination = output[index];
+            destination.geology = sampleGeology(x, z);
+            destination.hydrology = hydrology[index];
+            destination.terrainHeight = destination.hydrology.surfaceElevation;
+            destination.waterSurface = destination.hydrology.waterSurface;
+            if (footprint != SurfaceFootprint::BLOCK_1 && destination.hydrology.ocean) {
+                destination.terrainHeight =
+                    std::min(destination.terrainHeight +
+                                 reliefDetail(x, z, footprint) * OCEAN_FLOOR_DETAIL_SCALE,
+                             static_cast<double>(SEA_LEVEL) - 0.5);
+                destination.hydrology.surfaceElevation = destination.terrainHeight;
+            } else if (footprint != SurfaceFootprint::BLOCK_1 && !destination.hydrology.lake &&
+                       !destination.hydrology.river) {
+                const double channelClearance = destination.hydrology.channelDistance -
+                                                destination.hydrology.channelWidth * 2.5;
+                destination.terrainHeight += reliefDetail(x, z, footprint) *
+                                             smoothstep(0.0, 32.0, channelClearance) *
+                                             dryReliefDetailScale(destination.hydrology);
+                destination.hydrology.surfaceElevation = destination.terrainHeight;
+            }
+
+            const ColumnPos key{
+                world_coord::floorDiv(static_cast<int64_t>(x),
+                                      static_cast<int64_t>(FAR_CLIMATE_CONTROL_TILE_EDGE)),
+                world_coord::floorDiv(static_cast<int64_t>(z),
+                                      static_cast<int64_t>(FAR_CLIMATE_CONTROL_TILE_EDGE)),
+            };
+            auto [tile, inserted] = retainedTiles.try_emplace(key);
+            if (inserted) tile->second = farClimateControlTile(key.x, key.z);
+            const double tileOriginX = static_cast<double>(key.x * FAR_CLIMATE_CONTROL_TILE_EDGE);
+            const double tileOriginZ = static_cast<double>(key.z * FAR_CLIMATE_CONTROL_TILE_EDGE);
+            const CubicControlStencil stencil =
+                cubicControlStencil(x, z, tileOriginX, tileOriginZ, FAR_CLIMATE_CONTROL_SPACING,
+                                    FAR_CLIMATE_CONTROL_CORE_EDGE);
+            reconstructClimate(
+                destination, stencil,
+                [&](int controlX, int controlZ) {
+                    return tile->second->at(controlX, controlZ).terrainHeight;
+                },
+                [&](int controlX, int controlZ) -> const ClimateFields& {
+                    return tile->second->at(controlX, controlZ).climate;
+                });
+            applyAlpineSurfaceDetail(x, z, footprint, destination);
+        }
+    }
+}
+
+void MacroGenerationSampler::sampleGeometryPoints(std::span<const ColumnPos> positions,
+                                                  SurfaceFootprint footprint,
+                                                  std::span<SurfaceSample> output) const {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("invalid macro geometry sample points");
+    }
+    if (positions.empty()) return;
+
+    std::vector<HydrologySample> hydrology(output.size());
+    sampleHydrologyPoints(positions, hydrology);
+    std::unordered_map<ColumnPos, std::shared_ptr<const FarClimateControlTile>> retainedTiles;
+    retainedTiles.reserve(std::min(positions.size(), FAR_CLIMATE_CONTROL_CACHE_CAPACITY));
+
+    for (size_t index = 0; index < positions.size(); ++index) {
+        const double x = static_cast<double>(positions[index].x);
+        const double z = static_cast<double>(positions[index].z);
+        SurfaceSample& destination = output[index];
+        destination.geology = sampleGeology(x, z);
+        destination.hydrology = hydrology[index];
+        destination.terrainHeight = destination.hydrology.surfaceElevation;
+        destination.waterSurface = destination.hydrology.waterSurface;
+        if (footprint != SurfaceFootprint::BLOCK_1 && destination.hydrology.ocean) {
+            destination.terrainHeight =
+                std::min(destination.terrainHeight +
+                             reliefDetail(x, z, footprint) * OCEAN_FLOOR_DETAIL_SCALE,
+                         static_cast<double>(SEA_LEVEL) - 0.5);
+            destination.hydrology.surfaceElevation = destination.terrainHeight;
+        } else if (footprint != SurfaceFootprint::BLOCK_1 && !destination.hydrology.lake &&
+                   !destination.hydrology.river) {
+            const double channelClearance =
+                destination.hydrology.channelDistance - destination.hydrology.channelWidth * 2.5;
+            destination.terrainHeight += reliefDetail(x, z, footprint) *
+                                         smoothstep(0.0, 32.0, channelClearance) *
+                                         dryReliefDetailScale(destination.hydrology);
+            destination.hydrology.surfaceElevation = destination.terrainHeight;
+        }
+
+        const ColumnPos key{
+            world_coord::floorDiv(positions[index].x,
+                                  static_cast<int64_t>(FAR_CLIMATE_CONTROL_TILE_EDGE)),
+            world_coord::floorDiv(positions[index].z,
+                                  static_cast<int64_t>(FAR_CLIMATE_CONTROL_TILE_EDGE)),
+        };
+        auto [tile, inserted] = retainedTiles.try_emplace(key);
+        if (inserted) tile->second = farClimateControlTile(key.x, key.z);
+        const double tileOriginX = static_cast<double>(key.x * FAR_CLIMATE_CONTROL_TILE_EDGE);
+        const double tileOriginZ = static_cast<double>(key.z * FAR_CLIMATE_CONTROL_TILE_EDGE);
+        const CubicControlStencil stencil =
+            cubicControlStencil(x, z, tileOriginX, tileOriginZ, FAR_CLIMATE_CONTROL_SPACING,
+                                FAR_CLIMATE_CONTROL_CORE_EDGE);
+        reconstructClimate(
+            destination, stencil,
+            [&](int controlX, int controlZ) {
+                return tile->second->at(controlX, controlZ).terrainHeight;
+            },
+            [&](int controlX, int controlZ) -> const ClimateFields& {
+                return tile->second->at(controlX, controlZ).climate;
+            });
+        applyAlpineSurfaceDetail(x, z, footprint, destination);
+    }
+}
+
+MacroControlCacheMetrics MacroGenerationSampler::macroControlCacheMetrics() const {
+    return macroControlCache_->metrics();
+}
+
+MacroControlCacheMetrics MacroGenerationSampler::farClimateControlCacheMetrics() const {
+    return farClimateControlCache_->metrics();
+}
+
+void MacroGenerationSampler::clearMacroControlCache() const {
+    macroControlCache_->clear();
+    farClimateControlCache_->clear();
 }
 
 } // namespace worldgen

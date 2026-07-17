@@ -52,6 +52,32 @@ struct ChunkMeshState {
     bool uploaded = false;
 };
 
+// Worker results may complete out of order across renderer drains. Publish
+// only a result for the currently loaded revision, and never let it replace a
+// resident result from a later serial revision. Revision zero remains the
+// "nothing built" sentinel used by ChunkMeshState.
+constexpr bool chunkMeshAsyncResultCanReplace(uint32_t builtVersion, uint32_t liveVersion,
+                                              uint32_t residentVersion) {
+    return builtVersion == liveVersion &&
+           (residentVersion == 0 || static_cast<int32_t>(builtVersion - residentVersion) > 0);
+}
+
+// A completion owns only the request revision captured when it was queued.
+// An older completion must not clear a newer request for the same cube.
+constexpr uint32_t chunkMeshRequestAfterCompletion(uint32_t pendingVersion,
+                                                   uint32_t completedRequestVersion) {
+    return pendingVersion == completedRequestVersion ? 0 : pendingVersion;
+}
+
+// A hard-cap admission guard shared by exact mesh upload and scheduling.
+// Published exact owners are not eviction candidates. When every resident
+// entry owns its section, new work waits instead of growing past the cap.
+constexpr bool chunkMeshRegistryCanAdmit(size_t residentCount, size_t capacity,
+                                         bool alreadyResident, bool hasUnownedVictim) {
+    if (residentCount > capacity) return false;
+    return alreadyResident || residentCount < capacity || hasUnownedVictim;
+}
+
 // GPU allocation for one immutable 256x256-block far-terrain tile. Far tiles
 // use the same compact vertex format and shader as exact cubes, but live in a
 // separate bounded arena so horizon streaming can never evict collision-zone
@@ -78,6 +104,8 @@ struct FarTerrainLodTransition {
 struct WaterDraw {
     simd_float4 origin;
     simd_float4 overlayColorAndStrength;
+    simd_uint4 farMetadata;
+    FarTerrainOwnershipUniforms farOwnership;
     id<MTLBuffer> vertexBuffer;
     id<MTLBuffer> indexBuffer;
     uint64_t vertexOffset;
@@ -152,17 +180,37 @@ public:
         uint32_t meshQueueHighWater = 0;
         uint64_t meshCoalescedCount = 0;
         uint64_t meshDroppedStaleCount = 0;
+        uint32_t exactSurfaceRequiredCount = 0;
+        uint32_t exactSurfaceReadyCount = 0;
+        uint32_t exactSurfaceUnresolvedColumnCount = 0;
+        float exactSurfaceHandoffBlocks = 0.f;
         uint32_t farWantedTileCount = 0;
         uint32_t farResidentTileCount = 0;
+        uint32_t farBaseWantedTileCount = 0;
+        uint32_t farBaseResidentTileCount = 0;
+        uint32_t farBaseDrawnTileCount = 0;
+        uint32_t farBaseMissingTileCount = 0;
+        uint32_t farRefinementWantedTileCount = 0;
+        uint32_t farRefinementResidentTileCount = 0;
+        uint32_t farRefinementDrawnTileCount = 0;
         uint32_t farDrawnTileCount = 0;
         uint32_t farFrustumCulledTileCount = 0;
         uint32_t farOcclusionCulledTileCount = 0;
         uint32_t farPendingTileCount = 0;
         uint32_t farUploadsLastFrame = 0;
+        uint32_t farQueuedBaseTileCount = 0;
+        uint32_t farQueuedRefinementTileCount = 0;
+        uint32_t farActiveBaseWorkerCount = 0;
+        uint32_t farReservedBaseWorkerCount = 0;
+        uint32_t farActiveUrgentRefinementCount = 0;
+        uint32_t farWorkerBudget = 0;
+        uint32_t farCachedBaseTileCount = 0;
+        float farCoverageFrontierBlocks = 0.f;
         float farCacheMB = 0.f;
         float farMegaUsedMB = 0.f;
     };
     ChunkRenderStats chunkRenderStats() const { return _chunkStats; }
+    FarTerrainGenerationCacheStats farGenerationCacheStats() const;
 
     // Real GPU frame time (EMA over completed command buffers) for the F3
     // HUD and the 60-frame diagnostic log.
@@ -277,7 +325,7 @@ private:
     GraphicsSettings _gfx;
 
     // Exponential fog density per block
-    float _fogDensity = 0.0003f;
+    float _fogDensity = 0.00015f;
     float _wetness = 0.0f;
     // True while the camera is submerged this frame (set by render()). Gates
     // the rain-wetness sun sheen off: a gloss toward the sun on floors seen
@@ -325,9 +373,9 @@ private:
     // (all air) so it is not rebuilt every frame.
     std::unordered_map<ChunkPos, ChunkMeshState> _chunkMeshes;
 
-    // Scratch set reused each frame to sweep meshes of unloaded chunks
-    // without per-frame allocation.
-    std::unordered_set<ChunkPos> _liveChunkKeys;
+    // Scratch map reused each frame to sweep unloaded meshes and validate
+    // asynchronous results against the loaded chunk's current revision.
+    std::unordered_map<ChunkPos, const Chunk*> _liveChunksByPosition;
 
     // HUD counters, written only by the render thread during renderChunks.
     ChunkRenderStats _chunkStats;
@@ -343,29 +391,47 @@ private:
     std::unique_ptr<MeshScheduler> _meshScheduler;
     std::vector<MeshResult> _pendingResults;
     std::vector<std::pair<float, const Chunk*>> _meshCandidates;
+    // Once a revision-matched exact mesh is published, it retains ownership
+    // while that immutable mesh remains resident. A later edit can enqueue a
+    // replacement without briefly resurfacing far terrain underneath it.
+    std::unordered_set<ChunkPos> _exactOwnedSections;
+    FarTerrainExactCoverageCache _farTerrainExactCoverage;
 
     // ---- Far-terrain LOD annulus ----
     // Exact cubic terrain stops at radius 32. Immutable 256x256-block tiles
-    // cover the remaining visible annulus with 4, 8, and 16-block sampling.
+    // cover the remaining visible annulus with 2, 4, 8, and 16-block sampling.
     // CPU construction, CPU caching, and GPU residency all have independent
-    // hard bounds so the 256-chunk horizon remains inside the 64 GB target.
+    // hard bounds so the 512-chunk horizon remains inside the 64 GB target.
     std::unique_ptr<FarTerrainScheduler> _farTerrainScheduler;
-    std::unique_ptr<MegaBuffer> _farMegaBuffer;
+    std::unique_ptr<SegmentedMegaBuffer> _farMegaBuffer;
     std::optional<uint64_t> _farTerrainSeed;
     std::optional<ColumnPos> _farTerrainCenterTile;
     std::unordered_map<FarTerrainKey, FarTerrainMeshState, FarTerrainKeyHash> _farTerrainMeshes;
     std::unordered_set<FarTerrainKey, FarTerrainKeyHash> _farTerrainWanted;
+    std::vector<FarTerrainKey> _farTerrainPriorityOrder;
     std::unordered_set<ColumnPos> _farTerrainActiveTiles;
     std::unordered_map<ColumnPos, FarTerrainKey> _farTerrainDesiredByTile;
     std::unordered_map<ColumnPos, FarTerrainKey> _farTerrainDisplayedByTile;
     std::unordered_map<ColumnPos, float> _farTerrainComplexityByTile;
     std::unordered_map<ColumnPos, FarTerrainLodTransition> _farTerrainTransitions;
+    // Preallocated render-thread storage avoids one node allocation whenever
+    // a cold near tile begins its intermediate-refinement grace period.
+    std::vector<std::pair<ColumnPos, double>> _farTerrainNearGraceStartedAt;
     std::vector<FarTerrainResult> _farTerrainResults;
     std::vector<FarTerrainViewTile> _farTerrainCandidates;
+    std::vector<FarTerrainKey> _farTerrainCachedBaseRequests;
+    std::vector<FarTerrainRefinementCacheRequest> _farTerrainUrgentRefinementRequests;
+    std::vector<FarTerrainKey> _farTerrainUrgentRefinementKeys;
+    std::vector<FarTerrainRefinementCacheRequest> _farTerrainCachedRefinementRequests;
+    std::vector<std::shared_ptr<const FarTerrainMesh>> _farTerrainCachedMeshes;
+    size_t _farTerrainResidentWantedCount = 0;
+    size_t _farTerrainResidentRefinementCount = 0;
 
     void renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const World& world,
                           const Vec3& cameraPosition, const float fogColor[3]);
     void resetFarTerrain(uint64_t worldSeed);
+    void setExactSectionOwned(ChunkPos position, bool owned);
+    void clearExactSectionOwnership();
 
     // ---- Day/Night Cycle ----
     // sunDirection/sunColor come out as the ACTIVE directional light — the sun

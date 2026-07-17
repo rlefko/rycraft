@@ -70,7 +70,7 @@ static_assert(sizeof(FluidState) == 1);
 
 constexpr float fluidSurfaceHeight(FluidState state) {
     if (state.isFalling()) return 1.0f;
-    if (state.isSource()) return 0.875f;
+    if (state.isSource()) return 1.0f;
     return static_cast<float>(8 - state.level()) * 0.125f;
 }
 

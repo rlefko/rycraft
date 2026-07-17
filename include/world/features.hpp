@@ -10,6 +10,10 @@
 class ChunkGenerator;
 struct GenScratch;
 
+namespace worldgen {
+struct SurfaceSample;
+}
+
 namespace feature_generation {
 
 // These are reconstruction bounds, not placement density controls. Column
@@ -25,6 +29,39 @@ inline constexpr int TREE_MAXIMUM_VERTICAL_OFFSET = 20;
 // floors and gives sparse column planning a finite, exact vertical envelope.
 inline constexpr int TREE_MAXIMUM_SURFACE_DEVIATION = 24;
 
+enum class TreeSpecies : uint8_t {
+    OAK,
+    LARGE_OAK,
+    BIRCH,
+    SPRUCE,
+    ACACIA,
+    JUNGLE,
+    MANGROVE,
+    PALM,
+    WILLOW,
+    ALPINE_SCRUB,
+    FALLEN_LOG,
+    COUNT,
+};
+
+// Shared ecology result used by exact candidates and aggregate far crowns.
+// The supplied ground Y is the actual solid surface block, not a water plane.
+// Flooded roots are accepted only for explicitly adapted species in shallow,
+// supported habitat. Suitability remains continuous so climate and biome
+// transitions change forest composition without categorical seams.
+struct TreeHabitatEvaluation {
+    double suitability = 0.0;
+    int waterDepthBlocks = 0;
+    int spacing = 0;
+    bool submerged = false;
+    bool allowed = false;
+};
+
+TreeHabitatEvaluation evaluateTreeHabitat(TreeSpecies species,
+                                          const worldgen::SurfaceSample& surface,
+                                          int groundSurfaceY);
+double treeCoverDensity(const worldgen::SurfaceSample& surface);
+
 } // namespace feature_generation
 
 // Large plants come from world-aligned candidate cells. A candidate is
@@ -38,8 +75,11 @@ inline constexpr int TREE_MAXIMUM_SURFACE_DEVIATION = 24;
 // Compact, coordinate-pure description of one accepted large-plant canopy.
 // The anchor is the same world-space root used by cube emission. Canopy
 // offsets and radius enclose every emitted foliage candidate, including bent
-// and branching species, so far terrain can build conservative impostors
-// without generating cubes or maintaining a second forest distribution.
+// and branching species. Far terrain keeps that envelope fixed while using
+// the authoritative species plus its log and leaf materials to build a
+// compact, layered silhouette.
+// An aggregate entry is one small crown in a coarse forest cell, never a box
+// covering the complete cell.
 struct FarCanopy {
     int64_t x = 0;
     int64_t z = 0;
@@ -54,6 +94,13 @@ struct FarCanopy {
     BlockType leafBlock = BlockType::AIR;
     uint64_t anchorId = 0;
     bool aggregate = false;
+    feature_generation::TreeSpecies species = feature_generation::TreeSpecies::OAK;
+    // Signed horizontal form direction for bent trunks, asymmetric crowns,
+    // palm lean, and fallen logs. Form extent is the block length of a
+    // horizontal ground form and zero for ordinary standing trees.
+    int8_t formX = 0;
+    int8_t formZ = 0;
+    uint8_t formExtent = 0;
 
     bool operator==(const FarCanopy&) const = default;
 };
@@ -72,10 +119,20 @@ public:
                                               int64_t maximumZ, const ChunkGenerator& gen,
                                               const StructurePlacer& structures,
                                               GenScratch& scratch) const;
-    // Coarse LODs represent deterministic canopy cover with globally anchored
-    // clusters. Exact accepted tree anchors remain in the two near tiers,
-    // while distant tiers avoid constructing hundreds of cube-density column
-    // plans per tile.
+    // Near far-terrain canopies share the exact accepted 8-block anchor set,
+    // species, and shape without constructing a complete ColumnPlan for each
+    // potential root. The mesher grounds each returned silhouette against its
+    // own terrain sample; exact cube emission resolves the same anchor to the
+    // density surface only after local-priority acceptance.
+    std::vector<FarCanopy> collectFarCanopyAnchors(int64_t minimumX, int64_t minimumZ,
+                                                   int64_t maximumX, int64_t maximumZ,
+                                                   const ChunkGenerator& gen,
+                                                   const StructurePlacer& structures,
+                                                   GenScratch& scratch) const;
+    // Far LODs represent deterministic canopy cover with globally anchored
+    // clusters. Every tier evaluates one fixed candidate set and retains a
+    // strict subset of the preceding tier, so rendering never makes a second
+    // thinning decision. Exact anchors remain the block-resolution authority.
     std::vector<FarCanopy> collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ,
                                                     int64_t maximumX, int64_t maximumZ, int lodStep,
                                                     const ChunkGenerator& gen) const;

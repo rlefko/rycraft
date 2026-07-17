@@ -7,10 +7,16 @@
 // ---------------------------------------------------------------------------
 // ThreadPool implementation
 // ---------------------------------------------------------------------------
-ThreadPool::ThreadPool(size_t numWorkers, ThreadPriority priority) : priority_(priority) {
+ThreadPool::ThreadPool(size_t numWorkers, ThreadPriority priority, size_t latencySensitiveWorkers)
+    : priority_(priority)
+    , latencySensitiveWorkers_(latencySensitiveWorkers) {
+    if (latencySensitiveWorkers_ > numWorkers) {
+        throw std::invalid_argument("latency-sensitive worker count exceeds pool size");
+    }
     for (size_t i = 0; i < numWorkers; ++i) {
-        workers_.emplace_back([this]() {
-            setCurrentThreadPriority(priority_);
+        workers_.emplace_back([this, i]() {
+            setCurrentThreadPriority(i < latencySensitiveWorkers_ ? ThreadPriority::USER_INITIATED
+                                                                  : priority_);
             while (true) {
                 std::function<void()> task;
 
@@ -28,7 +34,7 @@ ThreadPool::ThreadPool(size_t numWorkers, ThreadPriority priority) : priority_(p
                         continue;
                     }
 
-                    task = std::move(tasks_.front());
+                    task = tasks_.top().function;
                     tasks_.pop();
                 }
                 // lock released here, task runs outside the lock

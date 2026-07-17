@@ -390,7 +390,7 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
     const float hudX = 8.0f / static_cast<float>(_width);
     const float hudY = 1.0f - 8.0f / static_cast<float>(_height);
     const float bgWidth = 440.0f / static_cast<float>(_width);
-    const float bgHeight = 208.0f / static_cast<float>(_height);
+    const float bgHeight = 220.0f / static_cast<float>(_height);
     const float lineHeight = (FONT_HEIGHT + 2) / static_cast<float>(_height);
     float textY = hudY - lineHeight;
     drawQuad(hudX - 4.0f / _width, hudY - bgHeight, bgWidth, bgHeight, 0.0f, 0.0f, 0.0f, 0.72f);
@@ -506,6 +506,25 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
     drawString(b, hudX + 192.0f / _width, textY, 1.0f, 0.9f, 0.9f, 0.5f);
     nextLine();
 
+    drawString("Exact ready/req", hudX, textY, 1.0f, 0.8f, 0.9f, 1.0f);
+    drawString(integerText(stats.exactSurfaceReady, a, sizeof(a)), hudX + 120.0f / _width, textY,
+               1.0f, 0.8f, 0.9f, 1.0f);
+    drawString("/", hudX + 168.0f / _width, textY, 1.0f, 0.8f, 0.9f, 1.0f);
+    drawString(integerText(stats.exactSurfaceRequired, b, sizeof(b)), hudX + 184.0f / _width, textY,
+               1.0f, 0.8f, 0.9f, 1.0f);
+    drawString("Unresolved", hudX + 240.0f / _width, textY, 1.0f, 0.8f, 0.9f, 1.0f);
+    drawString(integerText(stats.exactSurfaceUnresolvedColumns, c, sizeof(c)),
+               hudX + 328.0f / _width, textY, 1.0f, 0.8f, 0.9f, 1.0f);
+    nextLine();
+
+    drawString("Handoff/frontier", hudX, textY, 1.0f, 0.8f, 0.9f, 1.0f);
+    floatToString(stats.exactSurfaceHandoffBlocks, a, sizeof(a));
+    floatToString(stats.farCoverageFrontierBlocks, b, sizeof(b));
+    drawString(a, hudX + 136.0f / _width, textY, 1.0f, 0.8f, 0.9f, 1.0f);
+    drawString("/", hudX + 200.0f / _width, textY, 1.0f, 0.8f, 0.9f, 1.0f);
+    drawString(b, hudX + 216.0f / _width, textY, 1.0f, 0.8f, 0.9f, 1.0f);
+    nextLine();
+
     drawString("Far W/R/D", hudX, textY, 1.0f, 0.7f, 0.8f, 1.0f);
     drawString(integerText(stats.farWantedTiles, a, sizeof(a)), hudX + 88.0f / _width, textY, 1.0f,
                0.7f, 0.8f, 1.0f);
@@ -521,6 +540,54 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
     drawString("/", hudX + 336.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
     drawString(integerText(stats.farOcclusionCulledTiles, b, sizeof(b)), hudX + 352.0f / _width,
                textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    nextLine();
+
+    drawString("Base W/R/D/M", hudX, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farBaseWantedTiles, a, sizeof(a)), hudX + 112.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 152.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farBaseResidentTiles, b, sizeof(b)), hudX + 168.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 208.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farBaseDrawnTiles, c, sizeof(c)), hudX + 224.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 264.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farBaseMissingTiles, a, sizeof(a)), hudX + 280.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("Cached", hudX + 328.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farCachedBaseTiles, b, sizeof(b)), hudX + 384.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
+    nextLine();
+
+    drawString("Refine W/R/D", hudX, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farRefinementWantedTiles, a, sizeof(a)), hudX + 112.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 152.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farRefinementResidentTiles, b, sizeof(b)), hudX + 168.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 208.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farRefinementDrawnTiles, c, sizeof(c)), hudX + 224.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("Q B/R", hudX + 272.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farQueuedBaseTiles, a, sizeof(a)), hudX + 328.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 368.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farQueuedRefinementTiles, b, sizeof(b)), hudX + 384.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    nextLine();
+
+    drawString("Workers B/R/U/T", hudX, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farActiveBaseWorkers, a, sizeof(a)), hudX + 128.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 160.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farReservedBaseWorkers, b, sizeof(b)), hudX + 176.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 208.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farActiveUrgentRefinements, c, sizeof(c)), hudX + 224.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 256.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(integerText(stats.farWorkerBudget, a, sizeof(a)), hudX + 272.0f / _width, textY,
+               1.0f, 0.7f, 0.8f, 1.0f);
     nextLine();
 
     drawString("Far pending", hudX, textY, 1.0f, 0.7f, 0.8f, 1.0f);

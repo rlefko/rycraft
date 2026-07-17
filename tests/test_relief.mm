@@ -78,17 +78,17 @@ TEST_CASE("Continuous tectonic signals form broad elevated massifs",
     worldgen::MacroGenerationSampler sampler(42);
 
     const worldgen::GeologySample uplift = sampler.sampleGeology(-81'920.0, 126'976.0);
-    const worldgen::GeologySample fault = sampler.sampleGeology(-75'008.0, 88'064.0);
+    const worldgen::GeologySample fault = sampler.sampleGeology(-81'760.0, 88'480.0);
     const worldgen::GeologySample hotspot = sampler.sampleGeology(-22'528.0, 2'816.0);
-    const worldgen::GeologySample rift = sampler.sampleGeology(77'568.0, 45'824.0);
+    const worldgen::GeologySample rift = sampler.sampleGeology(82'080.0, 50'272.0);
     REQUIRE(uplift.uplift > 0.90);
     REQUIRE(fault.faultStrength > 0.80);
     REQUIRE(hotspot.hotspotInfluence > 0.90);
     REQUIRE(rift.rift > 0.50);
     REQUIRE(sampler.preliminaryElevation(-81'920.0, 126'976.0) > 300.0);
-    REQUIRE(sampler.preliminaryElevation(-75'008.0, 88'064.0) > 105.0);
+    REQUIRE(sampler.preliminaryElevation(-81'760.0, 88'480.0) > 105.0);
     REQUIRE(sampler.preliminaryElevation(-22'528.0, 2'816.0) > 190.0);
-    REQUIRE(sampler.preliminaryElevation(77'568.0, 45'824.0) > 105.0);
+    REQUIRE(sampler.preliminaryElevation(82'080.0, 50'272.0) > 105.0);
 
     ChunkGenerator generator(42);
     REQUIRE(generator.sampleFarSurface(-81'920, 126'976).terrainHeight > 300.0);
