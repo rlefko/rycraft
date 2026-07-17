@@ -191,6 +191,22 @@ void drawMenu(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
         }
     }
 
+    // ---- Gauges (furnace flame and cook arrow) ----
+    for (const MeterWidget& meter : layout.meters) {
+        ui.drawQuad(meter.rect.x, meter.rect.y, meter.rect.w, meter.rect.h, 0.08f, 0.08f, 0.1f,
+                    0.95f);
+        const float fill = std::clamp(meter.fill, 0.f, 1.f);
+        if (fill > 0.f) {
+            if (meter.vertical) {
+                ui.drawQuad(meter.rect.x, meter.rect.y, meter.rect.w, meter.rect.h * fill, meter.r,
+                            meter.g, meter.b, 0.95f);
+            } else {
+                ui.drawQuad(meter.rect.x, meter.rect.y, meter.rect.w * fill, meter.rect.h, meter.r,
+                            meter.g, meter.b, 0.95f);
+            }
+        }
+    }
+
     // ---- Cursor-held stack rides the mouse above everything ----
     if (!frame.cursorStack.empty()) {
         const float iconH = 40.0f * (h / 768.0f) / h;

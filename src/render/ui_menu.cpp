@@ -390,6 +390,32 @@ MenuLayout buildCraftingLayout(const LayoutContext& ctx, const MenuContext& menu
     return layout;
 }
 
+MenuLayout buildFurnaceLayout(const LayoutContext& ctx, const MenuContext& menu) {
+    MenuLayout layout;
+    layout.dimAlpha = 0.45f;
+    layout.panel = UIRect{0.5f - ctx.px(250.f), 0.5f - ctx.py(320.f), ctx.px(500.f), ctx.py(640.f)};
+    const ContainerView& view = menu.container;
+
+    addCenteredText(layout, ctx, "FURNACE", 0.5f + ctx.py(290.f), 2.5f);
+    addSlot(layout, ctx, SlotDomain::FURNACE_INPUT, 0, view.furnaceInput, 0.5f - ctx.px(90.f),
+            0.5f + ctx.py(240.f));
+    addSlot(layout, ctx, SlotDomain::FURNACE_FUEL, 0, view.furnaceFuel, 0.5f - ctx.px(90.f),
+            0.5f + ctx.py(140.f));
+    addSlot(layout, ctx, SlotDomain::FURNACE_OUTPUT, 0, view.furnaceOutput, 0.5f + ctx.px(110.f),
+            0.5f + ctx.py(190.f));
+
+    // Flame gauge between input and fuel, cook arrow toward the output.
+    layout.meters.push_back(
+        MeterWidget{UIRect{0.5f - ctx.px(96.f), 0.5f + ctx.py(178.f), ctx.px(12.f), ctx.py(24.f)},
+                    view.furnaceFuelLeft, true, 1.f, 0.55f, 0.1f});
+    layout.meters.push_back(
+        MeterWidget{UIRect{0.5f - ctx.px(52.f), 0.5f + ctx.py(186.f), ctx.px(120.f), ctx.py(8.f)},
+                    view.furnaceCook, false, 0.95f, 0.95f, 0.95f});
+
+    addInventoryBlock(layout, ctx, view, 0.5f - ctx.py(40.f));
+    return layout;
+}
+
 } // namespace
 
 MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeight,
@@ -447,11 +473,12 @@ MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHei
             return buildInventoryLayout(layoutCtx, ctx);
         case GameScreen::CRAFTING:
             return buildCraftingLayout(layoutCtx, ctx);
+        case GameScreen::FURNACE:
+            return buildFurnaceLayout(layoutCtx, ctx);
         case GameScreen::TITLE:
         case GameScreen::SETTINGS:
         case GameScreen::VIDEO_SETTINGS:
         case GameScreen::PLAYING:
-        case GameScreen::FURNACE:
         case GameScreen::DEATH:
             return buildMenuLayout(screen, pixelWidth, pixelHeight, ctx.settings,
                                    ctx.gfx ? *ctx.gfx : DEFAULT_GRAPHICS);

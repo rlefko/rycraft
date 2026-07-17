@@ -79,6 +79,14 @@ struct SlotWidget {
     ItemStack stack{}; // drawn snapshot (palette entries draw as full stacks)
 };
 
+// A filled gauge (furnace cook arrow, flame): fill is 0..1 along the axis.
+struct MeterWidget {
+    UIRect rect;
+    float fill = 0.f;
+    bool vertical = false;
+    float r = 1.f, g = 1.f, b = 1.f;
+};
+
 struct MenuLayout {
     float dimAlpha = 0.f; // full-screen darkening behind the menu
     UIRect panel{};       // w == 0 → no panel
@@ -86,6 +94,7 @@ struct MenuLayout {
     std::vector<MenuButton> buttons;
     std::vector<TextFieldWidget> textFields;
     std::vector<SlotWidget> slots;
+    std::vector<MeterWidget> meters;
 };
 
 // Typed hit-testing across every widget kind. menuHitTest remains for

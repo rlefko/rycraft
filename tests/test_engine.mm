@@ -1355,6 +1355,51 @@ TEST_CASE("Outside drops and container close return items", "[slots]") {
     REQUIRE(overflow.size() == 2);
 }
 
+TEST_CASE("Furnace layout exposes three slots and two gauges", "[ui][containers]") {
+    MenuContext ctx;
+    ctx.container.furnaceInput = ItemStack{ItemType::RAW_BEEF, 3, 0};
+    ctx.container.furnaceFuel = ItemStack{ItemType::COAL, 5, 0};
+    ctx.container.furnaceOutput = ItemStack{ItemType::COOKED_BEEF, 2, 0};
+    ctx.container.furnaceCook = 0.5f;
+    ctx.container.furnaceFuelLeft = 0.25f;
+
+    MenuLayout layout = buildScreenLayout(GameScreen::FURNACE, 1024.f, 768.f, ctx);
+    int input = 0;
+    int fuel = 0;
+    int output = 0;
+    int inventory = 0;
+    for (const SlotWidget& slot : layout.slots) {
+        switch (slot.ref.domain) {
+            case SlotDomain::FURNACE_INPUT:
+                ++input;
+                REQUIRE(slot.stack == ItemStack{ItemType::RAW_BEEF, 3, 0});
+                break;
+            case SlotDomain::FURNACE_FUEL:
+                ++fuel;
+                break;
+            case SlotDomain::FURNACE_OUTPUT:
+                ++output;
+                REQUIRE(slot.stack == ItemStack{ItemType::COOKED_BEEF, 2, 0});
+                break;
+            case SlotDomain::INVENTORY:
+                ++inventory;
+                break;
+            default:
+                break;
+        }
+    }
+    REQUIRE(input == 1);
+    REQUIRE(fuel == 1);
+    REQUIRE(output == 1);
+    REQUIRE(inventory == 36);
+    REQUIRE(layout.meters.size() == 2);
+    // The cook arrow is the horizontal gauge, the flame the vertical one.
+    const bool haveCook = layout.meters[0].fill == 0.5f || layout.meters[1].fill == 0.5f;
+    const bool haveFlame = layout.meters[0].fill == 0.25f || layout.meters[1].fill == 0.25f;
+    REQUIRE(haveCook);
+    REQUIRE(haveFlame);
+}
+
 TEST_CASE("Container layouts expose every slot with correct references", "[ui][containers]") {
     MenuContext ctx;
     ctx.container.inventory[0] = ItemStack{ItemType::COAL, 9, 0};

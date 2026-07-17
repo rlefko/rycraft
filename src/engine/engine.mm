@@ -318,6 +318,7 @@ struct EngineState {
     Vec3 worldSpawn{0.f, 100.f, 0.f}; // respawn anchor, distinct from playerPos
     int hunger = 20;
     FurnaceMap furnaces;
+    std::optional<BlockPos> openFurnace; // the furnace the FURNACE screen edits
 
     // ---- Container screens ----
     std::array<ItemStack, 9> craftGrid{}; // first 4 used on the inventory screen
@@ -540,6 +541,12 @@ static std::string defaultWorldDirectory() {
         state->inventory.setSlot(static_cast<int>(slot), playerMeta.inventory[slot]);
     }
     state->furnaces = state->saveManager->loadBlockEntities();
+    state->openFurnace.reset();
+    state->craftGrid.fill(ItemStack{});
+    state->craftResult.clear();
+    state->cursorStack.clear();
+    state->creativePage = 0;
+    state->hoveredSlot = -1;
     state->entityBrains.clear();
     state->spawnValidated = false;
     state->hasHighlightedBlock = false;
@@ -613,6 +620,7 @@ static std::string defaultWorldDirectory() {
     state->world.reset();
     state->saveManager.reset();
     state->furnaces.clear();
+    state->openFurnace.reset();
     state->inventory.clear();
     state->hasHighlightedBlock = false;
     state->worldName.clear();
@@ -733,7 +741,8 @@ static std::string defaultWorldDirectory() {
     const std::string screenName = screenEnv ? screenEnv : "";
     const bool wantsGameplayScreen = screenName == "playing" || screenName == "paused" ||
                                      screenName == "settings" || screenName == "video" ||
-                                     screenName == "inventory" || screenName == "crafting";
+                                     screenName == "inventory" || screenName == "crafting" ||
+                                     screenName == "furnace";
     const bool menuScreenRequested = !screenName.empty() && !wantsGameplayScreen;
     const bool wantsWorld = wantsGameplayScreen ||
                             (!menuScreenRequested &&
@@ -771,6 +780,19 @@ static std::string defaultWorldDirectory() {
                 _state->flow.screen = GameScreen::INVENTORY;
             } else if (screenName == "crafting") {
                 _state->flow.screen = GameScreen::CRAFTING;
+            } else if (screenName == "furnace") {
+                // A sample smelting job so the capture shows filled slots and
+                // an advancing cook arrow.
+                const BlockPos pos{0, 0, 0};
+                FurnaceState& furnace = _state->furnaces[pos];
+                furnace.input = ItemStack{ItemType::RAW_BEEF, 3, 0};
+                furnace.fuel = ItemStack{ItemType::COAL, 5, 0};
+                furnace.output = ItemStack{ItemType::COOKED_BEEF, 2, 0};
+                furnace.burnTicksRemaining = 800;
+                furnace.burnTicksTotal = 1600;
+                furnace.cookTicks = 120;
+                _state->openFurnace = pos;
+                _state->flow.screen = GameScreen::FURNACE;
             }
         }
     }
@@ -864,6 +886,19 @@ static std::string defaultWorldDirectory() {
         // that added latency. Falls stay gradual because velocity no longer
         // saturates (see Player::tick), so this no longer looks instantaneous.
         state->camera.setPosition(state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f});
+    } else if (state->world && state->flow.inContainer()) {
+        // Container screens freeze the world but keep furnaces cooking, so the
+        // cook arrow advances while the player watches. Bounded catch-up like
+        // the fluid scheduler to survive a hitch.
+        int steps = 0;
+        while (state->accumulator >= EngineState::TICK_DT && steps < 8) {
+            [self tickFurnaces:state];
+            state->accumulator -= EngineState::TICK_DT;
+            ++steps;
+        }
+        if (state->accumulator >= EngineState::TICK_DT) {
+            state->accumulator = 0;
+        }
     } else {
         state->accumulator = 0;
     }
@@ -1058,6 +1093,28 @@ static std::string defaultWorldDirectory() {
     }
 }
 
+// Advance every player-placed furnace one 20 Hz step and swap the world
+// block between FURNACE and FURNACE_LIT when a furnace ignites or dies. The
+// swap touches only resident cubes and retries next tick otherwise.
+- (void)tickFurnaces:(EngineState*)state {
+    if (!state->world)
+        return;
+    for (auto& [pos, furnace] : state->furnaces) {
+        const bool litChanged = furnaceTick(furnace);
+        if (!litChanged)
+            continue;
+        const std::optional<BlockType> current =
+            state->world->findBlockIfLoaded(pos.x, pos.y, pos.z);
+        if (current && (*current == BlockType::FURNACE || *current == BlockType::FURNACE_LIT)) {
+            state->world->setBlock(pos.x, pos.y, pos.z,
+                                   furnace.lit() ? BlockType::FURNACE_LIT : BlockType::FURNACE);
+            if (furnace.lit()) {
+                [self playSfx:state->sfxBlockPlace gain:0.3f];
+            }
+        }
+    }
+}
+
 // Mutable stack access for the currently open container screen.
 - (SlotAccess)slotAccessForScreen {
     EngineState* state = _state.get();
@@ -1078,6 +1135,13 @@ static std::string defaultWorldDirectory() {
         access.craftGridSize = 9;
         access.craftGridWidth = 3;
         access.craftResult = &state->craftResult;
+    } else if (screen == GameScreen::FURNACE && state->openFurnace) {
+        auto it = state->furnaces.find(*state->openFurnace);
+        if (it != state->furnaces.end()) {
+            access.furnaceInput = &it->second.input;
+            access.furnaceFuel = &it->second.fuel;
+            access.furnaceOutput = &it->second.output;
+        }
     }
     return access;
 }
@@ -1095,6 +1159,7 @@ static std::string defaultWorldDirectory() {
         }
     }
     state->hoveredSlot = -1;
+    state->openFurnace.reset();
 }
 
 // Close the focused text field, committing its filtered contents.
@@ -1317,6 +1382,16 @@ static std::string defaultWorldDirectory() {
             view.creative = state->flow.screen == GameScreen::INVENTORY &&
                             state->gameMode == GameMode::CREATIVE;
             view.creativePage = state->creativePage;
+            if (state->flow.screen == GameScreen::FURNACE && state->openFurnace) {
+                auto it = state->furnaces.find(*state->openFurnace);
+                if (it != state->furnaces.end()) {
+                    view.furnaceInput = it->second.input;
+                    view.furnaceFuel = it->second.fuel;
+                    view.furnaceOutput = it->second.output;
+                    view.furnaceCook = it->second.cookFraction();
+                    view.furnaceFuelLeft = it->second.fuelFraction();
+                }
+            }
         }
         if (state->flow.inContainer() && state->flow.screen != GameScreen::FURNACE &&
             state->gameMode != GameMode::CREATIVE) {
@@ -1772,9 +1847,34 @@ static std::string defaultWorldDirectory() {
         [self breakBlock:state hit:rayHit];
     }
 
-    // Block placing (right mouse click)
+    // Right click: an interactable block opens its screen (unless sneaking
+    // to place against it), otherwise place the held block.
     if (input.isPressedForTick(Key::MouseRight)) {
-        [self placeBlock:state hit:rayHit];
+        InputBindings bindings;
+        bool opened = NO;
+        if (rayHit.has_value() && !input.isDown(bindings.sneak.key)) {
+            const int64_t bx = static_cast<int64_t>(std::floor(rayHit->first.x));
+            const int32_t by = static_cast<int32_t>(std::floor(rayHit->first.y));
+            const int64_t bz = static_cast<int64_t>(std::floor(rayHit->first.z));
+            const std::optional<BlockType> block = state->world->findBlockIfLoaded(bx, by, bz);
+            if (block && isInteractable(*block)) {
+                if (*block == BlockType::CRAFTING_TABLE) {
+                    state->craftGrid.fill(ItemStack{});
+                    state->craftResult.clear();
+                    [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::CRAFTING)];
+                    opened = YES;
+                } else {
+                    const BlockPos pos{bx, by, bz};
+                    state->openFurnace = pos;
+                    state->furnaces.try_emplace(pos);
+                    [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::FURNACE)];
+                    opened = YES;
+                }
+            }
+        }
+        if (!opened) {
+            [self placeBlock:state hit:rayHit];
+        }
     }
 
     // Publish the immutable loaded-cube registry once per simulation tick.
@@ -1799,6 +1899,20 @@ static std::string defaultWorldDirectory() {
     const std::optional<BlockType> current = state->world->findBlockIfLoaded(hitX, hitY, hitZ);
     if (!current || *current == BlockType::BEDROCK)
         return;
+
+    // A broken furnace loses its state entry; its contents return to the
+    // player so nothing is silently lost before dropped items exist.
+    if (*current == BlockType::FURNACE || *current == BlockType::FURNACE_LIT) {
+        auto it = state->furnaces.find(BlockPos{hitX, hitY, hitZ});
+        if (it != state->furnaces.end()) {
+            for (const ItemStack& stack : {it->second.input, it->second.fuel, it->second.output}) {
+                if (!stack.empty()) {
+                    state->inventory.add(stack);
+                }
+            }
+            state->furnaces.erase(it);
+        }
+    }
 
     // Set block to air
     state->world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
@@ -1854,6 +1968,16 @@ static std::string defaultWorldDirectory() {
     if (selectedType == BlockType::AIR)
         return;
     state->world->setBlock(placeX, placeY, placeZ, selectedType);
+
+    // A placed furnace gets an empty state entry so it ticks and persists.
+    if (selectedType == BlockType::FURNACE) {
+        state->furnaces.try_emplace(BlockPos{placeX, placeY, placeZ});
+    }
+
+    // Survival consumes the placed block; creative keeps its infinite stack.
+    if (modeConsumesItems(state->gameMode)) {
+        state->inventory.consumeSelected();
+    }
 
     [self playSfx:state->sfxBlockPlace gain:0.8f];
 }
