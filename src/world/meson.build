@@ -18,6 +18,7 @@ world_sources = files(
   'save_manager.cpp',
   'recipes.cpp',
   'furnace.cpp',
+  'world_list.cpp',
 )
 
 libworld = static_library('world',

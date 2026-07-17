@@ -3,6 +3,7 @@
 
 #include "test_helpers.hpp"
 #include "world/save_manager.hpp"
+#include "world/world_list.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -197,4 +198,73 @@ TEST_CASE("Block entities write is atomic under injected failures", "[saves][blo
     const FurnaceMap loaded = saves.loadBlockEntities();
     REQUIRE(loaded.size() == 1);
     REQUIRE(loaded.count(BlockPos{1, 2, 3}) == 1);
+}
+
+TEST_CASE("World list enumerates saves and the legacy directory", "[saves][worlds]") {
+    TempDir directory("world_list");
+    const std::string root = directory.path();
+    REQUIRE(listWorlds(root).empty());
+
+    // The legacy world adopts in place and lists alongside created worlds.
+    std::filesystem::create_directories(std::filesystem::path(root) / LEGACY_WORLD_DIRECTORY /
+                                        SaveManager::CURRENT_REGIONS_DIRECTORY);
+    const auto first = createWorld("Alpha Base", 1234, GameMode::SURVIVAL, {}, root);
+    REQUIRE(first.has_value());
+    const auto second = createWorld("Beta Cove", 99, GameMode::CREATIVE, {}, root);
+    REQUIRE(second.has_value());
+
+    const auto worlds = listWorlds(root);
+    REQUIRE(worlds.size() == 3);
+    // Stamped worlds sort ahead of the legacy world, which has no stamp.
+    REQUIRE(worlds[2].metadata.name == LEGACY_WORLD_DIRECTORY);
+    const auto* alpha = worlds[0].metadata.name == "Alpha Base" ? &worlds[0] : &worlds[1];
+    REQUIRE(alpha->metadata.name == "Alpha Base");
+    REQUIRE(alpha->metadata.seed == 1234);
+    REQUIRE(alpha->metadata.gameMode == GameMode::SURVIVAL);
+    // Survival worlds start with nothing; the world list read must show it.
+    for (const ItemStack& stack : alpha->metadata.player.inventory) {
+        REQUIRE(stack.empty());
+    }
+
+    // A stray file or empty directory under saves/ is not a world.
+    std::filesystem::create_directories(std::filesystem::path(root) / SAVES_ROOT / "not_a_world");
+    REQUIRE(listWorlds(root).size() == 3);
+}
+
+TEST_CASE("World directories sanitize and deduplicate", "[saves][worlds]") {
+    TempDir directory("world_sanitize");
+    const std::string root = directory.path();
+
+    REQUIRE(sanitizeWorldDirectory("My World!", root) == "My_World");
+    REQUIRE(sanitizeWorldDirectory("dots.and spaces", root) == "dots_and_spaces");
+    REQUIRE(sanitizeWorldDirectory("", root) == "world");
+    REQUIRE(sanitizeWorldDirectory("~~~", root) == "world");
+
+    REQUIRE(createWorld("Twin", 1, GameMode::CREATIVE, {}, root).has_value());
+    REQUIRE(sanitizeWorldDirectory("Twin", root) == "Twin_2");
+    REQUIRE(createWorld("Twin", 2, GameMode::CREATIVE, {}, root).has_value());
+    REQUIRE(sanitizeWorldDirectory("Twin", root) == "Twin_3");
+}
+
+TEST_CASE("Delete world refuses anything outside the world roots", "[saves][worlds]") {
+    TempDir directory("world_delete");
+    const std::string root = directory.path();
+
+    const auto created = createWorld("Doomed", 5, GameMode::SURVIVAL, {}, root);
+    REQUIRE(created.has_value());
+    REQUIRE(std::filesystem::exists(*created));
+
+    // A sibling non-world directory refuses deletion.
+    const auto stray = std::filesystem::path(root) / SAVES_ROOT / "stray";
+    std::filesystem::create_directories(stray);
+    REQUIRE_FALSE(deleteWorld(stray.string(), root));
+
+    // Paths outside the roots refuse even when they exist.
+    REQUIRE_FALSE(deleteWorld(root, root));
+    REQUIRE_FALSE(deleteWorld((std::filesystem::path(root) / SAVES_ROOT).string(), root));
+
+    REQUIRE(deleteWorld(*created, root));
+    REQUIRE_FALSE(std::filesystem::exists(*created));
+    // Deleting twice reports failure instead of pretending success.
+    REQUIRE_FALSE(deleteWorld(*created, root));
 }
