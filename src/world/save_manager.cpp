@@ -135,7 +135,7 @@ bool parseCubeName(const std::string& name, ChunkPos& position) {
 
 SaveManager::SaveManager(const std::string& worldPath, std::shared_ptr<TestHooks> testHooks)
     : worldPath_(worldPath)
-    , regionsPath_(worldPath + "/regions")
+    , regionsPath_(worldPath + "/" + CURRENT_REGIONS_DIRECTORY)
     , metadataPath_(worldPath + "/metadata.json")
     , testHooks_(std::move(testHooks)) {
     ensureDirectory(worldPath_);
@@ -345,7 +345,7 @@ bool SaveManager::saveMetadata(uint32_t seed, Vec3 spawnPos, uint64_t worldTime,
     json << "]\n"
          << "  },\n"
          << "  \"chunkFormatVersion\": " << CHUNK_VERSION << ",\n"
-         << "  \"generatorVersion\": 2\n"
+         << "  \"generatorVersion\": " << CURRENT_GENERATOR_VERSION << "\n"
          << "}\n";
     const std::string text = json.str();
     return writeFileWithRetries(metadataPath_, std::vector<uint8_t>(text.begin(), text.end()));

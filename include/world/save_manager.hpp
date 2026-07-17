@@ -22,6 +22,8 @@ class SaveManager {
 public:
     static constexpr size_t PLAYER_INVENTORY_SLOTS = 9;
     static constexpr size_t MAX_PENDING_SAVE_JOBS = 32'768;
+    static constexpr uint32_t CURRENT_GENERATOR_VERSION = 3;
+    static constexpr const char* CURRENT_REGIONS_DIRECTORY = "regions-v3";
 
     // Optional deterministic write failures used by persistence regression
     // tests. Production callers leave this unset.
@@ -70,7 +72,7 @@ public:
         Vec3 spawnPos{};
         uint64_t worldTime = 0;
         uint32_t chunkFormatVersion = CHUNK_VERSION;
-        uint32_t generatorVersion = 2;
+        uint32_t generatorVersion = CURRENT_GENERATOR_VERSION;
         PlayerMetadata player;
     };
     std::optional<WorldMetadata> loadMetadata() const;
