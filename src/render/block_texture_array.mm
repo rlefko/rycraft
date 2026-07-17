@@ -949,7 +949,7 @@ static void uploadLayerMips(id<MTLTexture> texture,
 }
 
 // ---------------------------------------------------------------------------
-// Item icons — procedural 16x16 pixel art per non-block item: geometric
+// Item icons - procedural 16x16 pixel art per non-block item: geometric
 // painters parameterized by the item's palette, so twelve tools come from
 // four shapes and the meats from three.
 // ---------------------------------------------------------------------------

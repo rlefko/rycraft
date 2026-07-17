@@ -79,7 +79,7 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
             if (face == FaceNormal::PLUS_Y) return TEXTURE_LAYER_CRAFTING_TABLE_TOP;
             if (face == FaceNormal::MINUS_Y) return static_cast<uint8_t>(BlockType::PLANKS);
             return static_cast<uint8_t>(type);
-        case BlockType::FURNACE:     // the mouth is painted on every side face —
+        case BlockType::FURNACE:     // the mouth is painted on every side face,
         case BlockType::FURNACE_LIT: // the block format carries no facing bits
             if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
                 return TEXTURE_LAYER_FURNACE_TOP;

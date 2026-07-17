@@ -5,7 +5,7 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// Mining — held-left-click block breaking over time. Pure C++ so the timing
+// Mining - held-left-click block breaking over time. Pure C++ so the timing
 // and target-tracking rules are unit-testable. The break-time formula and
 // tool multipliers live in world/item.hpp (blockBreakTicks); this module only
 // accumulates progress against a stable ray target.

@@ -7,7 +7,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// World list — the single home for enumerating, creating, and deleting the
+// World list - the single home for enumerating, creating, and deleting the
 // named worlds under <root>/saves, plus the legacy <root>/rycraft_world
 // save, which is adopted in place (never moved: a half-finished migration of
 // a live save is worse than two roots). The game passes the default root

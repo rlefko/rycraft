@@ -1,7 +1,7 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// Survival stats — food, saturation, exhaustion, air, and the regeneration,
+// Survival stats - food, saturation, exhaustion, air, and the regeneration,
 // starvation, and drowning timers. Pure C++ so the whole loop is unit-
 // testable without the engine. Health lives on the Player (already persisted);
 // this module returns the per-tick health delta the engine applies.

@@ -9,7 +9,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Entity picking — ray versus living-entity AABBs for melee targeting. A
+// Entity picking - ray versus living-entity AABBs for melee targeting. A
 // linear slab test over the spawner's entity vector: at the 64-animal cap a
 // scan is cheaper than materializing spatial-hash queries, and it runs only
 // on attack click edges.

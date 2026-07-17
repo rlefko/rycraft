@@ -593,7 +593,7 @@ struct FlareState {
     float visibility; // 0 sun fully occluded .. 1 fully visible
 };
 
-// UI icon vertex — textured block/item icons in the LDR UI overlay pass.
+// UI icon vertex - textured block/item icons in the LDR UI overlay pass.
 // tint.rgb multiplies the sample (isometric face shading), tint.a scales
 // alpha; layer selects the block/item texture array slice.
 struct UIIconVertex {

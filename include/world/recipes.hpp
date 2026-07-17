@@ -6,7 +6,7 @@
 #include <span>
 
 // ---------------------------------------------------------------------------
-// Recipes — the single source of truth for crafting, smelting, and fuel.
+// Recipes - the single source of truth for crafting, smelting, and fuel.
 //
 // Crafting grids are row-major ItemStack spans with gridWidth 2 (inventory)
 // or 3 (crafting table); NONE marks an empty cell. Matching runs on grid

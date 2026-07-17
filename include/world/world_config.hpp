@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// Per-world configuration — the single home for the game-mode rules and the
+// Per-world configuration - the single home for the game-mode rules and the
 // generation toggles a world is created with. Both persist in metadata.json
 // and never change the deterministic output of an unchanged toggle set.
 // ---------------------------------------------------------------------------

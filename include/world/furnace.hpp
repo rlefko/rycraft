@@ -6,7 +6,7 @@
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------
-// Furnace — the single source of truth for smelting state and its 20 Hz step.
+// Furnace - the single source of truth for smelting state and its 20 Hz step.
 //
 // Furnaces are the only stateful blocks: the engine owns a FurnaceMap keyed
 // by block position, ticks every entry each gameTick, and swaps the world

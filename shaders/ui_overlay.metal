@@ -50,7 +50,7 @@ fragment float4 uiFragmentMain(
 }
 
 // ---------------------------------------------------------------------------
-// Icon pipeline — textured quads sampling the block/item texture array.
+// Icon pipeline - textured quads sampling the block/item texture array.
 // Runs between the two solid-color phases of the overlay batch.
 // ---------------------------------------------------------------------------
 

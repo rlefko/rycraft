@@ -10,7 +10,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// ItemEntityRenderer — draws dropped items as small spinning colored cubes.
+// ItemEntityRenderer - draws dropped items as small spinning colored cubes.
 //
 // Sibling of EntityRenderer: it reuses the exact entity shader, vertex
 // format, and MSAA scene pipeline, so items receive the same sun/fog/shadow

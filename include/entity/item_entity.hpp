@@ -9,7 +9,7 @@
 class World;
 
 // ---------------------------------------------------------------------------
-// Dropped items — the collectible entities a broken block or a Q-drop leaves
+// Dropped items - the collectible entities a broken block or a Q-drop leaves
 // in the world. Deliberately NOT an Entity: dropped items carry no AI,
 // territory, or breeding, and must never spend the 64-animal budget. A
 // lightweight value struct plus a bounded manager, owned by the engine.

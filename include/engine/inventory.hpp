@@ -5,7 +5,7 @@
 #include <array>
 
 // ---------------------------------------------------------------------------
-// Inventory — the player's 36 item stacks and hotbar selection.
+// Inventory - the player's 36 item stacks and hotbar selection.
 //
 // Slots 0-8 are the hotbar (number keys and scroll selection); slots 9-35
 // are the main grid the inventory screen shows. Pickups fill the hotbar

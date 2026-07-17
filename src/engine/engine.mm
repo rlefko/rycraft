@@ -1507,7 +1507,7 @@ static std::string defaultWorldDirectory() {
             if (state->flow.inContainer()) {
                 [self closeContainerSession];
             }
-            // Leaving a settings screen persists the values (not per click —
+            // Leaving a settings screen persists the values (not per click,
             // no disk I/O while stepping)
             bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
                                    state->flow.screen == GameScreen::VIDEO_SETTINGS;
@@ -2434,7 +2434,7 @@ static std::string defaultWorldDirectory() {
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
     // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered, then
     // quits ~1s later (the PNG write is async). A capture run is headless
-    // tooling — leaving it running leaked a full game instance per capture
+    // tooling: leaving it running leaked a full game instance per capture
     // until concurrent playtests exhausted system memory. Runs before the
     // world branch so menu screens capture too.
     static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");

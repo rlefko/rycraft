@@ -6,7 +6,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Slot interaction — the single home for what mouse clicks do to stacks on
+// Slot interaction - the single home for what mouse clicks do to stacks on
 // the container screens: pick up, place, split, quick-move, and craft-output
 // rules. Pure C++ over raw stack arrays so every rule is unit-testable; the
 // engine owns the stacks and the cursor and calls in from its click handler.

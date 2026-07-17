@@ -6,7 +6,7 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// Items — the single source of truth for everything an inventory slot can
+// Items - the single source of truth for everything an inventory slot can
 // hold: identifiers, stack rules, display names, swatch colors, tool and food
 // data, per-block drops, and the mining-time formula.
 //
@@ -303,7 +303,7 @@ constexpr ItemStack makeItemStack(ItemType type, uint8_t count = 1) {
 }
 
 // ---------------------------------------------------------------------------
-// Swatch colors — 0xRRGGBB per item, used for dropped-item cubes and any
+// Swatch colors - 0xRRGGBB per item, used for dropped-item cubes and any
 // untextured slot fallback. The block range keeps the palette the hotbar
 // previously spread across a switch in ui_hud.mm.
 // ---------------------------------------------------------------------------
@@ -434,7 +434,7 @@ constexpr uint32_t itemSwatchColor(ItemType type) {
 }
 
 // ---------------------------------------------------------------------------
-// Block drops — what survival mining yields once the tier gate passes.
+// Block drops - what survival mining yields once the tier gate passes.
 // ---------------------------------------------------------------------------
 
 struct BlockDrop {
@@ -486,7 +486,7 @@ constexpr BlockDrop blockDrop(BlockType type) {
 }
 
 // ---------------------------------------------------------------------------
-// Mining times — the one formula survival breaking uses. Seconds of work are
+// Mining times - the one formula survival breaking uses. Seconds of work are
 // hardness * 1.5 when the held tool can harvest the block and hardness * 5
 // when it cannot; a matching tool class divides by its mining speed.
 // ---------------------------------------------------------------------------
@@ -516,7 +516,7 @@ constexpr int blockBreakTicks(BlockType block, ItemType held) {
 }
 
 // ---------------------------------------------------------------------------
-// Creative palette — every obtainable item in slot order: placeable blocks
+// Creative palette - every obtainable item in slot order: placeable blocks
 // first (skipping the unobtainable lit furnace), then materials, foods, and
 // tools in id order.
 // ---------------------------------------------------------------------------
