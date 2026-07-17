@@ -2,9 +2,11 @@
 
 #include "common/random.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 
 // Horizontal coordinates use 64 bits so procedural sampling is not tied to
 // renderer precision. Vertical coordinates stay bounded and fit in 32 bits.
@@ -48,6 +50,20 @@ struct BlockPos {
 };
 
 namespace world_coord {
+
+inline int64_t floorToNeighborSafeInt64(double value) noexcept {
+    constexpr double INT64_LOWER_EXCLUSIVE = -0x1p63;
+    constexpr double INT64_UPPER_EXCLUSIVE = 0x1p63;
+    constexpr int64_t MINIMUM = std::numeric_limits<int64_t>::min() + 1;
+    constexpr int64_t MAXIMUM = std::numeric_limits<int64_t>::max() - 1;
+    if (std::isnan(value)) return 0;
+    if (value <= INT64_LOWER_EXCLUSIVE) return MINIMUM;
+    if (value >= INT64_UPPER_EXCLUSIVE) return MAXIMUM;
+    const int64_t floored = static_cast<int64_t>(std::floor(value));
+    if (floored < MINIMUM) return MINIMUM;
+    if (floored > MAXIMUM) return MAXIMUM;
+    return floored;
+}
 
 constexpr int64_t floorDiv(int64_t value, int64_t divisor) {
     const int64_t quotient = value / divisor;

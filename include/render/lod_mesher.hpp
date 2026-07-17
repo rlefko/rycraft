@@ -42,34 +42,32 @@ struct MeshScratch {
 
     std::array<uint32_t, MAX_FACE_CELLS> faceKeys{};
     std::array<int32_t, MAX_SKY_COLUMNS> skyHeight{};
+    std::array<uint8_t, MeshSnapshot::PADDED_VOLUME> exteriorAir{};
+    std::array<uint16_t, MeshSnapshot::PADDED_VOLUME> exteriorFrontier{};
 };
 
-// Greedy mesher with level-of-detail support. This is the single mesher in
-// the engine: ChunkLOD::FULL runs the standard 16x16x16 greedy meshing, the
-// coarser levels sample the chunk at reduced resolution first.
+// Exact-cube greedy mesher. Production exact terrain uses the MeshSnapshot
+// overload at full 16x16x16 block resolution. The direct Chunk overload
+// retains legacy downsample modes for isolated unit tests:
 //
-//   LOD 0 (near,  < 128 blocks):  full greedy meshing (16x16x16)
-//   LOD 1 (mid,   128-256 blocks): 2x downsampling (8x8x8)
-//   LOD 2 (far,   256-512 blocks): 4x downsampling (4x4x4)
-//   Beyond 512 blocks: returns empty mesh (distance culling)
+//   FULL:   full greedy meshing (16x16x16)
+//   MEDIUM: 2x downsampling (8x8x8)
+//   COARSE: 4x downsampling (4x4x4)
 //
-// The game meshes through the MeshSnapshot overload: real neighbor walls
+// Exact terrain meshes through the MeshSnapshot overload. Real neighbor walls
 // make chunk-boundary faces symmetric (no hidden interior walls between
-// solid chunks, no holes or light seams at borders). The Chunk overload
-// treats out-of-chunk as air and remains for the coarse LODs and for
-// single-chunk unit tests.
+// solid chunks, no holes or light seams at borders). The direct Chunk overload
+// treats out-of-chunk as air.
 //
-// NOTE: the renderer currently draws everything at ChunkLOD::FULL — the
-// coarse levels emit geometry at grid scale (not world scale) and switching
-// levels invalidates nothing, so LOD selection is parked until those are
-// reworked (see docs/rendering-conventions.md).
+// The separate far-terrain pipeline emits world-scale voxel tiers at 32-,
+// 16-, 8-, 4-, and 2-block footprints. ChunkLOD does not select those tiers.
 class LODMesher {
 public:
-    // Build mesh for the given chunk at the specified LOD level.
-    // Returns empty mesh when lodLevel >= ChunkLOD::COUNT (distance-culled).
+    // Build an isolated chunk at a legacy unit-test resolution. Returns an
+    // empty mesh when lodLevel is outside ChunkLOD.
     MeshOutput buildMesh(const Chunk& chunk, int lodLevel);
 
-    // Neighbor-aware full-detail build — the game's meshing path. Pure CPU
-    // (no Metal), safe to run on any thread with a per-thread scratch.
+    // Neighbor-aware full-detail exact build. This is pure CPU work and is
+    // safe to run on any thread with per-thread scratch storage.
     static MeshOutput buildMesh(const MeshSnapshot& snapshot, MeshScratch& scratch);
 };

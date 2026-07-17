@@ -2,6 +2,7 @@
 
 #include "engine/game_state.hpp"
 #include "world/macro_generation.hpp"
+#include "world/view_distance.hpp"
 
 #include <array>
 #include <cstdint>
@@ -49,12 +50,14 @@ struct MenuLayout {
 
 // Live values the settings screen displays.
 struct SettingsValues {
-    static constexpr int MIN_VIEW_DISTANCE = 4;
-    static constexpr int MAX_VIEW_DISTANCE = 256;
-    static constexpr int DEFAULT_VIEW_DISTANCE = 256;
-    inline static constexpr std::array<int, 10> VIEW_DISTANCES = {
-        4, 8, 12, 16, 24, 32, 64, 128, 192, 256,
+    static constexpr int MIN_VIEW_DISTANCE = MIN_RENDER_DISTANCE_CHUNKS;
+    static constexpr int MAX_VIEW_DISTANCE = MAX_RENDER_DISTANCE_CHUNKS;
+    static constexpr int DEFAULT_VIEW_DISTANCE = DEFAULT_RENDER_DISTANCE_CHUNKS;
+    inline static constexpr std::array<int, 12> VIEW_DISTANCES = {
+        MIN_VIEW_DISTANCE, 8, 12, 16, 24, 32, 64, 128, 192, 256, 384, MAX_VIEW_DISTANCE,
     };
+    static_assert(VIEW_DISTANCES.front() == MIN_VIEW_DISTANCE);
+    static_assert(VIEW_DISTANCES.back() == MAX_VIEW_DISTANCE);
 
     int viewDistance = DEFAULT_VIEW_DISTANCE; // chunks
     int fogLevel = 3;                         // 0-10
@@ -65,7 +68,9 @@ struct SettingsValues {
 // Level → physical-unit conversions, defined once for the engine's init
 // path and the stepper handlers (two independent copies once drifted).
 constexpr float fogDensityForLevel(int level) {
-    return static_cast<float>(level) * 0.0001f;
+    // The 512-chunk clear-weather horizon must remain legible. Weather still
+    // raises this value dynamically, while level zero remains truly clear.
+    return static_cast<float>(level) * 0.00005f;
 }
 constexpr float mouseSensitivityForLevel(int level) {
     return static_cast<float>(level) * 0.0005f;
@@ -85,12 +90,31 @@ struct PerformanceStats {
     uint32_t meshBuildsFrame = 0;
     float megaUsedMB = 0.f; // live combined vertex and index arena allocation
     float megaCapMB = 0.f;
+    uint32_t exactSurfaceRequired = 0;
+    uint32_t exactSurfaceReady = 0;
+    uint32_t exactSurfaceUnresolvedColumns = 0;
+    float exactSurfaceHandoffBlocks = 0.f;
     uint32_t farWantedTiles = 0;
     uint32_t farResidentTiles = 0;
     uint32_t farDrawnTiles = 0;
+    uint32_t farBaseWantedTiles = 0;
+    uint32_t farBaseResidentTiles = 0;
+    uint32_t farBaseDrawnTiles = 0;
+    uint32_t farBaseMissingTiles = 0;
+    uint32_t farRefinementWantedTiles = 0;
+    uint32_t farRefinementResidentTiles = 0;
+    uint32_t farRefinementDrawnTiles = 0;
     uint32_t farFrustumCulledTiles = 0;
     uint32_t farOcclusionCulledTiles = 0;
     uint32_t farPendingTiles = 0;
+    uint32_t farQueuedBaseTiles = 0;
+    uint32_t farQueuedRefinementTiles = 0;
+    uint32_t farActiveBaseWorkers = 0;
+    uint32_t farReservedBaseWorkers = 0;
+    uint32_t farActiveUrgentRefinements = 0;
+    uint32_t farWorkerBudget = 0;
+    uint32_t farCachedBaseTiles = 0;
+    float farCoverageFrontierBlocks = 0.f;
     float farCacheMB = 0.f;
     float farMeshMB = 0.f;
     int64_t cubeX = 0;

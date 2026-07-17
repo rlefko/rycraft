@@ -9,21 +9,114 @@
 
 #ifndef __METAL_VERSION__
 #include <algorithm>
+#include <cmath>
 #endif
 
-#define FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS 16.0f
+#define FAR_TERRAIN_COVERAGE_FADE_BLOCKS 256.0f
+#define FAR_TERRAIN_COVERAGE_FADE_FRACTION 0.125f
+#define FAR_TERRAIN_COVERAGE_MIN_FADE_BLOCKS 16.0f
+#define FAR_TERRAIN_TILE_EDGE_BLOCKS 256.0f
+#define FAR_TERRAIN_EXACT_COLUMN_EDGE_BLOCKS 16.0f
+#define FAR_TERRAIN_EXACT_COLUMNS_PER_TILE 16
 #define FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK (1u << 28u)
 #define FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK (1u << 29u)
+#define FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD 32
+#define FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR 4
+#define FAR_TERRAIN_EXACT_MASK_WORD_COUNT 8
+#define FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE                                                    \
+    (FAR_TERRAIN_EXACT_MASK_WORD_COUNT / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR)
+#define FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE 3
+#define FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS (FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE / 2)
+#define FAR_TERRAIN_EXACT_MASK_NEIGHBOR_COUNT 9
+#define FAR_TERRAIN_LOD_TRANSITION_SECONDS_VALUE 0.65f
+#define FAR_TERRAIN_LOD_EMERGENCY_SWAP_SECONDS_VALUE 0.10f
+#define FAR_TERRAIN_DRAW_FLAG 1u
+#define FAR_TERRAIN_LOD_TRANSITION_FLAG 2u
+#define FAR_TERRAIN_LOD_TARGET_FLAG 4u
+#define FAR_TERRAIN_LOD_EMERGENCY_FLAG 8u
+#define FAR_TERRAIN_FACE_PLUS_X 0u
+#define FAR_TERRAIN_FACE_MINUS_X 1u
+#define FAR_TERRAIN_FACE_PLUS_Z 2u
+#define FAR_TERRAIN_FACE_MINUS_Z 3u
+#define FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS 0.03125f
 
-// Exact cubic terrain owns water and canopy fragments through its advertised
-// radius. Those far summaries fade in over the following chunk through a
-// stable world-space threshold. Opaque far tops remain as depth-tested cold
-// residency fallback until their exact surfaces arrive.
-static inline float farTerrainHandoffCoverage(float horizontalDistance, float exactRadius) {
-    if (exactRadius <= 0.0f) {
-        return 1.0f;
+// A far terrain riser is emitted by the higher terrain column behind its
+// outward face. Half-open X/Z lookup already selects that column for -X and
+// -Z faces, but a +X or +Z face lies exactly on the following column boundary.
+// Move only those terrain-riser samples inward by one binary-exact fraction.
+// Tops, water, canopies, and skirts keep destination-fragment ownership by
+// passing false for useEmittingColumn.
+static inline bool farTerrainOpaqueRiserUsesEmittingColumn(unsigned int face, bool canopy,
+                                                           bool skirt) {
+    return face <= FAR_TERRAIN_FACE_MINUS_Z && !canopy && !skirt;
+}
+
+// A skirt joins the edge column that emitted it to the neighboring receiving
+// column. It is valid only while both far-terrain owners remain visible.
+// Testing just the destination leaves an orphan wall when exact residency
+// reaches the emitting side of a tile boundary first.
+static inline bool farTerrainSkirtOwnersVisible(bool emittingColumnOwnedByExact,
+                                                bool receivingColumnOwnedByExact) {
+    return !emittingColumnOwnedByExact && !receivingColumnOwnedByExact;
+}
+
+static inline simd_float2 farTerrainExactOwnershipSamplePosition(simd_float2 localPosition,
+                                                                 unsigned int face,
+                                                                 bool useEmittingColumn) {
+    if (!useEmittingColumn) {
+        return localPosition;
     }
-    float amount = (horizontalDistance - exactRadius) / FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
+    if (face == FAR_TERRAIN_FACE_PLUS_X) {
+        localPosition.x -= FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS;
+    } else if (face == FAR_TERRAIN_FACE_PLUS_Z) {
+        localPosition.y -= FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS;
+    }
+    return localPosition;
+}
+
+// Positive faces already lie in the receiving half-open column. Negative
+// faces lie in the emitting column and need the corresponding outward inset
+// to reach their receiving neighbor.
+static inline simd_float2 farTerrainSkirtReceivingOwnershipSamplePosition(simd_float2 localPosition,
+                                                                          unsigned int face) {
+    if (face == FAR_TERRAIN_FACE_MINUS_X) {
+        localPosition.x -= FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS;
+    } else if (face == FAR_TERRAIN_FACE_MINUS_Z) {
+        localPosition.y -= FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS;
+    }
+    return localPosition;
+}
+
+// A positive frontier marks the nearest missing GPU-resident step-32 parent.
+// Geometry beyond it is suppressed and the preceding tile fades completely
+// into the frame fog. Zero is the steady-state disabled value used by exact
+// cubes and by a fully covered far view.
+static inline bool farTerrainCoverageVisible(float horizontalDistance, float frontierDistance) {
+    return frontierDistance <= 0.0f || horizontalDistance < frontierDistance;
+}
+
+static inline float farTerrainCoverageFadeBlocks(float frontierDistance) {
+    const float proportional = frontierDistance * FAR_TERRAIN_COVERAGE_FADE_FRACTION;
+#ifdef __METAL_VERSION__
+    return metal::clamp(proportional, FAR_TERRAIN_COVERAGE_MIN_FADE_BLOCKS,
+                        FAR_TERRAIN_COVERAGE_FADE_BLOCKS);
+#else
+    return std::clamp(proportional, FAR_TERRAIN_COVERAGE_MIN_FADE_BLOCKS,
+                      FAR_TERRAIN_COVERAGE_FADE_BLOCKS);
+#endif
+}
+
+static inline float farTerrainCoverageFog(float horizontalDistance, float frontierDistance) {
+    if (frontierDistance <= 0.0f) {
+        return 0.0f;
+    }
+    // During cold startup the nearest missing parent can be less than one tile
+    // away. Applying the full 256-block horizon taper in that state starts the
+    // fade behind the camera and turns every available fallback fragment into
+    // an opaque fog wall. Keep only the last eighth of a short connected prefix
+    // as its transition, then grow smoothly to the full horizon band.
+    const float fadeBlocks = farTerrainCoverageFadeBlocks(frontierDistance);
+    float amount = (horizontalDistance - (frontierDistance - fadeBlocks)) / fadeBlocks;
 #ifdef __METAL_VERSION__
     amount = metal::clamp(amount, 0.0f, 1.0f);
 #else
@@ -32,29 +125,101 @@ static inline float farTerrainHandoffCoverage(float horizontalDistance, float ex
     return amount * amount * (3.0f - 2.0f * amount);
 }
 
-static inline bool farTerrainHandoffVisible(float horizontalDistance, float exactRadius,
-                                            float ditherThreshold) {
-    const float coverage = farTerrainHandoffCoverage(horizontalDistance, exactRadius);
-    if (coverage <= 0.0f) {
-        return false;
-    }
-    if (coverage >= 1.0f) {
-        return true;
-    }
+static inline float farTerrainLodTransitionAmount(float amount) {
 #ifdef __METAL_VERSION__
-    ditherThreshold = metal::clamp(ditherThreshold, 0.0f, 1.0f);
+    return metal::clamp(amount, 0.0f, 1.0f);
 #else
-    ditherThreshold = std::clamp(ditherThreshold, 0.0f, 1.0f);
+    return std::clamp(amount, 0.0f, 1.0f);
 #endif
-    return ditherThreshold < coverage;
 }
 
-// Boundary skirts cover cracks between resident far-terrain tiers. Exact
-// terrain already supplies crack-free geometry throughout the handoff band,
-// so exposing a skirt there would turn a tile edge into a deep vertical wall.
-static inline bool farTerrainSkirtVisible(float horizontalDistance, float exactRadius) {
-    return exactRadius <= 0.0f ||
-           horizontalDistance >= exactRadius + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
+static inline float farTerrainLodTransitionProgressAtSeconds(float elapsedSeconds) {
+    const float phase =
+        farTerrainLodTransitionAmount(elapsedSeconds / FAR_TERRAIN_LOD_TRANSITION_SECONDS_VALUE);
+    return phase * phase * (3.0f - 2.0f * phase);
+}
+
+static inline bool farTerrainLodTransitionTarget(unsigned int flags) {
+    return (flags & FAR_TERRAIN_LOD_TARGET_FLAG) != 0u;
+}
+
+static inline float farTerrainLodTerrainSwapProgress(unsigned int flags) {
+    // A direct emergency-parent replacement reaches its hidden terrain swap
+    // at the shared emergency time. Normal tier changes use the temporal
+    // midpoint.
+    return (flags & FAR_TERRAIN_LOD_EMERGENCY_FLAG) != 0u
+               ? farTerrainLodTransitionProgressAtSeconds(
+                     FAR_TERRAIN_LOD_EMERGENCY_SWAP_SECONDS_VALUE)
+               : 0.5f;
+}
+
+// Production filtered tiers are not a strict height-min pyramid. Draw one
+// complete terrain topology at a time so a source/target height mismatch can
+// never expose an unsupported partial sheet.
+static inline bool farTerrainLodTerrainVisible(float progress, unsigned int flags) {
+    if ((flags & FAR_TERRAIN_LOD_TRANSITION_FLAG) == 0u) {
+        return true;
+    }
+    progress = farTerrainLodTransitionAmount(progress);
+    const bool target = farTerrainLodTransitionTarget(flags);
+    const bool swapped = progress >= farTerrainLodTerrainSwapProgress(flags);
+    return target == swapped;
+}
+
+// Skirts belong to the currently visible terrain topology. Water keeps its
+// source topology until transition completion, but retaining a source skirt
+// after the source terrain swaps out creates a freestanding vertical panel.
+static inline bool farTerrainLodSkirtVisible(float progress, unsigned int flags) {
+    return farTerrainLodTerrainVisible(progress, flags);
+}
+
+// Hide the complete terrain swap behind a narrow terrain-only fog pulse. It is
+// intentionally independent of canopy, water, skirt, and coverage fog.
+static inline float farTerrainLodTerrainFog(float progress, unsigned int flags) {
+    if ((flags & FAR_TERRAIN_LOD_TRANSITION_FLAG) == 0u) {
+        return 0.0f;
+    }
+    progress = farTerrainLodTransitionAmount(progress);
+    const bool emergency = (flags & FAR_TERRAIN_LOD_EMERGENCY_FLAG) != 0u;
+    const float center = farTerrainLodTerrainSwapProgress(flags);
+    const float halfWidth = emergency ? 0.030f : 0.080f;
+#ifdef __METAL_VERSION__
+    const float amount = metal::clamp(1.0f - metal::abs(progress - center) / halfWidth, 0.0f, 1.0f);
+#else
+    const float amount = std::clamp(1.0f - std::abs(progress - center) / halfWidth, 0.0f, 1.0f);
+#endif
+    return amount * amount * (3.0f - 2.0f * amount);
+}
+
+// Unrelated canopy sets exchange in two monotonic phases. The target appears
+// before the source retires, so a forest never passes through an empty frame
+// and no source-only crown disappears at transition completion.
+static inline bool farTerrainLodCanopyVisible(float progress, float ditherThreshold,
+                                              unsigned int flags) {
+    if ((flags & FAR_TERRAIN_LOD_TRANSITION_FLAG) == 0u) {
+        return true;
+    }
+    progress = farTerrainLodTransitionAmount(progress);
+    ditherThreshold = farTerrainLodTransitionAmount(ditherThreshold);
+    if (farTerrainLodTransitionTarget(flags)) {
+        if (progress >= 0.5f) {
+            return true;
+        }
+        return ditherThreshold < farTerrainLodTransitionAmount(progress * 2.0f);
+    }
+    if (progress <= 0.5f) {
+        return true;
+    }
+    if (progress >= 1.0f) {
+        return false;
+    }
+    return ditherThreshold >= farTerrainLodTransitionAmount((progress - 0.5f) * 2.0f);
+}
+
+// Water remains source-owned for the complete transition, and the renderer
+// retires it atomically after the target topology becomes authoritative.
+static inline bool farTerrainLodConnectedGeometryVisible(unsigned int flags) {
+    return (flags & FAR_TERRAIN_LOD_TRANSITION_FLAG) == 0u || !farTerrainLodTransitionTarget(flags);
 }
 
 #ifdef __METAL_VERSION__
@@ -65,6 +230,16 @@ static inline bool farTerrainSkirtVisible(float horizontalDistance, float exactR
 static inline float interleavedGradientNoise(metal::float2 px) {
     return metal::fract(52.9829189f *
                         metal::fract(metal::dot(px, metal::float2(0.06711056f, 0.00583715f))));
+}
+
+// Fade procedural water bands before their phase advances too far between
+// adjacent pixels. The argument is the screen-space phase footprint in
+// radians per pixel. Keeping this transfer function shared and portable lets
+// the CPU regression suite pin the threshold while the fragment shader
+// derives the footprint from screen-space derivatives.
+static inline float waterBandVisibility(float phaseFootprint) {
+    float t = metal::clamp((phaseFootprint - 0.45f) / 1.35f, 0.0f, 1.0f);
+    return 1.0f - t * t * (3.0f - 2.0f * t);
 }
 
 // Foliage wind sway, ONE definition shared by the scene and shadow vertex
@@ -143,6 +318,16 @@ static inline metal::float3 waterSurfaceNormal(metal::float2 p, float t) {
 }
 #endif
 
+#ifndef __METAL_VERSION__
+// CPU form of waterBandVisibility for deterministic shader-contract tests.
+// This deliberately mirrors the Metal expression above rather than depending
+// on a graphics framework in otherwise portable render tests.
+static inline float waterBandVisibility(float phaseFootprint) {
+    const float t = std::clamp((phaseFootprint - 0.45f) / 1.35f, 0.0f, 1.0f);
+    return 1.0f - t * t * (3.0f - 2.0f * t);
+}
+#endif
+
 // Bound at buffer(1) in the main chunk/highlight shaders.
 struct Uniforms {
     simd_float4x4 modelMatrix;
@@ -161,14 +346,27 @@ struct Uniforms {
 
 // Per-chunk world offset, bound at buffer(2) via setVertexBytes. Vertices are
 // chunk-local so their fp16 coordinates stay exact; this restores world space.
-// origin.w is zero for exact cubes and the exact-radius handoff start for far
-// tiles. overlayColorAndStrength remains independent for LOD fog transitions.
+// origin.w is reserved and remains zero. overlayColorAndStrength remains
+// available for diagnostic overlays.
 // farMetadata.x contains the four displayed-neighbor skirt edge bits ordered
-// by FaceNormal values +X, -X, +Z, and -Z.
+// by FaceNormal values +X, -X, +Z, and -Z. farMetadata.y stores the float bits
+// of the temporary coverage frontier distance, or zero when coverage is
+// complete. farMetadata.z stores LOD transition progress as float bits.
+// farMetadata.w stores FAR_TERRAIN_* flags and is zero for exact cube draws.
 struct ChunkOrigin {
     simd_float4 origin;
     simd_float4 overlayColorAndStrength;
     simd_uint4 farMetadata;
+};
+
+// Fragment-only ownership for one far tile and its eight immediate neighbors.
+// Each tile contributes one 256-bit mask, with one bit per 16x16 exact chunk
+// column in row-major local X/Z order. The neighboring masks let a canopy or
+// waterfall owned by one tile cross a tile face without reappearing over a
+// revision-ready exact column. Exact cube draws bind an all-zero value.
+struct FarTerrainOwnershipUniforms {
+    simd_uint4 readyColumnMasks[FAR_TERRAIN_EXACT_MASK_NEIGHBOR_COUNT *
+                                FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE];
 };
 
 // One cascade's light view-projection, bound at buffer(1) via setVertexBytes
@@ -401,6 +599,15 @@ struct FlareState {
 static_assert(sizeof(Uniforms) == 304);
 static_assert(sizeof(ChunkOrigin) == 48);
 static_assert(offsetof(ChunkOrigin, farMetadata) == 32);
+static_assert(sizeof(FarTerrainOwnershipUniforms) == 288);
+static_assert(offsetof(FarTerrainOwnershipUniforms, readyColumnMasks) == 0);
+static_assert(FAR_TERRAIN_EXACT_MASK_WORD_COUNT * FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD ==
+              FAR_TERRAIN_EXACT_COLUMNS_PER_TILE * FAR_TERRAIN_EXACT_COLUMNS_PER_TILE);
+static_assert(FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE * FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR ==
+              FAR_TERRAIN_EXACT_MASK_WORD_COUNT);
+static_assert(sizeof(simd_uint4) / sizeof(uint32_t) == FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR);
+static_assert(FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE * FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE ==
+              FAR_TERRAIN_EXACT_MASK_NEIGHBOR_COUNT);
 static_assert(offsetof(Uniforms, sunDirection) == 192);
 static_assert(offsetof(Uniforms, fogColor) == 240);
 static_assert(offsetof(Uniforms, fogDensity) == 256);

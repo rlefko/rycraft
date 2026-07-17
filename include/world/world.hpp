@@ -7,6 +7,7 @@
 #include "world/chunk_pos.hpp"
 #include "world/fluid.hpp"
 #include "world/mesh_snapshot.hpp"
+#include "world/view_distance.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,13 +33,38 @@ inline void sortChunksByDistance(std::vector<ChunkPos>& chunks, int64_t centerCh
     sortChunksByDistance(chunks, centerChunkX, 0, centerChunkZ);
 }
 
+// Selects the bounded exact-mesh set in descending priority order. Existing
+// candidates win ties before distance so a small camera movement cannot churn
+// already-published surface, cliff, or tree meshes at the hard residency cap.
+std::unordered_set<ChunkPos>
+selectStableMeshCandidates(const std::unordered_map<ChunkPos, uint8_t>& candidatePriorities,
+                           const std::unordered_set<ChunkPos>& previousCandidates, ChunkPos center,
+                           size_t capacity);
+
 inline constexpr size_t MAX_INFLIGHT_GEN = 64;
+inline constexpr size_t EXACT_GENERATION_WORKER_COUNT = 6;
+inline constexpr size_t EXACT_LATENCY_WORKER_COUNT = 4;
+static_assert(EXACT_LATENCY_WORKER_COUNT <= EXACT_GENERATION_WORKER_COUNT);
+inline constexpr size_t EXACT_GENERATION_SUBMISSION_LIMIT = EXACT_GENERATION_WORKER_COUNT + 1;
+static_assert(EXACT_GENERATION_SUBMISSION_LIMIT <= MAX_INFLIGHT_GEN);
+
+enum class ColumnPlanCompletionAction : uint8_t {
+    PUBLISH,
+    REQUEUE,
+    DROP,
+};
+
+constexpr ColumnPlanCompletionAction columnPlanCompletionAction(bool planAvailable,
+                                                                bool shuttingDown, bool requiredNow,
+                                                                bool alreadyQueued) {
+    if (planAvailable) return ColumnPlanCompletionAction::PUBLISH;
+    if (!shuttingDown && requiredNow && !alreadyQueued) return ColumnPlanCompletionAction::REQUEUE;
+    return ColumnPlanCompletionAction::DROP;
+}
+inline constexpr size_t EXACT_MESH_WORKER_COUNT = 4;
 inline constexpr size_t MAX_LOADED_CUBES = 32768;
 inline constexpr size_t MAX_MESH_RESIDENT_CUBES = 16384;
 inline constexpr size_t MAX_COLD_COLUMN_PLANS = 2;
-inline constexpr int DEFAULT_RENDER_DISTANCE_CHUNKS = 256;
-inline constexpr int MIN_RENDER_DISTANCE_CHUNKS = 4;
-inline constexpr int MAX_RENDER_DISTANCE_CHUNKS = 256;
 inline constexpr int MAX_EXACT_CUBIC_DISTANCE_CHUNKS = 32;
 inline constexpr int EXPLORATION_RADIUS_CHUNKS = 6;
 inline constexpr int EXPLORATION_VERTICAL_RADIUS_CUBES = 4;
@@ -45,6 +72,21 @@ inline constexpr int HORIZONTAL_UNLOAD_HYSTERESIS_CHUNKS = 2;
 inline constexpr int VERTICAL_UNLOAD_HYSTERESIS_CUBES = 1;
 inline constexpr size_t COLUMN_PLAN_REBUILD_BATCH = 128;
 inline constexpr size_t COLUMN_PLAN_REBUILD_COOLDOWN_TICKS = 4;
+
+// Exact streaming uses stable lanes before distance. A newer active-set epoch
+// outranks queued work from an old camera position, the exploration and
+// collision band outranks the broad surface disk, and distance orders work
+// within a lane. The low 32 bits are sufficient for the bounded exact radius.
+inline constexpr int64_t exactStreamingTaskPriority(uint64_t epoch, uint8_t lane,
+                                                    uint64_t distanceSquared) {
+    constexpr uint64_t EPOCH_MASK = (uint64_t{1} << 27U) - 1U;
+    constexpr uint64_t DISTANCE_MASK = (uint64_t{1} << 32U) - 1U;
+    const uint64_t boundedDistance = std::min(distanceSquared, DISTANCE_MASK);
+    const uint64_t packed = ((epoch & EPOCH_MASK) << 36U) |
+                            (static_cast<uint64_t>(lane & 0x0FU) << 32U) |
+                            (DISTANCE_MASK - boundedDistance);
+    return static_cast<int64_t>(packed);
+}
 
 struct StreamingWorkStats {
     uint64_t activeSetRebuilds = 0;
@@ -60,7 +102,19 @@ struct StreamingWorkStats {
     uint64_t activeSetRequests = 0;
     uint64_t activeSetRequestsCoalesced = 0;
     uint64_t activeSetBuildsCanceled = 0;
+    uint64_t loadedCubeAdmissionsRejected = 0;
+    size_t loadedCubeHighWater = 0;
     float activeSetBuildMs = 0.0F;
+};
+
+// Immutable pre-cap description of the exact surface that the renderer is
+// expected to replace. Far terrain uses this to retain its coarse parent
+// until every current exact requirement has a revision-matched mesh.
+struct ExactSurfaceCoverageSnapshot {
+    uint64_t epoch = 0;
+    int nominalRadiusChunks = 0;
+    std::vector<ChunkPos> requiredSections;
+    std::vector<ColumnPos> unresolvedColumns;
 };
 inline constexpr size_t MAX_FLUID_RESUME_CUBES_PER_FRAME = 64;
 inline constexpr size_t MAX_FLUID_FRONTIER_RESUMES_PER_FRAME = 256;
@@ -68,7 +122,8 @@ inline constexpr size_t MAX_FLUID_FRONTIER_RESUMES_PER_CUBE = 16;
 
 class World : public FluidWorldAccess {
 public:
-    explicit World(uint32_t seed, int viewDistance = DEFAULT_RENDER_DISTANCE_CHUNKS);
+    explicit World(uint32_t seed, int viewDistance = DEFAULT_RENDER_DISTANCE_CHUNKS,
+                   size_t loadedCubeLimit = MAX_LOADED_CUBES);
     ~World();
 
     World(const World&) = delete;
@@ -116,6 +171,7 @@ public:
     std::vector<std::shared_ptr<Chunk>> getLoadedChunks() const;
     std::shared_ptr<const std::vector<std::shared_ptr<Chunk>>> getLoadedSnapshot() const;
     std::shared_ptr<const std::unordered_set<ChunkPos>> getMeshCandidateSnapshot() const;
+    std::shared_ptr<const ExactSurfaceCoverageSnapshot> getExactSurfaceCoverageSnapshot() const;
     void publishLoadedSnapshot();
     bool snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const;
     std::vector<std::shared_ptr<Chunk>> getDirtyChunks();
@@ -170,8 +226,12 @@ private:
     mutable std::mutex chunksMutex_;
     std::shared_ptr<const std::vector<std::shared_ptr<Chunk>>> loadedSnapshot_;
     std::shared_ptr<const std::unordered_set<ChunkPos>> meshCandidateSnapshot_;
+    std::shared_ptr<const ExactSurfaceCoverageSnapshot> exactSurfaceCoverageSnapshot_;
     std::atomic<bool> loadedSnapshotDirty_{true};
     std::atomic<size_t> loadedCubeCount_{0};
+    const size_t loadedCubeLimit_;
+    std::atomic<size_t> loadedCubeHighWater_{0};
+    std::atomic<uint64_t> loadedCubeAdmissionsRejected_{0};
 
     struct SkyColumnKey {
         int64_t x = 0;
@@ -221,9 +281,27 @@ private:
     std::unordered_set<ChunkPos> generationsInFlight_;
     std::unordered_map<ColumnPos, std::future<void>> pendingColumnPlans_;
     std::unordered_set<ColumnPos> columnPlansInFlight_;
-    std::vector<ChunkPos> genBacklog_;
+    struct GenerationBacklogEntry {
+        ChunkPos position;
+        int64_t priority = 0;
+    };
+    struct GenerationBacklogLater {
+        bool operator()(const GenerationBacklogEntry& left,
+                        const GenerationBacklogEntry& right) const {
+            if (left.priority != right.priority) return left.priority < right.priority;
+            if (left.position.x != right.position.x) return left.position.x > right.position.x;
+            if (left.position.z != right.position.z) return left.position.z > right.position.z;
+            return left.position.y > right.position.y;
+        }
+    };
+    std::priority_queue<GenerationBacklogEntry, std::vector<GenerationBacklogEntry>,
+                        GenerationBacklogLater>
+        genBacklog_;
     std::unordered_set<ChunkPos> genBacklogSet_;
     std::vector<ColumnPos> columnPlanBacklog_;
+    std::unordered_map<ChunkPos, uint8_t> exactPriorityByCube_;
+    std::unordered_map<ColumnPos, uint8_t> exactPriorityByPlan_;
+    ChunkPos exactPriorityCenter_{};
     enum class PlanDependencyKind : uint8_t { OWN_PLAN, EXPOSED_APRON };
     struct PlanDependent {
         ChunkPos pos;
@@ -271,8 +349,8 @@ private:
     void queueLightReconcileWithNeighbors(ChunkPos pos);
 
     void generateChunk(const std::shared_ptr<Chunk>& chunk);
-    void generateChunkAsync(ChunkPos pos);
-    void generateColumnPlanAsync(ColumnPos pos);
+    void generateChunkAsync(ChunkPos pos, int64_t priority);
+    void generateColumnPlanAsync(ColumnPos pos, int64_t priority);
     std::shared_ptr<Chunk> loadOrGenerateChunk(ChunkPos pos, bool* loadedFromSave = nullptr);
     bool shouldRetain(ChunkPos pos) const;
     void setBlockLoaded(BlockPos position, BlockType type, std::optional<FluidState> fluidState);

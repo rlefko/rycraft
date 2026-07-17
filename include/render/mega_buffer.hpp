@@ -3,6 +3,7 @@
 #include "render/vertex.hpp"
 #import <Metal/Metal.h>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -38,6 +39,9 @@ public:
 
     uint64_t vertexUsed() const;
     uint64_t indexUsed() const;
+    bool owns(const ChunkAllocation& alloc) const {
+        return alloc.vertexBuffer == _vertexBuffer && alloc.indexBuffer == _indexBuffer;
+    }
     uint64_t vertexCapacity() const { return _vertexSize; }
     uint64_t indexCapacity() const { return _indexSize; }
 
@@ -76,4 +80,44 @@ private:
 
     bool tryFreeListAllocate(uint64_t& outOffset, uint64_t alignedSize, uint64_t bufferSize,
                              std::vector<std::pair<uint64_t, uint64_t>>& freeList);
+};
+
+// A bounded collection of lazily allocated Metal buffer pairs. Large horizon
+// residency cannot rely on one multi-gigabyte MTLBuffer being available as a
+// single contiguous allocation. Each returned ChunkAllocation already carries
+// its concrete buffers, so draw submission stays unchanged while frees and
+// uploads route back to the owning slab.
+class SegmentedMegaBuffer {
+public:
+    using ChunkAllocation = MegaBuffer::ChunkAllocation;
+
+    SegmentedMegaBuffer(id<MTLDevice> device, uint64_t vertexCapacity, uint64_t indexCapacity,
+                        uint64_t vertexSlabSize, uint64_t indexSlabSize);
+
+    ChunkAllocation allocate(uint32_t vertexCount, uint32_t indexCount);
+    void uploadVertices(const void* data, size_t size, const ChunkAllocation& alloc);
+    void uploadIndices(const void* data, size_t size, const ChunkAllocation& alloc);
+    void free(ChunkAllocation& alloc);
+    void deferFree(ChunkAllocation& alloc, uint64_t frame);
+    void drainDeferredFrees(uint64_t completedFrame);
+
+    uint64_t vertexUsed() const;
+    uint64_t indexUsed() const;
+    uint64_t vertexCapacity() const { return _vertexCapacity; }
+    uint64_t indexCapacity() const { return _indexCapacity; }
+    size_t segmentCount() const { return _segments.size(); }
+
+private:
+    MegaBuffer& owner(const ChunkAllocation& alloc) const;
+    bool canCreateSegment() const;
+    MegaBuffer& createSegment();
+
+    id<MTLDevice> _device;
+    uint64_t _vertexCapacity;
+    uint64_t _indexCapacity;
+    uint64_t _vertexSlabSize;
+    uint64_t _indexSlabSize;
+    uint64_t _createdVertexCapacity = 0;
+    uint64_t _createdIndexCapacity = 0;
+    std::vector<std::unique_ptr<MegaBuffer>> _segments;
 };
