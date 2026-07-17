@@ -54,6 +54,7 @@ enum class MenuAction {
     REQUEST_DELETE_WORLD,
     CONFIRM_DELETE,
     CANCEL_DELETE,
+    WORLD_BACK,
     RESPAWN,
     SAVE_QUIT_TO_TITLE,
     TOGGLE_GAME_MODE,
@@ -86,6 +87,14 @@ enum class MenuAction {
     SHARPEN_UP,
 };
 
+// Screens that run over a live world session (the HUD draws only there).
+constexpr bool screenHasWorldSession(GameScreen screen) {
+    return screen == GameScreen::PLAYING || screen == GameScreen::PAUSED ||
+           screen == GameScreen::SETTINGS || screen == GameScreen::VIDEO_SETTINGS ||
+           screen == GameScreen::INVENTORY || screen == GameScreen::CRAFTING ||
+           screen == GameScreen::FURNACE || screen == GameScreen::DEATH;
+}
+
 // What the engine must do after a transition.
 struct GameFlowEffects {
     bool captureCursor = false; // hide + pointer-lock the mouse
@@ -101,12 +110,7 @@ struct GameFlow {
     constexpr bool inMenu() const { return screen != GameScreen::PLAYING; }
 
     // Screens that require a live world session behind them.
-    constexpr bool worldScreens() const {
-        return screen == GameScreen::PLAYING || screen == GameScreen::PAUSED ||
-               screen == GameScreen::SETTINGS || screen == GameScreen::VIDEO_SETTINGS ||
-               screen == GameScreen::INVENTORY || screen == GameScreen::CRAFTING ||
-               screen == GameScreen::FURNACE || screen == GameScreen::DEATH;
-    }
+    constexpr bool worldScreens() const { return screenHasWorldSession(screen); }
 
     // Container screens the inventory key and container blocks open.
     constexpr bool inContainer() const {
@@ -236,6 +240,14 @@ struct GameFlow {
                 return {};
             case MenuAction::CANCEL_DELETE:
                 if (screen == GameScreen::WORLD_DELETE_CONFIRM) screen = GameScreen::WORLD_SELECT;
+                return {};
+            case MenuAction::WORLD_BACK:
+                if (screen == GameScreen::WORLD_SELECT) {
+                    screen = GameScreen::TITLE;
+                } else if (screen == GameScreen::WORLD_CREATE ||
+                           screen == GameScreen::WORLD_DELETE_CONFIRM) {
+                    screen = GameScreen::WORLD_SELECT;
+                }
                 return {};
             case MenuAction::QUIT:
                 if (screen == GameScreen::TITLE || screen == GameScreen::PAUSED ||

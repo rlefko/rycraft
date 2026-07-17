@@ -4,6 +4,7 @@
 #include "world/item.hpp"
 #include "world/macro_generation.hpp"
 #include "world/view_distance.hpp"
+#include "world/world_config.hpp"
 
 #include <array>
 #include <cstdint>
@@ -40,6 +41,18 @@ struct MenuButton {
     UIRect rect;
     std::string label;
     MenuAction action = MenuAction::NONE;
+    int payload = -1;        // row index for list actions (SELECT_WORLD)
+    bool emphasized = false; // selected world row highlight
+};
+
+// One text-entry box: the label draws above it, the caret only while the
+// engine has this field focused and the blink phase is on.
+struct TextFieldWidget {
+    UIRect rect;
+    std::string label;
+    std::string text;
+    bool focused = false;
+    bool caret = false;
 };
 
 struct MenuLayout {
@@ -47,7 +60,17 @@ struct MenuLayout {
     UIRect panel{};       // w == 0 → no panel
     std::vector<MenuText> texts;
     std::vector<MenuButton> buttons;
+    std::vector<TextFieldWidget> textFields;
 };
+
+// Typed hit-testing across every widget kind. menuHitTest remains for
+// button-only callers.
+enum class UIHitKind : uint8_t { NONE, BUTTON, TEXT_FIELD };
+struct UIHit {
+    UIHitKind kind = UIHitKind::NONE;
+    int index = -1; // into the matching layout vector
+};
+UIHit uiHitTest(const MenuLayout& layout, float mouseX, float mouseY);
 
 // Live values the settings screen displays.
 struct SettingsValues {
@@ -159,6 +182,45 @@ struct UIFrameState {
 float menuTextWidth(const std::string& text, float scale, float pixelWidth);
 
 struct GraphicsSettings; // render/graphics_settings.hpp (video screen values)
+
+// Per-screen editable state the engine owns and the layouts render.
+struct WorldSelectState {
+    int selected = -1; // index into the cached world list, -1 = none
+    int scroll = 0;    // first visible row
+    static constexpr int VISIBLE_ROWS = 5;
+};
+
+struct WorldCreateState {
+    std::string name;
+    std::string seedText;  // digits only; empty creates a random seed
+    int focusedField = -1; // 0 = name, 1 = seed, -1 = none
+    bool structures = true;
+    bool fauna = true;
+    bool weather = true;
+    bool dayCycle = true;
+    bool creative = false;
+    static constexpr size_t MAX_NAME_LENGTH = 24;
+    static constexpr size_t MAX_SEED_LENGTH = 10;
+};
+
+// Field charset enforcement in one place: the world-name charset comes from
+// world_list.hpp so typed names always render and persist escape-free.
+std::string filterTextField(const std::string& raw, bool digitsOnly, size_t maxLength);
+
+// Everything any menu screen draws, filled by the engine each frame.
+struct MenuContext {
+    SettingsValues settings{};
+    const GraphicsSettings* gfx = nullptr; // video screen only (non-owning)
+    std::vector<std::string> worldRows;    // display labels, cached on entry
+    WorldSelectState worldSelect{};
+    WorldCreateState worldCreate{};
+    bool caretVisible = true;
+    std::string deleteWorldName;
+};
+
+// Build the layout for any screen (Playing returns an empty layout).
+MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHeight,
+                             const MenuContext& ctx);
 
 // Build the layout for the current screen (Playing returns an empty layout).
 MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeight,

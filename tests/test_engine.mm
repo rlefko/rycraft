@@ -34,6 +34,7 @@
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
 #include <world/world.hpp>
+#include <world/world_list.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -518,17 +519,154 @@ TEST_CASE("Menu hit test: button centers hit, gaps miss", "[ui][menu]") {
     REQUIRE(menuHitTest(layout, 0.02f, 0.02f) == -1);
 }
 
+TEST_CASE("World select layout scrolls selects and guards actions", "[ui][worlds]") {
+    MenuContext ctx;
+    auto buttonWith = [](const MenuLayout& layout, MenuAction action) {
+        for (const auto& button : layout.buttons) {
+            if (button.action == action)
+                return true;
+        }
+        return false;
+    };
+
+    // Empty list: no play/delete targets, create and back present.
+    MenuLayout empty = buildScreenLayout(GameScreen::WORLD_SELECT, 1024.f, 768.f, ctx);
+    REQUIRE_FALSE(buttonWith(empty, MenuAction::PLAY_SELECTED_WORLD));
+    REQUIRE_FALSE(buttonWith(empty, MenuAction::REQUEST_DELETE_WORLD));
+    REQUIRE(buttonWith(empty, MenuAction::OPEN_WORLD_CREATE));
+    REQUIRE(buttonWith(empty, MenuAction::WORLD_BACK));
+    REQUIRE_FALSE(buttonWith(empty, MenuAction::WORLD_LIST_UP));
+
+    // Seven rows: five visible with correct payloads, scroll arrows appear
+    // on the scrollable side only.
+    for (int i = 0; i < 7; ++i) {
+        ctx.worldRows.push_back("World " + std::to_string(i));
+    }
+    ctx.worldSelect.selected = 1;
+    MenuLayout list = buildScreenLayout(GameScreen::WORLD_SELECT, 1024.f, 768.f, ctx);
+    int rows = 0;
+    for (const auto& button : list.buttons) {
+        if (button.action != MenuAction::SELECT_WORLD)
+            continue;
+        REQUIRE(button.payload == rows);
+        if (button.payload == 1)
+            REQUIRE(button.emphasized);
+        ++rows;
+    }
+    REQUIRE(rows == WorldSelectState::VISIBLE_ROWS);
+    REQUIRE_FALSE(buttonWith(list, MenuAction::WORLD_LIST_UP));
+    REQUIRE(buttonWith(list, MenuAction::WORLD_LIST_DOWN));
+    REQUIRE(buttonWith(list, MenuAction::PLAY_SELECTED_WORLD));
+    REQUIRE(buttonWith(list, MenuAction::REQUEST_DELETE_WORLD));
+
+    // Scrolled to the bottom: rows start at the clamped offset.
+    ctx.worldSelect.scroll = 99;
+    MenuLayout bottom = buildScreenLayout(GameScreen::WORLD_SELECT, 1024.f, 768.f, ctx);
+    int firstPayload = -1;
+    for (const auto& button : bottom.buttons) {
+        if (button.action == MenuAction::SELECT_WORLD) {
+            firstPayload = button.payload;
+            break;
+        }
+    }
+    REQUIRE(firstPayload == 2);
+    REQUIRE(buttonWith(bottom, MenuAction::WORLD_LIST_UP));
+    REQUIRE_FALSE(buttonWith(bottom, MenuAction::WORLD_LIST_DOWN));
+}
+
+TEST_CASE("World create layout gates the create button on a name", "[ui][worlds]") {
+    MenuContext ctx;
+    auto hasCreate = [](const MenuLayout& layout) {
+        for (const auto& button : layout.buttons) {
+            if (button.action == MenuAction::CREATE_WORLD_CONFIRM)
+                return true;
+        }
+        return false;
+    };
+
+    MenuLayout unnamed = buildScreenLayout(GameScreen::WORLD_CREATE, 1024.f, 768.f, ctx);
+    REQUIRE(unnamed.textFields.size() == 2);
+    REQUIRE(unnamed.textFields[0].label == "NAME");
+    REQUIRE(unnamed.textFields[1].label == "SEED");
+    REQUIRE_FALSE(hasCreate(unnamed));
+
+    ctx.worldCreate.name = "   ";
+    REQUIRE_FALSE(hasCreate(buildScreenLayout(GameScreen::WORLD_CREATE, 1024.f, 768.f, ctx)));
+
+    ctx.worldCreate.name = "Base";
+    ctx.worldCreate.focusedField = 1;
+    MenuLayout named = buildScreenLayout(GameScreen::WORLD_CREATE, 1024.f, 768.f, ctx);
+    REQUIRE(hasCreate(named));
+    REQUIRE(named.textFields[1].focused);
+    REQUIRE(named.textFields[1].caret);
+    REQUIRE_FALSE(named.textFields[0].focused);
+
+    // The caret obeys the blink phase.
+    ctx.caretVisible = false;
+    MenuLayout blink = buildScreenLayout(GameScreen::WORLD_CREATE, 1024.f, 768.f, ctx);
+    REQUIRE_FALSE(blink.textFields[1].caret);
+}
+
+TEST_CASE("Typed hit-testing distinguishes fields and buttons", "[ui][worlds]") {
+    MenuContext ctx;
+    ctx.worldCreate.name = "Base";
+    MenuLayout layout = buildScreenLayout(GameScreen::WORLD_CREATE, 1024.f, 768.f, ctx);
+
+    const auto& field = layout.textFields[0];
+    UIHit hit =
+        uiHitTest(layout, field.rect.x + field.rect.w * 0.5f, field.rect.y + field.rect.h * 0.5f);
+    REQUIRE(hit.kind == UIHitKind::TEXT_FIELD);
+    REQUIRE(hit.index == 0);
+
+    const auto& button = layout.buttons.front();
+    hit = uiHitTest(layout, button.rect.x + button.rect.w * 0.5f,
+                    button.rect.y + button.rect.h * 0.5f);
+    REQUIRE(hit.kind == UIHitKind::BUTTON);
+    REQUIRE(layout.buttons[static_cast<size_t>(hit.index)].action == button.action);
+
+    REQUIRE(uiHitTest(layout, 0.01f, 0.01f).kind == UIHitKind::NONE);
+}
+
+TEST_CASE("Text field filtering enforces charset and length", "[ui][worlds]") {
+    REQUIRE(filterTextField("My World_2.0-x", false, 24) == "My World_2.0-x");
+    REQUIRE(filterTextField("bad!@#chars$%", false, 24) == "badchars");
+    REQUIRE(filterTextField("way too long name for the field", false, 10) == "way too lo");
+    REQUIRE(filterTextField("seed123seed", true, 10) == "123");
+    REQUIRE(filterTextField("42", true, 10) == "42");
+    REQUIRE(filterTextField("", true, 10).empty());
+}
+
 TEST_CASE("Font covers every character the menus draw", "[ui][font]") {
-    SettingsValues values;
     GraphicsSettings gfx;
     std::string needed = "0123456789.:/-+ ";
-    for (GameScreen screen : {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS,
-                              GameScreen::VIDEO_SETTINGS}) {
-        MenuLayout layout = buildMenuLayout(screen, 1024.f, 768.f, values, gfx);
+
+    // Every screen with a fully populated context, including a world name
+    // exercising the complete allowed charset.
+    MenuContext ctx;
+    ctx.gfx = &gfx;
+    ctx.worldRows = {"A world_NAME.42-x - Survival - Seed 4294967295",
+                     "second row - Creative - Seed 7"};
+    ctx.worldSelect.selected = 0;
+    ctx.worldCreate.name = "AZaz09 ._-";
+    ctx.worldCreate.seedText = "0123456789";
+    ctx.deleteWorldName = "A world_NAME.42-x";
+    for (GameScreen screen :
+         {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS, GameScreen::VIDEO_SETTINGS,
+          GameScreen::WORLD_SELECT, GameScreen::WORLD_CREATE, GameScreen::WORLD_DELETE_CONFIRM}) {
+        MenuLayout layout = buildScreenLayout(screen, 1024.f, 768.f, ctx);
         for (const auto& text : layout.texts)
             needed += text.text;
         for (const auto& button : layout.buttons)
             needed += button.label;
+        for (const auto& field : layout.textFields) {
+            needed += field.label;
+            needed += field.text;
+        }
+    }
+    // The full world-name charset can appear in any typed name.
+    for (int c = 0; c < 128; ++c) {
+        if (isWorldNameChar(static_cast<char>(c)))
+            needed += static_cast<char>(c);
     }
     // Plus everything the debug HUD prints
     needed += "FPS: Chunks: Entities: Frame: ";

@@ -24,6 +24,8 @@
 #include <world/world.hpp>
 #include <world/world_list.hpp>
 
+#include <random>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -316,6 +318,9 @@ struct EngineState {
     FurnaceMap furnaces;
 
     // ---- Game flow & UI ----
+    std::vector<WorldSummary> worldList; // cached on entering the world menus
+    WorldSelectState worldSelect;
+    WorldCreateState worldCreate;
     GameFlow flow;                   // Title → Playing ⇄ Paused ⇄ Settings
     bool spawnValidated = false;     // player unstuck from stale-save terrain
     SettingsValues settings;         // live values shown in the settings menu
@@ -720,6 +725,17 @@ static std::string defaultWorldDirectory() {
             [self applyFlowEffects:_state->flow.onWorldStarted()];
         }
     }
+    if (screenName == "worlds" || screenName == "delete") {
+        _state->worldList = listWorlds();
+        if (screenName == "delete" && !_state->worldList.empty()) {
+            _state->worldSelect.selected = 0;
+            _state->flow.screen = GameScreen::WORLD_DELETE_CONFIRM;
+        } else {
+            _state->flow.screen = GameScreen::WORLD_SELECT;
+        }
+    } else if (screenName == "create") {
+        _state->flow.screen = GameScreen::WORLD_CREATE;
+    }
     if (_state->world && wantsGameplayScreen) {
         if (screenName == "playing") {
             _state->flow.screen = GameScreen::PLAYING;
@@ -1019,6 +1035,120 @@ static std::string defaultWorldDirectory() {
     }
 }
 
+// Close the focused text field, committing its filtered contents.
+- (void)commitTextEntry {
+    EngineState* state = _state.get();
+    InputState& input = state->inputManager->state();
+    if (!input.textEntryActive)
+        return;
+    const bool digits = state->worldCreate.focusedField == 1;
+    const std::string value = filterTextField(input.endTextEntry(), digits,
+                                              digits ? WorldCreateState::MAX_SEED_LENGTH
+                                                     : WorldCreateState::MAX_NAME_LENGTH);
+    if (state->worldCreate.focusedField == 0) {
+        state->worldCreate.name = value;
+    } else if (state->worldCreate.focusedField == 1) {
+        state->worldCreate.seedText = value;
+    }
+    state->worldCreate.focusedField = -1;
+}
+
+// One menu click: engine-side effects first (world lifecycle, list edits),
+// then the pure flow transition.
+- (void)handleMenuAction:(MenuAction)action payload:(int)payload {
+    EngineState* state = _state.get();
+    const int worldCount = static_cast<int>(state->worldList.size());
+    switch (action) {
+        case MenuAction::OPEN_WORLD_SELECT:
+            state->worldList = listWorlds();
+            state->worldSelect = WorldSelectState{};
+            break;
+        case MenuAction::OPEN_WORLD_CREATE:
+            state->worldCreate = WorldCreateState{};
+            break;
+        case MenuAction::SELECT_WORLD:
+            if (payload >= 0 && payload < worldCount) {
+                state->worldSelect.selected = payload;
+            }
+            return;
+        case MenuAction::WORLD_LIST_UP:
+            state->worldSelect.scroll = std::max(0, state->worldSelect.scroll - 1);
+            return;
+        case MenuAction::WORLD_LIST_DOWN:
+            state->worldSelect.scroll =
+                std::min(std::max(0, worldCount - WorldSelectState::VISIBLE_ROWS),
+                         state->worldSelect.scroll + 1);
+            return;
+        case MenuAction::PLAY_SELECTED_WORLD: {
+            const int selected = state->worldSelect.selected;
+            if (selected < 0 || selected >= worldCount)
+                return;
+            if ([self startWorldAtPath:state->worldList[static_cast<size_t>(selected)].directory]) {
+                [self applyFlowEffects:state->flow.onWorldStarted()];
+            }
+            return;
+        }
+        case MenuAction::RANDOM_SEED:
+            state->worldCreate.seedText = std::to_string(std::random_device{}());
+            return;
+        case MenuAction::TOGGLE_GEN_STRUCTURES:
+            state->worldCreate.structures = !state->worldCreate.structures;
+            return;
+        case MenuAction::TOGGLE_GEN_FAUNA:
+            state->worldCreate.fauna = !state->worldCreate.fauna;
+            return;
+        case MenuAction::TOGGLE_GEN_WEATHER:
+            state->worldCreate.weather = !state->worldCreate.weather;
+            return;
+        case MenuAction::TOGGLE_GEN_DAY_CYCLE:
+            state->worldCreate.dayCycle = !state->worldCreate.dayCycle;
+            return;
+        case MenuAction::TOGGLE_CREATE_MODE:
+            state->worldCreate.creative = !state->worldCreate.creative;
+            return;
+        case MenuAction::CREATE_WORLD_CONFIRM: {
+            const WorldCreateState& create = state->worldCreate;
+            const uint32_t seed =
+                create.seedText.empty()
+                    ? static_cast<uint32_t>(std::random_device{}())
+                    : static_cast<uint32_t>(std::strtoull(create.seedText.c_str(), nullptr, 10));
+            GenerationSettings generation;
+            generation.structures = create.structures;
+            generation.fauna = create.fauna;
+            generation.weather = create.weather;
+            generation.dayCycle = create.dayCycle;
+            const auto directory =
+                createWorld(create.name, seed,
+                            create.creative ? GameMode::CREATIVE : GameMode::SURVIVAL, generation);
+            if (directory && [self startWorldAtPath:*directory]) {
+                [self applyFlowEffects:state->flow.onWorldStarted()];
+            }
+            return;
+        }
+        case MenuAction::CONFIRM_DELETE: {
+            const int selected = state->worldSelect.selected;
+            if (selected >= 0 && selected < worldCount) {
+                deleteWorld(state->worldList[static_cast<size_t>(selected)].directory);
+            }
+            state->worldList = listWorlds();
+            state->worldSelect = WorldSelectState{};
+            [self applyFlowEffects:state->flow.onMenuAction(MenuAction::CANCEL_DELETE)];
+            return;
+        }
+        case MenuAction::SAVE_QUIT_TO_TITLE:
+            [self stopWorld];
+            return;
+        default:
+            break;
+    }
+    [self applySettingAction:action];
+    [self applyFlowEffects:state->flow.onMenuAction(action)];
+    if ((action == MenuAction::CLOSE_SETTINGS || action == MenuAction::CLOSE_VIDEO_SETTINGS) &&
+        !state->envOverridesActive) {
+        saveSettings(settingsPath(), state->settings, state->gfx);
+    }
+}
+
 - (void)handleGlobalInput {
     EngineState* state = _state.get();
     if (!state->inputManager)
@@ -1026,13 +1156,18 @@ static std::string defaultWorldDirectory() {
     InputState& input = state->inputManager->state();
 
     if (input.isJustPressed(Key::Escape)) {
-        // Leaving a settings screen persists the values (not per click —
-        // no disk I/O while stepping)
-        bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
-                               state->flow.screen == GameScreen::VIDEO_SETTINGS;
-        [self applyFlowEffects:state->flow.onEscape()];
-        if (leavingSettings && !state->envOverridesActive) {
-            saveSettings(settingsPath(), state->settings, state->gfx);
+        if (input.textEntryActive) {
+            // Escape closes the field, not the screen.
+            [self commitTextEntry];
+        } else {
+            // Leaving a settings screen persists the values (not per click —
+            // no disk I/O while stepping)
+            bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
+                                   state->flow.screen == GameScreen::VIDEO_SETTINGS;
+            [self applyFlowEffects:state->flow.onEscape()];
+            if (leavingSettings && !state->envOverridesActive) {
+                saveSettings(settingsPath(), state->settings, state->gfx);
+            }
         }
     }
     if (input.isJustPressed(Key::F3)) {
@@ -1044,31 +1179,67 @@ static std::string defaultWorldDirectory() {
         // hit-test in window points — the same normalized space it's drawn in
         float boundsW = static_cast<float>(_view.bounds.size.width);
         float boundsH = static_cast<float>(_view.bounds.size.height);
-        state->menuLayout =
-            buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings, state->gfx);
+
+        // Live text entry streams into the focused create-screen field.
+        if (input.textEntryActive && state->worldCreate.focusedField >= 0) {
+            const bool digits = state->worldCreate.focusedField == 1;
+            const std::string filtered = filterTextField(
+                input.textBuffer, digits,
+                digits ? WorldCreateState::MAX_SEED_LENGTH : WorldCreateState::MAX_NAME_LENGTH);
+            if (filtered != input.textBuffer) {
+                input.textBuffer = filtered;
+            }
+            if (state->worldCreate.focusedField == 0) {
+                state->worldCreate.name = filtered;
+            } else {
+                state->worldCreate.seedText = filtered;
+            }
+            if (input.textSubmitted) {
+                [self commitTextEntry];
+            }
+        }
+
+        MenuContext menuCtx;
+        menuCtx.settings = state->settings;
+        menuCtx.gfx = &state->gfx;
+        menuCtx.caretVisible = (state->frameCount / 30) % 2 == 0;
+        if (state->flow.screen == GameScreen::WORLD_SELECT ||
+            state->flow.screen == GameScreen::WORLD_DELETE_CONFIRM) {
+            menuCtx.worldRows.reserve(state->worldList.size());
+            for (const WorldSummary& world : state->worldList) {
+                menuCtx.worldRows.push_back(world.metadata.name + " - " +
+                                            gameModeName(world.metadata.gameMode) + " - Seed " +
+                                            std::to_string(world.metadata.seed));
+            }
+            menuCtx.worldSelect = state->worldSelect;
+            const int selected = state->worldSelect.selected;
+            if (selected >= 0 && selected < static_cast<int>(state->worldList.size())) {
+                menuCtx.deleteWorldName =
+                    state->worldList[static_cast<size_t>(selected)].metadata.name;
+            }
+        }
+        if (state->flow.screen == GameScreen::WORLD_CREATE) {
+            menuCtx.worldCreate = state->worldCreate;
+        }
+        state->menuLayout = buildScreenLayout(state->flow.screen, boundsW, boundsH, menuCtx);
 
         Vec2 mouse = input.mousePosition;
-        state->hoveredButton = menuHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
+        const UIHit hit = uiHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
+        state->hoveredButton = hit.kind == UIHitKind::BUTTON ? hit.index : -1;
 
-        if (input.isJustPressed(Key::MouseLeft) && state->hoveredButton >= 0) {
-            MenuAction action =
-                state->menuLayout.buttons[static_cast<size_t>(state->hoveredButton)].action;
-            if (action == MenuAction::PLAY && !state->world) {
-                // Interim entry until the selection screen: PLAY opens the
-                // default world.
-                if ([self startWorldAtPath:defaultWorldDirectory()]) {
-                    [self applyFlowEffects:state->flow.onWorldStarted()];
-                }
-            } else if (action == MenuAction::SAVE_QUIT_TO_TITLE) {
-                [self stopWorld];
+        if (input.isJustPressed(Key::MouseLeft)) {
+            if (hit.kind == UIHitKind::TEXT_FIELD) {
+                [self commitTextEntry];
+                state->worldCreate.focusedField = hit.index;
+                input.beginTextEntry(hit.index == 0 ? state->worldCreate.name
+                                                    : state->worldCreate.seedText);
             } else {
-                [self applySettingAction:action];
-                [self applyFlowEffects:state->flow.onMenuAction(action)];
+                [self commitTextEntry];
             }
-            if ((action == MenuAction::CLOSE_SETTINGS ||
-                 action == MenuAction::CLOSE_VIDEO_SETTINGS) &&
-                !state->envOverridesActive) {
-                saveSettings(settingsPath(), state->settings, state->gfx);
+            if (hit.kind == UIHitKind::BUTTON) {
+                const MenuButton& button =
+                    state->menuLayout.buttons[static_cast<size_t>(hit.index)];
+                [self handleMenuAction:button.action payload:button.payload];
             }
         }
     } else {

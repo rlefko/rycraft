@@ -5,7 +5,7 @@
 
 void drawGameHud(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
                  uint32_t displayHeight) {
-    if (frame.screen == GameScreen::TITLE)
+    if (!screenHasWorldSession(frame.screen))
         return;
 
     const float w = static_cast<float>(displayWidth);
@@ -94,19 +94,53 @@ void drawMenu(UIOverlay& ui, const MenuLayout& layout, int hoveredButton, uint32
         if (hovered) {
             ui.drawQuad(button.rect.x, button.rect.y, button.rect.w, button.rect.h, 0.45f, 0.52f,
                         0.82f, 0.95f);
+        } else if (button.emphasized) {
+            ui.drawQuad(button.rect.x, button.rect.y, button.rect.w, button.rect.h, 0.30f, 0.48f,
+                        0.36f, 0.95f);
         } else {
             ui.drawQuad(button.rect.x, button.rect.y, button.rect.w, button.rect.h, 0.33f, 0.33f,
                         0.38f, 0.92f);
         }
 
-        const float labelScale = 2.0f * (h / 768.0f);
+        // Long labels (world rows) shrink to fit instead of bleeding out.
+        float labelScale = 2.0f * (h / 768.0f);
         float labelWidth = ui.measureString(button.label.c_str(), labelScale);
+        const float maxWidth = button.rect.w * 0.94f;
+        if (labelWidth > maxWidth && labelWidth > 0.f) {
+            labelScale *= maxWidth / labelWidth;
+            labelWidth = ui.measureString(button.label.c_str(), labelScale);
+        }
         float labelHeight = 8.0f * labelScale / h;
         float labelX = button.rect.x + (button.rect.w - labelWidth) * 0.5f;
         float labelY = button.rect.y + (button.rect.h - labelHeight) * 0.5f;
         float brightness = hovered ? 1.0f : 0.92f;
         ui.drawString(button.label.c_str(), labelX, labelY, labelScale, brightness, brightness,
                       brightness);
+    }
+
+    for (const TextFieldWidget& field : layout.textFields) {
+        float bx = 2.0f / w;
+        float by = 2.0f / h;
+        const float border = field.focused ? 0.85f : 0.35f;
+        ui.drawQuad(field.rect.x - bx, field.rect.y - by, field.rect.w + 2 * bx,
+                    field.rect.h + 2 * by, border, border, border + 0.05f, 0.95f);
+        ui.drawQuad(field.rect.x, field.rect.y, field.rect.w, field.rect.h, 0.05f, 0.05f, 0.07f,
+                    0.95f);
+
+        const float labelScale = 1.5f * (h / 768.0f);
+        ui.drawString(field.label.c_str(), field.rect.x, field.rect.y + field.rect.h + 4.0f / h,
+                      labelScale, 0.8f, 0.8f, 0.85f);
+
+        const float textScale = 2.0f * (h / 768.0f);
+        const float textHeight = 8.0f * textScale / h;
+        const float textX = field.rect.x + 8.0f / w;
+        const float textY = field.rect.y + (field.rect.h - textHeight) * 0.5f;
+        const float advance =
+            ui.drawString(field.text.c_str(), textX, textY, textScale, 1.0f, 1.0f, 1.0f);
+        if (field.caret) {
+            ui.drawQuad(textX + advance + 1.0f / w, textY, 2.0f / w, textHeight, 1.0f, 1.0f, 1.0f,
+                        0.9f);
+        }
     }
 
     for (const MenuText& text : layout.texts) {
