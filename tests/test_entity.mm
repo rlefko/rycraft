@@ -12,6 +12,7 @@
 #include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
+#include <entity/item_entity.hpp>
 #include <entity/physics.hpp>
 #include <entity/player.hpp>
 #include <entity/spatial_hash.hpp>
@@ -2622,4 +2623,96 @@ TEST_CASE("Game mode gates: flight refusal and fall damage immunity", "[player][
     }
     REQUIRE(creative.onGround);
     REQUIRE(creative.health == 20);
+}
+
+// ============================================================================
+// Dropped item entities
+// ============================================================================
+
+TEST_CASE("Dropped item falls under gravity and lands on solid ground", "[item-entity][physics]") {
+    auto world = makePlatform(101); // stone surface top at y = 101
+
+    ItemEntityManager manager;
+    manager.spawn(ItemStack{ItemType::COAL, 1, 0}, Vec3{0.f, 105.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+    REQUIRE(manager.items().size() == 1);
+    const float startY = manager.items().front().position.y;
+
+    for (int tick = 0; tick < 200; ++tick) {
+        manager.tick(*world, Vec3{0.f, 105.f, 0.f});
+        if (manager.items().front().onGround)
+            break;
+    }
+    const ItemEntity& item = manager.items().front();
+    REQUIRE(item.position.y < startY);                              // gravity pulled it down
+    REQUIRE(item.position.y == Catch::Approx(101.f).margin(0.05f)); // rests on the surface
+    REQUIRE(item.onGround);
+}
+
+TEST_CASE("Item entities freeze beyond the active radius", "[item-entity]") {
+    auto world = makePlatform(101);
+    ItemEntityManager manager;
+    // Far from the player: should not move or age.
+    const Vec3 farPos{500.f, 130.f, 500.f};
+    manager.spawn(ItemStack{ItemType::STICK, 1, 0}, farPos, Vec3{0.f, 0.f, 0.f}, 0);
+    for (int tick = 0; tick < 20; ++tick) {
+        manager.tick(*world, Vec3{0.f, 105.f, 0.f});
+    }
+    REQUIRE(manager.items().front().position.y == Catch::Approx(130.f));
+    REQUIRE(manager.items().front().ageTicks == 0);
+}
+
+TEST_CASE("Same-type items merge within range", "[item-entity]") {
+    auto world = makePlatform(101);
+    ItemEntityManager manager;
+    manager.spawn(ItemStack{ItemType::COAL, 10, 0}, Vec3{0.f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+    manager.spawn(ItemStack{ItemType::COAL, 5, 0}, Vec3{0.2f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+    manager.spawn(ItemStack{ItemType::STICK, 3, 0}, Vec3{0.1f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+
+    // The merge pass runs once per second (20 ticks).
+    for (int tick = 0; tick < 21; ++tick) {
+        manager.tick(*world, Vec3{0.f, 101.f, 0.f});
+    }
+    int coal = 0;
+    int coalStacks = 0;
+    int sticks = 0;
+    for (const ItemEntity& item : manager.items()) {
+        if (item.stack.type == ItemType::COAL) {
+            coal += item.stack.count;
+            ++coalStacks;
+        }
+        if (item.stack.type == ItemType::STICK)
+            sticks += item.stack.count;
+    }
+    REQUIRE(coal == 15);
+    REQUIRE(coalStacks == 1); // the two coal drops folded into one
+    REQUIRE(sticks == 3);     // the stick drop is untouched
+}
+
+TEST_CASE("Item spawns respect the cap by evicting the oldest", "[item-entity]") {
+    auto world = makePlatform(101);
+    ItemEntityManager manager;
+    for (size_t i = 0; i < ItemEntityManager::MAX_ITEMS; ++i) {
+        manager.spawn(ItemStack{ItemType::STICK, 1, 0}, Vec3{static_cast<float>(i), 101.f, 0.f},
+                      Vec3{0.f, 0.f, 0.f}, 0);
+    }
+    REQUIRE(manager.items().size() == ItemEntityManager::MAX_ITEMS);
+    // One more never exceeds the cap; the fresh spawn survives.
+    manager.spawn(ItemStack{ItemType::DIAMOND, 1, 0}, Vec3{0.f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f},
+                  0);
+    REQUIRE(manager.items().size() == ItemEntityManager::MAX_ITEMS);
+    bool hasDiamond = false;
+    for (const ItemEntity& item : manager.items()) {
+        if (item.stack.type == ItemType::DIAMOND)
+            hasDiamond = true;
+    }
+    REQUIRE(hasDiamond);
+}
+
+TEST_CASE("Aged-out items despawn", "[item-entity]") {
+    auto world = makePlatform(101);
+    ItemEntityManager manager;
+    manager.spawn(ItemStack{ItemType::STICK, 1, 0}, Vec3{0.f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+    manager.items().front().ageTicks = ItemEntity::DESPAWN_TICKS - 1;
+    manager.tick(*world, Vec3{0.f, 101.f, 0.f});
+    REQUIRE(manager.items().empty());
 }

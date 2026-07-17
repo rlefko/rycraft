@@ -6,6 +6,7 @@ entity_sources = files(
   'ai.cpp',
   'spatial_hash.cpp',
   'spawner.cpp',
+  'item_entity.cpp',
 )
 
 libentity = static_library('entity',

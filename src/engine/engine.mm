@@ -14,6 +14,7 @@
 #include <engine/inventory.hpp>
 #include <engine/slot_interaction.hpp>
 #include <entity/ai.hpp>
+#include <entity/item_entity.hpp>
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
@@ -319,6 +320,8 @@ struct EngineState {
     int hunger = 20;
     FurnaceMap furnaces;
     std::optional<BlockPos> openFurnace; // the furnace the FURNACE screen edits
+    ItemEntityManager itemEntities;
+    int pickupSoundCooldown = 0;
 
     // ---- Container screens ----
     std::array<ItemStack, 9> craftGrid{}; // first 4 used on the inventory screen
@@ -542,6 +545,8 @@ static std::string defaultWorldDirectory() {
     }
     state->furnaces = state->saveManager->loadBlockEntities();
     state->openFurnace.reset();
+    state->itemEntities.clear();
+    state->pickupSoundCooldown = 0;
     state->craftGrid.fill(ItemStack{});
     state->craftResult.clear();
     state->cursorStack.clear();
@@ -621,6 +626,7 @@ static std::string defaultWorldDirectory() {
     state->saveManager.reset();
     state->furnaces.clear();
     state->openFurnace.reset();
+    state->itemEntities.clear();
     state->inventory.clear();
     state->hasHighlightedBlock = false;
     state->worldName.clear();
@@ -1111,6 +1117,48 @@ static std::string defaultWorldDirectory() {
             if (furnace.lit()) {
                 [self playSfx:state->sfxBlockPlace gain:0.3f];
             }
+        }
+    }
+}
+
+// Dropped-item physics and the pickup pass. The manager owns physics/merge/
+// despawn; the inventory mutation lives here so the entity module never
+// depends on the engine's Inventory.
+- (void)tickItemEntities:(EngineState*)state {
+    if (!state->world)
+        return;
+    state->itemEntities.tick(*state->world, state->player.position);
+
+    if (state->pickupSoundCooldown > 0)
+        --state->pickupSoundCooldown;
+
+    const AABB playerBox = state->player.getAABB();
+    const AABB pickupBox{Vec3{playerBox.min.x - ItemEntityManager::PICKUP_XZ,
+                              playerBox.min.y - ItemEntityManager::PICKUP_Y,
+                              playerBox.min.z - ItemEntityManager::PICKUP_XZ},
+                         Vec3{playerBox.max.x + ItemEntityManager::PICKUP_XZ,
+                              playerBox.max.y + ItemEntityManager::PICKUP_Y,
+                              playerBox.max.z + ItemEntityManager::PICKUP_XZ}};
+
+    bool pickedUp = false;
+    for (ItemEntity& item : state->itemEntities.items()) {
+        if (item.pickupDelay > 0 || item.stack.empty())
+            continue;
+        if (!pickupBox.intersects(item.getAABB()))
+            continue;
+        const int absorbed = state->inventory.add(item.stack);
+        if (absorbed > 0) {
+            item.stack.count = static_cast<uint8_t>(item.stack.count - absorbed);
+            if (item.stack.count == 0)
+                item.stack.clear();
+            pickedUp = true;
+        }
+    }
+    if (pickedUp) {
+        state->itemEntities.compact();
+        if (state->pickupSoundCooldown == 0) {
+            [self playSfx:state->sfxBlockPlace gain:0.35f];
+            state->pickupSoundCooldown = 2;
         }
     }
 }
@@ -1649,6 +1697,27 @@ static std::string defaultWorldDirectory() {
                 }
             }
 
+            // Playtest hook: RYCRAFT_SPAWN_ITEMS=N scatters N dropped items on
+            // the loaded ground ahead of spawn so headless captures can show
+            // the item entities falling and resting (never in unloaded space,
+            // where closed missing cubes would freeze them mid-air).
+            static const int spawnItems = [] {
+                const char* v = std::getenv("RYCRAFT_SPAWN_ITEMS");
+                return v ? std::clamp(std::atoi(v), 0, 64) : 0;
+            }();
+            for (int i = 0; i < spawnItems; ++i) {
+                const auto type =
+                    CREATIVE_PALETTE[static_cast<size_t>(i) % CREATIVE_PALETTE.size()];
+                const int64_t wx = px + (i % 8) - 3;
+                const int64_t wz = pz + 3 + i / 8;
+                const int32_t surface = static_cast<int32_t>(std::clamp(
+                    state->world->getTerrainHeight(wx, wz) + CHUNK_EDGE,
+                    static_cast<double>(WORLD_MIN_Y + 1), static_cast<double>(WORLD_MAX_Y - 1)));
+                const Vec3 pos{static_cast<float>(wx) + 0.5f, static_cast<float>(surface) + 3.0f,
+                               static_cast<float>(wz) + 0.5f};
+                state->itemEntities.spawn(makeItemStack(type, 1), pos, Vec3{0.f, 0.f, 0.f}, 0);
+            }
+
             // Playtest hook: RYCRAFT_YAW / RYCRAFT_PITCH (degrees) point the
             // camera for captures — e.g. face the afternoon sun for the lens
             // flare. Yaw 0 looks +Z; -90 looks -X.
@@ -1876,6 +1945,29 @@ static std::string defaultWorldDirectory() {
             [self placeBlock:state hit:rayHit];
         }
     }
+
+    // Q drops one item from the selected hotbar stack, thrown ahead of the
+    // eye. Creative drops without decrementing.
+    {
+        InputBindings bindings;
+        if (input.isPressedForTick(bindings.drop.key)) {
+            const ItemStack selected = state->inventory.getSelectedStack();
+            if (!selected.empty()) {
+                const Vec3 eye = state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f};
+                const Vec3 dir = state->camera.forward();
+                const Vec3 velocity{dir.x * 0.3f, dir.y * 0.3f + 0.15f, dir.z * 0.3f};
+                state->itemEntities.spawn(ItemStack{selected.type, 1, selected.durability},
+                                          eye + dir * 0.4f, velocity, 40);
+                if (modeConsumesItems(state->gameMode)) {
+                    state->inventory.consumeSelected();
+                }
+            }
+        }
+    }
+
+    // Dropped items: physics, merge, despawn, then a pickup pass into the
+    // inventory. Beyond the manager's active radius items freeze.
+    [self tickItemEntities:state];
 
     // Publish the immutable loaded-cube registry once per simulation tick.
     // Rendering reads this pointer without copying or taking the world lock.
@@ -2246,7 +2338,8 @@ static std::string defaultWorldDirectory() {
         _queue, drawable, viewMatrix, state->projectionMatrix, *state->world, state->camera,
         state->worldTime, state->deltaTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
-        uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
+        uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr,
+        &state->itemEntities.items());
 
     if (updatePerformanceCapture(state->performance, state->frameCount, state->deltaTime * 1000.0,
                                  state->cachedChunkCount, state->autopilotStopFrame, *state->world,

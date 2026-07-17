@@ -27,7 +27,9 @@
 
 // Forward declarations
 class Entity;
+struct ItemEntity;
 class EntityRenderer;
+class ItemEntityRenderer;
 class World;
 class Camera;
 class UIOverlay;
@@ -139,7 +141,8 @@ public:
                 uint64_t worldTime = 0, double deltaSeconds = 0.0,
                 std::optional<Vec3> highlightedBlock = std::nullopt,
                 const UIFrameState& uiFrame = UIFrameState{},
-                const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
+                const std::vector<std::shared_ptr<Entity>>* entities = nullptr,
+                const std::vector<ItemEntity>* itemEntities = nullptr);
 
     // Menu-only frame when no world session is live: one single-sample pass
     // that clears the drawable to the backdrop color and draws the UI
@@ -326,6 +329,7 @@ private:
 
     // Animal voxel-model renderer
     std::unique_ptr<EntityRenderer> _entityRenderer;
+    std::unique_ptr<ItemEntityRenderer> _itemEntityRenderer;
 
     // GPU frame/pass timing (per-pass sampling only under RYCRAFT_GPU_COUNTERS)
     std::unique_ptr<GpuFrameTimer> _gpuTimer;

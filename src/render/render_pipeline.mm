@@ -4,6 +4,7 @@
 #include "render/block_textures.hpp"
 #include "render/bloom.hpp"
 #include "render/entity_renderer.hpp"
+#include "render/item_entity_renderer.hpp"
 #include "render/lod_mesher.hpp"
 #include "render/pixel_formats.hpp"
 #include "render/post_stack.hpp"
@@ -432,6 +433,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
     // ---- Animal renderer ----
     _entityRenderer = std::make_unique<EntityRenderer>(_device, shaderLibrary);
+    _itemEntityRenderer = std::make_unique<ItemEntityRenderer>(_device, shaderLibrary);
 
     // ---- GPU timing (per-pass sampling is a diagnostic opt-in) ----
     const char* counters = std::getenv("RYCRAFT_GPU_COUNTERS");
@@ -521,7 +523,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                             const World& world, const Camera& camera, uint64_t worldTime,
                             double deltaSeconds, std::optional<Vec3> highlightedBlock,
                             const UIFrameState& uiFrame,
-                            const std::vector<std::shared_ptr<Entity>>* entities) {
+                            const std::vector<std::shared_ptr<Entity>>* entities,
+                            const std::vector<ItemEntity>* itemEntities) {
     if (!drawable || !queue)
         return;
 
@@ -688,6 +691,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     if (entities && _entityRenderer) {
         _entityRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset, *entities,
                                 [this](const AABB& aabb) { return isChunkInFrustum(aabb); });
+    }
+    if (itemEntities && _itemEntityRenderer) {
+        _itemEntityRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset,
+                                    *itemEntities,
+                                    [this](const AABB& aabb) { return isChunkInFrustum(aabb); });
     }
 
     if (highlightedBlock.has_value()) {
