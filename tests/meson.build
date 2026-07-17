@@ -19,6 +19,7 @@ test_sources = files(
   'test_tree_geometry.mm',
   'test_render.mm',
   'test_items.mm',
+  'test_recipes.mm',
   'test_entity.mm',
   'test_fauna_habitat.mm',
   'test_fluid_persistence.mm',
