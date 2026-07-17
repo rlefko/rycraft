@@ -231,6 +231,23 @@ TEST_CASE("Settings save/load round-trips values and video settings", "[engine][
     REQUIRE(loaded.gfx.sharpening == 6);
 }
 
+TEST_CASE("Settings reuse the supported world view-distance contract", "[engine][settings]") {
+    STATIC_REQUIRE(SettingsValues::MIN_VIEW_DISTANCE == MIN_RENDER_DISTANCE_CHUNKS);
+    STATIC_REQUIRE(SettingsValues::MAX_VIEW_DISTANCE == MAX_RENDER_DISTANCE_CHUNKS);
+    STATIC_REQUIRE(SettingsValues::DEFAULT_VIEW_DISTANCE == DEFAULT_RENDER_DISTANCE_CHUNKS);
+    STATIC_REQUIRE(SettingsValues::VIEW_DISTANCES.front() == MIN_RENDER_DISTANCE_CHUNKS);
+    STATIC_REQUIRE(SettingsValues::VIEW_DISTANCES.back() == MAX_RENDER_DISTANCE_CHUNKS);
+}
+
+TEST_CASE("Default clear-weather fog preserves the eight-kilometer horizon",
+          "[engine][settings][render][far-terrain]") {
+    REQUIRE(fogDensityForLevel(0) == 0.0F);
+    REQUIRE(fogDensityForLevel(3) == Catch::Approx(0.00015F));
+    constexpr float HORIZON_BLOCKS = MAX_RENDER_DISTANCE_CHUNKS * CHUNK_EDGE;
+    const float fogCoverage = 1.0F - std::exp(-fogDensityForLevel(3) * HORIZON_BLOCKS);
+    REQUIRE(fogCoverage < 0.75F);
+}
+
 TEST_CASE("Settings load: missing file and out-of-range values fall back", "[engine][settings]") {
     TempDir dir("settings");
 

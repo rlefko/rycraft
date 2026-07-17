@@ -44,6 +44,7 @@
 #include <cstddef>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <memory>
 #include <numbers>
 #include <thread>
@@ -82,6 +83,23 @@ TEST_CASE("Floor division and local coordinates are canonical for negatives", "[
     REQUIRE(Chunk::worldToChunkY(WORLD_MAX_Y) == WORLD_MAX_CHUNK_Y);
     REQUIRE(Chunk::worldToLocalY(-1) == 15);
     REQUIRE(Chunk::worldToLocalY(WORLD_MAX_Y) == 15);
+}
+
+TEST_CASE("Floating coordinate floors retain neighbor headroom at int64 limits",
+          "[chunk][coords][regression]") {
+    constexpr int64_t minimum = std::numeric_limits<int64_t>::min() + 1;
+    constexpr int64_t maximum = std::numeric_limits<int64_t>::max() - 1;
+    REQUIRE(world_coord::floorToNeighborSafeInt64(-1.01) == -2);
+    REQUIRE(world_coord::floorToNeighborSafeInt64(1.99) == 1);
+    REQUIRE(world_coord::floorToNeighborSafeInt64(std::numeric_limits<double>::quiet_NaN()) == 0);
+    REQUIRE(world_coord::floorToNeighborSafeInt64(-std::numeric_limits<double>::infinity()) ==
+            minimum);
+    REQUIRE(world_coord::floorToNeighborSafeInt64(std::numeric_limits<double>::infinity()) ==
+            maximum);
+    REQUIRE(world_coord::floorToNeighborSafeInt64(-0x1p63) == minimum);
+    REQUIRE(world_coord::floorToNeighborSafeInt64(0x1p63) == maximum);
+    REQUIRE(world_coord::floorToNeighborSafeInt64(std::nextafter(0x1p63, 0.0)) <= maximum);
+    REQUIRE(world_coord::floorToNeighborSafeInt64(std::nextafter(-0x1p63, 0.0)) >= minimum);
 }
 
 TEST_CASE("Three dimensional positions compare and hash distinctly", "[chunk][coords]") {
@@ -524,8 +542,10 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
 
     REQUIRE(surface.hydrology.lake);
     REQUIRE(surface.hydrology.endorheic);
+    REQUIRE(surface.hydrology.waterBodyId != worldgen::NO_WATER_BODY);
     REQUIRE(surface.waterSurface > surface.terrainHeight);
     REQUIRE(waterTopY > surfaceY);
+    const worldgen::WaterBodyId craterWaterBodyId = surface.hydrology.waterBodyId;
 
     Chunk conduit(ChunkPos{chunkX, Chunk::worldToChunkY(conduitY), chunkZ});
     Chunk craterFloor(ChunkPos{chunkX, Chunk::worldToChunkY(surfaceY), chunkZ});
@@ -589,6 +609,10 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
         int64_t priorX = centerX;
         int64_t priorZ = centerZ;
         double maximumStep = 0.0;
+        int64_t maximumStepFromX = centerX;
+        int64_t maximumStepFromZ = centerZ;
+        int64_t maximumStepToX = centerX;
+        int64_t maximumStepToZ = centerZ;
         for (int radius = 1; radius <= scanRadius; ++radius) {
             const int64_t sampleX =
                 static_cast<int64_t>(std::llround(centerX + std::cos(angle) * radius));
@@ -597,7 +621,14 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
             const worldgen::SurfaceSample far =
                 generator.sampleFarGeometrySurface(sampleX, sampleZ);
             if (sampleX != priorX || sampleZ != priorZ) {
-                maximumStep = std::max(maximumStep, std::abs(far.terrainHeight - priorHeight));
+                const double step = std::abs(far.terrainHeight - priorHeight);
+                if (step > maximumStep) {
+                    maximumStep = step;
+                    maximumStepFromX = priorX;
+                    maximumStepFromZ = priorZ;
+                    maximumStepToX = sampleX;
+                    maximumStepToZ = sampleZ;
+                }
                 priorHeight = far.terrainHeight;
                 priorX = sampleX;
                 priorZ = sampleZ;
@@ -606,6 +637,7 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
                 far.hydrology.lake &&
                 std::abs(far.waterSurface - primitive->craterLakeSurface) < 1.0e-9;
             if (craterWater) {
+                REQUIRE(far.hydrology.waterBodyId == craterWaterBodyId);
                 REQUIRE_FALSE(foundTransition);
                 sawWet = true;
                 wetX = sampleX;
@@ -622,9 +654,11 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
             const worldgen::SurfaceSample dryExact =
                 generator.sampleExactGeometrySurface(sampleX, sampleZ);
             REQUIRE(wetFar.hydrology.lake);
+            REQUIRE(wetFar.hydrology.waterBodyId == craterWaterBodyId);
             REQUIRE(wetFar.hydrology.lakeShoreDistance > 0.0);
             REQUIRE(wetFar.hydrology.lakeDepth <= 2.0);
             REQUIRE(wetExact.hydrology.lake);
+            REQUIRE(wetExact.hydrology.waterBodyId == craterWaterBodyId);
             REQUIRE_FALSE(dryExact.hydrology.lake);
             REQUIRE(dryExact.hydrology.lakeBank);
             REQUIRE(dryExact.hydrology.lakeShoreDistance <= 0.0);
@@ -648,6 +682,7 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
         }
         REQUIRE(sawWet);
         REQUIRE(foundTransition);
+        CAPTURE(direction, maximumStepFromX, maximumStepFromZ, maximumStepToX, maximumStepToZ);
         REQUIRE(maximumStep <= 2.0);
         return transition;
     };
@@ -687,7 +722,14 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
             const int localX = Chunk::worldToLocal(worldX);
             const int localY = Chunk::worldToLocalY(worldY);
             const int localZ = Chunk::worldToLocal(worldZ);
-            REQUIRE(cube.getBlock(localX, localY, localZ) == BlockType::WATER);
+            const BlockType block = cube.getBlock(localX, localY, localZ);
+            if (worldY == waterTopY && block == BlockType::ICE) {
+                // Climate can cross the freezing threshold within a broad
+                // caldera. An ice cap is a valid top cell as long as the full
+                // liquid volume beneath it remains source water.
+                continue;
+            }
+            REQUIRE(block == BlockType::WATER);
             REQUIRE(cube.getFluidState(localX, localY, localZ).isSource());
         }
     };
@@ -695,7 +737,10 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
     requireSourceColumn(centerX, centerZ);
     const int64_t crossCubeWaterX = centerX + CHUNK_EDGE;
     REQUIRE(Chunk::worldToChunk(crossCubeWaterX) != Chunk::worldToChunk(centerX));
-    REQUIRE(generator.sampleExactGeometrySurface(crossCubeWaterX, centerZ).hydrology.lake);
+    const worldgen::SurfaceSample crossCubeWater =
+        generator.sampleExactGeometrySurface(crossCubeWaterX, centerZ);
+    REQUIRE(crossCubeWater.hydrology.lake);
+    REQUIRE(crossCubeWater.hydrology.waterBodyId == craterWaterBodyId);
     requireSourceColumn(crossCubeWaterX, centerZ);
     for (const RingTransition& transition : forwardRing) {
         Chunk& dryCube = emittedCube(transition.dryX, waterTopY, transition.dryZ);
@@ -709,6 +754,9 @@ TEST_CASE("Hotspot volcanoes emit conduits and settled crater lakes", "[worldgen
     }
 
     generator.clearMacroCaches();
+    const worldgen::SurfaceSample rebuiltCenter = generator.sampleSurface(x, z);
+    REQUIRE(rebuiltCenter.hydrology.waterBodyId == craterWaterBodyId);
+    REQUIRE(rebuiltCenter.waterSurface == surface.waterSurface);
     std::vector<RingTransition> rebuiltRing(static_cast<size_t>(RING_DIRECTIONS));
     for (int direction = RING_DIRECTIONS - 1; direction >= 0; --direction) {
         rebuiltRing[static_cast<size_t>(direction)] = scanDirection(direction);
@@ -843,8 +891,13 @@ TEST_CASE("Column plans cache immutable cubic surface data", "[worldgen][column-
     const int64_t worldZ = column.z * CHUNK_EDGE + localZ;
     const worldgen::SurfaceSample planned = first->sample(localX, localZ);
     const worldgen::SurfaceSample direct = generator.sampleSurface(worldX, worldZ);
-    REQUIRE(planned.terrainHeight == Catch::Approx(direct.terrainHeight));
-    REQUIRE(planned.waterSurface == Catch::Approx(direct.waterSurface));
+    // ColumnPlan::sample retains the continuous hydrologic substrate while
+    // the exact surface grid records the emitted voxel top. The public
+    // block-footprint sampler must expose that exact mesh plane.
+    REQUIRE(first->surfaceY(localX, localZ) + 1 == Catch::Approx(direct.terrainHeight));
+    REQUIRE(std::isfinite(planned.terrainHeight));
+    REQUIRE(planned.waterSurface == Catch::Approx(planned.hydrology.waterSurface));
+    REQUIRE(direct.waterSurface == Catch::Approx(direct.hydrology.waterSurface));
     REQUIRE(planned.biome.primary == direct.biome.primary);
     REQUIRE(std::isfinite(planned.climate.temperatureC));
     REQUIRE(std::isfinite(planned.climate.annualPrecipitationMm));
@@ -904,8 +957,13 @@ TEST_CASE("Column plans expose tree reach from every neighboring face",
                 return surfaces;
             });
 
-        REQUIRE(surfaceSamples == 9);
-        REQUIRE(heightSamples == 16);
+        constexpr int treeApron =
+            (feature_generation::TREE_MAXIMUM_HORIZONTAL_REACH + COLUMN_PLAN_LATTICE_SPACING - 1) /
+            COLUMN_PLAN_LATTICE_SPACING;
+        constexpr size_t sampledEdge = COLUMN_PLAN_LATTICE_EDGE + treeApron * 2;
+        constexpr size_t retainedSamples = COLUMN_PLAN_LATTICE_EDGE * COLUMN_PLAN_LATTICE_EDGE;
+        REQUIRE(surfaceSamples == sampledEdge * sampledEdge);
+        REQUIRE(heightSamples == sampledEdge * sampledEdge - retainedSamples);
         const int minimumTreeY = 40 - feature_generation::TREE_MAXIMUM_SURFACE_DEVIATION + 1 +
                                  feature_generation::TREE_MINIMUM_VERTICAL_OFFSET;
         const int maximumTreeY = 180 + feature_generation::TREE_MAXIMUM_SURFACE_DEVIATION + 1 +
@@ -922,15 +980,15 @@ TEST_CASE("Column plans expose tree reach from every neighboring face",
 TEST_CASE("Column plans expose the exact density surface below macro relief",
           "[worldgen][column-plan][density]") {
     ChunkGenerator generator(42);
-    constexpr int64_t worldX = 16;
-    constexpr int64_t worldZ = 84;
+    constexpr int64_t worldX = 18;
+    constexpr int64_t worldZ = 86;
     const ColumnPos column{Chunk::worldToChunk(worldX), Chunk::worldToChunk(worldZ)};
     const auto plan = generator.getColumnPlan(column);
     const int localX = Chunk::worldToLocal(worldX);
     const int localZ = Chunk::worldToLocal(worldZ);
     const int exactSurface = generator.surfaceYAt(worldX, worldZ);
 
-    REQUIRE(exactSurface == 41);
+    REQUIRE(exactSurface == 79);
     REQUIRE(plan->surfaceY(localX, localZ) == exactSurface);
     REQUIRE(exactSurface <
             static_cast<int>(std::floor(plan->sample(localX, localZ).terrainHeight)));
@@ -945,9 +1003,9 @@ TEST_CASE("Bounded basins expose stable river canyon waterfall and delta feature
     REQUIRE_FALSE(lakeLip.hydrology.endorheic);
     REQUIRE(lakeLip.waterSurface > lakeLip.terrainHeight);
 
-    for (const double z : {2653.0, 2654.0}) {
-        const worldgen::SurfaceSample riverLeft = sampler.sampleSurface(-12289.0, z);
-        const worldgen::SurfaceSample riverRight = sampler.sampleSurface(-12288.0, z);
+    for (const double z : {2759.0, 2760.0}) {
+        const worldgen::SurfaceSample riverLeft = sampler.sampleSurface(-12801.0, z);
+        const worldgen::SurfaceSample riverRight = sampler.sampleSurface(-12800.0, z);
         for (const worldgen::SurfaceSample* river : {&riverLeft, &riverRight}) {
             REQUIRE(river->hydrology.river);
             REQUIRE_FALSE(river->hydrology.lake);
@@ -967,7 +1025,7 @@ TEST_CASE("Bounded basins expose stable river canyon waterfall and delta feature
     REQUIRE(canyon.hydrology.erosionDepth > 4.5);
     REQUIRE(canyon.hydrology.channelGradient > 0.012);
 
-    const worldgen::SurfaceSample waterfall = sampler.sampleSurface(-8256.0, 3072.0);
+    const worldgen::SurfaceSample waterfall = sampler.sampleSurface(-8240.0, 3088.0);
     REQUIRE(waterfall.hydrology.waterfall);
     REQUIRE(waterfall.hydrology.waterfallAnchor);
     REQUIRE(waterfall.hydrology.waterfallTop >= waterfall.hydrology.waterfallBottom + 2.5);
@@ -981,8 +1039,11 @@ TEST_CASE("Bounded basins expose stable river canyon waterfall and delta feature
 
     ChunkGenerator generator(42);
     const worldgen::SurfaceSample emittedDelta = generator.sampleFarSurface(-23904, 0);
-    REQUIRE(emittedDelta.hydrology.ocean);
+    REQUIRE_FALSE(emittedDelta.hydrology.ocean);
+    REQUIRE(emittedDelta.hydrology.river);
     REQUIRE(emittedDelta.hydrology.delta);
+    REQUIRE(emittedDelta.waterSurface == SEA_LEVEL);
+    REQUIRE(emittedDelta.waterSurface > emittedDelta.terrainHeight);
     REQUIRE(emittedDelta.hydrology.distributaryCount == delta.hydrology.distributaryCount);
     REQUIRE(worldgen::hasEcotope(emittedDelta.ecotopes, worldgen::Ecotope::DELTA));
 }
@@ -1014,11 +1075,21 @@ TEST_CASE("Basin cache is single flight bounded and eviction deterministic",
     }
 
     const worldgen::BasinCacheMetrics warm = sampler.basinCacheMetrics();
-    REQUIRE(warm.builds == 1);
+    // This contour page straddles one catchment face, so its canonical
+    // authority has exactly two immutable basin dependencies. Concurrent
+    // callers must still construct each dependency only once.
+    REQUIRE(warm.builds == 2);
     REQUIRE(warm.failures == 0);
-    REQUIRE(warm.entries == 1);
+    REQUIRE(warm.entries == 2);
     REQUIRE(warm.bytes > 0);
     REQUIRE(warm.bytes <= worldgen::BASIN_CACHE_BYTE_BUDGET);
+    REQUIRE(warm.shorelineBuilds == 1);
+    REQUIRE(warm.shorelineMisses == 1);
+    REQUIRE(warm.shorelineHits >= requests.size() - 1);
+    REQUIRE(warm.shorelineFailures == 0);
+    REQUIRE(warm.shorelineEntries == 1);
+    REQUIRE(warm.shorelineBytes > 0);
+    REQUIRE(warm.shorelineBytes <= worldgen::SHORELINE_CACHE_BYTE_BUDGET);
 
     sampler.clearBasinCache();
     const worldgen::HydrologySample rebuilt = sampler.sampleHydrology(-8235.0, 2976.0);
@@ -1027,7 +1098,12 @@ TEST_CASE("Basin cache is single flight bounded and eviction deterministic",
     REQUIRE(rebuilt.discharge == samples.front().discharge);
     const worldgen::BasinCacheMetrics afterEviction = sampler.basinCacheMetrics();
     REQUIRE(afterEviction.failures == 0);
-    REQUIRE(afterEviction.builds == 2);
+    REQUIRE(afterEviction.builds == 4);
+    REQUIRE(afterEviction.entries == 2);
+    REQUIRE(afterEviction.shorelineBuilds == 2);
+    REQUIRE(afterEviction.shorelineFailures == 0);
+    REQUIRE(afterEviction.shorelineEntries == 1);
+    REQUIRE(afterEviction.shorelineBytes > 0);
 }
 
 // ===========================================================================
@@ -1214,6 +1290,7 @@ TEST_CASE("SaveManager metadata records the cubic format version", "[save]") {
     REQUIRE(metadata->spawnPos == Vec3{100.f, 80.f, -50.f});
     REQUIRE(metadata->worldTime == 9876543210ULL);
     REQUIRE(metadata->chunkFormatVersion == CHUNK_VERSION);
+    REQUIRE(metadata->generatorVersion == SaveManager::CURRENT_GENERATOR_VERSION);
 }
 
 TEST_CASE("SaveManager preserves non-chunk player metadata", "[save][metadata]") {
@@ -1321,6 +1398,38 @@ TEST_CASE("Chunk distance sorting includes vertical distance", "[world][priority
     REQUIRE(cubes.back() == ChunkPos{0, 4, 0});
 }
 
+TEST_CASE("Exact streaming priority preserves camera lanes across cold work and camera jumps",
+          "[world][streaming][priority][cold-start][camera-jump][regression]") {
+    STATIC_REQUIRE(EXACT_GENERATION_WORKER_COUNT == 6);
+    STATIC_REQUIRE(EXACT_LATENCY_WORKER_COUNT == 4);
+    STATIC_REQUIRE(EXACT_GENERATION_SUBMISSION_LIMIT == EXACT_GENERATION_WORKER_COUNT + 1);
+    STATIC_REQUIRE(EXACT_GENERATION_SUBMISSION_LIMIT <= MAX_INFLIGHT_GEN);
+    STATIC_REQUIRE(EXACT_MESH_WORKER_COUNT == 4);
+
+    constexpr uint64_t EPOCH = 37;
+    const int64_t camera = exactStreamingTaskPriority(EPOCH, 7, 128);
+    const int64_t explorationEdge = exactStreamingTaskPriority(EPOCH, 6, 0);
+    const int64_t broadSurface = exactStreamingTaskPriority(EPOCH, 4, 0);
+    REQUIRE(camera > explorationEdge);
+    REQUIRE(explorationEdge > broadSurface);
+
+    // Distance resolves work only inside one lane. A new active-set epoch
+    // jumps every still-queued task from the old camera position.
+    REQUIRE(exactStreamingTaskPriority(EPOCH, 6, 4) > exactStreamingTaskPriority(EPOCH, 6, 64));
+    REQUIRE(exactStreamingTaskPriority(EPOCH + 1, 3, 4'096) >
+            exactStreamingTaskPriority(EPOCH, 7, 0));
+}
+
+TEST_CASE("Stale column plans requeue when a camera jump requires them again",
+          "[world][streaming][priority][cold-start][camera-jump][regression]") {
+    using Action = ColumnPlanCompletionAction;
+    REQUIRE(columnPlanCompletionAction(true, false, false, false) == Action::PUBLISH);
+    REQUIRE(columnPlanCompletionAction(false, false, true, false) == Action::REQUEUE);
+    REQUIRE(columnPlanCompletionAction(false, false, true, true) == Action::DROP);
+    REQUIRE(columnPlanCompletionAction(false, false, false, false) == Action::DROP);
+    REQUIRE(columnPlanCompletionAction(false, true, true, false) == Action::DROP);
+}
+
 TEST_CASE("World loads a saved cubic edit before generation", "[world][save]") {
     TempDir directory("world_cubic_load");
     SaveManager saves(directory.path());
@@ -1344,6 +1453,65 @@ TEST_CASE("World streaming remains within the cubic loaded cap", "[world][async]
     }
     REQUIRE(world.getLoadedChunkCount() <= MAX_LOADED_CUBES);
     REQUIRE(world.getLoadedChunkCount() > 0);
+    REQUIRE(world.getStreamingWorkStats().loadedCubeHighWater <= MAX_LOADED_CUBES);
+}
+
+TEST_CASE("World rejects synchronous cube admission at its configured hard cap",
+          "[world][streaming][capacity][performance][regression]") {
+    constexpr size_t TEST_CAP = 2;
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS, TEST_CAP);
+    REQUIRE(world.getChunk({0, WORLD_MAX_CHUNK_Y, 0}));
+    REQUIRE(world.getChunk({0, WORLD_MAX_CHUNK_Y - 1, 0}));
+    REQUIRE_FALSE(world.getChunk({0, WORLD_MAX_CHUNK_Y - 2, 0}));
+    REQUIRE(world.getLoadedChunkCount() == TEST_CAP);
+
+    const StreamingWorkStats capped = world.getStreamingWorkStats();
+    REQUIRE(capped.loadedCubeAdmissionsRejected == 1);
+    REQUIRE(capped.loadedCubeHighWater == TEST_CAP);
+    REQUIRE(capped.loadedCubeHighWater <= MAX_LOADED_CUBES);
+
+    world.unloadDistantChunks();
+    REQUIRE(world.getLoadedChunkCount() == 0);
+    REQUIRE(world.getChunk({0, WORLD_MAX_CHUNK_Y - 2, 0}));
+    REQUIRE(world.getLoadedChunkCount() == 1);
+    REQUIRE(world.getStreamingWorkStats().loadedCubeHighWater == TEST_CAP);
+}
+
+TEST_CASE("Exact priority metadata survives a cap too small for complete mesh halos",
+          "[world][streaming][priority][capacity][regression]") {
+    constexpr size_t TINY_CAP = 2;
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS, TINY_CAP);
+    REQUIRE_NOTHROW(world.generateAroundPlayer(0, SEA_LEVEL, 0));
+    REQUIRE(world.getLoadedChunkCount() <= TINY_CAP);
+    REQUIRE(world.getStreamingWorkStats().loadedCubeHighWater <= TINY_CAP);
+}
+
+TEST_CASE("Concurrent cube admission cannot race past the loaded hard cap",
+          "[world][streaming][capacity][performance][concurrency][regression]") {
+    constexpr size_t TEST_CAP = 2;
+    constexpr size_t REQUEST_COUNT = 4;
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS, TEST_CAP);
+    std::array<std::shared_ptr<Chunk>, REQUEST_COUNT> results;
+    std::atomic<bool> start{false};
+    std::array<std::thread, REQUEST_COUNT> workers;
+    for (size_t index = 0; index < workers.size(); ++index) {
+        workers[index] = std::thread([&, index] {
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            results[index] =
+                world.getChunk({0, WORLD_MAX_CHUNK_Y - static_cast<int32_t>(index), 0});
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (std::thread& worker : workers)
+        worker.join();
+
+    REQUIRE(std::ranges::count_if(results, [](const auto& result) { return result != nullptr; }) ==
+            TEST_CAP);
+    REQUIRE(world.getLoadedChunkCount() == TEST_CAP);
+    const StreamingWorkStats stats = world.getStreamingWorkStats();
+    REQUIRE(stats.loadedCubeAdmissionsRejected == REQUEST_COUNT - TEST_CAP);
+    REQUIRE(stats.loadedCubeHighWater == TEST_CAP);
 }
 
 TEST_CASE("Column plan completions wake only registered cube dependencies",
@@ -1476,7 +1644,7 @@ TEST_CASE("The underground exploration band is a hard mesh and retention priorit
 TEST_CASE("Visible distance does not expand exact cubic simulation beyond 32 chunks",
           "[world][streaming][lod]") {
     World world(42, MAX_RENDER_DISTANCE_CHUNKS);
-    REQUIRE(world.getViewDistance() == 256);
+    REQUIRE(world.getViewDistance() == 512);
     REQUIRE(world.getExactViewDistance() == 32);
 
     world.setViewDistance(12);
@@ -1490,6 +1658,70 @@ TEST_CASE("Visible distance does not expand exact cubic simulation beyond 32 chu
     world.setViewDistance(1);
     REQUIRE(world.getViewDistance() == MIN_RENDER_DISTANCE_CHUNKS);
     REQUIRE(world.getExactViewDistance() == MIN_RENDER_DISTANCE_CHUNKS);
+}
+
+TEST_CASE("Capped exact mesh selection keeps resident surfaces stable across small movement",
+          "[world][streaming][mesh-cap][residency][regression]") {
+    constexpr size_t EXTRA_REQUIREMENTS = 2'048;
+    constexpr uint8_t SURFACE_PRIORITY = 3;
+    constexpr uint8_t EDITED_PRIORITY = 5;
+    std::unordered_map<ChunkPos, uint8_t> requirements;
+    requirements.reserve(MAX_MESH_RESIDENT_CUBES + EXTRA_REQUIREMENTS);
+    for (size_t index = 0; index < MAX_MESH_RESIDENT_CUBES + EXTRA_REQUIREMENTS; ++index) {
+        const int64_t x = static_cast<int64_t>(index % 192) - 96;
+        const int64_t z = static_cast<int64_t>(index / 192) - 48;
+        requirements.emplace(ChunkPos{x, 4, z}, SURFACE_PRIORITY);
+    }
+    REQUIRE(requirements.size() > MAX_MESH_RESIDENT_CUBES);
+
+    const std::unordered_set<ChunkPos> empty;
+    const auto initial =
+        selectStableMeshCandidates(requirements, empty, {0, 4, 0}, MAX_MESH_RESIDENT_CUBES);
+    REQUIRE(initial.size() == MAX_MESH_RESIDENT_CUBES);
+
+    // A rebuild within the same camera cube and a one-cube movement retain
+    // the complete prior intersection instead of selecting a new equal-rank
+    // subset from unordered iteration or tiny distance changes.
+    const auto sameCube =
+        selectStableMeshCandidates(requirements, initial, {0, 4, 0}, MAX_MESH_RESIDENT_CUBES);
+    const auto adjacentCube =
+        selectStableMeshCandidates(requirements, sameCube, {1, 4, -1}, MAX_MESH_RESIDENT_CUBES);
+    REQUIRE(sameCube == initial);
+    REQUIRE(adjacentCube == initial);
+
+    std::vector<ChunkPos> promoted;
+    for (const auto& [position, priority] : requirements) {
+        if (initial.contains(position))
+            continue;
+        requirements[position] = EDITED_PRIORITY;
+        promoted.push_back(position);
+        if (promoted.size() == 128)
+            break;
+    }
+    REQUIRE(promoted.size() == 128);
+    const auto withEdits =
+        selectStableMeshCandidates(requirements, adjacentCube, {1, 4, -1}, MAX_MESH_RESIDENT_CUBES);
+    for (ChunkPos position : promoted)
+        REQUIRE(withEdits.contains(position));
+    REQUIRE(std::count_if(initial.begin(), initial.end(), [&](ChunkPos position) {
+                return withEdits.contains(position);
+            }) == static_cast<std::ptrdiff_t>(MAX_MESH_RESIDENT_CUBES - promoted.size()));
+}
+
+TEST_CASE("Exact mesh selection preserves hard gameplay priority at capacity",
+          "[world][streaming][mesh-cap][priority]") {
+    const std::unordered_map<ChunkPos, uint8_t> requirements{
+        {{0, 4, 0}, 3}, // additional surface or cliff
+        {{1, 4, 0}, 4}, // primary surface
+        {{2, 4, 0}, 5}, // edited section
+        {{3, 4, 0}, 6}, // exploration and collision
+    };
+    const std::unordered_set<ChunkPos> previous{{0, 4, 0}};
+    const auto selected = selectStableMeshCandidates(requirements, previous, {0, 4, 0}, 3);
+    REQUIRE_FALSE(selected.contains({0, 4, 0}));
+    REQUIRE(selected.contains({1, 4, 0}));
+    REQUIRE(selected.contains({2, 4, 0}));
+    REQUIRE(selected.contains({3, 4, 0}));
 }
 
 // ===========================================================================
@@ -1555,9 +1787,9 @@ TEST_CASE("FluidState packs source levels and falling flow", "[fluid]") {
     REQUIRE(FluidState::flowing(9).level() == 7);
     REQUIRE(FluidState::falling(4).level() == 4);
     REQUIRE(FluidState::falling(4).isFalling());
-    REQUIRE(fluidSurfaceHeight(FluidState::source()) == Catch::Approx(0.875f));
-    REQUIRE(fluidSurfaceHeight(FluidState::flowing(7)) == Catch::Approx(0.125f));
-    REQUIRE(fluidSurfaceHeight(FluidState::falling(4)) == Catch::Approx(1.0f));
+    STATIC_REQUIRE(fluidSurfaceHeight(FluidState::source()) == 1.0F);
+    STATIC_REQUIRE(fluidSurfaceHeight(FluidState::flowing(7)) == 0.125F);
+    STATIC_REQUIRE(fluidSurfaceHeight(FluidState::falling(4)) == 1.0F);
     REQUIRE(FluidState::isValidPacked(0x0F));
     REQUIRE_FALSE(FluidState::isValidPacked(0x10));
 }
@@ -1578,6 +1810,24 @@ TEST_CASE("Water falls before spreading horizontally", "[fluid][rules]") {
     REQUIRE(downward != nullptr);
     REQUIRE(downward->state.isFalling());
     REQUIRE(findMutation(result, FluidDirection::WEST, FluidMutationType::SET_WATER) == nullptr);
+}
+
+TEST_CASE("Supported falling water does not spread sideways", "[fluid][rules][waterfall]") {
+    for (const FluidState support : {FluidState::falling(7), FluidState::source()}) {
+        CAPTURE(support.packed());
+        const FluidNeighborhood cells{
+            .center = loadedCell(BlockType::WATER, FluidState::falling(7)),
+            .down = loadedCell(BlockType::WATER, support),
+            .up = loadedCell(BlockType::WATER, FluidState::falling(7)),
+            .west = loadedCell(),
+            .east = loadedCell(),
+            .north = loadedCell(),
+            .south = loadedCell(),
+        };
+        const FluidRuleResult result = evaluateWaterRules(cells);
+        REQUIRE(result.deferredCount == 0);
+        REQUIRE(result.mutationCount == 0);
+    }
 }
 
 TEST_CASE("Supported source water spreads at level one", "[fluid][rules]") {

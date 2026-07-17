@@ -404,9 +404,58 @@ TEST_CASE("ThreadPool multiple tasks complete", "[thread]") {
     REQUIRE(f4.get() == 4);
 }
 
+TEST_CASE("ThreadPool starts newly available priority work before queued FIFO work",
+          "[thread][priority][regression]") {
+    ThreadPool pool(1);
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool blockerStarted = false;
+    bool releaseBlocker = false;
+    std::vector<int> order;
+
+    auto blocker = pool.submit([&] {
+        std::unique_lock lock(mutex);
+        blockerStarted = true;
+        condition.notify_all();
+        condition.wait(lock, [&] { return releaseBlocker; });
+    });
+    bool didStart = false;
+    {
+        std::unique_lock lock(mutex);
+        didStart =
+            condition.wait_for(lock, std::chrono::seconds(1), [&] { return blockerStarted; });
+    }
+    if (!didStart) {
+        std::lock_guard lock(mutex);
+        releaseBlocker = true;
+        condition.notify_all();
+    }
+    REQUIRE(didStart);
+
+    auto low = pool.submitWithPriority(1, [&] { order.push_back(1); });
+    auto high = pool.submitWithPriority(10, [&] { order.push_back(10); });
+    auto samePriority = pool.submitWithPriority(10, [&] { order.push_back(11); });
+    {
+        std::lock_guard lock(mutex);
+        releaseBlocker = true;
+    }
+    condition.notify_all();
+
+    blocker.get();
+    low.get();
+    high.get();
+    samePriority.get();
+    REQUIRE(order == std::vector<int>{10, 11, 1});
+}
+
 TEST_CASE("ThreadPool size", "[thread]") {
     ThreadPool pool(3);
     REQUIRE(pool.size() == 3);
+}
+
+TEST_CASE("ThreadPool bounds latency-sensitive workers", "[thread][priority]") {
+    REQUIRE_NOTHROW(ThreadPool(3, ThreadPriority::UTILITY, 2));
+    REQUIRE_THROWS_AS(ThreadPool(2, ThreadPriority::UTILITY, 3), std::invalid_argument);
 }
 
 TEST_CASE("ThreadPool destructor joins", "[thread]") {

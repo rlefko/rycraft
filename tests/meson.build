@@ -9,7 +9,14 @@ test_sources = files(
   'test_world.mm',
   'test_worldgen_advanced.mm',
   'test_geology_ecology.mm',
+  'test_organic_geology.mm',
+  'test_natural_bank_substrate.mm',
+  'test_macro_control.mm',
+  'test_final_field_artifacts.mm',
+  'test_reported_water_continuity.mm',
   'test_relief.mm',
+  'test_alpine_morphology.mm',
+  'test_tree_geometry.mm',
   'test_render.mm',
   'test_entity.mm',
   'test_fauna_habitat.mm',
@@ -26,6 +33,8 @@ test_exe = executable('test_rycraft',
   dependencies : [catch2_with_main_dep, lz4_dep],
 )
 
-# The worldgen regression suite alone runs ~3.5 minutes in a debug build;
-# 180 s killed a fully passing run mid-suite.
-test('rycraft tests', test_exe, timeout : 480)
+# The deterministic worldgen, full-disk coverage, and hydrology matrices run
+# for more than eight minutes on the reference machine. Keep CI's process
+# timeout above the measured suite duration so a real assertion, rather than
+# SIGTERM in a late water fixture, reports any failure.
+test('rycraft tests', test_exe, timeout : 1200)
