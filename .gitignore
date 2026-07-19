@@ -1,4 +1,7 @@
 /build/
+# Local world saves (multi-world directory and the legacy single world)
+/saves/
+/rycraft_world/
 *.a
 *.air
 *.metallib
