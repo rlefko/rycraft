@@ -7,6 +7,7 @@ catch2_with_main_dep = catch2_proj.get_variable('catch2_with_main_dep')
 test_sources = files(
   'test_common.mm',
   'test_world.mm',
+  'test_weather.mm',
   'test_worldgen_advanced.mm',
   'test_geology_ecology.mm',
   'test_organic_geology.mm',
@@ -24,6 +25,7 @@ test_sources = files(
   'test_render_concurrency.mm',
   'test_engine.mm',
   'test_audio.mm',
+  'test_lightning.mm',
 )
 
 test_exe = executable('test_rycraft',
