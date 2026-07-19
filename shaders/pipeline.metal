@@ -906,8 +906,11 @@ fragment float4 waterFragmentMain(
             smoothstep(0.05f, 0.35f, waterDepth) * (1.0f - smoothstep(0.35f, 0.9f, waterDepth));
         float foam =
             foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz, water.time, 0.0f));
-        color =
-            mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * 0.45f * exteriorSkyVisibility);
+        // Foam is froth reflecting the sky, not emission. The same lit
+        // response as the water tints keeps it from glowing as bright white
+        // fringes around trunks and shorelines under moonlight.
+        color = mix(color, float3(0.92f, 0.96f, 1.0f) * tintIllumination,
+                    saturate(foam) * 0.45f * exteriorSkyVisibility);
     }
 
     color = mix(color, in.vOverlayColor.rgb, max(saturate(in.vOverlayColor.a), coverageFog));
