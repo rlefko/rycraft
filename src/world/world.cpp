@@ -496,7 +496,7 @@ void World::setBlock(int64_t x, int32_t y, int64_t z, BlockType type) {
     const BlockPos position{x, y, z};
     setBlockLoaded(position, type,
                    type == BlockType::WATER ? std::optional(FluidState::source()) : std::nullopt,
-                   LightUrgency::Immediate);
+                   LightUrgency::IMMEDIATE);
     fluidScheduler_.activateBlockChange(position);
 }
 
@@ -516,7 +516,7 @@ void World::setBlockLoaded(BlockPos position, BlockType type, std::optional<Flui
     std::array<ChunkPos, 4> immediateCubes{};
     std::array<std::shared_ptr<const ColumnPlan>, 4> immediatePlans{};
     size_t immediateCount = 0;
-    if (urgency == LightUrgency::Immediate) {
+    if (urgency == LightUrgency::IMMEDIATE) {
         immediateCubes[immediateCount++] = pos;
         if (lx == 0) immediateCubes[immediateCount++] = {pos.x - 1, pos.y, pos.z};
         if (lx == CHUNK_EDGE - 1) immediateCubes[immediateCount++] = {pos.x + 1, pos.y, pos.z};
@@ -573,15 +573,21 @@ void World::setBlockLoaded(BlockPos position, BlockType type, std::optional<Flui
     // Any edit can add or remove an emitter or open or seal a light path.
     // Reconcile the edited cube and its full 3D neighborhood. Deduplication
     // keeps repeated fluid changes within the per-tick lighting budget.
+    const auto floodedSynchronously = [&](ChunkPos queued) {
+        for (size_t cube = 0; cube < immediateCount; ++cube) {
+            if (immediateCubes[cube] == queued) return true;
+        }
+        return false;
+    };
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
             for (int offsetX = -1; offsetX <= 1; ++offsetX) {
                 const ChunkPos queued{pos.x + offsetX, pos.y + offsetY, pos.z + offsetZ};
-                if (urgency == LightUrgency::Immediate) {
-                    queueEditLightReconcile(queued);
-                } else {
-                    queueLightReconcile(queued);
-                }
+                // Cubes the synchronous flood already fixed would only rerun
+                // as no-diff floods; their changed borders requeue neighbors
+                // on their own.
+                if (floodedSynchronously(queued)) continue;
+                queueLightReconcile(queued, urgency);
             }
         }
     }
@@ -592,7 +598,7 @@ void World::setBlockLoaded(BlockPos position, BlockType type, std::optional<Flui
     // neighbors seed from its fresh levels.
     for (size_t cube = 0; cube < immediateCount; ++cube) {
         reconcileCubeLocked(immediateCubes[cube], immediatePlans[cube].get(),
-                            LightUrgency::Immediate);
+                            LightUrgency::IMMEDIATE);
     }
 }
 
@@ -785,19 +791,18 @@ void World::refreshSavedSkyCutoffsLocked(ChunkPos pos) {
     }
 }
 
-void World::queueLightReconcile(ChunkPos pos) {
+void World::queueLightReconcile(ChunkPos pos, LightUrgency urgency) {
     std::lock_guard<std::mutex> lock(lightMutex_);
+    // A position may sit in both queue tiers; the later pop floods again
+    // with no diff, which is cheaper than searching the other queue for it.
+    if (urgency == LightUrgency::IMMEDIATE) {
+        if (editLightQueued_.insert(pos).second) {
+            editLightQueue_.push_back(pos);
+        }
+        return;
+    }
     if (lightQueued_.insert(pos).second) {
         lightQueue_.push_back(pos);
-    }
-}
-
-void World::queueEditLightReconcile(ChunkPos pos) {
-    std::lock_guard<std::mutex> lock(lightMutex_);
-    // A position may sit in both queues; the later pop floods again with no
-    // diff, which is cheaper than searching the streaming queue to remove it.
-    if (editLightQueued_.insert(pos).second) {
-        editLightQueue_.push_back(pos);
     }
 }
 
@@ -848,6 +853,11 @@ LightEngine::SkyLightSeedColumns World::skyLightSeedsLocked(ChunkPos pos,
 
     const int64_t baseX = pos.x * CHUNK_EDGE;
     const int64_t baseZ = pos.z * CHUNK_EDGE;
+    std::optional<int32_t> savedCeiling;
+    if (const auto saved = savedEditedSectionCeilings_.find(column);
+        saved != savedEditedSectionCeilings_.end()) {
+        savedCeiling = saved->second;
+    }
     for (int z = 0; z < CHUNK_EDGE; ++z) {
         for (int x = 0; x < CHUNK_EDGE; ++x) {
             int32_t cutoff = std::clamp(plan->surfaceY(x, z) + 1, WORLD_MIN_Y, WORLD_MAX_Y + 1);
@@ -858,11 +868,6 @@ LightEngine::SkyLightSeedColumns World::skyLightSeedsLocked(ChunkPos pos,
 
             const int32_t cutoffBlock = std::clamp(cutoff - 1, WORLD_MIN_Y, WORLD_MAX_Y);
             const int32_t cutoffSection = Chunk::worldToChunkY(cutoffBlock);
-            std::optional<int32_t> savedCeiling;
-            if (const auto saved = savedEditedSectionCeilings_.find(column);
-                saved != savedEditedSectionCeilings_.end()) {
-                savedCeiling = saved->second;
-            }
             const int32_t lastRequiredSection =
                 skyAuthorityTopSection(pos.y, cutoffSection, savedCeiling);
             const uint64_t requiredMask = sectionRangeMask(pos.y, lastRequiredSection);
@@ -931,29 +936,21 @@ bool World::reconcileCubeLocked(ChunkPos pos, const ColumnPlan* plan, LightUrgen
         // This chunk's border light moved: each face-neighbor both SAMPLES
         // that border (so its border faces must re-mesh even if its own
         // stored light is unchanged, such as a solid wall at the seam) and
-        // may pull in more light (so it must re-reconcile).
-        for (size_t face = 0; face < faces.size(); ++face) {
-            Chunk* neighbor = faces[face];
-            if (neighbor && (result.changedFaceMask & (1U << face)) != 0) {
-                neighbor->needsMeshUpdate = true;
-                neighbor->version.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
+        // may pull in more light (so it must re-reconcile). Spread stays in
+        // the queue tier it started in so edit-driven propagation cannot
+        // sink back into the starving streaming queue.
         constexpr std::array<ChunkPos, 6> OFFSETS = {
             ChunkPos{-1, 0, 0}, ChunkPos{1, 0, 0},  ChunkPos{0, 0, -1},
             ChunkPos{0, 0, 1},  ChunkPos{0, -1, 0}, ChunkPos{0, 1, 0},
         };
         for (size_t face = 0; face < OFFSETS.size(); ++face) {
             if ((result.changedFaceMask & (1U << face)) == 0) continue;
-            const ChunkPos offset = OFFSETS[face];
-            const ChunkPos spread{pos.x + offset.x, pos.y + offset.y, pos.z + offset.z};
-            // Spread stays in the queue tier it started in so edit-driven
-            // propagation cannot sink back into the starving streaming queue.
-            if (urgency == LightUrgency::Immediate) {
-                queueEditLightReconcile(spread);
-            } else {
-                queueLightReconcile(spread);
+            if (Chunk* neighbor = faces[face]) {
+                neighbor->needsMeshUpdate = true;
+                neighbor->version.fetch_add(1, std::memory_order_relaxed);
             }
+            const ChunkPos offset = OFFSETS[face];
+            queueLightReconcile({pos.x + offset.x, pos.y + offset.y, pos.z + offset.z}, urgency);
         }
     }
     return result.changedState;
@@ -962,14 +959,14 @@ bool World::reconcileCubeLocked(ChunkPos pos, const ColumnPlan* plan, LightUrgen
 void World::reconcileLight(int budgetCubes) {
     for (int processed = 0; processed < budgetCubes; ++processed) {
         ChunkPos pos;
-        LightUrgency urgency = LightUrgency::Deferred;
+        LightUrgency urgency = LightUrgency::DEFERRED;
         {
             std::lock_guard<std::mutex> lock(lightMutex_);
             if (!editLightQueue_.empty()) {
                 pos = editLightQueue_.back();
                 editLightQueue_.pop_back();
                 editLightQueued_.erase(pos);
-                urgency = LightUrgency::Immediate;
+                urgency = LightUrgency::IMMEDIATE;
             } else if (!lightQueue_.empty()) {
                 pos = lightQueue_.back();
                 lightQueue_.pop_back();

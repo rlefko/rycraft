@@ -92,12 +92,6 @@ float3 viewNormalFromGuide(float2 uv, texture2d<half, access::sample> normalGuid
     return decodeOctahedralNormal(float2(normalGuide.sample(normalSampler, uv).xy));
 }
 
-float screenSpaceNormalGuideWeight(float3 receiverNormal, float3 candidateNormal) {
-    const float agreement = dot(receiverNormal, candidateNormal);
-    const float t = saturate((agreement - 0.65f) / 0.25f);
-    return t * t * (3.0f - 2.0f * t);
-}
-
 } // namespace
 
 kernel void screenSpaceLinearDepthKernel(depth2d<float, access::read> sceneDepth [[texture(0)]],
@@ -125,7 +119,7 @@ kernel void screenSpaceNormalKernel(texture2d<float, access::sample> linearDepth
     const float2 uv =
         (float2(gid) + 0.5f) / float2(normalGuide.get_width(), normalGuide.get_height());
     const float centerDepth = linearDepth.sample(pointSampler, uv, level(0.0f)).r;
-    const float3 normal = centerDepth > 60000.0f
+    const float3 normal = centerDepth > INDIRECT_SKY_LINEAR_DEPTH
                               ? float3(0.0f, 0.0f, 1.0f)
                               : viewNormalFromDepth(uv, linearDepth, pointSampler, uniforms);
     normalGuide.write(half4(half2(encodeOctahedralNormal(normal)), half(0.0f), half(1.0f)), gid);
@@ -175,7 +169,7 @@ kernel void screenSpaceTraceKernel(texture2d<float, access::sample> linearDepth 
     const float2 workSize = float2(output.get_width(), output.get_height());
     const float2 uv = (float2(gid) + 0.5f) / workSize;
     const float centerDepth = linearDepth.sample(pointSampler, uv, level(0.0f)).r;
-    if (centerDepth > 60000.0f) {
+    if (centerDepth > INDIRECT_SKY_LINEAR_DEPTH) {
         output.write(float4(0.0f, 0.0f, 0.0f, 1.0f), gid);
         return;
     }
@@ -217,7 +211,7 @@ kernel void screenSpaceTraceKernel(texture2d<float, access::sample> linearDepth 
         if (rayLength <= 1.0e-3f) {
             continue;
         }
-        const float3 endPoint = rayOrigin + direction * rayLength;
+        const float3 endPoint = screenSpaceTraceViewSample(rayOrigin, direction, rayLength);
         const float2 startPx =
             screenSpaceProjectViewPosition(rayOrigin, uniforms.projection) * fullSize;
         const float2 endPx =
@@ -360,12 +354,15 @@ kernel void screenSpaceTemporalKernel(texture2d<float, access::read> current [[t
                 screenSpaceFireflyClampScale(luminance(value.rgb), uniforms.temporalParams.w);
             const float2 neighborUv = (float2(coordinate) + 0.5f) / size;
             const float neighborDepth = linearDepth.sample(pointSampler, neighborUv, level(0.0f)).r;
-            const float depthWeight =
-                exp(-abs(neighborDepth - currentDepth) / max(currentDepth * 0.02f, 0.25f));
             const float3 neighborNormal =
                 viewNormalFromGuide(neighborUv, normalGuide, pointSampler);
-            const float normalWeight = pow(saturate(dot(centerNormal, neighborNormal)), 8.0f);
-            const float weight = (x == 0 && y == 0 ? 2.0f : 1.0f) * depthWeight * normalWeight;
+            // Same edge stops as the a-trous passes with the luminance term
+            // neutralized, so one tolerance retune reaches every consumer.
+            const float weight =
+                (x == 0 && y == 0 ? 2.0f : 1.0f) *
+                screenSpaceAtrousEdgeWeight(neighborDepth - currentDepth,
+                                            screenSpaceBilateralLinearDepthTolerance(currentDepth),
+                                            dot(centerNormal, neighborNormal), 0.0f, 1.0f);
             weightedSum += value * weight;
             weightedSquares += value * value * weight;
             weightSum += weight;
@@ -462,7 +459,7 @@ kernel void screenSpaceAtrousKernel(texture2d<float, access::read> source [[text
     const float2 uv = (float2(gid) + 0.5f) / size;
     const float4 center = source.read(gid);
     const float centerDepth = linearDepth.sample(pointSampler, uv, level(0.0f)).r;
-    if (centerDepth > 60000.0f) {
+    if (centerDepth > INDIRECT_SKY_LINEAR_DEPTH) {
         destination.write(center, gid);
         return;
     }
@@ -474,7 +471,8 @@ kernel void screenSpaceAtrousKernel(texture2d<float, access::read> source [[text
     const float variance = max(momentsAge.read(gid).w, 0.0f);
     const float luminanceSigma =
         max(uniforms.filterParams.y * sqrt(variance) / float(max(stepSize, 1u)), 1.0e-4f);
-    const float depthTolerance = max(centerDepth * 0.02f, 0.25f) * float(max(stepSize, 1u));
+    const float depthTolerance =
+        screenSpaceBilateralLinearDepthTolerance(centerDepth) * float(max(stepSize, 1u));
 
     float3 colorSum = 0.0f;
     float colorWeightSum = 0.0f;
@@ -580,9 +578,8 @@ fragment float4 screenSpaceApplyFragment(FullscreenVertex in [[stage_in]],
                     abs(viewPosition(candidateUv, candidateDeviceDepth, uniforms).z);
                 const float weight =
                     xWeight * yWeight *
-                    screenSpaceBilateralDepthWeight(receiverDepth, candidateDepth) *
-                    screenSpaceNormalGuideWeight(
-                        receiverNormal,
+                    screenSpaceJointBilateralUpsampleWeight(
+                        receiverDepth, candidateDepth, receiverNormal,
                         viewNormalFromGuide(candidateUv, normalGuide, pointSampler));
                 accumulated += indirect.sample(pointSampler, candidateUv) * weight;
                 weightSum += weight;
@@ -614,11 +611,9 @@ fragment float4 screenSpaceApplyFragment(FullscreenVertex in [[stage_in]],
                     }
                     const float candidateDepth =
                         abs(viewPosition(candidateUv, candidateDeviceDepth, uniforms).z);
-                    const float compatibility =
-                        screenSpaceBilateralDepthWeight(receiverDepth, candidateDepth) *
-                        screenSpaceNormalGuideWeight(
-                            receiverNormal,
-                            viewNormalFromGuide(candidateUv, normalGuide, pointSampler));
+                    const float compatibility = screenSpaceJointBilateralUpsampleWeight(
+                        receiverDepth, candidateDepth, receiverNormal,
+                        viewNormalFromGuide(candidateUv, normalGuide, pointSampler));
                     const float2 offset = float2(coordinate) - texelPosition;
                     const float score = compatibility / (1.0f + dot(offset, offset));
                     if (score > bestScore) {

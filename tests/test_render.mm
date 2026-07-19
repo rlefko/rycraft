@@ -8614,8 +8614,8 @@ TEST_CASE("Screen-space lighting bilateral upsample rejects voxel depth disconti
 
 TEST_CASE("Screen-space lighting fallback keeps a compatible voxel-face owner",
           "[render][indirect][upsample]") {
-    const Vec3 floorNormal{0.0F, 1.0F, 0.0F};
-    const Vec3 wallNormal{1.0F, 0.0F, 0.0F};
+    const simd_float3 floorNormal = simd_make_float3(0.0F, 1.0F, 0.0F);
+    const simd_float3 wallNormal = simd_make_float3(1.0F, 0.0F, 0.0F);
 
     // The regular footprint can contain only a perpendicular wall and reject
     // it completely. A nearby coplanar candidate is safe for the bounded

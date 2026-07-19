@@ -356,14 +356,15 @@ TEST_CASE("Screen-space lighting memory follows quality at native resolution",
 
 TEST_CASE("Screen-space lighting normal guide rejects separate voxel faces",
           "[render][indirect][upsample]") {
-    const Vec3 floorNormal{0.0F, 1.0F, 0.0F};
-    const Vec3 nearbyFloorNormal{0.0F, 0.98F, 0.2F};
-    const Vec3 wallNormal{1.0F, 0.0F, 0.0F};
+    const simd_float3 floorNormal = simd_make_float3(0.0F, 1.0F, 0.0F);
+    const simd_float3 nearbyFloorNormal = simd_make_float3(0.0F, 0.98F, 0.2F);
+    const simd_float3 wallNormal = simd_make_float3(1.0F, 0.0F, 0.0F);
 
-    REQUIRE(screenSpaceBilateralNormalWeight(floorNormal, floorNormal) == Catch::Approx(1.0F));
-    REQUIRE(screenSpaceBilateralNormalWeight(floorNormal, nearbyFloorNormal) > 0.99F);
-    REQUIRE(screenSpaceBilateralNormalWeight(floorNormal, wallNormal) == Catch::Approx(0.0F));
-    REQUIRE(screenSpaceBilateralNormalWeight(floorNormal, Vec3{}) == Catch::Approx(0.0F));
+    REQUIRE(screenSpaceNormalGuideWeight(floorNormal, floorNormal) == Catch::Approx(1.0F));
+    REQUIRE(screenSpaceNormalGuideWeight(floorNormal, nearbyFloorNormal) > 0.99F);
+    REQUIRE(screenSpaceNormalGuideWeight(floorNormal, wallNormal) == Catch::Approx(0.0F));
+    REQUIRE(screenSpaceNormalGuideWeight(floorNormal, simd_make_float3(0.0F, 0.0F, 0.0F)) ==
+            Catch::Approx(0.0F));
 
     REQUIRE(screenSpaceJointBilateralUpsampleWeight(12.0F, 12.0F, floorNormal, floorNormal) >
             0.99F);

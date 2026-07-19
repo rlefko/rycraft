@@ -370,10 +370,9 @@ private:
     // stay on the budgeted reconcile queue. Player edits are a handful per
     // tick and are remeshed by the render thread before the next tick, so
     // they flood synchronously under the same lock as the block write.
-    enum class LightUrgency : uint8_t { Deferred, Immediate };
+    enum class LightUrgency : uint8_t { DEFERRED, IMMEDIATE };
 
-    void queueLightReconcile(ChunkPos pos);
-    void queueEditLightReconcile(ChunkPos pos);
+    void queueLightReconcile(ChunkPos pos, LightUrgency urgency = LightUrgency::DEFERRED);
     void queueFaceNeighbors(ChunkPos pos);
     void queueLightReconcileWithNeighbors(ChunkPos pos);
     void ensureSavedSkyAuthority(ColumnPos column);
@@ -388,7 +387,7 @@ private:
     std::shared_ptr<Chunk> loadOrGenerateChunk(ChunkPos pos, bool* loadedFromSave = nullptr);
     bool shouldRetain(ChunkPos pos) const;
     void setBlockLoaded(BlockPos position, BlockType type, std::optional<FluidState> fluidState,
-                        LightUrgency urgency = LightUrgency::Deferred);
+                        LightUrgency urgency = LightUrgency::DEFERRED);
     bool refreshSkyCutoffLocked(int64_t worldX, int64_t worldZ);
     bool refreshSkyOverrideColumnLocked(ColumnPos column);
     bool extendGeneratedSkyCutoffsLocked(const Chunk& chunk);

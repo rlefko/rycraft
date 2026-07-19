@@ -1284,18 +1284,29 @@ static inline float screenSpaceTemporalLinearDepthTolerance(float linearDepth) {
 #endif
 }
 
+// One home for the screen-space bilateral depth tolerance. The temporal
+// statistics, the a-trous base tolerance, and the joint bilateral upsample
+// all derive from it, so a retune cannot silently miss one consumer.
+static inline float screenSpaceBilateralLinearDepthTolerance(float receiverDepth) {
+#ifdef __METAL_VERSION__
+    return metal::max(receiverDepth * 0.02f, 0.25f);
+#else
+    return std::max(receiverDepth * 0.02f, 0.25f);
+#endif
+}
+
 // The final indirect pass reconstructs a lower-resolution temporal history at
 // native resolution. Keep the candidate's view depth close to the full-resolution
 // receiver so GTAO and bounced radiance cannot cross a voxel edge. The soft
 // falloff preserves smooth surfaces while the hard cutoff makes an unrelated
 // block face contribute nothing.
 static inline float screenSpaceBilateralDepthWeight(float receiverDepth, float candidateDepth) {
+    const float tolerance = screenSpaceBilateralLinearDepthTolerance(receiverDepth);
 #ifdef __METAL_VERSION__
     if (!metal::isfinite(receiverDepth) || !metal::isfinite(candidateDepth) ||
         receiverDepth <= 0.0f || candidateDepth <= 0.0f) {
         return 0.0f;
     }
-    const float tolerance = metal::max(receiverDepth * 0.02f, 0.25f);
     const float difference = metal::abs(candidateDepth - receiverDepth);
     return difference > tolerance * 3.0f ? 0.0f : metal::exp(-difference / tolerance);
 #else
@@ -1303,10 +1314,53 @@ static inline float screenSpaceBilateralDepthWeight(float receiverDepth, float c
         candidateDepth <= 0.0f) {
         return 0.0f;
     }
-    const float tolerance = std::max(receiverDepth * 0.02f, 0.25f);
     const float difference = std::abs(candidateDepth - receiverDepth);
     return difference > tolerance * 3.0f ? 0.0f : std::exp(-difference / tolerance);
 #endif
+}
+
+// The reduced-resolution trace can reconstruct only from a candidate that
+// describes the same visible receiver. Depth alone cannot distinguish two
+// perpendicular voxel faces at the same view distance, which smears a bright
+// cave-floor bounce onto the wall. The cubic curve preserves a gently
+// changing receiver while fully rejecting a separate voxel face without a
+// visible threshold on shallow slopes.
+static inline float screenSpaceNormalGuideWeight(simd_float3 receiverNormal,
+                                                 simd_float3 candidateNormal) {
+#ifdef __METAL_VERSION__
+    const float receiverLengthSquared = metal::dot(receiverNormal, receiverNormal);
+    const float candidateLengthSquared = metal::dot(candidateNormal, candidateNormal);
+    if (!metal::isfinite(receiverLengthSquared) || !metal::isfinite(candidateLengthSquared) ||
+        receiverLengthSquared <= 1.0e-8f || candidateLengthSquared <= 1.0e-8f) {
+        return 0.0f;
+    }
+    const float agreement =
+        metal::clamp(metal::dot(receiverNormal, candidateNormal) *
+                         metal::rsqrt(receiverLengthSquared * candidateLengthSquared),
+                     -1.0f, 1.0f);
+    const float t = metal::saturate((agreement - 0.65f) / 0.25f);
+#else
+    const float receiverLengthSquared = simd_dot(receiverNormal, receiverNormal);
+    const float candidateLengthSquared = simd_dot(candidateNormal, candidateNormal);
+    if (!std::isfinite(receiverLengthSquared) || !std::isfinite(candidateLengthSquared) ||
+        receiverLengthSquared <= 1.0e-8f || candidateLengthSquared <= 1.0e-8f) {
+        return 0.0f;
+    }
+    const float agreement =
+        std::clamp(simd_dot(receiverNormal, candidateNormal) /
+                       std::sqrt(receiverLengthSquared * candidateLengthSquared),
+                   -1.0f, 1.0f);
+    const float t = std::clamp((agreement - 0.65f) / 0.25f, 0.0f, 1.0f);
+#endif
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static inline float screenSpaceJointBilateralUpsampleWeight(float receiverDepth,
+                                                            float candidateDepth,
+                                                            simd_float3 receiverNormal,
+                                                            simd_float3 candidateNormal) {
+    return screenSpaceBilateralDepthWeight(receiverDepth, candidateDepth) *
+           screenSpaceNormalGuideWeight(receiverNormal, candidateNormal);
 }
 
 // ---- Hi-Z screen-space ray traversal ----
@@ -1325,9 +1379,9 @@ static inline simd_float2 screenSpaceRaySequenceSample(uint32_t sequenceIndex,
                                                        simd_float2 pixelNoise) {
     const float index = (float)(sequenceIndex & 1023u);
 #ifdef __METAL_VERSION__
-    return metal::fract(pixelNoise + index * metal::float2(0.7548777f, 0.5698403f));
+    return metal::fract(pixelNoise + index * metal::float2(0.754877666f, 0.569840296f));
 #else
-    const simd_float2 shifted = pixelNoise + index * simd_make_float2(0.7548777f, 0.5698403f);
+    const simd_float2 shifted = pixelNoise + index * simd_make_float2(0.754877666f, 0.569840296f);
     return simd_make_float2(shifted.x - std::floor(shifted.x), shifted.y - std::floor(shifted.y));
 #endif
 }

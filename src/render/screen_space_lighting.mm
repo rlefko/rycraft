@@ -55,8 +55,9 @@ id<MTLTexture> makeTexture2D(id<MTLDevice> device, MTLPixelFormat format, NSUInt
                                                                         height:height
                                                                      mipmapped:mipmapped];
     descriptor.storageMode = MTLStorageModePrivate;
-    descriptor.usage =
-        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+    // Every target is written by compute and read by compute or fragment
+    // work; nothing here is ever a render attachment.
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     if (mipmapped) {
         descriptor.mipmapLevelCount = mipCount(width, height);
     }
@@ -269,7 +270,7 @@ void ScreenSpaceLighting::resize(uint32_t width, uint32_t height) {
     _displayWidth = width;
     _displayHeight = height;
     allocateTargets();
-    resetHistory(INDIRECT_HISTORY_RESIZE);
+    resetHistory();
 }
 
 void ScreenSpaceLighting::setQuality(int quality) {
@@ -279,12 +280,11 @@ void ScreenSpaceLighting::setQuality(int quality) {
     }
     _quality = quality;
     allocateTargets();
-    resetHistory(INDIRECT_HISTORY_QUALITY_CHANGE);
+    resetHistory();
 }
 
-void ScreenSpaceLighting::resetHistory(uint32_t reasons) {
+void ScreenSpaceLighting::resetHistory() {
     _historyValid = false;
-    _lastResetReasons = reasons;
 }
 
 void ScreenSpaceLighting::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR,
@@ -302,38 +302,28 @@ void ScreenSpaceLighting::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTextu
 
     id<MTLTexture> indirectTexture = _neutralTexture;
     if (_quality > 0) {
+        // Linearize, normal guide, and the pyramid reduction share one
+        // encoder with texture barriers, matching the froxel style: the
+        // stages are strictly dependent, and Apple GPUs only sample compute
+        // timestamps at encoder boundaries anyway.
         id<MTLComputeCommandEncoder> compute = [commandBuffer computeCommandEncoder];
-        compute.label = @"Screen-Space Lighting";
+        compute.label = @"Screen-Space Lighting Prepare";
         uint32_t computeTimerToken =
-            timer ? timer->beginComputePass(compute, "indirectDepth") : UINT32_MAX;
+            timer ? timer->beginComputePass(compute, "indirectPrepare") : UINT32_MAX;
         [compute setComputePipelineState:_linearDepthPipeline];
         [compute setTexture:depthResolve atIndex:0];
         [compute setTexture:_linearDepthPyramid atIndex:1];
         [compute setBytes:&frameUniforms length:sizeof(frameUniforms) atIndex:0];
         dispatch2D(compute, _linearDepthPipeline, _displayWidth, _displayHeight);
-        if (timer) {
-            timer->endComputePass(compute, computeTimerToken);
-        }
-        [compute endEncoding];
+        [compute memoryBarrierWithScope:MTLBarrierScopeTextures];
 
-        compute = [commandBuffer computeCommandEncoder];
-        compute.label = @"Screen-Space Normal Guide";
-        computeTimerToken =
-            timer ? timer->beginComputePass(compute, "indirectNormals") : UINT32_MAX;
         [compute setComputePipelineState:_normalPipeline];
         [compute setTexture:_linearDepthPyramid atIndex:0];
         [compute setTexture:_normalTexture atIndex:1];
         [compute setBytes:&frameUniforms length:sizeof(frameUniforms) atIndex:0];
         dispatch2D(compute, _normalPipeline, _displayWidth, _displayHeight);
-        if (timer) {
-            timer->endComputePass(compute, computeTimerToken);
-        }
-        [compute endEncoding];
+        [compute memoryBarrierWithScope:MTLBarrierScopeTextures];
 
-        compute = [commandBuffer computeCommandEncoder];
-        compute.label = @"Conservative Screen-Space Depth Pyramid";
-        computeTimerToken =
-            timer ? timer->beginComputePass(compute, "indirectDepthPyramid") : UINT32_MAX;
         [compute setComputePipelineState:_depthReducePipeline];
         [compute setTexture:_linearDepthPyramid atIndex:0];
         for (uint32_t level = 1; level < _linearDepthPyramid.mipmapLevelCount; ++level) {
@@ -426,7 +416,6 @@ void ScreenSpaceLighting::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTextu
         indirectTexture = atrousSource;
         _historyIndex = writeIndex;
         _historyValid = true;
-        _lastResetReasons = INDIRECT_HISTORY_STABLE;
     }
 
     auto applyPass = [[MTLRenderPassDescriptor alloc] init];

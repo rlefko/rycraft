@@ -767,7 +767,7 @@ fragment float4 waterFragmentMain(
     float2 refractUV = clamp(screenUV + N.xz * 0.035f * distortion, 0.001f, 0.999f);
     float refractDepth = sceneDepth.sample(depthPoint, refractUV);
     if (refractDepth < in.clipPosition.z) {
-        // The distorted tap landed on something in FRONT of the surface ,
+        // The distorted tap landed on something in FRONT of the surface, so
         // fall back to the undistorted sample
         refractUV = screenUV;
         refractDepth = opaqueDepth;
