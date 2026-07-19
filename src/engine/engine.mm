@@ -2296,7 +2296,13 @@ static std::string defaultWorldDirectory() {
         } else {
             state->eatingState.reset();
             if (!interactableTarget && input.isPressedForTick(Key::MouseRight)) {
-                [self placeBlock:state hit:rayHit];
+                // A held bucket fills or empties a fluid; otherwise place.
+                if (![self tryBucketInteraction:state
+                                      cameraPos:cameraPos
+                                        forward:forward
+                                            hit:rayHit]) {
+                    [self placeBlock:state hit:rayHit];
+                }
             }
         }
     }
@@ -2434,6 +2440,86 @@ static std::string defaultWorldDirectory() {
 }
 
 // ---- Block Placing (Task 6.2) ----
+
+// Empty and filled buckets exchange a single fluid source with the world,
+// exactly like Minecraft: an empty bucket scoops the water source or lava it
+// is aimed at, and a filled bucket empties its fluid against the targeted
+// block face. Returns YES when it handled the click.
+- (BOOL)tryBucketInteraction:(EngineState*)state
+                   cameraPos:(Vec3)cameraPos
+                     forward:(Vec3)forward
+                         hit:(BlockRayHit)hit {
+    const ItemStack selected = state->inventory.getSelectedStack();
+    const ItemType held = selected.type;
+    if (held != ItemType::BUCKET && held != ItemType::WATER_BUCKET &&
+        held != ItemType::LAVA_BUCKET) {
+        return NO;
+    }
+
+    const bool creative = !modeConsumesItems(state->gameMode);
+    const int selectedIndex = state->inventory.getSelectedIndex();
+    auto swapSelected = [&](ItemType to) {
+        if (!creative)
+            state->inventory.setSlot(selectedIndex, ItemStack{to, 1, 0});
+    };
+
+    if (held == ItemType::BUCKET) {
+        // March the aim ray for the first fluid source within reach; fluids are
+        // not solid, so the standard block ray passes straight through them.
+        constexpr float REACH = 5.0f;
+        constexpr float STEP = 0.1f;
+        for (float t = 0.f; t <= REACH; t += STEP) {
+            const int64_t bx = static_cast<int64_t>(std::floor(cameraPos.x + forward.x * t));
+            const int32_t by = static_cast<int32_t>(std::floor(cameraPos.y + forward.y * t));
+            const int64_t bz = static_cast<int64_t>(std::floor(cameraPos.z + forward.z * t));
+            const std::optional<BlockType> block = state->world->findBlockIfLoaded(bx, by, bz);
+            if (!block)
+                return NO;
+            if (*block == BlockType::WATER) {
+                const FluidCell cell = state->world->readFluidCell(FluidPos{bx, by, bz});
+                if (!cell.state.isSource())
+                    continue; // only a full source fills a bucket
+                state->world->setBlock(bx, by, bz, BlockType::AIR);
+                swapSelected(ItemType::WATER_BUCKET);
+                [self playSfx:state->sfxBlockPlace gain:0.5f];
+                return YES;
+            }
+            if (*block == BlockType::LAVA) {
+                state->world->setBlock(bx, by, bz, BlockType::AIR);
+                swapSelected(ItemType::LAVA_BUCKET);
+                [self playSfx:state->sfxBlockPlace gain:0.5f];
+                return YES;
+            }
+            if (isSolid(*block))
+                return NO; // an opaque block blocks the aim before any fluid
+        }
+        return NO;
+    }
+
+    // A filled bucket pours its fluid against the targeted block face.
+    if (!hit.has_value())
+        return NO;
+    const BlockType fluid = held == ItemType::WATER_BUCKET ? BlockType::WATER : BlockType::LAVA;
+    const int64_t px =
+        static_cast<int64_t>(std::floor(hit->first.x)) + static_cast<int64_t>(hit->second.x);
+    const int32_t py =
+        static_cast<int32_t>(std::floor(hit->first.y)) + static_cast<int32_t>(hit->second.y);
+    const int64_t pz =
+        static_cast<int64_t>(std::floor(hit->first.z)) + static_cast<int64_t>(hit->second.z);
+    if (py < WORLD_MIN_Y || py > WORLD_MAX_Y)
+        return NO;
+    const ChunkPos placeChunk{Chunk::worldToChunk(px), Chunk::worldToChunkY(py),
+                              Chunk::worldToChunk(pz)};
+    if (!state->world->isChunkLoaded(placeChunk))
+        return NO;
+    const std::optional<BlockType> target = state->world->findBlockIfLoaded(px, py, pz);
+    if (!target || (*target != BlockType::AIR && *target != BlockType::WATER))
+        return NO;
+    state->world->setBlock(px, py, pz, fluid);
+    swapSelected(ItemType::BUCKET);
+    [self playSfx:state->sfxBlockPlace gain:0.5f];
+    return YES;
+}
 
 - (void)placeBlock:(EngineState*)state hit:(BlockRayHit)hit {
     if (!hit.has_value())

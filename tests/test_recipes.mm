@@ -84,6 +84,16 @@ TEST_CASE("Sticks torches tables and furnaces follow their shapes", "[recipes]")
     REQUIRE_FALSE(matchCraftingRecipe(grid2(C, C, C, C), 2).has_value());
 }
 
+TEST_CASE("Three iron ingots in a V craft a bucket", "[recipes]") {
+    constexpr ItemType I = ItemType::IRON_INGOT;
+    const auto bucket = matchCraftingRecipe(grid3({I, N, I, N, I, N, N, N, N}), 3);
+    REQUIRE(bucket.has_value());
+    REQUIRE(bucket->type == ItemType::BUCKET);
+    REQUIRE(bucket->count == 1);
+    // A solid iron block is not the bucket shape.
+    REQUIRE_FALSE(matchCraftingRecipe(grid3({I, I, I, I, I, I, I, I, I}), 3).has_value());
+}
+
 TEST_CASE("Tool recipes cover tiers offsets and mirrors", "[recipes]") {
     constexpr ItemType I = ItemType::IRON_INGOT;
     const auto pickaxe = matchCraftingRecipe(grid3({I, I, I, N, S, N, N, S, N}), 3);

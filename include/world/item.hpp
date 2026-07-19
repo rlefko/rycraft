@@ -48,7 +48,10 @@ enum class ItemType : uint16_t {
     IRON_AXE = 281,
     IRON_SHOVEL = 282,
     IRON_SWORD = 283,
-    COUNT = 284
+    BUCKET = 284,
+    WATER_BUCKET = 285,
+    LAVA_BUCKET = 286,
+    COUNT = 287
 };
 
 inline constexpr size_t NON_BLOCK_ITEM_COUNT = static_cast<size_t>(ItemType::COUNT) - ITEM_ID_BASE;
@@ -186,6 +189,12 @@ constexpr std::array<ItemDefinition, NON_BLOCK_ITEM_COUNT> makeItemDefinitions()
     at(ItemType::IRON_INGOT) = {"Iron Ingot", ItemCategory::MATERIAL};
     at(ItemType::GOLD_INGOT) = {"Gold Ingot", ItemCategory::MATERIAL};
     at(ItemType::DIAMOND) = {"Diamond", ItemCategory::MATERIAL};
+
+    // An empty bucket stacks to 16; a filled one is unstackable, exactly like
+    // Minecraft, so a filled bucket can never merge and lose a fluid.
+    at(ItemType::BUCKET) = {"Bucket", ItemCategory::MATERIAL, 16};
+    at(ItemType::WATER_BUCKET) = {"Water Bucket", ItemCategory::MATERIAL, 1};
+    at(ItemType::LAVA_BUCKET) = {"Lava Bucket", ItemCategory::MATERIAL, 1};
 
     struct Food {
         ItemType type;
@@ -418,6 +427,9 @@ constexpr std::array<uint32_t, NON_BLOCK_ITEM_COUNT> makeItemSwatches() {
                       ItemType::IRON_SWORD}) {
         at(tool) = 0xD9D9D9;
     }
+    at(ItemType::BUCKET) = 0xB0B4BA;
+    at(ItemType::WATER_BUCKET) = 0x4073D9;
+    at(ItemType::LAVA_BUCKET) = 0xE6661A;
     return colors;
 }
 

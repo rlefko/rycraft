@@ -1072,6 +1072,22 @@ static void paintItemIcon(BgraPixel* pixels, ItemType item, SimplexNoise& noise)
             }
             break;
         }
+        case ItemType::BUCKET:
+        case ItemType::WATER_BUCKET:
+        case ItemType::LAVA_BUCKET: {
+            constexpr uint32_t METAL = 0xB0B4BA;
+            // A filled bucket carries its fluid in the mouth of the pail.
+            if (item != ItemType::BUCKET) {
+                const uint32_t fluid = item == ItemType::WATER_BUCKET ? 0x4073D9 : 0xE6661A;
+                fillRect(5, 5, 10, 7, fluid);
+            }
+            fillRect(4, 4, 11, 5, METAL); // rim
+            for (int y = 6; y <= 12; ++y) {
+                const int inset = (y - 6) / 3; // taper toward a narrow base
+                fillRect(4 + inset, y, 11 - inset, y, METAL);
+            }
+            break;
+        }
         default:
             fillEllipse(8, 8, 4, 4, swatch);
             break;
