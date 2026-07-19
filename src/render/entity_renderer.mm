@@ -2,6 +2,7 @@
 
 #include "common/error.hpp"
 #include "render/pixel_formats.hpp"
+#include "world/chunk.hpp"
 
 #include <array>
 
@@ -75,15 +76,27 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     auto pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
-    pipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
-    pipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
-    // Entities draw inside the 4x MSAA scene pass
-    pipelineDesc.rasterSampleCount = 4;
+    // Entities draw inside the same 4x MSAA HDR and surface-data scene pass
+    // as terrain, sky, and the block highlight.
+    PixelFormats::configureScenePassPipeline(pipelineDesc);
 
     NSError* error = nil;
     _pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
     if (!_pipelineState) {
         RY_LOG_FATAL("Failed to create entity pipeline state");
+    }
+
+    id<MTLFunction> shadowVertex = [shaderLibrary newFunctionWithName:@"entityShadowVertexMain"];
+    if (!shadowVertex) {
+        RY_LOG_FATAL("Failed to load entity shadow shader function");
+    }
+    auto shadowDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    shadowDescriptor.vertexFunction = shadowVertex;
+    shadowDescriptor.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
+    _shadowPipelineState = [device newRenderPipelineStateWithDescriptor:shadowDescriptor
+                                                                  error:&error];
+    if (!_shadowPipelineState) {
+        RY_LOG_FATAL("Failed to create entity shadow pipeline state");
     }
 
     for (size_t type = 0; type < TYPE_COUNT; ++type) {
@@ -92,10 +105,45 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     }
 }
 
+void EntityRenderer::renderShadows(id<MTLRenderCommandEncoder> encoder,
+                                   const ShadowPassUniforms& shadowUniforms,
+                                   const std::vector<std::shared_ptr<Entity>>& entities,
+                                   const std::function<bool(const AABB&)>& isVisible) {
+    if (entities.empty()) {
+        return;
+    }
+    [encoder setRenderPipelineState:_shadowPipelineState];
+    [encoder setVertexBytes:&shadowUniforms length:sizeof(shadowUniforms) atIndex:1];
+    [encoder setCullMode:MTLCullModeBack];
+    [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+    for (const auto& entity : entities) {
+        if (!entity || !entity->alive || !isVisible(entity->aabb)) {
+            continue;
+        }
+        const size_t type = static_cast<size_t>(entity->type);
+        if (type >= TYPE_COUNT) {
+            continue;
+        }
+        const Mesh& mesh = _meshes[type][entity->isBaby ? 1 : 0];
+        EntityModel model{};
+        model.model = matrix_identity_float4x4;
+        model.model.columns[3] =
+            simd_make_float4(entity->position.x, entity->position.y, entity->position.z, 1.0F);
+        [encoder setVertexBytes:&model length:sizeof(model) atIndex:2];
+        [encoder setVertexBuffer:mesh.vertexBuffer offset:0 atIndex:0];
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:mesh.indexCount
+                             indexType:MTLIndexTypeUInt16
+                           indexBuffer:mesh.indexBuffer
+                     indexBufferOffset:0];
+    }
+}
+
 void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
                             uint64_t uniformsOffset,
                             const std::vector<std::shared_ptr<Entity>>& entities,
-                            const std::function<bool(const AABB&)>& isVisible) {
+                            const std::function<bool(const AABB&)>& isVisible,
+                            const std::function<uint8_t(const Vec3&)>& packedLightAt) {
     if (entities.empty())
         return;
 
@@ -118,6 +166,13 @@ void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> u
         model.model = matrix_identity_float4x4;
         model.model.columns[3] =
             simd_make_float4(entity->position.x, entity->position.y, entity->position.z, 1.0f);
+        const Vec3 lightPosition{entity->position.x,
+                                 (entity->aabb.min.y + entity->aabb.max.y) * 0.5F,
+                                 entity->position.z};
+        const uint8_t packedLight = packedLightAt ? packedLightAt(lightPosition) : 0;
+        model.lighting = simd_make_float4(
+            static_cast<float>(derivedSkyLight(packedLight)) / 15.0F,
+            static_cast<float>(derivedBlockLight(packedLight)) / 15.0F, 0.0F, 0.0F);
         [encoder setVertexBytes:&model length:sizeof(model) atIndex:2];
 
         [encoder setVertexBuffer:mesh.vertexBuffer offset:0 atIndex:0];

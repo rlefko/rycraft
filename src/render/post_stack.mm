@@ -1,6 +1,7 @@
 #import "render/post_stack.hpp"
 
 #include "common/error.hpp"
+#include "render/metal_ownership.hpp"
 #include "render/pixel_formats.hpp"
 #include "render/shader_types.hpp"
 
@@ -21,13 +22,16 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
 
     NSError* error = nil;
     _compositePipelineState = [_device newRenderPipelineStateWithDescriptor:desc error:&error];
+    resetMetalObject(desc);
+    resetMetalObject(vertexFunc);
+    resetMetalObject(fragmentFunc);
     if (!_compositePipelineState) {
         RY_LOG_FATAL("Failed to create post-composite pipeline state");
     }
 
     // 4×4 black fallback: bound as the bloom input when bloom is disabled.
     // The composite forces bloomIntensity to 0 in that case, so the sampled
-    // value is multiplied out — but a Private RG11B10 render target is
+    // value is multiplied out, but a Private RG11B10 render target is
     // cleared to black once below so even a stray NaN can't survive x*0.
     auto texDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:PixelFormats::BLOOM
                                                                       width:4
@@ -47,7 +51,23 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
     clearPass.colorAttachments[0].storeAction = MTLStoreActionStore;
     clearPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
     [[clearCmd renderCommandEncoderWithDescriptor:clearPass] endEncoding];
+    resetMetalObject(clearPass);
     [clearCmd commit];
+    [clearCmd waitUntilCompleted];
+    resetMetalObject(queue);
+
+    auto whiteDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                        width:1
+                                                                       height:1
+                                                                    mipmapped:false];
+    whiteDesc.usage = MTLTextureUsageShaderRead;
+    whiteDesc.storageMode = MTLStorageModeShared;
+    _whiteFallback = [_device newTextureWithDescriptor:whiteDesc];
+    const uint8_t white = 255;
+    [_whiteFallback replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                      mipmapLevel:0
+                        withBytes:&white
+                      bytesPerRow:sizeof(white)];
 
     auto samplerDesc = [[MTLSamplerDescriptor alloc] init];
     samplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
@@ -55,6 +75,7 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
     samplerDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
     samplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
     _linearSampler = [_device newSamplerStateWithDescriptor:samplerDesc];
+    resetMetalObject(samplerDesc);
     if (!_linearSampler) {
         RY_LOG_FATAL("Failed to create post-stack sampler");
     }
@@ -66,6 +87,7 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
     }
     _exposurePipelineState = [_device newComputePipelineStateWithFunction:exposureFunc
                                                                     error:&error];
+    resetMetalObject(exposureFunc);
     if (!_exposurePipelineState) {
         RY_LOG_FATAL("Failed to create exposure compute pipeline state");
     }
@@ -87,6 +109,7 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
         RY_LOG_FATAL("Failed to load flareProbe compute function");
     }
     _flarePipelineState = [_device newComputePipelineStateWithFunction:flareFunc error:&error];
+    resetMetalObject(flareFunc);
     if (!_flarePipelineState) {
         RY_LOG_FATAL("Failed to create flare probe pipeline state");
     }
@@ -99,12 +122,23 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
     }
 }
 
+PostStack::~PostStack() {
+    resetMetalObject(_compositePipelineState);
+    resetMetalObject(_exposurePipelineState);
+    resetMetalObject(_flarePipelineState);
+    resetMetalObject(_exposureBuffer);
+    resetMetalObject(_flareBuffer);
+    resetMetalObject(_blackFallback);
+    resetMetalObject(_whiteFallback);
+    resetMetalObject(_linearSampler);
+}
+
 // ---------------------------------------------------------------------------
-// encodeFlareProbe — one compute thread taps the depth around the sun and
+// encodeFlareProbe, one compute thread taps the depth around the sun and
 // eases the persistent visibility (see post.metal).
 // ---------------------------------------------------------------------------
 void PostStack::encodeFlareProbe(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneDepth,
-                                 simd_float2 sunScreenUV) {
+                                 id<MTLTexture> resolvedCloud, simd_float2 sunScreenUV) {
     if (!commandBuffer || !sceneDepth)
         return;
     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
@@ -112,8 +146,10 @@ void PostStack::encodeFlareProbe(id<MTLCommandBuffer> commandBuffer, id<MTLTextu
         return;
     PostUniforms uniforms{};
     uniforms.sunScreenUV = sunScreenUV;
+    uniforms.flareCloudOpacityTexture = resolvedCloud != nil ? 1U : 0U;
     [encoder setComputePipelineState:_flarePipelineState];
     [encoder setTexture:sceneDepth atIndex:0];
+    [encoder setTexture:resolvedCloud ? resolvedCloud : _whiteFallback atIndex:1];
     [encoder setBuffer:_flareBuffer offset:0 atIndex:0];
     [encoder setBytes:&uniforms length:sizeof(uniforms) atIndex:1];
     [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -121,7 +157,7 @@ void PostStack::encodeFlareProbe(id<MTLCommandBuffer> commandBuffer, id<MTLTextu
 }
 
 // ---------------------------------------------------------------------------
-// encodeExposure — one threadgroup reduces average scene luminance and eases
+// encodeExposure, one threadgroup reduces average scene luminance and eases
 // the persistent exposure toward it.
 // ---------------------------------------------------------------------------
 void PostStack::encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR) {
@@ -135,7 +171,7 @@ void PostStack::encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture
     ExposureParams params{};
     // keyValue sets where metered daylight lands (exposure = key / avgLum).
     // 0.85 compensates the filmic curve, which maps the same input about a
-    // stop lower through the mids than the old curve did — a 0.5 key read as
+    // stop lower through the mids than the old curve did, a 0.5 key read as
     // globally underexposed navy once the curve changed.
     params.keyValue = 0.85f;
     params.adaptationDownRate = 0.10f; // ~0.15 s to stop down at 60 fps
@@ -146,7 +182,7 @@ void PostStack::encodeExposure(id<MTLCommandBuffer> commandBuffer, id<MTLTexture
     // Floor 0.25 lets sun-facing frames actually stop down (0.7 pinned the
     // exposure before it could react). Ceiling 3.0: the filmic toe already
     // holds shadow detail, and the old 4x lift made caves and night look
-    // daylit — dark places should read dark, with the curve doing the
+    // daylit, dark places should read dark, with the curve doing the
     // grading, while sunlit water a few blocks down stays legible.
     params.minExposure = 0.25f;
     params.maxExposure = 3.0f;
@@ -180,8 +216,10 @@ void PostStack::encodeComposite(id<MTLCommandBuffer> commandBuffer, id<MTLTextur
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
-    if (!encoder)
+    if (!encoder) {
+        resetMetalObject(passDesc);
         return;
+    }
 
     const bool bloomOn = bloomTexture != nil;
     PostUniforms uniforms{};
@@ -208,4 +246,5 @@ void PostStack::encodeComposite(id<MTLCommandBuffer> commandBuffer, id<MTLTextur
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
+    resetMetalObject(passDesc);
 }

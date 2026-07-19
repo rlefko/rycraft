@@ -11,7 +11,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// EntityRenderer — draws animals as their voxel-box models.
+// EntityRenderer, draws animals as their voxel-box models.
 //
 // Each EntityType's model (adult and baby variants) bakes into one small
 // static mesh at construction; per entity, only a model matrix changes.
@@ -26,7 +26,13 @@ public:
     // The uniforms live in the caller's frame ring, hence buffer + offset.
     void render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
                 uint64_t uniformsOffset, const std::vector<std::shared_ptr<Entity>>& entities,
-                const std::function<bool(const AABB&)>& isVisible);
+                const std::function<bool(const AABB&)>& isVisible,
+                const std::function<uint8_t(const Vec3&)>& packedLightAt);
+
+    void renderShadows(id<MTLRenderCommandEncoder> encoder,
+                       const ShadowPassUniforms& shadowUniforms,
+                       const std::vector<std::shared_ptr<Entity>>& entities,
+                       const std::function<bool(const AABB&)>& isVisible);
 
 private:
     struct Mesh {
@@ -40,6 +46,7 @@ private:
     std::array<std::array<Mesh, 2>, TYPE_COUNT> _meshes; // [type][adult=0 / baby=1]
 
     id<MTLRenderPipelineState> _pipelineState;
+    id<MTLRenderPipelineState> _shadowPipelineState;
 
     Mesh buildMesh(id<MTLDevice> device, EntityType type, bool isBaby);
 };

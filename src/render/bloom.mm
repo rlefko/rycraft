@@ -1,6 +1,7 @@
 #import "render/bloom.hpp"
 
 #include "common/error.hpp"
+#include "render/metal_ownership.hpp"
 #include "render/pixel_formats.hpp"
 #include "render/shader_types.hpp"
 
@@ -30,6 +31,9 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
 
     NSError* error = nil;
     _extractPipelineState = [_device newRenderPipelineStateWithDescriptor:extractDesc error:&error];
+    resetMetalObject(extractDesc);
+    resetMetalObject(extractVertexFunc);
+    resetMetalObject(extractFragmentFunc);
     if (!_extractPipelineState) {
         RY_LOG_FATAL("Failed to create bloom extract pipeline state");
     }
@@ -41,6 +45,9 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
     blurDesc.colorAttachments[0].pixelFormat = PixelFormats::BLOOM;
 
     _blurPipelineState = [_device newRenderPipelineStateWithDescriptor:blurDesc error:&error];
+    resetMetalObject(blurDesc);
+    resetMetalObject(blurVertexFunc);
+    resetMetalObject(blurFragmentFunc);
     if (!_blurPipelineState) {
         RY_LOG_FATAL("Failed to create bloom blur pipeline state");
     }
@@ -53,6 +60,7 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
     samplerDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
     samplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
     _linearSampler = [_device newSamplerStateWithDescriptor:samplerDesc];
+    resetMetalObject(samplerDesc);
     if (!_linearSampler) {
         RY_LOG_FATAL("Failed to create bloom linear sampler");
     }
@@ -66,16 +74,18 @@ Bloom::Bloom(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
 // Destructor
 // ---------------------------------------------------------------------------
 Bloom::~Bloom() {
-    // Metal objects are reference-counted; nil assignment releases them
-    _extractTexture = nil;
+    resetMetalObject(_extractTexture);
     for (int i = 0; i < PYRAMID_LEVELS; ++i) {
-        _blurPyramid[i][0] = nil;
-        _blurPyramid[i][1] = nil;
+        resetMetalObject(_blurPyramid[i][0]);
+        resetMetalObject(_blurPyramid[i][1]);
     }
+    resetMetalObject(_extractPipelineState);
+    resetMetalObject(_blurPipelineState);
+    resetMetalObject(_linearSampler);
 }
 
 // ---------------------------------------------------------------------------
-// allocateExtractTexture — extract runs at half resolution so bloom never
+// allocateExtractTexture, extract runs at half resolution so bloom never
 // pays the full-res bandwidth (a wide blur wants a small source anyway).
 // ---------------------------------------------------------------------------
 void Bloom::allocateExtractTexture() {
@@ -130,10 +140,10 @@ void Bloom::resize(uint32_t width, uint32_t height) {
     _height = height;
 
     // Release and reallocate all textures
-    _extractTexture = nil;
+    resetMetalObject(_extractTexture);
     for (int i = 0; i < PYRAMID_LEVELS; ++i) {
-        _blurPyramid[i][0] = nil;
-        _blurPyramid[i][1] = nil;
+        resetMetalObject(_blurPyramid[i][0]);
+        resetMetalObject(_blurPyramid[i][1]);
     }
 
     allocateExtractTexture();
@@ -154,8 +164,10 @@ void Bloom::renderExtractPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture>
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
-    if (!encoder)
+    if (!encoder) {
+        resetMetalObject(passDesc);
         return;
+    }
 
     [encoder setRenderPipelineState:_extractPipelineState];
     [encoder setFragmentTexture:sceneTexture atIndex:0];
@@ -173,6 +185,7 @@ void Bloom::renderExtractPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture>
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
     [encoder endEncoding];
+    resetMetalObject(passDesc);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,8 +203,10 @@ void Bloom::renderBlurPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> so
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
-    if (!encoder)
+    if (!encoder) {
+        resetMetalObject(passDesc);
         return;
+    }
 
     [encoder setRenderPipelineState:_blurPipelineState];
     [encoder setFragmentTexture:source atIndex:0];
@@ -209,10 +224,11 @@ void Bloom::renderBlurPass(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> so
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
     [encoder endEncoding];
+    resetMetalObject(passDesc);
 }
 
 // ---------------------------------------------------------------------------
-// renderBloom — extract + blur pyramid, leaving the result in _blurPyramid[0][0]
+// renderBloom, extract + blur pyramid, leaving the result in _blurPyramid[0][0]
 // ---------------------------------------------------------------------------
 void Bloom::renderBloom(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneTexture) {
     if (!commandBuffer || !sceneTexture)
@@ -226,7 +242,7 @@ void Bloom::renderBloom(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> scene
     // 1. Extract bright pixels (half-res)
     renderExtractPass(commandBuffer, sceneTexture);
 
-    // 2. Kawase blur pyramid — each level ping-pongs twice, growing radius
+    // 2. Kawase blur pyramid, each level ping-pongs twice, growing radius
     renderBlurPass(commandBuffer, _extractTexture, _blurPyramid[0][0], 1.0f);
     renderBlurPass(commandBuffer, _blurPyramid[0][0], _blurPyramid[0][1], 1.0f);
 

@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -36,8 +37,14 @@ class Bloom;
 class PostStack;
 class ShadowMap;
 class Volumetrics;
-class Ssao;
+class ScreenSpaceLighting;
+class AtmosphereRenderer;
+class CloudRenderer;
+class LightningRenderer;
 class ParticleSystem;
+class WeatherSnapshot;
+struct IndirectHistoryState;
+struct WeatherSample;
 
 // GPU-side per-chunk mesh allocation tracking. opaqueIndexCount splits the
 // one allocation into the opaque section and the water section (see
@@ -115,13 +122,11 @@ struct WaterDraw {
 };
 
 // ---------------------------------------------------------------------------
-// RenderPipeline — Metal renderer with a single 4x MSAA scene pass.
-//
-// Frame structure:
-//   1. Scene pass (MSAA, native resolution): sky → chunks → block highlight
-//      → weather particles → clouds, resolved into _colorResolve
-//   2. Bloom: extract/blur/composite from _colorResolve into the drawable
-//      (plain blit when bloom intensity is zero)
+// RenderPipeline owns the integrated Metal frame graph. Weather, atmosphere,
+// cloud shadows, and terrain shadows are prepared before the native 4x MSAA
+// sky and opaque pass. Screen-space lighting, clouds, lightning, water,
+// froxels, and weather particles then composite into resolved HDR before
+// exposure, flare, bloom, grading, and UI produce the drawable.
 //   3. UI overlay pass onto the drawable
 //
 // Also owns frustum culling and the on-demand chunk mesh cache.
@@ -129,7 +134,7 @@ struct WaterDraw {
 class RenderPipeline {
 public:
     RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
-                   uint32_t height);
+                   uint32_t height, uint64_t worldSeed = 0);
 
     ~RenderPipeline();
 
@@ -140,7 +145,9 @@ public:
                 uint64_t worldTime = 0, double deltaSeconds = 0.0,
                 std::optional<Vec3> highlightedBlock = std::nullopt,
                 const Hotbar& hotbar = Hotbar(), const UIFrameState& uiFrame = UIFrameState{},
-                const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
+                const std::vector<std::shared_ptr<Entity>>* entities = nullptr,
+                std::shared_ptr<const WeatherSnapshot> weatherSnapshot = nullptr,
+                const std::vector<LightningEvent>* lightningEvents = nullptr);
 
     // Reallocate MSAA and resolve textures for new viewport size.
     void resize(uint32_t width, uint32_t height);
@@ -155,7 +162,8 @@ public:
     void setGraphicsSettings(const GraphicsSettings& gfx);
 
     // Update particle system physics (call each game tick).
-    void tickParticles(float dt, const World& world, const Vec3& playerPosition, bool raining);
+    void tickParticles(float dt, const World& world, const Vec3& playerPosition,
+                       const WeatherSample& weather);
 
     // Exponential fog density per block (settings menu).
     void setFogDensity(float density) { _fogDensity = density; }
@@ -166,7 +174,7 @@ public:
 
     // Write the next presented frame to `path` as a PNG (async, off the
     // render thread). Used by the playtest workflow for headless visual
-    // verification — macOS screen-recording permissions don't apply.
+    // verification, macOS screen-recording permissions don't apply.
     void requestFrameCapture(const std::string& path);
 
     // Chunk streaming counters for the F3 HUD (render thread only).
@@ -212,6 +220,26 @@ public:
     ChunkRenderStats chunkRenderStats() const { return _chunkStats; }
     FarTerrainGenerationCacheStats farGenerationCacheStats() const;
 
+    struct AtmosphericRenderStats {
+        uint32_t shadowRefreshMask = 0;
+        std::array<uint32_t, SHADOW_CASCADE_COUNT> shadowCasterCounts{};
+        std::array<uint64_t, SHADOW_CASCADE_COUNT> shadowRefreshCounts{};
+        uint32_t indirectHistoryResetMask = 0;
+        bool indirectHistoryValid = false;
+        bool cloudHistoryValid = false;
+        bool froxelHistoryValid = false;
+        uint64_t atmosphereSlowRefreshCount = 0;
+        uint64_t atmosphereSkyRefreshCount = 0;
+        uint64_t indirectPersistentBytes = 0;
+        uint64_t cloudPersistentBytes = 0;
+        uint64_t froxelPersistentBytes = 0;
+        uint64_t integratedPersistentBytes = 0;
+        uint64_t lightningEventId = 0;
+        float lunarPhaseEnergy = 0.0F;
+        float lunarPhaseCycle = 0.0F;
+    };
+    AtmosphericRenderStats atmosphericRenderStats() const;
+
     // Real GPU frame time (EMA over completed command buffers) for the F3
     // HUD and the 60-frame diagnostic log.
     float gpuFrameMs() const { return _gpuTimer->frameMsEma(); }
@@ -235,48 +263,46 @@ private:
 
     // ---- Metal resources ----
     id<MTLDevice> _device;
-    id<MTLRenderPipelineState> _pipelineState;
-    id<MTLDepthStencilState> _depthState;
+    id<MTLRenderPipelineState> _pipelineState{};
+    id<MTLDepthStencilState> _depthState{};
 
     // Sky pipeline state (drawn first in the scene pass, behind everything)
-    id<MTLRenderPipelineState> _skyPipelineState;
-    id<MTLDepthStencilState> _skyDepthState;
+    id<MTLRenderPipelineState> _skyPipelineState{};
+    id<MTLDepthStencilState> _skyDepthState{};
 
     // Depth-tested but non-writing state (block highlight)
-    id<MTLDepthStencilState> _noDepthWriteState;
+    id<MTLDepthStencilState> _noDepthWriteState{};
 
     // Block highlight pipeline state (wireframe lines)
-    id<MTLRenderPipelineState> _highlightPipelineState;
-    id<MTLBuffer> _highlightVertexBuffer;
+    id<MTLRenderPipelineState> _highlightPipelineState{};
+    id<MTLBuffer> _highlightVertexBuffer{};
 
-    // Cloud pipeline state (Phase 8)
-    id<MTLRenderPipelineState> _cloudPipelineState;
-    id<MTLDepthStencilState> _cloudDepthState;
-
-    // Water pass (refraction/reflection/caustics) — no depth attachment;
-    // the fragment shader depth-tests against the resolved scene depth
-    id<MTLRenderPipelineState> _waterPipelineState;
-    id<MTLRenderPipelineState> _underwaterOverlayState;
+    // Water reads the resolved opaque depth for refraction and rejection, then
+    // hardware depth-tests and writes the nearest interface into media depth.
+    id<MTLRenderPipelineState> _waterPipelineState{};
+    id<MTLRenderPipelineState> _underwaterOverlayState{};
     std::vector<WaterDraw> _waterDraws; // reused each frame
 
-    // MSAA render targets (memoryless — resolved or discarded at pass end)
-    id<MTLTexture> _colorMSAA;
-    id<MTLTexture> _depthMSAA;
+    // MSAA render targets (memoryless, resolved or discarded at pass end)
+    id<MTLTexture> _colorMSAA{};
+    id<MTLTexture> _surfaceMSAA{};
+    id<MTLTexture> _depthMSAA{};
 
     // Single-sample resolve target feeding bloom / the drawable blit
-    id<MTLTexture> _colorResolve;
+    id<MTLTexture> _colorResolve{};
+    id<MTLTexture> _surfaceResolve{};
 
-    // Water pass inputs: the opaque scene's resolved depth, and a copy of
-    // the resolved color the refraction samples (a render target cannot
-    // sample itself)
-    id<MTLTexture> _depthResolve;
-    id<MTLTexture> _sceneColorCopy;
+    // Water pass inputs: the opaque scene's resolved depth, a water-inclusive
+    // media depth, and a copy of the resolved color the refraction samples.
+    id<MTLTexture> _depthResolve{};
+    id<MTLTexture> _mediaDepthResolve{};
+    id<MTLTexture> _sceneColorCopy{};
 
     // Frames-in-flight gate + per-frame constants arena: every uniform block
     // the CPU rewrites per frame sub-allocates from the current slot.
     FrameRing _frameRing;
 
-    // The frame's chunk Uniforms allocation — filled by renderChunks, also
+    // The frame's chunk Uniforms allocation, filled by renderChunks, also
     // bound by the entity renderer and the water pass vertex stage.
     FrameRing::Alloc _frameUniforms;
 
@@ -298,13 +324,18 @@ private:
     // Cascaded sun/moon shadow maps (skipped when shadowQuality is 0)
     std::unique_ptr<ShadowMap> _shadowMap;
 
-    // Ray-marched volumetric light shafts (skipped when the setting is off)
+    // Unified atmospheric froxel volume.
     std::unique_ptr<Volumetrics> _volumetrics;
 
-    // Screen-space ambient occlusion (skipped when the setting is off)
-    std::unique_ptr<Ssao> _ssao;
+    // Near-field GTAO and diffuse screen-space indirect lighting.
+    std::unique_ptr<ScreenSpaceLighting> _screenSpaceLighting;
 
-    // The shadow sampling block the scene pass binds each frame — the
+    // Physical atmosphere LUTs and true volumetric cloud layers.
+    std::unique_ptr<AtmosphereRenderer> _atmosphere;
+    std::unique_ptr<CloudRenderer> _clouds;
+    std::unique_ptr<LightningRenderer> _lightning;
+
+    // The shadow sampling block the scene pass binds each frame, the
     // computed cascades when shadows are on, or a zeroed (strength 0) block
     // when off/faded so the chunk fragment reads full sun without branching.
     ShadowUniforms _sceneShadowUniforms{};
@@ -327,6 +358,14 @@ private:
     // Exponential fog density per block
     float _fogDensity = 0.00015f;
     float _wetness = 0.0f;
+    uint32_t _shadowRefreshMask = 0;
+    std::array<uint32_t, SHADOW_CASCADE_COUNT> _shadowCasterCounts{};
+    uint32_t _indirectHistoryResetMask = 0;
+    uint64_t _lastLightningEventId = 0;
+    float _lunarPhaseEnergy = 0.0F;
+    float _lunarPhaseCycle = 0.0F;
+    float _directSpecularFactor = 0.0F;
+    uint8_t _activeCelestialSource = 0;
     // True while the camera is submerged this frame (set by render()). Gates
     // the rain-wetness sun sheen off: a gloss toward the sun on floors seen
     // through five blocks of water read as a white-out, not rain.
@@ -336,9 +375,16 @@ private:
     float _uwSkyExposure = 1.0f;
     // World Y of the surface of the water body the camera is in (see render()).
     float _uwSurfaceY = 0.0f;
+    simd_float4x4 _previousViewProjection = matrix_identity_float4x4;
+    std::unique_ptr<IndirectHistoryState> _indirectHistoryState;
+    uint64_t _previousWorldTime = 0;
+    uint64_t _forcedStateRevision = 0;
+    uint8_t _previousWeatherPreset = 0;
+    bool _hasPreviousWorldTime = false;
+    bool _weatherSnapshotWasPresent = false;
 
     // Frame animation clock driving water waves, caustics, and foliage sway in
-    // the scene AND shadow passes — one value per frame so the two can never
+    // the scene AND shadow passes, one value per frame so the two can never
     // sample different phases. It accumulates the real frame delta (NOT the
     // day-night worldTime), so animation keeps flowing when the time of day is
     // frozen (captures) or paused and never jumps at the daily rollover. Bounded
@@ -359,6 +405,7 @@ private:
 
     // (Re)allocate the MSAA + resolve textures at the current drawable size.
     void allocateSceneTargets();
+    void releaseSceneTargets();
 
     // Encode the drawable readback + async PNG write for requestFrameCapture.
     void encodeFrameCapture(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> frameTexture);
@@ -380,7 +427,7 @@ private:
     // HUD counters, written only by the render thread during renderChunks.
     ChunkRenderStats _chunkStats;
 
-    // Reused meshing buffers (render thread only) — snapshot + scratch keep
+    // Reused meshing buffers (render thread only), snapshot + scratch keep
     // their capacity across builds instead of reallocating ~85 KB each time.
     // (These serve the synchronous edit fast path; workers have their own.)
     MeshSnapshot _meshSnapshot;
@@ -414,6 +461,15 @@ private:
     std::unordered_map<ColumnPos, FarTerrainKey> _farTerrainDisplayedByTile;
     std::unordered_map<ColumnPos, float> _farTerrainComplexityByTile;
     std::unordered_map<ColumnPos, FarTerrainLodTransition> _farTerrainTransitions;
+    struct FarShadowDrawPlan {
+        ColumnPos coordinate;
+        FarTerrainKey key;
+        simd_uint4 farMetadata{};
+    };
+    // Exact copy of the prior color pass's eligible far draw plans. Shadows
+    // encode earlier in the next frame, so retaining this authority keeps LOD
+    // transitions and disconnected coverage from diverging.
+    std::vector<FarShadowDrawPlan> _farShadowDrawPlans;
     // Preallocated render-thread storage avoids one node allocation whenever
     // a cold near tile begins its intermediate-refinement grace period.
     std::vector<std::pair<ColumnPos, double>> _farTerrainNearGraceStartedAt;
@@ -434,8 +490,8 @@ private:
     void clearExactSectionOwnership();
 
     // ---- Day/Night Cycle ----
-    // sunDirection/sunColor come out as the ACTIVE directional light — the sun
-    // by day, the moon (dim cool light) by night — so terrain shading and
+    // sunDirection/sunColor come out as the ACTIVE directional light, the sun
+    // by day, the moon (dim cool light) by night, so terrain shading and
     // shadows share one light. The sky keeps the real sun/moon positions for
     // its discs. shadowStrength is the cascade term's weight (0 at the horizon
     // crossing so the sun→moon swap never pops).
@@ -450,8 +506,8 @@ private:
                       const std::vector<std::shared_ptr<Chunk>>& loadedChunks,
                       const Mat4& viewMatrix, const Mat4& projectionMatrix,
                       const Vec3& cameraPosition, const float sunDirection[3],
-                      const float sunColor[3], const float ambientColor[3],
-                      const float fogColor[3]);
+                      const float sunColor[3], const float ambientColor[3], const float fogColor[3],
+                      const FoliageWindUniforms& foliageWind);
 
     // Encode the cascade depth passes before the scene pass (no-op when
     // shadowQuality is 0 or strength is 0). lightDirection is the active
@@ -460,7 +516,9 @@ private:
     // locked chunk-list copy happens once per frame.
     void renderShadows(id<MTLCommandBuffer> commandBuffer,
                        const std::vector<std::shared_ptr<Chunk>>& loadedChunks,
-                       const Camera& camera, const float lightDirection[3], float strength);
+                       const std::vector<std::shared_ptr<Entity>>* entities, const Camera& camera,
+                       const float lightDirection[3], float strength,
+                       const FoliageWindUniforms& foliageWind);
 
     void renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, const Vec3& blockPos,
                               const Mat4& viewMatrix, const Mat4& projectionMatrix);
@@ -470,11 +528,9 @@ private:
     void renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4& viewMatrix,
                      const Mat4& projectionMatrix, const Vec3& cameraPosition,
                      bool cameraUnderwater, const SkyUniforms& skyUniforms,
+                     const float directLightDirection[3], const float directLightRadiance[3],
                      const float fogColor[3]);
 
     void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
                          const UIFrameState& uiFrame);
-
-    void renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera, uint64_t worldTime,
-                      const float sunDirection[3], float sunIntensity);
 };

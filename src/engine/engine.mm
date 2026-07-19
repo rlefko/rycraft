@@ -5,6 +5,7 @@
 
 #include <audio/audio_engine.hpp>
 #include <audio/sfx.hpp>
+#include <audio/thunder.hpp>
 #include <common/error.hpp>
 #include <common/math.hpp>
 #include <common/random.hpp>
@@ -16,11 +17,13 @@
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
+#include <render/celestial.hpp>
 #include <render/far_terrain.hpp>
 #include <render/graphics_settings.hpp>
 #include <render/render_pipeline.hpp>
 #include <render/ui_menu.hpp>
 #include <world/save_manager.hpp>
+#include <world/weather.hpp>
 #include <world/world.hpp>
 
 #include <algorithm>
@@ -40,7 +43,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Engine — Singleton (Objective-C class with C++ internals)
+// Engine, Singleton (Objective-C class with C++ internals)
 // ---------------------------------------------------------------------------
 
 // Raycast hit result type for block interaction
@@ -70,6 +73,25 @@ struct PerformanceCapture {
     float maxFarArenaMB = 0.0f;
     float maxExactArenaMB = 0.0f;
     float maxGpuFrameMs = 0.0f;
+    std::array<uint32_t, SHADOW_CASCADE_COUNT> maxShadowCasterCounts{};
+    std::array<uint64_t, SHADOW_CASCADE_COUNT> shadowRefreshCounts{};
+    uint64_t atmosphereSlowRefreshCount = 0;
+    uint64_t atmosphereSkyRefreshCount = 0;
+    uint64_t indirectHistoryInvalidFrames = 0;
+    uint64_t cloudHistoryInvalidFrames = 0;
+    uint64_t froxelHistoryInvalidFrames = 0;
+    uint64_t maxIndirectPersistentBytes = 0;
+    uint64_t maxCloudPersistentBytes = 0;
+    uint64_t maxFroxelPersistentBytes = 0;
+    uint64_t maxIntegratedAtmosphericPersistentBytes = 0;
+    uint64_t weatherRequests = 0;
+    uint64_t weatherCoalescedRequests = 0;
+    uint64_t weatherBuildsStarted = 0;
+    uint64_t weatherSnapshotsPublished = 0;
+    uint64_t weatherStaleBuildsDiscarded = 0;
+    size_t maxWeatherPendingRequests = 0;
+    uint64_t weatherWorkerBusyFrames = 0;
+    size_t maxThunderPending = 0;
     uint64_t peakResidentBytes = 0;
     uint64_t peakMetalBytes = 0;
     double settleStartSeconds = -1.0;
@@ -97,6 +119,13 @@ uint64_t unsignedEnvironmentValue(const char* name, uint64_t fallback) {
     return end == value || *end != '\0' ? fallback : static_cast<uint64_t>(parsed);
 }
 
+void resolveLightningTerrainHeight(const World& world, LightningEvent& event) {
+    const auto surface = world.sampleSurface(static_cast<int64_t>(std::floor(event.x)),
+                                             static_cast<int64_t>(std::floor(event.z)));
+    event.y = static_cast<float>(surface.terrainHeight);
+    event.cloudY = std::max(event.cloudY, event.y + 1.0F);
+}
+
 uint64_t processResidentBytes() {
     mach_task_basic_info_data_t info{};
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
@@ -108,11 +137,13 @@ uint64_t processResidentBytes() {
 bool updatePerformanceCapture(PerformanceCapture& capture, uint64_t frameCount,
                               double frameMilliseconds, uint32_t loadedCubes,
                               uint64_t autopilotStopFrame, World& world, RenderPipeline& renderer,
-                              id<MTLDevice> device) {
+                              id<MTLDevice> device, const WeatherSystemStats& weatherStats,
+                              size_t thunderPending) {
     if (!capture.enabled() || capture.reported)
         return false;
 
     const RenderPipeline::ChunkRenderStats stats = renderer.chunkRenderStats();
+    const RenderPipeline::AtmosphericRenderStats atmospheric = renderer.atmosphericRenderStats();
     if (autopilotStopFrame != std::numeric_limits<uint64_t>::max() &&
         frameCount >= autopilotStopFrame) {
         if (capture.settleStartSeconds < 0.0)
@@ -154,6 +185,40 @@ bool updatePerformanceCapture(PerformanceCapture& capture, uint64_t frameCount,
     capture.maxFarArenaMB = std::max(capture.maxFarArenaMB, stats.farMegaUsedMB);
     capture.maxExactArenaMB = std::max(capture.maxExactArenaMB, stats.megaUsedMB);
     capture.maxGpuFrameMs = std::max(capture.maxGpuFrameMs, renderer.gpuFrameMs());
+    for (uint32_t cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        capture.maxShadowCasterCounts[cascade] = std::max(capture.maxShadowCasterCounts[cascade],
+                                                          atmospheric.shadowCasterCounts[cascade]);
+        capture.shadowRefreshCounts[cascade] = std::max(capture.shadowRefreshCounts[cascade],
+                                                        atmospheric.shadowRefreshCounts[cascade]);
+    }
+    capture.atmosphereSlowRefreshCount =
+        std::max(capture.atmosphereSlowRefreshCount, atmospheric.atmosphereSlowRefreshCount);
+    capture.atmosphereSkyRefreshCount =
+        std::max(capture.atmosphereSkyRefreshCount, atmospheric.atmosphereSkyRefreshCount);
+    capture.indirectHistoryInvalidFrames += atmospheric.indirectHistoryValid ? 0U : 1U;
+    capture.cloudHistoryInvalidFrames += atmospheric.cloudHistoryValid ? 0U : 1U;
+    capture.froxelHistoryInvalidFrames += atmospheric.froxelHistoryValid ? 0U : 1U;
+    capture.maxIndirectPersistentBytes =
+        std::max(capture.maxIndirectPersistentBytes, atmospheric.indirectPersistentBytes);
+    capture.maxCloudPersistentBytes =
+        std::max(capture.maxCloudPersistentBytes, atmospheric.cloudPersistentBytes);
+    capture.maxFroxelPersistentBytes =
+        std::max(capture.maxFroxelPersistentBytes, atmospheric.froxelPersistentBytes);
+    capture.maxIntegratedAtmosphericPersistentBytes = std::max(
+        capture.maxIntegratedAtmosphericPersistentBytes, atmospheric.integratedPersistentBytes);
+    capture.weatherRequests = std::max(capture.weatherRequests, weatherStats.requests);
+    capture.weatherCoalescedRequests =
+        std::max(capture.weatherCoalescedRequests, weatherStats.coalescedRequests);
+    capture.weatherBuildsStarted =
+        std::max(capture.weatherBuildsStarted, weatherStats.buildsStarted);
+    capture.weatherSnapshotsPublished =
+        std::max(capture.weatherSnapshotsPublished, weatherStats.snapshotsPublished);
+    capture.weatherStaleBuildsDiscarded =
+        std::max(capture.weatherStaleBuildsDiscarded, weatherStats.staleBuildsDiscarded);
+    capture.maxWeatherPendingRequests =
+        std::max(capture.maxWeatherPendingRequests, weatherStats.pendingRequests);
+    capture.weatherWorkerBusyFrames += weatherStats.workerBusy ? 1U : 0U;
+    capture.maxThunderPending = std::max(capture.maxThunderPending, thunderPending);
     if (frameCount % 30 == 0 || capture.frameMilliseconds.size() == 1) {
         capture.peakResidentBytes = std::max(capture.peakResidentBytes, processResidentBytes());
         capture.peakMetalBytes =
@@ -259,6 +324,51 @@ bool updatePerformanceCapture(PerformanceCapture& capture, uint64_t frameCount,
                   static_cast<double>(capture.peakMetalBytes) / MEBIBYTE, credibleUnifiedMB,
                   capture.settleSeconds);
     RY_LOG_INFO(memory);
+
+    char atmosphericSummary[768];
+    std::snprintf(
+        atmosphericSummary, sizeof(atmosphericSummary),
+        "Performance atmosphere: shadow selected %u/%u/%u/%u/%u refreshes %llu/%llu/%llu/%llu/"
+        "%llu LUT slow %llu sky %llu history invalid frames indirect %llu cloud %llu froxel %llu",
+        capture.maxShadowCasterCounts[0], capture.maxShadowCasterCounts[1],
+        capture.maxShadowCasterCounts[2], capture.maxShadowCasterCounts[3],
+        capture.maxShadowCasterCounts[4],
+        static_cast<unsigned long long>(capture.shadowRefreshCounts[0]),
+        static_cast<unsigned long long>(capture.shadowRefreshCounts[1]),
+        static_cast<unsigned long long>(capture.shadowRefreshCounts[2]),
+        static_cast<unsigned long long>(capture.shadowRefreshCounts[3]),
+        static_cast<unsigned long long>(capture.shadowRefreshCounts[4]),
+        static_cast<unsigned long long>(capture.atmosphereSlowRefreshCount),
+        static_cast<unsigned long long>(capture.atmosphereSkyRefreshCount),
+        static_cast<unsigned long long>(capture.indirectHistoryInvalidFrames),
+        static_cast<unsigned long long>(capture.cloudHistoryInvalidFrames),
+        static_cast<unsigned long long>(capture.froxelHistoryInvalidFrames));
+    RY_LOG_INFO(atmosphericSummary);
+
+    char atmosphericMemory[384];
+    std::snprintf(atmosphericMemory, sizeof(atmosphericMemory),
+                  "Performance atmospheric memory: indirect %.1f MB cloud %.1f MB froxel %.1f MB "
+                  "integrated %.1f MB",
+                  static_cast<double>(capture.maxIndirectPersistentBytes) / MEBIBYTE,
+                  static_cast<double>(capture.maxCloudPersistentBytes) / MEBIBYTE,
+                  static_cast<double>(capture.maxFroxelPersistentBytes) / MEBIBYTE,
+                  static_cast<double>(capture.maxIntegratedAtmosphericPersistentBytes) / MEBIBYTE);
+    RY_LOG_INFO(atmosphericMemory);
+
+    char weather[512];
+    std::snprintf(
+        weather, sizeof(weather),
+        "Performance weather worker: requests %llu coalesced %llu builds %llu published %llu "
+        "stale %llu pending max %zu busy samples %llu thunder pending max %zu",
+        static_cast<unsigned long long>(capture.weatherRequests),
+        static_cast<unsigned long long>(capture.weatherCoalescedRequests),
+        static_cast<unsigned long long>(capture.weatherBuildsStarted),
+        static_cast<unsigned long long>(capture.weatherSnapshotsPublished),
+        static_cast<unsigned long long>(capture.weatherStaleBuildsDiscarded),
+        capture.maxWeatherPendingRequests,
+        static_cast<unsigned long long>(capture.weatherWorkerBusyFrames),
+        capture.maxThunderPending);
+    RY_LOG_INFO(weather);
     capture.reported = true;
     return true;
 }
@@ -289,13 +399,15 @@ struct EngineState {
     float fovCurrent = BASE_FOV;
 
     // ---- Day/Night Cycle & Weather ----
-    static constexpr uint64_t TICKS_PER_DAY = 24000; // 20 min at 20Hz
     uint64_t worldTime = 0;
-    bool raining = false; // deterministic per-day schedule (seeded)
-    float wetness = 0.0f; // 0 dry .. 1 soaked; ramps with the rain
-    // Weather tuning: how many days rain (percent), and how fast surfaces
-    // soak under rain / dry out after it stops.
-    static constexpr uint32_t RAIN_DAYS_PERCENT = 40;
+    std::shared_ptr<const WeatherSnapshot> weatherSnapshot;
+    WeatherSample localWeather;
+    std::vector<LightningEvent> lightningEvents;
+    uint64_t lastWeatherEventTick = 0;
+    ThunderScheduler thunder;
+    std::optional<CaptureLightningOverride> captureLightningOverride;
+    bool captureLightningInjected = false;
+    float wetness = 0.0f; // 0 dry .. 1 soaked; integrates local precipitation
     static constexpr float SOAK_SECONDS = 15.0f;
     static constexpr float DRY_SECONDS = 45.0f;
 
@@ -325,6 +437,9 @@ struct EngineState {
     // ---- Player & World ----
     Player player;
     std::shared_ptr<World> world;
+    // Declared after World so destruction joins the weather worker before its
+    // non-owning ChunkGenerator reference can become invalid.
+    std::unique_ptr<WeatherSystem> weatherSystem;
     std::unique_ptr<SaveManager> saveManager;
     Camera camera;
 
@@ -339,8 +454,15 @@ struct EngineState {
     std::vector<float> sfxBlockPlace;
     std::vector<float> sfxFootstep;
     std::vector<float> sfxWind;
+    std::vector<float> sfxRain;
+    std::vector<float> sfxSnow;
     std::array<std::vector<float>, ENTITY_TYPE_COUNT> sfxAnimal;
     int32_t windVoice = -1;
+    int32_t rainVoice = -1;
+    int32_t snowVoice = -1;
+    float windGain = 0.0F;
+    float rainGain = 0.0F;
+    float snowGain = 0.0F;
     float footstepDistance = 0.f; // ground distance walked since last step
     Vec3 lastFootstepPos{0.f, 0.f, 0.f};
 
@@ -368,7 +490,7 @@ struct EngineState {
     bool _savedWorld;
 }
 
-// ---- C++ bridge helper — must be inside @implementation to access _state ----
+// ---- C++ bridge helper, must be inside @implementation to access _state ----
 static EngineState* _engineGetState(Engine* engine) {
     return engine->_state.get();
 }
@@ -435,15 +557,30 @@ static EngineState* _engineGetState(Engine* engine) {
                 spawnPos = {x, y, z};
         }
 
-        // Playtest hook: pin the time of day (0..23999; 6000 = noon).
+        // Playtest hook: pin absolute saved world time. Values beyond one day
+        // select a repeatable lunar phase while the remainder selects time of
+        // day (6000 = noon).
         if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
-            _state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
+            if (const auto parsed = parseUnsignedDecimal(timeEnv)) {
+                _state->worldTime = *parsed;
+            } else {
+                RY_LOG_ERROR("Ignoring invalid RYCRAFT_TIME; expected unsigned decimal ticks");
+            }
+        }
+        const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
+        const char* captureLightning = std::getenv("RYCRAFT_CAPTURE_LIGHTNING");
+        if (capturePath && *capturePath && captureLightning && *captureLightning) {
+            _state->captureLightningOverride = parseCaptureLightningOverride(captureLightning);
+            if (!_state->captureLightningOverride) {
+                RY_LOG_ERROR("Ignoring invalid RYCRAFT_CAPTURE_LIGHTNING; expected "
+                             "x,z,id,ageTicks");
+            }
         }
 
         // Persisted settings load before the World exists (view distance
         // feeds its constructor); env overrides win over the file for
         // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..512>.
-        // An env-overridden session never saves settings — a playtest run
+        // An env-overridden session never saves settings, a playtest run
         // must not rewrite the user's file with its overrides.
         LoadedSettings loaded = loadSettings(settingsPath());
         _state->settings = loaded.values;
@@ -466,6 +603,21 @@ static EngineState* _engineGetState(Engine* engine) {
         _state->world->setSaveManager(_state->saveManager.get());
         _state->spawner = std::make_unique<Spawner>(*_state->world);
         _state->player.position = spawnPos;
+        _state->weatherSystem = std::make_unique<WeatherSystem>(_state->world->generator());
+        _state->weatherSystem->requestSnapshot(static_cast<int64_t>(std::floor(spawnPos.x)),
+                                               static_cast<int64_t>(std::floor(spawnPos.z)),
+                                               _state->worldTime);
+        _state->localWeather =
+            _state->weatherSystem->sample(spawnPos.x, spawnPos.z, _state->worldTime);
+        _state->lastWeatherEventTick = _state->worldTime;
+        _state->thunder.beginTimeline(_state->worldTime);
+
+        // Fixed presets are capture/test authorities, so their surface state
+        // starts settled instead of visibly ramping after launch.
+        const WeatherPreset preset = _state->weatherSystem->preset();
+        if (preset == WeatherPreset::RAIN || preset == WeatherPreset::STORM) {
+            _state->wetness = 1.0f;
+        }
     }
     return self;
 }
@@ -537,7 +689,7 @@ static EngineState* _engineGetState(Engine* engine) {
     _view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
     _view.preferredFramesPerSecond = 120;
 
-    // Disable automatic setNeedsDisplay — we drive rendering from the game loop
+    // Disable automatic setNeedsDisplay, we drive rendering from the game loop
     _view.enableSetNeedsDisplay = false;
     _view.framebufferOnly = false;
 
@@ -567,7 +719,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     _renderPipeline = std::make_unique<RenderPipeline>(
         _device, library, static_cast<uint32_t>(_view.bounds.size.width),
-        static_cast<uint32_t>(_view.bounds.size.height));
+        static_cast<uint32_t>(_view.bounds.size.height), _state->world->getSeed());
 
     // Apply the persisted settings to the live systems (world view distance
     // was already applied through the World constructor; RYCRAFT_BLOOM rides
@@ -592,20 +744,22 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 8. Audio: non-fatal on failure — the game is fully playable silent
+    // 8. Audio: non-fatal on failure, the game is fully playable silent
     _state->audio = std::make_unique<AudioEngine>();
     if (_state->audio->initialize()) {
         _state->sfxBlockBreak = SoundEffect::generateBlockBreak();
         _state->sfxBlockPlace = SoundEffect::generateBlockPlace();
         _state->sfxFootstep = SoundEffect::generateFootstep();
         _state->sfxWind = SoundEffect::generateAmbientWind();
+        _state->sfxRain = SoundEffect::generateRainAmbience();
+        _state->sfxSnow = SoundEffect::generateSnowAmbience();
         for (size_t index = 0; index < ENTITY_TYPE_COUNT; ++index) {
             _state->sfxAnimal[index] =
                 SoundEffect::generateAnimalCall(static_cast<EntityType>(index));
         }
         [self syncAudioVolume];
     } else {
-        RY_LOG_ERROR("Audio engine failed to initialize — continuing without sound");
+        RY_LOG_ERROR("Audio engine failed to initialize, continuing without sound");
         _state->audio.reset();
     }
 
@@ -653,7 +807,7 @@ static EngineState* _engineGetState(Engine* engine) {
     // 2. Add to accumulator
     state->accumulator += frameTime;
 
-    // 3. Screen-level input (ESC, menu clicks, F3) — runs every frame so
+    // 3. Screen-level input (ESC, menu clicks, F3), runs every frame so
     // menus stay responsive while the simulation is frozen
     [self handleGlobalInput];
 
@@ -665,7 +819,7 @@ static EngineState* _engineGetState(Engine* engine) {
         state->accumulator = 0.0;
     }
 
-    // 4. Fixed timestep game tick — menus freeze the world
+    // 4. Fixed timestep game tick, menus freeze the world
     if (state->flow.screen == GameScreen::PLAYING) {
         while (state->accumulator >= EngineState::TICK_DT) {
             const double tickStart = CACurrentMediaTime();
@@ -675,7 +829,7 @@ static EngineState* _engineGetState(Engine* engine) {
             state->accumulator -= EngineState::TICK_DT;
         }
 
-        // Render the latest simulated position directly — no inter-tick
+        // Render the latest simulated position directly, no inter-tick
         // interpolation. Interpolation trails the sim by up to a tick (50 ms)
         // and read as floaty/light; the 20 Hz camera step is preferred over
         // that added latency. Falls stay gradual because velocity no longer
@@ -722,9 +876,42 @@ static EngineState* _engineGetState(Engine* engine) {
     state->audio->setMasterVolume(playing ? volume : 0.0f);
 
     if (playing && state->windVoice < 0 && !state->sfxWind.empty()) {
-        state->windVoice = state->audio->playSound(state->sfxWind, SoundEffect::SAMPLE_RATE, 0.18f,
+        state->windVoice = state->audio->playSound(state->sfxWind, SoundEffect::SAMPLE_RATE, 0.0F,
                                                    /*looping=*/true);
     }
+    if (playing && state->rainVoice < 0 && !state->sfxRain.empty()) {
+        state->rainVoice = state->audio->playSound(state->sfxRain, SoundEffect::SAMPLE_RATE, 0.0F,
+                                                   /*looping=*/true);
+    }
+    if (playing && state->snowVoice < 0 && !state->sfxSnow.empty()) {
+        state->snowVoice = state->audio->playSound(state->sfxSnow, SoundEffect::SAMPLE_RATE, 0.0F,
+                                                   /*looping=*/true);
+    }
+}
+
+- (void)syncWeatherAudio {
+    EngineState* state = _state.get();
+    if (!state->audio || state->flow.screen != GameScreen::PLAYING)
+        return;
+
+    const float wind =
+        std::clamp(state->localWeather.windBlocksPerSecond.length() / 12.0F, 0.0F, 1.0F);
+    const float precipitation = std::clamp(state->localWeather.precipitationIntensity, 0.0F, 1.0F);
+    const float targetWind =
+        0.12F + 0.30F * wind + 0.18F * std::clamp(state->localWeather.stormPotential, 0.0F, 1.0F);
+    const float targetRain = state->localWeather.precipitationKind == PrecipitationKind::RAIN
+                                 ? precipitation * 0.52F
+                                 : 0.0F;
+    const float targetSnow = state->localWeather.precipitationKind == PrecipitationKind::SNOW
+                                 ? precipitation * 0.34F
+                                 : 0.0F;
+    const float blend = 1.0F - std::exp(-static_cast<float>(EngineState::TICK_DT) / 1.25F);
+    state->windGain += (targetWind - state->windGain) * blend;
+    state->rainGain += (targetRain - state->rainGain) * blend;
+    state->snowGain += (targetSnow - state->snowGain) * blend;
+    state->audio->setVoiceGain(state->windVoice, state->windGain);
+    state->audio->setVoiceGain(state->rainVoice, state->rainGain);
+    state->audio->setVoiceGain(state->snowVoice, state->snowGain);
 }
 
 - (void)playSfx:(const std::vector<float>&)buffer gain:(float)gain {
@@ -747,7 +934,7 @@ static EngineState* _engineGetState(Engine* engine) {
     if (effects.resetTiming) {
         state->accumulator = 0;
         if (state->inputManager) {
-            // Drop buffered look deltas AND pending tick presses — the click
+            // Drop buffered look deltas AND pending tick presses, the click
             // that pressed RESUME must not break a block on the next tick
             state->inputManager->state().clearMouseDelta();
             state->inputManager->state().clearTickPresses();
@@ -827,13 +1014,17 @@ static EngineState* _engineGetState(Engine* engine) {
         case MenuAction::CLOUDS_DOWN:
         case MenuAction::CLOUDS_UP: {
             int step = (action == MenuAction::CLOUDS_UP) ? 1 : -1;
-            state->gfx.cloudMode =
-                std::clamp(state->gfx.cloudMode + step, 0, GraphicsSettings::CLOUD_MODE_MAX);
+            state->gfx.cloudQuality =
+                std::clamp(state->gfx.cloudQuality + step, 0, GraphicsSettings::QUALITY_MAX);
             break;
         }
-        case MenuAction::SSAO_TOGGLE:
-            state->gfx.ssao = !state->gfx.ssao;
+        case MenuAction::INDIRECT_DOWN:
+        case MenuAction::INDIRECT_UP: {
+            int step = (action == MenuAction::INDIRECT_UP) ? 1 : -1;
+            state->gfx.indirectLightingQuality = std::clamp(
+                state->gfx.indirectLightingQuality + step, 0, GraphicsSettings::QUALITY_MAX);
             break;
+        }
         case MenuAction::SSR_TOGGLE:
             state->gfx.waterReflections = !state->gfx.waterReflections;
             break;
@@ -882,7 +1073,7 @@ static EngineState* _engineGetState(Engine* engine) {
     InputState& input = state->inputManager->state();
 
     if (input.isJustPressed(Key::Escape)) {
-        // Leaving a settings screen persists the values (not per click —
+        // Leaving a settings screen persists the values (not per click,
         // no disk I/O while stepping)
         bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
                                state->flow.screen == GameScreen::VIDEO_SETTINGS;
@@ -897,7 +1088,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     if (state->flow.inMenu()) {
         // Rebuild the layout each frame (settings values can change) and
-        // hit-test in window points — the same normalized space it's drawn in
+        // hit-test in window points, the same normalized space it's drawn in
         float boundsW = static_cast<float>(_view.bounds.size.width);
         float boundsH = static_cast<float>(_view.bounds.size.height);
         state->menuLayout =
@@ -977,7 +1168,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Settings share the quit path so mid-session tweaks survive a close
     // that never revisited the settings screen. Env-overridden playtest
-    // sessions never save — their overrides must not become the file.
+    // sessions never save, their overrides must not become the file.
     if (!state->envOverridesActive) {
         saveSettings(settingsPath(), state->settings, state->gfx);
     }
@@ -1050,20 +1241,20 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 1. Advance world time (1 tick per game tick). Playtest hooks:
-    // RYCRAFT_TIME=<0..23999> pins the time of day at launch and
+    // RYCRAFT_TIME=<absolute world tick> pins time and lunar phase at launch;
     // RYCRAFT_TIME_FREEZE=1 stops it advancing, so captures at noon /
     // sunset / midnight don't depend on hand-editing the save.
     static const bool freezeTime = [] {
         const char* f = std::getenv("RYCRAFT_TIME_FREEZE");
         return f && *f && std::strcmp(f, "0") != 0;
     }();
-    if (!freezeTime) {
+    if (!freezeTime && state->worldTime < std::numeric_limits<uint64_t>::max()) {
         state->worldTime++;
     }
 
     // 1b. Unstick a stale spawn: a resumed save can place the player inside
     // terrain when world generation has changed shape since the save was
-    // written — collision then zeroes every move. Once the spawn chunk
+    // written, collision then zeroes every move. Once the spawn chunk
     // exists, lift the player to the surface if they are embedded.
     if (!state->spawnValidated) {
         int64_t px = static_cast<int64_t>(std::floor(state->player.position.x));
@@ -1151,7 +1342,7 @@ static EngineState* _engineGetState(Engine* engine) {
             }
 
             // Playtest hook: RYCRAFT_YAW / RYCRAFT_PITCH (degrees) point the
-            // camera for captures — e.g. face the afternoon sun for the lens
+            // camera for captures, e.g. face the afternoon sun for the lens
             // flare. Yaw 0 looks +Z; -90 looks -X.
             static const char* yawEnv = std::getenv("RYCRAFT_YAW");
             static const char* pitchEnv = std::getenv("RYCRAFT_PITCH");
@@ -1223,7 +1414,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // 6. Update loaded chunks around player
     // updatePlayerPosition takes WORLD coordinates (it converts to chunk
-    // coords itself) — passing pre-converted chunk coords made streaming
+    // coords itself), passing pre-converted chunk coords made streaming
     // track chunk/16, so the world unloaded under the player ~200 blocks out
     state->world->updatePlayerPosition(static_cast<int64_t>(std::floor(state->player.position.x)),
                                        static_cast<int32_t>(std::floor(state->player.position.y)),
@@ -1255,7 +1446,7 @@ static EngineState* _engineGetState(Engine* engine) {
                 continue;
 
             // Simulation distance: distant animals stand still (cheap and
-            // invisible — they are beyond the fog anyway)
+            // invisible, they are beyond the fog anyway)
             Vec3 offset = entity->position - state->player.position;
             if (offset.length() > 96.f)
                 continue;
@@ -1294,39 +1485,122 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // 7. Weather: a deterministic schedule from the world seed (convention:
-    // seeded randomness only) — each in-game day hashes to a maybe-rain
-    // window, so playtests reproduce exactly. Playtest hook:
-    // RYCRAFT_WEATHER=rain|clear pins the state.
-    {
-        // hash64 is the engine's one seeded-hash home (common/random.hpp)
-        uint64_t day = state->worldTime / EngineState::TICKS_PER_DAY;
-        uint64_t h = hash64(day ^ (static_cast<uint64_t>(state->world->getSeed()) << 32));
-        uint32_t tod = static_cast<uint32_t>(state->worldTime % EngineState::TICKS_PER_DAY);
-        uint32_t start = 3000u + static_cast<uint32_t>((h >> 8) % 12000u);
-        uint32_t length = 2000u + static_cast<uint32_t>((h >> 4) % 4000u);
-        state->raining =
-            (h % 100u) < EngineState::RAIN_DAYS_PERCENT && tod >= start && tod < start + length;
-        static const char* weatherEnv = std::getenv("RYCRAFT_WEATHER");
-        if (weatherEnv) {
-            // Playtest override skips the soak ramp so captures are stable.
-            state->raining = std::strcmp(weatherEnv, "rain") == 0;
-            state->wetness = state->raining ? 1.0f : 0.0f;
+    // 7. Regional weather. Snapshot construction is asynchronous and
+    // latest-wins; the engine retains the prior immutable snapshot while a
+    // time-slice or recenter replacement is being built.
+    if (state->weatherSystem) {
+        const int64_t playerX = static_cast<int64_t>(std::floor(state->player.position.x));
+        const int64_t playerZ = static_cast<int64_t>(std::floor(state->player.position.z));
+        state->weatherSystem->requestSnapshot(playerX, playerZ, state->worldTime);
+        if (std::shared_ptr<const WeatherSnapshot> snapshot =
+                state->weatherSystem->latestSnapshot()) {
+            state->weatherSnapshot = std::move(snapshot);
+        }
+        state->localWeather =
+            state->weatherSnapshot
+                ? state->weatherSnapshot->sample(state->player.position.x, state->player.position.z,
+                                                 state->worldTime)
+                : state->weatherSystem->sample(state->player.position.x, state->player.position.z,
+                                               state->worldTime);
+        std::vector<LightningEvent> newLightningEvents =
+            state->weatherSystem->lightningEvents(state->lastWeatherEventTick, state->worldTime);
+        state->lastWeatherEventTick = state->worldTime;
+
+        // The weather grid supplies a coarse strike height. Resolve the final
+        // endpoint against exact deterministic terrain at the generated X/Z
+        // before rendering the bolt or scheduling its distance-based thunder.
+        for (LightningEvent& event : newLightningEvents) {
+            resolveLightningTerrainHeight(*state->world, event);
+        }
+
+        const double audioNow = CACurrentMediaTime();
+        for (const LightningEvent& event : newLightningEvents) {
+            state->thunder.schedule(event, state->player.position.x, state->player.position.y,
+                                    state->player.position.z, audioNow);
+        }
+        state->lightningEvents.insert(state->lightningEvents.end(), newLightningEvents.begin(),
+                                      newLightningEvents.end());
+
+        // A fixed capture can inject one visual strike without advancing or
+        // replaying the canonical weather event timeline. Waiting for the
+        // immutable snapshot gives the bolt the same regional cloud bounds as
+        // a generated strike. This hook deliberately bypasses thunder so it
+        // cannot alter the scheduler's load-boundary and backlog semantics.
+        if (!state->captureLightningInjected && state->captureLightningOverride &&
+            state->weatherSnapshot) {
+            state->captureLightningInjected = true;
+            const CaptureLightningOverride& capture = *state->captureLightningOverride;
+            if (capture.ageTicks <= state->worldTime) {
+                LightningEvent event;
+                event.id = capture.id;
+                event.tick = state->worldTime - capture.ageTicks;
+                event.x = capture.x;
+                event.z = capture.z;
+                event.intensity = 1.0F;
+                const WeatherSample strikeWeather =
+                    state->weatherSnapshot->sample(event.x, event.z, event.tick);
+                const uint32_t heightBits =
+                    static_cast<uint32_t>(event.id) ^ static_cast<uint32_t>(event.id >> 32U);
+                const float heightUnit = static_cast<float>(heightBits) /
+                                         static_cast<float>(std::numeric_limits<uint32_t>::max());
+                event.cloudY = std::lerp(strikeWeather.cloudBaseY, strikeWeather.cloudTopY,
+                                         0.68F + heightUnit * 0.24F);
+                resolveLightningTerrainHeight(*state->world, event);
+                state->lightningEvents.insert(state->lightningEvents.begin(), event);
+            } else {
+                RY_LOG_ERROR("Ignoring RYCRAFT_CAPTURE_LIGHTNING whose age exceeds world time");
+            }
+        }
+        std::erase_if(state->lightningEvents, [worldTime = state->worldTime](const auto& event) {
+            return worldTime > event.tick && worldTime - event.tick > 11U;
+        });
+        for (const ScheduledThunder& thunder : state->thunder.popDue(audioNow)) {
+            const std::vector<float> samples =
+                SoundEffect::generateThunder(thunder.eventId, thunder.gain);
+            [self playSfx:samples gain:1.0F];
+        }
+
+        const WeatherPreset preset = state->weatherSystem->preset();
+        if (preset != WeatherPreset::NATURAL) {
+            // Captures need a fully settled, reproducible material state.
+            state->wetness =
+                preset == WeatherPreset::RAIN || preset == WeatherPreset::STORM ? 1.0f : 0.0f;
         } else {
-            // Fixed-step tick logic uses the tick dt, not the frame delta.
+            // Rain soaks surfaces. Snow remains non-destructive and only adds
+            // meltwater near freezing. Temperature, wind, and sunlight all
+            // accelerate drying once precipitation eases.
+            constexpr float TWO_PI = 6.28318530717958647692f;
+            const float dayFraction =
+                static_cast<float>(state->worldTime % CELESTIAL_TICKS_PER_DAY) /
+                static_cast<float>(CELESTIAL_TICKS_PER_DAY);
+            const float sunlight = std::max(0.0f, std::sin(dayFraction * TWO_PI));
+            const float wind =
+                std::clamp(state->localWeather.windBlocksPerSecond.length() / 12.0f, 0.0f, 1.0f);
+            const float warmth =
+                std::clamp((state->localWeather.temperatureC + 5.0f) / 30.0f, 0.0f, 1.0f);
+            float wetting = state->localWeather.precipitationIntensity;
+            if (state->localWeather.precipitationKind == PrecipitationKind::SNOW) {
+                wetting *=
+                    0.2f * std::clamp((state->localWeather.temperatureC + 2.0f) / 4.0f, 0.0f, 1.0f);
+            } else if (state->localWeather.precipitationKind == PrecipitationKind::NONE) {
+                wetting = 0.0f;
+            }
+            const float drying =
+                (0.25f + 0.35f * warmth + 0.25f * wind + 0.55f * sunlight) * (1.0f - wetting);
             const float dt = static_cast<float>(EngineState::TICK_DT);
-            state->wetness = state->raining
-                                 ? std::min(1.0f, state->wetness + dt / EngineState::SOAK_SECONDS)
-                                 : std::max(0.0f, state->wetness - dt / EngineState::DRY_SECONDS);
+            state->wetness = std::clamp(state->wetness + dt * (wetting / EngineState::SOAK_SECONDS -
+                                                               drying / EngineState::DRY_SECONDS),
+                                        0.0f, 1.0f);
         }
     }
     if (_renderPipeline) {
-        // Particles integrate per fixed tick too — the frame delta here made
+        // Particles integrate per fixed tick too, the frame delta here made
         // rainfall speed depend on the frame rate (1/3 speed at 60 FPS).
         _renderPipeline->tickParticles(static_cast<float>(EngineState::TICK_DT), *state->world,
-                                       state->player.position, state->raining);
+                                       state->player.position, state->localWeather);
         _renderPipeline->setWetness(state->wetness);
     }
+    [self syncWeatherAudio];
 
     // 8. Single raycast for block interaction + highlight
     Vec3 cameraPos = state->camera.position();
@@ -1355,7 +1629,7 @@ static EngineState* _engineGetState(Engine* engine) {
     // Rendering reads this pointer without copying or taking the world lock.
     state->world->publishLoadedSnapshot();
 
-    // Tick-edge input consumed — a second tick in this frame must not re-fire
+    // Tick-edge input consumed, a second tick in this frame must not re-fire
     input.clearTickPresses();
 }
 
@@ -1439,7 +1713,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
     // Ease the FOV toward the movement mode's target (dt-correct exponential,
     // so the zoom speed doesn't depend on frame rate) and hand it to the
-    // camera — the cloud shader reads camera.FOV(), so routing the projection
+    // camera, the cloud shader reads camera.FOV(), so routing the projection
     // through the same value keeps clouds registered with the world mid-zoom.
     float targetFov = state->player.sprinting ? EngineState::SPRINT_FOV : EngineState::BASE_FOV;
     state->fovCurrent +=
@@ -1529,7 +1803,7 @@ static EngineState* _engineGetState(Engine* engine) {
     // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
     // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered, then
     // quits ~1s later (the PNG write is async). A capture run is headless
-    // tooling — leaving it running leaked a full game instance per capture
+    // tooling, leaving it running leaked a full game instance per capture
     // until concurrent playtests exhausted system memory.
     static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
     if (capturePath && *capturePath) {
@@ -1549,7 +1823,7 @@ static EngineState* _engineGetState(Engine* engine) {
     Mat4 viewMatrix = state->camera.viewMatrix();
 
     // Real performance stats for the F3 HUD (EMA-smoothed frame time; chunk
-    // count sampled every 30 frames — getLoadedChunks copies under a lock)
+    // count sampled every 30 frames, getLoadedChunks copies under a lock)
     state->smoothedFrameMs =
         state->smoothedFrameMs * 0.95f + static_cast<float>(state->deltaTime) * 1000.0f * 0.05f;
     if (state->frameCount % 30 == 0) {
@@ -1562,7 +1836,7 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.hoveredButton = state->hoveredButton;
     uiFrame.showDebugHud = state->showDebugHud;
     // Underwater view (veil, god rays, dense fog): the camera cell is water.
-    // Non-generating read — a streaming lag must never stall the frame.
+    // Non-generating read, a streaming lag must never stall the frame.
     {
         Vec3 camPos = state->camera.getPosition();
         const int64_t waterX = static_cast<int64_t>(std::floor(camPos.x));
@@ -1640,6 +1914,52 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.stats.pendingFluids = static_cast<uint32_t>(state->world->getPendingFluidCount());
     uiFrame.stats.droppedFluidUpdates = state->world->getDroppedFluidUpdateCount();
     uiFrame.stats.droppedFluidFrontiers = state->world->getDroppedFluidFrontierCount();
+    const RenderPipeline::AtmosphericRenderStats atmospheric =
+        _renderPipeline->atmosphericRenderStats();
+    const WeatherSystemStats weatherSystemStats =
+        state->weatherSystem ? state->weatherSystem->stats() : WeatherSystemStats{};
+    uiFrame.stats.shadowRefreshMask = atmospheric.shadowRefreshMask;
+    uiFrame.stats.shadowCasterCounts = atmospheric.shadowCasterCounts;
+    uiFrame.stats.shadowRefreshCounts = atmospheric.shadowRefreshCounts;
+    uiFrame.stats.indirectHistoryResetMask = atmospheric.indirectHistoryResetMask;
+    uiFrame.stats.indirectHistoryValid = atmospheric.indirectHistoryValid;
+    uiFrame.stats.cloudHistoryValid = atmospheric.cloudHistoryValid;
+    uiFrame.stats.froxelHistoryValid = atmospheric.froxelHistoryValid;
+    uiFrame.stats.atmosphereSlowRefreshCount = atmospheric.atmosphereSlowRefreshCount;
+    uiFrame.stats.atmosphereSkyRefreshCount = atmospheric.atmosphereSkyRefreshCount;
+    constexpr float BYTES_TO_MEBIBYTES = 1.0F / (1024.0F * 1024.0F);
+    uiFrame.stats.indirectPersistentMB =
+        static_cast<float>(atmospheric.indirectPersistentBytes) * BYTES_TO_MEBIBYTES;
+    uiFrame.stats.cloudPersistentMB =
+        static_cast<float>(atmospheric.cloudPersistentBytes) * BYTES_TO_MEBIBYTES;
+    uiFrame.stats.froxelPersistentMB =
+        static_cast<float>(atmospheric.froxelPersistentBytes) * BYTES_TO_MEBIBYTES;
+    uiFrame.stats.integratedAtmosphericPersistentMB =
+        static_cast<float>(atmospheric.integratedPersistentBytes) * BYTES_TO_MEBIBYTES;
+    uiFrame.stats.weatherRequests = weatherSystemStats.requests;
+    uiFrame.stats.weatherCoalescedRequests = weatherSystemStats.coalescedRequests;
+    uiFrame.stats.weatherBuildsStarted = weatherSystemStats.buildsStarted;
+    uiFrame.stats.weatherSnapshotsPublished = weatherSystemStats.snapshotsPublished;
+    uiFrame.stats.weatherStaleBuildsDiscarded = weatherSystemStats.staleBuildsDiscarded;
+    uiFrame.stats.weatherPendingRequests =
+        static_cast<uint32_t>(weatherSystemStats.pendingRequests);
+    uiFrame.stats.weatherWorkerBusy = weatherSystemStats.workerBusy;
+    uiFrame.stats.thunderPending = static_cast<uint32_t>(state->thunder.pendingCount());
+    uiFrame.stats.weatherPressureHpa = state->localWeather.pressureHpa;
+    uiFrame.stats.weatherHumidity = state->localWeather.relativeHumidity;
+    uiFrame.stats.weatherTemperatureC = state->localWeather.temperatureC;
+    uiFrame.stats.weatherWindX = state->localWeather.windBlocksPerSecond.x;
+    uiFrame.stats.weatherWindZ = state->localWeather.windBlocksPerSecond.y;
+    uiFrame.stats.cloudCoverage = state->localWeather.cloudCoverage;
+    uiFrame.stats.cloudType = static_cast<uint8_t>(state->localWeather.cloudType);
+    uiFrame.stats.precipitationIntensity = state->localWeather.precipitationIntensity;
+    uiFrame.stats.precipitationKind = static_cast<uint8_t>(state->localWeather.precipitationKind);
+    uiFrame.stats.stormPotential = state->localWeather.stormPotential;
+    uiFrame.stats.weatherFogExtinction = state->localWeather.fogExtinction;
+    uiFrame.stats.aerosolDensity = state->localWeather.aerosolDensity;
+    uiFrame.stats.stormId = atmospheric.lightningEventId;
+    uiFrame.stats.lunarPhaseEnergy = atmospheric.lunarPhaseEnergy;
+    uiFrame.stats.lunarPhaseCycle = atmospheric.lunarPhaseCycle;
     if (state->showDebugHud) {
         if (const auto surface = state->world->findSurfaceSample(playerX, playerZ)) {
             uiFrame.stats.plateId = surface->geology.plateId;
@@ -1659,11 +1979,13 @@ static EngineState* _engineGetState(Engine* engine) {
         _queue, drawable, viewMatrix, state->projectionMatrix, *state->world, state->camera,
         state->worldTime, state->deltaTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
-        state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
+        state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr,
+        state->weatherSnapshot, &state->lightningEvents);
 
     if (updatePerformanceCapture(state->performance, state->frameCount, state->deltaTime * 1000.0,
                                  state->cachedChunkCount, state->autopilotStopFrame, *state->world,
-                                 *_renderPipeline, _device)) {
+                                 *_renderPipeline, _device, weatherSystemStats,
+                                 state->thunder.pendingCount())) {
         [self requestQuit];
     }
 }

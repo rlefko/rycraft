@@ -5,6 +5,7 @@
 #include "world/world.hpp"
 
 #include "common/random.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -44,8 +45,8 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
         MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
-    // Particles draw inside the 4x MSAA scene pass
-    pipelineDesc.rasterSampleCount = 4;
+    // Weather is composited after the resolved froxel pass.
+    pipelineDesc.rasterSampleCount = 1;
 
     NSError* error = nil;
     _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
@@ -75,9 +76,10 @@ ParticleSystem::~ParticleSystem() {
 }
 
 // ---------------------------------------------------------------------------
-// tick — Update particle physics each game tick
+// tick, Update particle physics each game tick
 // ---------------------------------------------------------------------------
-void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPosition, bool raining) {
+void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPosition,
+                          const WeatherSample& weather) {
     if (dt <= 0.f)
         return;
 
@@ -87,15 +89,8 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
     // Spawn radius based on view distance (use player position as center)
     constexpr float SPAWN_RADIUS = 64.f;
 
-    // ---- Count active particles ----
+    // ---- Update existing particles and count survivors ----
     size_t activeCount = 0;
-    for (size_t i = 0; i < MAX_PARTICLES; ++i) {
-        if (particles_[i].active) {
-            ++activeCount;
-        }
-    }
-
-    // ---- Update existing particles ----
     for (size_t i = 0; i < MAX_PARTICLES; ++i) {
         Particle& p = particles_[i];
         if (!p.active)
@@ -104,33 +99,41 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
         // Advance lifetime
         p.lifetime += clampedDt;
 
-        // Kill if exceeded max lifetime or fell below Y=0
-        if (p.lifetime >= p.maxLifetime || p.position[1] < 0.f) {
-            p.active = false;
-            continue;
-        }
-
         // Apply velocity
         p.position[0] += p.velocity[0] * clampedDt;
         p.position[1] += p.velocity[1] * clampedDt;
         p.position[2] += p.velocity[2] * clampedDt;
+
+        const float windScale = p.type == ParticleType::RAIN ? 0.65f : 0.82f;
+        const float response = std::min(1.0f, clampedDt * 1.8f);
+        p.velocity[0] += (weather.windBlocksPerSecond.x * windScale - p.velocity[0]) * response;
+        p.velocity[2] += (weather.windBlocksPerSecond.y * windScale - p.velocity[2]) * response;
 
         // Snow: sinusoidal horizontal drift
         if (p.type == ParticleType::SNOW) {
             float driftAngle = p.lifetime * 2.0f + p.position[0] * 0.1f;
             p.velocity[0] += std::sin(driftAngle) * 0.5f * clampedDt;
             p.velocity[2] += std::cos(driftAngle) * 0.5f * clampedDt;
-
-            // Dampen horizontal velocity to prevent runaway drift
-            p.velocity[0] *= 0.99f;
-            p.velocity[2] *= 0.99f;
         }
+
+        // Count after deaths, including particles that crossed the lower
+        // boundary this tick. The former pre-update count underfilled the pool
+        // whenever a large cohort expired together.
+        if (p.lifetime >= p.maxLifetime || p.position[1] < 0.f) {
+            p.active = false;
+            continue;
+        }
+        ++activeCount;
     }
 
     // ---- Spawn new particles to fill pool ----
-    // Target: keep ~70% of the pool active while it rains, none when clear
-    // (live drops finish their fall so weather fades instead of popping off)
-    const size_t targetActive = raining ? static_cast<size_t>(MAX_PARTICLES * 0.7) : 0;
+    // Intensity scales the same bounded pool instead of turning all
+    // precipitation into a binary 70-percent load.
+    const float intensity = std::clamp(weather.precipitationIntensity, 0.0f, 1.0f);
+    const bool precipitating = weather.precipitationKind != PrecipitationKind::NONE;
+    const size_t targetActive =
+        precipitating ? static_cast<size_t>(static_cast<float>(MAX_PARTICLES) * 0.7f * intensity)
+                      : 0;
     size_t toSpawn = (activeCount < targetActive) ? (targetActive - activeCount) : 0;
 
     // Limit spawn rate per tick to prevent sudden bursts
@@ -155,14 +158,10 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
         }
         Particle& p = particles_[slot];
 
-        // Determine biome at spawn location
-        int spawnX = static_cast<int>(playerPosition.x);
-        int spawnZ = static_cast<int>(playerPosition.z);
-
-        if (isSnowBiome(world, spawnX, spawnZ)) {
-            spawnSnowParticle(p, world, playerPosition, SPAWN_RADIUS);
-        } else {
-            spawnRainParticle(p, world, playerPosition, SPAWN_RADIUS);
+        if (weather.precipitationKind == PrecipitationKind::SNOW) {
+            spawnSnowParticle(p, world, playerPosition, SPAWN_RADIUS, weather);
+        } else if (weather.precipitationKind == PrecipitationKind::RAIN) {
+            spawnRainParticle(p, world, playerPosition, SPAWN_RADIUS, weather);
         }
     }
 }
@@ -171,7 +170,7 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
 // spawnRainParticle
 // ---------------------------------------------------------------------------
 bool ParticleSystem::spawnRainParticle(Particle& p, const World& world, const Vec3& playerPos,
-                                       float spawnRadius) {
+                                       float spawnRadius, const WeatherSample& weather) {
     // Deterministic weather: the same seed always rains the same way
     static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
 
@@ -179,7 +178,7 @@ bool ParticleSystem::spawnRainParticle(Particle& p, const World& world, const Ve
     float radius = rng.nextFloat() * spawnRadius;
 
     // Spawn in a band just above the camera: at 10 blocks/s a drop lives
-    // long enough to fall PAST eye level and below the feet — the old
+    // long enough to fall PAST eye level and below the feet, the old
     // +128-block spawn with a 2 s lifetime died ~110 blocks up, so rain was
     // simulated but never once visible on screen.
     p.position[0] = playerPos.x + std::cos(angle) * radius;
@@ -188,16 +187,16 @@ bool ParticleSystem::spawnRainParticle(Particle& p, const World& world, const Ve
 
     // Only sky-exposed columns rain: a spawn point at or below the column's
     // surface is inside terrain (cave, overhang) and would rain indoors.
-    auto surface = world.surfaceHeightIfLoaded(static_cast<int>(p.position[0]),
-                                               static_cast<int>(p.position[2]));
+    auto surface = world.surfaceHeightIfLoaded(static_cast<int64_t>(std::floor(p.position[0])),
+                                               static_cast<int64_t>(std::floor(p.position[2])));
     if (!surface || p.position[1] <= static_cast<float>(*surface + 1)) {
         return false;
     }
 
-    // Fall speed ~10 blocks/s with slight wind drift
-    p.velocity[0] = (rng.nextFloat() - 0.5f) * 1.0f;
+    // Fall speed ~10 blocks/s with drift from the canonical weather wind.
+    p.velocity[0] = weather.windBlocksPerSecond.x * 0.65f + (rng.nextFloat() - 0.5f);
     p.velocity[1] = -10.f;
-    p.velocity[2] = (rng.nextFloat() - 0.5f) * 1.0f;
+    p.velocity[2] = weather.windBlocksPerSecond.y * 0.65f + (rng.nextFloat() - 0.5f);
 
     p.lifetime = 0.f;
     p.maxLifetime = 5.0f;
@@ -210,7 +209,7 @@ bool ParticleSystem::spawnRainParticle(Particle& p, const World& world, const Ve
 // spawnSnowParticle
 // ---------------------------------------------------------------------------
 bool ParticleSystem::spawnSnowParticle(Particle& p, const World& world, const Vec3& playerPos,
-                                       float spawnRadius) {
+                                       float spawnRadius, const WeatherSample& weather) {
     // Deterministic weather: the same seed always rains the same way
     static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
 
@@ -224,16 +223,16 @@ bool ParticleSystem::spawnSnowParticle(Particle& p, const World& world, const Ve
     p.position[2] = playerPos.z + std::sin(angle) * radius;
 
     // Same sky-exposure gate as rain (see spawnRainParticle).
-    auto surface = world.surfaceHeightIfLoaded(static_cast<int>(p.position[0]),
-                                               static_cast<int>(p.position[2]));
+    auto surface = world.surfaceHeightIfLoaded(static_cast<int64_t>(std::floor(p.position[0])),
+                                               static_cast<int64_t>(std::floor(p.position[2])));
     if (!surface || p.position[1] <= static_cast<float>(*surface + 1)) {
         return false;
     }
 
-    // Fall speed ~3 blocks/s with gentle initial drift
-    p.velocity[0] = (rng.nextFloat() - 0.5f) * 0.5f;
+    // Fall speed ~3 blocks/s with gentle drift around the shared weather wind.
+    p.velocity[0] = weather.windBlocksPerSecond.x * 0.82f + (rng.nextFloat() - 0.5f) * 0.5f;
     p.velocity[1] = -3.f;
-    p.velocity[2] = (rng.nextFloat() - 0.5f) * 0.5f;
+    p.velocity[2] = weather.windBlocksPerSecond.y * 0.82f + (rng.nextFloat() - 0.5f) * 0.5f;
 
     p.lifetime = 0.f;
     p.maxLifetime = 10.0f;
@@ -243,19 +242,12 @@ bool ParticleSystem::spawnSnowParticle(Particle& p, const World& world, const Ve
 }
 
 // ---------------------------------------------------------------------------
-// isSnowBiome
-// ---------------------------------------------------------------------------
-bool ParticleSystem::isSnowBiome(const World& world, int x, int z) const {
-    Biome biome = world.getBiome(x, z);
-    return biome == Biome::ICE_SPIKES || biome == Biome::TAIGA;
-}
-
-// ---------------------------------------------------------------------------
-// render — Draw active particles as billboards
+// render, Draw active particles as billboards
 // ---------------------------------------------------------------------------
 void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, FrameRing& frameRing,
                             const Mat4& viewMatrix, const Mat4& projectionMatrix,
-                            const Vec3& cameraPosition) {
+                            const Vec3& cameraPosition, const WeatherSample& weather,
+                            float baseExtinction) {
     if (!encoder || !_pipelineState)
         return;
 
@@ -288,6 +280,9 @@ void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, FrameRing& fram
                 sizeof(uniforms.projectionMatrix));
     uniforms.cameraPosition =
         simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+    uniforms.atmosphericExtinction =
+        std::max(baseExtinction, 0.0F) * (0.35F + std::max(weather.aerosolDensity, 0.0F)) +
+        std::max(weather.fogExtinction, 0.0F);
     FrameRing::Alloc uniformsAlloc = frameRing.push(&uniforms, sizeof(uniforms));
 
     // ---- Bind and draw ----
