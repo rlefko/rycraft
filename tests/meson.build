@@ -36,8 +36,14 @@ test_exe = executable('test_rycraft',
   dependencies : [catch2_with_main_dep, lz4_dep],
 )
 
-# The deterministic worldgen, full-disk coverage, and hydrology matrices run
-# for more than eight minutes on the reference machine. Keep CI's process
-# timeout above the measured suite duration so a real assertion, rather than
-# SIGTERM in a late water fixture, reports any failure.
-test('rycraft tests', test_exe, timeout : 1200)
+# The deterministic worldgen, full-disk coverage, and hydrology matrices
+# dominate the suite. Catch2 shards partition every test case across several
+# meson test targets that run in parallel, so the wall-clock (and the CI
+# runner minutes billed for it) drops to the slowest shard instead of the
+# sum, with no loss of coverage. Each shard finishes well inside its timeout.
+test_shard_count = '6'
+foreach shard : ['0', '1', '2', '3', '4', '5']
+  test('rycraft tests ' + shard, test_exe,
+       args : ['--shard-count', test_shard_count, '--shard-index', shard],
+       timeout : 900)
+endforeach
