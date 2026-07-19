@@ -7967,8 +7967,13 @@ TEST_CASE("Celestial state suppresses competing Moon light through twilight",
     REQUIRE(justAfterSunset.directSource == CelestialLightSource::NONE);
     REQUIRE(civilTwilight.directLightRadiance.length() < 0.04F);
     REQUIRE(midnight.directSource == CelestialLightSource::MOON);
-    REQUIRE(midnight.directLightRadiance.length() < 0.02F);
-    REQUIRE(midnight.lunarDiscRadiance.length() < 0.13F);
+    // Full-moon direct light sits at the playable-night level: far below any
+    // daylight value, bright enough that moonlit terrain reads in motion.
+    REQUIRE(midnight.directLightRadiance.length() < 0.05F);
+    // The disc peaks just past the bloom threshold for a slight glow while
+    // staying an order of magnitude below the sun disc's 18x on-screen
+    // radiance, so the Moon reads at a glance without becoming a second sun.
+    REQUIRE(midnight.lunarDiscRadiance.length() < 3.60F);
     REQUIRE(midnight.shadowStrength < 0.08F);
     REQUIRE(midnight.directSpecularFactor == Catch::Approx(midnight.phaseEnergy));
 }
@@ -8019,9 +8024,12 @@ TEST_CASE("Night ambient is phase-aware and cannot resemble daylight",
 
     REQUIRE(newMoon.phaseEnergy < 0.002F);
     REQUIRE(fullMoon.ambientRadiance.length() > newMoon.ambientRadiance.length());
-    REQUIRE(fullMoon.ambientRadiance.length() < 0.03F);
-    REQUIRE(newMoon.ambientRadiance.length() < 0.01F);
-    REQUIRE(noon.ambientRadiance.length() > fullMoon.ambientRadiance.length() * 20.0F);
+    // Playable-night contract: a full moon sits about a tenth of daylight so
+    // moonlit terrain stays legible, while a new moon keeps only the stellar
+    // floor and daylight remains an order of magnitude above any night.
+    REQUIRE(fullMoon.ambientRadiance.length() < 0.055F);
+    REQUIRE(newMoon.ambientRadiance.length() < 0.025F);
+    REQUIRE(noon.ambientRadiance.length() > fullMoon.ambientRadiance.length() * 10.0F);
 }
 
 TEST_CASE("Moon fades in only after civil twilight at sunset and sunrise",
