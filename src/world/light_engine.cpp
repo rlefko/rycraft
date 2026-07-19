@@ -2,25 +2,42 @@
 
 #include "world/block_properties.hpp"
 
+#include <algorithm>
 #include <vector>
 
-bool LightEngine::floodChunk(Chunk& chunk, const FaceNeighbors& neighbors) {
-    // Built lazily: a chunk with no light stays fully dark and allocates
-    // nothing. `frontier` is a FIFO of lit cell indices to expand; a cell is
-    // re-queued only when its level rises, so the sweep ends at the max light.
+LightEngine::FloodResult LightEngine::floodChunk(Chunk& chunk, const FaceNeighbors& neighbors,
+                                                 const SkyLightSeedColumns& skySeeds) {
+    // A frontier item stores cellIndex * 2 + channel, where zero is block
+    // light and one is skylight. A cell is queued only when that channel
+    // rises, so both sweeps end at their unique max-light fixed points.
     std::vector<uint8_t> light;
     std::vector<int> frontier;
 
-    auto raise = [&](int x, int y, int z, uint8_t level) {
+    auto raise = [&](int x, int y, int z, uint8_t level, bool sky) {
         if (light.empty()) {
             light.assign(CHUNK_VOLUME, 0);
         }
         const int i = Chunk::index(x, y, z);
-        if (level > light[i]) {
-            light[i] = level;
-            frontier.push_back(i);
+        const uint8_t current = sky ? derivedSkyLight(light[i]) : derivedBlockLight(light[i]);
+        if (level > current) {
+            light[i] = sky ? packDerivedLight(level, derivedBlockLight(light[i]))
+                           : packDerivedLight(derivedSkyLight(light[i]), level);
+            frontier.push_back(i * 2 + static_cast<int>(sky));
         }
     };
+
+    const int32_t cubeBaseY = chunk.chunkY * CHUNK_EDGE;
+    for (int z = 0; z < CHUNK_DEPTH; ++z) {
+        for (int x = 0; x < CHUNK_WIDTH; ++x) {
+            const int32_t cutoffY = skySeeds.at(x, z);
+            const int firstLocalY = std::max(0, cutoffY - cubeBaseY);
+            for (int y = firstLocalY; y < CHUNK_HEIGHT; ++y) {
+                if (isTransparent(chunk.getBlock(x, y, z))) {
+                    raise(x, y, z, 15, true);
+                }
+            }
+        }
+    }
 
     // Seed self emitters (lava). The emitter cell itself may be opaque; light
     // still radiates from it into the transparent cells around it.
@@ -29,7 +46,7 @@ bool LightEngine::floodChunk(Chunk& chunk, const FaceNeighbors& neighbors) {
             for (int x = 0; x < CHUNK_WIDTH; ++x) {
                 uint8_t emission = blockLightEmission(chunk.getBlock(x, y, z));
                 if (emission > 0) {
-                    raise(x, y, z, emission);
+                    raise(x, y, z, emission, false);
                 }
             }
         }
@@ -46,9 +63,13 @@ bool LightEngine::floodChunk(Chunk& chunk, const FaceNeighbors& neighbors) {
                 if (!isTransparent(chunk.getBlock(borderX, y, z))) {
                     continue;
                 }
-                uint8_t incoming = n->getBlockLight(neighborX, y, z);
-                if (incoming > 1) {
-                    raise(borderX, y, z, static_cast<uint8_t>(incoming - 1));
+                const uint8_t incomingBlock = n->getBlockLight(neighborX, y, z);
+                const uint8_t incomingSky = n->getSkyLight(neighborX, y, z);
+                if (incomingBlock > 1) {
+                    raise(borderX, y, z, static_cast<uint8_t>(incomingBlock - 1), false);
+                }
+                if (incomingSky > 1) {
+                    raise(borderX, y, z, static_cast<uint8_t>(incomingSky - 1), true);
                 }
             }
         }
@@ -62,9 +83,13 @@ bool LightEngine::floodChunk(Chunk& chunk, const FaceNeighbors& neighbors) {
                 if (!isTransparent(chunk.getBlock(x, y, borderZ))) {
                     continue;
                 }
-                uint8_t incoming = n->getBlockLight(x, y, neighborZ);
-                if (incoming > 1) {
-                    raise(x, y, borderZ, static_cast<uint8_t>(incoming - 1));
+                const uint8_t incomingBlock = n->getBlockLight(x, y, neighborZ);
+                const uint8_t incomingSky = n->getSkyLight(x, y, neighborZ);
+                if (incomingBlock > 1) {
+                    raise(x, y, borderZ, static_cast<uint8_t>(incomingBlock - 1), false);
+                }
+                if (incomingSky > 1) {
+                    raise(x, y, borderZ, static_cast<uint8_t>(incomingSky - 1), true);
                 }
             }
         }
@@ -78,9 +103,13 @@ bool LightEngine::floodChunk(Chunk& chunk, const FaceNeighbors& neighbors) {
                 if (!isTransparent(chunk.getBlock(x, borderY, z))) {
                     continue;
                 }
-                const uint8_t incoming = n->getBlockLight(x, neighborY, z);
-                if (incoming > 1) {
-                    raise(x, borderY, z, static_cast<uint8_t>(incoming - 1));
+                const uint8_t incomingBlock = n->getBlockLight(x, neighborY, z);
+                const uint8_t incomingSky = n->getSkyLight(x, neighborY, z);
+                if (incomingBlock > 1) {
+                    raise(x, borderY, z, static_cast<uint8_t>(incomingBlock - 1), false);
+                }
+                if (incomingSky > 1) {
+                    raise(x, borderY, z, static_cast<uint8_t>(incomingSky - 1), true);
                 }
             }
         }
@@ -98,8 +127,10 @@ bool LightEngine::floodChunk(Chunk& chunk, const FaceNeighbors& neighbors) {
     static constexpr int DY[6] = {0, 0, 1, -1, 0, 0};
     static constexpr int DZ[6] = {0, 0, 0, 0, 1, -1};
     for (size_t head = 0; head < frontier.size(); ++head) {
-        int i = frontier[head];
-        int level = light[i];
+        const int item = frontier[head];
+        const int i = item / 2;
+        const bool sky = (item & 1) != 0;
+        const uint8_t level = sky ? derivedSkyLight(light[i]) : derivedBlockLight(light[i]);
         if (level <= 1) {
             continue;
         }
@@ -115,19 +146,73 @@ bool LightEngine::floodChunk(Chunk& chunk, const FaceNeighbors& neighbors) {
             if (!isTransparent(chunk.getBlock(nx, ny, nz))) {
                 continue;
             }
-            raise(nx, ny, nz, static_cast<uint8_t>(level - 1));
+            raise(nx, ny, nz, static_cast<uint8_t>(level - 1), sky);
         }
+    }
+
+    const std::vector<uint8_t>& previous = chunk.packedLightData();
+    if (previous == light) {
+        return {};
+    }
+
+    const auto levelAt = [](const std::vector<uint8_t>& field, int x, int y, int z) {
+        return field.empty() ? uint8_t{0} : field[Chunk::index(x, y, z)];
+    };
+    uint8_t changedFaces = 0;
+    const auto compareX = [&](int x) {
+        for (int z = 0; z < CHUNK_DEPTH; ++z) {
+            for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+                if (levelAt(previous, x, y, z) != levelAt(light, x, y, z)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    const auto compareZ = [&](int z) {
+        for (int y = 0; y < CHUNK_HEIGHT; ++y) {
+            for (int x = 0; x < CHUNK_WIDTH; ++x) {
+                if (levelAt(previous, x, y, z) != levelAt(light, x, y, z)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    const auto compareY = [&](int y) {
+        for (int z = 0; z < CHUNK_DEPTH; ++z) {
+            for (int x = 0; x < CHUNK_WIDTH; ++x) {
+                if (levelAt(previous, x, y, z) != levelAt(light, x, y, z)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (compareX(0)) {
+        changedFaces |= CHANGED_MINUS_X;
+    }
+    if (compareX(CHUNK_WIDTH - 1)) {
+        changedFaces |= CHANGED_PLUS_X;
+    }
+    if (compareZ(0)) {
+        changedFaces |= CHANGED_MINUS_Z;
+    }
+    if (compareZ(CHUNK_DEPTH - 1)) {
+        changedFaces |= CHANGED_PLUS_Z;
+    }
+    if (compareY(0)) {
+        changedFaces |= CHANGED_MINUS_Y;
+    }
+    if (compareY(CHUNK_HEIGHT - 1)) {
+        changedFaces |= CHANGED_PLUS_Y;
     }
 
     // Commit, keeping the array unallocated when the chunk is fully dark.
     if (light.empty()) {
-        const bool changed = chunk.hasBlockLight();
-        chunk.clearBlockLight();
-        return changed;
+        chunk.clearDerivedLight();
+        return {.changedState = true, .changedFaceMask = changedFaces};
     }
-    if (chunk.blockLightData() == light) {
-        return false;
-    }
-    chunk.replaceBlockLight(std::move(light));
-    return true;
+    chunk.replacePackedLight(std::move(light));
+    return {.changedState = true, .changedFaceMask = changedFaces};
 }
