@@ -2153,6 +2153,18 @@ TEST_CASE("LightEngine: lava light falls off one level per block", "[world][ligh
     REQUIRE(chunk.getBlockLight(0, 8, 0) == 0);
 }
 
+TEST_CASE("LightEngine: a placed torch emits and propagates light", "[world][light]") {
+    Chunk chunk(ChunkPos{0, 4, 0});
+    chunk.setBlock(8, 8, 8, BlockType::TORCH); // a lone torch in open air
+
+    REQUIRE(LightEngine::computeSelfLight(chunk));
+
+    REQUIRE(chunk.getBlockLight(8, 8, 8) == 14); // the torch's own emission
+    REQUIRE(chunk.getBlockLight(9, 8, 8) == 13); // falls off one level per block
+    REQUIRE(chunk.getBlockLight(8, 12, 8) == 10);
+    REQUIRE(chunk.getBlockLight(8, 8, 8 - 6) == 8);
+}
+
 TEST_CASE("LightEngine: opaque blocks do not receive light", "[world][light]") {
     Chunk chunk(ChunkPos{0, 4, 0});
     chunk.setBlock(8, 8, 8, BlockType::LAVA);
