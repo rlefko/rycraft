@@ -4,6 +4,7 @@
 
 #import <AudioToolbox/AudioComponent.h>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -174,7 +175,7 @@ int32_t AudioEngine::playSound(const std::vector<float>& buffer, uint32_t sample
         return -1;
 
     // Copy the incoming buffer OUTSIDE the lock, then swap it into the slot
-    // UNDER the lock. This keeps the critical section O(1) — no malloc/free
+    // UNDER the lock. This keeps the critical section O(1), no malloc/free
     // runs while the real-time render thread may be blocked on the mutex, and
     // the slot's previous buffer frees after the lock is released.
     std::vector<float> incoming = buffer;
@@ -206,6 +207,15 @@ void AudioEngine::stopVoice(int32_t voiceIndex) {
     deallocateVoice(voiceIndex);
 }
 
+void AudioEngine::setVoiceGain(int32_t voiceIndex, float gain) {
+    if (voiceIndex < 0 || voiceIndex >= MAX_VOICES)
+        return;
+    std::lock_guard<std::mutex> lock(_voiceMutex);
+    if (_voices[voiceIndex].active) {
+        _voices[voiceIndex].gain = std::clamp(gain, 0.0F, 1.0F);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // setMasterVolume
 // ---------------------------------------------------------------------------
@@ -215,7 +225,7 @@ void AudioEngine::setMasterVolume(float gain) {
 }
 
 // ---------------------------------------------------------------------------
-// audioCallback — called from audio thread
+// audioCallback, called from audio thread
 // ---------------------------------------------------------------------------
 void AudioEngine::audioCallback(AudioBufferList* outputData) {
     if (!outputData)
@@ -230,7 +240,7 @@ void AudioEngine::audioCallback(AudioBufferList* outputData) {
 
     // Hold the voice lock for the WHOLE mix. playSound/stopVoice mutate the
     // voice table (including reallocating a voice's sample buffer) under this
-    // same lock; reading it here without the lock was a data race — a torn
+    // same lock; reading it here without the lock was a data race, a torn
     // std::vector read / use-after-free on the real-time thread that corrupted
     // the heap and made libmalloc trap (the "trace trap"). This finally makes
     // the code honor the documented "voice table is mutex-guarded" invariant.
@@ -247,27 +257,43 @@ void AudioEngine::audioCallback(AudioBufferList* outputData) {
         if (voice.samples.empty())
             continue;
 
-        uint32_t samplesAvailable = voice.samples.size();
-        uint32_t framesToMix = std::min(frameCount, samplesAvailable - voice.readPosition);
-
-        for (uint32_t f = 0; f < framesToMix; ++f) {
-            float sample = voice.samples[voice.readPosition + f];
-            float mixedSample = sample * voice.gain * masterVolume;
-
-            // Write to both channels (mono → stereo)
-            outputBuffer[f * 2] += mixedSample;     // left
-            outputBuffer[f * 2 + 1] += mixedSample; // right
+        const uint32_t samplesAvailable = static_cast<uint32_t>(voice.samples.size());
+        if (voice.readPosition >= samplesAvailable) {
+            if (!voice.looping) {
+                deallocateVoice(i);
+                continue;
+            }
+            voice.readPosition %= samplesAvailable;
         }
 
-        // Advance read position (already holding _voiceMutex — deallocate
-        // directly; a nested lock_guard would deadlock the non-recursive mutex)
-        if (!voice.looping) {
-            uint32_t newReadPos = voice.readPosition + framesToMix;
-            if (newReadPos >= samplesAvailable) {
-                deallocateVoice(i); // voice finished
-            } else {
-                voice.readPosition = newReadPos;
+        uint32_t outputFrame = 0;
+        const uint32_t targetFrames =
+            voice.looping ? frameCount
+                          : std::min(frameCount, samplesAvailable - voice.readPosition);
+        while (outputFrame < targetFrames) {
+            const uint32_t contiguousFrames =
+                std::min(targetFrames - outputFrame, samplesAvailable - voice.readPosition);
+            for (uint32_t f = 0; f < contiguousFrames; ++f) {
+                const float sample = voice.samples[voice.readPosition + f];
+                const float mixedSample = sample * voice.gain * masterVolume;
+                const uint32_t destinationFrame = outputFrame + f;
+
+                // Write to both channels (mono → stereo)
+                outputBuffer[destinationFrame * 2] += mixedSample;
+                outputBuffer[destinationFrame * 2 + 1] += mixedSample;
             }
+
+            outputFrame += contiguousFrames;
+            voice.readPosition += contiguousFrames;
+            if (voice.readPosition == samplesAvailable && voice.looping) {
+                voice.readPosition = 0;
+            }
+        }
+
+        // Already holding _voiceMutex, so deallocate directly. A nested
+        // lock_guard would deadlock the non-recursive mutex.
+        if (!voice.looping && voice.readPosition >= samplesAvailable) {
+            deallocateVoice(i); // voice finished
         }
     }
 }

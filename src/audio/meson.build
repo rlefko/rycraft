@@ -1,4 +1,4 @@
-audio_sources = files('audio_engine.mm', 'sfx.cpp')
+audio_sources = files('audio_engine.mm', 'sfx.cpp', 'thunder.cpp')
 
 libaudio = static_library('audio',
   audio_sources,

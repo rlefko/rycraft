@@ -2,6 +2,7 @@
 #include "entity/entity.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <utility>
@@ -197,6 +198,119 @@ std::vector<float> SoundEffect::generateAmbientWind(uint32_t durationSeconds) {
                                    static_cast<float>(SAMPLE_RATE));
 
         samples[i] = noise * modulation * 0.15f; // Low volume for ambient
+    }
+
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Precipitation beds: deterministic filtered noise loops. Rain keeps a broad
+// high-frequency hiss with individual drop ticks; snow is a much softer,
+// lower band carried mostly by wind. Matching the loop endpoints avoids a
+// click when the audio voice wraps.
+// ---------------------------------------------------------------------------
+static void closeProceduralLoop(std::vector<float>& samples) {
+    const size_t blendSamples =
+        std::min<size_t>(samples.size() / 8U, SoundEffect::SAMPLE_RATE / 40U);
+    if (blendSamples == 0) return;
+    for (size_t index = 0; index < blendSamples; ++index) {
+        const size_t tail = samples.size() - blendSamples + index;
+        const float amount = static_cast<float>(index) / static_cast<float>(blendSamples);
+        const float joined = samples[tail] * (1.0F - amount) + samples[index] * amount;
+        samples[index] = joined;
+        samples[tail] = joined;
+    }
+}
+
+std::vector<float> SoundEffect::generateRainAmbience(uint32_t durationSeconds) {
+    const uint32_t duration = durationSeconds * SAMPLE_RATE;
+    std::vector<float> samples(duration);
+    float bodyState = 0.0F;
+    for (uint32_t index = 0; index < duration; ++index) {
+        const float noise = randomNoise(0x5241494EU, index);
+        const float body = noise - lowPassFilter(noise, &bodyState, 1'800.0F, SAMPLE_RATE);
+        const float drop = randomNoise(0x44524F50U, index / 37U) > 0.985F
+                               ? std::exp(-static_cast<float>(index % 37U) * 0.18F)
+                               : 0.0F;
+        samples[index] = std::clamp(body * 0.16F + drop * 0.08F, -1.0F, 1.0F);
+    }
+    closeProceduralLoop(samples);
+    return samples;
+}
+
+std::vector<float> SoundEffect::generateSnowAmbience(uint32_t durationSeconds) {
+    const uint32_t duration = durationSeconds * SAMPLE_RATE;
+    std::vector<float> samples(duration);
+    float softState = 0.0F;
+    for (uint32_t index = 0; index < duration; ++index) {
+        const float noise = randomNoise(0x534E4F57U, index / 3U);
+        const float soft = lowPassFilter(noise, &softState, 420.0F, SAMPLE_RATE);
+        const float drift =
+            0.65F + 0.35F * std::sin(2.0F * static_cast<float>(M_PI) * 0.13F *
+                                     static_cast<float>(index) / static_cast<float>(SAMPLE_RATE));
+        samples[index] = std::clamp(soft * drift * 0.045F, -1.0F, 1.0F);
+    }
+    closeProceduralLoop(samples);
+    return samples;
+}
+
+// ---------------------------------------------------------------------------
+// Thunder: deterministic broadband crack followed by a rolling low rumble.
+// Event identity controls the timing and resonance, so repeated weather
+// queries produce exactly the same sound without shipping external assets.
+// ---------------------------------------------------------------------------
+std::vector<float> SoundEffect::generateThunder(uint64_t eventId, float intensity) {
+    constexpr float DURATION_SECONDS = 4.0F;
+    const uint32_t duration = static_cast<uint32_t>(DURATION_SECONDS * SAMPLE_RATE);
+    std::vector<float> samples(duration);
+    const uint32_t seed =
+        static_cast<uint32_t>(eventId) ^ static_cast<uint32_t>(eventId >> 32U) ^ 0x7468756EU;
+    const float strength = std::isfinite(intensity) ? std::clamp(intensity, 0.0F, 1.25F) : 0.0F;
+    const float resonance = 34.0F + static_cast<float>((seed >> 8U) % 18U);
+    const float rollRate = 1.6F + static_cast<float>((seed >> 16U) % 11U) * 0.07F;
+    float lowState = 0.0F;
+    float bodyState = 0.0F;
+    const double radiansPerSample = 2.0 * M_PI / static_cast<double>(SAMPLE_RATE);
+    const std::array<double, 4> phaseStep = {
+        radiansPerSample * static_cast<double>(rollRate),
+        radiansPerSample * static_cast<double>(rollRate * 0.57F),
+        radiansPerSample * static_cast<double>(resonance),
+        radiansPerSample * static_cast<double>(resonance * 1.47F),
+    };
+    std::array<double, 4> phaseSine{};
+    std::array<double, 4> phaseCosine{1.0, 1.0, 1.0, 1.0};
+    std::array<double, 4> stepSine{};
+    std::array<double, 4> stepCosine{};
+    for (size_t oscillator = 0; oscillator < phaseStep.size(); ++oscillator) {
+        stepSine[oscillator] = std::sin(phaseStep[oscillator]);
+        stepCosine[oscillator] = std::cos(phaseStep[oscillator]);
+    }
+
+    for (uint32_t i = 0; i < duration; ++i) {
+        const float time = static_cast<float>(i) / static_cast<float>(SAMPLE_RATE);
+        const float noise = randomNoise(seed, i);
+        const float lowNoise = lowPassFilter(noise, &lowState, 125.0F, SAMPLE_RATE);
+        const float bodyNoise = lowPassFilter(noise, &bodyState, 720.0F, SAMPLE_RATE);
+
+        const float crackEnvelope = std::exp(-time * 31.0F) * std::min(time * 190.0F, 1.0F);
+        const float bodyEnvelope = std::exp(-time * 0.72F) * std::min(time * 22.0F, 1.0F);
+        std::array<float, 4> oscillatorSample{};
+        for (size_t oscillator = 0; oscillator < phaseStep.size(); ++oscillator) {
+            oscillatorSample[oscillator] = static_cast<float>(phaseSine[oscillator]);
+            const double nextSine = phaseSine[oscillator] * stepCosine[oscillator] +
+                                    phaseCosine[oscillator] * stepSine[oscillator];
+            phaseCosine[oscillator] = phaseCosine[oscillator] * stepCosine[oscillator] -
+                                      phaseSine[oscillator] * stepSine[oscillator];
+            phaseSine[oscillator] = nextSine;
+        }
+        const float rolling = 0.48F + 0.32F * std::max(0.0F, oscillatorSample[0]) +
+                              0.20F * std::max(0.0F, oscillatorSample[1]);
+        const float resonanceTone = oscillatorSample[2] * 0.18F + oscillatorSample[3] * 0.08F;
+        const float tailFade = std::clamp((DURATION_SECONDS - time) / 0.35F, 0.0F, 1.0F);
+        const float raw =
+            bodyNoise * crackEnvelope * 1.35F +
+            (lowNoise * 1.75F + bodyNoise * 0.22F + resonanceTone) * bodyEnvelope * rolling;
+        samples[i] = std::tanh(raw * strength * 1.45F) * tailFade;
     }
 
     return samples;
