@@ -67,7 +67,8 @@ enum class BlockType : uint8_t {
     FURNACE = 59,
     FURNACE_LIT = 60,
     TORCH = 61,
-    COUNT = 62
+    CHEST = 62,
+    COUNT = 63
 };
 
 enum class BlockRenderShape : uint8_t {
@@ -174,6 +175,12 @@ constexpr std::array<BlockDefinition, BLOCK_TYPE_COUNT> makeBlockDefinitions() {
         BlockMaterial::WOOD};
     definitions[static_cast<size_t>(BlockType::TORCH)].lightEmission = 14;
     definitions[static_cast<size_t>(BlockType::TORCH)].emissive = true;
+    definitions[static_cast<size_t>(BlockType::CHEST)] = {
+        BlockRenderShape::CUBE, true, true, true, false, false, BlockSound::WOOD,
+        BlockMaterial::WOOD};
+    definitions[static_cast<size_t>(BlockType::CHEST)].hardness = 2.5f;
+    definitions[static_cast<size_t>(BlockType::CHEST)].tool = ToolClass::AXE;
+    definitions[static_cast<size_t>(BlockType::CHEST)].interactable = true;
 
     constexpr BlockType rocks[] = {
         BlockType::STONE,       BlockType::BEDROCK,           BlockType::COAL_ORE,

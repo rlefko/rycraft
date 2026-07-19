@@ -65,6 +65,7 @@ enum class SlotDomain : uint8_t {
     FURNACE_INPUT,
     FURNACE_FUEL,
     FURNACE_OUTPUT,
+    CHEST,
     CREATIVE_PALETTE,
 };
 
@@ -263,9 +264,10 @@ struct ContainerView {
     ItemStack furnaceInput{};
     ItemStack furnaceFuel{};
     ItemStack furnaceOutput{};
-    float furnaceCook = 0.f;     // 0..1 arrow fill
-    float furnaceFuelLeft = 0.f; // 0..1 flame fill
-    bool creative = false;       // palette instead of the craft grid
+    float furnaceCook = 0.f;                // 0..1 arrow fill
+    float furnaceFuelLeft = 0.f;            // 0..1 flame fill
+    std::array<ItemStack, 27> chestSlots{}; // 3x9 storage, CHEST screen only
+    bool creative = false;                  // palette instead of the craft grid
     int creativePage = 0;
 };
 

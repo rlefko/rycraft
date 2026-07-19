@@ -25,6 +25,8 @@ struct SlotAccess {
     ItemStack* furnaceInput = nullptr;
     ItemStack* furnaceFuel = nullptr;
     ItemStack* furnaceOutput = nullptr;
+    ItemStack* chest = nullptr; // 27 storage slots when a chest is open
+    int chestSize = 0;
     const ItemType* palette = nullptr; // creative palette entries
     int paletteSize = 0;
 };

@@ -6496,7 +6496,7 @@ TEST_CASE("UI icon vertices share one layout between C++ and Metal", "[render][u
 TEST_CASE("Item icon layers map the non-block range past the block layers", "[render][textures]") {
     REQUIRE(TEXTURE_LAYER_ITEM_FIRST == TEXTURE_LAYER_COUNT);
     REQUIRE(itemIconLayer(ItemType::STICK) == TEXTURE_LAYER_ITEM_FIRST);
-    REQUIRE(itemIconLayer(ItemType::IRON_SWORD) ==
+    REQUIRE(itemIconLayer(static_cast<ItemType>(static_cast<uint16_t>(ItemType::COUNT) - 1)) ==
             TEXTURE_LAYER_ITEM_FIRST + NON_BLOCK_ITEM_COUNT - 1);
     REQUIRE(TEXTURE_LAYER_TOTAL == TEXTURE_LAYER_ITEM_FIRST + ITEM_ICON_COUNT);
     REQUIRE(TEXTURE_LAYER_TOTAL <= 255);
@@ -7121,7 +7121,7 @@ TEST_CASE("Block textures upload a complete deterministic mip chain", "[render][
 
     const uint64_t firstHash = blockTextureHash(first);
     REQUIRE(blockTextureHash(second) == firstHash);
-    REQUIRE(firstHash == 0x69733e9701d8885cULL);
+    REQUIRE(firstHash == 0x82be47c6006e0370ULL);
 }
 
 TEST_CASE("Block texture mips preserve alpha-tested flora coverage", "[render][textures][mip]") {

@@ -497,26 +497,27 @@ std::optional<SaveManager::WorldMetadata> SaveManager::readMetadataFile(const st
     return metadata;
 }
 
-bool SaveManager::saveBlockEntities(const FurnaceMap& furnaces) {
-    // Deterministic order keeps the file diffable and the tests stable.
-    std::vector<const FurnaceMap::value_type*> entries;
-    entries.reserve(furnaces.size());
-    for (const auto& entry : furnaces) {
-        entries.push_back(&entry);
-    }
-    std::sort(entries.begin(), entries.end(), [](const auto* left, const auto* right) {
-        return blockPositionLess(left->first, right->first);
-    });
-
+bool SaveManager::saveBlockEntities(const FurnaceMap& furnaces, const ChestMap& chests) {
     std::ostringstream out;
     out << "RYBE 1\n";
-    for (const auto* entry : entries) {
+    auto stack = [&out](const ItemStack& item) {
+        out << ' ' << static_cast<unsigned>(item.type) << ' ' << static_cast<unsigned>(item.count)
+            << ' ' << item.durability;
+    };
+
+    // Deterministic order keeps the file diffable and the tests stable.
+    std::vector<const FurnaceMap::value_type*> furnaceEntries;
+    furnaceEntries.reserve(furnaces.size());
+    for (const auto& entry : furnaces) {
+        furnaceEntries.push_back(&entry);
+    }
+    std::sort(furnaceEntries.begin(), furnaceEntries.end(),
+              [](const auto* left, const auto* right) {
+                  return blockPositionLess(left->first, right->first);
+              });
+    for (const auto* entry : furnaceEntries) {
         const BlockPos& pos = entry->first;
         const FurnaceState& furnace = entry->second;
-        auto stack = [&out](const ItemStack& item) {
-            out << ' ' << static_cast<unsigned>(item.type) << ' '
-                << static_cast<unsigned>(item.count) << ' ' << item.durability;
-        };
         out << "furnace " << pos.x << ' ' << pos.y << ' ' << pos.z << ' '
             << furnace.burnTicksRemaining << ' ' << furnace.burnTicksTotal << ' '
             << furnace.cookTicks;
@@ -525,68 +526,115 @@ bool SaveManager::saveBlockEntities(const FurnaceMap& furnaces) {
         stack(furnace.output);
         out << '\n';
     }
+
+    std::vector<const ChestMap::value_type*> chestEntries;
+    chestEntries.reserve(chests.size());
+    for (const auto& entry : chests) {
+        chestEntries.push_back(&entry);
+    }
+    std::sort(chestEntries.begin(), chestEntries.end(), [](const auto* left, const auto* right) {
+        return blockPositionLess(left->first, right->first);
+    });
+    for (const auto* entry : chestEntries) {
+        const BlockPos& pos = entry->first;
+        out << "chest " << pos.x << ' ' << pos.y << ' ' << pos.z;
+        for (const ItemStack& slot : entry->second.slots) {
+            stack(slot);
+        }
+        out << '\n';
+    }
+
     const std::string text = out.str();
     return writeFileWithRetries(blockEntitiesPath_, std::vector<uint8_t>(text.begin(), text.end()));
 }
 
-FurnaceMap SaveManager::loadBlockEntities() const {
-    FurnaceMap furnaces;
+SaveManager::BlockEntities SaveManager::loadBlockEntities() const {
+    BlockEntities entities;
     std::ifstream file(blockEntitiesPath_);
-    if (!file.is_open()) return furnaces;
+    if (!file.is_open()) return entities;
 
     std::string header;
     if (!std::getline(file, header) || header.rfind("RYBE ", 0) != 0) {
         RY_LOG_ERROR("Block entities file has an unrecognized header; ignoring it");
-        return furnaces;
+        return entities;
     }
+
+    // A slot triple is valid only when its type is a defined item id.
+    auto decodeStack = [](unsigned type, unsigned count, unsigned durability) {
+        if (type == 0 || !isValidItemId(static_cast<uint16_t>(type)) || count == 0) {
+            return ItemStack{};
+        }
+        const auto item = static_cast<ItemType>(type);
+        const auto capped = static_cast<uint8_t>(std::min<unsigned>(count, maxStackSize(item)));
+        return ItemStack{item, capped, static_cast<uint16_t>(durability)};
+    };
 
     std::string line;
     bool reportedMalformed = false;
+    auto reportMalformed = [&reportedMalformed] {
+        if (!reportedMalformed) {
+            RY_LOG_ERROR("Dropped a malformed block entity line");
+            reportedMalformed = true;
+        }
+    };
     while (std::getline(file, line)) {
         if (line.empty()) continue;
         std::istringstream in(line);
         std::string record;
         in >> record;
-        if (record != "furnace") continue; // future record types load as unknown
 
-        long long x = 0;
-        long long z = 0;
-        int y = 0;
-        unsigned burnRemaining = 0;
-        unsigned burnTotal = 0;
-        unsigned cook = 0;
-        std::array<unsigned, 9> stackValues{};
-        in >> x >> y >> z >> burnRemaining >> burnTotal >> cook;
-        for (unsigned& value : stackValues) {
-            in >> value;
-        }
-        if (in.fail()) {
-            if (!reportedMalformed) {
-                RY_LOG_ERROR("Dropped a malformed block entity line");
-                reportedMalformed = true;
+        if (record == "furnace") {
+            long long x = 0;
+            long long z = 0;
+            int y = 0;
+            unsigned burnRemaining = 0;
+            unsigned burnTotal = 0;
+            unsigned cook = 0;
+            std::array<unsigned, 9> stackValues{};
+            in >> x >> y >> z >> burnRemaining >> burnTotal >> cook;
+            for (unsigned& value : stackValues) {
+                in >> value;
             }
-            continue;
-        }
-        auto readStack = [&stackValues](size_t base) {
-            const unsigned type = stackValues[base];
-            const unsigned count = stackValues[base + 1];
-            if (type == 0 || !isValidItemId(static_cast<uint16_t>(type)) || count == 0) {
-                return ItemStack{};
+            if (in.fail()) {
+                reportMalformed();
+                continue;
             }
-            const auto item = static_cast<ItemType>(type);
-            const auto capped = static_cast<uint8_t>(std::min<unsigned>(count, maxStackSize(item)));
-            return ItemStack{item, capped, static_cast<uint16_t>(stackValues[base + 2])};
-        };
-        FurnaceState furnace;
-        furnace.burnTicksRemaining = static_cast<uint16_t>(burnRemaining);
-        furnace.burnTicksTotal = static_cast<uint16_t>(burnTotal);
-        furnace.cookTicks = static_cast<uint16_t>(cook);
-        furnace.input = readStack(0);
-        furnace.fuel = readStack(3);
-        furnace.output = readStack(6);
-        furnaces[BlockPos{static_cast<int64_t>(x), y, static_cast<int64_t>(z)}] = furnace;
+            FurnaceState furnace;
+            furnace.burnTicksRemaining = static_cast<uint16_t>(burnRemaining);
+            furnace.burnTicksTotal = static_cast<uint16_t>(burnTotal);
+            furnace.cookTicks = static_cast<uint16_t>(cook);
+            furnace.input = decodeStack(stackValues[0], stackValues[1], stackValues[2]);
+            furnace.fuel = decodeStack(stackValues[3], stackValues[4], stackValues[5]);
+            furnace.output = decodeStack(stackValues[6], stackValues[7], stackValues[8]);
+            entities.furnaces[BlockPos{static_cast<int64_t>(x), y, static_cast<int64_t>(z)}] =
+                furnace;
+        } else if (record == "chest") {
+            long long x = 0;
+            long long z = 0;
+            int y = 0;
+            in >> x >> y >> z;
+            ChestState chest;
+            bool malformed = false;
+            for (ItemStack& slot : chest.slots) {
+                unsigned type = 0;
+                unsigned count = 0;
+                unsigned durability = 0;
+                in >> type >> count >> durability;
+                if (in.fail()) {
+                    malformed = true;
+                    break;
+                }
+                slot = decodeStack(type, count, durability);
+            }
+            if (malformed) {
+                reportMalformed();
+                continue;
+            }
+            entities.chests[BlockPos{static_cast<int64_t>(x), y, static_cast<int64_t>(z)}] = chest;
+        }
+        // Any other record type loads as unknown for forward compatibility.
     }
-    return furnaces;
+    return entities;
 }
 
 bool SaveManager::flush() {

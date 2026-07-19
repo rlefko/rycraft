@@ -913,6 +913,28 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                 break;
             }
 
+            case BlockType::CHEST: {
+                // Wooden crate: plank grain with a dark lid seam across the
+                // middle and an iron latch at the front center.
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.2, y * 0.2);
+                        const bool seam = (y == 5 || y == 6);   // lid seam
+                        const bool frame = (x == 0 || x == 15); // plank edges
+                        double f = seam ? 0.5 : (frame ? 0.75 : 1.0);
+                        fillTilePixel(&getTilePixel(x, y), 0.62 * f, 0.44 * f, 0.22 * f, n, 0.06);
+                    }
+                }
+                for (uint32_t y = 5; y < 9; ++y) {
+                    for (uint32_t x = 7; x < 9; ++x) {
+                        auto& p = getTilePixel(x, y); // iron latch
+                        p.r = p.g = p.b = clampToByte(0.55);
+                        p.a = 255;
+                    }
+                }
+                break;
+            }
+
             // AIR (never drawn) gets a transparent black layer
             default:
                 break;

@@ -157,12 +157,13 @@ TEST_CASE("Reserved-gap item ids read as empty, not phantom items", "[saves][met
     REQUIRE(loaded->player.inventory[1] == ItemStack{itemFromBlock(BlockType::ANDESITE), 1, 0});
 }
 
-TEST_CASE("Block entities sidecar round-trips furnaces", "[saves][block-entities]") {
+TEST_CASE("Block entities sidecar round-trips furnaces and chests", "[saves][block-entities]") {
     TempDir directory("block_entities_roundtrip");
     SaveManager saves(directory.path());
 
     // Missing file reads as empty.
-    REQUIRE(saves.loadBlockEntities().empty());
+    REQUIRE(saves.loadBlockEntities().furnaces.empty());
+    REQUIRE(saves.loadBlockEntities().chests.empty());
 
     FurnaceMap furnaces;
     FurnaceState lit;
@@ -174,18 +175,31 @@ TEST_CASE("Block entities sidecar round-trips furnaces", "[saves][block-entities
     lit.cookTicks = 77;
     furnaces[BlockPos{10, 64, -3}] = lit;
     furnaces[BlockPos{-2000000000LL, -40, 7}] = FurnaceState{};
-    REQUIRE(saves.saveBlockEntities(furnaces));
 
-    const FurnaceMap loaded = saves.loadBlockEntities();
-    REQUIRE(loaded.size() == 2);
-    const auto& reloaded = loaded.at(BlockPos{10, 64, -3});
+    ChestMap chests;
+    ChestState chest;
+    chest.slots[0] = ItemStack{itemFromBlock(BlockType::COBBLESTONE), 64, 0};
+    chest.slots[26] = ItemStack{ItemType::IRON_PICKAXE, 1, 131};
+    chests[BlockPos{4, 70, 4}] = chest;
+    chests[BlockPos{4, 70, 5}] = ChestState{}; // an empty chest still persists
+    REQUIRE(saves.saveBlockEntities(furnaces, chests));
+
+    const SaveManager::BlockEntities loaded = saves.loadBlockEntities();
+    REQUIRE(loaded.furnaces.size() == 2);
+    const auto& reloaded = loaded.furnaces.at(BlockPos{10, 64, -3});
     REQUIRE(reloaded.input == lit.input);
     REQUIRE(reloaded.fuel == lit.fuel);
     REQUIRE(reloaded.output == lit.output);
     REQUIRE(reloaded.burnTicksRemaining == 900);
     REQUIRE(reloaded.burnTicksTotal == 1600);
     REQUIRE(reloaded.cookTicks == 77);
-    REQUIRE(loaded.at(BlockPos{-2000000000LL, -40, 7}).input.empty());
+    REQUIRE(loaded.furnaces.at(BlockPos{-2000000000LL, -40, 7}).input.empty());
+
+    REQUIRE(loaded.chests.size() == 2);
+    const auto& reloadedChest = loaded.chests.at(BlockPos{4, 70, 4});
+    REQUIRE(reloadedChest.slots[0] == ItemStack{itemFromBlock(BlockType::COBBLESTONE), 64, 0});
+    REQUIRE(reloadedChest.slots[26] == ItemStack{ItemType::IRON_PICKAXE, 1, 131});
+    REQUIRE(loaded.chests.at(BlockPos{4, 70, 5}).empty());
 }
 
 TEST_CASE("Block entities sidecar skips unknown records and malformed lines",
@@ -193,17 +207,17 @@ TEST_CASE("Block entities sidecar skips unknown records and malformed lines",
     TempDir directory("block_entities_tolerance");
     writeTextFile(directory.path() + "/block_entities.dat",
                   "RYBE 1\n"
-                  "chest 1 2 3 some future payload\n"
+                  "beehive 1 2 3 some future payload\n"
                   "furnace 5 60 5 0 0 0 262 2 0 257 1 0 0 0 0\n"
                   "furnace broken line\n");
     SaveManager saves(directory.path());
-    const FurnaceMap loaded = saves.loadBlockEntities();
+    const FurnaceMap loaded = saves.loadBlockEntities().furnaces;
     REQUIRE(loaded.size() == 1);
     REQUIRE(loaded.at(BlockPos{5, 60, 5}).input == ItemStack{ItemType::RAW_BEEF, 2, 0});
 
     // An unrecognized header refuses the whole file rather than guessing.
     writeTextFile(directory.path() + "/block_entities.dat", "RYBX 9\nfurnace 1 1 1\n");
-    REQUIRE(saves.loadBlockEntities().empty());
+    REQUIRE(saves.loadBlockEntities().furnaces.empty());
 }
 
 TEST_CASE("Block entities write is atomic under injected failures", "[saves][block-entities]") {
@@ -221,7 +235,7 @@ TEST_CASE("Block entities write is atomic under injected failures", "[saves][blo
     REQUIRE_FALSE(saves.saveBlockEntities(second));
 
     // The prior durable contents survive the failed replacement.
-    const FurnaceMap loaded = saves.loadBlockEntities();
+    const FurnaceMap loaded = saves.loadBlockEntities().furnaces;
     REQUIRE(loaded.size() == 1);
     REQUIRE(loaded.count(BlockPos{1, 2, 3}) == 1);
 }

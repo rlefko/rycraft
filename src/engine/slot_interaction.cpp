@@ -64,6 +64,11 @@ ItemStack* resolveSlot(const SlotAccess& access, SlotRef slot) {
             return access.furnaceFuel;
         case SlotDomain::FURNACE_OUTPUT:
             return access.furnaceOutput;
+        case SlotDomain::CHEST:
+            if (access.chest && slot.index >= 0 && slot.index < access.chestSize) {
+                return &access.chest[slot.index];
+            }
+            return nullptr;
         default:
             return nullptr;
     }
@@ -144,7 +149,8 @@ SlotClickOutcome takeFromOutput(const SlotAccess& access, ItemStack& cursor, boo
 }
 
 // Quick move between regions: containers empty into the inventory; the
-// inventory feeds an open furnace by item kind or swaps hotbar and main.
+// inventory feeds an open furnace by item kind, an open chest wholesale, or
+// swaps hotbar and main.
 SlotClickOutcome quickMove(const SlotAccess& access, SlotRef slot) {
     SlotClickOutcome outcome;
     ItemStack* source = resolveSlot(access, slot);
@@ -157,6 +163,18 @@ SlotClickOutcome quickMove(const SlotAccess& access, SlotRef slot) {
                                                           : nullptr;
         if (!target) return outcome;
         const int absorbed = addToSlots(target, 1, *source);
+        if (absorbed > 0) {
+            source->count = static_cast<uint8_t>(source->count - absorbed);
+            if (source->count == 0) source->clear();
+            outcome.changed = true;
+        }
+        return outcome;
+    }
+
+    // With a chest open, inventory items move into it and chest items come
+    // back out, mirroring Minecraft's shift-click transfer.
+    if (access.chest && slot.domain == SlotDomain::INVENTORY) {
+        const int absorbed = addToSlots(access.chest, access.chestSize, *source);
         if (absorbed > 0) {
             source->count = static_cast<uint8_t>(source->count - absorbed);
             if (source->count == 0) source->clear();

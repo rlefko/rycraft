@@ -167,6 +167,7 @@ inline constexpr std::array<const char*, BLOCK_TYPE_COUNT> BLOCK_NAMES = {
     "Furnace",
     "Furnace",
     "Torch",
+    "Chest",
 };
 static_assert([] {
     for (const char* name : BLOCK_NAMES) {
@@ -389,6 +390,7 @@ constexpr std::array<uint32_t, BLOCK_TYPE_COUNT> makeBlockSwatches() {
     at(BlockType::FURNACE) = 0x6B6B70;
     at(BlockType::FURNACE_LIT) = 0x8C6247;
     at(BlockType::TORCH) = 0xFFD966;
+    at(BlockType::CHEST) = 0x8C6A32;
     return colors;
 }
 

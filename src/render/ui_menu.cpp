@@ -432,6 +432,28 @@ MenuLayout buildFurnaceLayout(const LayoutContext& ctx, const MenuContext& menu)
     return layout;
 }
 
+MenuLayout buildChestLayout(const LayoutContext& ctx, const MenuContext& menu) {
+    MenuLayout layout;
+    layout.dimAlpha = 0.45f;
+    layout.panel = UIRect{0.5f - ctx.px(250.f), 0.5f - ctx.py(320.f), ctx.px(500.f), ctx.py(640.f)};
+    const ContainerView& view = menu.container;
+
+    addCenteredText(layout, ctx, "CHEST", 0.5f + ctx.py(290.f), 2.5f);
+    // Three rows of nine storage slots above the player inventory.
+    constexpr float PITCH = 50.f;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 9; ++col) {
+            const int slot = row * 9 + col;
+            addSlot(layout, ctx, SlotDomain::CHEST, slot,
+                    view.chestSlots[static_cast<size_t>(slot)], 0.5f + ctx.px((col - 4) * PITCH),
+                    0.5f + ctx.py(240.f - row * PITCH));
+        }
+    }
+
+    addInventoryBlock(layout, ctx, view, 0.5f - ctx.py(60.f));
+    return layout;
+}
+
 } // namespace
 
 MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeight,
@@ -455,6 +477,7 @@ MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeigh
         case GameScreen::INVENTORY:
         case GameScreen::CRAFTING:
         case GameScreen::FURNACE:
+        case GameScreen::CHEST:
         case GameScreen::DEATH:
             return {};
     }
@@ -491,6 +514,8 @@ MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHei
             return buildCraftingLayout(layoutCtx, ctx);
         case GameScreen::FURNACE:
             return buildFurnaceLayout(layoutCtx, ctx);
+        case GameScreen::CHEST:
+            return buildChestLayout(layoutCtx, ctx);
         case GameScreen::DEATH:
             return buildDeathLayout(layoutCtx, ctx);
         case GameScreen::TITLE:

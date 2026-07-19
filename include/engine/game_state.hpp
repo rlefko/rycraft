@@ -21,6 +21,7 @@ enum class GameScreen {
     INVENTORY,            // player inventory + 2x2 craft grid (world frozen)
     CRAFTING,             // crafting table 3x3 grid (world frozen)
     FURNACE,              // furnace slots + gauges (world frozen)
+    CHEST,                // 27-slot storage block (world frozen)
     DEATH,                // respawn / quit after health reaches zero
 };
 
@@ -92,7 +93,8 @@ constexpr bool screenHasWorldSession(GameScreen screen) {
     return screen == GameScreen::PLAYING || screen == GameScreen::PAUSED ||
            screen == GameScreen::SETTINGS || screen == GameScreen::VIDEO_SETTINGS ||
            screen == GameScreen::INVENTORY || screen == GameScreen::CRAFTING ||
-           screen == GameScreen::FURNACE || screen == GameScreen::DEATH;
+           screen == GameScreen::FURNACE || screen == GameScreen::CHEST ||
+           screen == GameScreen::DEATH;
 }
 
 // What the engine must do after a transition.
@@ -115,7 +117,7 @@ struct GameFlow {
     // Container screens the inventory key and container blocks open.
     constexpr bool inContainer() const {
         return screen == GameScreen::INVENTORY || screen == GameScreen::CRAFTING ||
-               screen == GameScreen::FURNACE;
+               screen == GameScreen::FURNACE || screen == GameScreen::CHEST;
     }
 
     // ESC: pause from gameplay, resume from pause, back out of settings,
@@ -137,6 +139,7 @@ struct GameFlow {
             case GameScreen::INVENTORY:
             case GameScreen::CRAFTING:
             case GameScreen::FURNACE:
+            case GameScreen::CHEST:
                 screen = GameScreen::PLAYING;
                 return {.captureCursor = true, .resetTiming = true};
             case GameScreen::WORLD_SELECT:
@@ -166,10 +169,11 @@ struct GameFlow {
         return {};
     }
 
-    // Right-clicking a crafting table or furnace while playing.
+    // Right-clicking a crafting table, furnace, or chest while playing.
     constexpr GameFlowEffects onContainerOpened(GameScreen container) {
         if (screen != GameScreen::PLAYING ||
-            (container != GameScreen::CRAFTING && container != GameScreen::FURNACE)) {
+            (container != GameScreen::CRAFTING && container != GameScreen::FURNACE &&
+             container != GameScreen::CHEST)) {
             return {};
         }
         screen = container;

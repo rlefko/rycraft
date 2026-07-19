@@ -94,6 +94,19 @@ TEST_CASE("Three iron ingots in a V craft a bucket", "[recipes]") {
     REQUIRE_FALSE(matchCraftingRecipe(grid3({I, I, I, I, I, I, I, I, I}), 3).has_value());
 }
 
+TEST_CASE("Eight planks ringing an empty center craft a chest", "[recipes]") {
+    const auto chest = matchCraftingRecipe(
+        grid3({PLANKS, PLANKS, PLANKS, PLANKS, N, PLANKS, PLANKS, PLANKS, PLANKS}), 3);
+    REQUIRE(chest.has_value());
+    REQUIRE(chest->type == itemFromBlock(BlockType::CHEST));
+    REQUIRE(chest->count == 1);
+    // A filled center is the furnace shape family, never a chest.
+    REQUIRE_FALSE(
+        matchCraftingRecipe(
+            grid3({PLANKS, PLANKS, PLANKS, PLANKS, PLANKS, PLANKS, PLANKS, PLANKS, PLANKS}), 3)
+            .has_value());
+}
+
 TEST_CASE("Tool recipes cover tiers offsets and mirrors", "[recipes]") {
     constexpr ItemType I = ItemType::IRON_INGOT;
     const auto pickaxe = matchCraftingRecipe(grid3({I, I, I, N, S, N, N, S, N}), 3);

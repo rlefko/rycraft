@@ -1,5 +1,6 @@
 #pragma once
 
+#include "world/chest.hpp"
 #include "world/chunk.hpp"
 #include "world/fluid.hpp"
 #include "world/furnace.hpp"
@@ -102,11 +103,15 @@ public:
     // (world enumeration must not spawn save threads per row).
     static std::optional<WorldMetadata> readMetadataFile(const std::string& path);
 
-    // Stateful blocks (furnaces) persist in one per-world sidecar; missing
-    // files read as empty, unknown record types are skipped for forward
-    // compatibility.
-    bool saveBlockEntities(const FurnaceMap& furnaces);
-    FurnaceMap loadBlockEntities() const;
+    // Stateful blocks (furnaces and chests) persist in one per-world sidecar;
+    // missing files read as empty, unknown record types are skipped for
+    // forward compatibility.
+    struct BlockEntities {
+        FurnaceMap furnaces;
+        ChestMap chests;
+    };
+    bool saveBlockEntities(const FurnaceMap& furnaces, const ChestMap& chests = {});
+    BlockEntities loadBlockEntities() const;
 
     // Waits for all queued cube writes and reports whether each one reached
     // both its cube file and column manifest.

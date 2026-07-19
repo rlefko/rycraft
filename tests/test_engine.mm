@@ -1408,6 +1408,33 @@ TEST_CASE("Double-click gathers matching stacks up to a full one", "[slots]") {
     REQUIRE(inventory[5].count == 45);
 }
 
+TEST_CASE("Shift-click moves items into and out of an open chest", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 27> chest{};
+    SlotAccess access;
+    access.inventory = inventory.data();
+    access.chest = chest.data();
+    access.chestSize = 27;
+    ItemStack cursor;
+
+    inventory[0] = ItemStack{ItemType::COAL, 30, 0};
+    REQUIRE(applySlotClick(access, cursor, {SlotDomain::INVENTORY, 0}, SlotClickKind::SHIFT_LEFT)
+                .changed);
+    REQUIRE(inventory[0].empty());
+    REQUIRE(chest[0] == ItemStack{ItemType::COAL, 30, 0});
+
+    // Shift-clicking the chest slot sends it back into the player inventory.
+    REQUIRE(
+        applySlotClick(access, cursor, {SlotDomain::CHEST, 0}, SlotClickKind::SHIFT_LEFT).changed);
+    REQUIRE(chest[0].empty());
+    bool returned = false;
+    for (const ItemStack& slot : inventory) {
+        if (slot == ItemStack{ItemType::COAL, 30, 0})
+            returned = true;
+    }
+    REQUIRE(returned);
+}
+
 TEST_CASE("Outside drops and container close return items", "[slots]") {
     ItemStack cursor{ItemType::COAL, 5, 0};
     REQUIRE(takeOutsideDrop(cursor, SlotClickKind::RIGHT) == ItemStack{ItemType::COAL, 1, 0});

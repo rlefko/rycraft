@@ -326,6 +326,8 @@ struct EngineState {
     int hurtSoundCooldown = 0;
     FurnaceMap furnaces;
     std::optional<BlockPos> openFurnace; // the furnace the FURNACE screen edits
+    ChestMap chests;
+    std::optional<BlockPos> openChest; // the chest the CHEST screen edits
     ItemEntityManager itemEntities;
     int pickupSoundCooldown = 0;
     MiningState miningState;
@@ -568,8 +570,11 @@ static std::string defaultWorldDirectory() {
     for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
         state->inventory.setSlot(static_cast<int>(slot), playerMeta.inventory[slot]);
     }
-    state->furnaces = state->saveManager->loadBlockEntities();
+    SaveManager::BlockEntities blockEntities = state->saveManager->loadBlockEntities();
+    state->furnaces = std::move(blockEntities.furnaces);
+    state->chests = std::move(blockEntities.chests);
     state->openFurnace.reset();
+    state->openChest.reset();
     state->itemEntities.clear();
     state->pickupSoundCooldown = 0;
     state->miningState.reset();
@@ -625,7 +630,8 @@ static std::string defaultWorldDirectory() {
         worldMetadata.player.inventory[slot] = state->inventory.getSlot(static_cast<int>(slot));
     }
     const bool metadataSaved = state->saveManager->saveMetadata(worldMetadata);
-    const bool blockEntitiesSaved = state->saveManager->saveBlockEntities(state->furnaces);
+    const bool blockEntitiesSaved =
+        state->saveManager->saveBlockEntities(state->furnaces, state->chests);
     const bool cubesSaved = state->saveManager->flush();
     if (frontiersSaved && metadataSaved && blockEntitiesSaved && cubesSaved) {
         RY_LOG_INFO("World state saved");
@@ -654,6 +660,8 @@ static std::string defaultWorldDirectory() {
     state->saveManager.reset();
     state->furnaces.clear();
     state->openFurnace.reset();
+    state->chests.clear();
+    state->openChest.reset();
     state->itemEntities.clear();
     state->miningState.reset();
     state->inventory.clear();
@@ -774,10 +782,10 @@ static std::string defaultWorldDirectory() {
     // path otherwise reaches the title with no world session.
     const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN");
     const std::string screenName = screenEnv ? screenEnv : "";
-    const bool wantsGameplayScreen = screenName == "playing" || screenName == "paused" ||
-                                     screenName == "settings" || screenName == "video" ||
-                                     screenName == "inventory" || screenName == "crafting" ||
-                                     screenName == "furnace" || screenName == "death";
+    const bool wantsGameplayScreen =
+        screenName == "playing" || screenName == "paused" || screenName == "settings" ||
+        screenName == "video" || screenName == "inventory" || screenName == "crafting" ||
+        screenName == "furnace" || screenName == "chest" || screenName == "death";
     const bool menuScreenRequested = !screenName.empty() && !wantsGameplayScreen;
     const bool wantsWorld = wantsGameplayScreen ||
                             (!menuScreenRequested &&
@@ -831,6 +839,17 @@ static std::string defaultWorldDirectory() {
                 furnace.cookTicks = 120;
                 _state->openFurnace = pos;
                 _state->flow.screen = GameScreen::FURNACE;
+            } else if (screenName == "chest") {
+                // A partly filled chest so the capture shows populated storage.
+                const BlockPos pos{0, 0, 0};
+                ChestState& chest = _state->chests[pos];
+                chest.slots[0] = ItemStack{itemFromBlock(BlockType::COBBLESTONE), 64, 0};
+                chest.slots[1] = ItemStack{ItemType::IRON_INGOT, 12, 0};
+                chest.slots[9] = ItemStack{ItemType::COOKED_BEEF, 8, 0};
+                chest.slots[13] = ItemStack{ItemType::DIAMOND, 3, 0};
+                chest.slots[26] = ItemStack{ItemType::IRON_PICKAXE, 1, 131};
+                _state->openChest = pos;
+                _state->flow.screen = GameScreen::CHEST;
             }
         }
     }
@@ -1346,6 +1365,12 @@ static std::string defaultWorldDirectory() {
             access.furnaceFuel = &it->second.fuel;
             access.furnaceOutput = &it->second.output;
         }
+    } else if (screen == GameScreen::CHEST && state->openChest) {
+        auto it = state->chests.find(*state->openChest);
+        if (it != state->chests.end()) {
+            access.chest = it->second.slots.data();
+            access.chestSize = ChestState::SLOT_COUNT;
+        }
     }
     return access;
 }
@@ -1364,6 +1389,7 @@ static std::string defaultWorldDirectory() {
     }
     state->hoveredSlot = -1;
     state->openFurnace.reset();
+    state->openChest.reset();
 }
 
 // Close the focused text field, committing its filtered contents.
@@ -1600,9 +1626,15 @@ static std::string defaultWorldDirectory() {
                     view.furnaceFuelLeft = it->second.fuelFraction();
                 }
             }
+            if (state->flow.screen == GameScreen::CHEST && state->openChest) {
+                auto it = state->chests.find(*state->openChest);
+                if (it != state->chests.end()) {
+                    view.chestSlots = it->second.slots;
+                }
+            }
         }
         if (state->flow.inContainer() && state->flow.screen != GameScreen::FURNACE &&
-            state->gameMode != GameMode::CREATIVE) {
+            state->flow.screen != GameScreen::CHEST && state->gameMode != GameMode::CREATIVE) {
             const int gridSize = state->flow.screen == GameScreen::CRAFTING ? 9 : 4;
             const int gridWidth = state->flow.screen == GameScreen::CRAFTING ? 3 : 2;
             const auto result = matchCraftingRecipe(
@@ -2266,12 +2298,16 @@ static std::string defaultWorldDirectory() {
             const std::optional<BlockType> block = state->world->findBlockIfLoaded(bx, by, bz);
             if (block && isInteractable(*block)) {
                 interactableTarget = YES;
+                const BlockPos pos{bx, by, bz};
                 if (*block == BlockType::CRAFTING_TABLE) {
                     state->craftGrid.fill(ItemStack{});
                     state->craftResult.clear();
                     [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::CRAFTING)];
+                } else if (*block == BlockType::CHEST) {
+                    state->openChest = pos;
+                    state->chests.try_emplace(pos);
+                    [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::CHEST)];
                 } else {
-                    const BlockPos pos{bx, by, bz};
                     state->openFurnace = pos;
                     state->furnaces.try_emplace(pos);
                     [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::FURNACE)];
@@ -2374,6 +2410,23 @@ static std::string defaultWorldDirectory() {
                 }
             }
             state->furnaces.erase(it);
+        }
+    }
+
+    // A broken chest empties its whole 27-slot store the same way.
+    if (*current == BlockType::CHEST) {
+        auto it = state->chests.find(BlockPos{hitX, hitY, hitZ});
+        if (it != state->chests.end()) {
+            for (const ItemStack& stack : it->second.slots) {
+                if (stack.empty())
+                    continue;
+                if (withDrops) {
+                    [self spawnDrop:state stack:stack atX:hitX y:hitY z:hitZ];
+                } else {
+                    state->inventory.add(stack);
+                }
+            }
+            state->chests.erase(it);
         }
     }
 
@@ -2555,9 +2608,11 @@ static std::string defaultWorldDirectory() {
         return;
     state->world->setBlock(placeX, placeY, placeZ, selectedType);
 
-    // A placed furnace gets an empty state entry so it ticks and persists.
+    // A placed furnace or chest gets an empty state entry so it persists.
     if (selectedType == BlockType::FURNACE) {
         state->furnaces.try_emplace(BlockPos{placeX, placeY, placeZ});
+    } else if (selectedType == BlockType::CHEST) {
+        state->chests.try_emplace(BlockPos{placeX, placeY, placeZ});
     }
 
     // Survival consumes the placed block; creative keeps its infinite stack.
