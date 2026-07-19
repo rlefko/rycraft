@@ -94,6 +94,24 @@ TEST_CASE("Three iron ingots in a V craft a bucket", "[recipes]") {
     REQUIRE_FALSE(matchCraftingRecipe(grid3({I, I, I, I, I, I, I, I, I}), 3).has_value());
 }
 
+TEST_CASE("Wool over planks crafts a bed and iron crafts shears", "[recipes]") {
+    constexpr ItemType I = ItemType::IRON_INGOT;
+    constexpr ItemType WOOL = itemFromBlock(BlockType::WOOL);
+
+    const auto shears = matchCraftingRecipe(grid2(N, I, I, N), 2);
+    REQUIRE(shears.has_value());
+    REQUIRE(shears->type == ItemType::SHEARS);
+    REQUIRE(shears->count == 1);
+
+    const auto bed =
+        matchCraftingRecipe(grid3({WOOL, WOOL, WOOL, PLANKS, PLANKS, PLANKS, N, N, N}), 3);
+    REQUIRE(bed.has_value());
+    REQUIRE(bed->type == itemFromBlock(BlockType::BED));
+    // Planks over wool (inverted) is not a bed.
+    REQUIRE_FALSE(matchCraftingRecipe(grid3({PLANKS, PLANKS, PLANKS, WOOL, WOOL, WOOL, N, N, N}), 3)
+                      .has_value());
+}
+
 TEST_CASE("Eight planks ringing an empty center craft a chest", "[recipes]") {
     const auto chest = matchCraftingRecipe(
         grid3({PLANKS, PLANKS, PLANKS, PLANKS, N, PLANKS, PLANKS, PLANKS, PLANKS}), 3);

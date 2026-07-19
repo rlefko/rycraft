@@ -51,7 +51,8 @@ enum class ItemType : uint16_t {
     BUCKET = 284,
     WATER_BUCKET = 285,
     LAVA_BUCKET = 286,
-    COUNT = 287
+    SHEARS = 287,
+    COUNT = 288
 };
 
 inline constexpr size_t NON_BLOCK_ITEM_COUNT = static_cast<size_t>(ItemType::COUNT) - ITEM_ID_BASE;
@@ -168,6 +169,8 @@ inline constexpr std::array<const char*, BLOCK_TYPE_COUNT> BLOCK_NAMES = {
     "Furnace",
     "Torch",
     "Chest",
+    "Wool",
+    "Bed",
 };
 static_assert([] {
     for (const char* name : BLOCK_NAMES) {
@@ -196,6 +199,8 @@ constexpr std::array<ItemDefinition, NON_BLOCK_ITEM_COUNT> makeItemDefinitions()
     at(ItemType::BUCKET) = {"Bucket", ItemCategory::MATERIAL, 16};
     at(ItemType::WATER_BUCKET) = {"Water Bucket", ItemCategory::MATERIAL, 1};
     at(ItemType::LAVA_BUCKET) = {"Lava Bucket", ItemCategory::MATERIAL, 1};
+    // Shears are unstackable; they cut wool from sheep and shear wool blocks.
+    at(ItemType::SHEARS) = {"Shears", ItemCategory::MATERIAL, 1};
 
     struct Food {
         ItemType type;
@@ -286,6 +291,8 @@ constexpr ItemDefinition itemDefinition(ItemType type) {
         const auto id = static_cast<uint16_t>(type);
         definition.name = id < BLOCK_TYPE_COUNT ? BLOCK_NAMES[id] : "";
         definition.category = ItemCategory::BLOCK;
+        // Beds are unstackable, exactly like Minecraft.
+        if (type == itemFromBlock(BlockType::BED)) definition.maxStack = 1;
         return definition;
     }
     return detail::ITEM_DEFINITIONS[static_cast<uint16_t>(type) - ITEM_ID_BASE];
@@ -391,6 +398,8 @@ constexpr std::array<uint32_t, BLOCK_TYPE_COUNT> makeBlockSwatches() {
     at(BlockType::FURNACE_LIT) = 0x8C6247;
     at(BlockType::TORCH) = 0xFFD966;
     at(BlockType::CHEST) = 0x8C6A32;
+    at(BlockType::WOOL) = 0xE6E6E6;
+    at(BlockType::BED) = 0xC03530;
     return colors;
 }
 
@@ -432,6 +441,7 @@ constexpr std::array<uint32_t, NON_BLOCK_ITEM_COUNT> makeItemSwatches() {
     at(ItemType::BUCKET) = 0xB0B4BA;
     at(ItemType::WATER_BUCKET) = 0x4073D9;
     at(ItemType::LAVA_BUCKET) = 0xE6661A;
+    at(ItemType::SHEARS) = 0xC0C0C8;
     return colors;
 }
 

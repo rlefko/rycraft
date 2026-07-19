@@ -68,7 +68,9 @@ enum class BlockType : uint8_t {
     FURNACE_LIT = 60,
     TORCH = 61,
     CHEST = 62,
-    COUNT = 63
+    WOOL = 63,
+    BED = 64,
+    COUNT = 65
 };
 
 enum class BlockRenderShape : uint8_t {
@@ -181,6 +183,16 @@ constexpr std::array<BlockDefinition, BLOCK_TYPE_COUNT> makeBlockDefinitions() {
     definitions[static_cast<size_t>(BlockType::CHEST)].hardness = 2.5f;
     definitions[static_cast<size_t>(BlockType::CHEST)].tool = ToolClass::AXE;
     definitions[static_cast<size_t>(BlockType::CHEST)].interactable = true;
+    definitions[static_cast<size_t>(BlockType::WOOL)] = {
+        BlockRenderShape::CUBE, true, true, true, false, false, BlockSound::PLANT,
+        BlockMaterial::LEAVES};
+    definitions[static_cast<size_t>(BlockType::WOOL)].hardness = 0.8f;
+    // A single-block bed (the cube format has no facing metadata for a two-part
+    // bed): right-clicking it sleeps through the night and sets the spawn.
+    definitions[static_cast<size_t>(BlockType::BED)] = {
+        BlockRenderShape::CUBE, true, true, true, false, false, BlockSound::WOOD,
+        BlockMaterial::WOOD};
+    definitions[static_cast<size_t>(BlockType::BED)].hardness = 0.2f;
 
     constexpr BlockType rocks[] = {
         BlockType::STONE,       BlockType::BEDROCK,           BlockType::COAL_ORE,

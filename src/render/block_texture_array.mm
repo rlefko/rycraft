@@ -935,6 +935,34 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                 break;
             }
 
+            case BlockType::WOOL: {
+                // Soft off-white fleece with a gentle speckle.
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.5, y * 0.5);
+                        fillTilePixel(&getTilePixel(x, y), 0.9, 0.9, 0.9, n, 0.08);
+                    }
+                }
+                break;
+            }
+
+            case BlockType::BED: {
+                // Red quilt over a wooden frame with a pale pillow strip.
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.3, y * 0.3);
+                        if (y >= 13) { // wooden base band along the bottom
+                            fillTilePixel(&getTilePixel(x, y), 0.5, 0.34, 0.18, n, 0.06);
+                        } else if (y < 4) { // pale pillow at the head
+                            fillTilePixel(&getTilePixel(x, y), 0.9, 0.9, 0.85, n, 0.05);
+                        } else {
+                            fillTilePixel(&getTilePixel(x, y), 0.75, 0.19, 0.19, n, 0.07);
+                        }
+                    }
+                }
+                break;
+            }
+
             // AIR (never drawn) gets a transparent black layer
             default:
                 break;

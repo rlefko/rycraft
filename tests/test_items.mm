@@ -48,6 +48,10 @@ TEST_CASE("Item definitions cover names stacks tools and foods", "[item]") {
     REQUIRE(maxStackSize(ItemType::BUCKET) == 16);
     REQUIRE(maxStackSize(ItemType::WATER_BUCKET) == 1);
     REQUIRE(maxStackSize(ItemType::LAVA_BUCKET) == 1);
+    // Shears and beds are unstackable, exactly like Minecraft.
+    REQUIRE(maxStackSize(ItemType::SHEARS) == 1);
+    REQUIRE(maxStackSize(itemFromBlock(BlockType::BED)) == 1);
+    REQUIRE(maxStackSize(itemFromBlock(BlockType::WOOL)) == 64);
     REQUIRE(itemDefinition(ItemType::IRON_SWORD).attackDamage == 6);
     REQUIRE(itemDefinition(ItemType::WOODEN_SWORD).attackDamage == 4);
     REQUIRE(itemDefinition(ItemType::COOKED_BEEF).foodValue == 8);

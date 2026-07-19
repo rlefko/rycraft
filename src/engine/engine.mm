@@ -2312,6 +2312,9 @@ static std::string defaultWorldDirectory() {
                     state->furnaces.try_emplace(pos);
                     [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::FURNACE)];
                 }
+            } else if (block && *block == BlockType::BED) {
+                interactableTarget = YES;
+                [self sleepInBed:state atX:bx y:by z:bz];
             }
         }
 
@@ -2332,11 +2335,14 @@ static std::string defaultWorldDirectory() {
         } else {
             state->eatingState.reset();
             if (!interactableTarget && input.isPressedForTick(Key::MouseRight)) {
-                // A held bucket fills or empties a fluid; otherwise place.
-                if (![self tryBucketInteraction:state
-                                      cameraPos:cameraPos
-                                        forward:forward
-                                            hit:rayHit]) {
+                // Shears cut wool from a sheep; a held bucket fills or empties a
+                // fluid; otherwise place the held block.
+                if ([self tryShearSheep:state cameraPos:cameraPos forward:forward]) {
+                    // handled
+                } else if (![self tryBucketInteraction:state
+                                             cameraPos:cameraPos
+                                               forward:forward
+                                                   hit:rayHit]) {
                     [self placeBlock:state hit:rayHit];
                 }
             }
@@ -2493,6 +2499,47 @@ static std::string defaultWorldDirectory() {
 }
 
 // ---- Block Placing (Task 6.2) ----
+
+// Shearing a sheep with shears drops wool without killing it, the Minecraft
+// way to gather the wool a bed needs. Returns YES when it handled the click.
+- (BOOL)tryShearSheep:(EngineState*)state cameraPos:(Vec3)cameraPos forward:(Vec3)forward {
+    if (state->inventory.getSelectedStack().type != ItemType::SHEARS || !state->spawner)
+        return NO;
+    const auto hit = pickEntity(cameraPos, forward, 3.0f, state->spawner->getEntities());
+    if (!hit)
+        return NO;
+    for (auto& entity : state->spawner->getEntities()) {
+        if (!entity || entity->id != hit->entityId || !entity->alive ||
+            entity->type != EntityType::SHEEP) {
+            continue;
+        }
+        [self spawnDrop:state
+                  stack:ItemStack{itemFromBlock(BlockType::WOOL), 2, 0}
+                    atX:static_cast<int64_t>(std::floor(entity->position.x))
+                      y:static_cast<int32_t>(std::floor(entity->position.y))
+                      z:static_cast<int64_t>(std::floor(entity->position.z))];
+        [self playSfx:state->sfxBlockBreak gain:0.4f];
+        return YES;
+    }
+    return NO;
+}
+
+// Right-clicking a bed sets the spawn anchor and, at night, sleeps through to
+// dawn, exactly like Minecraft.
+- (void)sleepInBed:(EngineState*)state atX:(int64_t)bx y:(int32_t)by z:(int64_t)bz {
+    state->worldSpawn = Vec3{static_cast<float>(bx) + 0.5f, static_cast<float>(by) + 1.0f,
+                             static_cast<float>(bz) + 0.5f};
+    // Sleepable night runs from dusk to just before dawn; sleeping jumps the
+    // clock to the next dawn (the tick-0 rollover the sun orbit treats as day).
+    const uint64_t tod = state->worldTime % EngineState::TICKS_PER_DAY;
+    constexpr uint64_t NIGHT_START = 12500;
+    constexpr uint64_t NIGHT_END = 23500;
+    if (tod >= NIGHT_START && tod < NIGHT_END) {
+        state->worldTime =
+            ((state->worldTime / EngineState::TICKS_PER_DAY) + 1) * EngineState::TICKS_PER_DAY;
+    }
+    [self playSfx:state->sfxBlockPlace gain:0.3f];
+}
 
 // Empty and filled buckets exchange a single fluid source with the world,
 // exactly like Minecraft: an empty bucket scoops the water source or lava it

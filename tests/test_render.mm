@@ -7121,7 +7121,7 @@ TEST_CASE("Block textures upload a complete deterministic mip chain", "[render][
 
     const uint64_t firstHash = blockTextureHash(first);
     REQUIRE(blockTextureHash(second) == firstHash);
-    REQUIRE(firstHash == 0x82be47c6006e0370ULL);
+    REQUIRE(firstHash == 0x5bb2a0c9c1913dd6ULL);
 }
 
 TEST_CASE("Block texture mips preserve alpha-tested flora coverage", "[render][textures][mip]") {
