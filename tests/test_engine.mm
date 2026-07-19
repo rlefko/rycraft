@@ -1588,16 +1588,54 @@ TEST_CASE("Survival exhaustion spends saturation then food", "[survival]") {
     REQUIRE(stats.food == 19);
 }
 
-TEST_CASE("Survival regenerates at high food and starves at empty", "[survival]") {
-    SurvivalStats regen;
-    regen.food = 20;
+TEST_CASE("Survival regenerates fast with saturation and slow without", "[survival]") {
     SurvivalTickInputs idle;
-    int delta = 0;
-    for (int tick = 0; tick < SurvivalStats::REGEN_INTERVAL; ++tick) {
-        delta = tickSurvivalStats(regen, idle, 15);
-    }
-    REQUIRE(delta == 1); // +1 hp after the regen interval
 
+    // Full food plus ample saturation heals a whole hp every fast interval.
+    SurvivalStats fast;
+    fast.food = 20;
+    fast.saturation = 20.f;
+    int delta = 0;
+    for (int tick = 0; tick < SurvivalStats::FAST_REGEN_INTERVAL; ++tick) {
+        delta = tickSurvivalStats(fast, idle, 15);
+    }
+    REQUIRE(delta == 1); // +1 hp after only the short fast interval
+
+    // High food with no saturation falls back to the slow regen path.
+    SurvivalStats slow;
+    slow.food = 18;
+    slow.saturation = 0.f;
+    for (int tick = 0; tick < SurvivalStats::FAST_REGEN_INTERVAL; ++tick) {
+        REQUIRE(tickSurvivalStats(slow, idle, 15) == 0); // no fast heal without saturation
+    }
+    int slowDelta = 0;
+    for (int tick = SurvivalStats::FAST_REGEN_INTERVAL; tick < SurvivalStats::SLOW_REGEN_INTERVAL;
+         ++tick) {
+        slowDelta = tickSurvivalStats(slow, idle, 15);
+    }
+    REQUIRE(slowDelta == 1); // +1 hp only after the full slow interval
+}
+
+TEST_CASE("Survival regenerates a well-fed player back to full health", "[survival]") {
+    SurvivalStats stats;
+    stats.food = 20;
+    stats.saturation = 20.f;
+    SurvivalTickInputs idle;
+    int health = 4;
+    // A player who stays fed (topping the bar back up as it drains, as a
+    // Minecraft player does by eating) regenerates all the way to full health.
+    for (int tick = 0; tick < 4000 && health < SurvivalStats::MAX_HEALTH; ++tick) {
+        if (stats.saturation <= 0.f) {
+            stats.food = SurvivalStats::MAX_FOOD;
+            stats.saturation = 20.f;
+        }
+        health += tickSurvivalStats(stats, idle, health);
+    }
+    REQUIRE(health == SurvivalStats::MAX_HEALTH);
+}
+
+TEST_CASE("Survival starves at empty food down to the floor", "[survival]") {
+    SurvivalTickInputs idle;
     SurvivalStats starve;
     starve.food = 0;
     int applied = 0;

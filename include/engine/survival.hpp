@@ -13,21 +13,27 @@
 
 struct SurvivalStats {
     int food = 20;
-    float saturation = 5.f; // spent before food; refilled by eating
-    float exhaustion = 0.f; // accumulates from activity, costs saturation/food
-    int air = 300;          // ticks of breath remaining
-    int regenCounter = 0;
-    int starveCounter = 0;
+    float saturation = 5.f;   // spent before food; refilled by eating
+    float exhaustion = 0.f;   // accumulates from activity, costs saturation/food
+    int air = 300;            // ticks of breath remaining
+    int foodTimer = 0;        // shared regen/starve timer, exactly like Minecraft
+    float healResidual = 0.f; // fractional saturation healing awaiting a whole hp
     int drownCounter = 0;
 
+    static constexpr int MAX_HEALTH = 20;
     static constexpr int MAX_FOOD = 20;
     static constexpr int MAX_AIR = 300;              // 15 s
     static constexpr int AIR_REFILL_PER_TICK = 8;    // full refill in ~2 s
     static constexpr int DROWN_DAMAGE_INTERVAL = 20; // 2 dmg/s once out of air
     static constexpr int DROWN_DAMAGE = 2;
-    static constexpr int REGEN_INTERVAL = 80; // +1 hp / 4 s at high food
-    static constexpr int REGEN_FOOD_MIN = 18; // food needed to regenerate
-    static constexpr float REGEN_EXHAUSTION = 3.0f;
+    // Saturation heals fast (min(saturation, cap)/cap hp every interval, costing
+    // that much exhaustion), so a full food bar with leftover saturation
+    // regenerates to full within seconds, just as in Minecraft.
+    static constexpr int FAST_REGEN_INTERVAL = 10;
+    static constexpr float FAST_REGEN_SATURATION_CAP = 6.0f;
+    static constexpr int SLOW_REGEN_INTERVAL = 80; // +1 hp / 4 s once food is high
+    static constexpr int REGEN_FOOD_MIN = 18;      // food needed for slow regen
+    static constexpr float SLOW_REGEN_EXHAUSTION = 6.0f;
     static constexpr int STARVE_INTERVAL = 80;    // -1 hp / 4 s at food 0
     static constexpr int STARVE_HEALTH_FLOOR = 1; // starvation never kills outright
     static constexpr int SPRINT_DISABLE_FOOD = 6;
