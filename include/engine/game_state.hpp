@@ -1,13 +1,91 @@
 #pragma once
 
+#include <charconv>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <string_view>
+
 // ---------------------------------------------------------------------------
-// Game flow — which screen the player is on and how input transitions it.
+// Game flow, which screen the player is on and how input transitions it.
 //
 // Pure C++ (no Cocoa/Metal) so every transition is unit-testable. The engine
 // applies the returned effects: cursor capture/release, timing resets, and
 // quitting. World simulation ticks only while the screen is Playing; menus
 // freeze time.
 // ---------------------------------------------------------------------------
+
+// Parse an absolute tick count without accepting the sign, whitespace, base
+// prefixes, or overflow behavior that strtoull permits. Capture tooling uses
+// saved-world-scale uint64 values so a fixed time can select both time of day
+// and a repeatable lunar phase.
+inline std::optional<uint64_t> parseUnsignedDecimal(std::string_view text) noexcept {
+    if (text.empty()) return std::nullopt;
+
+    uint64_t result = 0;
+    for (char character : text) {
+        if (character < '0' || character > '9') return std::nullopt;
+        const uint64_t digit = static_cast<uint64_t>(character - '0');
+        if (result > (std::numeric_limits<uint64_t>::max() - digit) / 10U) {
+            return std::nullopt;
+        }
+        result = result * 10U + digit;
+    }
+    return result;
+}
+
+struct CaptureLightningOverride {
+    double x = 0.0;
+    double z = 0.0;
+    uint64_t id = 0;
+    uint64_t ageTicks = 0;
+};
+
+namespace game_state_detail {
+
+inline std::optional<double> parseFiniteDecimal(std::string_view text) noexcept {
+    if (text.empty()) return std::nullopt;
+    double result = 0.0;
+    const char* const begin = text.data();
+    const char* const end = begin + text.size();
+    const auto parsed = std::from_chars(begin, end, result, std::chars_format::general);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || !std::isfinite(result)) {
+        return std::nullopt;
+    }
+    return result;
+}
+
+} // namespace game_state_detail
+
+// Strict capture-only format: x,z,id,ageTicks. Coordinates are finite decimal
+// values; the event ID and rendered age are unsigned decimal integers.
+inline std::optional<CaptureLightningOverride>
+parseCaptureLightningOverride(std::string_view text) noexcept {
+    std::string_view fields[4];
+    for (std::size_t field = 0; field < 3; ++field) {
+        const std::size_t delimiter = text.find(',');
+        if (delimiter == std::string_view::npos) return std::nullopt;
+        fields[field] = text.substr(0, delimiter);
+        text.remove_prefix(delimiter + 1);
+    }
+    if (text.find(',') != std::string_view::npos) return std::nullopt;
+    fields[3] = text;
+
+    const auto x = game_state_detail::parseFiniteDecimal(fields[0]);
+    const auto z = game_state_detail::parseFiniteDecimal(fields[1]);
+    const auto id = parseUnsignedDecimal(fields[2]);
+    const auto ageTicks = parseUnsignedDecimal(fields[3]);
+    if (!x || !z || !id || !ageTicks) return std::nullopt;
+    const double minimumCoordinate = static_cast<double>(std::numeric_limits<int64_t>::min());
+    const double maximumCoordinateExclusive = -minimumCoordinate;
+    if (*x < minimumCoordinate || *x >= maximumCoordinateExclusive || *z < minimumCoordinate ||
+        *z >= maximumCoordinateExclusive) {
+        return std::nullopt;
+    }
+    return CaptureLightningOverride{*x, *z, *id, *ageTicks};
+}
 
 enum class GameScreen {
     TITLE,          // launch screen: PLAY / QUIT, world visible behind
@@ -41,7 +119,8 @@ enum class MenuAction {
     VL_TOGGLE,
     CLOUDS_DOWN,
     CLOUDS_UP,
-    SSAO_TOGGLE,
+    INDIRECT_DOWN,
+    INDIRECT_UP,
     SSR_TOGGLE,
     WAVING_TOGGLE,
     LENS_FLARE_TOGGLE,

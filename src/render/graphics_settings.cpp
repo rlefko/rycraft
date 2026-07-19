@@ -17,7 +17,7 @@ int clampInt(int v, int lo, int hi) {
     return std::clamp(v, lo, hi);
 }
 
-// "key": <int> — returns false when the key is absent or malformed.
+// "key": <int>, returns false when the key is absent or malformed.
 bool parseIntField(const std::string& content, const char* key, int& out) {
     std::string searchKey = std::string("\"") + key + "\"";
     size_t pos = content.find(searchKey);
@@ -66,8 +66,21 @@ bool GraphicsSettings::applyEnvOverrides() {
     bool any = false;
     any |= envInt("RYCRAFT_SHADOWS", shadowQuality, 0, SHADOW_QUALITY_MAX);
     any |= envBool("RYCRAFT_VL", volumetricLight);
-    any |= envInt("RYCRAFT_CLOUDS", cloudMode, 0, CLOUD_MODE_MAX);
-    any |= envBool("RYCRAFT_SSAO", ssao);
+    bool cloudOverride = envInt("RYCRAFT_CLOUD_QUALITY", cloudQuality, 0, QUALITY_MAX);
+    if (!cloudOverride) {
+        cloudOverride = envInt("RYCRAFT_CLOUDS", cloudQuality, 0, QUALITY_MAX);
+    }
+    any |= cloudOverride;
+    bool indirectOverride =
+        envInt("RYCRAFT_INDIRECT_LIGHT", indirectLightingQuality, 0, QUALITY_MAX);
+    if (!indirectOverride) {
+        bool legacySsao = indirectLightingQuality != 0;
+        if (envBool("RYCRAFT_SSAO", legacySsao)) {
+            indirectLightingQuality = legacySsao ? QUALITY_MAX : 0;
+            indirectOverride = true;
+        }
+    }
+    any |= indirectOverride;
     any |= envBool("RYCRAFT_SSR", waterReflections);
     any |= envBool("RYCRAFT_WAVING", wavingFoliage);
     any |= envBool("RYCRAFT_LENS_FLARE", lensFlare);
@@ -109,8 +122,8 @@ bool saveSettings(const std::string& path, const SettingsValues& values,
     writeField("volumeLevel", values.volumeLevel);
     writeField("shadowQuality", gfx.shadowQuality);
     writeField("volumetricLight", gfx.volumetricLight ? 1 : 0);
-    writeField("cloudMode", gfx.cloudMode);
-    writeField("ssao", gfx.ssao ? 1 : 0);
+    writeField("cloudQuality", gfx.cloudQuality);
+    writeField("indirectLightingQuality", gfx.indirectLightingQuality);
     writeField("waterReflections", gfx.waterReflections ? 1 : 0);
     writeField("wavingFoliage", gfx.wavingFoliage ? 1 : 0);
     writeField("lensFlare", gfx.lensFlare ? 1 : 0);
@@ -163,11 +176,15 @@ LoadedSettings loadSettings(const std::string& path) {
     if (parseIntField(content, "volumetricLight", v)) {
         loaded.gfx.volumetricLight = v != 0;
     }
-    if (parseIntField(content, "cloudMode", v)) {
-        loaded.gfx.cloudMode = clampInt(v, 0, GraphicsSettings::CLOUD_MODE_MAX);
+    if (parseIntField(content, "cloudQuality", v)) {
+        loaded.gfx.cloudQuality = clampInt(v, 0, GraphicsSettings::QUALITY_MAX);
+    } else if (parseIntField(content, "cloudMode", v)) {
+        loaded.gfx.cloudQuality = clampInt(v, 0, GraphicsSettings::QUALITY_MAX);
     }
-    if (parseIntField(content, "ssao", v)) {
-        loaded.gfx.ssao = v != 0;
+    if (parseIntField(content, "indirectLightingQuality", v)) {
+        loaded.gfx.indirectLightingQuality = clampInt(v, 0, GraphicsSettings::QUALITY_MAX);
+    } else if (parseIntField(content, "ssao", v)) {
+        loaded.gfx.indirectLightingQuality = v != 0 ? GraphicsSettings::QUALITY_MAX : 0;
     }
     if (parseIntField(content, "waterReflections", v)) {
         loaded.gfx.waterReflections = v != 0;
