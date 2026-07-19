@@ -144,9 +144,16 @@ kernel void screenSpaceDepthReduceKernel(texture2d<float, access::read_write> li
     const uint sourceWidth = max(linearDepth.get_width(sourceLevel), 1u);
     const uint sourceHeight = max(linearDepth.get_height(sourceLevel), 1u);
     const uint2 source = gid * 2u;
+    // A halved odd dimension drops its trailing row or column. Fold it into
+    // the boundary texel: the pyramid must stay a conservative minimum or the
+    // Hi-Z march can prove a cell empty whose nearest surface lives in the
+    // dropped edge.
+    const uint sampleWidth = (gid.x == destinationWidth - 1u && (sourceWidth & 1u) != 0u) ? 3u : 2u;
+    const uint sampleHeight =
+        (gid.y == destinationHeight - 1u && (sourceHeight & 1u) != 0u) ? 3u : 2u;
     float minimumDepth = INFINITY;
-    for (uint y = 0u; y < 2u; ++y) {
-        for (uint x = 0u; x < 2u; ++x) {
+    for (uint y = 0u; y < sampleHeight; ++y) {
+        for (uint x = 0u; x < sampleWidth; ++x) {
             const uint2 coordinate =
                 min(source + uint2(x, y), uint2(sourceWidth - 1u, sourceHeight - 1u));
             minimumDepth = min(minimumDepth, linearDepth.read(coordinate, sourceLevel).r);
