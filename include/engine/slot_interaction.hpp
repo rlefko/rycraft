@@ -3,6 +3,7 @@
 #include "render/ui_menu.hpp"
 #include "world/item.hpp"
 
+#include <span>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,18 @@ struct SlotClickOutcome {
 // can loop. Palette slots never mutate.
 SlotClickOutcome applySlotClick(const SlotAccess& access, ItemStack& cursor, SlotRef slot,
                                 SlotClickKind kind);
+
+// Distribute the held cursor stack across the slots painted while a mouse
+// button stayed down (Minecraft's drag/quick-craft). LEFT splits the held
+// count evenly among the accepting slots; RIGHT drops exactly one into each.
+// Output and palette slots are ignored and the cursor keeps the remainder.
+SlotClickOutcome applySlotDrag(const SlotAccess& access, ItemStack& cursor,
+                               std::span<const SlotRef> slots, SlotClickKind kind);
+
+// Double-click gather: pull every matching loose stack across the open
+// surfaces into the held cursor, up to a full stack, consolidating partial
+// stacks first exactly like Minecraft.
+SlotClickOutcome applyDoubleClick(const SlotAccess& access, ItemStack& cursor);
 
 // Clicking outside the panel: LEFT drops the whole held stack, RIGHT one.
 ItemStack takeOutsideDrop(ItemStack& cursor, SlotClickKind kind);

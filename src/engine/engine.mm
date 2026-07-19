@@ -337,6 +337,17 @@ struct EngineState {
     int creativePage = 0;
     int hoveredSlot = -1;
 
+    // ---- Slot drag and double-click (Minecraft-style) ----
+    // A drag session paints every slot a held button passes over, then splits
+    // (left) or spreads one-per-slot (right) the cursor across them on release.
+    bool dragActive = false;
+    SlotClickKind dragKind = SlotClickKind::LEFT;
+    bool dragMoved = false; // painted a second distinct slot: a real drag
+    std::vector<SlotRef> dragSlots;
+    double lastSlotClickSeconds = -1.0; // for double-click gather detection
+    SlotRef lastSlotClickRef;
+    static constexpr double DOUBLE_CLICK_WINDOW = 0.3; // seconds
+
     // ---- Game flow & UI ----
     std::vector<WorldSummary> worldList; // cached on entering the world menus
     WorldSelectState worldSelect;
@@ -1607,18 +1618,92 @@ static std::string defaultWorldDirectory() {
         state->hoveredButton = hit.kind == UIHitKind::BUTTON ? hit.index : -1;
         state->hoveredSlot = hit.kind == UIHitKind::SLOT ? hit.index : -1;
 
+        // Slot interaction. A held cursor plus a press over a slot begins a
+        // drag that paints every slot the button crosses and distributes on
+        // release (left even-splits, right spreads one apiece); a quick second
+        // left click on the same slot gathers instead; a lone click picks,
+        // places, or quick-moves through applySlotClick.
+        SlotAccess access = [self slotAccessForScreen];
+        const SlotRef hovered = hit.kind == UIHitKind::SLOT
+                                    ? state->menuLayout.slots[static_cast<size_t>(hit.index)].ref
+                                    : SlotRef{};
+        const auto sameSlot = [](SlotRef a, SlotRef b) {
+            return a.domain == b.domain && a.index == b.index;
+        };
+
         if (hit.kind == UIHitKind::SLOT &&
             (input.isJustPressed(Key::MouseLeft) || input.isJustPressed(Key::MouseRight))) {
-            const SlotWidget& slotWidget = state->menuLayout.slots[static_cast<size_t>(hit.index)];
-            const SlotClickKind kind = input.isJustPressed(Key::MouseRight) ? SlotClickKind::RIGHT
-                                       : input.isDown(Key::LeftShift) ? SlotClickKind::SHIFT_LEFT
-                                                                      : SlotClickKind::LEFT;
-            SlotAccess access = [self slotAccessForScreen];
-            const SlotClickOutcome outcome =
-                applySlotClick(access, state->cursorStack, slotWidget.ref, kind);
-            if (outcome.changed) {
+            const bool isLeft = input.isJustPressed(Key::MouseLeft);
+            const double now = CACurrentMediaTime();
+            const bool doubleClick =
+                isLeft && !state->cursorStack.empty() &&
+                now - state->lastSlotClickSeconds <= EngineState::DOUBLE_CLICK_WINDOW &&
+                sameSlot(state->lastSlotClickRef, hovered);
+            if (doubleClick) {
+                if (applyDoubleClick(access, state->cursorStack).changed) {
+                    [self playUiSfx:state->sfxClick gain:0.3f];
+                }
+                state->lastSlotClickSeconds = -1.0; // consume: a third click restarts
+            } else if (!state->cursorStack.empty()) {
+                state->dragActive = true;
+                state->dragKind = isLeft ? SlotClickKind::LEFT : SlotClickKind::RIGHT;
+                state->dragMoved = false;
+                state->dragSlots.clear();
+                state->dragSlots.push_back(hovered);
+                if (isLeft) {
+                    state->lastSlotClickSeconds = now;
+                    state->lastSlotClickRef = hovered;
+                }
+            } else {
+                const SlotClickKind kind = !isLeft ? SlotClickKind::RIGHT
+                                           : input.isDown(Key::LeftShift)
+                                               ? SlotClickKind::SHIFT_LEFT
+                                               : SlotClickKind::LEFT;
+                if (applySlotClick(access, state->cursorStack, hovered, kind).changed) {
+                    [self playUiSfx:state->sfxClick gain:0.3f];
+                }
+                if (isLeft) {
+                    state->lastSlotClickSeconds = now;
+                    state->lastSlotClickRef = hovered;
+                }
+            }
+        }
+
+        // Paint newly crossed slots while the drag button stays down.
+        if (state->dragActive && hit.kind == UIHitKind::SLOT) {
+            bool present = false;
+            for (const SlotRef ref : state->dragSlots) {
+                if (sameSlot(ref, hovered)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                state->dragSlots.push_back(hovered);
+                state->dragMoved = true;
+            }
+        }
+
+        // Release finalizes: a real multi-slot drag distributes, a lone
+        // press-release falls back to a normal place click.
+        const Key dragButton =
+            state->dragKind == SlotClickKind::RIGHT ? Key::MouseRight : Key::MouseLeft;
+        if (state->dragActive && input.isJustReleased(dragButton)) {
+            if (state->dragMoved && state->dragSlots.size() >= 2) {
+                if (applySlotDrag(access, state->cursorStack,
+                                  std::span<const SlotRef>(state->dragSlots), state->dragKind)
+                        .changed) {
+                    [self playUiSfx:state->sfxClick gain:0.3f];
+                }
+            } else if (!state->dragSlots.empty() &&
+                       applySlotClick(access, state->cursorStack, state->dragSlots.front(),
+                                      state->dragKind)
+                           .changed) {
                 [self playUiSfx:state->sfxClick gain:0.3f];
             }
+            state->dragActive = false;
+            state->dragMoved = false;
+            state->dragSlots.clear();
         }
 
         if (input.isJustPressed(Key::MouseLeft)) {
@@ -1640,6 +1725,10 @@ static std::string defaultWorldDirectory() {
         }
     } else {
         state->hoveredButton = -1;
+        // No container open: abandon any half-finished drag so it never leaks
+        // a phantom deposit into the next screen.
+        state->dragActive = false;
+        state->dragSlots.clear();
 
         // Hotbar: scroll wheel cycles slots (frame-level, gameplay only)
         _scrollAccumulator += input.scrollDelta;

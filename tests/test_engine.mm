@@ -1339,6 +1339,75 @@ TEST_CASE("Creative palette hands out stacks and eats held ones", "[slots]") {
     REQUIRE(inventory[0].type == first);
 }
 
+TEST_CASE("Right-drag spreads one item into each painted slot", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    ItemStack result;
+    SlotAccess access = craftingAccess(inventory, grid, result, 9, 3);
+    ItemStack cursor{ItemType::COAL, 5, 0};
+
+    const std::array<SlotRef, 3> painted = {SlotRef{SlotDomain::INVENTORY, 10},
+                                            SlotRef{SlotDomain::INVENTORY, 11},
+                                            SlotRef{SlotDomain::CRAFT_IN, 4}};
+    REQUIRE(applySlotDrag(access, cursor, painted, SlotClickKind::RIGHT).changed);
+    REQUIRE(inventory[10] == ItemStack{ItemType::COAL, 1, 0});
+    REQUIRE(inventory[11] == ItemStack{ItemType::COAL, 1, 0});
+    REQUIRE(grid[4] == ItemStack{ItemType::COAL, 1, 0});
+    REQUIRE(cursor.count == 2); // the untouched remainder stays on the cursor
+}
+
+TEST_CASE("Left-drag splits the held stack evenly", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    ItemStack result;
+    SlotAccess access = craftingAccess(inventory, grid, result, 9, 3);
+    ItemStack cursor{ItemType::COAL, 10, 0};
+
+    // Ten items across three slots: each takes floor(10/3)=3, one stays held.
+    const std::array<SlotRef, 3> painted = {SlotRef{SlotDomain::INVENTORY, 0},
+                                            SlotRef{SlotDomain::INVENTORY, 1},
+                                            SlotRef{SlotDomain::INVENTORY, 2}};
+    REQUIRE(applySlotDrag(access, cursor, painted, SlotClickKind::LEFT).changed);
+    REQUIRE(inventory[0].count == 3);
+    REQUIRE(inventory[1].count == 3);
+    REQUIRE(inventory[2].count == 3);
+    REQUIRE(cursor.count == 1);
+
+    // A slot already holding the item is topped up by the even share, and a
+    // foreign slot is skipped rather than overwritten.
+    inventory[3] = ItemStack{ItemType::COAL, 60, 0};
+    inventory[4] = ItemStack{ItemType::STICK, 1, 0};
+    cursor = ItemStack{ItemType::COAL, 8, 0};
+    const std::array<SlotRef, 2> topUp = {SlotRef{SlotDomain::INVENTORY, 3},
+                                          SlotRef{SlotDomain::INVENTORY, 4}};
+    REQUIRE(applySlotDrag(access, cursor, topUp, SlotClickKind::LEFT).changed);
+    REQUIRE(inventory[3].count == 64); // capped at the max stack, absorbing 4
+    REQUIRE(inventory[4] == ItemStack{ItemType::STICK, 1, 0});
+    REQUIRE(cursor.count == 4);
+}
+
+TEST_CASE("Double-click gathers matching stacks up to a full one", "[slots]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    ItemStack result;
+    SlotAccess access = craftingAccess(inventory, grid, result, 9, 3);
+
+    inventory[5] = ItemStack{ItemType::COAL, 64, 0}; // a full stack, left last
+    inventory[6] = ItemStack{ItemType::COAL, 10, 0};
+    inventory[7] = ItemStack{ItemType::STICK, 20, 0};
+    grid[0] = ItemStack{ItemType::COAL, 30, 0};
+    ItemStack cursor{ItemType::COAL, 5, 0};
+
+    REQUIRE(applyDoubleClick(access, cursor).changed);
+    REQUIRE(cursor.count == 64);                                // exactly one stack
+    REQUIRE(inventory[7] == ItemStack{ItemType::STICK, 20, 0}); // foreign untouched
+    // Partial stacks are consumed before the full one: 5 + 10 + 30 = 45, then
+    // 19 pulled from the full stack to reach 64.
+    REQUIRE(inventory[6].empty());
+    REQUIRE(grid[0].empty());
+    REQUIRE(inventory[5].count == 45);
+}
+
 TEST_CASE("Outside drops and container close return items", "[slots]") {
     ItemStack cursor{ItemType::COAL, 5, 0};
     REQUIRE(takeOutsideDrop(cursor, SlotClickKind::RIGHT) == ItemStack{ItemType::COAL, 1, 0});

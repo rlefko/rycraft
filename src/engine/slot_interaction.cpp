@@ -270,6 +270,89 @@ SlotClickOutcome applySlotClick(const SlotAccess& access, ItemStack& cursor, Slo
     return outcome;
 }
 
+SlotClickOutcome applySlotDrag(const SlotAccess& access, ItemStack& cursor,
+                               std::span<const SlotRef> slots, SlotClickKind kind) {
+    SlotClickOutcome outcome;
+    if (cursor.empty() || slots.empty()) return outcome;
+    const bool oneEach = kind == SlotClickKind::RIGHT;
+    if (!oneEach && kind != SlotClickKind::LEFT) return outcome;
+
+    const ItemType type = cursor.type;
+    const int limit = maxStackSize(type);
+
+    // Resolve the painted slots to distinct, acceptor pointers. Output and
+    // palette slots never take drag deposits.
+    std::vector<ItemStack*> targets;
+    for (const SlotRef ref : slots) {
+        if (ref.domain == SlotDomain::CRAFT_OUT || ref.domain == SlotDomain::FURNACE_OUTPUT ||
+            ref.domain == SlotDomain::CREATIVE_PALETTE) {
+            continue;
+        }
+        ItemStack* slot = resolveSlot(access, ref);
+        if (!slot) continue;
+        const bool acceptor = slot->empty() || (slot->type == type && slot->count < limit);
+        if (!acceptor) continue;
+        if (std::find(targets.begin(), targets.end(), slot) != targets.end()) continue;
+        targets.push_back(slot);
+    }
+    if (targets.empty()) return outcome;
+
+    // Left splits the held count evenly (floor), right places one apiece; the
+    // remainder that will not divide stays on the cursor, just as in Minecraft.
+    const int startCount = cursor.count;
+    const int placeCount = oneEach ? 1 : startCount / static_cast<int>(targets.size());
+    if (placeCount <= 0) return outcome;
+
+    int remaining = startCount;
+    for (ItemStack* slot : targets) {
+        if (remaining <= 0) break;
+        const int existing = slot->empty() ? 0 : slot->count;
+        const int add = std::min({placeCount, limit - existing, remaining});
+        if (add <= 0) continue;
+        if (slot->empty()) {
+            *slot = ItemStack{type, static_cast<uint8_t>(add), cursor.durability};
+        } else {
+            slot->count = static_cast<uint8_t>(slot->count + add);
+        }
+        remaining -= add;
+        outcome.changed = true;
+    }
+    cursor.count = static_cast<uint8_t>(remaining);
+    if (cursor.count == 0) cursor.clear();
+    if (outcome.changed) refreshCraftResult(access);
+    return outcome;
+}
+
+SlotClickOutcome applyDoubleClick(const SlotAccess& access, ItemStack& cursor) {
+    SlotClickOutcome outcome;
+    if (cursor.empty()) return outcome;
+    const int limit = maxStackSize(cursor.type);
+    if (cursor.count >= limit) return outcome;
+
+    // Consolidate partial stacks before breaking into full ones so a gather
+    // never needlessly empties a full stack, matching Minecraft's two passes.
+    const auto gatherFrom = [&](ItemStack* slots, int count, bool partialsOnly) {
+        if (!slots) return;
+        for (int index = 0; index < count && cursor.count < limit; ++index) {
+            ItemStack& slot = slots[index];
+            if (slot.empty() || slot.type != cursor.type) continue;
+            if (partialsOnly && slot.count >= limit) continue;
+            const int take = std::min<int>(limit - cursor.count, slot.count);
+            cursor.count = static_cast<uint8_t>(cursor.count + take);
+            slot.count = static_cast<uint8_t>(slot.count - take);
+            if (slot.count == 0) slot.clear();
+            outcome.changed = true;
+        }
+    };
+    for (const bool partialsOnly : {true, false}) {
+        if (cursor.count >= limit) break;
+        gatherFrom(access.inventory, 36, partialsOnly);
+        gatherFrom(access.craftGrid, access.craftGridSize, partialsOnly);
+    }
+    if (outcome.changed) refreshCraftResult(access);
+    return outcome;
+}
+
 ItemStack takeOutsideDrop(ItemStack& cursor, SlotClickKind kind) {
     if (cursor.empty()) return ItemStack{};
     if (kind == SlotClickKind::RIGHT) {
