@@ -17,11 +17,16 @@
 #include <entity/spatial_hash.hpp>
 #include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
+#include <render/atmosphere.hpp>
+#include <render/atmospheric_memory.hpp>
 #include <render/block_texture_array.hpp>
 #include <render/block_textures.hpp>
+#include <render/cloud_renderer.hpp>
 #include <render/graphics_settings.hpp>
 #include <render/lod_mesher.hpp>
 #include <render/mega_buffer.hpp>
+#include <render/render_pipeline.hpp>
+#include <render/screen_space_lighting.hpp>
 #include <render/shader_types.hpp>
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
@@ -33,20 +38,516 @@
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
+#include <world/weather.hpp>
 #include <world/world.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
 #include <thread>
 
 // ============================================================================
 // Vec3 Tests
 // ============================================================================
+
+TEST_CASE("Physical atmosphere parameters and volume helpers stay finite",
+          "[render][atmosphere][volumetrics]") {
+    AtmosphereUniforms atmosphere =
+        earthAtmosphereUniforms(225.0F, simd_make_float3(0.3F, 0.8F, 0.2F),
+                                simd_make_float3(18.0F, 17.5F, 16.0F), 1.25F, 0.7F, 7);
+    REQUIRE(atmosphereUniformsFinite(atmosphere));
+    REQUIRE(atmosphere.atmosphereRadii.x == Catch::Approx(6360.0F));
+    REQUIRE(atmosphere.atmosphereRadii.y == Catch::Approx(6460.0F));
+    REQUIRE(atmosphere.atmosphereRadii.z == Catch::Approx(0.004675F));
+    REQUIRE(atmosphere.weatherOptics.z == Catch::Approx(0.0F));
+    REQUIRE(ATMOSPHERE_RADIANCE_SCALE ==
+            Catch::Approx(16.0F * static_cast<float>(M_PI)).margin(1.0e-6F));
+
+    // The normalized 15-degree clear-noon integral is intentionally lifted
+    // into the shared HDR exposure range. Otherwise the terrain can meter as
+    // daytime while the physical sky itself grades nearly black.
+    const simd_float3 clearNoon =
+        atmosphereSceneRadiance(simd_make_float3(0.0115F, 0.0229F, 0.0436F));
+    REQUIRE(clearNoon.x > 0.5F);
+    REQUIRE(clearNoon.y > 1.0F);
+    REQUIRE(clearNoon.z > 2.0F);
+
+    // A view ray that reaches the spherical lower boundary must retain a
+    // finite Lambertian radiance. This is the fallback behind streamed
+    // terrain gaps, so a daytime horizon cannot reveal a black band.
+    const simd_float3 ground = atmosphereGroundRadiance(simd_make_float3(0.18F, 0.20F, 0.16F),
+                                                        simd_make_float3(0.94F, 0.87F, 0.77F), 0.8F,
+                                                        simd_make_float3(0.003F, 0.010F, 0.032F));
+    REQUIRE(ground.x > 0.04F);
+    REQUIRE(ground.y > 0.04F);
+    REQUIRE(ground.z > 0.03F);
+
+    float previous = 0.0F;
+    for (unsigned int slice = 0; slice <= FROXEL_DEPTH; ++slice) {
+        float depth = froxelSliceDepth(slice, FROXEL_DEPTH, 0.1F, 8192.0F);
+        REQUIRE(std::isfinite(depth));
+        REQUIRE(depth >= previous);
+        previous = depth;
+    }
+    REQUIRE(previous == Catch::Approx(8192.0F));
+
+    REQUIRE(beerLambertTransmittance(0.02F, 0.0F) == Catch::Approx(1.0F));
+    REQUIRE(beerLambertTransmittance(0.02F, 100.0F) < beerLambertTransmittance(0.02F, 10.0F));
+    REQUIRE(beerLambertTransmittance(-1.0F, 100.0F) == Catch::Approx(1.0F));
+}
+
+TEST_CASE("Atmosphere transmittance stops at the lower boundary",
+          "[render][atmosphere][regression]") {
+    constexpr float GROUND_RADIUS_KM = 6360.0F;
+    constexpr float TOP_RADIUS_KM = 6460.0F;
+    constexpr float CAMERA_RADIUS_KM = GROUND_RADIUS_KM + 0.225F;
+
+    // The transmittance LUT includes downward-looking rows. A camera 225 m
+    // above the spherical surface must reach the ground almost immediately,
+    // not integrate through the planet to the far top-atmosphere crossing.
+    const float farTopDistance =
+        atmosphereRayToSphereDistance(CAMERA_RADIUS_KM, -1.0F, TOP_RADIUS_KM);
+    const float downwardDistance =
+        atmosphereTransmittancePathLength(CAMERA_RADIUS_KM, -1.0F, GROUND_RADIUS_KM, TOP_RADIUS_KM);
+    REQUIRE(atmosphereRayHitsGround(CAMERA_RADIUS_KM, -1.0F, GROUND_RADIUS_KM));
+    REQUIRE(downwardDistance == Catch::Approx(0.225F).margin(0.002F));
+    REQUIRE(downwardDistance < farTopDistance * 0.01F);
+
+    // Upward and above-horizon rows must continue to the upper boundary.
+    const float upwardDistance =
+        atmosphereTransmittancePathLength(CAMERA_RADIUS_KM, 1.0F, GROUND_RADIUS_KM, TOP_RADIUS_KM);
+    REQUIRE_FALSE(atmosphereRayHitsGround(CAMERA_RADIUS_KM, 1.0F, GROUND_RADIUS_KM));
+    REQUIRE(upwardDistance == Catch::Approx(TOP_RADIUS_KM - CAMERA_RADIUS_KM).margin(0.002F));
+    REQUIRE(upwardDistance ==
+            Catch::Approx(atmosphereRayToSphereDistance(CAMERA_RADIUS_KM, 1.0F, TOP_RADIUS_KM)));
+}
+
+TEST_CASE("Atmosphere transmittance mu coordinates match the LUT domain",
+          "[render][atmosphere][regression]") {
+    REQUIRE(atmosphereTransmittanceMuUv(ATMOSPHERE_TRANSMITTANCE_MU_MIN) == Catch::Approx(0.0F));
+    REQUIRE(atmosphereTransmittanceMuUv(0.0F) == Catch::Approx(0.15F / 1.15F).margin(1.0e-6F));
+    REQUIRE(atmosphereTransmittanceMuUv(ATMOSPHERE_TRANSMITTANCE_MU_MAX) == Catch::Approx(1.0F));
+    REQUIRE(atmosphereTransmittanceUvMu(0.0F) == Catch::Approx(ATMOSPHERE_TRANSMITTANCE_MU_MIN));
+    REQUIRE(atmosphereTransmittanceUvMu(1.0F) == Catch::Approx(ATMOSPHERE_TRANSMITTANCE_MU_MAX));
+
+    for (float mu :
+         {-2.0F, ATMOSPHERE_TRANSMITTANCE_MU_MIN, 0.0F, ATMOSPHERE_TRANSMITTANCE_MU_MAX, 2.0F}) {
+        const float uv = atmosphereTransmittanceMuUv(mu);
+        REQUIRE(std::isfinite(uv));
+        REQUIRE(uv >= 0.0F);
+        REQUIRE(uv <= 1.0F);
+    }
+    REQUIRE(std::isfinite(atmosphereTransmittanceMuUv(std::numeric_limits<float>::quiet_NaN())));
+}
+
+TEST_CASE("Volumetric cloud noise tiles in three dimensions and wind uses physical units",
+          "[render][clouds][weather]") {
+    STATIC_REQUIRE(WeatherSnapshot::GRID_EDGE == WEATHER_MAP_EDGE);
+    STATIC_REQUIRE(WeatherSnapshot::GRID_SPACING == static_cast<int>(WEATHER_MAP_CELL_SPACING));
+    constexpr int EDGE = 32;
+    constexpr uint64_t SEED = 764891;
+    const float origin = cloudBaseNoise(0, 7, 19, EDGE, SEED);
+    REQUIRE(cloudBaseNoise(EDGE, 7, 19, EDGE, SEED) == Catch::Approx(origin));
+    REQUIRE(cloudBaseNoise(0, 7 + EDGE, 19, EDGE, SEED) == Catch::Approx(origin));
+    REQUIRE(cloudBaseNoise(0, 7, 19 + EDGE, EDGE, SEED) == Catch::Approx(origin));
+    REQUIRE(cloudBaseNoise(3, 4, 5, EDGE, SEED) !=
+            Catch::Approx(cloudBaseNoise(3, 5, 5, EDGE, SEED)));
+    REQUIRE(cloudBaseNoise(3, 4, 5, EDGE, SEED) >= 0.0F);
+    REQUIRE(cloudBaseNoise(3, 4, 5, EDGE, SEED) <= 1.0F);
+
+    REQUIRE(wrappedCloudOffset(100.0, 12.0, 10.0) == Catch::Approx(220.0));
+    REQUIRE(wrappedCloudOffset(CLOUD_MOTION_WRAP_BLOCKS - 6.0, 12.0, 1.0) == Catch::Approx(6.0));
+    REQUIRE(wrappedCloudOffset(2.0, -4.0, 1.0) == Catch::Approx(CLOUD_MOTION_WRAP_BLOCKS - 2.0));
+}
+
+TEST_CASE("Regional cloud motion wraps coherently and ignores camera movement",
+          "[render][clouds][weather][precision]") {
+    WeatherSample previous{};
+    previous.cloudType = CloudType::CUMULUS;
+    previous.cloudOffsetBlocks = {1'000'000'000'000.0, -1'000'000'000'000.0};
+    previous.highCloudOffsetBlocks = {750'000'000'000.0, -750'000'000'000.0};
+    WeatherSample current = previous;
+    current.cloudOffsetBlocks.x += 0.5;
+    current.cloudOffsetBlocks.z -= 0.25;
+    current.highCloudOffsetBlocks.x += 0.75;
+    current.highCloudOffsetBlocks.z -= 0.375;
+
+    const simd_float2 previousMotion = decodeCloudMotion(encodeCloudMotion(previous));
+    const simd_float2 currentMotion = decodeCloudMotion(encodeCloudMotion(current));
+    const simd_float2 delta = cloudMotionDelta(currentMotion, previousMotion);
+    REQUIRE(delta.x == Catch::Approx(0.5F).margin(0.001F));
+    REQUIRE(delta.y == Catch::Approx(-0.25F).margin(0.001F));
+
+    const simd_float2 previousHighMotion =
+        decodeCloudMotion(encodeCloudMotionOffset(previous.highCloudOffsetBlocks));
+    const simd_float2 currentHighMotion =
+        decodeCloudMotion(encodeCloudMotionOffset(current.highCloudOffsetBlocks));
+    const simd_float2 highDelta = cloudMotionDelta(currentHighMotion, previousHighMotion);
+    REQUIRE(highDelta.x == Catch::Approx(0.75F).margin(0.001F));
+    REQUIRE(highDelta.y == Catch::Approx(-0.375F).margin(0.001F));
+
+    // Changing the categorical profile must not rescale the absolute phase.
+    // At large saved-world ages, even a small multiplier would create a
+    // visually unbounded jump instead of the sub-block physical motion.
+    WeatherSample transitioned = current;
+    transitioned.cloudType = CloudType::CIRRUS;
+    const simd_float2 transitionedMotion = decodeCloudMotion(encodeCloudMotion(transitioned));
+    const simd_float2 transitionDelta = cloudMotionDelta(transitionedMotion, currentMotion);
+    REQUIRE(transitionDelta.x == Catch::Approx(0.0F).margin(0.001F));
+    REQUIRE(transitionDelta.y == Catch::Approx(0.0F).margin(0.001F));
+
+    WeatherMapUniforms map{};
+    map.cellSpacing = WEATHER_MAP_CELL_SPACING;
+    map.gridSize = simd_make_uint2(WEATHER_MAP_EDGE, WEATHER_MAP_EDGE);
+    map.motionWrapBlocks = CLOUD_MOTION_WRAP_BLOCKS;
+    constexpr int64_t ORIGIN_X = 12'288;
+    constexpr int64_t ORIGIN_Z = -122'880;
+    const simd_float2 worldXZ = simd_make_float2(23'800.0F, -111'200.0F);
+    const auto uvForCamera = [&](simd_float2 cameraXZ) {
+        WeatherMapUniforms cameraMap = map;
+        cameraMap.originXZ = simd_make_float2(static_cast<float>(ORIGIN_X) - cameraXZ.x,
+                                              static_cast<float>(ORIGIN_Z) - cameraXZ.y);
+        return weatherMapTextureCoordinate(worldXZ - cameraXZ, cameraMap);
+    };
+    const simd_float2 stationary = uvForCamera(simd_make_float2(23'029.0F, -111'726.0F));
+    const simd_float2 moved = uvForCamera(simd_make_float2(24'053.0F, -110'702.0F));
+    REQUIRE(stationary.x == Catch::Approx(moved.x).margin(1.0e-6F));
+    REQUIRE(stationary.y == Catch::Approx(moved.y).margin(1.0e-6F));
+}
+
+TEST_CASE("Cloud horizon uses camera-forward depth within regional weather coverage",
+          "[render][clouds][weather][horizon]") {
+    WeatherMapUniforms map{};
+    map.originXZ = simd_make_float2(-10'240.0F, -10'240.0F);
+    map.cellSpacing = WEATHER_MAP_CELL_SPACING;
+    map.gridSize = simd_make_uint2(WEATHER_MAP_EDGE, WEATHER_MAP_EDGE);
+
+    const simd_float3 forward = simd_make_float3(0.0F, 0.0F, -1.0F);
+    REQUIRE(cloudMarchRayDistanceLimit(forward, forward, CLOUD_HORIZON_VIEW_DEPTH, map) ==
+            Catch::Approx(CLOUD_HORIZON_VIEW_DEPTH));
+
+    const simd_float3 diagonal = simd_normalize(simd_make_float3(0.7F, 0.0F, -1.0F));
+    const float diagonalDistance =
+        cloudMarchRayDistanceLimit(diagonal, forward, CLOUD_HORIZON_VIEW_DEPTH, map);
+    REQUIRE(diagonalDistance * simd_dot(diagonal, forward) ==
+            Catch::Approx(CLOUD_HORIZON_VIEW_DEPTH).margin(0.01F));
+    REQUIRE(diagonalDistance > CLOUD_HORIZON_VIEW_DEPTH);
+
+    // Model the largest permitted camera displacement before recentering.
+    // The positive map edge is then closer, and the one-cell guard must cap a
+    // wide ray before filtered sampling can clamp to stale boundary weather.
+    map.originXZ.x -= 1'024.0F;
+    const simd_float3 edgeRay = simd_normalize(simd_make_float3(1.0F, 0.0F, -0.2F));
+    const float weatherLimit = cloudWeatherCoverageRayDistance(edgeRay, map);
+    const float marchLimit =
+        cloudMarchRayDistanceLimit(edgeRay, forward, CLOUD_HORIZON_VIEW_DEPTH, map);
+    REQUIRE(marchLimit == Catch::Approx(weatherLimit));
+    REQUIRE(marchLimit < cloudViewDepthRayDistance(edgeRay, forward, CLOUD_HORIZON_VIEW_DEPTH));
+    REQUIRE(marchLimit * edgeRay.x == Catch::Approx(8'960.0F).margin(0.01F));
+}
+
+TEST_CASE("Bulk cloud noise preserves the scalar contract with bounded hash work",
+          "[render][clouds][performance]") {
+    constexpr int EDGE = CLOUD_BASE_NOISE_EDGE;
+    constexpr uint64_t SEED = 764891;
+    CloudNoiseGenerationStats stats;
+    const std::vector<uint8_t> volume = generateCloudBaseNoiseVolume(EDGE, SEED, &stats);
+    REQUIRE(volume.size() == 2'097'152);
+    REQUIRE(stats.voxelCount == volume.size());
+    REQUIRE(stats.hashEvaluations == 2'112);
+    REQUIRE(stats.worleyFeatureTests == 56'623'104);
+    REQUIRE(stats.hashEvaluations * 512U < stats.voxelCount);
+
+    constexpr std::array<std::array<int, 3>, 8> SAMPLES{{
+        {0, 0, 0},
+        {1, 7, 19},
+        {31, 63, 95},
+        {64, 64, 64},
+        {87, 42, 113},
+        {126, 3, 91},
+        {127, 0, 127},
+        {127, 127, 127},
+    }};
+    for (const auto& coordinate : SAMPLES) {
+        const int x = coordinate[0];
+        const int y = coordinate[1];
+        const int z = coordinate[2];
+        const size_t index = (static_cast<size_t>(z) * EDGE + static_cast<size_t>(y)) * EDGE +
+                             static_cast<size_t>(x);
+        const uint8_t scalar =
+            static_cast<uint8_t>(cloudBaseNoise(x, y, z, EDGE, SEED) * 255.0F + 0.5F);
+        REQUIRE(volume[index] == scalar);
+    }
+
+    constexpr int CONTRACT_EDGE = 32;
+    const std::vector<uint8_t> contractVolume = generateCloudBaseNoiseVolume(CONTRACT_EDGE, SEED);
+    size_t mismatchedVoxels = 0;
+    for (int z = 0; z < CONTRACT_EDGE; ++z) {
+        for (int y = 0; y < CONTRACT_EDGE; ++y) {
+            for (int x = 0; x < CONTRACT_EDGE; ++x) {
+                const size_t index =
+                    (static_cast<size_t>(z) * CONTRACT_EDGE + static_cast<size_t>(y)) *
+                        CONTRACT_EDGE +
+                    static_cast<size_t>(x);
+                const uint8_t scalar = static_cast<uint8_t>(
+                    cloudBaseNoise(x, y, z, CONTRACT_EDGE, SEED) * 255.0F + 0.5F);
+                mismatchedVoxels += contractVolume[index] != scalar ? 1U : 0U;
+            }
+        }
+    }
+    REQUIRE(mismatchedVoxels == 0);
+
+    uint64_t digest = 14'695'981'039'346'656'037ULL;
+    for (uint8_t value : volume) {
+        digest ^= value;
+        digest *= 1'099'511'628'211ULL;
+    }
+    REQUIRE(digest == 0x2F90AEDA76D69F7CULL);
+}
+
+TEST_CASE("Screen-space lighting memory follows quality at native resolution",
+          "[render][indirect][memory]") {
+    constexpr uint32_t WIDTH = 3456;
+    constexpr uint32_t HEIGHT = 2234;
+    const ScreenSpaceLightingMemoryFootprint off =
+        screenSpaceLightingMemoryFootprint(WIDTH, HEIGHT, 0);
+    REQUIRE(off.workWidth == 1);
+    REQUIRE(off.workHeight == 1);
+    REQUIRE(off.neutralBytes == 8);
+    REQUIRE(off.linearDepthPyramidBytes == 0);
+    REQUIRE(off.normalBytes == 0);
+    REQUIRE(off.traceBytes == 0);
+    REQUIRE(off.historyBytes == 0);
+    REQUIRE(off.historyDepthBytes == 0);
+    REQUIRE(off.momentsBytes == 0);
+    REQUIRE(off.scratchBytes == 0);
+    REQUIRE(off.totalBytes() == 8);
+
+    const ScreenSpaceLightingMemoryFootprint medium =
+        screenSpaceLightingMemoryFootprint(WIDTH, HEIGHT, 1);
+    REQUIRE(medium.workWidth == 864);
+    REQUIRE(medium.workHeight == 558);
+    REQUIRE(medium.linearDepthPyramidBytes == 41'173'704);
+    REQUIRE(medium.normalBytes == 30'882'816);
+    REQUIRE(medium.traceBytes == 3'856'896);
+    REQUIRE(medium.historyBytes == 7'713'792);
+    REQUIRE(medium.historyDepthBytes == 3'856'896);
+    REQUIRE(medium.momentsBytes == 7'713'792);
+    REQUIRE(medium.scratchBytes == 3'856'896);
+    REQUIRE(medium.totalBytes() == 99'054'800);
+
+    const ScreenSpaceLightingMemoryFootprint high =
+        screenSpaceLightingMemoryFootprint(WIDTH, HEIGHT, 2);
+    REQUIRE(high.workWidth == 1728);
+    REQUIRE(high.workHeight == 1117);
+    REQUIRE(high.normalBytes == 30'882'816);
+    REQUIRE(high.traceBytes == 15'441'408);
+    REQUIRE(high.historyBytes == 30'882'816);
+    REQUIRE(high.historyDepthBytes == 15'441'408);
+    REQUIRE(high.momentsBytes == 30'882'816);
+    REQUIRE(high.scratchBytes == 15'441'408);
+    REQUIRE(high.totalBytes() == 180'146'384);
+    REQUIRE(screenSpaceLightingMemoryFootprint(WIDTH, HEIGHT, -4).totalBytes() == off.totalBytes());
+    REQUIRE(screenSpaceLightingMemoryFootprint(WIDTH, HEIGHT, 8).totalBytes() == high.totalBytes());
+}
+
+TEST_CASE("Screen-space lighting normal guide rejects separate voxel faces",
+          "[render][indirect][upsample]") {
+    const Vec3 floorNormal{0.0F, 1.0F, 0.0F};
+    const Vec3 nearbyFloorNormal{0.0F, 0.98F, 0.2F};
+    const Vec3 wallNormal{1.0F, 0.0F, 0.0F};
+
+    REQUIRE(screenSpaceBilateralNormalWeight(floorNormal, floorNormal) == Catch::Approx(1.0F));
+    REQUIRE(screenSpaceBilateralNormalWeight(floorNormal, nearbyFloorNormal) > 0.99F);
+    REQUIRE(screenSpaceBilateralNormalWeight(floorNormal, wallNormal) == Catch::Approx(0.0F));
+    REQUIRE(screenSpaceBilateralNormalWeight(floorNormal, Vec3{}) == Catch::Approx(0.0F));
+
+    REQUIRE(screenSpaceJointBilateralUpsampleWeight(12.0F, 12.0F, floorNormal, floorNormal) >
+            0.99F);
+    REQUIRE(screenSpaceJointBilateralUpsampleWeight(12.0F, 12.0F, floorNormal, wallNormal) ==
+            Catch::Approx(0.0F));
+}
+
+TEST_CASE("Screen-space lighting history resets for every discontinuity",
+          "[render][indirect][history]") {
+    const IndirectHistoryState previous{
+        .width = 3456,
+        .height = 2234,
+        .cameraPosition = {23'029.0F, 225.0F, -111'726.0F},
+        .fovDegrees = 70.0F,
+        .worldIdentity = 17,
+        .forcedStateRevision = 9,
+        .quality = 2,
+        .directLightSource = 1,
+        .priorDepthValid = true,
+    };
+    REQUIRE(indirectHistoryResetMask(previous, previous) == INDIRECT_HISTORY_STABLE);
+
+    const auto requireOnly = [&previous](auto mutate, uint32_t expected) {
+        IndirectHistoryState current = previous;
+        mutate(current);
+        REQUIRE(indirectHistoryResetMask(previous, current) == expected);
+    };
+    requireOnly([](IndirectHistoryState& state) { ++state.width; }, INDIRECT_HISTORY_RESIZE);
+    requireOnly([](IndirectHistoryState& state) { ++state.height; }, INDIRECT_HISTORY_RESIZE);
+    requireOnly([](IndirectHistoryState& state) { state.cameraPosition.x += 8.01F; },
+                INDIRECT_HISTORY_TELEPORT);
+    requireOnly([](IndirectHistoryState& state) { ++state.worldIdentity; },
+                INDIRECT_HISTORY_WORLD_CHANGE);
+    requireOnly([](IndirectHistoryState& state) { state.fovDegrees += 0.51F; },
+                INDIRECT_HISTORY_FOV_CHANGE);
+    requireOnly([](IndirectHistoryState& state) { --state.quality; },
+                INDIRECT_HISTORY_QUALITY_CHANGE);
+    requireOnly([](IndirectHistoryState& state) { ++state.forcedStateRevision; },
+                INDIRECT_HISTORY_FORCED_STATE);
+    requireOnly([](IndirectHistoryState& state) { state.priorDepthValid = false; },
+                INDIRECT_HISTORY_INVALID_DEPTH);
+    requireOnly([](IndirectHistoryState& state) { ++state.directLightSource; },
+                INDIRECT_HISTORY_LIGHT_SOURCE);
+
+    IndirectHistoryState continuous = previous;
+    continuous.cameraPosition.x += 8.0F;
+    continuous.fovDegrees += 0.5F;
+    REQUIRE(indirectHistoryResetMask(previous, continuous) == INDIRECT_HISTORY_STABLE);
+
+    IndirectHistoryState allReasons = previous;
+    ++allReasons.width;
+    allReasons.cameraPosition.x += 9.0F;
+    ++allReasons.worldIdentity;
+    allReasons.fovDegrees += 1.0F;
+    --allReasons.quality;
+    ++allReasons.forcedStateRevision;
+    allReasons.priorDepthValid = false;
+    ++allReasons.directLightSource;
+    constexpr uint32_t EVERY_REASON =
+        INDIRECT_HISTORY_RESIZE | INDIRECT_HISTORY_TELEPORT | INDIRECT_HISTORY_WORLD_CHANGE |
+        INDIRECT_HISTORY_FOV_CHANGE | INDIRECT_HISTORY_QUALITY_CHANGE |
+        INDIRECT_HISTORY_FORCED_STATE | INDIRECT_HISTORY_INVALID_DEPTH |
+        INDIRECT_HISTORY_LIGHT_SOURCE;
+    REQUIRE(indirectHistoryResetMask(previous, allReasons) == EVERY_REASON);
+}
+
+TEST_CASE("Cloud memory omits frame and shadow targets when disabled", "[render][clouds][memory]") {
+    constexpr uint32_t WIDTH = 3456;
+    constexpr uint32_t HEIGHT = 2234;
+    const CloudRendererMemoryFootprint off = cloudRendererMemoryFootprint(WIDTH, HEIGHT, 0);
+    REQUIRE(off.quarterWidth == 1);
+    REQUIRE(off.quarterHeight == 1);
+    REQUIRE(off.shadowEdge == 0);
+    REQUIRE(off.noiseBytes == 2'162'688);
+    REQUIRE(off.weatherBytes == 2'519'424);
+    REQUIRE(off.neutralShadowBytes == 2);
+    REQUIRE(off.frameTargetBytes == 0);
+    REQUIRE(off.shadowBytes == 0);
+    REQUIRE(off.totalBytes() == 4'682'114);
+
+    const CloudRendererMemoryFootprint medium = cloudRendererMemoryFootprint(WIDTH, HEIGHT, 1);
+    REQUIRE(medium.quarterWidth == 864);
+    REQUIRE(medium.quarterHeight == 558);
+    REQUIRE(medium.shadowEdge == 1024);
+    REQUIRE(medium.frameTargetBytes == 14'463'360);
+    REQUIRE(medium.shadowBytes == 2'097'152);
+    REQUIRE(medium.totalBytes() == 21'242'626);
+
+    const CloudRendererMemoryFootprint high = cloudRendererMemoryFootprint(WIDTH, HEIGHT, 2);
+    REQUIRE(high.shadowEdge == 2048);
+    REQUIRE(high.frameTargetBytes == medium.frameTargetBytes);
+    REQUIRE(high.shadowBytes == 8'388'608);
+    REQUIRE(high.totalBytes() == 27'534'082);
+    REQUIRE(cloudRendererMemoryFootprint(WIDTH, HEIGHT, -1).totalBytes() == off.totalBytes());
+    REQUIRE(cloudRendererMemoryFootprint(WIDTH, HEIGHT, 4).totalBytes() == high.totalBytes());
+
+    constexpr uint64_t HIGH_TIER_BUDGET = 768ULL * 1024ULL * 1024ULL;
+    const AtmosphericMemoryFootprint integrated = atmosphericMemoryFootprint(WIDTH, HEIGHT, 2);
+    REQUIRE(waterReflectionPyramidMemoryBytes(0, HEIGHT) == 0);
+    REQUIRE(waterReflectionPyramidMemoryBytes(3, 5) == 144);
+    REQUIRE(waterReflectionPyramidMemoryBytes(WIDTH, HEIGHT) == 82'347'408);
+    REQUIRE(atmosphericSceneTargetMemoryBytes(WIDTH, HEIGHT) == 236'761'488);
+    REQUIRE(integrated.sceneTargetBytes == 236'761'488);
+    REQUIRE(integrated.shadowBytes == 184'549'376);
+    REQUIRE(integrated.indirectBytes == 180'146'384);
+    REQUIRE(integrated.atmosphereBytes == 305'152);
+    REQUIRE(integrated.cloudBytes == 27'534'082);
+    REQUIRE(integrated.volumetricBytes == 86'525'723);
+    REQUIRE(integrated.lightningBytes == 2);
+    REQUIRE(integrated.totalBytes() == 715'822'207);
+    REQUIRE(integrated.totalBytes() < HIGH_TIER_BUDGET);
+    REQUIRE(HIGH_TIER_BUDGET - integrated.totalBytes() == 89'484'161);
+}
+
+TEST_CASE("Atmospheric diagnostics preserve all cascade worker and memory counters",
+          "[engine][hud][atmosphere][diagnostics]") {
+    RenderPipeline::AtmosphericRenderStats rendererStats;
+    REQUIRE(rendererStats.shadowCasterCounts.size() == SHADOW_CASCADE_COUNT);
+    REQUIRE(rendererStats.shadowRefreshCounts.size() == SHADOW_CASCADE_COUNT);
+    REQUIRE(std::ranges::all_of(rendererStats.shadowCasterCounts,
+                                [](uint32_t value) { return value == 0U; }));
+    REQUIRE(std::ranges::all_of(rendererStats.shadowRefreshCounts,
+                                [](uint64_t value) { return value == 0U; }));
+    REQUIRE(rendererStats.integratedPersistentBytes == 0U);
+
+    PerformanceStats hudStats;
+    REQUIRE(hudStats.shadowCasterCounts.size() == SHADOW_CASCADE_COUNT);
+    REQUIRE(hudStats.shadowRefreshCounts.size() == SHADOW_CASCADE_COUNT);
+    REQUIRE(hudStats.weatherRequests == 0U);
+    REQUIRE(hudStats.weatherPendingRequests == 0U);
+    REQUIRE_FALSE(hudStats.weatherWorkerBusy);
+    REQUIRE(hudStats.thunderPending == 0U);
+    REQUIRE(hudStats.integratedAtmosphericPersistentMB == Catch::Approx(0.0F));
+
+    WeatherSystemStats weatherStats;
+    weatherStats.requests = 9U;
+    weatherStats.coalescedRequests = 4U;
+    weatherStats.pendingRequests = 1U;
+    weatherStats.workerBusy = true;
+    REQUIRE(weatherStats.requests == 9U);
+    REQUIRE(weatherStats.coalescedRequests == 4U);
+    REQUIRE(weatherStats.pendingRequests == 1U);
+    REQUIRE(weatherStats.workerBusy);
+}
 // ===========================================================================
 // Engine: game flow, menus, input, hotbar
 // ===========================================================================
+
+TEST_CASE("Unsigned decimal capture ticks reject signs invalid text and overflow",
+          "[engine][capture][time]") {
+    REQUIRE(parseUnsignedDecimal("0") == 0U);
+    REQUIRE(parseUnsignedDecimal("24000") == 24'000U);
+    REQUIRE(parseUnsignedDecimal("18446744073709551615") == std::numeric_limits<uint64_t>::max());
+
+    REQUIRE_FALSE(parseUnsignedDecimal(""));
+    REQUIRE_FALSE(parseUnsignedDecimal("-1"));
+    REQUIRE_FALSE(parseUnsignedDecimal("+1"));
+    REQUIRE_FALSE(parseUnsignedDecimal(" 1"));
+    REQUIRE_FALSE(parseUnsignedDecimal("1 "));
+    REQUIRE_FALSE(parseUnsignedDecimal("0x10"));
+    REQUIRE_FALSE(parseUnsignedDecimal("12ticks"));
+    REQUIRE_FALSE(parseUnsignedDecimal("18446744073709551616"));
+}
+
+TEST_CASE("Capture lightning override parses finite coordinates ID and rendered age",
+          "[engine][capture][lightning]") {
+    const auto parsed = parseCaptureLightningOverride("23029.25,-111726.5,18446744073709551615,7");
+    REQUIRE(parsed);
+    REQUIRE(parsed->x == Catch::Approx(23'029.25));
+    REQUIRE(parsed->z == Catch::Approx(-111'726.5));
+    REQUIRE(parsed->id == std::numeric_limits<uint64_t>::max());
+    REQUIRE(parsed->ageTicks == 7U);
+
+    REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,17"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,17,2,extra"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("nan,-111726,17,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("23029,inf,17,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("1e300,-111726,17,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("23029,-1e300,17,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,-17,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,17,-2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,18446744073709551616,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("23029, -111726,17,2"));
+}
 
 TEST_CASE("InputBindings save/load round-trips a custom binding", "[engine][bindings]") {
     TempDir dir("bindings");
@@ -126,7 +627,7 @@ TEST_CASE("Double-tap: a triple-tap fires exactly one gesture", "[engine][input]
     REQUIRE(input.isDoubleTappedForTick(Key::Space));
     input.clearTickPresses();
 
-    input.recordPress(Key::Space, 1.2); // pairs with nothing — history was consumed
+    input.recordPress(Key::Space, 1.2); // pairs with nothing, history was consumed
     REQUIRE(!input.isDoubleTappedForTick(Key::Space));
 }
 
@@ -148,7 +649,7 @@ TEST_CASE("Double-tap: latch survives per-frame update() until a tick consumes i
     input.recordPress(Key::W, 1.0);
     input.recordPress(Key::W, 1.1);
 
-    // Several tickless frames pass — the gesture must not be dropped
+    // Several tickless frames pass, the gesture must not be dropped
     input.update();
     input.update();
     REQUIRE(input.isDoubleTappedForTick(Key::W));
@@ -203,8 +704,8 @@ TEST_CASE("Settings save/load round-trips values and video settings", "[engine][
     GraphicsSettings gfx;
     gfx.shadowQuality = 1;
     gfx.volumetricLight = false;
-    gfx.cloudMode = 0;
-    gfx.ssao = false;
+    gfx.cloudQuality = 0;
+    gfx.indirectLightingQuality = 1;
     gfx.waterReflections = false;
     gfx.wavingFoliage = false;
     gfx.lensFlare = false;
@@ -221,8 +722,8 @@ TEST_CASE("Settings save/load round-trips values and video settings", "[engine][
     REQUIRE(loaded.values.volumeLevel == 2);
     REQUIRE(loaded.gfx.shadowQuality == 1);
     REQUIRE(loaded.gfx.volumetricLight == false);
-    REQUIRE(loaded.gfx.cloudMode == 0);
-    REQUIRE(loaded.gfx.ssao == false);
+    REQUIRE(loaded.gfx.cloudQuality == 0);
+    REQUIRE(loaded.gfx.indirectLightingQuality == 1);
     REQUIRE(loaded.gfx.waterReflections == false);
     REQUIRE(loaded.gfx.wavingFoliage == false);
     REQUIRE(loaded.gfx.lensFlare == false);
@@ -256,7 +757,8 @@ TEST_CASE("Settings load: missing file and out-of-range values fall back", "[eng
     REQUIRE(missing.values.viewDistance == SettingsValues::DEFAULT_VIEW_DISTANCE);
     REQUIRE(missing.gfx.shadowQuality == 2);
     REQUIRE(missing.gfx.volumetricLight);
-    REQUIRE(missing.gfx.cloudMode == 2);
+    REQUIRE(missing.gfx.cloudQuality == 2);
+    REQUIRE(missing.gfx.indirectLightingQuality == 2);
     REQUIRE(missing.gfx.bloomLevel == 5);
     REQUIRE(missing.gfx.sharpening == 0);
 
@@ -272,7 +774,45 @@ TEST_CASE("Settings load: missing file and out-of-range values fall back", "[eng
     REQUIRE(clamped.gfx.shadowQuality == 0);
     REQUIRE(clamped.gfx.vibrance == 10);
     // Keys the file omits keep their defaults
-    REQUIRE(clamped.gfx.cloudMode == 2);
+    REQUIRE(clamped.gfx.cloudQuality == 2);
+}
+
+TEST_CASE("Settings migrate legacy ambient and cloud quality keys", "[engine][settings]") {
+    TempDir dir("settings-migration");
+    std::string path = dir.path() + "/settings.json";
+    std::filesystem::create_directories(dir.path());
+    {
+        std::ofstream file(path);
+        file << "{ \"cloudMode\": 1, \"ssao\": 0 }";
+    }
+
+    LoadedSettings loaded = loadSettings(path);
+    REQUIRE(loaded.gfx.cloudQuality == 1);
+    REQUIRE(loaded.gfx.indirectLightingQuality == 0);
+
+    REQUIRE(saveSettings(path, loaded.values, loaded.gfx));
+    std::ifstream savedFile(path);
+    std::ostringstream saved;
+    saved << savedFile.rdbuf();
+    REQUIRE(saved.str().find("\"cloudQuality\"") != std::string::npos);
+    REQUIRE(saved.str().find("\"indirectLightingQuality\"") != std::string::npos);
+    REQUIRE(saved.str().find("\"cloudMode\"") == std::string::npos);
+    REQUIRE(saved.str().find("\"ssao\"") == std::string::npos);
+}
+
+TEST_CASE("Settings prefer new quality keys over legacy keys", "[engine][settings]") {
+    TempDir dir("settings-quality-precedence");
+    std::string path = dir.path() + "/settings.json";
+    std::filesystem::create_directories(dir.path());
+    {
+        std::ofstream file(path);
+        file << "{ \"cloudQuality\": 2, \"cloudMode\": 0, "
+                "\"indirectLightingQuality\": 1, \"ssao\": 0 }";
+    }
+
+    const LoadedSettings loaded = loadSettings(path);
+    REQUIRE(loaded.gfx.cloudQuality == 2);
+    REQUIRE(loaded.gfx.indirectLightingQuality == 1);
 }
 
 TEST_CASE("GraphicsSettings env overrides map onto the fields", "[engine][settings]") {
@@ -286,11 +826,11 @@ TEST_CASE("GraphicsSettings env overrides map onto the fields", "[engine][settin
     REQUIRE(gfx.applyEnvOverrides()); // reports that overrides fired
     REQUIRE(gfx.shadowQuality == 1);
     REQUIRE(gfx.volumetricLight == false);
-    REQUIRE(gfx.cloudMode == 1);
+    REQUIRE(gfx.cloudQuality == 1);
     REQUIRE(gfx.waterReflections == false);
     REQUIRE(gfx.bloomLevel == 0);
     // Untouched fields keep defaults
-    REQUIRE(gfx.ssao);
+    REQUIRE(gfx.indirectLightingQuality == 2);
     REQUIRE(gfx.wavingFoliage);
 
     unsetenv("RYCRAFT_SHADOWS");
@@ -302,6 +842,24 @@ TEST_CASE("GraphicsSettings env overrides map onto the fields", "[engine][settin
     // With no RYCRAFT_* set it reports false, so the engine keeps saving
     GraphicsSettings clean;
     REQUIRE(!clean.applyEnvOverrides());
+}
+
+TEST_CASE("GraphicsSettings prefer new quality overrides over legacy aliases",
+          "[engine][settings]") {
+    setenv("RYCRAFT_CLOUD_QUALITY", "2", 1);
+    setenv("RYCRAFT_CLOUDS", "0", 1);
+    setenv("RYCRAFT_INDIRECT_LIGHT", "1", 1);
+    setenv("RYCRAFT_SSAO", "0", 1);
+
+    GraphicsSettings gfx;
+    REQUIRE(gfx.applyEnvOverrides());
+    REQUIRE(gfx.cloudQuality == 2);
+    REQUIRE(gfx.indirectLightingQuality == 1);
+
+    unsetenv("RYCRAFT_CLOUD_QUALITY");
+    unsetenv("RYCRAFT_CLOUDS");
+    unsetenv("RYCRAFT_INDIRECT_LIGHT");
+    unsetenv("RYCRAFT_SSAO");
 }
 
 TEST_CASE("GameFlow: video settings nest under settings", "[ui][flow]") {
@@ -565,8 +1123,8 @@ TEST_CASE("UIOverlay orthographic projection maps screen to NDC", "[render][ui]"
 
 TEST_CASE("UIOverlay quad index order forms two triangles", "[render][ui]") {
     // Index buffer: {0, 1, 2, 0, 2, 3}
-    // Triangle 1: vertices 0, 1, 2 (BL, TL, BR) — left-bottom triangle
-    // Triangle 2: vertices 0, 2, 3 (BL, BR, TR) — right-top triangle
+    // Triangle 1: vertices 0, 1, 2 (BL, TL, BR), left-bottom triangle
+    // Triangle 2: vertices 0, 2, 3 (BL, BR, TR), right-top triangle
     uint16_t indices[] = {0, 1, 2, 0, 2, 3};
 
     // Verify 6 indices (2 triangles)
