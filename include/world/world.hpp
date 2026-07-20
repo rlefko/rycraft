@@ -383,6 +383,17 @@ private:
     void initializeChunkLightLocked(ChunkPos pos, const ColumnPlan* plan);
     bool reconcileCubeLocked(ChunkPos pos, const ColumnPlan* plan, LightUrgency urgency);
 
+    // A single edit's light reaches at most one cube in each direction (max
+    // level 15, one step per block, 16-block edge), so its whole affected
+    // neighborhood is a subset of the 3x3x3 around the edit. Drain the IMMEDIATE
+    // queue to its fixed point synchronously under the block-write lock, using
+    // the nine prefetched column plans, so adjacent cubes never wait a tick to
+    // relight. The cap is a pathological safety valve; any residue falls back to
+    // the per-tick reconcile.
+    static constexpr int EDIT_SYNC_LIGHT_FLOOD_CAP = 96;
+    int drainEditLightNeighborhoodLocked(
+        ChunkPos home, const std::array<std::shared_ptr<const ColumnPlan>, 9>& columnPlans);
+
     void generateChunk(const std::shared_ptr<Chunk>& chunk);
     void generateChunkAsync(ChunkPos pos, int64_t priority);
     void generateColumnPlanAsync(ColumnPos pos, int64_t priority);

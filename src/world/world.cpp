@@ -510,13 +510,20 @@ void World::setBlockLoaded(BlockPos position, BlockType type, std::optional<Flui
     const int ly = Chunk::worldToLocalY(position.y);
     const int lz = Chunk::worldToLocal(position.z);
 
-    // The edited cell's light only crosses into cubes that share one of its
-    // faces, so an immediate edit floods the home cube plus at most three
-    // border neighbors. Column plans come from the generator cache and are
-    // fetched before chunksMutex_, matching the reconcileLight convention.
+    // The home cube floods first so its fresh borders seed neighbors, then the
+    // rest of the affected neighborhood drains synchronously. The 27 cubes of
+    // the 3x3x3 share nine XZ columns; prefetch those column plans before
+    // chunksMutex_, matching the reconcileLight convention, so neither the
+    // immediate floods nor the neighborhood drain calls the generator under the
+    // lock. The plan for offset (dx, dz) lives at index (dx + 1) + (dz + 1) * 3.
     std::array<ChunkPos, 4> immediateCubes{};
-    std::array<std::shared_ptr<const ColumnPlan>, 4> immediatePlans{};
+    std::array<std::shared_ptr<const ColumnPlan>, 9> columnPlans{};
     size_t immediateCount = 0;
+    const auto planForOffset = [&columnPlans, pos](ChunkPos cube) -> const ColumnPlan* {
+        const int64_t dx = cube.x - pos.x;
+        const int64_t dz = cube.z - pos.z;
+        return columnPlans[static_cast<size_t>((dx + 1) + (dz + 1) * 3)].get();
+    };
     if (urgency == LightUrgency::IMMEDIATE) {
         immediateCubes[immediateCount++] = pos;
         if (lx == 0) immediateCubes[immediateCount++] = {pos.x - 1, pos.y, pos.z};
@@ -529,9 +536,11 @@ void World::setBlockLoaded(BlockPos position, BlockType type, std::optional<Flui
         if (ly == CHUNK_EDGE - 1 && validChunkY(pos.y + 1)) {
             immediateCubes[immediateCount++] = {pos.x, pos.y + 1, pos.z};
         }
-        for (size_t cube = 0; cube < immediateCount; ++cube) {
-            immediatePlans[cube] =
-                generator_.findColumnPlan({immediateCubes[cube].x, immediateCubes[cube].z});
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                columnPlans[static_cast<size_t>((dx + 1) + (dz + 1) * 3)] =
+                    generator_.findColumnPlan({pos.x + dx, pos.z + dz});
+            }
         }
     }
 
@@ -596,10 +605,15 @@ void World::setBlockLoaded(BlockPos position, BlockType type, std::optional<Flui
     // Flooding here, under the same chunksMutex_ hold as the block write and
     // version bumps, guarantees no mesh snapshot can pair post-edit blocks
     // with pre-edit packed light. The home cube floods first so border
-    // neighbors seed from its fresh levels.
+    // neighbors seed from its fresh levels, then the neighborhood drain
+    // converges the rest before the edit returns, so adjacent cubes light and
+    // remesh this tick instead of waiting for the next reconcile.
     for (size_t cube = 0; cube < immediateCount; ++cube) {
-        reconcileCubeLocked(immediateCubes[cube], immediatePlans[cube].get(),
+        reconcileCubeLocked(immediateCubes[cube], planForOffset(immediateCubes[cube]),
                             LightUrgency::IMMEDIATE);
+    }
+    if (urgency == LightUrgency::IMMEDIATE) {
+        drainEditLightNeighborhoodLocked(pos, columnPlans);
     }
 }
 
@@ -981,6 +995,44 @@ void World::reconcileLight(int budgetCubes) {
         std::lock_guard<std::mutex> lock(chunksMutex_);
         reconcileCubeLocked(pos, lightPlan.get(), urgency);
     }
+}
+
+int World::drainEditLightNeighborhoodLocked(
+    ChunkPos home, const std::array<std::shared_ptr<const ColumnPlan>, 9>& columnPlans) {
+    // Runs with chunksMutex_ held. reconcileCubeLocked re-enqueues a neighbor
+    // whenever a shared border changed, so popping the IMMEDIATE queue until it
+    // empties floods the whole connected affected set to its fixed point.
+    std::vector<ChunkPos> outOfRange;
+    int processed = 0;
+    while (processed < EDIT_SYNC_LIGHT_FLOOD_CAP) {
+        ChunkPos pos;
+        {
+            std::lock_guard<std::mutex> lock(lightMutex_);
+            if (editLightQueue_.empty()) break;
+            pos = editLightQueue_.back();
+            editLightQueue_.pop_back();
+            editLightQueued_.erase(pos);
+        }
+        const int64_t dx = pos.x - home.x;
+        const int64_t dz = pos.z - home.z;
+        if (dx < -1 || dx > 1 || dz < -1 || dz > 1) {
+            // A single edit's light cannot reach a column two cubes away; if the
+            // queue ever holds one (unrelated churn), leave it for the tick
+            // drain rather than calling the generator under the lock.
+            outOfRange.push_back(pos);
+            continue;
+        }
+        reconcileCubeLocked(pos, columnPlans[static_cast<size_t>((dx + 1) + (dz + 1) * 3)].get(),
+                            LightUrgency::IMMEDIATE);
+        ++processed;
+    }
+    if (!outOfRange.empty()) {
+        std::lock_guard<std::mutex> lock(lightMutex_);
+        for (const ChunkPos& pos : outOfRange) {
+            if (editLightQueued_.insert(pos).second) editLightQueue_.push_back(pos);
+        }
+    }
+    return processed;
 }
 
 FluidCell World::readFluidCell(FluidPos position) const {
