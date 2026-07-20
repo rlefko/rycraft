@@ -2430,6 +2430,74 @@ TEST_CASE("World relights the face neighbor of a border edit synchronously",
     REQUIRE(upper->getBlockLight(8, 0, 8) == 14);
 }
 
+TEST_CASE("World relights a non-border edit's face neighbor synchronously",
+          "[world][light][edit]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    auto west = world.getChunk(ChunkPos{-1, 4, 0});
+    REQUIRE(home);
+    REQUIRE(west);
+    home->fill(BlockType::AIR);
+    west->fill(BlockType::AIR);
+
+    const uint32_t westVersionBefore = west->version.load(std::memory_order_relaxed);
+    // Local x == 1 is not on the chunk border, yet the emitter still reaches the
+    // -X neighbor. The old immediate flood only covered a cell sitting exactly
+    // on a face, so this neighbor used to relight and remesh a tick late.
+    world.setBlock(1, 4 * CHUNK_EDGE + 8, 8, BlockType::LAVA);
+    REQUIRE(home->getBlockLight(1, 8, 8) == 15);
+    REQUIRE(home->getBlockLight(0, 8, 8) == 14);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 13);
+    REQUIRE(west->version.load(std::memory_order_relaxed) > westVersionBefore);
+}
+
+TEST_CASE("World relights the diagonal neighbor of a corner edit synchronously",
+          "[world][light][edit]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    auto east = world.getChunk(ChunkPos{1, 4, 0});
+    auto south = world.getChunk(ChunkPos{0, 4, 1});
+    auto diagonal = world.getChunk(ChunkPos{1, 4, 1});
+    REQUIRE(home);
+    REQUIRE(east);
+    REQUIRE(south);
+    REQUIRE(diagonal);
+    home->fill(BlockType::AIR);
+    east->fill(BlockType::AIR);
+    south->fill(BlockType::AIR);
+    diagonal->fill(BlockType::AIR);
+
+    const uint32_t diagonalVersionBefore = diagonal->version.load(std::memory_order_relaxed);
+    // A +X+Z corner emitter reaches the edge-diagonal cube, which shares no face
+    // with the edited cube. The flood chain hops home -> face -> diagonal and
+    // must light and dirty it in the same call.
+    world.setBlock(CHUNK_EDGE - 1, 4 * CHUNK_EDGE + 8, CHUNK_EDGE - 1, BlockType::LAVA);
+    REQUIRE(diagonal->getBlockLight(0, 8, 0) == 13);
+    REQUIRE(diagonal->version.load(std::memory_order_relaxed) > diagonalVersionBefore);
+}
+
+TEST_CASE("World removes a broken emitter's neighbor light synchronously", "[world][light][edit]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    auto west = world.getChunk(ChunkPos{-1, 4, 0});
+    REQUIRE(home);
+    REQUIRE(west);
+    home->fill(BlockType::AIR);
+    west->fill(BlockType::AIR);
+
+    world.setBlock(1, 4 * CHUNK_EDGE + 8, 8, BlockType::LAVA);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 13);
+    // Breaking the emitter must darken the neighbor in the same call, not a tick
+    // later; floodChunk recomputes from scratch, so removal converges too.
+    world.setBlock(1, 4 * CHUNK_EDGE + 8, 8, BlockType::AIR);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 0);
+
+    // The synchronous cross-chunk result is already the fixed point.
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 0);
+}
+
 TEST_CASE("LightEngine: lava light falls off one level per block", "[world][light]") {
     Chunk chunk(ChunkPos{0, 4, 0});
     chunk.setBlock(8, 8, 8, BlockType::LAVA); // one source in open air
