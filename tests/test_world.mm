@@ -176,7 +176,10 @@ TEST_CASE("Persisted block identifiers retain their original values", "[block]")
     REQUIRE(static_cast<int>(BlockType::FURNACE) == 59);
     REQUIRE(static_cast<int>(BlockType::FURNACE_LIT) == 60);
     REQUIRE(static_cast<int>(BlockType::TORCH) == 61);
-    REQUIRE(static_cast<int>(BlockType::COUNT) == 62);
+    REQUIRE(static_cast<int>(BlockType::CHEST) == 62);
+    REQUIRE(static_cast<int>(BlockType::WOOL) == 63);
+    REQUIRE(static_cast<int>(BlockType::BED) == 64);
+    REQUIRE(static_cast<int>(BlockType::COUNT) == 65);
 }
 
 TEST_CASE("Block survival data gates mining by hardness tool and tier", "[block][survival]") {
