@@ -1727,6 +1727,12 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     _meshScheduler->drainCompleted(_pendingResults);
     constexpr int MAX_MESH_UPLOADS_PER_FRAME = 64;
     constexpr size_t MAX_UPLOAD_BYTES_PER_FRAME = 32 * 1024 * 1024;
+    // An edit synchronously relights its whole affected neighborhood (home cube
+    // plus the face, edge, and corner cubes light can reach), so let the edit
+    // fast path rebuild all of them in the same frame instead of trickling two
+    // per frame. It only bites on the post-edit frame and stays inside the
+    // upload count and byte budgets below.
+    constexpr int MAX_EDIT_SYNC_BUILDS_PER_FRAME = 8;
     constexpr int MAX_ASYNC_UPLOADS_PER_FRAME = MAX_MESH_UPLOADS_PER_FRAME - 2;
     constexpr size_t MAX_ASYNC_UPLOAD_BYTES_PER_FRAME =
         MAX_UPLOAD_BYTES_PER_FRAME - 4 * 1024 * 1024;
@@ -1790,7 +1796,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     //    synchronously so breaking a block never shows a stale frame.
     int syncBuilds = 0;
     for (auto& chunk : loadedChunks) {
-        if (!chunk || !chunk->generated || syncBuilds >= 2 || uploads >= MAX_MESH_UPLOADS_PER_FRAME)
+        if (!chunk || !chunk->generated || syncBuilds >= MAX_EDIT_SYNC_BUILDS_PER_FRAME ||
+            uploads >= MAX_MESH_UPLOADS_PER_FRAME)
             continue;
         if (std::abs(chunk->chunkX - camChunkX) > 2 || std::abs(chunk->chunkY - camChunkY) > 2 ||
             std::abs(chunk->chunkZ - camChunkZ) > 2)
