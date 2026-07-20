@@ -27,14 +27,16 @@ A concept gets exactly one definition, in one header, and everyone imports it. C
 | Items, stacks, drops, item colors, and the mining-time formula | `world/item.hpp` |
 | Crafting and smelting recipes and fuels | `world/recipes.hpp` |
 | Furnace state and its 20 Hz step | `world/furnace.hpp` |
+| Chest storage state (27 slots) | `world/chest.hpp` |
 | Game mode rules and per-world generation toggles | `world/world_config.hpp` |
 | World enumeration, creation, and deletion | `world/world_list.hpp` |
 | Player inventory (36 slots, hotbar selection) | `engine/inventory.hpp` |
-| Slot click interaction (pick/place/split/quick-move) | `engine/slot_interaction.hpp` |
+| Slot click interaction (pick/place/split/quick-move, drag distribution, double-click gather) | `engine/slot_interaction.hpp` |
 | Survival food/air/regen timers and eating | `engine/survival.hpp` |
 | Block mining progress and tracking | `engine/mining.hpp` |
 | Melee entity picking | `entity/entity_picking.hpp` |
 | Dropped item entities | `entity/item_entity.hpp` |
+| Rideable boats (float physics, riding, picking) | `entity/boat.hpp` |
 | Item-icon texture layers and slot drawing | `render/block_textures.hpp`, `render/ui_item_icon.mm` |
 | Yaw/pitch → look direction | `common/math.hpp` (`directionFromYawPitch`) |
 
