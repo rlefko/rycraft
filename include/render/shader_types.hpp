@@ -1219,7 +1219,11 @@ struct BloomUniforms {
 // traceParams carries (aoRadius, thickness, aoStrength, bounceIntensity),
 // temporalParams carries (maxHistoryWeight, colorClampGamma, aoClampGamma,
 // fireflyMaxLuminance), and filterParams carries (giMaxDistance,
-// atrousLuminanceSigma, disocclusionAgeThreshold, reserved).
+// atrousLuminanceSigma, disocclusionAgeThreshold, dayNightSkyLevel). The last
+// term, 1 in daylight and ramping to 0 through twilight, scales the additive
+// bounce so the near-field one-bounce does not become an exposure-amplified
+// halo at night; the ambient/AO term is already scaled by the night ambient.
+#define SSGI_BOUNCE_NIGHT_FLOOR 0.05f
 #define INDIRECT_HIGH_RAY_COUNT 4u
 #define INDIRECT_MEDIUM_RAY_COUNT 2u
 #define INDIRECT_HIGH_HIZ_ITERATION_CAP 24u

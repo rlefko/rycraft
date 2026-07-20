@@ -630,6 +630,14 @@ fragment float4 screenSpaceApplyFragment(FullscreenVertex in [[stage_in]],
     const float3 ambient = uniforms.ambientAndFrame.xyz;
     const float3 ambientCorrection =
         ambient * surfaceSample.rgb * surfaceSample.a * (indirectSample.a - 1.0f);
-    const float3 bounce = indirectSample.rgb * surfaceSample.rgb;
+    // Gate the additive one-bounce by the receiver's baked sky access (the same
+    // surface.a the ambient-correction term uses) so screen-space skylight
+    // cannot teleport into a sealed cave and follow the camera as a bright disk,
+    // and by the day-night sky level so night auto-exposure cannot amplify the
+    // near-field bounce on open ground. Together these leave full daytime GI on
+    // sky-lit surfaces while keeping dug shafts and tunnels dark. The small
+    // floor keeps HDR emissive (lava) spill readable.
+    const float bounceScale = mix(SSGI_BOUNCE_NIGHT_FLOOR, 1.0f, saturate(uniforms.filterParams.w));
+    const float3 bounce = indirectSample.rgb * surfaceSample.rgb * bounceScale * surfaceSample.a;
     return float4(ambientCorrection + bounce, 0.0f);
 }

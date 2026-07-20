@@ -846,8 +846,13 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     // sparse-but-real bright source survives, while ambient occlusion clamps
     // at one so disocclusion darkening reacts within a frame.
     indirect.temporalParams = simd_make_float4(0.90F, 2.0F, 1.0F, 4.0F);
-    indirect.filterParams =
-        simd_make_float4(_gfx.indirectLightingQuality >= 2 ? 24.0F : 16.0F, 4.0F, 4.0F, 0.0F);
+    // The day-night sky level (1 in daylight, 0 deep at night) scales the
+    // additive SSGI bounce so night auto-exposure cannot amplify the near-field
+    // one-bounce into a camera-following ground disk. It reuses the same
+    // celestial signal the water tint fades by, so the two never drift.
+    const float dayNightSkyLevel = std::clamp(1.0F - skyUniforms.visibilityAndPhase.w, 0.0F, 1.0F);
+    indirect.filterParams = simd_make_float4(_gfx.indirectLightingQuality >= 2 ? 24.0F : 16.0F,
+                                             4.0F, 4.0F, dayNightSkyLevel);
     indirect.ambientAndFrame = simd_make_float4(ambientColor[0], ambientColor[1], ambientColor[2],
                                                 static_cast<float>(_frameRing.frameIndex()));
     _screenSpaceLighting->encode(commandBuffer, _colorResolve, _depthResolve, _surfaceResolve,
