@@ -46,8 +46,8 @@ public:
     // Higher values start first among work that has not begun. Equal-priority
     // submissions retain FIFO order. Running work is never interrupted.
     template <typename F, typename... Args>
-    auto submitWithPriority(int64_t priority, F&& f, Args&&... args)
-        -> std::future<std::invoke_result_t<F, Args...>> {
+    auto submitWithPriority(int64_t priority, F&& f,
+                            Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
         using ReturnType = std::invoke_result_t<F, Args...>;
 
         auto task = std::make_shared<std::packaged_task<ReturnType()>>(

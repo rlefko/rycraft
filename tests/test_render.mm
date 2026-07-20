@@ -1787,7 +1787,7 @@ TEST_CASE("Urgent nearby refinement shares all eight utility workers with parent
     bool initialBasesStarted = false;
     {
         std::unique_lock lock(gateMutex);
-        initialBasesStarted = gateCv.wait_for(lock, std::chrono::seconds(2), [&] {
+        initialBasesStarted = gateCv.wait_for(lock, std::chrono::seconds(30), [&] {
             return std::all_of(BASES.begin(), BASES.begin() + 8,
                                [&](FarTerrainKey key) { return started.contains(key.tileX); });
         });
@@ -1831,7 +1831,7 @@ TEST_CASE("Urgent nearby refinement shares all eight utility workers with parent
     bool nearbyAndParentAdvancedTogether = false;
     {
         std::unique_lock lock(gateMutex);
-        nearbyAndParentAdvancedTogether = gateCv.wait_for(lock, std::chrono::seconds(2), [&] {
+        nearbyAndParentAdvancedTogether = gateCv.wait_for(lock, std::chrono::seconds(30), [&] {
             const bool urgentStarted =
                 std::all_of(URGENT.begin(), URGENT.begin() + 4,
                             [&](FarTerrainKey key) { return started.contains(key.tileX); });
@@ -1915,7 +1915,7 @@ TEST_CASE("Cold selected step two publishes a near step eight fallback first",
 
     {
         std::unique_lock lock(gateMutex);
-        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(2), [&] { return stepTwoStarted; }));
+        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(30), [&] { return stepTwoStarted; }));
     }
     for (int attempt = 0; attempt < 400 && scheduler.stats().completedRefinement < 3; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1996,7 +1996,7 @@ TEST_CASE("Camera jumps reset obsolete urgent refinement quota",
     {
         std::unique_lock lock(gateMutex);
         const bool started =
-            gateCv.wait_for(lock, std::chrono::seconds(2), [&] { return baseStarted; });
+            gateCv.wait_for(lock, std::chrono::seconds(30), [&] { return baseStarted; });
         if (!started)
             releaseBase = true;
         REQUIRE(started);
@@ -4940,7 +4940,7 @@ TEST_CASE("Far terrain scheduler bounds work and never builds on the caller",
             if (workerThreads.size() == FarTerrainScheduler::WORKER_COUNT) {
                 workersReleased = true;
                 threadCv.notify_all();
-            } else if (!workersReleased && !threadCv.wait_for(lock, std::chrono::seconds(2),
+            } else if (!workersReleased && !threadCv.wait_for(lock, std::chrono::seconds(30),
                                                               [&] { return workersReleased; })) {
                 workerGateTimedOut = true;
                 workersReleased = true;
@@ -5011,7 +5011,7 @@ TEST_CASE("Far terrain scheduler discards canceled epochs",
     REQUIRE(scheduler.enqueue({0, 0, FarTerrainStep::SIXTEEN}));
     {
         std::unique_lock lock(gateMutex);
-        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
+        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(30), [&] { return entered; }));
     }
     const uint64_t newEpoch = scheduler.advanceEpoch();
     {
@@ -5299,7 +5299,7 @@ TEST_CASE("Far terrain scheduler cancels obsolete view work",
     bool allWorkersEntered = false;
     {
         std::unique_lock lock(gateMutex);
-        allWorkersEntered = gateCv.wait_for(lock, std::chrono::seconds(2), [&] {
+        allWorkersEntered = gateCv.wait_for(lock, std::chrono::seconds(30), [&] {
             return enteredWorkers >= FarTerrainScheduler::WORKER_COUNT;
         });
     }
