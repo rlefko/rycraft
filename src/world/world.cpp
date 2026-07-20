@@ -82,12 +82,13 @@ void recordLoadedCubeHighWater(std::atomic<size_t>& highWater, size_t candidate)
 
 } // namespace
 
-World::World(uint32_t seed, int viewDistance, size_t loadedCubeLimit)
+World::World(uint32_t seed, int viewDistance, size_t loadedCubeLimit, GenerationSettings generation)
     : seed_(seed)
+    , generation_(generation)
     , viewDistance_(
           std::clamp(viewDistance, MIN_RENDER_DISTANCE_CHUNKS, MAX_RENDER_DISTANCE_CHUNKS))
     , loadedCubeLimit_(std::clamp<size_t>(loadedCubeLimit, 1, MAX_LOADED_CUBES))
-    , generator_(seed) {
+    , generator_(seed, generation) {
     std::atomic_store_explicit(&loadedSnapshot_,
                                std::make_shared<const std::vector<std::shared_ptr<Chunk>>>(),
                                std::memory_order_release);

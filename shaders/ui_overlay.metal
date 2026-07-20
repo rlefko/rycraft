@@ -48,3 +48,43 @@ fragment float4 uiFragmentMain(
 ) {
     return in.vColor;
 }
+
+// ---------------------------------------------------------------------------
+// Icon pipeline - textured quads sampling the block/item texture array.
+// Runs between the two solid-color phases of the overlay batch.
+// ---------------------------------------------------------------------------
+
+struct UIIconVertexInput {
+    float2 position [[attribute(0)]];
+    float2 uv [[attribute(1)]];
+    float4 tint [[attribute(2)]];
+    uint layer [[attribute(3)]];
+};
+
+struct UIIconVertexOutput {
+    float4 clipPosition [[position]];
+    float2 vUv;
+    float4 vTint;
+    uint vLayer [[flat]];
+};
+
+vertex UIIconVertexOutput uiIconVertexMain(
+    UIIconVertexInput in [[stage_in]],
+    constant float4x4 &projection [[buffer(1)]]
+) {
+    UIIconVertexOutput out;
+    out.clipPosition = projection * float4(in.position, 0.0, 1.0);
+    out.vUv = in.uv;
+    out.vTint = in.tint;
+    out.vLayer = in.layer;
+    return out;
+}
+
+fragment float4 uiIconFragmentMain(
+    UIIconVertexOutput in [[stage_in]],
+    texture2d_array<float> icons [[texture(0)]],
+    sampler iconSampler [[sampler(0)]]
+) {
+    float4 sampled = icons.sample(iconSampler, in.vUv, in.vLayer);
+    return float4(sampled.rgb * in.vTint.rgb, sampled.a * in.vTint.a);
+}

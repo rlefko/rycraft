@@ -787,7 +787,7 @@ ColumnShape shapeFromSurface(const worldgen::SurfaceSample& surface,
 
 } // namespace
 
-ChunkGenerator::ChunkGenerator(uint32_t worldSeed)
+ChunkGenerator::ChunkGenerator(uint32_t worldSeed, GenerationSettings generation)
     : seed_(worldSeed)
     , scratchToken_(nextGeneratorInstanceToken())
     , random_(worldSeed)
@@ -796,7 +796,7 @@ ChunkGenerator::ChunkGenerator(uint32_t worldSeed)
     , climate_(worldSeed)
     , density_(worldSeed)
     , ores_(worldSeed)
-    , structures_(worldSeed)
+    , structures_(worldSeed, generation.structures)
     , features_(worldSeed) {}
 
 void ChunkGenerator::clearMacroCaches() const {

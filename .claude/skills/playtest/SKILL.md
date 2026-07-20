@@ -90,7 +90,12 @@ The engine supports:
 | `RYCRAFT_CAPTURE=/absolute/path.png` | Write one frame to a PNG |
 | `RYCRAFT_CAPTURE_FRAME=N` | Choose the capture frame; 400 through 600 usually allows streaming to settle |
 | `RYCRAFT_NATIVE_WINDOW=1` | Fill the current display so captures and acceptance runs use its native backing resolution |
-| `RYCRAFT_START_SCREEN=title\|playing\|paused\|settings` | Choose the initial screen |
+| `RYCRAFT_START_SCREEN=title\|worlds\|create\|delete\|playing\|paused\|settings\|video\|inventory\|crafting\|furnace\|chest\|death` | Choose the initial screen; the gameplay and container tokens auto-start the world in `RYCRAFT_WORLD_DIR`, and `furnace`/`chest`/`death` seed sample state to capture |
+| `RYCRAFT_WORLD_DIR=path` | World directory the auto-start tokens open (default: `rycraft_world`, else `saves/default`) |
+| `RYCRAFT_GAME_MODE=survival\|creative` | Force the game mode for this session without touching the saved metadata |
+| `RYCRAFT_SPAWN_ITEMS=N` | Scatter N dropped items on the loaded ground ahead of spawn to capture item entities |
+| `RYCRAFT_SPAWN_WATER=1` | Sink a pool ahead of spawn for water and reflection captures (pairs with `RYCRAFT_SPAWN_BOAT`) |
+| `RYCRAFT_SPAWN_BOAT=1` | Drop a boat a few blocks ahead of spawn to capture it floating or beached |
 | `RYCRAFT_BLOOM=0..1` | Scale or disable bloom |
 | `RYCRAFT_VIEW_DISTANCE=4..512` | Override visible distance; exact simulation remains capped at radius 32 |
 | `RYCRAFT_TIME=0..23999` and `RYCRAFT_TIME_FREEZE=1` | Pin time of day for repeatable shadow, sky, and flare captures |

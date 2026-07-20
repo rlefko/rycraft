@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "common/math.hpp"
-#include "engine/hotbar.hpp"
 #include "render/block_texture_array.hpp"
 #include "render/far_terrain.hpp"
 #include "render/frame_ring.hpp"
@@ -28,7 +27,11 @@
 
 // Forward declarations
 class Entity;
+struct ItemEntity;
+struct Boat;
 class EntityRenderer;
+class ItemEntityRenderer;
+class BoatRenderer;
 class World;
 class Camera;
 class UIOverlay;
@@ -139,8 +142,23 @@ public:
                 const Mat4& projectionMatrix, const World& world, const Camera& camera,
                 uint64_t worldTime = 0, double deltaSeconds = 0.0,
                 std::optional<Vec3> highlightedBlock = std::nullopt,
-                const Hotbar& hotbar = Hotbar(), const UIFrameState& uiFrame = UIFrameState{},
-                const std::vector<std::shared_ptr<Entity>>* entities = nullptr);
+                const UIFrameState& uiFrame = UIFrameState{},
+                const std::vector<std::shared_ptr<Entity>>* entities = nullptr,
+                const std::vector<ItemEntity>* itemEntities = nullptr,
+                const std::vector<Boat>* boats = nullptr);
+
+    // Menu-only frame when no world session is live: one single-sample pass
+    // that clears the drawable to the backdrop color and draws the UI
+    // overlay. No HDR, no depth, no world reads.
+    void renderMenuOnly(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
+                        const UIFrameState& uiFrame);
+
+    // Detach every renderer structure that references or is keyed by the
+    // current World: the mesh scheduler (it captures a const World& lazily
+    // at first render), pending mesh results, resident cube meshes, exact
+    // ownership, and the recorded far-terrain identity so the next session
+    // rebuilds even under an equal seed. Must run before the World dies.
+    void endWorldSession();
 
     // Reallocate MSAA and resolve textures for new viewport size.
     void resize(uint32_t width, uint32_t height);
@@ -314,6 +332,8 @@ private:
 
     // Animal voxel-model renderer
     std::unique_ptr<EntityRenderer> _entityRenderer;
+    std::unique_ptr<ItemEntityRenderer> _itemEntityRenderer;
+    std::unique_ptr<BoatRenderer> _boatRenderer;
 
     // GPU frame/pass timing (per-pass sampling only under RYCRAFT_GPU_COUNTERS)
     std::unique_ptr<GpuFrameTimer> _gpuTimer;
@@ -429,7 +449,7 @@ private:
 
     void renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const World& world,
                           const Vec3& cameraPosition, const float fogColor[3]);
-    void resetFarTerrain(uint64_t worldSeed);
+    void resetFarTerrain(uint64_t worldSeed, GenerationSettings generation = {});
     void setExactSectionOwned(ChunkPos position, bool owned);
     void clearExactSectionOwnership();
 
@@ -472,8 +492,7 @@ private:
                      bool cameraUnderwater, const SkyUniforms& skyUniforms,
                      const float fogColor[3]);
 
-    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
-                         const UIFrameState& uiFrame);
+    void renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const UIFrameState& uiFrame);
 
     void renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera, uint64_t worldTime,
                       const float sunDirection[3], float sunIntensity);

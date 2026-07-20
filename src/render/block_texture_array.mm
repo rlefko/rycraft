@@ -113,6 +113,12 @@ void preserveAlphaCoverage(std::vector<BgraPixel>& pixels, uint32_t baseCovered,
 
 } // namespace
 
+static void uploadLayerMips(id<MTLTexture> texture,
+                            const std::array<BgraPixel, BlockTextureArray::TILE_SIZE *
+                                                            BlockTextureArray::TILE_SIZE>& pixels,
+                            uint8_t layer);
+static void paintItemIcon(BgraPixel* pixels, ItemType item, SimplexNoise& noise);
+
 void BlockTextureArray::generateLayer(uint8_t layer) {
     std::array<BgraPixel, TILE_SIZE * TILE_SIZE> tilePixels;
     std::memset(tilePixels.data(), 0, tilePixels.size() * sizeof(BgraPixel));
@@ -122,6 +128,15 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
     auto getTilePixel = [&](uint32_t px, uint32_t py) -> BgraPixel& {
         return tilePixels[py * TILE_SIZE + px];
     };
+
+    // Item-icon layers: simple procedural pixel art on a transparent tile,
+    // shaded with the same noise the block layers use.
+    if (layer >= TEXTURE_LAYER_ITEM_FIRST) {
+        const auto item = static_cast<ItemType>(ITEM_ID_BASE + (layer - TEXTURE_LAYER_ITEM_FIRST));
+        paintItemIcon(tilePixels.data(), item, noise);
+        uploadLayerMips(_texture, tilePixels, layer);
+        return;
+    }
 
     // Ring cross-section shared by the log end-grain layers.
     auto paintLogRings = [&](double palette) {
@@ -197,6 +212,24 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
             for (uint32_t x = 0; x < TILE_SIZE; ++x) {
                 double n = noise.noise2D(x * 0.25, y * 0.25);
                 fillTilePixel(&getTilePixel(x, y), 0.82, 0.74, 0.52, n, 0.05);
+            }
+        }
+    } else if (layer == TEXTURE_LAYER_CRAFTING_TABLE_TOP) {
+        // Plank base scored by a dark 2x2 work-grid
+        for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+            for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                double n = noise.noise2D(x * 0.15, y * 0.15);
+                bool grid = (x == 0 || x == 7 || x == 8 || x == 15 || y == 0 || y == 7 || y == 8 ||
+                             y == 15);
+                double f = grid ? 0.55 : 1.0;
+                fillTilePixel(&getTilePixel(x, y), 0.6 * f, 0.45 * f, 0.28 * f, n, 0.06);
+            }
+        }
+    } else if (layer == TEXTURE_LAYER_FURNACE_TOP) {
+        for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+            for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                double n = noise.noise2D(x * 0.3, y * 0.3);
+                fillTilePixel(&getTilePixel(x, y), 0.42, 0.42, 0.44, n, 0.12);
             }
         }
     } else {
@@ -817,30 +850,305 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                 break;
             }
 
+            case BlockType::CRAFTING_TABLE: {
+                // Plank side with a dark tool band across the top rows
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.15, y * 0.15);
+                        bool band = y < 4;
+                        bool slot = band && (x % 5 == 2);
+                        double f = slot ? 0.35 : (band ? 0.7 : 1.0);
+                        fillTilePixel(&getTilePixel(x, y), 0.6 * f, 0.45 * f, 0.28 * f, n, 0.06);
+                    }
+                }
+                break;
+            }
+
+            case BlockType::FURNACE:
+            case BlockType::FURNACE_LIT: {
+                // Cobble-style speckle with the mouth cut into the lower half
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.3, y * 0.3);
+                        fillTilePixel(&getTilePixel(x, y), 0.42, 0.42, 0.44, n, 0.14);
+                    }
+                }
+                const bool lit = static_cast<BlockType>(layer) == BlockType::FURNACE_LIT;
+                for (uint32_t y = 6; y < 13; ++y) {
+                    for (uint32_t x = 3; x < 13; ++x) {
+                        auto& p = getTilePixel(x, y);
+                        if (lit) {
+                            double flame = noise.noise2D(x * 0.6 + 30.0, y * 0.6 + 30.0);
+                            p.r = 255;
+                            p.g = clampToByte(0.55 + flame * 0.25);
+                            p.b = clampToByte(0.08);
+                        } else {
+                            p.r = p.g = p.b = clampToByte(0.12);
+                        }
+                        p.a = 255;
+                    }
+                }
+                break;
+            }
+
+            case BlockType::TORCH: {
+                // Cutout cross: a glowing tip (row 0 is the tile top) over a
+                // thin stick column; everything else stays transparent
+                for (uint32_t y = 5; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 7; x < 9; ++x) {
+                        double n = noise.noise2D(x * 0.4, y * 0.4);
+                        fillTilePixel(&getTilePixel(x, y), 0.45, 0.3, 0.15, n, 0.1);
+                    }
+                }
+                for (uint32_t y = 1; y < 5; ++y) {
+                    for (uint32_t x = 6; x < 10; ++x) {
+                        auto& p = getTilePixel(x, y);
+                        double flame = noise.noise2D(x * 0.7, y * 0.7);
+                        p.r = 255;
+                        p.g = clampToByte(0.85 + flame * 0.1);
+                        p.b = clampToByte(0.35);
+                        p.a = 255;
+                    }
+                }
+                break;
+            }
+
+            case BlockType::CHEST: {
+                // Wooden crate: plank grain with a dark lid seam across the
+                // middle and an iron latch at the front center.
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.2, y * 0.2);
+                        const bool seam = (y == 5 || y == 6);   // lid seam
+                        const bool frame = (x == 0 || x == 15); // plank edges
+                        double f = seam ? 0.5 : (frame ? 0.75 : 1.0);
+                        fillTilePixel(&getTilePixel(x, y), 0.62 * f, 0.44 * f, 0.22 * f, n, 0.06);
+                    }
+                }
+                for (uint32_t y = 5; y < 9; ++y) {
+                    for (uint32_t x = 7; x < 9; ++x) {
+                        auto& p = getTilePixel(x, y); // iron latch
+                        p.r = p.g = p.b = clampToByte(0.55);
+                        p.a = 255;
+                    }
+                }
+                break;
+            }
+
+            case BlockType::WOOL: {
+                // Soft off-white fleece with a gentle speckle.
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.5, y * 0.5);
+                        fillTilePixel(&getTilePixel(x, y), 0.9, 0.9, 0.9, n, 0.08);
+                    }
+                }
+                break;
+            }
+
+            case BlockType::BED: {
+                // Red quilt over a wooden frame with a pale pillow strip.
+                for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+                    for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                        double n = noise.noise2D(x * 0.3, y * 0.3);
+                        if (y >= 13) { // wooden base band along the bottom
+                            fillTilePixel(&getTilePixel(x, y), 0.5, 0.34, 0.18, n, 0.06);
+                        } else if (y < 4) { // pale pillow at the head
+                            fillTilePixel(&getTilePixel(x, y), 0.9, 0.9, 0.85, n, 0.05);
+                        } else {
+                            fillTilePixel(&getTilePixel(x, y), 0.75, 0.19, 0.19, n, 0.07);
+                        }
+                    }
+                }
+                break;
+            }
+
             // AIR (never drawn) gets a transparent black layer
             default:
                 break;
         }
     }
 
-    std::vector<BgraPixel> mipPixels(tilePixels.begin(), tilePixels.end());
+    uploadLayerMips(_texture, tilePixels, layer);
+}
+
+static void uploadLayerMips(id<MTLTexture> texture,
+                            const std::array<BgraPixel, BlockTextureArray::TILE_SIZE *
+                                                            BlockTextureArray::TILE_SIZE>& pixels,
+                            uint8_t layer) {
+    std::vector<BgraPixel> mipPixels(pixels.begin(), pixels.end());
     const uint32_t baseCovered = alphaCoverage(mipPixels);
-    constexpr uint32_t BASE_TEXEL_COUNT = TILE_SIZE * TILE_SIZE;
-    uint32_t mipEdge = TILE_SIZE;
+    constexpr uint32_t BASE_TEXEL_COUNT =
+        BlockTextureArray::TILE_SIZE * BlockTextureArray::TILE_SIZE;
+    uint32_t mipEdge = BlockTextureArray::TILE_SIZE;
 
-    for (uint32_t mipLevel = 0; mipLevel < MIP_LEVEL_COUNT; ++mipLevel) {
-        [_texture replaceRegion:MTLRegionMake2D(0, 0, mipEdge, mipEdge)
-                    mipmapLevel:mipLevel
-                          slice:layer
-                      withBytes:mipPixels.data()
-                    bytesPerRow:mipEdge * sizeof(BgraPixel)
-                  bytesPerImage:0];
+    for (uint32_t mipLevel = 0; mipLevel < BlockTextureArray::MIP_LEVEL_COUNT; ++mipLevel) {
+        [texture replaceRegion:MTLRegionMake2D(0, 0, mipEdge, mipEdge)
+                   mipmapLevel:mipLevel
+                         slice:layer
+                     withBytes:mipPixels.data()
+                   bytesPerRow:mipEdge * sizeof(BgraPixel)
+                 bytesPerImage:0];
 
-        if (mipLevel + 1 == MIP_LEVEL_COUNT)
+        if (mipLevel + 1 == BlockTextureArray::MIP_LEVEL_COUNT)
             break;
         mipPixels = downsampleAlphaAware(mipPixels, mipEdge);
         preserveAlphaCoverage(mipPixels, baseCovered, BASE_TEXEL_COUNT);
         mipEdge /= 2;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Item icons - procedural 16x16 pixel art per non-block item: geometric
+// painters parameterized by the item's palette, so twelve tools come from
+// four shapes and the meats from three.
+// ---------------------------------------------------------------------------
+static void paintItemIcon(BgraPixel* pixels, ItemType item, SimplexNoise& noise) {
+    constexpr int TILE = static_cast<int>(BlockTextureArray::TILE_SIZE);
+    auto setPx = [&](int x, int y, uint32_t rgb, double shadeJitter = 0.08) {
+        if (x < 0 || x >= TILE || y < 0 || y >= TILE)
+            return;
+        const double n = noise.noise2D(x * 0.5, y * 0.5) * shadeJitter;
+        BgraPixel& p = pixels[static_cast<uint32_t>(y) * BlockTextureArray::TILE_SIZE +
+                              static_cast<uint32_t>(x)];
+        p.r = clampToByte(((rgb >> 16) & 0xFF) / 255.0 * (1.0 + n));
+        p.g = clampToByte(((rgb >> 8) & 0xFF) / 255.0 * (1.0 + n));
+        p.b = clampToByte((rgb & 0xFF) / 255.0 * (1.0 + n));
+        p.a = 255;
+    };
+    auto fillRect = [&](int x0, int y0, int x1, int y1, uint32_t rgb) {
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                setPx(x, y, rgb);
+            }
+        }
+    };
+    // A 2px-wide diagonal from (x0, y0) up-right to (x1, y1).
+    auto fillDiagonal = [&](int x0, int y0, int x1, int y1, uint32_t rgb) {
+        const int steps = std::max(std::abs(x1 - x0), std::abs(y1 - y0));
+        for (int i = 0; i <= steps; ++i) {
+            const int x = x0 + (x1 - x0) * i / std::max(1, steps);
+            const int y = y0 + (y1 - y0) * i / std::max(1, steps);
+            setPx(x, y, rgb);
+            setPx(x + 1, y, rgb);
+        }
+    };
+    auto fillEllipse = [&](int cx, int cy, int rx, int ry, uint32_t rgb) {
+        for (int y = cy - ry; y <= cy + ry; ++y) {
+            for (int x = cx - rx; x <= cx + rx; ++x) {
+                const double dx = static_cast<double>(x - cx) / rx;
+                const double dy = static_cast<double>(y - cy) / ry;
+                if (dx * dx + dy * dy <= 1.0)
+                    setPx(x, y, rgb);
+            }
+        }
+    };
+
+    constexpr uint32_t WOOD = 0x8A5C2E;
+    const uint32_t swatch = itemSwatchColor(item);
+    const ItemDefinition definition = itemDefinition(item);
+
+    if (definition.category == ItemCategory::TOOL) {
+        // Handle first, head painted over it in the tier material.
+        fillDiagonal(3, 12, 11, 4, WOOD);
+        switch (definition.toolClass) {
+            case ToolClass::PICKAXE:
+                fillRect(3, 2, 12, 3, swatch);
+                fillRect(2, 3, 4, 5, swatch);
+                fillRect(11, 3, 13, 5, swatch);
+                break;
+            case ToolClass::AXE:
+                fillRect(8, 1, 12, 5, swatch);
+                fillRect(6, 2, 8, 4, swatch);
+                break;
+            case ToolClass::SHOVEL:
+                fillEllipse(11, 3, 3, 3, swatch);
+                break;
+            case ToolClass::SWORD:
+                fillDiagonal(5, 10, 12, 3, swatch);
+                fillDiagonal(6, 11, 13, 4, swatch);
+                setPx(4, 11, 0x33261A);
+                setPx(5, 12, 0x33261A);
+                break;
+            case ToolClass::NONE:
+                break;
+        }
+        return;
+    }
+
+    if (definition.category == ItemCategory::FOOD) {
+        const bool fish = item == ItemType::RAW_FISH || item == ItemType::COOKED_FISH;
+        const bool bird = item == ItemType::RAW_CHICKEN || item == ItemType::COOKED_CHICKEN;
+        if (fish) {
+            fillEllipse(7, 8, 5, 3, swatch);
+            for (int i = 0; i < 4; ++i) {
+                fillRect(11 + i, 8 - i, 11 + i, 8 + i, swatch); // tail fan
+            }
+            setPx(4, 7, 0x1A1A1A); // eye
+        } else if (bird) {
+            fillEllipse(9, 6, 4, 4, swatch);
+            fillDiagonal(3, 13, 7, 9, 0xF2EFE6); // bone
+            fillEllipse(3, 13, 1, 1, 0xF2EFE6);
+        } else {
+            fillEllipse(8, 8, 5, 4, swatch);
+            fillRect(5, 7, 10, 8, 0xF2E6D9); // marbling
+        }
+        return;
+    }
+
+    switch (item) {
+        case ItemType::STICK:
+            fillDiagonal(4, 12, 11, 4, swatch);
+            break;
+        case ItemType::COAL:
+        case ItemType::CHARCOAL:
+            fillEllipse(8, 8, 4, 4, swatch);
+            setPx(6, 7, 0x000000);
+            setPx(9, 9, 0x000000);
+            break;
+        case ItemType::IRON_INGOT:
+        case ItemType::GOLD_INGOT: {
+            fillRect(3, 8, 12, 12, swatch); // front face
+            for (int i = 0; i < 3; ++i) {
+                fillRect(4 + i, 7 - i, 13 + i - 3, 7 - i, swatch); // beveled top
+            }
+            fillRect(4, 6, 11, 6, (swatch & 0xFFFFFF) | 0x303030); // top sheen
+            break;
+        }
+        case ItemType::DIAMOND: {
+            for (int y = 4; y <= 12; ++y) {
+                const int half = y <= 7 ? (y - 3) * 2 : (13 - y);
+                fillRect(8 - half, y, 8 + half - 1, y, swatch);
+            }
+            break;
+        }
+        case ItemType::BOAT: {
+            // A little wooden hull: wide rim tapering to a rounded keel.
+            for (int y = 7; y <= 12; ++y) {
+                const int inset = std::min(3, y - 7);
+                fillRect(3 + inset, y, 12 - inset, y, swatch);
+            }
+            break;
+        }
+        case ItemType::BUCKET:
+        case ItemType::WATER_BUCKET:
+        case ItemType::LAVA_BUCKET: {
+            constexpr uint32_t METAL = 0xB0B4BA;
+            // A filled bucket carries its fluid in the mouth of the pail.
+            if (item != ItemType::BUCKET) {
+                const uint32_t fluid = item == ItemType::WATER_BUCKET ? 0x4073D9 : 0xE6661A;
+                fillRect(5, 5, 10, 7, fluid);
+            }
+            fillRect(4, 4, 11, 5, METAL); // rim
+            for (int y = 6; y <= 12; ++y) {
+                const int inset = (y - 6) / 3; // taper toward a narrow base
+                fillRect(4 + inset, y, 11 - inset, y, METAL);
+            }
+            break;
+        }
+        default:
+            fillEllipse(8, 8, 4, 4, swatch);
+            break;
     }
 }
 
@@ -850,7 +1158,7 @@ BlockTextureArray::BlockTextureArray(id<MTLDevice> device) {
     descriptor.pixelFormat = MTLPixelFormatBGRA8Unorm;
     descriptor.width = TILE_SIZE;
     descriptor.height = TILE_SIZE;
-    descriptor.arrayLength = TEXTURE_LAYER_COUNT;
+    descriptor.arrayLength = TEXTURE_LAYER_TOTAL;
     descriptor.mipmapLevelCount = MIP_LEVEL_COUNT;
     descriptor.usage = MTLTextureUsageShaderRead;
 
@@ -873,7 +1181,7 @@ BlockTextureArray::BlockTextureArray(id<MTLDevice> device) {
         RY_LOG_FATAL("Failed to create block texture sampler");
     }
 
-    for (uint8_t layer = 0; layer < TEXTURE_LAYER_COUNT; ++layer) {
-        generateLayer(layer);
+    for (uint16_t layer = 0; layer < TEXTURE_LAYER_TOTAL; ++layer) {
+        generateLayer(static_cast<uint8_t>(layer));
     }
 }

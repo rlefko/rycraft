@@ -8,8 +8,8 @@
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
 #include <engine/game_state.hpp>
-#include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -6485,6 +6485,39 @@ TEST_CASE("Block textures: grass uses per-face layers", "[render][textures]") {
     REQUIRE(textureLayerFor(BlockType::GRASS, FaceNormal::MINUS_Z) == TEXTURE_LAYER_GRASS_SIDE);
 }
 
+TEST_CASE("UI icon vertices share one layout between C++ and Metal", "[render][ui]") {
+    REQUIRE(sizeof(UIIconVertex) == 48);
+    REQUIRE(offsetof(UIIconVertex, position) == 0);
+    REQUIRE(offsetof(UIIconVertex, uv) == 8);
+    REQUIRE(offsetof(UIIconVertex, tint) == 16);
+    REQUIRE(offsetof(UIIconVertex, layer) == 32);
+}
+
+TEST_CASE("Item icon layers map the non-block range past the block layers", "[render][textures]") {
+    REQUIRE(TEXTURE_LAYER_ITEM_FIRST == TEXTURE_LAYER_COUNT);
+    REQUIRE(itemIconLayer(ItemType::STICK) == TEXTURE_LAYER_ITEM_FIRST);
+    REQUIRE(itemIconLayer(static_cast<ItemType>(static_cast<uint16_t>(ItemType::COUNT) - 1)) ==
+            TEXTURE_LAYER_ITEM_FIRST + NON_BLOCK_ITEM_COUNT - 1);
+    REQUIRE(TEXTURE_LAYER_TOTAL == TEXTURE_LAYER_ITEM_FIRST + ITEM_ICON_COUNT);
+    REQUIRE(TEXTURE_LAYER_TOTAL <= 255);
+}
+
+TEST_CASE("Block textures: workshop blocks use per-face layers", "[render][textures]") {
+    REQUIRE(textureLayerFor(BlockType::CRAFTING_TABLE, FaceNormal::PLUS_Y) ==
+            TEXTURE_LAYER_CRAFTING_TABLE_TOP);
+    REQUIRE(textureLayerFor(BlockType::CRAFTING_TABLE, FaceNormal::MINUS_Y) ==
+            static_cast<uint8_t>(BlockType::PLANKS));
+    REQUIRE(textureLayerFor(BlockType::CRAFTING_TABLE, FaceNormal::PLUS_X) ==
+            static_cast<uint8_t>(BlockType::CRAFTING_TABLE));
+    for (BlockType furnace : {BlockType::FURNACE, BlockType::FURNACE_LIT}) {
+        REQUIRE(textureLayerFor(furnace, FaceNormal::PLUS_Y) == TEXTURE_LAYER_FURNACE_TOP);
+        REQUIRE(textureLayerFor(furnace, FaceNormal::MINUS_Y) == TEXTURE_LAYER_FURNACE_TOP);
+        REQUIRE(textureLayerFor(furnace, FaceNormal::MINUS_X) == static_cast<uint8_t>(furnace));
+    }
+    REQUIRE(textureLayerFor(BlockType::TORCH, FaceNormal::PLUS_X) ==
+            static_cast<uint8_t>(BlockType::TORCH));
+}
+
 TEST_CASE("Block textures: face attr pack/unpack round-trips", "[render][textures]") {
     for (int f = 0; f < 6; ++f) {
         for (uint8_t layer :
@@ -7084,11 +7117,11 @@ TEST_CASE("Block textures upload a complete deterministic mip chain", "[render][
     BlockTextureArray first(device);
     BlockTextureArray second(device);
     REQUIRE(first.texture().mipmapLevelCount == BlockTextureArray::MIP_LEVEL_COUNT);
-    REQUIRE(first.texture().arrayLength == TEXTURE_LAYER_COUNT);
+    REQUIRE(first.texture().arrayLength == TEXTURE_LAYER_TOTAL);
 
     const uint64_t firstHash = blockTextureHash(first);
     REQUIRE(blockTextureHash(second) == firstHash);
-    REQUIRE(firstHash == 0x3c3f105249a0d97eULL);
+    REQUIRE(firstHash == 0x5bb2a0c9c1913dd6ULL);
 }
 
 TEST_CASE("Block texture mips preserve alpha-tested flora coverage", "[render][textures][mip]") {

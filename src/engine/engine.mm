@@ -10,9 +10,15 @@
 #include <common/random.hpp>
 #include <engine/camera.hpp>
 #include <engine/game_state.hpp>
-#include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
+#include <engine/mining.hpp>
+#include <engine/slot_interaction.hpp>
+#include <engine/survival.hpp>
 #include <entity/ai.hpp>
+#include <entity/boat.hpp>
+#include <entity/entity_picking.hpp>
+#include <entity/item_entity.hpp>
 #include <entity/player.hpp>
 #include <entity/spawner.hpp>
 #include <entity/voxel_traversal.hpp>
@@ -20,8 +26,12 @@
 #include <render/graphics_settings.hpp>
 #include <render/render_pipeline.hpp>
 #include <render/ui_menu.hpp>
+#include <world/recipes.hpp>
 #include <world/save_manager.hpp>
 #include <world/world.hpp>
+#include <world/world_list.hpp>
+
+#include <random>
 
 #include <algorithm>
 #include <array>
@@ -300,11 +310,53 @@ struct EngineState {
     static constexpr float DRY_SECONDS = 45.0f;
 
     // ---- Block Interaction ----
-    Hotbar hotbar;
+    Inventory inventory;
     Vec3 highlightedBlock; // Block currently targeted by crosshair
     bool hasHighlightedBlock = false;
 
+    // ---- Per-world configuration & stateful blocks ----
+    // Round-tripped through metadata.json and the block-entities sidecar.
+    std::string worldName;
+    GameMode gameMode = GameMode::CREATIVE;
+    GenerationSettings generation;
+    uint64_t worldCreatedMs = 0;
+    Vec3 worldSpawn{0.f, 100.f, 0.f}; // respawn anchor, distinct from playerPos
+    SurvivalStats survival;
+    EatingState eatingState;
+    std::string deathMessage;
+    int hurtSoundCooldown = 0;
+    FurnaceMap furnaces;
+    std::optional<BlockPos> openFurnace; // the furnace the FURNACE screen edits
+    ChestMap chests;
+    std::optional<BlockPos> openChest; // the chest the CHEST screen edits
+    ItemEntityManager itemEntities;
+    BoatManager boats;
+    int ridingBoat = -1; // index into boats, -1 when on foot
+    int pickupSoundCooldown = 0;
+    MiningState miningState;
+
+    // ---- Container screens ----
+    std::array<ItemStack, 9> craftGrid{}; // first 4 used on the inventory screen
+    ItemStack craftResult;
+    ItemStack cursorStack;
+    int creativePage = 0;
+    int hoveredSlot = -1;
+
+    // ---- Slot drag and double-click (Minecraft-style) ----
+    // A drag session paints every slot a held button passes over, then splits
+    // (left) or spreads one-per-slot (right) the cursor across them on release.
+    bool dragActive = false;
+    SlotClickKind dragKind = SlotClickKind::LEFT;
+    bool dragMoved = false; // painted a second distinct slot: a real drag
+    std::vector<SlotRef> dragSlots;
+    double lastSlotClickSeconds = -1.0; // for double-click gather detection
+    SlotRef lastSlotClickRef;
+    static constexpr double DOUBLE_CLICK_WINDOW = 0.3; // seconds
+
     // ---- Game flow & UI ----
+    std::vector<WorldSummary> worldList; // cached on entering the world menus
+    WorldSelectState worldSelect;
+    WorldCreateState worldCreate;
     GameFlow flow;                   // Title → Playing ⇄ Paused ⇄ Settings
     bool spawnValidated = false;     // player unstuck from stale-save terrain
     SettingsValues settings;         // live values shown in the settings menu
@@ -339,6 +391,12 @@ struct EngineState {
     std::vector<float> sfxBlockPlace;
     std::vector<float> sfxFootstep;
     std::vector<float> sfxWind;
+    std::vector<float> sfxHurt;
+    std::vector<float> sfxEat;
+    std::vector<float> sfxDeath;
+    std::vector<float> sfxClick;
+    std::vector<float> sfxPickup;
+    std::vector<float> sfxFurnacePop;
     std::array<std::vector<float>, ENTITY_TYPE_COUNT> sfxAnimal;
     int32_t windVoice = -1;
     float footstepDistance = 0.f; // ground distance walked since last step
@@ -407,40 +465,7 @@ static EngineState* _engineGetState(Engine* engine) {
                                                               std::numeric_limits<uint64_t>::max());
         _state->autoPauseFrame = unsignedEnvironmentValue("RYCRAFT_AUTOPAUSE_FRAME",
                                                           std::numeric_limits<uint64_t>::max());
-        _state->saveManager = std::make_unique<SaveManager>([@"rycraft_world" UTF8String]);
-
-        // Resume the saved world when one exists; otherwise start fresh
-        uint32_t seed = 42;
-        Vec3 spawnPos{0.f, 100.f, 0.f};
-        if (auto meta = _state->saveManager->loadMetadata()) {
-            seed = meta->seed;
-            spawnPos = meta->spawnPos;
-            _state->worldTime = meta->worldTime;
-            _state->player.yaw = meta->player.yaw;
-            _state->player.pitch = meta->player.pitch;
-            _state->player.health = meta->player.health;
-            _state->hotbar.selectSlot(meta->player.selectedSlot);
-            for (int slot = 0; slot < Hotbar::SLOTS; ++slot) {
-                _state->hotbar.setSlot(slot, meta->player.inventory[static_cast<size_t>(slot)]);
-            }
-        }
-        if (const char* seedEnv = std::getenv("RYCRAFT_WORLD_SEED")) {
-            seed = static_cast<uint32_t>(std::strtoull(seedEnv, nullptr, 0));
-        }
-        if (const char* spawnEnv = std::getenv("RYCRAFT_SPAWN")) {
-            float x = 0.0f;
-            float y = 0.0f;
-            float z = 0.0f;
-            if (std::sscanf(spawnEnv, "%f,%f,%f", &x, &y, &z) == 3)
-                spawnPos = {x, y, z};
-        }
-
-        // Playtest hook: pin the time of day (0..23999; 6000 = noon).
-        if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
-            _state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
-        }
-
-        // Persisted settings load before the World exists (view distance
+        // Persisted settings load before any World exists (view distance
         // feeds its constructor); env overrides win over the file for
         // headless playtests. Playtest hook: RYCRAFT_VIEW_DISTANCE=<4..512>.
         // An env-overridden session never saves settings — a playtest run
@@ -461,13 +486,195 @@ static EngineState* _engineGetState(Engine* engine) {
         if (const char* debugEnv = std::getenv("RYCRAFT_SHOW_DEBUG")) {
             _state->showDebugHud = *debugEnv != '\0' && std::strcmp(debugEnv, "0") != 0;
         }
-        _state->world = std::make_shared<World>(seed, _state->settings.viewDistance);
-        // Chunks load from disk before regenerating, so block edits persist
-        _state->world->setSaveManager(_state->saveManager.get());
-        _state->spawner = std::make_unique<Spawner>(*_state->world);
-        _state->player.position = spawnPos;
     }
     return self;
+}
+
+// The world for launches that bypass the selection screen (playtest hooks
+// and headless captures): RYCRAFT_WORLD_DIR, else the legacy directory,
+// which is created fresh when missing exactly as the game always did.
+static std::string defaultWorldDirectory() {
+    if (const char* dirEnv = std::getenv("RYCRAFT_WORLD_DIR")) {
+        if (*dirEnv)
+            return dirEnv;
+    }
+    return LEGACY_WORLD_DIRECTORY;
+}
+
+// Build the live world session from a world directory. The caller drives the
+// screen flow (onWorldStarted) only after this succeeds.
+- (BOOL)startWorldAtPath:(const std::string&)worldDir {
+    EngineState* state = _state.get();
+    if (state->world) {
+        RY_LOG_ERROR("A world session is already live");
+        return NO;
+    }
+
+    state->saveManager = std::make_unique<SaveManager>(worldDir);
+
+    // Per-session defaults, then the saved world when one exists.
+    uint32_t seed = 42;
+    Vec3 spawnPos{0.f, 100.f, 0.f};
+    Vec3 playerPos = spawnPos;
+    SaveManager::PlayerMetadata playerMeta{};
+    state->worldTime = 0;
+    state->worldName.clear();
+    state->gameMode = GameMode::CREATIVE;
+    state->generation = GenerationSettings{};
+    state->worldCreatedMs = 0;
+    if (auto meta = state->saveManager->loadMetadata()) {
+        seed = meta->seed;
+        spawnPos = meta->spawnPos;
+        playerPos = meta->playerPos;
+        state->worldTime = meta->worldTime;
+        state->worldName = meta->name;
+        state->gameMode = meta->gameMode;
+        state->generation = meta->generation;
+        state->worldCreatedMs = meta->createdMs;
+        playerMeta = meta->player;
+    }
+    if (const char* seedEnv = std::getenv("RYCRAFT_WORLD_SEED")) {
+        seed = static_cast<uint32_t>(std::strtoull(seedEnv, nullptr, 0));
+    }
+    if (const char* spawnEnv = std::getenv("RYCRAFT_SPAWN")) {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        if (std::sscanf(spawnEnv, "%f,%f,%f", &x, &y, &z) == 3) {
+            spawnPos = {x, y, z};
+            playerPos = spawnPos;
+        }
+    }
+    // Playtest hook: pin the time of day (0..23999; 6000 = noon).
+    if (const char* timeEnv = std::getenv("RYCRAFT_TIME")) {
+        state->worldTime = static_cast<uint64_t>(std::clamp(std::atoi(timeEnv), 0, 23999));
+    }
+    // Playtest hook: force the mode without touching the saved metadata
+    // (env-override capture sessions never save).
+    if (const char* modeEnv = std::getenv("RYCRAFT_GAME_MODE")) {
+        if (std::strcmp(modeEnv, "survival") == 0) {
+            state->gameMode = GameMode::SURVIVAL;
+        } else if (std::strcmp(modeEnv, "creative") == 0) {
+            state->gameMode = GameMode::CREATIVE;
+        }
+    }
+
+    state->worldSpawn = spawnPos;
+    state->player = Player{};
+    state->player.position = playerPos;
+    state->player.yaw = playerMeta.yaw;
+    state->player.pitch = playerMeta.pitch;
+    state->player.health = playerMeta.health;
+    state->camera.setLook(playerMeta.yaw, playerMeta.pitch);
+    state->survival = SurvivalStats{};
+    state->survival.food = playerMeta.hunger;
+    state->inventory.clear();
+    state->inventory.selectSlot(playerMeta.selectedSlot);
+    for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
+        state->inventory.setSlot(static_cast<int>(slot), playerMeta.inventory[slot]);
+    }
+    SaveManager::BlockEntities blockEntities = state->saveManager->loadBlockEntities();
+    state->furnaces = std::move(blockEntities.furnaces);
+    state->chests = std::move(blockEntities.chests);
+    state->openFurnace.reset();
+    state->openChest.reset();
+    state->itemEntities.clear();
+    state->boats.clear();
+    state->ridingBoat = -1;
+    state->pickupSoundCooldown = 0;
+    state->miningState.reset();
+    state->eatingState.reset();
+    state->deathMessage.clear();
+    state->craftGrid.fill(ItemStack{});
+    state->craftResult.clear();
+    state->cursorStack.clear();
+    state->creativePage = 0;
+    state->hoveredSlot = -1;
+    state->entityBrains.clear();
+    state->spawnValidated = false;
+    state->hasHighlightedBlock = false;
+    state->raining = false;
+    state->wetness = 0.0f;
+    _scrollAccumulator = 0;
+    _savedWorld = NO;
+
+    state->world = std::make_shared<World>(seed, state->settings.viewDistance, MAX_LOADED_CUBES,
+                                           state->generation);
+    // Chunks load from disk before regenerating, so block edits persist
+    state->world->setSaveManager(state->saveManager.get());
+    if (state->generation.fauna) {
+        state->spawner = std::make_unique<Spawner>(*state->world);
+    }
+    return YES;
+}
+
+// Persist the live session: sweep edited cubes, write metadata and block
+// entities, and drain the save queue. Capture-run gating stays with the
+// callers so quit and world-switch share one body.
+- (void)saveCurrentWorld {
+    EngineState* state = _state.get();
+    if (!state->saveManager || !state->world)
+        return;
+    // Edited chunks persist on unload; this path sweeps the rest
+    const bool frontiersSaved = state->world->saveModifiedChunks();
+    SaveManager::WorldMetadata worldMetadata;
+    worldMetadata.seed = state->world->getSeed();
+    worldMetadata.spawnPos = state->worldSpawn;
+    worldMetadata.playerPos = state->player.position;
+    worldMetadata.worldTime = state->worldTime;
+    worldMetadata.name = state->worldName;
+    worldMetadata.gameMode = state->gameMode;
+    worldMetadata.generation = state->generation;
+    worldMetadata.createdMs = state->worldCreatedMs;
+    worldMetadata.player.yaw = state->player.yaw;
+    worldMetadata.player.pitch = state->player.pitch;
+    worldMetadata.player.health = state->player.health;
+    worldMetadata.player.hunger = state->survival.food;
+    worldMetadata.player.selectedSlot = state->inventory.getSelectedIndex();
+    for (size_t slot = 0; slot < SaveManager::PLAYER_INVENTORY_SLOTS; ++slot) {
+        worldMetadata.player.inventory[slot] = state->inventory.getSlot(static_cast<int>(slot));
+    }
+    const bool metadataSaved = state->saveManager->saveMetadata(worldMetadata);
+    const bool blockEntitiesSaved =
+        state->saveManager->saveBlockEntities(state->furnaces, state->chests);
+    const bool cubesSaved = state->saveManager->flush();
+    if (frontiersSaved && metadataSaved && blockEntitiesSaved && cubesSaved) {
+        RY_LOG_INFO("World state saved");
+    } else {
+        RY_LOG_ERROR("World state save did not complete");
+    }
+}
+
+// Save and tear down the live session, returning to the title. Order
+// matters: the renderer detaches first (its mesh scheduler captured a
+// const World&), then the Spawner (holds World&), then the World (joins
+// generation workers), then the SaveManager (joins the save thread).
+- (void)stopWorld {
+    EngineState* state = _state.get();
+    if (!state->world)
+        return;
+    if (!std::getenv("RYCRAFT_CAPTURE")) {
+        [self saveCurrentWorld];
+    }
+    if (_renderPipeline) {
+        _renderPipeline->endWorldSession();
+    }
+    state->spawner.reset();
+    state->entityBrains.clear();
+    state->world.reset();
+    state->saveManager.reset();
+    state->furnaces.clear();
+    state->openFurnace.reset();
+    state->chests.clear();
+    state->openChest.reset();
+    state->itemEntities.clear();
+    state->boats.clear();
+    state->ridingBoat = -1;
+    state->miningState.reset();
+    state->inventory.clear();
+    state->hasHighlightedBlock = false;
+    state->worldName.clear();
+    [self applyFlowEffects:state->flow.onWorldStopped()];
 }
 
 - (BOOL)initialize {
@@ -577,18 +784,80 @@ static EngineState* _engineGetState(Engine* engine) {
     _state->camera.setMouseSensitivity(mouseSensitivityForLevel(_state->settings.sensitivityLevel));
 
     // Playtest override: start on a specific screen
-    // (title|playing|paused|settings|video)
-    if (const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN")) {
-        std::string name = screenEnv;
-        if (name == "playing") {
+    // (title|playing|paused|settings|video). Gameplay screens and headless
+    // hooks (capture/autopilot/perf) auto-start the default world; the boot
+    // path otherwise reaches the title with no world session.
+    const char* screenEnv = std::getenv("RYCRAFT_START_SCREEN");
+    const std::string screenName = screenEnv ? screenEnv : "";
+    const bool wantsGameplayScreen =
+        screenName == "playing" || screenName == "paused" || screenName == "settings" ||
+        screenName == "video" || screenName == "inventory" || screenName == "crafting" ||
+        screenName == "furnace" || screenName == "chest" || screenName == "death";
+    const bool menuScreenRequested = !screenName.empty() && !wantsGameplayScreen;
+    const bool wantsWorld = wantsGameplayScreen ||
+                            (!menuScreenRequested &&
+                             (std::getenv("RYCRAFT_CAPTURE") || std::getenv("RYCRAFT_AUTOPILOT") ||
+                              _state->performance.enabled()));
+    if (wantsWorld) {
+        if ([self startWorldAtPath:defaultWorldDirectory()]) {
+            [self applyFlowEffects:_state->flow.onWorldStarted()];
+        }
+    }
+    if (screenName == "worlds" || screenName == "delete") {
+        _state->worldList = listWorlds();
+        if (screenName == "delete" && !_state->worldList.empty()) {
+            _state->worldSelect.selected = 0;
+            _state->flow.screen = GameScreen::WORLD_DELETE_CONFIRM;
+        } else {
+            _state->flow.screen = GameScreen::WORLD_SELECT;
+        }
+    } else if (screenName == "create") {
+        _state->flow.screen = GameScreen::WORLD_CREATE;
+    }
+    if (_state->world && wantsGameplayScreen) {
+        if (screenName == "playing") {
             _state->flow.screen = GameScreen::PLAYING;
             _state->inputManager->captureMouse();
-        } else if (name == "paused") {
-            _state->flow.screen = GameScreen::PAUSED;
-        } else if (name == "settings") {
-            _state->flow.screen = GameScreen::SETTINGS;
-        } else if (name == "video") {
-            _state->flow.screen = GameScreen::VIDEO_SETTINGS;
+        } else {
+            _state->inputManager->releaseMouse();
+            if (screenName == "paused") {
+                _state->flow.screen = GameScreen::PAUSED;
+            } else if (screenName == "settings") {
+                _state->flow.screen = GameScreen::SETTINGS;
+            } else if (screenName == "video") {
+                _state->flow.screen = GameScreen::VIDEO_SETTINGS;
+            } else if (screenName == "inventory") {
+                _state->flow.screen = GameScreen::INVENTORY;
+            } else if (screenName == "crafting") {
+                _state->flow.screen = GameScreen::CRAFTING;
+            } else if (screenName == "death") {
+                _state->deathMessage = "YOU FELL";
+                _state->flow.screen = GameScreen::DEATH;
+            } else if (screenName == "furnace") {
+                // A sample smelting job so the capture shows filled slots and
+                // an advancing cook arrow.
+                const BlockPos pos{0, 0, 0};
+                FurnaceState& furnace = _state->furnaces[pos];
+                furnace.input = ItemStack{ItemType::RAW_BEEF, 3, 0};
+                furnace.fuel = ItemStack{ItemType::COAL, 5, 0};
+                furnace.output = ItemStack{ItemType::COOKED_BEEF, 2, 0};
+                furnace.burnTicksRemaining = 800;
+                furnace.burnTicksTotal = 1600;
+                furnace.cookTicks = 120;
+                _state->openFurnace = pos;
+                _state->flow.screen = GameScreen::FURNACE;
+            } else if (screenName == "chest") {
+                // A partly filled chest so the capture shows populated storage.
+                const BlockPos pos{0, 0, 0};
+                ChestState& chest = _state->chests[pos];
+                chest.slots[0] = ItemStack{itemFromBlock(BlockType::COBBLESTONE), 64, 0};
+                chest.slots[1] = ItemStack{ItemType::IRON_INGOT, 12, 0};
+                chest.slots[9] = ItemStack{ItemType::COOKED_BEEF, 8, 0};
+                chest.slots[13] = ItemStack{ItemType::DIAMOND, 3, 0};
+                chest.slots[26] = ItemStack{ItemType::IRON_PICKAXE, 1, 131};
+                _state->openChest = pos;
+                _state->flow.screen = GameScreen::CHEST;
+            }
         }
     }
 
@@ -599,6 +868,12 @@ static EngineState* _engineGetState(Engine* engine) {
         _state->sfxBlockPlace = SoundEffect::generateBlockPlace();
         _state->sfxFootstep = SoundEffect::generateFootstep();
         _state->sfxWind = SoundEffect::generateAmbientWind();
+        _state->sfxHurt = SoundEffect::generateHurt();
+        _state->sfxEat = SoundEffect::generateEat();
+        _state->sfxDeath = SoundEffect::generateDeath();
+        _state->sfxClick = SoundEffect::generateClick();
+        _state->sfxPickup = SoundEffect::generatePickup();
+        _state->sfxFurnacePop = SoundEffect::generateFurnacePop();
         for (size_t index = 0; index < ENTITY_TYPE_COUNT; ++index) {
             _state->sfxAnimal[index] =
                 SoundEffect::generateAnimalCall(static_cast<EntityType>(index));
@@ -666,7 +941,7 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 4. Fixed timestep game tick — menus freeze the world
-    if (state->flow.screen == GameScreen::PLAYING) {
+    if (state->world && state->flow.screen == GameScreen::PLAYING) {
         while (state->accumulator >= EngineState::TICK_DT) {
             const double tickStart = CACurrentMediaTime();
             [self gameTick:state];
@@ -681,6 +956,19 @@ static EngineState* _engineGetState(Engine* engine) {
         // that added latency. Falls stay gradual because velocity no longer
         // saturates (see Player::tick), so this no longer looks instantaneous.
         state->camera.setPosition(state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f});
+    } else if (state->world && state->flow.inContainer()) {
+        // Container screens freeze the world but keep furnaces cooking, so the
+        // cook arrow advances while the player watches. Bounded catch-up like
+        // the fluid scheduler to survive a hitch.
+        int steps = 0;
+        while (state->accumulator >= EngineState::TICK_DT && steps < 8) {
+            [self tickFurnaces:state];
+            state->accumulator -= EngineState::TICK_DT;
+            ++steps;
+        }
+        if (state->accumulator >= EngineState::TICK_DT) {
+            state->accumulator = 0;
+        }
     } else {
         state->accumulator = 0;
     }
@@ -717,19 +1005,35 @@ static EngineState* _engineGetState(Engine* engine) {
     if (!state->audio)
         return;
 
+    // Master volume follows the slider at all times so GUI clicks are audible
+    // in menus. The "paused world = paused soundscape" feel is kept by
+    // stopping the wind bed off the playing screen; frozen ticks produce no
+    // world one-shots anyway.
     const bool playing = state->flow.screen == GameScreen::PLAYING;
     float volume = static_cast<float>(state->settings.volumeLevel) / 10.0f;
-    state->audio->setMasterVolume(playing ? volume : 0.0f);
+    state->audio->setMasterVolume(volume);
 
     if (playing && state->windVoice < 0 && !state->sfxWind.empty()) {
         state->windVoice = state->audio->playSound(state->sfxWind, SoundEffect::SAMPLE_RATE, 0.18f,
                                                    /*looping=*/true);
+    } else if (!playing && state->windVoice >= 0) {
+        state->audio->stopVoice(state->windVoice);
+        state->windVoice = -1;
     }
 }
 
 - (void)playSfx:(const std::vector<float>&)buffer gain:(float)gain {
     EngineState* state = _state.get();
     if (!state->audio || state->flow.screen != GameScreen::PLAYING)
+        return;
+    state->audio->playSound(buffer, SoundEffect::SAMPLE_RATE, gain);
+}
+
+// Interface sounds bypass the playing-screen gate so buttons and slot clicks
+// respond on every menu screen.
+- (void)playUiSfx:(const std::vector<float>&)buffer gain:(float)gain {
+    EngineState* state = _state.get();
+    if (!state->audio)
         return;
     state->audio->playSound(buffer, SoundEffect::SAMPLE_RATE, gain);
 }
@@ -875,20 +1179,386 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 }
 
+// Advance every player-placed furnace one 20 Hz step and swap the world
+// block between FURNACE and FURNACE_LIT when a furnace ignites or dies. The
+// swap touches only resident cubes and retries next tick otherwise.
+- (void)tickFurnaces:(EngineState*)state {
+    if (!state->world)
+        return;
+    for (auto& [pos, furnace] : state->furnaces) {
+        const bool litChanged = furnaceTick(furnace);
+        if (!litChanged)
+            continue;
+        const std::optional<BlockType> current =
+            state->world->findBlockIfLoaded(pos.x, pos.y, pos.z);
+        if (current && (*current == BlockType::FURNACE || *current == BlockType::FURNACE_LIT)) {
+            state->world->setBlock(pos.x, pos.y, pos.z,
+                                   furnace.lit() ? BlockType::FURNACE_LIT : BlockType::FURNACE);
+            if (furnace.lit()) {
+                [self playSfx:state->sfxFurnacePop gain:0.4f];
+            }
+        }
+    }
+}
+
+// Strike an animal: subtract the held item's damage, apply knockback, and on
+// death scatter its meat drops and remove it. Works in both modes so the
+// hunger loop can close from a fresh creative test too.
+- (void)attackEntity:(EngineState*)state entityId:(uint64_t)entityId {
+    if (!state->spawner)
+        return;
+    for (auto& entity : state->spawner->getEntities()) {
+        if (!entity || entity->id != entityId || !entity->alive)
+            continue;
+
+        const ItemStack held = state->inventory.getSelectedStack();
+        const int damage = static_cast<int>(itemDefinition(held.type).attackDamage);
+        entity->health -= damage;
+
+        // Minimal knockback away from the player, plus a small hop.
+        Vec3 away{entity->position.x - state->player.position.x, 0.f,
+                  entity->position.z - state->player.position.z};
+        const float length = away.length();
+        if (length > 1e-4f) {
+            away.x /= length;
+            away.z /= length;
+        }
+        entity->velocity.x += away.x * 0.3f;
+        entity->velocity.z += away.z * 0.3f;
+        entity->velocity.y += 0.2f;
+
+        if (modeDrainsHunger(state->gameMode)) {
+            state->survival.exhaustion += SurvivalStats::EXHAUST_ATTACK;
+        }
+        if (isTool(held.type) && modeConsumesItems(state->gameMode)) {
+            state->inventory.damageSelectedTool();
+        }
+        [self playSfx:state->sfxHurt gain:0.5f];
+
+        if (entity->health <= 0) {
+            const EntityConfig config = Entity::getConfig(entity->type);
+            if (config.drop != ItemType::NONE && config.dropCount > 0) {
+                [self spawnDrop:state
+                          stack:ItemStack{config.drop, config.dropCount, 0}
+                            atX:static_cast<int64_t>(std::floor(entity->position.x))
+                              y:static_cast<int32_t>(std::floor(entity->position.y))
+                              z:static_cast<int64_t>(std::floor(entity->position.z))];
+            }
+            entity->alive = false;
+            state->spawner->removeEntity(entityId);
+        }
+        return;
+    }
+}
+
+// Apply damage in survival, playing a rate-limited hurt sound and recording
+// the cause for the death screen. Never drops health below zero.
+- (void)damagePlayer:(EngineState*)state amount:(int)amount message:(const char*)message {
+    if (amount <= 0 || !modeTakesDamage(state->gameMode))
+        return;
+    state->player.health = std::max(0, state->player.health - amount);
+    state->deathMessage = message;
+    if (state->hurtSoundCooldown == 0) {
+        [self playSfx:state->sfxHurt gain:0.7f];
+        state->hurtSoundCooldown = 10;
+    }
+}
+
+// Death: scatter the whole inventory as item entities, clear it, and freeze
+// the world on the death screen until the player respawns.
+- (void)killPlayer:(EngineState*)state {
+    const Vec3 at = state->player.position + Vec3{0.f, 0.5f, 0.f};
+    for (int slot = 0; slot < Inventory::SLOTS; ++slot) {
+        const ItemStack stack = state->inventory.getSlot(slot);
+        if (stack.empty())
+            continue;
+        const uint64_t h = hash64(static_cast<uint64_t>(slot) * 2654435761ull +
+                                  static_cast<uint64_t>(state->frameCount));
+        const float vx = (static_cast<float>(h & 0xFF) / 255.f - 0.5f) * 0.4f;
+        const float vz = (static_cast<float>((h >> 8) & 0xFF) / 255.f - 0.5f) * 0.4f;
+        state->itemEntities.spawn(stack, at, Vec3{vx, 0.25f, vz}, 20);
+    }
+    state->inventory.clear();
+    state->cursorStack.clear();
+    state->miningState.reset();
+    state->eatingState.reset();
+    if (state->deathMessage.empty()) {
+        state->deathMessage = "YOU DIED";
+    }
+    [self playSfx:state->sfxDeath gain:0.8f];
+    [self applyFlowEffects:state->flow.onPlayerDied()];
+}
+
+// Respawn at the world's creation-time spawn anchor with reset stats. The
+// unstick pass places the player on solid ground next tick.
+- (void)respawnPlayer:(EngineState*)state {
+    state->player.position = state->worldSpawn;
+    state->player.velocity = Vec3{0.f, 0.f, 0.f};
+    state->player.health = 20;
+    state->player.flying = false;
+    state->player.resetFallDistance();
+    state->survival = SurvivalStats{};
+    state->deathMessage.clear();
+    state->spawnValidated = false;
+    [self applyFlowEffects:state->flow.onRespawn()];
+}
+
+// Dropped-item physics and the pickup pass. The manager owns physics/merge/
+// despawn; the inventory mutation lives here so the entity module never
+// depends on the engine's Inventory.
+- (void)tickItemEntities:(EngineState*)state {
+    if (!state->world)
+        return;
+    state->itemEntities.tick(*state->world, state->player.position);
+
+    if (state->pickupSoundCooldown > 0)
+        --state->pickupSoundCooldown;
+
+    const AABB playerBox = state->player.getAABB();
+    const AABB pickupBox{Vec3{playerBox.min.x - ItemEntityManager::PICKUP_XZ,
+                              playerBox.min.y - ItemEntityManager::PICKUP_Y,
+                              playerBox.min.z - ItemEntityManager::PICKUP_XZ},
+                         Vec3{playerBox.max.x + ItemEntityManager::PICKUP_XZ,
+                              playerBox.max.y + ItemEntityManager::PICKUP_Y,
+                              playerBox.max.z + ItemEntityManager::PICKUP_XZ}};
+
+    bool pickedUp = false;
+    for (ItemEntity& item : state->itemEntities.items()) {
+        if (item.pickupDelay > 0 || item.stack.empty())
+            continue;
+        if (!pickupBox.intersects(item.getAABB()))
+            continue;
+        const int absorbed = state->inventory.add(item.stack);
+        if (absorbed > 0) {
+            item.stack.count = static_cast<uint8_t>(item.stack.count - absorbed);
+            if (item.stack.count == 0)
+                item.stack.clear();
+            pickedUp = true;
+        }
+    }
+    if (pickedUp) {
+        state->itemEntities.compact();
+        if (state->pickupSoundCooldown == 0) {
+            [self playSfx:state->sfxPickup gain:0.4f];
+            state->pickupSoundCooldown = 2;
+        }
+    }
+}
+
+// Mutable stack access for the currently open container screen.
+- (SlotAccess)slotAccessForScreen {
+    EngineState* state = _state.get();
+    SlotAccess access;
+    access.inventory = state->inventory.slots().data();
+    const GameScreen screen = state->flow.screen;
+    const bool creative = state->gameMode == GameMode::CREATIVE;
+    if (screen == GameScreen::INVENTORY && creative) {
+        access.palette = CREATIVE_PALETTE.data();
+        access.paletteSize = static_cast<int>(CREATIVE_PALETTE.size());
+    } else if (screen == GameScreen::INVENTORY) {
+        access.craftGrid = state->craftGrid.data();
+        access.craftGridSize = 4;
+        access.craftGridWidth = 2;
+        access.craftResult = &state->craftResult;
+    } else if (screen == GameScreen::CRAFTING) {
+        access.craftGrid = state->craftGrid.data();
+        access.craftGridSize = 9;
+        access.craftGridWidth = 3;
+        access.craftResult = &state->craftResult;
+    } else if (screen == GameScreen::FURNACE && state->openFurnace) {
+        auto it = state->furnaces.find(*state->openFurnace);
+        if (it != state->furnaces.end()) {
+            access.furnaceInput = &it->second.input;
+            access.furnaceFuel = &it->second.fuel;
+            access.furnaceOutput = &it->second.output;
+        }
+    } else if (screen == GameScreen::CHEST && state->openChest) {
+        auto it = state->chests.find(*state->openChest);
+        if (it != state->chests.end()) {
+            access.chest = it->second.slots.data();
+            access.chestSize = ChestState::SLOT_COUNT;
+        }
+    }
+    return access;
+}
+
+// Leaving a container: the craft grid and held stack return to the
+// inventory. Anything that cannot fit is genuinely homeless (a full
+// inventory) and is logged; dropped item entities absorb this path next.
+- (void)closeContainerSession {
+    EngineState* state = _state.get();
+    SlotAccess access = [self slotAccessForScreen];
+    std::vector<ItemStack> overflow = collectOnClose(access, state->cursorStack);
+    for (const ItemStack& stack : overflow) {
+        if (state->inventory.add(stack) < stack.count) {
+            RY_LOG_ERROR("Container close overflow could not return every item");
+        }
+    }
+    state->hoveredSlot = -1;
+    state->openFurnace.reset();
+    state->openChest.reset();
+}
+
+// Close the focused text field, committing its filtered contents.
+- (void)commitTextEntry {
+    EngineState* state = _state.get();
+    InputState& input = state->inputManager->state();
+    if (!input.textEntryActive)
+        return;
+    const bool digits = state->worldCreate.focusedField == 1;
+    const std::string value = filterTextField(input.endTextEntry(), digits,
+                                              digits ? WorldCreateState::MAX_SEED_LENGTH
+                                                     : WorldCreateState::MAX_NAME_LENGTH);
+    if (state->worldCreate.focusedField == 0) {
+        state->worldCreate.name = value;
+    } else if (state->worldCreate.focusedField == 1) {
+        state->worldCreate.seedText = value;
+    }
+    state->worldCreate.focusedField = -1;
+}
+
+// One menu click: engine-side effects first (world lifecycle, list edits),
+// then the pure flow transition.
+- (void)handleMenuAction:(MenuAction)action payload:(int)payload {
+    EngineState* state = _state.get();
+    const int worldCount = static_cast<int>(state->worldList.size());
+    switch (action) {
+        case MenuAction::OPEN_WORLD_SELECT:
+            state->worldList = listWorlds();
+            state->worldSelect = WorldSelectState{};
+            break;
+        case MenuAction::OPEN_WORLD_CREATE:
+            state->worldCreate = WorldCreateState{};
+            break;
+        case MenuAction::SELECT_WORLD:
+            if (payload >= 0 && payload < worldCount) {
+                state->worldSelect.selected = payload;
+            }
+            return;
+        case MenuAction::WORLD_LIST_UP:
+            state->worldSelect.scroll = std::max(0, state->worldSelect.scroll - 1);
+            return;
+        case MenuAction::WORLD_LIST_DOWN:
+            state->worldSelect.scroll =
+                std::min(std::max(0, worldCount - WorldSelectState::VISIBLE_ROWS),
+                         state->worldSelect.scroll + 1);
+            return;
+        case MenuAction::PLAY_SELECTED_WORLD: {
+            const int selected = state->worldSelect.selected;
+            if (selected < 0 || selected >= worldCount)
+                return;
+            if ([self startWorldAtPath:state->worldList[static_cast<size_t>(selected)].directory]) {
+                [self applyFlowEffects:state->flow.onWorldStarted()];
+            }
+            return;
+        }
+        case MenuAction::RANDOM_SEED:
+            state->worldCreate.seedText = std::to_string(std::random_device{}());
+            return;
+        case MenuAction::TOGGLE_GEN_STRUCTURES:
+            state->worldCreate.structures = !state->worldCreate.structures;
+            return;
+        case MenuAction::TOGGLE_GEN_FAUNA:
+            state->worldCreate.fauna = !state->worldCreate.fauna;
+            return;
+        case MenuAction::TOGGLE_GEN_WEATHER:
+            state->worldCreate.weather = !state->worldCreate.weather;
+            return;
+        case MenuAction::TOGGLE_GEN_DAY_CYCLE:
+            state->worldCreate.dayCycle = !state->worldCreate.dayCycle;
+            return;
+        case MenuAction::TOGGLE_CREATE_MODE:
+            state->worldCreate.creative = !state->worldCreate.creative;
+            return;
+        case MenuAction::CREATE_WORLD_CONFIRM: {
+            const WorldCreateState& create = state->worldCreate;
+            const uint32_t seed =
+                create.seedText.empty()
+                    ? static_cast<uint32_t>(std::random_device{}())
+                    : static_cast<uint32_t>(std::strtoull(create.seedText.c_str(), nullptr, 10));
+            GenerationSettings generation;
+            generation.structures = create.structures;
+            generation.fauna = create.fauna;
+            generation.weather = create.weather;
+            generation.dayCycle = create.dayCycle;
+            const auto directory =
+                createWorld(create.name, seed,
+                            create.creative ? GameMode::CREATIVE : GameMode::SURVIVAL, generation);
+            if (directory && [self startWorldAtPath:*directory]) {
+                [self applyFlowEffects:state->flow.onWorldStarted()];
+            }
+            return;
+        }
+        case MenuAction::CONFIRM_DELETE: {
+            const int selected = state->worldSelect.selected;
+            if (selected >= 0 && selected < worldCount) {
+                deleteWorld(state->worldList[static_cast<size_t>(selected)].directory);
+            }
+            state->worldList = listWorlds();
+            state->worldSelect = WorldSelectState{};
+            [self applyFlowEffects:state->flow.onMenuAction(MenuAction::CANCEL_DELETE)];
+            return;
+        }
+        case MenuAction::CREATIVE_PAGE_PREV:
+            state->creativePage = std::max(0, state->creativePage - 1);
+            return;
+        case MenuAction::CREATIVE_PAGE_NEXT: {
+            const int pageCount =
+                (static_cast<int>(CREATIVE_PALETTE.size()) + CREATIVE_PALETTE_PAGE_SIZE - 1) /
+                CREATIVE_PALETTE_PAGE_SIZE;
+            state->creativePage = std::min(pageCount - 1, state->creativePage + 1);
+            return;
+        }
+        case MenuAction::TOGGLE_GAME_MODE:
+            state->gameMode =
+                state->gameMode == GameMode::CREATIVE ? GameMode::SURVIVAL : GameMode::CREATIVE;
+            return;
+        case MenuAction::RESPAWN:
+            [self respawnPlayer:state];
+            return;
+        case MenuAction::SAVE_QUIT_TO_TITLE:
+            [self stopWorld];
+            return;
+        default:
+            break;
+    }
+    [self applySettingAction:action];
+    [self applyFlowEffects:state->flow.onMenuAction(action)];
+    if ((action == MenuAction::CLOSE_SETTINGS || action == MenuAction::CLOSE_VIDEO_SETTINGS) &&
+        !state->envOverridesActive) {
+        saveSettings(settingsPath(), state->settings, state->gfx);
+    }
+}
+
 - (void)handleGlobalInput {
     EngineState* state = _state.get();
     if (!state->inputManager)
         return;
     InputState& input = state->inputManager->state();
 
+    if (state->world && !input.textEntryActive &&
+        input.isJustPressed(InputBindings{}.inventory.key)) {
+        if (state->flow.inContainer()) {
+            [self closeContainerSession];
+        }
+        [self applyFlowEffects:state->flow.onInventoryKey()];
+    }
     if (input.isJustPressed(Key::Escape)) {
-        // Leaving a settings screen persists the values (not per click —
-        // no disk I/O while stepping)
-        bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
-                               state->flow.screen == GameScreen::VIDEO_SETTINGS;
-        [self applyFlowEffects:state->flow.onEscape()];
-        if (leavingSettings && !state->envOverridesActive) {
-            saveSettings(settingsPath(), state->settings, state->gfx);
+        if (input.textEntryActive) {
+            // Escape closes the field, not the screen.
+            [self commitTextEntry];
+        } else {
+            if (state->flow.inContainer()) {
+                [self closeContainerSession];
+            }
+            // Leaving a settings screen persists the values (not per click,
+            // no disk I/O while stepping)
+            bool leavingSettings = state->flow.screen == GameScreen::SETTINGS ||
+                                   state->flow.screen == GameScreen::VIDEO_SETTINGS;
+            [self applyFlowEffects:state->flow.onEscape()];
+            if (leavingSettings && !state->envOverridesActive) {
+                saveSettings(settingsPath(), state->settings, state->gfx);
+            }
         }
     }
     if (input.isJustPressed(Key::F3)) {
@@ -900,34 +1570,213 @@ static EngineState* _engineGetState(Engine* engine) {
         // hit-test in window points — the same normalized space it's drawn in
         float boundsW = static_cast<float>(_view.bounds.size.width);
         float boundsH = static_cast<float>(_view.bounds.size.height);
-        state->menuLayout =
-            buildMenuLayout(state->flow.screen, boundsW, boundsH, state->settings, state->gfx);
+
+        // Live text entry streams into the focused create-screen field.
+        if (input.textEntryActive && state->worldCreate.focusedField >= 0) {
+            const bool digits = state->worldCreate.focusedField == 1;
+            const std::string filtered = filterTextField(
+                input.textBuffer, digits,
+                digits ? WorldCreateState::MAX_SEED_LENGTH : WorldCreateState::MAX_NAME_LENGTH);
+            if (filtered != input.textBuffer) {
+                input.textBuffer = filtered;
+            }
+            if (state->worldCreate.focusedField == 0) {
+                state->worldCreate.name = filtered;
+            } else {
+                state->worldCreate.seedText = filtered;
+            }
+            if (input.textSubmitted) {
+                [self commitTextEntry];
+            }
+        }
+
+        MenuContext menuCtx;
+        menuCtx.settings = state->settings;
+        menuCtx.gfx = &state->gfx;
+        menuCtx.mode = state->gameMode;
+        menuCtx.caretVisible = (state->frameCount / 30) % 2 == 0;
+        menuCtx.deathMessage = state->deathMessage;
+        if (state->flow.screen == GameScreen::WORLD_SELECT ||
+            state->flow.screen == GameScreen::WORLD_DELETE_CONFIRM) {
+            menuCtx.worldRows.reserve(state->worldList.size());
+            for (const WorldSummary& world : state->worldList) {
+                menuCtx.worldRows.push_back(world.metadata.name + " - " +
+                                            gameModeName(world.metadata.gameMode) + " - Seed " +
+                                            std::to_string(world.metadata.seed));
+            }
+            menuCtx.worldSelect = state->worldSelect;
+            const int selected = state->worldSelect.selected;
+            if (selected >= 0 && selected < static_cast<int>(state->worldList.size())) {
+                menuCtx.deleteWorldName =
+                    state->worldList[static_cast<size_t>(selected)].metadata.name;
+            }
+        }
+        if (state->flow.screen == GameScreen::WORLD_CREATE) {
+            menuCtx.worldCreate = state->worldCreate;
+        }
+        if (state->flow.inContainer()) {
+            ContainerView& view = menuCtx.container;
+            view.inventory = state->inventory.slots();
+            view.craftGrid = state->craftGrid;
+            view.craftGridSize = state->flow.screen == GameScreen::CRAFTING ? 9 : 4;
+            view.craftResult = state->craftResult;
+            view.creative = state->flow.screen == GameScreen::INVENTORY &&
+                            state->gameMode == GameMode::CREATIVE;
+            view.creativePage = state->creativePage;
+            if (state->flow.screen == GameScreen::FURNACE && state->openFurnace) {
+                auto it = state->furnaces.find(*state->openFurnace);
+                if (it != state->furnaces.end()) {
+                    view.furnaceInput = it->second.input;
+                    view.furnaceFuel = it->second.fuel;
+                    view.furnaceOutput = it->second.output;
+                    view.furnaceCook = it->second.cookFraction();
+                    view.furnaceFuelLeft = it->second.fuelFraction();
+                }
+            }
+            if (state->flow.screen == GameScreen::CHEST && state->openChest) {
+                auto it = state->chests.find(*state->openChest);
+                if (it != state->chests.end()) {
+                    view.chestSlots = it->second.slots;
+                }
+            }
+        }
+        if (state->flow.inContainer() && state->flow.screen != GameScreen::FURNACE &&
+            state->flow.screen != GameScreen::CHEST && state->gameMode != GameMode::CREATIVE) {
+            const int gridSize = state->flow.screen == GameScreen::CRAFTING ? 9 : 4;
+            const int gridWidth = state->flow.screen == GameScreen::CRAFTING ? 3 : 2;
+            const auto result = matchCraftingRecipe(
+                std::span<const ItemStack>(state->craftGrid.data(), static_cast<size_t>(gridSize)),
+                gridWidth);
+            state->craftResult = result.value_or(ItemStack{});
+            menuCtx.container.craftResult = state->craftResult;
+        }
+        state->menuLayout = buildScreenLayout(state->flow.screen, boundsW, boundsH, menuCtx);
 
         Vec2 mouse = input.mousePosition;
-        state->hoveredButton = menuHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
+        const UIHit hit = uiHitTest(state->menuLayout, mouse.x / boundsW, mouse.y / boundsH);
+        state->hoveredButton = hit.kind == UIHitKind::BUTTON ? hit.index : -1;
+        state->hoveredSlot = hit.kind == UIHitKind::SLOT ? hit.index : -1;
 
-        if (input.isJustPressed(Key::MouseLeft) && state->hoveredButton >= 0) {
-            MenuAction action =
-                state->menuLayout.buttons[static_cast<size_t>(state->hoveredButton)].action;
-            [self applySettingAction:action];
-            [self applyFlowEffects:state->flow.onMenuAction(action)];
-            if ((action == MenuAction::CLOSE_SETTINGS ||
-                 action == MenuAction::CLOSE_VIDEO_SETTINGS) &&
-                !state->envOverridesActive) {
-                saveSettings(settingsPath(), state->settings, state->gfx);
+        // Slot interaction. A held cursor plus a press over a slot begins a
+        // drag that paints every slot the button crosses and distributes on
+        // release (left even-splits, right spreads one apiece); a quick second
+        // left click on the same slot gathers instead; a lone click picks,
+        // places, or quick-moves through applySlotClick.
+        SlotAccess access = [self slotAccessForScreen];
+        const SlotRef hovered = hit.kind == UIHitKind::SLOT
+                                    ? state->menuLayout.slots[static_cast<size_t>(hit.index)].ref
+                                    : SlotRef{};
+        const auto sameSlot = [](SlotRef a, SlotRef b) {
+            return a.domain == b.domain && a.index == b.index;
+        };
+
+        if (hit.kind == UIHitKind::SLOT &&
+            (input.isJustPressed(Key::MouseLeft) || input.isJustPressed(Key::MouseRight))) {
+            const bool isLeft = input.isJustPressed(Key::MouseLeft);
+            const double now = CACurrentMediaTime();
+            const bool doubleClick =
+                isLeft && !state->cursorStack.empty() &&
+                now - state->lastSlotClickSeconds <= EngineState::DOUBLE_CLICK_WINDOW &&
+                sameSlot(state->lastSlotClickRef, hovered);
+            if (doubleClick) {
+                if (applyDoubleClick(access, state->cursorStack).changed) {
+                    [self playUiSfx:state->sfxClick gain:0.3f];
+                }
+                state->lastSlotClickSeconds = -1.0; // consume: a third click restarts
+            } else if (!state->cursorStack.empty()) {
+                state->dragActive = true;
+                state->dragKind = isLeft ? SlotClickKind::LEFT : SlotClickKind::RIGHT;
+                state->dragMoved = false;
+                state->dragSlots.clear();
+                state->dragSlots.push_back(hovered);
+                if (isLeft) {
+                    state->lastSlotClickSeconds = now;
+                    state->lastSlotClickRef = hovered;
+                }
+            } else {
+                const SlotClickKind kind = !isLeft ? SlotClickKind::RIGHT
+                                           : input.isDown(Key::LeftShift)
+                                               ? SlotClickKind::SHIFT_LEFT
+                                               : SlotClickKind::LEFT;
+                if (applySlotClick(access, state->cursorStack, hovered, kind).changed) {
+                    [self playUiSfx:state->sfxClick gain:0.3f];
+                }
+                if (isLeft) {
+                    state->lastSlotClickSeconds = now;
+                    state->lastSlotClickRef = hovered;
+                }
+            }
+        }
+
+        // Paint newly crossed slots while the drag button stays down.
+        if (state->dragActive && hit.kind == UIHitKind::SLOT) {
+            bool present = false;
+            for (const SlotRef ref : state->dragSlots) {
+                if (sameSlot(ref, hovered)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                state->dragSlots.push_back(hovered);
+                state->dragMoved = true;
+            }
+        }
+
+        // Release finalizes: a real multi-slot drag distributes, a lone
+        // press-release falls back to a normal place click.
+        const Key dragButton =
+            state->dragKind == SlotClickKind::RIGHT ? Key::MouseRight : Key::MouseLeft;
+        if (state->dragActive && input.isJustReleased(dragButton)) {
+            if (state->dragMoved && state->dragSlots.size() >= 2) {
+                if (applySlotDrag(access, state->cursorStack,
+                                  std::span<const SlotRef>(state->dragSlots), state->dragKind)
+                        .changed) {
+                    [self playUiSfx:state->sfxClick gain:0.3f];
+                }
+            } else if (!state->dragSlots.empty() &&
+                       applySlotClick(access, state->cursorStack, state->dragSlots.front(),
+                                      state->dragKind)
+                           .changed) {
+                [self playUiSfx:state->sfxClick gain:0.3f];
+            }
+            state->dragActive = false;
+            state->dragMoved = false;
+            state->dragSlots.clear();
+        }
+
+        if (input.isJustPressed(Key::MouseLeft)) {
+            if (hit.kind == UIHitKind::TEXT_FIELD) {
+                [self commitTextEntry];
+                state->worldCreate.focusedField = hit.index;
+                input.beginTextEntry(hit.index == 0 ? state->worldCreate.name
+                                                    : state->worldCreate.seedText);
+                [self playUiSfx:state->sfxClick gain:0.3f];
+            } else {
+                [self commitTextEntry];
+            }
+            if (hit.kind == UIHitKind::BUTTON) {
+                const MenuButton& button =
+                    state->menuLayout.buttons[static_cast<size_t>(hit.index)];
+                [self playUiSfx:state->sfxClick gain:0.3f];
+                [self handleMenuAction:button.action payload:button.payload];
             }
         }
     } else {
         state->hoveredButton = -1;
+        // No container open: abandon any half-finished drag so it never leaks
+        // a phantom deposit into the next screen.
+        state->dragActive = false;
+        state->dragSlots.clear();
 
         // Hotbar: scroll wheel cycles slots (frame-level, gameplay only)
         _scrollAccumulator += input.scrollDelta;
         while (_scrollAccumulator >= 10.0f) {
-            state->hotbar.selectNext();
+            state->inventory.selectNext();
             _scrollAccumulator -= 10.0f;
         }
         while (_scrollAccumulator <= -10.0f) {
-            state->hotbar.selectPrev();
+            state->inventory.selectPrev();
             _scrollAccumulator += 10.0f;
         }
     }
@@ -954,26 +1803,7 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     EngineState* state = _state.get();
-    if (state->saveManager && state->world) {
-        // Edited chunks persist on unload; the quit path sweeps the rest
-        const bool frontiersSaved = state->world->saveModifiedChunks();
-        SaveManager::PlayerMetadata playerMetadata;
-        playerMetadata.yaw = state->player.yaw;
-        playerMetadata.pitch = state->player.pitch;
-        playerMetadata.health = state->player.health;
-        playerMetadata.selectedSlot = state->hotbar.getSelectedIndex();
-        for (int slot = 0; slot < Hotbar::SLOTS; ++slot) {
-            playerMetadata.inventory[static_cast<size_t>(slot)] = state->hotbar.getSlot(slot);
-        }
-        const bool metadataSaved = state->saveManager->saveMetadata(
-            state->world->getSeed(), state->player.position, state->worldTime, playerMetadata);
-        const bool cubesSaved = state->saveManager->flush();
-        if (frontiersSaved && metadataSaved && cubesSaved) {
-            RY_LOG_INFO("World state saved");
-        } else {
-            RY_LOG_ERROR("World state save did not complete");
-        }
-    }
+    [self saveCurrentWorld];
 
     // Settings share the quit path so mid-session tweaks survive a close
     // that never revisited the settings screen. Env-overridden playtest
@@ -1057,7 +1887,7 @@ static EngineState* _engineGetState(Engine* engine) {
         const char* f = std::getenv("RYCRAFT_TIME_FREEZE");
         return f && *f && std::strcmp(f, "0") != 0;
     }();
-    if (!freezeTime) {
+    if (!freezeTime && state->generation.dayCycle) {
         state->worldTime++;
     }
 
@@ -1150,6 +1980,46 @@ static EngineState* _engineGetState(Engine* engine) {
                 }
             }
 
+            // Playtest hook: RYCRAFT_SPAWN_ITEMS=N scatters N dropped items on
+            // the loaded ground ahead of spawn so headless captures can show
+            // the item entities falling and resting (never in unloaded space,
+            // where closed missing cubes would freeze them mid-air).
+            static const int spawnItems = [] {
+                const char* v = std::getenv("RYCRAFT_SPAWN_ITEMS");
+                return v ? std::clamp(std::atoi(v), 0, 64) : 0;
+            }();
+            for (int i = 0; i < spawnItems; ++i) {
+                const auto type =
+                    CREATIVE_PALETTE[static_cast<size_t>(i) % CREATIVE_PALETTE.size()];
+                const int64_t wx = px + (i % 8) - 3;
+                const int64_t wz = pz + 3 + i / 8;
+                const int32_t surface = static_cast<int32_t>(std::clamp(
+                    state->world->getTerrainHeight(wx, wz) + CHUNK_EDGE,
+                    static_cast<double>(WORLD_MIN_Y + 1), static_cast<double>(WORLD_MAX_Y - 1)));
+                const Vec3 pos{static_cast<float>(wx) + 0.5f, static_cast<float>(surface) + 3.0f,
+                               static_cast<float>(wz) + 0.5f};
+                state->itemEntities.spawn(makeItemStack(type, 1), pos, Vec3{0.f, 0.f, 0.f}, 0);
+            }
+
+            // Playtest hook: RYCRAFT_SPAWN_BOAT=1 drops a boat a few blocks
+            // ahead of spawn so headless captures can show it rendering (on
+            // the RYCRAFT_SPAWN_WATER pool it floats).
+            static const bool spawnBoat = [] {
+                const char* v = std::getenv("RYCRAFT_SPAWN_BOAT");
+                return v && *v && std::strcmp(v, "0") != 0;
+            }();
+            if (spawnBoat) {
+                const int64_t wx = px;
+                const int64_t wz = pz + 4;
+                const int32_t surface = static_cast<int32_t>(std::clamp(
+                    state->world->getTerrainHeight(wx, wz) + CHUNK_EDGE,
+                    static_cast<double>(WORLD_MIN_Y + 1), static_cast<double>(WORLD_MAX_Y - 1)));
+                state->boats.spawn(Vec3{static_cast<float>(wx) + 0.5f,
+                                        static_cast<float>(surface) + 2.0f,
+                                        static_cast<float>(wz) + 0.5f},
+                                   0.f);
+            }
+
             // Playtest hook: RYCRAFT_YAW / RYCRAFT_PITCH (degrees) point the
             // camera for captures — e.g. face the afternoon sun for the lens
             // flare. Yaw 0 looks +Z; -90 looks -X.
@@ -1166,10 +2036,10 @@ static EngineState* _engineGetState(Engine* engine) {
     }
 
     // 2. Hotbar input: keys 1-9 select slots
-    for (int i = 0; i < Hotbar::SLOTS; ++i) {
+    for (int i = 0; i < Inventory::HOTBAR_SLOTS; ++i) {
         Key key = static_cast<Key>(static_cast<int>(Key::One) + i);
         if (input.isPressedForTick(key)) {
-            state->hotbar.selectSlot(i);
+            state->inventory.selectSlot(i);
             break;
         }
     }
@@ -1188,22 +2058,92 @@ static EngineState* _engineGetState(Engine* engine) {
     state->player.yaw = state->camera.yaw();
     state->player.pitch = state->camera.pitch();
 
+    // 4b. Boat riding: while seated, WASD paddles the boat and the rider is
+    // slaved to the seat instead of running the normal player physics. Jump or
+    // sneak dismounts to the side.
+    bool riding =
+        state->ridingBoat >= 0 && state->ridingBoat < static_cast<int>(state->boats.boats().size());
+    Vec3 look = state->camera.forward();
+    Vec3 horizForward{look.x, 0.f, look.z};
+    const float horizLen = horizForward.length();
+    if (horizLen > 1e-4f) {
+        horizForward.x /= horizLen;
+        horizForward.z /= horizLen;
+    }
+    const Vec3 horizRight{-horizForward.z, 0.f, horizForward.x};
+    if (riding &&
+        (input.isPressedForTick(bindings.jump.key) || input.isPressedForTick(bindings.sneak.key))) {
+        Boat& boat = state->boats.boats()[static_cast<size_t>(state->ridingBoat)];
+        state->player.position =
+            boat.position + horizRight + Vec3{0.f, 0.4f, 0.f}; // step out to the side
+        state->player.velocity = Vec3{0.f, 0.f, 0.f};
+        state->ridingBoat = -1;
+        riding = false;
+    }
+    if (riding) {
+        Boat& boat = state->boats.boats()[static_cast<size_t>(state->ridingBoat)];
+        constexpr float PADDLE = 0.02f;
+        Vec3 accel{0.f, 0.f, 0.f};
+        if (input.isDown(bindings.forward.key))
+            accel += horizForward * PADDLE;
+        if (input.isDown(bindings.backward.key))
+            accel -= horizForward * PADDLE;
+        if (input.isDown(bindings.right.key))
+            accel += horizRight * PADDLE;
+        if (input.isDown(bindings.left.key))
+            accel -= horizRight * PADDLE;
+        boat.yaw = std::atan2(horizForward.x, horizForward.z);
+        state->boats.tick(*state->world, state->player.position, state->ridingBoat, accel);
+        // Seat the rider on the boat and freeze player physics for the tick.
+        state->player.position = boat.position + Vec3{0.f, 0.3f, 0.f};
+        state->player.velocity = Vec3{0.f, 0.f, 0.f};
+        state->player.onGround = true;
+        state->player.resetFallDistance();
+    }
+
     // 5. Player physics tick. All movement keys are decoded through the
     // bindings here (sprint once read a hardcoded key and fired on sneak);
     // Player itself never touches the input layer.
-    PlayerInput playerInput;
-    playerInput.forward = input.isDown(bindings.forward.key);
-    playerInput.backward = input.isDown(bindings.backward.key);
-    playerInput.left = input.isDown(bindings.left.key);
-    playerInput.right = input.isDown(bindings.right.key);
-    playerInput.jumpHeld = input.isDown(bindings.jump.key);
-    playerInput.jumpPressed = input.isPressedForTick(bindings.jump.key);
-    playerInput.sprintHeld = input.isDown(bindings.sprint.key);
-    playerInput.descendHeld = input.isDown(bindings.sneak.key);
-    playerInput.doubleTapForward = input.isDoubleTappedForTick(bindings.forward.key);
-    playerInput.doubleTapJump = input.isDoubleTappedForTick(bindings.jump.key);
-    const Vec3 playerPositionBeforeMove = state->player.position;
-    state->player.tick(*state->world, playerInput);
+    bool jumpedThisTick = false;
+    Vec3 playerPositionBeforeMove = state->player.position;
+    if (!riding) {
+        PlayerInput playerInput;
+        playerInput.forward = input.isDown(bindings.forward.key);
+        playerInput.backward = input.isDown(bindings.backward.key);
+        playerInput.left = input.isDown(bindings.left.key);
+        playerInput.right = input.isDown(bindings.right.key);
+        playerInput.jumpHeld = input.isDown(bindings.jump.key);
+        playerInput.jumpPressed = input.isPressedForTick(bindings.jump.key);
+        playerInput.sprintHeld = input.isDown(bindings.sprint.key);
+        playerInput.descendHeld = input.isDown(bindings.sneak.key);
+        playerInput.doubleTapForward = input.isDoubleTappedForTick(bindings.forward.key);
+        playerInput.doubleTapJump = input.isDoubleTappedForTick(bindings.jump.key);
+        playerInput.allowFlight = modeAllowsFlight(state->gameMode);
+        playerInput.takesFallDamage = modeTakesDamage(state->gameMode);
+        // Low food disables sprinting in survival.
+        if (modeDrainsHunger(state->gameMode) &&
+            state->survival.food <= SurvivalStats::SPRINT_DISABLE_FOOD) {
+            playerInput.sprintHeld = false;
+            playerInput.doubleTapForward = false;
+        }
+        jumpedThisTick = playerInput.jumpPressed && state->player.onGround;
+        const int healthBeforeMove = state->player.health;
+        state->player.tick(*state->world, playerInput);
+        // Player::tick applies fall damage directly to health; catch it here for
+        // the hurt sound and the death-screen cause.
+        if (state->player.health < healthBeforeMove && modeTakesDamage(state->gameMode)) {
+            state->deathMessage = "YOU FELL";
+            if (state->hurtSoundCooldown == 0) {
+                [self playSfx:state->sfxHurt gain:0.7f];
+                state->hurtSoundCooldown = 10;
+            }
+        }
+        // On foot, drift every floating boat once this tick (the ridden boat
+        // already stepped above with the rider's paddle).
+        state->boats.tick(*state->world, state->player.position, -1, Vec3{});
+    }
+    if (state->hurtSoundCooldown > 0)
+        --state->hurtSoundCooldown;
 
     // 5b. Footsteps: one thud roughly every two blocks walked on the ground
     if (state->audio) {
@@ -1218,6 +2158,32 @@ static EngineState* _engineGetState(Engine* engine) {
             }
         } else {
             state->footstepDistance = 0.f;
+        }
+    }
+
+    // 5c. Survival stats: exhaustion, hunger, air, regen, starvation, and
+    // drowning. Creative freezes them all.
+    if (modeTakesDamage(state->gameMode)) {
+        const Vec3 eye = state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f};
+        const int64_t ex = static_cast<int64_t>(std::floor(eye.x));
+        const int32_t ey = static_cast<int32_t>(std::floor(eye.y));
+        const int64_t ez = static_cast<int64_t>(std::floor(eye.z));
+        const bool eyesUnderwater =
+            state->world->getBlockIfLoaded(ex, ey, ez) == BlockType::WATER &&
+            eye.y < static_cast<float>(ey) + state->world->getFluidHeightIfLoaded(ex, ey, ez);
+
+        SurvivalTickInputs inputs;
+        inputs.sprinting = state->player.sprinting && state->player.onGround;
+        inputs.swimming = state->player.swimming;
+        inputs.jumped = jumpedThisTick;
+        inputs.eyesUnderwater = eyesUnderwater;
+        const int delta = tickSurvivalStats(state->survival, inputs, state->player.health);
+        if (delta < 0) {
+            [self damagePlayer:state
+                        amount:-delta
+                       message:eyesUnderwater ? "YOU DROWNED" : "YOU STARVED"];
+        } else if (delta > 0) {
+            state->player.health = std::min(20, state->player.health + delta);
         }
     }
 
@@ -1305,8 +2271,8 @@ static EngineState* _engineGetState(Engine* engine) {
         uint32_t tod = static_cast<uint32_t>(state->worldTime % EngineState::TICKS_PER_DAY);
         uint32_t start = 3000u + static_cast<uint32_t>((h >> 8) % 12000u);
         uint32_t length = 2000u + static_cast<uint32_t>((h >> 4) % 4000u);
-        state->raining =
-            (h % 100u) < EngineState::RAIN_DAYS_PERCENT && tod >= start && tod < start + length;
+        state->raining = state->generation.weather && (h % 100u) < EngineState::RAIN_DAYS_PERCENT &&
+                         tod >= start && tod < start + length;
         static const char* weatherEnv = std::getenv("RYCRAFT_WEATHER");
         if (weatherEnv) {
             // Playtest override skips the soak ramp so captures are stable.
@@ -1341,14 +2307,184 @@ static EngineState* _engineGetState(Engine* engine) {
         state->hasHighlightedBlock = false;
     }
 
-    // Block breaking (left mouse click)
-    if (input.isPressedForTick(Key::MouseLeft)) {
-        [self breakBlock:state hit:rayHit];
+    // Attack precedence: a left-click edge on an animal nearer than the block
+    // target hits it instead of mining. Reach is shorter than block reach.
+    bool attackedEntity = NO;
+
+    // A left click on a boat pops it back into a boat item and suppresses
+    // mining for the tick.
+    if (input.isPressedForTick(Key::MouseLeft) && !state->boats.empty()) {
+        const int boatIndex = state->boats.pick(cameraPos, forward, 3.5f);
+        if (boatIndex >= 0) {
+            const Vec3 pos = state->boats.boats()[static_cast<size_t>(boatIndex)].position;
+            if (state->ridingBoat == boatIndex)
+                state->ridingBoat = -1;
+            else if (state->ridingBoat > boatIndex)
+                --state->ridingBoat; // the removal shifts later indices down
+            const ItemStack boatItem{ItemType::BOAT, 1, 0};
+            if (modeConsumesItems(state->gameMode)) {
+                [self spawnDrop:state
+                          stack:boatItem
+                            atX:static_cast<int64_t>(std::floor(pos.x))
+                              y:static_cast<int32_t>(std::floor(pos.y))
+                              z:static_cast<int64_t>(std::floor(pos.z))];
+            } else {
+                state->inventory.add(boatItem);
+            }
+            state->boats.remove(static_cast<size_t>(boatIndex));
+            [self playSfx:state->sfxBlockBreak gain:0.5f];
+            attackedEntity = YES;
+        }
     }
 
-    // Block placing (right mouse click)
-    if (input.isPressedForTick(Key::MouseRight)) {
-        [self placeBlock:state hit:rayHit];
+    if (!attackedEntity && input.isPressedForTick(Key::MouseLeft) && state->spawner) {
+        const auto entityHit = pickEntity(cameraPos, forward, 3.0f, state->spawner->getEntities());
+        if (entityHit) {
+            float blockDistance = 1e9f;
+            if (rayHit.has_value()) {
+                const Vec3 center{static_cast<float>(std::floor(rayHit->first.x)) + 0.5f,
+                                  static_cast<float>(std::floor(rayHit->first.y)) + 0.5f,
+                                  static_cast<float>(std::floor(rayHit->first.z)) + 0.5f};
+                blockDistance = (center - cameraPos).length();
+            }
+            if (entityHit->distance <= blockDistance) {
+                [self attackEntity:state entityId:entityHit->entityId];
+                attackedEntity = YES;
+            }
+        }
+    }
+
+    // Block breaking. Creative is instant on the click edge; survival mines
+    // held-left over time, its speed set by hardness and the held tool.
+    if (attackedEntity) {
+        // Attacking suppresses mining this tick but keeps any held progress.
+    } else if (modeInstantBreak(state->gameMode)) {
+        state->miningState.reset();
+        if (input.isPressedForTick(Key::MouseLeft)) {
+            [self breakBlock:state hit:rayHit withDrops:NO];
+        }
+    } else {
+        bool hasTarget = NO;
+        int64_t tx = 0;
+        int32_t ty = 0;
+        int64_t tz = 0;
+        BlockType targetBlock = BlockType::AIR;
+        if (rayHit.has_value()) {
+            tx = static_cast<int64_t>(std::floor(rayHit->first.x));
+            ty = static_cast<int32_t>(std::floor(rayHit->first.y));
+            tz = static_cast<int64_t>(std::floor(rayHit->first.z));
+            const std::optional<BlockType> block = state->world->findBlockIfLoaded(tx, ty, tz);
+            if (block && *block != BlockType::AIR) {
+                hasTarget = YES;
+                targetBlock = *block;
+            }
+        }
+        const ItemType held = state->inventory.getSelectedStack().type;
+        if (tickMining(state->miningState, input.mouseLeftDown, hasTarget, tx, ty, tz, targetBlock,
+                       held)) {
+            [self breakBlock:state hit:rayHit withDrops:YES];
+            state->survival.exhaustion += SurvivalStats::EXHAUST_MINE_BLOCK;
+        }
+    }
+
+    // Right click precedence: open an interactable block, else eat held food,
+    // else place. Opening and placing are click edges; eating is held.
+    {
+        InputBindings bindings;
+        bool interactableTarget = NO;
+        if (input.isPressedForTick(Key::MouseRight) && rayHit.has_value() &&
+            !input.isDown(bindings.sneak.key)) {
+            const int64_t bx = static_cast<int64_t>(std::floor(rayHit->first.x));
+            const int32_t by = static_cast<int32_t>(std::floor(rayHit->first.y));
+            const int64_t bz = static_cast<int64_t>(std::floor(rayHit->first.z));
+            const std::optional<BlockType> block = state->world->findBlockIfLoaded(bx, by, bz);
+            if (block && isInteractable(*block)) {
+                interactableTarget = YES;
+                const BlockPos pos{bx, by, bz};
+                if (*block == BlockType::CRAFTING_TABLE) {
+                    state->craftGrid.fill(ItemStack{});
+                    state->craftResult.clear();
+                    [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::CRAFTING)];
+                } else if (*block == BlockType::CHEST) {
+                    state->openChest = pos;
+                    state->chests.try_emplace(pos);
+                    [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::CHEST)];
+                } else {
+                    state->openFurnace = pos;
+                    state->furnaces.try_emplace(pos);
+                    [self applyFlowEffects:state->flow.onContainerOpened(GameScreen::FURNACE)];
+                }
+            } else if (block && *block == BlockType::BED) {
+                interactableTarget = YES;
+                [self sleepInBed:state atX:bx y:by z:bz];
+            }
+        }
+
+        // Mounting or placing a boat consumes the right-click before eating or
+        // block placement, and works whether or not a block was aimed at.
+        if (!interactableTarget && input.isPressedForTick(Key::MouseRight) &&
+            [self tryBoatInteraction:state cameraPos:cameraPos forward:forward]) {
+            interactableTarget = YES;
+        }
+
+        const ItemStack selected = state->inventory.getSelectedStack();
+        const bool holdingFood = modeDrainsHunger(state->gameMode) && isFood(selected.type) &&
+                                 state->survival.food < SurvivalStats::MAX_FOOD;
+        if (!interactableTarget && holdingFood) {
+            if (tickEating(state->eatingState, input.mouseRightDown,
+                           state->inventory.getSelectedIndex(), true, state->survival.food)) {
+                const ItemDefinition def = itemDefinition(selected.type);
+                state->survival.food =
+                    std::min(SurvivalStats::MAX_FOOD, state->survival.food + def.foodValue);
+                state->survival.saturation = std::min(static_cast<float>(state->survival.food),
+                                                      state->survival.saturation + def.foodValue);
+                state->inventory.consumeSelected();
+                [self playSfx:state->sfxEat gain:0.6f];
+            }
+        } else {
+            state->eatingState.reset();
+            if (!interactableTarget && input.isPressedForTick(Key::MouseRight)) {
+                // Shears cut wool from a sheep; a held bucket fills or empties a
+                // fluid; otherwise place the held block.
+                if ([self tryShearSheep:state cameraPos:cameraPos forward:forward]) {
+                    // handled
+                } else if (![self tryBucketInteraction:state
+                                             cameraPos:cameraPos
+                                               forward:forward
+                                                   hit:rayHit]) {
+                    [self placeBlock:state hit:rayHit];
+                }
+            }
+        }
+    }
+
+    // Q drops one item from the selected hotbar stack, thrown ahead of the
+    // eye. Creative drops without decrementing.
+    {
+        InputBindings bindings;
+        if (input.isPressedForTick(bindings.drop.key)) {
+            const ItemStack selected = state->inventory.getSelectedStack();
+            if (!selected.empty()) {
+                const Vec3 eye = state->player.position + Vec3{0.f, Player::EYE_HEIGHT, 0.f};
+                const Vec3 dir = state->camera.forward();
+                const Vec3 velocity{dir.x * 0.3f, dir.y * 0.3f + 0.15f, dir.z * 0.3f};
+                state->itemEntities.spawn(ItemStack{selected.type, 1, selected.durability},
+                                          eye + dir * 0.4f, velocity, 40);
+                if (modeConsumesItems(state->gameMode)) {
+                    state->inventory.consumeSelected();
+                }
+            }
+        }
+    }
+
+    // Dropped items: physics, merge, despawn, then a pickup pass into the
+    // inventory. Beyond the manager's active radius items freeze.
+    [self tickItemEntities:state];
+
+    // Death: any survival damage that emptied the health bar ends the tick on
+    // the death screen with the inventory scattered.
+    if (modeTakesDamage(state->gameMode) && state->player.health <= 0) {
+        [self killPlayer:state];
     }
 
     // Publish the immutable loaded-cube registry once per simulation tick.
@@ -1361,7 +2497,7 @@ static EngineState* _engineGetState(Engine* engine) {
 
 // ---- Block Breaking (Task 6.1) ----
 
-- (void)breakBlock:(EngineState*)state hit:(BlockRayHit)hit {
+- (void)breakBlock:(EngineState*)state hit:(BlockRayHit)hit withDrops:(BOOL)withDrops {
     if (!hit.has_value())
         return;
 
@@ -1374,6 +2510,44 @@ static EngineState* _engineGetState(Engine* engine) {
     if (!current || *current == BlockType::BEDROCK)
         return;
 
+    // A broken furnace loses its state entry; its contents scatter (survival)
+    // or return to the player (creative-instant, which never drops).
+    if (*current == BlockType::FURNACE || *current == BlockType::FURNACE_LIT) {
+        auto it = state->furnaces.find(BlockPos{hitX, hitY, hitZ});
+        if (it != state->furnaces.end()) {
+            for (const ItemStack& stack : {it->second.input, it->second.fuel, it->second.output}) {
+                if (stack.empty())
+                    continue;
+                if (withDrops) {
+                    [self spawnDrop:state stack:stack atX:hitX y:hitY z:hitZ];
+                } else {
+                    state->inventory.add(stack);
+                }
+            }
+            state->furnaces.erase(it);
+        }
+    }
+
+    // A broken chest empties its whole 27-slot store the same way.
+    if (*current == BlockType::CHEST) {
+        auto it = state->chests.find(BlockPos{hitX, hitY, hitZ});
+        if (it != state->chests.end()) {
+            for (const ItemStack& stack : it->second.slots) {
+                if (stack.empty())
+                    continue;
+                if (withDrops) {
+                    [self spawnDrop:state stack:stack atX:hitX y:hitY z:hitZ];
+                } else {
+                    state->inventory.add(stack);
+                }
+            }
+            state->chests.erase(it);
+        }
+    }
+
+    const BlockType broken = *current;
+    const ItemStack heldStack = state->inventory.getSelectedStack();
+
     // Set block to air
     state->world->setBlock(hitX, hitY, hitZ, BlockType::AIR);
 
@@ -1381,7 +2555,30 @@ static EngineState* _engineGetState(Engine* engine) {
     // (same column → same chunk → the dirty/save below covers it)
     const std::optional<BlockType> flora = state->world->findBlockIfLoaded(hitX, hitY + 1, hitZ);
     if (flora && isFlora(*flora)) {
+        const BlockType floraBlock = *flora;
         state->world->setBlock(hitX, hitY + 1, hitZ, BlockType::AIR);
+        if (withDrops) {
+            const BlockDrop floraDrop = blockDrop(floraBlock);
+            if (floraDrop.count > 0) {
+                [self spawnDrop:state
+                          stack:ItemStack{floraDrop.item, floraDrop.count, 0}
+                            atX:hitX
+                              y:hitY + 1
+                              z:hitZ];
+            }
+        }
+    }
+
+    // Survival loot: the block's drop, gated by the tool tier, plus one point
+    // of tool wear.
+    if (withDrops) {
+        const BlockDrop drop = blockDrop(broken);
+        if (drop.count > 0 && toolCanHarvest(broken, heldStack.type)) {
+            [self spawnDrop:state stack:ItemStack{drop.item, drop.count, 0} atX:hitX y:hitY z:hitZ];
+        }
+        if (isTool(heldStack.type)) {
+            state->inventory.damageSelectedTool();
+        }
     }
 
     // World::setBlock marks the chunk (and boundary neighbors) dirty and
@@ -1393,7 +2590,190 @@ static EngineState* _engineGetState(Engine* engine) {
     [self playSfx:state->sfxBlockBreak gain:0.8f];
 }
 
+// Spawn a dropped item at the center of a broken block with a small random
+// pop so drops do not stack into a single point.
+- (void)spawnDrop:(EngineState*)state
+            stack:(ItemStack)stack
+              atX:(int64_t)x
+                y:(int32_t)y
+                z:(int64_t)z {
+    const Vec3 center{static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.25f,
+                      static_cast<float>(z) + 0.5f};
+    const uint64_t h =
+        hash64(static_cast<uint64_t>(x) * 6364136223846793005ull +
+               static_cast<uint64_t>(z) * 1442695040888963407ull + static_cast<uint64_t>(y));
+    const float vx = (static_cast<float>(h & 0xFF) / 255.f - 0.5f) * 0.1f;
+    const float vz = (static_cast<float>((h >> 8) & 0xFF) / 255.f - 0.5f) * 0.1f;
+    state->itemEntities.spawn(stack, center, Vec3{vx, 0.15f, vz}, 10);
+}
+
 // ---- Block Placing (Task 6.2) ----
+
+// Right-clicking a boat mounts it; right-clicking water with a boat item
+// places one on the surface. Returns YES when it handled the click.
+- (BOOL)tryBoatInteraction:(EngineState*)state cameraPos:(Vec3)cameraPos forward:(Vec3)forward {
+    if (!state->world)
+        return NO;
+
+    // Mounting an aimed boat takes priority and works with any held item.
+    const int boatIndex = state->boats.pick(cameraPos, forward, 4.0f);
+    if (boatIndex >= 0) {
+        state->ridingBoat = boatIndex;
+        [self playSfx:state->sfxBlockPlace gain:0.3f];
+        return YES;
+    }
+
+    if (state->inventory.getSelectedStack().type != ItemType::BOAT)
+        return NO;
+
+    // March the aim ray for the first water surface within reach; fluids are
+    // not solid, so the standard block ray passes straight through them.
+    constexpr float REACH = 5.0f;
+    constexpr float STEP = 0.1f;
+    for (float t = 0.f; t <= REACH; t += STEP) {
+        const int64_t bx = static_cast<int64_t>(std::floor(cameraPos.x + forward.x * t));
+        const int32_t by = static_cast<int32_t>(std::floor(cameraPos.y + forward.y * t));
+        const int64_t bz = static_cast<int64_t>(std::floor(cameraPos.z + forward.z * t));
+        const std::optional<BlockType> block = state->world->findBlockIfLoaded(bx, by, bz);
+        if (!block)
+            return NO;
+        if (*block == BlockType::WATER) {
+            const float surface =
+                static_cast<float>(by) + state->world->getFluidHeightIfLoaded(bx, by, bz);
+            state->boats.spawn(
+                Vec3{static_cast<float>(bx) + 0.5f, surface, static_cast<float>(bz) + 0.5f},
+                std::atan2(forward.x, forward.z));
+            if (modeConsumesItems(state->gameMode))
+                state->inventory.consumeSelected();
+            [self playSfx:state->sfxBlockPlace gain:0.5f];
+            return YES;
+        }
+        if (isSolid(*block))
+            return NO; // an opaque block blocks the aim before any water
+    }
+    return NO;
+}
+
+// Shearing a sheep with shears drops wool without killing it, the Minecraft
+// way to gather the wool a bed needs. Returns YES when it handled the click.
+- (BOOL)tryShearSheep:(EngineState*)state cameraPos:(Vec3)cameraPos forward:(Vec3)forward {
+    if (state->inventory.getSelectedStack().type != ItemType::SHEARS || !state->spawner)
+        return NO;
+    const auto hit = pickEntity(cameraPos, forward, 3.0f, state->spawner->getEntities());
+    if (!hit)
+        return NO;
+    for (auto& entity : state->spawner->getEntities()) {
+        if (!entity || entity->id != hit->entityId || !entity->alive ||
+            entity->type != EntityType::SHEEP) {
+            continue;
+        }
+        [self spawnDrop:state
+                  stack:ItemStack{itemFromBlock(BlockType::WOOL), 2, 0}
+                    atX:static_cast<int64_t>(std::floor(entity->position.x))
+                      y:static_cast<int32_t>(std::floor(entity->position.y))
+                      z:static_cast<int64_t>(std::floor(entity->position.z))];
+        [self playSfx:state->sfxBlockBreak gain:0.4f];
+        return YES;
+    }
+    return NO;
+}
+
+// Right-clicking a bed sets the spawn anchor and, at night, sleeps through to
+// dawn, exactly like Minecraft.
+- (void)sleepInBed:(EngineState*)state atX:(int64_t)bx y:(int32_t)by z:(int64_t)bz {
+    state->worldSpawn = Vec3{static_cast<float>(bx) + 0.5f, static_cast<float>(by) + 1.0f,
+                             static_cast<float>(bz) + 0.5f};
+    // Sleepable night runs from dusk to just before dawn; sleeping jumps the
+    // clock to the next dawn (the tick-0 rollover the sun orbit treats as day).
+    const uint64_t tod = state->worldTime % EngineState::TICKS_PER_DAY;
+    constexpr uint64_t NIGHT_START = 12500;
+    constexpr uint64_t NIGHT_END = 23500;
+    if (tod >= NIGHT_START && tod < NIGHT_END) {
+        state->worldTime =
+            ((state->worldTime / EngineState::TICKS_PER_DAY) + 1) * EngineState::TICKS_PER_DAY;
+    }
+    [self playSfx:state->sfxBlockPlace gain:0.3f];
+}
+
+// Empty and filled buckets exchange a single fluid source with the world,
+// exactly like Minecraft: an empty bucket scoops the water source or lava it
+// is aimed at, and a filled bucket empties its fluid against the targeted
+// block face. Returns YES when it handled the click.
+- (BOOL)tryBucketInteraction:(EngineState*)state
+                   cameraPos:(Vec3)cameraPos
+                     forward:(Vec3)forward
+                         hit:(BlockRayHit)hit {
+    const ItemStack selected = state->inventory.getSelectedStack();
+    const ItemType held = selected.type;
+    if (held != ItemType::BUCKET && held != ItemType::WATER_BUCKET &&
+        held != ItemType::LAVA_BUCKET) {
+        return NO;
+    }
+
+    const bool creative = !modeConsumesItems(state->gameMode);
+    const int selectedIndex = state->inventory.getSelectedIndex();
+    auto swapSelected = [&](ItemType to) {
+        if (!creative)
+            state->inventory.setSlot(selectedIndex, ItemStack{to, 1, 0});
+    };
+
+    if (held == ItemType::BUCKET) {
+        // March the aim ray for the first fluid source within reach; fluids are
+        // not solid, so the standard block ray passes straight through them.
+        constexpr float REACH = 5.0f;
+        constexpr float STEP = 0.1f;
+        for (float t = 0.f; t <= REACH; t += STEP) {
+            const int64_t bx = static_cast<int64_t>(std::floor(cameraPos.x + forward.x * t));
+            const int32_t by = static_cast<int32_t>(std::floor(cameraPos.y + forward.y * t));
+            const int64_t bz = static_cast<int64_t>(std::floor(cameraPos.z + forward.z * t));
+            const std::optional<BlockType> block = state->world->findBlockIfLoaded(bx, by, bz);
+            if (!block)
+                return NO;
+            if (*block == BlockType::WATER) {
+                const FluidCell cell = state->world->readFluidCell(FluidPos{bx, by, bz});
+                if (!cell.state.isSource())
+                    continue; // only a full source fills a bucket
+                state->world->setBlock(bx, by, bz, BlockType::AIR);
+                swapSelected(ItemType::WATER_BUCKET);
+                [self playSfx:state->sfxBlockPlace gain:0.5f];
+                return YES;
+            }
+            if (*block == BlockType::LAVA) {
+                state->world->setBlock(bx, by, bz, BlockType::AIR);
+                swapSelected(ItemType::LAVA_BUCKET);
+                [self playSfx:state->sfxBlockPlace gain:0.5f];
+                return YES;
+            }
+            if (isSolid(*block))
+                return NO; // an opaque block blocks the aim before any fluid
+        }
+        return NO;
+    }
+
+    // A filled bucket pours its fluid against the targeted block face.
+    if (!hit.has_value())
+        return NO;
+    const BlockType fluid = held == ItemType::WATER_BUCKET ? BlockType::WATER : BlockType::LAVA;
+    const int64_t px =
+        static_cast<int64_t>(std::floor(hit->first.x)) + static_cast<int64_t>(hit->second.x);
+    const int32_t py =
+        static_cast<int32_t>(std::floor(hit->first.y)) + static_cast<int32_t>(hit->second.y);
+    const int64_t pz =
+        static_cast<int64_t>(std::floor(hit->first.z)) + static_cast<int64_t>(hit->second.z);
+    if (py < WORLD_MIN_Y || py > WORLD_MAX_Y)
+        return NO;
+    const ChunkPos placeChunk{Chunk::worldToChunk(px), Chunk::worldToChunkY(py),
+                              Chunk::worldToChunk(pz)};
+    if (!state->world->isChunkLoaded(placeChunk))
+        return NO;
+    const std::optional<BlockType> target = state->world->findBlockIfLoaded(px, py, pz);
+    if (!target || (*target != BlockType::AIR && *target != BlockType::WATER))
+        return NO;
+    state->world->setBlock(px, py, pz, fluid);
+    swapSelected(ItemType::BUCKET);
+    [self playSfx:state->sfxBlockPlace gain:0.5f];
+    return YES;
+}
 
 - (void)placeBlock:(EngineState*)state hit:(BlockRayHit)hit {
     if (!hit.has_value())
@@ -1422,9 +2802,24 @@ static EngineState* _engineGetState(Engine* engine) {
         return;
 
     // Place block (World::setBlock marks the chunk and boundary neighbors
-    // dirty and flags the chunk for save-on-unload)
-    BlockType selectedType = state->hotbar.getSelectedBlockType();
+    // dirty and flags the chunk for save-on-unload). An empty slot or a
+    // non-block item has nothing to place.
+    BlockType selectedType = state->inventory.getSelectedBlockType();
+    if (selectedType == BlockType::AIR)
+        return;
     state->world->setBlock(placeX, placeY, placeZ, selectedType);
+
+    // A placed furnace or chest gets an empty state entry so it persists.
+    if (selectedType == BlockType::FURNACE) {
+        state->furnaces.try_emplace(BlockPos{placeX, placeY, placeZ});
+    } else if (selectedType == BlockType::CHEST) {
+        state->chests.try_emplace(BlockPos{placeX, placeY, placeZ});
+    }
+
+    // Survival consumes the placed block; creative keeps its infinite stack.
+    if (modeConsumesItems(state->gameMode)) {
+        state->inventory.consumeSelected();
+    }
 
     [self playSfx:state->sfxBlockPlace gain:0.8f];
 }
@@ -1464,8 +2859,38 @@ static EngineState* _engineGetState(Engine* engine) {
     if (!drawable)
         return;
 
-    if (!_renderPipeline || !state->world)
+    if (!_renderPipeline)
         return;
+
+    // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
+    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered, then
+    // quits ~1s later (the PNG write is async). A capture run is headless
+    // tooling: leaving it running leaked a full game instance per capture
+    // until concurrent playtests exhausted system memory. Runs before the
+    // world branch so menu screens capture too.
+    static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
+    if (capturePath && *capturePath) {
+        static const uint64_t captureFrame = [] {
+            const char* frameEnv = std::getenv("RYCRAFT_CAPTURE_FRAME");
+            return frameEnv ? static_cast<uint64_t>(std::atoll(frameEnv)) : uint64_t{240};
+        }();
+        if (state->frameCount == captureFrame) {
+            _renderPipeline->requestFrameCapture(capturePath);
+        }
+        if (state->frameCount == captureFrame + 60) {
+            [self requestQuit];
+        }
+    }
+
+    // Menu-only frame while no world session is live (title, world menus).
+    if (!state->world) {
+        UIFrameState uiFrame;
+        uiFrame.screen = state->flow.screen;
+        uiFrame.hoveredButton = state->hoveredButton;
+        uiFrame.menu = state->menuLayout;
+        _renderPipeline->renderMenuOnly(_queue, drawable, uiFrame);
+        return;
+    }
 
     // Log render + streaming diagnostics every 60 frames (the same numbers
     // the F3 HUD shows, so headless playtests can measure against budgets;
@@ -1526,25 +2951,6 @@ static EngineState* _engineGetState(Engine* engine) {
         }
     }
 
-    // Playtest hook: RYCRAFT_CAPTURE=<path.png> writes one frame to disk
-    // once RYCRAFT_CAPTURE_FRAME (default 240) frames have rendered, then
-    // quits ~1s later (the PNG write is async). A capture run is headless
-    // tooling — leaving it running leaked a full game instance per capture
-    // until concurrent playtests exhausted system memory.
-    static const char* capturePath = std::getenv("RYCRAFT_CAPTURE");
-    if (capturePath && *capturePath) {
-        static const uint64_t captureFrame = [] {
-            const char* frameEnv = std::getenv("RYCRAFT_CAPTURE_FRAME");
-            return frameEnv ? static_cast<uint64_t>(std::atoll(frameEnv)) : uint64_t{240};
-        }();
-        if (state->frameCount == captureFrame) {
-            _renderPipeline->requestFrameCapture(capturePath);
-        }
-        if (state->frameCount == captureFrame + 60) {
-            [self requestQuit];
-        }
-    }
-
     // Camera view matrix
     Mat4 viewMatrix = state->camera.viewMatrix();
 
@@ -1561,6 +2967,36 @@ static EngineState* _engineGetState(Engine* engine) {
     uiFrame.screen = state->flow.screen;
     uiFrame.hoveredButton = state->hoveredButton;
     uiFrame.showDebugHud = state->showDebugHud;
+    uiFrame.hotbar.selected = state->inventory.getSelectedIndex();
+    for (int slot = 0; slot < Inventory::HOTBAR_SLOTS; ++slot) {
+        uiFrame.hotbar.slots[static_cast<size_t>(slot)] = state->inventory.getSlot(slot);
+    }
+    uiFrame.hoveredSlot = state->hoveredSlot;
+    uiFrame.cursorStack = state->cursorStack;
+    uiFrame.miningProgress = state->miningState.active ? state->miningState.progress : 0.f;
+    uiFrame.mode = state->gameMode;
+    uiFrame.health = state->player.health;
+    uiFrame.food = state->survival.food;
+    uiFrame.air = state->survival.air;
+    uiFrame.maxAir = SurvivalStats::MAX_AIR;
+    uiFrame.deathMessage = state->deathMessage;
+    if (state->inputManager && _view) {
+        const Vec2 mouse = state->inputManager->state().mousePosition;
+        const float boundsW = static_cast<float>(_view.bounds.size.width);
+        const float boundsH = static_cast<float>(_view.bounds.size.height);
+        if (boundsW > 0.f && boundsH > 0.f) {
+            uiFrame.mouseX = mouse.x / boundsW;
+            uiFrame.mouseY = mouse.y / boundsH;
+        }
+    }
+    if (state->hoveredSlot >= 0 && state->cursorStack.empty() &&
+        state->hoveredSlot < static_cast<int>(state->menuLayout.slots.size())) {
+        const ItemStack& hovered =
+            state->menuLayout.slots[static_cast<size_t>(state->hoveredSlot)].stack;
+        if (!hovered.empty()) {
+            uiFrame.tooltipText = itemName(hovered.type);
+        }
+    }
     // Underwater view (veil, god rays, dense fog): the camera cell is water.
     // Non-generating read — a streaming lag must never stall the frame.
     {
@@ -1659,7 +3095,8 @@ static EngineState* _engineGetState(Engine* engine) {
         _queue, drawable, viewMatrix, state->projectionMatrix, *state->world, state->camera,
         state->worldTime, state->deltaTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
-        state->hotbar, uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr);
+        uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr,
+        &state->itemEntities.items(), &state->boats.boats());
 
     if (updatePerformanceCapture(state->performance, state->frameCount, state->deltaTime * 1000.0,
                                  state->cachedChunkCount, state->autopilotStopFrame, *state->world,

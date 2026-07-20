@@ -23,6 +23,11 @@ struct PlayerInput {
     bool descendHeld = false;      // sneak key held (Shift) — fly descend
     bool doubleTapForward = false; // forward double-tapped this tick → sprint
     bool doubleTapJump = false;    // jump double-tapped this tick → fly toggle
+    // Engine-decoded game-mode gates, so the entity layer never sees
+    // GameMode. Defaults preserve the standalone physics contract the tests
+    // pin; the engine narrows them per mode each tick.
+    bool allowFlight = true;     // creative only; false also clears active flight
+    bool takesFallDamage = true; // survival only
 };
 
 // ---------------------------------------------------------------------------

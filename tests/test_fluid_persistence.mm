@@ -301,11 +301,19 @@ TEST_CASE("Atomic metadata and manifest replacement preserve prior durable state
 
     {
         SaveManager saves(directory.path(), hooks);
-        REQUIRE(saves.saveMetadata(11, Vec3{1.0f, 2.0f, 3.0f}, 4));
+        SaveManager::WorldMetadata first;
+        first.seed = 11;
+        first.spawnPos = Vec3{1.0f, 2.0f, 3.0f};
+        first.worldTime = 4;
+        REQUIRE(saves.saveMetadata(first));
         REQUIRE(saves.saveDeferredFluidFrontiers({original}));
 
         hooks->writeFailuresRemaining.store(100);
-        REQUIRE_FALSE(saves.saveMetadata(22, Vec3{4.0f, 5.0f, 6.0f}, 7));
+        SaveManager::WorldMetadata second;
+        second.seed = 22;
+        second.spawnPos = Vec3{4.0f, 5.0f, 6.0f};
+        second.worldTime = 7;
+        REQUIRE_FALSE(saves.saveMetadata(second));
         REQUIRE_FALSE(saves.saveDeferredFluidFrontiers({replacement}));
         REQUIRE(saves.loadMetadata()->seed == 11);
         REQUIRE(saves.loadDeferredFluidFrontiers() == std::vector<FluidBoundaryFrontier>{original});
@@ -322,10 +330,13 @@ TEST_CASE("Generator version three preserves metadata and isolates legacy cube d
     constexpr ChunkPos position{7, 5, -9};
     {
         SaveManager current(directory.path());
-        SaveManager::PlayerMetadata player;
-        player.yaw = 37.0F;
-        player.inventory[2] = BlockType::OBSIDIAN;
-        REQUIRE(current.saveMetadata(9182, Vec3{12.0F, 91.0F, -33.0F}, 4455, player));
+        SaveManager::WorldMetadata metadata;
+        metadata.seed = 9182;
+        metadata.spawnPos = Vec3{12.0F, 91.0F, -33.0F};
+        metadata.worldTime = 4455;
+        metadata.player.yaw = 37.0F;
+        metadata.player.inventory[2] = ItemStack{itemFromBlock(BlockType::OBSIDIAN), 1, 0};
+        REQUIRE(current.saveMetadata(metadata));
         Chunk edited(position);
         edited.setBlock(3, 4, 5, BlockType::DIAMOND_ORE);
         current.saveChunk(edited);
@@ -363,11 +374,11 @@ TEST_CASE("Generator version three preserves metadata and isolates legacy cube d
         REQUIRE(metadata->spawnPos == Vec3{12.0F, 91.0F, -33.0F});
         REQUIRE(metadata->worldTime == 4455);
         REQUIRE(metadata->player.yaw == 37.0F);
-        REQUIRE(metadata->player.inventory[2] == BlockType::OBSIDIAN);
+        REQUIRE(metadata->player.inventory[2] ==
+                ItemStack{itemFromBlock(BlockType::OBSIDIAN), 1, 0});
         REQUIRE_FALSE(upgraded.loadChunk(position).has_value());
         REQUIRE(upgraded.savedSections({position.x, position.z}).empty());
-        REQUIRE(upgraded.saveMetadata(metadata->seed, metadata->spawnPos, metadata->worldTime,
-                                      metadata->player));
+        REQUIRE(upgraded.saveMetadata(*metadata));
     }
 
     REQUIRE(std::filesystem::exists(legacyRegions));

@@ -66,6 +66,51 @@ UIOverlay::UIOverlay(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_
         RY_LOG_FATAL(msg.UTF8String);
     }
 
+    // ---- Icon pipeline (textured quads over the same projection) ----
+    id<MTLFunction> iconVertexFunc = [shaderLibrary newFunctionWithName:@"uiIconVertexMain"];
+    id<MTLFunction> iconFragmentFunc = [shaderLibrary newFunctionWithName:@"uiIconFragmentMain"];
+    if (!iconVertexFunc || !iconFragmentFunc) {
+        RY_LOG_FATAL("Failed to load UI icon shader functions");
+    }
+
+    auto iconVertexDesc = [MTLVertexDescriptor vertexDescriptor];
+    iconVertexDesc.attributes[0].format = MTLVertexFormatFloat2;
+    iconVertexDesc.attributes[0].offset = offsetof(UIIconVertex, position);
+    iconVertexDesc.attributes[0].bufferIndex = 0;
+    iconVertexDesc.attributes[1].format = MTLVertexFormatFloat2;
+    iconVertexDesc.attributes[1].offset = offsetof(UIIconVertex, uv);
+    iconVertexDesc.attributes[1].bufferIndex = 0;
+    iconVertexDesc.attributes[2].format = MTLVertexFormatFloat4;
+    iconVertexDesc.attributes[2].offset = offsetof(UIIconVertex, tint);
+    iconVertexDesc.attributes[2].bufferIndex = 0;
+    iconVertexDesc.attributes[3].format = MTLVertexFormatUInt;
+    iconVertexDesc.attributes[3].offset = offsetof(UIIconVertex, layer);
+    iconVertexDesc.attributes[3].bufferIndex = 0;
+    iconVertexDesc.layouts[0].stride = sizeof(UIIconVertex);
+    iconVertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+    iconVertexDesc.layouts[0].stepRate = 1;
+
+    auto iconPipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    iconPipelineDesc.vertexFunction = iconVertexFunc;
+    iconPipelineDesc.fragmentFunction = iconFragmentFunc;
+    iconPipelineDesc.vertexDescriptor = iconVertexDesc;
+    iconPipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    iconPipelineDesc.colorAttachments[0].blendingEnabled = true;
+    iconPipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    iconPipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    iconPipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    iconPipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
+    iconPipelineDesc.colorAttachments[0].destinationRGBBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+    iconPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+
+    _iconPipelineState = [_device newRenderPipelineStateWithDescriptor:iconPipelineDesc
+                                                                 error:&error];
+    if (!_iconPipelineState) {
+        RY_LOG_FATAL("Failed to create UI icon pipeline state");
+    }
+
     // ---- Projection matrix buffer (16 floats = 64 bytes) ----
     _projectionBuffer = [_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
     if (!_projectionBuffer) {
@@ -76,8 +121,16 @@ UIOverlay::UIOverlay(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_
     // Vertex ring slots are allocated lazily in flush() (grow on demand).
     for (int i = 0; i < RING_SLOTS; ++i) {
         _vertexRing[i] = nil;
+        _iconRing[i] = nil;
     }
     _vertices.reserve(4096);
+    _topVertices.reserve(512);
+    _iconVertices.reserve(512);
+}
+
+void UIOverlay::setIconAtlas(id<MTLTexture> texture, id<MTLSamplerState> sampler) {
+    _iconTexture = texture;
+    _iconSampler = sampler;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,54 +138,129 @@ UIOverlay::UIOverlay(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_
 // ---------------------------------------------------------------------------
 void UIOverlay::beginFrame() {
     _vertices.clear();
+    _topVertices.clear();
+    _iconVertices.clear();
 }
 
 void UIOverlay::flush(id<MTLRenderCommandEncoder> encoder) {
-    if (!encoder || _vertices.empty())
+    const size_t baseCount = _vertices.size();
+    const size_t topCount = _topVertices.size();
+    const size_t iconCount = _iconVertices.size();
+    if (!encoder || (baseCount == 0 && topCount == 0 && iconCount == 0))
         return;
 
-    const size_t byteCount = _vertices.size() * sizeof(UIVertex);
-    id<MTLBuffer>& slot = _vertexRing[_frameIndex % RING_SLOTS];
+    const uint64_t ringSlot = _frameIndex % RING_SLOTS;
     ++_frameIndex;
 
-    if (!slot || slot.length < byteCount) {
+    auto ensureCapacity = [this](id<MTLBuffer>& slot, size_t byteCount) {
+        if (slot && slot.length >= byteCount)
+            return true;
         // Grow to the next power of two so steady-state frames never realloc
         size_t capacity = 16384;
         while (capacity < byteCount)
             capacity *= 2;
         slot = [_device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
         if (!slot) {
-            RY_LOG_ERROR("Failed to allocate UI overlay vertex buffer");
-            _vertices.clear();
-            return;
+            RY_LOG_ERROR("Failed to allocate a UI overlay vertex buffer");
+            return false;
+        }
+        return true;
+    };
+
+    // Both solid phases share one upload: base first, top appended after.
+    id<MTLBuffer>& solidSlot = _vertexRing[ringSlot];
+    const size_t solidBytes = (baseCount + topCount) * sizeof(UIVertex);
+    bool solidsReady = solidBytes > 0 && ensureCapacity(solidSlot, solidBytes);
+    if (solidsReady) {
+        std::memcpy((void*)solidSlot.contents, _vertices.data(), baseCount * sizeof(UIVertex));
+        std::memcpy((void*)((char*)solidSlot.contents + baseCount * sizeof(UIVertex)),
+                    _topVertices.data(), topCount * sizeof(UIVertex));
+    }
+
+    if (solidsReady && baseCount > 0) {
+        [encoder setRenderPipelineState:_pipelineState];
+        [encoder setVertexBuffer:solidSlot offset:0 atIndex:0];
+        [encoder setVertexBuffer:_projectionBuffer offset:0 atIndex:1];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:baseCount];
+    }
+
+    if (iconCount > 0 && _iconTexture && _iconSampler) {
+        id<MTLBuffer>& iconSlot = _iconRing[ringSlot];
+        const size_t iconBytes = iconCount * sizeof(UIIconVertex);
+        if (ensureCapacity(iconSlot, iconBytes)) {
+            std::memcpy((void*)iconSlot.contents, _iconVertices.data(), iconBytes);
+            [encoder setRenderPipelineState:_iconPipelineState];
+            [encoder setVertexBuffer:iconSlot offset:0 atIndex:0];
+            [encoder setVertexBuffer:_projectionBuffer offset:0 atIndex:1];
+            [encoder setFragmentTexture:_iconTexture atIndex:0];
+            [encoder setFragmentSamplerState:_iconSampler atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:iconCount];
         }
     }
 
-    std::memcpy((void*)slot.contents, _vertices.data(), byteCount);
-
-    [encoder setRenderPipelineState:_pipelineState];
-    [encoder setVertexBuffer:slot offset:0 atIndex:0];
-    [encoder setVertexBuffer:_projectionBuffer offset:0 atIndex:1];
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:_vertices.size()];
+    if (solidsReady && topCount > 0) {
+        [encoder setRenderPipelineState:_pipelineState];
+        [encoder setVertexBuffer:solidSlot offset:0 atIndex:0];
+        [encoder setVertexBuffer:_projectionBuffer offset:0 atIndex:1];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                    vertexStart:baseCount
+                    vertexCount:topCount];
+    }
 
     _vertices.clear();
+    _topVertices.clear();
+    _iconVertices.clear();
 }
 
 // ---------------------------------------------------------------------------
 // drawQuad()
 // ---------------------------------------------------------------------------
-void UIOverlay::drawQuad(float x, float y, float w, float h, float r, float g, float b, float a) {
+void UIOverlay::drawQuadInto(std::vector<UIVertex>& target, float x, float y, float w, float h,
+                             float r, float g, float b, float a) {
     const UIVertex bl{x, y, r, g, b, a};
     const UIVertex tl{x, y + h, r, g, b, a};
     const UIVertex br{x + w, y, r, g, b, a};
     const UIVertex tr{x + w, y + h, r, g, b, a};
 
-    _vertices.push_back(bl);
-    _vertices.push_back(tl);
-    _vertices.push_back(br);
-    _vertices.push_back(tl);
-    _vertices.push_back(tr);
-    _vertices.push_back(br);
+    target.push_back(bl);
+    target.push_back(tl);
+    target.push_back(br);
+    target.push_back(tl);
+    target.push_back(tr);
+    target.push_back(br);
+}
+
+void UIOverlay::drawQuad(float x, float y, float w, float h, float r, float g, float b, float a) {
+    drawQuadInto(_vertices, x, y, w, h, r, g, b, a);
+}
+
+void UIOverlay::drawQuadTop(float x, float y, float w, float h, float r, float g, float b,
+                            float a) {
+    drawQuadInto(_topVertices, x, y, w, h, r, g, b, a);
+}
+
+void UIOverlay::drawIconQuadCorners(const float corners[8], uint8_t layer, float shade,
+                                    float alpha) {
+    const auto vertex = [&](float px, float py, float u, float v) {
+        return UIIconVertex{{px, py}, {u, v}, {shade, shade, shade, alpha}, layer, 0};
+    };
+    const UIIconVertex bl = vertex(corners[0], corners[1], 0.f, 1.f);
+    const UIIconVertex br = vertex(corners[2], corners[3], 1.f, 1.f);
+    const UIIconVertex tl = vertex(corners[4], corners[5], 0.f, 0.f);
+    const UIIconVertex tr = vertex(corners[6], corners[7], 1.f, 0.f);
+
+    _iconVertices.push_back(bl);
+    _iconVertices.push_back(tl);
+    _iconVertices.push_back(br);
+    _iconVertices.push_back(tl);
+    _iconVertices.push_back(tr);
+    _iconVertices.push_back(br);
+}
+
+void UIOverlay::drawIconQuad(float x, float y, float w, float h, uint8_t layer, float shade,
+                             float alpha) {
+    const float corners[8] = {x, y, x + w, y, x, y + h, x + w, y + h};
+    drawIconQuadCorners(corners, layer, shade, alpha);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +385,7 @@ constexpr Glyph FONT[] = {
     {'(', {0x04, 0x08, 0x10, 0x10, 0x10, 0x08, 0x04, 0x00}},
     {')', {0x10, 0x08, 0x04, 0x04, 0x04, 0x08, 0x10, 0x00}},
     {'%', {0x32, 0x34, 0x08, 0x08, 0x16, 0x26, 0x00, 0x00}},
+    {'_', {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3E, 0x00}},
 };
 
 } // namespace
@@ -273,7 +402,8 @@ std::array<uint8_t, 8> UIOverlay::getCharBitmap(char c) {
     return {};
 }
 
-void UIOverlay::drawChar(char c, float x, float y, float scale, float r, float g, float b) {
+void UIOverlay::drawCharInto(std::vector<UIVertex>& target, char c, float x, float y, float scale,
+                             float r, float g, float b) {
     auto bitmap = getCharBitmap(c);
 
     // Each lit font pixel becomes one small quad
@@ -286,10 +416,14 @@ void UIOverlay::drawChar(char c, float x, float y, float scale, float r, float g
             if (rowBits & (0x80 >> col)) {
                 float px = x + col * pixelW;
                 float py = y + (FONT_HEIGHT - 1 - row) * pixelH;
-                drawQuad(px, py, pixelW, pixelH, r, g, b, 1.0f);
+                drawQuadInto(target, px, py, pixelW, pixelH, r, g, b, 1.0f);
             }
         }
     }
+}
+
+void UIOverlay::drawChar(char c, float x, float y, float scale, float r, float g, float b) {
+    drawCharInto(_vertices, c, x, y, scale, r, g, b);
 }
 
 float UIOverlay::drawString(const char* str, float x, float y, float scale, float r, float g,
@@ -301,6 +435,22 @@ float UIOverlay::drawString(const char* str, float x, float y, float scale, floa
 
     while (*str) {
         drawChar(*str, cursorX, y, scale, r, g, b);
+        cursorX += (FONT_WIDTH + 1) * scale / static_cast<float>(_width);
+        ++str;
+    }
+
+    return cursorX - x;
+}
+
+float UIOverlay::drawStringTop(const char* str, float x, float y, float scale, float r, float g,
+                               float b) {
+    if (!str)
+        return 0.f;
+
+    float cursorX = x;
+
+    while (*str) {
+        drawCharInto(_topVertices, *str, cursorX, y, scale, r, g, b);
         cursorX += (FONT_WIDTH + 1) * scale / static_cast<float>(_width);
         ++str;
     }

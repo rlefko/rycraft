@@ -2,6 +2,7 @@
 
 #import <Metal/Metal.h>
 
+#include "render/shader_types.hpp"
 #include "render/ui_menu.hpp"
 
 #include <array>
@@ -34,6 +35,24 @@ public:
     // x, y: bottom-left corner in normalized [0, 1] coordinates
     // w, h: width and height in normalized [0, 1] coordinates
     void drawQuad(float x, float y, float w, float h, float r, float g, float b, float a);
+
+    // The overlay draws three fixed z-phases per frame: base solids, then
+    // textured icons, then top solids (counts, tooltips, carets). The two
+    // solid phases share one pipeline and buffer; icons bind their own.
+    void setIconAtlas(id<MTLTexture> texture, id<MTLSamplerState> sampler);
+
+    // Queue a textured icon quad sampling the given texture array layer.
+    // shade multiplies rgb (isometric face lighting), alpha scales coverage.
+    void drawIconQuad(float x, float y, float w, float h, uint8_t layer, float shade, float alpha);
+
+    // Arbitrary-corner icon quad for isometric cube faces. Corners are
+    // normalized screen positions ordered bottom-left, bottom-right,
+    // top-left, top-right; uvs map (0,1)/(1,1)/(0,0)/(1,0) respectively.
+    void drawIconQuadCorners(const float corners[8], uint8_t layer, float shade, float alpha);
+
+    // Top-phase solids draw above every icon.
+    void drawQuadTop(float x, float y, float w, float h, float r, float g, float b, float a);
+    float drawStringTop(const char* str, float x, float y, float scale, float r, float g, float b);
 
     // Queue a single 8×8 bitmap-font character. `scale` multiplies the glyph
     // pixel size (1.0 = 8px tall on screen).
@@ -73,15 +92,28 @@ private:
 
     id<MTLDevice> _device;
     id<MTLRenderPipelineState> _pipelineState;
+    id<MTLRenderPipelineState> _iconPipelineState;
 
-    // CPU-side batch for the current frame.
+    // CPU-side batches for the current frame, one per z-phase.
     std::vector<UIVertex> _vertices;
+    std::vector<UIVertex> _topVertices;
+    std::vector<UIIconVertex> _iconVertices;
 
-    // Triple-buffered vertex upload ring so the CPU never rewrites a buffer
-    // the GPU is still reading.
+    // Triple-buffered vertex upload rings so the CPU never rewrites a buffer
+    // the GPU is still reading. Both solid phases share one ring slot per
+    // frame (base first, top appended); icons ride their own ring.
     static constexpr int RING_SLOTS = 3;
     id<MTLBuffer> _vertexRing[RING_SLOTS];
+    id<MTLBuffer> _iconRing[RING_SLOTS];
     uint64_t _frameIndex = 0;
+
+    id<MTLTexture> _iconTexture = nil;
+    id<MTLSamplerState> _iconSampler = nil;
+
+    void drawQuadInto(std::vector<UIVertex>& target, float x, float y, float w, float h, float r,
+                      float g, float b, float a);
+    void drawCharInto(std::vector<UIVertex>& target, char c, float x, float y, float scale, float r,
+                      float g, float b);
 
     // Projection matrix constant buffer.
     id<MTLBuffer> _projectionBuffer;

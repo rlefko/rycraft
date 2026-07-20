@@ -7,8 +7,8 @@
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
 #include <engine/game_state.hpp>
-#include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -172,7 +172,64 @@ TEST_CASE("Persisted block identifiers retain their original values", "[block]")
     REQUIRE(static_cast<int>(BlockType::ACACIA_LOG) == 41);
     REQUIRE(static_cast<int>(BlockType::FERN) == 51);
     REQUIRE(static_cast<int>(BlockType::ANDESITE) == 57);
-    REQUIRE(static_cast<int>(BlockType::COUNT) == 58);
+    REQUIRE(static_cast<int>(BlockType::CRAFTING_TABLE) == 58);
+    REQUIRE(static_cast<int>(BlockType::FURNACE) == 59);
+    REQUIRE(static_cast<int>(BlockType::FURNACE_LIT) == 60);
+    REQUIRE(static_cast<int>(BlockType::TORCH) == 61);
+    REQUIRE(static_cast<int>(BlockType::CHEST) == 62);
+    REQUIRE(static_cast<int>(BlockType::WOOL) == 63);
+    REQUIRE(static_cast<int>(BlockType::BED) == 64);
+    REQUIRE(static_cast<int>(BlockType::COUNT) == 65);
+}
+
+TEST_CASE("Block survival data gates mining by hardness tool and tier", "[block][survival]") {
+    for (size_t index = 0; index < BLOCK_TYPE_COUNT; ++index) {
+        const BlockType type = static_cast<BlockType>(index);
+        const BlockDefinition& definition = blockDefinition(type);
+        REQUIRE(blockHardness(type) == definition.hardness);
+        if (type == BlockType::BEDROCK) {
+            REQUIRE(definition.hardness < 0.0f);
+        } else {
+            REQUIRE(definition.hardness >= 0.0f);
+        }
+        if (definition.solid && definition.targetable && type != BlockType::BEDROCK) {
+            REQUIRE(definition.hardness > 0.0f);
+        }
+        if (definition.minimumTier != ToolTier::NONE) {
+            REQUIRE(definition.tool != ToolClass::NONE);
+        }
+        if (definition.interactable) {
+            REQUIRE(definition.solid);
+        }
+    }
+
+    REQUIRE(blockDefinition(BlockType::STONE).tool == ToolClass::PICKAXE);
+    REQUIRE(blockDefinition(BlockType::STONE).minimumTier == ToolTier::WOOD);
+    REQUIRE(blockDefinition(BlockType::IRON_ORE).minimumTier == ToolTier::STONE);
+    REQUIRE(blockDefinition(BlockType::GOLD_ORE).minimumTier == ToolTier::IRON);
+    REQUIRE(blockDefinition(BlockType::DIAMOND_ORE).minimumTier == ToolTier::IRON);
+    REQUIRE(blockDefinition(BlockType::OBSIDIAN).hardness == 50.0f);
+    REQUIRE(blockDefinition(BlockType::DIRT).tool == ToolClass::SHOVEL);
+    REQUIRE(blockDefinition(BlockType::LOG).tool == ToolClass::AXE);
+    REQUIRE(blockDefinition(BlockType::TALL_GRASS).hardness == 0.0f);
+    REQUIRE(isInteractable(BlockType::CRAFTING_TABLE));
+    REQUIRE(isInteractable(BlockType::FURNACE));
+    REQUIRE(isInteractable(BlockType::FURNACE_LIT));
+    REQUIRE_FALSE(isInteractable(BlockType::STONE));
+}
+
+TEST_CASE("New workshop blocks render light and break like their materials", "[block]") {
+    REQUIRE(rendersAsCube(BlockType::CRAFTING_TABLE));
+    REQUIRE(rendersAsCube(BlockType::FURNACE));
+    REQUIRE(rendersAsCube(BlockType::FURNACE_LIT));
+    REQUIRE(blockDefinition(BlockType::CRAFTING_TABLE).material == BlockMaterial::WOOD);
+    REQUIRE(blockDefinition(BlockType::FURNACE).material == BlockMaterial::ROCK);
+    REQUIRE(blockLightEmission(BlockType::FURNACE) == 0);
+    REQUIRE(blockLightEmission(BlockType::FURNACE_LIT) == 13);
+    REQUIRE(isFlora(BlockType::TORCH));
+    REQUIRE_FALSE(isSolid(BlockType::TORCH));
+    REQUIRE(blockLightEmission(BlockType::TORCH) == 14);
+    REQUIRE(isEmissive(BlockType::TORCH));
 }
 
 TEST_CASE("Block properties distinguish flora liquids and cubes", "[block]") {
@@ -1282,7 +1339,11 @@ TEST_CASE("SaveManager snapshots edited sections under one manifest lock", "[sav
 TEST_CASE("SaveManager metadata records the cubic format version", "[save]") {
     TempDir directory("cubic_metadata");
     SaveManager saves(directory.path());
-    saves.saveMetadata(12345, Vec3{100.f, 80.f, -50.f}, 9876543210ULL);
+    SaveManager::WorldMetadata written;
+    written.seed = 12345;
+    written.spawnPos = Vec3{100.f, 80.f, -50.f};
+    written.worldTime = 9876543210ULL;
+    saves.saveMetadata(written);
 
     auto metadata = saves.loadMetadata();
     REQUIRE(metadata.has_value());
@@ -1296,15 +1357,18 @@ TEST_CASE("SaveManager metadata records the cubic format version", "[save]") {
 TEST_CASE("SaveManager preserves non-chunk player metadata", "[save][metadata]") {
     TempDir directory("rycraft_player_metadata");
     SaveManager saves(directory.path());
-    SaveManager::PlayerMetadata player;
-    player.yaw = 127.5f;
-    player.pitch = -31.25f;
-    player.health = 13;
-    player.selectedSlot = 7;
-    player.inventory[0] = BlockType::BASALT;
-    player.inventory[7] = BlockType::LILY_PAD;
+    SaveManager::WorldMetadata written;
+    written.seed = 9191;
+    written.spawnPos = Vec3{12.0f, 88.0f, -4.0f};
+    written.worldTime = 123456;
+    written.player.yaw = 127.5f;
+    written.player.pitch = -31.25f;
+    written.player.health = 13;
+    written.player.selectedSlot = 7;
+    written.player.inventory[0] = ItemStack{itemFromBlock(BlockType::BASALT), 12, 0};
+    written.player.inventory[35] = ItemStack{ItemType::IRON_PICKAXE, 1, 187};
 
-    saves.saveMetadata(9191, Vec3{12.0f, 88.0f, -4.0f}, 123456, player);
+    saves.saveMetadata(written);
     const auto loaded = saves.loadMetadata();
 
     REQUIRE(loaded.has_value());
@@ -1315,8 +1379,8 @@ TEST_CASE("SaveManager preserves non-chunk player metadata", "[save][metadata]")
     REQUIRE(loaded->player.pitch == Catch::Approx(-31.25f));
     REQUIRE(loaded->player.health == 13);
     REQUIRE(loaded->player.selectedSlot == 7);
-    REQUIRE(loaded->player.inventory[0] == BlockType::BASALT);
-    REQUIRE(loaded->player.inventory[7] == BlockType::LILY_PAD);
+    REQUIRE(loaded->player.inventory[0] == ItemStack{itemFromBlock(BlockType::BASALT), 12, 0});
+    REQUIRE(loaded->player.inventory[35] == ItemStack{ItemType::IRON_PICKAXE, 1, 187});
 }
 
 TEST_CASE("SaveManager persists activated fluid frontiers across restart", "[save][fluid]") {
@@ -2092,6 +2156,18 @@ TEST_CASE("LightEngine: lava light falls off one level per block", "[world][ligh
     REQUIRE(chunk.getBlockLight(0, 8, 0) == 0);
 }
 
+TEST_CASE("LightEngine: a placed torch emits and propagates light", "[world][light]") {
+    Chunk chunk(ChunkPos{0, 4, 0});
+    chunk.setBlock(8, 8, 8, BlockType::TORCH); // a lone torch in open air
+
+    REQUIRE(LightEngine::computeSelfLight(chunk));
+
+    REQUIRE(chunk.getBlockLight(8, 8, 8) == 14); // the torch's own emission
+    REQUIRE(chunk.getBlockLight(9, 8, 8) == 13); // falls off one level per block
+    REQUIRE(chunk.getBlockLight(8, 12, 8) == 10);
+    REQUIRE(chunk.getBlockLight(8, 8, 8 - 6) == 8);
+}
+
 TEST_CASE("LightEngine: opaque blocks do not receive light", "[world][light]") {
     Chunk chunk(ChunkPos{0, 4, 0});
     chunk.setBlock(8, 8, 8, BlockType::LAVA);
@@ -2198,4 +2274,57 @@ TEST_CASE("LightEngine: block light is derived, never serialized", "[world][ligh
     // ...but recomputable from the blocks alone.
     LightEngine::computeSelfLight(*restored);
     REQUIRE(restored->getBlockLight(9, 8, 8) == 14);
+}
+
+TEST_CASE("Default generation settings produce byte-identical cubes", "[worldgen][settings]") {
+    ChunkGenerator legacy(42);
+    ChunkGenerator configured(42, GenerationSettings{});
+    // Surface, underground, and structure-region fixtures around spawn.
+    constexpr std::array<ChunkPos, 5> POSITIONS = {
+        ChunkPos{0, 6, 0},  ChunkPos{3, 5, -2}, ChunkPos{-4, 4, 7},
+        ChunkPos{12, 6, 9}, ChunkPos{1, -2, 1},
+    };
+    for (ChunkPos position : POSITIONS) {
+        Chunk fromLegacy(position);
+        legacy.generate(fromLegacy);
+        Chunk fromConfigured(position);
+        configured.generate(fromConfigured);
+        REQUIRE(ChunkSerializer::serialize(fromLegacy) ==
+                ChunkSerializer::serialize(fromConfigured));
+    }
+}
+
+TEST_CASE("Disabled structures reserve no footprints", "[worldgen][settings][structures]") {
+    StructurePlacer enabled(42);
+    StructurePlacer disabled(42, false);
+
+    // The enabled placer reserves at least one candidate footprint in a wide
+    // scan; the disabled placer must reserve none anywhere.
+    bool foundReserved = false;
+    for (int64_t chunkX = -48; chunkX <= 48 && !foundReserved; ++chunkX) {
+        for (int64_t chunkZ = -48; chunkZ <= 48 && !foundReserved; ++chunkZ) {
+            const int64_t x = chunkX * CHUNK_WIDTH + 8;
+            const int64_t z = chunkZ * CHUNK_DEPTH + 8;
+            if (enabled.insideStructure(x, z, chunkX, chunkZ, 2)) {
+                foundReserved = true;
+                REQUIRE_FALSE(disabled.insideStructure(x, z, chunkX, chunkZ, 2));
+            }
+        }
+    }
+    REQUIRE(foundReserved);
+
+    // Disabled placement is invalid for every region.
+    ChunkGenerator generator(42, GenerationSettings{.structures = false});
+    GenScratch scratch;
+    REQUIRE_FALSE(disabled.regionPlacement(0, 0, generator, scratch).valid);
+    REQUIRE_FALSE(disabled.regionPlacement(-3, 7, generator, scratch).valid);
+}
+
+TEST_CASE("World carries its generation settings", "[world][settings]") {
+    const GenerationSettings settings{
+        .structures = false, .fauna = false, .weather = true, .dayCycle = false};
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS, 64, settings);
+    REQUIRE(world.getGenerationSettings() == settings);
+    World defaults(42, MIN_RENDER_DISTANCE_CHUNKS, 64);
+    REQUIRE(defaults.getGenerationSettings() == GenerationSettings{});
 }
