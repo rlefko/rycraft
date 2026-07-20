@@ -802,12 +802,13 @@ fragment float4 waterFragmentMain(
     // of the world above.
     // The intrinsic tints are the water's response to received sky light,
     // not emission. Scale them by the surface's sky access and the day-night
-    // sky level, otherwise still water glows teal from its constant shallow
-    // tint at night and in covered caves, drawing a bright ring on the lake
-    // floor around the camera where refraction still outweighs the dark
-    // night reflection.
-    const float tintIllumination = max(in.vSkyLight, exteriorSkyVisibility) *
-                                   mix(0.08f, 1.0f, saturate(water.physicalSkyBlend));
+    // sky level with no constant floor, otherwise still water glows teal from
+    // its shallow tint at night and in covered caves, drawing a bright ring on
+    // the lake floor around the camera where refraction still outweighs the
+    // dark night reflection. Daylight keeps physicalSkyBlend near 1, so shallow
+    // water still reads full turquoise.
+    const float tintIllumination =
+        max(in.vSkyLight, exteriorSkyVisibility) * saturate(water.physicalSkyBlend);
     float3 shallowTint = float3(0.10f, 0.42f, 0.48f) * tintIllumination;
     float3 deepTint = float3(0.02f, 0.10f, 0.22f) * tintIllumination;
     float3 waterColor = mix(shallowTint, deepTint, saturate(opticalWaterDepth * 0.12f));
