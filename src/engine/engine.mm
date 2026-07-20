@@ -3234,7 +3234,6 @@ static std::string defaultWorldDirectory() {
         }
     }
 
-
     // Camera view matrix
     Mat4 viewMatrix = state->camera.viewMatrix();
 
