@@ -66,8 +66,8 @@ constexpr std::array<ItemType, 3> TIER_PICKAXES = {ItemType::WOODEN_PICKAXE,
                                                    ItemType::STONE_PICKAXE, ItemType::IRON_PICKAXE};
 
 constexpr auto makeRecipes() {
-    // 9 fixed recipes plus 4 tool classes across 3 tiers.
-    std::array<CraftingRecipe, 21> recipes{};
+    // 10 fixed recipes plus 4 tool classes across 3 tiers.
+    std::array<CraftingRecipe, 22> recipes{};
     size_t next = 0;
     recipes[next++] = shapeless(LOG, {PLANKS, 4});
     recipes[next++] = shaped(1, 2, {PLANKS, PLANKS}, {ItemType::STICK, 4});
@@ -92,6 +92,9 @@ constexpr auto makeRecipes() {
     constexpr ItemType WOOL = itemFromBlock(BlockType::WOOL);
     recipes[next++] = shaped(3, 2, {WOOL, WOOL, WOOL, PLANKS, PLANKS, PLANKS},
                              {itemFromBlock(BlockType::BED), 1});
+    // Five planks in a U make a boat.
+    recipes[next++] =
+        shaped(3, 2, {PLANKS, NONE, PLANKS, PLANKS, PLANKS, PLANKS}, {ItemType::BOAT, 1});
     for (size_t tier = 0; tier < 3; ++tier) {
         const ItemType material = TIER_MATERIALS[tier];
         const auto pickaxe = static_cast<uint16_t>(TIER_PICKAXES[tier]);

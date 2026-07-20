@@ -11,6 +11,7 @@
 #include <engine/input_bindings.hpp>
 #include <engine/inventory.hpp>
 #include <entity/ai.hpp>
+#include <entity/boat.hpp>
 #include <entity/entity.hpp>
 #include <entity/entity_picking.hpp>
 #include <entity/item_entity.hpp>
@@ -2716,6 +2717,53 @@ TEST_CASE("Aged-out items despawn", "[item-entity]") {
     manager.items().front().ageTicks = ItemEntity::DESPAWN_TICKS - 1;
     manager.tick(*world, Vec3{0.f, 101.f, 0.f});
     REQUIRE(manager.items().empty());
+}
+
+// ============================================================================
+// Boats
+// ============================================================================
+
+TEST_CASE("Boat sinks under gravity and grounds on solid land", "[boat][physics]") {
+    auto world = makePlatform(101); // stone surface top at y = 101
+    BoatManager boats;
+    boats.spawn(Vec3{0.f, 108.f, 0.f}, 0.f);
+    REQUIRE(boats.boats().size() == 1);
+    const float startY = boats.boats().front().position.y;
+
+    for (int tick = 0; tick < 400; ++tick) {
+        boats.tick(*world, Vec3{0.f, 108.f, 0.f}, -1, Vec3{});
+        if (boats.boats().front().onGround)
+            break;
+    }
+    const Boat& boat = boats.boats().front();
+    REQUIRE(boat.position.y < startY); // gravity pulled a beached boat down
+    REQUIRE(boat.onGround);
+    REQUIRE(boat.position.y == Catch::Approx(101.f).margin(0.2f));
+}
+
+TEST_CASE("Boat picking hits an aimed hull and misses otherwise", "[boat]") {
+    BoatManager boats;
+    boats.spawn(Vec3{0.f, 64.f, 5.f}, 0.f);
+    // Aiming +Z from the origin crosses the hull; aiming away misses.
+    REQUIRE(boats.pick(Vec3{0.f, 64.3f, 0.f}, Vec3{0.f, 0.f, 1.f}, 10.f) == 0);
+    REQUIRE(boats.pick(Vec3{0.f, 64.3f, 0.f}, Vec3{0.f, 0.f, -1.f}, 10.f) == -1);
+}
+
+TEST_CASE("Boat spawns respect the cap and removal is bounds-checked", "[boat]") {
+    BoatManager boats;
+    for (size_t i = 0; i < BoatManager::MAX_BOATS; ++i) {
+        boats.spawn(Vec3{static_cast<float>(i), 64.f, 0.f}, 0.f);
+    }
+    REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS);
+    // One more evicts the oldest; the fresh spawn survives at the cap.
+    boats.spawn(Vec3{999.f, 64.f, 0.f}, 0.f);
+    REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS);
+    REQUIRE(boats.boats().back().position.x == Catch::Approx(999.f));
+
+    boats.remove(0);
+    REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS - 1);
+    boats.remove(9999); // out of range: a safe no-op
+    REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS - 1);
 }
 
 // ============================================================================

@@ -112,6 +112,14 @@ TEST_CASE("Wool over planks crafts a bed and iron crafts shears", "[recipes]") {
                       .has_value());
 }
 
+TEST_CASE("Five planks in a U craft a boat", "[recipes]") {
+    const auto boat =
+        matchCraftingRecipe(grid3({PLANKS, N, PLANKS, PLANKS, PLANKS, PLANKS, N, N, N}), 3);
+    REQUIRE(boat.has_value());
+    REQUIRE(boat->type == ItemType::BOAT);
+    REQUIRE(boat->count == 1);
+}
+
 TEST_CASE("Eight planks ringing an empty center craft a chest", "[recipes]") {
     const auto chest = matchCraftingRecipe(
         grid3({PLANKS, PLANKS, PLANKS, PLANKS, N, PLANKS, PLANKS, PLANKS, PLANKS}), 3);

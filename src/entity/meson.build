@@ -8,6 +8,7 @@ entity_sources = files(
   'spawner.cpp',
   'item_entity.cpp',
   'entity_picking.cpp',
+  'boat.cpp',
 )
 
 libentity = static_library('entity',

@@ -16,6 +16,7 @@
 #include <engine/slot_interaction.hpp>
 #include <engine/survival.hpp>
 #include <entity/ai.hpp>
+#include <entity/boat.hpp>
 #include <entity/entity_picking.hpp>
 #include <entity/item_entity.hpp>
 #include <entity/player.hpp>
@@ -329,6 +330,8 @@ struct EngineState {
     ChestMap chests;
     std::optional<BlockPos> openChest; // the chest the CHEST screen edits
     ItemEntityManager itemEntities;
+    BoatManager boats;
+    int ridingBoat = -1; // index into boats, -1 when on foot
     int pickupSoundCooldown = 0;
     MiningState miningState;
 
@@ -576,6 +579,8 @@ static std::string defaultWorldDirectory() {
     state->openFurnace.reset();
     state->openChest.reset();
     state->itemEntities.clear();
+    state->boats.clear();
+    state->ridingBoat = -1;
     state->pickupSoundCooldown = 0;
     state->miningState.reset();
     state->eatingState.reset();
@@ -663,6 +668,8 @@ static std::string defaultWorldDirectory() {
     state->chests.clear();
     state->openChest.reset();
     state->itemEntities.clear();
+    state->boats.clear();
+    state->ridingBoat = -1;
     state->miningState.reset();
     state->inventory.clear();
     state->hasHighlightedBlock = false;
@@ -1994,6 +2001,25 @@ static std::string defaultWorldDirectory() {
                 state->itemEntities.spawn(makeItemStack(type, 1), pos, Vec3{0.f, 0.f, 0.f}, 0);
             }
 
+            // Playtest hook: RYCRAFT_SPAWN_BOAT=1 drops a boat a few blocks
+            // ahead of spawn so headless captures can show it rendering (on
+            // the RYCRAFT_SPAWN_WATER pool it floats).
+            static const bool spawnBoat = [] {
+                const char* v = std::getenv("RYCRAFT_SPAWN_BOAT");
+                return v && *v && std::strcmp(v, "0") != 0;
+            }();
+            if (spawnBoat) {
+                const int64_t wx = px;
+                const int64_t wz = pz + 4;
+                const int32_t surface = static_cast<int32_t>(std::clamp(
+                    state->world->getTerrainHeight(wx, wz) + CHUNK_EDGE,
+                    static_cast<double>(WORLD_MIN_Y + 1), static_cast<double>(WORLD_MAX_Y - 1)));
+                state->boats.spawn(Vec3{static_cast<float>(wx) + 0.5f,
+                                        static_cast<float>(surface) + 2.0f,
+                                        static_cast<float>(wz) + 0.5f},
+                                   0.f);
+            }
+
             // Playtest hook: RYCRAFT_YAW / RYCRAFT_PITCH (degrees) point the
             // camera for captures — e.g. face the afternoon sun for the lens
             // flare. Yaw 0 looks +Z; -90 looks -X.
@@ -2032,43 +2058,92 @@ static std::string defaultWorldDirectory() {
     state->player.yaw = state->camera.yaw();
     state->player.pitch = state->camera.pitch();
 
+    // 4b. Boat riding: while seated, WASD paddles the boat and the rider is
+    // slaved to the seat instead of running the normal player physics. Jump or
+    // sneak dismounts to the side.
+    bool riding =
+        state->ridingBoat >= 0 && state->ridingBoat < static_cast<int>(state->boats.boats().size());
+    Vec3 look = state->camera.forward();
+    Vec3 horizForward{look.x, 0.f, look.z};
+    const float horizLen = horizForward.length();
+    if (horizLen > 1e-4f) {
+        horizForward.x /= horizLen;
+        horizForward.z /= horizLen;
+    }
+    const Vec3 horizRight{-horizForward.z, 0.f, horizForward.x};
+    if (riding &&
+        (input.isPressedForTick(bindings.jump.key) || input.isPressedForTick(bindings.sneak.key))) {
+        Boat& boat = state->boats.boats()[static_cast<size_t>(state->ridingBoat)];
+        state->player.position =
+            boat.position + horizRight + Vec3{0.f, 0.4f, 0.f}; // step out to the side
+        state->player.velocity = Vec3{0.f, 0.f, 0.f};
+        state->ridingBoat = -1;
+        riding = false;
+    }
+    if (riding) {
+        Boat& boat = state->boats.boats()[static_cast<size_t>(state->ridingBoat)];
+        constexpr float PADDLE = 0.02f;
+        Vec3 accel{0.f, 0.f, 0.f};
+        if (input.isDown(bindings.forward.key))
+            accel += horizForward * PADDLE;
+        if (input.isDown(bindings.backward.key))
+            accel -= horizForward * PADDLE;
+        if (input.isDown(bindings.right.key))
+            accel += horizRight * PADDLE;
+        if (input.isDown(bindings.left.key))
+            accel -= horizRight * PADDLE;
+        boat.yaw = std::atan2(horizForward.x, horizForward.z);
+        state->boats.tick(*state->world, state->player.position, state->ridingBoat, accel);
+        // Seat the rider on the boat and freeze player physics for the tick.
+        state->player.position = boat.position + Vec3{0.f, 0.3f, 0.f};
+        state->player.velocity = Vec3{0.f, 0.f, 0.f};
+        state->player.onGround = true;
+        state->player.resetFallDistance();
+    }
+
     // 5. Player physics tick. All movement keys are decoded through the
     // bindings here (sprint once read a hardcoded key and fired on sneak);
     // Player itself never touches the input layer.
-    PlayerInput playerInput;
-    playerInput.forward = input.isDown(bindings.forward.key);
-    playerInput.backward = input.isDown(bindings.backward.key);
-    playerInput.left = input.isDown(bindings.left.key);
-    playerInput.right = input.isDown(bindings.right.key);
-    playerInput.jumpHeld = input.isDown(bindings.jump.key);
-    playerInput.jumpPressed = input.isPressedForTick(bindings.jump.key);
-    playerInput.sprintHeld = input.isDown(bindings.sprint.key);
-    playerInput.descendHeld = input.isDown(bindings.sneak.key);
-    playerInput.doubleTapForward = input.isDoubleTappedForTick(bindings.forward.key);
-    playerInput.doubleTapJump = input.isDoubleTappedForTick(bindings.jump.key);
-    playerInput.allowFlight = modeAllowsFlight(state->gameMode);
-    playerInput.takesFallDamage = modeTakesDamage(state->gameMode);
-    // Low food disables sprinting in survival.
-    if (modeDrainsHunger(state->gameMode) &&
-        state->survival.food <= SurvivalStats::SPRINT_DISABLE_FOOD) {
-        playerInput.sprintHeld = false;
-        playerInput.doubleTapForward = false;
+    bool jumpedThisTick = false;
+    Vec3 playerPositionBeforeMove = state->player.position;
+    if (!riding) {
+        PlayerInput playerInput;
+        playerInput.forward = input.isDown(bindings.forward.key);
+        playerInput.backward = input.isDown(bindings.backward.key);
+        playerInput.left = input.isDown(bindings.left.key);
+        playerInput.right = input.isDown(bindings.right.key);
+        playerInput.jumpHeld = input.isDown(bindings.jump.key);
+        playerInput.jumpPressed = input.isPressedForTick(bindings.jump.key);
+        playerInput.sprintHeld = input.isDown(bindings.sprint.key);
+        playerInput.descendHeld = input.isDown(bindings.sneak.key);
+        playerInput.doubleTapForward = input.isDoubleTappedForTick(bindings.forward.key);
+        playerInput.doubleTapJump = input.isDoubleTappedForTick(bindings.jump.key);
+        playerInput.allowFlight = modeAllowsFlight(state->gameMode);
+        playerInput.takesFallDamage = modeTakesDamage(state->gameMode);
+        // Low food disables sprinting in survival.
+        if (modeDrainsHunger(state->gameMode) &&
+            state->survival.food <= SurvivalStats::SPRINT_DISABLE_FOOD) {
+            playerInput.sprintHeld = false;
+            playerInput.doubleTapForward = false;
+        }
+        jumpedThisTick = playerInput.jumpPressed && state->player.onGround;
+        const int healthBeforeMove = state->player.health;
+        state->player.tick(*state->world, playerInput);
+        // Player::tick applies fall damage directly to health; catch it here for
+        // the hurt sound and the death-screen cause.
+        if (state->player.health < healthBeforeMove && modeTakesDamage(state->gameMode)) {
+            state->deathMessage = "YOU FELL";
+            if (state->hurtSoundCooldown == 0) {
+                [self playSfx:state->sfxHurt gain:0.7f];
+                state->hurtSoundCooldown = 10;
+            }
+        }
+        // On foot, drift every floating boat once this tick (the ridden boat
+        // already stepped above with the rider's paddle).
+        state->boats.tick(*state->world, state->player.position, -1, Vec3{});
     }
-    const bool jumpedThisTick = playerInput.jumpPressed && state->player.onGround;
-    const Vec3 playerPositionBeforeMove = state->player.position;
-    const int healthBeforeMove = state->player.health;
-    state->player.tick(*state->world, playerInput);
     if (state->hurtSoundCooldown > 0)
         --state->hurtSoundCooldown;
-    // Player::tick applies fall damage directly to health; catch it here for
-    // the hurt sound and the death-screen cause.
-    if (state->player.health < healthBeforeMove && modeTakesDamage(state->gameMode)) {
-        state->deathMessage = "YOU FELL";
-        if (state->hurtSoundCooldown == 0) {
-            [self playSfx:state->sfxHurt gain:0.7f];
-            state->hurtSoundCooldown = 10;
-        }
-    }
 
     // 5b. Footsteps: one thud roughly every two blocks walked on the ground
     if (state->audio) {
@@ -2235,7 +2310,34 @@ static std::string defaultWorldDirectory() {
     // Attack precedence: a left-click edge on an animal nearer than the block
     // target hits it instead of mining. Reach is shorter than block reach.
     bool attackedEntity = NO;
-    if (input.isPressedForTick(Key::MouseLeft) && state->spawner) {
+
+    // A left click on a boat pops it back into a boat item and suppresses
+    // mining for the tick.
+    if (input.isPressedForTick(Key::MouseLeft) && !state->boats.empty()) {
+        const int boatIndex = state->boats.pick(cameraPos, forward, 3.5f);
+        if (boatIndex >= 0) {
+            const Vec3 pos = state->boats.boats()[static_cast<size_t>(boatIndex)].position;
+            if (state->ridingBoat == boatIndex)
+                state->ridingBoat = -1;
+            else if (state->ridingBoat > boatIndex)
+                --state->ridingBoat; // the removal shifts later indices down
+            const ItemStack boatItem{ItemType::BOAT, 1, 0};
+            if (modeConsumesItems(state->gameMode)) {
+                [self spawnDrop:state
+                          stack:boatItem
+                            atX:static_cast<int64_t>(std::floor(pos.x))
+                              y:static_cast<int32_t>(std::floor(pos.y))
+                              z:static_cast<int64_t>(std::floor(pos.z))];
+            } else {
+                state->inventory.add(boatItem);
+            }
+            state->boats.remove(static_cast<size_t>(boatIndex));
+            [self playSfx:state->sfxBlockBreak gain:0.5f];
+            attackedEntity = YES;
+        }
+    }
+
+    if (!attackedEntity && input.isPressedForTick(Key::MouseLeft) && state->spawner) {
         const auto entityHit = pickEntity(cameraPos, forward, 3.0f, state->spawner->getEntities());
         if (entityHit) {
             float blockDistance = 1e9f;
@@ -2316,6 +2418,13 @@ static std::string defaultWorldDirectory() {
                 interactableTarget = YES;
                 [self sleepInBed:state atX:bx y:by z:bz];
             }
+        }
+
+        // Mounting or placing a boat consumes the right-click before eating or
+        // block placement, and works whether or not a block was aimed at.
+        if (!interactableTarget && input.isPressedForTick(Key::MouseRight) &&
+            [self tryBoatInteraction:state cameraPos:cameraPos forward:forward]) {
+            interactableTarget = YES;
         }
 
         const ItemStack selected = state->inventory.getSelectedStack();
@@ -2499,6 +2608,51 @@ static std::string defaultWorldDirectory() {
 }
 
 // ---- Block Placing (Task 6.2) ----
+
+// Right-clicking a boat mounts it; right-clicking water with a boat item
+// places one on the surface. Returns YES when it handled the click.
+- (BOOL)tryBoatInteraction:(EngineState*)state cameraPos:(Vec3)cameraPos forward:(Vec3)forward {
+    if (!state->world)
+        return NO;
+
+    // Mounting an aimed boat takes priority and works with any held item.
+    const int boatIndex = state->boats.pick(cameraPos, forward, 4.0f);
+    if (boatIndex >= 0) {
+        state->ridingBoat = boatIndex;
+        [self playSfx:state->sfxBlockPlace gain:0.3f];
+        return YES;
+    }
+
+    if (state->inventory.getSelectedStack().type != ItemType::BOAT)
+        return NO;
+
+    // March the aim ray for the first water surface within reach; fluids are
+    // not solid, so the standard block ray passes straight through them.
+    constexpr float REACH = 5.0f;
+    constexpr float STEP = 0.1f;
+    for (float t = 0.f; t <= REACH; t += STEP) {
+        const int64_t bx = static_cast<int64_t>(std::floor(cameraPos.x + forward.x * t));
+        const int32_t by = static_cast<int32_t>(std::floor(cameraPos.y + forward.y * t));
+        const int64_t bz = static_cast<int64_t>(std::floor(cameraPos.z + forward.z * t));
+        const std::optional<BlockType> block = state->world->findBlockIfLoaded(bx, by, bz);
+        if (!block)
+            return NO;
+        if (*block == BlockType::WATER) {
+            const float surface =
+                static_cast<float>(by) + state->world->getFluidHeightIfLoaded(bx, by, bz);
+            state->boats.spawn(
+                Vec3{static_cast<float>(bx) + 0.5f, surface, static_cast<float>(bz) + 0.5f},
+                std::atan2(forward.x, forward.z));
+            if (modeConsumesItems(state->gameMode))
+                state->inventory.consumeSelected();
+            [self playSfx:state->sfxBlockPlace gain:0.5f];
+            return YES;
+        }
+        if (isSolid(*block))
+            return NO; // an opaque block blocks the aim before any water
+    }
+    return NO;
+}
 
 // Shearing a sheep with shears drops wool without killing it, the Minecraft
 // way to gather the wool a bed needs. Returns YES when it handled the click.
@@ -2942,7 +3096,7 @@ static std::string defaultWorldDirectory() {
         state->worldTime, state->deltaTime,
         state->hasHighlightedBlock ? std::optional<Vec3>(state->highlightedBlock) : std::nullopt,
         uiFrame, state->spawner ? &state->spawner->getEntities() : nullptr,
-        &state->itemEntities.items());
+        &state->itemEntities.items(), &state->boats.boats());
 
     if (updatePerformanceCapture(state->performance, state->frameCount, state->deltaTime * 1000.0,
                                  state->cachedChunkCount, state->autopilotStopFrame, *state->world,

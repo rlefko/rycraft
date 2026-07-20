@@ -1122,6 +1122,14 @@ static void paintItemIcon(BgraPixel* pixels, ItemType item, SimplexNoise& noise)
             }
             break;
         }
+        case ItemType::BOAT: {
+            // A little wooden hull: wide rim tapering to a rounded keel.
+            for (int y = 7; y <= 12; ++y) {
+                const int inset = std::min(3, y - 7);
+                fillRect(3 + inset, y, 12 - inset, y, swatch);
+            }
+            break;
+        }
         case ItemType::BUCKET:
         case ItemType::WATER_BUCKET:
         case ItemType::LAVA_BUCKET: {

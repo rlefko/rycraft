@@ -52,7 +52,8 @@ enum class ItemType : uint16_t {
     WATER_BUCKET = 285,
     LAVA_BUCKET = 286,
     SHEARS = 287,
-    COUNT = 288
+    BOAT = 288,
+    COUNT = 289
 };
 
 inline constexpr size_t NON_BLOCK_ITEM_COUNT = static_cast<size_t>(ItemType::COUNT) - ITEM_ID_BASE;
@@ -201,6 +202,8 @@ constexpr std::array<ItemDefinition, NON_BLOCK_ITEM_COUNT> makeItemDefinitions()
     at(ItemType::LAVA_BUCKET) = {"Lava Bucket", ItemCategory::MATERIAL, 1};
     // Shears are unstackable; they cut wool from sheep and shear wool blocks.
     at(ItemType::SHEARS) = {"Shears", ItemCategory::MATERIAL, 1};
+    // A boat is unstackable and places a rideable craft on water.
+    at(ItemType::BOAT) = {"Boat", ItemCategory::MATERIAL, 1};
 
     struct Food {
         ItemType type;
@@ -442,6 +445,7 @@ constexpr std::array<uint32_t, NON_BLOCK_ITEM_COUNT> makeItemSwatches() {
     at(ItemType::WATER_BUCKET) = 0x4073D9;
     at(ItemType::LAVA_BUCKET) = 0xE6661A;
     at(ItemType::SHEARS) = 0xC0C0C8;
+    at(ItemType::BOAT) = 0x9C6B3B;
     return colors;
 }
 
