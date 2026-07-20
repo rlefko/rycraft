@@ -8,10 +8,13 @@
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
 #include <engine/game_state.hpp>
-#include <engine/hotbar.hpp>
 #include <engine/input_bindings.hpp>
+#include <engine/inventory.hpp>
 #include <entity/ai.hpp>
+#include <entity/boat.hpp>
 #include <entity/entity.hpp>
+#include <entity/entity_picking.hpp>
+#include <entity/item_entity.hpp>
 #include <entity/physics.hpp>
 #include <entity/player.hpp>
 #include <entity/spatial_hash.hpp>
@@ -2588,4 +2591,221 @@ TEST_CASE("Entity: eat animation stops at zero", "[entity][animation]") {
     entity->tick(*world);
 
     REQUIRE(entity->eatAnimationTimer == 0);
+}
+
+TEST_CASE("Game mode gates: flight refusal and fall damage immunity", "[player][modes]") {
+    auto world = makePlatform(101);
+    loadFixtureCubes(*world, -2, 100, -2, 2, 132, 2);
+
+    // Survival input ignores the fly double-tap and drops an active flier.
+    Player player;
+    player.position = Vec3{0.f, 102.f, 0.f};
+    PlayerInput survival;
+    survival.allowFlight = false;
+    survival.doubleTapJump = true;
+    player.tick(*world, survival);
+    REQUIRE_FALSE(player.flying);
+
+    player.flying = true;
+    survival.doubleTapJump = false;
+    player.tick(*world, survival);
+    REQUIRE_FALSE(player.flying);
+
+    // Creative input lands a tall drop unhurt.
+    Player creative;
+    creative.health = 20;
+    creative.position = Vec3{0.f, 130.f, 0.f};
+    creative.onGround = false;
+    PlayerInput noDamage;
+    noDamage.takesFallDamage = false;
+    for (int i = 0; i < 200; ++i) {
+        creative.tick(*world, noDamage);
+        if (creative.onGround)
+            break;
+    }
+    REQUIRE(creative.onGround);
+    REQUIRE(creative.health == 20);
+}
+
+// ============================================================================
+// Dropped item entities
+// ============================================================================
+
+TEST_CASE("Dropped item falls under gravity and lands on solid ground", "[item-entity][physics]") {
+    auto world = makePlatform(101); // stone surface top at y = 101
+
+    ItemEntityManager manager;
+    manager.spawn(ItemStack{ItemType::COAL, 1, 0}, Vec3{0.f, 105.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+    REQUIRE(manager.items().size() == 1);
+    const float startY = manager.items().front().position.y;
+
+    for (int tick = 0; tick < 200; ++tick) {
+        manager.tick(*world, Vec3{0.f, 105.f, 0.f});
+        if (manager.items().front().onGround)
+            break;
+    }
+    const ItemEntity& item = manager.items().front();
+    REQUIRE(item.position.y < startY);                              // gravity pulled it down
+    REQUIRE(item.position.y == Catch::Approx(101.f).margin(0.05f)); // rests on the surface
+    REQUIRE(item.onGround);
+}
+
+TEST_CASE("Item entities freeze beyond the active radius", "[item-entity]") {
+    auto world = makePlatform(101);
+    ItemEntityManager manager;
+    // Far from the player: should not move or age.
+    const Vec3 farPos{500.f, 130.f, 500.f};
+    manager.spawn(ItemStack{ItemType::STICK, 1, 0}, farPos, Vec3{0.f, 0.f, 0.f}, 0);
+    for (int tick = 0; tick < 20; ++tick) {
+        manager.tick(*world, Vec3{0.f, 105.f, 0.f});
+    }
+    REQUIRE(manager.items().front().position.y == Catch::Approx(130.f));
+    REQUIRE(manager.items().front().ageTicks == 0);
+}
+
+TEST_CASE("Same-type items merge within range", "[item-entity]") {
+    auto world = makePlatform(101);
+    ItemEntityManager manager;
+    manager.spawn(ItemStack{ItemType::COAL, 10, 0}, Vec3{0.f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+    manager.spawn(ItemStack{ItemType::COAL, 5, 0}, Vec3{0.2f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+    manager.spawn(ItemStack{ItemType::STICK, 3, 0}, Vec3{0.1f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+
+    // The merge pass runs once per second (20 ticks).
+    for (int tick = 0; tick < 21; ++tick) {
+        manager.tick(*world, Vec3{0.f, 101.f, 0.f});
+    }
+    int coal = 0;
+    int coalStacks = 0;
+    int sticks = 0;
+    for (const ItemEntity& item : manager.items()) {
+        if (item.stack.type == ItemType::COAL) {
+            coal += item.stack.count;
+            ++coalStacks;
+        }
+        if (item.stack.type == ItemType::STICK)
+            sticks += item.stack.count;
+    }
+    REQUIRE(coal == 15);
+    REQUIRE(coalStacks == 1); // the two coal drops folded into one
+    REQUIRE(sticks == 3);     // the stick drop is untouched
+}
+
+TEST_CASE("Item spawns respect the cap by evicting the oldest", "[item-entity]") {
+    auto world = makePlatform(101);
+    ItemEntityManager manager;
+    for (size_t i = 0; i < ItemEntityManager::MAX_ITEMS; ++i) {
+        manager.spawn(ItemStack{ItemType::STICK, 1, 0}, Vec3{static_cast<float>(i), 101.f, 0.f},
+                      Vec3{0.f, 0.f, 0.f}, 0);
+    }
+    REQUIRE(manager.items().size() == ItemEntityManager::MAX_ITEMS);
+    // One more never exceeds the cap; the fresh spawn survives.
+    manager.spawn(ItemStack{ItemType::DIAMOND, 1, 0}, Vec3{0.f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f},
+                  0);
+    REQUIRE(manager.items().size() == ItemEntityManager::MAX_ITEMS);
+    bool hasDiamond = false;
+    for (const ItemEntity& item : manager.items()) {
+        if (item.stack.type == ItemType::DIAMOND)
+            hasDiamond = true;
+    }
+    REQUIRE(hasDiamond);
+}
+
+TEST_CASE("Aged-out items despawn", "[item-entity]") {
+    auto world = makePlatform(101);
+    ItemEntityManager manager;
+    manager.spawn(ItemStack{ItemType::STICK, 1, 0}, Vec3{0.f, 101.f, 0.f}, Vec3{0.f, 0.f, 0.f}, 0);
+    manager.items().front().ageTicks = ItemEntity::DESPAWN_TICKS - 1;
+    manager.tick(*world, Vec3{0.f, 101.f, 0.f});
+    REQUIRE(manager.items().empty());
+}
+
+// ============================================================================
+// Boats
+// ============================================================================
+
+TEST_CASE("Boat sinks under gravity and grounds on solid land", "[boat][physics]") {
+    auto world = makePlatform(101); // stone surface top at y = 101
+    BoatManager boats;
+    boats.spawn(Vec3{0.f, 108.f, 0.f}, 0.f);
+    REQUIRE(boats.boats().size() == 1);
+    const float startY = boats.boats().front().position.y;
+
+    for (int tick = 0; tick < 400; ++tick) {
+        boats.tick(*world, Vec3{0.f, 108.f, 0.f}, -1, Vec3{});
+        if (boats.boats().front().onGround)
+            break;
+    }
+    const Boat& boat = boats.boats().front();
+    REQUIRE(boat.position.y < startY); // gravity pulled a beached boat down
+    REQUIRE(boat.onGround);
+    REQUIRE(boat.position.y == Catch::Approx(101.f).margin(0.2f));
+}
+
+TEST_CASE("Boat picking hits an aimed hull and misses otherwise", "[boat]") {
+    BoatManager boats;
+    boats.spawn(Vec3{0.f, 64.f, 5.f}, 0.f);
+    // Aiming +Z from the origin crosses the hull; aiming away misses.
+    REQUIRE(boats.pick(Vec3{0.f, 64.3f, 0.f}, Vec3{0.f, 0.f, 1.f}, 10.f) == 0);
+    REQUIRE(boats.pick(Vec3{0.f, 64.3f, 0.f}, Vec3{0.f, 0.f, -1.f}, 10.f) == -1);
+}
+
+TEST_CASE("Boat spawns respect the cap and removal is bounds-checked", "[boat]") {
+    BoatManager boats;
+    for (size_t i = 0; i < BoatManager::MAX_BOATS; ++i) {
+        boats.spawn(Vec3{static_cast<float>(i), 64.f, 0.f}, 0.f);
+    }
+    REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS);
+    // One more evicts the oldest; the fresh spawn survives at the cap.
+    boats.spawn(Vec3{999.f, 64.f, 0.f}, 0.f);
+    REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS);
+    REQUIRE(boats.boats().back().position.x == Catch::Approx(999.f));
+
+    boats.remove(0);
+    REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS - 1);
+    boats.remove(9999); // out of range: a safe no-op
+    REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS - 1);
+}
+
+// ============================================================================
+// Entity picking (melee targeting)
+// ============================================================================
+
+TEST_CASE("Entity picking hits along the ray and prefers the nearest", "[entity-picking]") {
+    std::vector<std::shared_ptr<Entity>> entities;
+    auto near = std::make_shared<Entity>(1, EntityType::PIG, Vec3{0.f, 0.f, 3.f});
+    auto far = std::make_shared<Entity>(2, EntityType::COW, Vec3{0.f, 0.f, 6.f});
+    entities.push_back(near);
+    entities.push_back(far);
+
+    // Looking +Z from the origin at eye height hits the pig first.
+    const Vec3 origin{0.f, near->aabb.min.y + 0.5f, 0.f};
+    auto hit = pickEntity(origin, Vec3{0.f, 0.f, 1.f}, 8.f, entities);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->entityId == 1);
+    REQUIRE(hit->distance == Catch::Approx(3.f).margin(0.6f));
+
+    // Looking away misses entirely.
+    REQUIRE_FALSE(pickEntity(origin, Vec3{0.f, 0.f, -1.f}, 8.f, entities).has_value());
+
+    // Short reach cannot touch the farther cow through the pig.
+    REQUIRE(pickEntity(origin, Vec3{0.f, 0.f, 1.f}, 3.5f, entities)->entityId == 1);
+
+    // A dead entity is skipped even when it is nearer.
+    near->alive = false;
+    auto through = pickEntity(origin, Vec3{0.f, 0.f, 1.f}, 8.f, entities);
+    REQUIRE(through.has_value());
+    REQUIRE(through->entityId == 2);
+}
+
+TEST_CASE("Entity health initializes from the per-type config", "[entity-picking]") {
+    for (int type = 0; type < static_cast<int>(EntityType::COUNT); ++type) {
+        auto entity =
+            std::make_shared<Entity>(1, static_cast<EntityType>(type), Vec3{0.f, 0.f, 0.f});
+        REQUIRE(entity->health == Entity::getConfig(static_cast<EntityType>(type)).maxHealth);
+        REQUIRE(entity->health > 0);
+    }
+    // Chickens and rabbits are the frail ones; cows are sturdier.
+    auto chicken = std::make_shared<Entity>(1, EntityType::CHICKEN, Vec3{0.f, 0.f, 0.f});
+    auto cow = std::make_shared<Entity>(2, EntityType::COW, Vec3{0.f, 0.f, 0.f});
+    REQUIRE(chicken->health < cow->health);
 }

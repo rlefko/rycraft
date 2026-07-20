@@ -6,9 +6,11 @@
 #include "render/atmospheric_memory.hpp"
 #include "render/block_textures.hpp"
 #include "render/bloom.hpp"
+#include "render/boat_renderer.hpp"
 #include "render/celestial.hpp"
 #include "render/cloud_renderer.hpp"
 #include "render/entity_renderer.hpp"
+#include "render/item_entity_renderer.hpp"
 #include "render/lightning_renderer.hpp"
 #include "render/lod_mesher.hpp"
 #include "render/metal_ownership.hpp"
@@ -19,7 +21,6 @@
 #include "render/volumetrics.hpp"
 
 #include "engine/camera.hpp"
-#include "engine/hotbar.hpp"
 #include "render/particles.hpp"
 #include "render/ui_hud.hpp"
 #include "render/ui_overlay.hpp"
@@ -398,6 +399,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
     // ---- UIOverlay (screen-space HUD rendering) ----
     _uiOverlay = std::make_unique<UIOverlay>(_device, shaderLibrary, _displayWidth, _displayHeight);
+    _uiOverlay->setIconAtlas(_blockTextures->texture(), _blockTextures->sampler());
 
     // ---- Bloom post-processing (HDR extract + blur) ----
     _bloom = std::make_unique<Bloom>(_device, shaderLibrary, _displayWidth, _displayHeight);
@@ -425,6 +427,8 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
     // ---- Animal renderer ----
     _entityRenderer = std::make_unique<EntityRenderer>(_device, shaderLibrary);
+    _itemEntityRenderer = std::make_unique<ItemEntityRenderer>(_device, shaderLibrary);
+    _boatRenderer = std::make_unique<BoatRenderer>(_device, shaderLibrary);
 
     // ---- GPU timing (per-pass sampling is a diagnostic opt-in) ----
     const char* counters = std::getenv("RYCRAFT_GPU_COUNTERS");
@@ -555,8 +559,10 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                             const Mat4& viewMatrix, const Mat4& projectionMatrix,
                             const World& world, const Camera& camera, uint64_t worldTime,
                             double deltaSeconds, std::optional<Vec3> highlightedBlock,
-                            const Hotbar& hotbar, const UIFrameState& uiFrame,
+                            const UIFrameState& uiFrame,
                             const std::vector<std::shared_ptr<Entity>>* entities,
+                            const std::vector<ItemEntity>* itemEntities,
+                            const std::vector<Boat>* boats,
                             std::shared_ptr<const WeatherSnapshot> weatherSnapshot,
                             const std::vector<LightningEvent>* lightningEvents) {
     if (!drawable || !queue)
@@ -763,6 +769,15 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                                                     static_cast<int32_t>(std::floor(position.y)),
                                                     static_cast<int64_t>(std::floor(position.z)));
             });
+    }
+    if (itemEntities && _itemEntityRenderer) {
+        _itemEntityRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset,
+                                    *itemEntities,
+                                    [this](const AABB& aabb) { return isChunkInFrustum(aabb); });
+    }
+    if (boats && _boatRenderer) {
+        _boatRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset, *boats,
+                              [this](const AABB& aabb) { return isChunkInFrustum(aabb); });
     }
 
     if (highlightedBlock.has_value()) {
@@ -988,7 +1003,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     id<MTLRenderCommandEncoder> uiEncoder =
         [commandBuffer renderCommandEncoderWithDescriptor:uiPassDesc];
     if (uiEncoder) {
-        renderUIOverlay(uiEncoder, hotbar, uiFrame);
+        renderUIOverlay(uiEncoder, uiFrame);
         [uiEncoder endEncoding];
     }
     resetMetalObject(uiPassDesc);
@@ -1007,6 +1022,81 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     // Present and commit
     [commandBuffer presentDrawable:drawable];
     [commandBuffer commit];
+}
+
+void RenderPipeline::renderMenuOnly(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
+                                    const UIFrameState& uiFrame) {
+    if (!drawable || !queue)
+        return;
+
+    if (drawable.texture.width != _displayWidth || drawable.texture.height != _displayHeight) {
+        resize(static_cast<uint32_t>(drawable.texture.width),
+               static_cast<uint32_t>(drawable.texture.height));
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    if (!commandBuffer)
+        return;
+
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.06, 0.07, 0.10, 1.0);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (encoder) {
+        renderUIOverlay(encoder, uiFrame);
+        [encoder endEncoding];
+    }
+
+    // Menu screens are capturable too (world selection playtests).
+    if (!_capturePath.empty()) {
+        encodeFrameCapture(commandBuffer, drawable.texture);
+    }
+
+    [commandBuffer presentDrawable:drawable];
+    [commandBuffer commit];
+}
+
+void RenderPipeline::endWorldSession() {
+    if (_meshScheduler) {
+        _meshScheduler->shutdown();
+        _meshScheduler.reset();
+    }
+    _pendingResults.clear();
+    if (_megaBuffer) {
+        for (auto& [key, state] : _chunkMeshes) {
+            (void)key;
+            if (state.uploaded) {
+                _megaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
+            }
+        }
+    }
+    _chunkMeshes.clear();
+    _liveChunksByPosition.clear();
+    clearExactSectionOwnership();
+    _waterDraws.clear();
+
+    // Far terrain: stop the eight workers and free the resident tiles now
+    // rather than pinning a full world's horizon arena and generation cache
+    // while sitting at the title. The next world's resetFarTerrain rebuilds
+    // the scheduler because it is null (which also forces a rebuild even for
+    // an identical seed, the World-identity guarantee).
+    if (_farTerrainScheduler) {
+        _farTerrainScheduler->shutdown();
+        _farTerrainScheduler.reset();
+    }
+    if (_farMegaBuffer) {
+        for (auto& [key, state] : _farTerrainMeshes) {
+            (void)key;
+            if (state.uploaded) {
+                _farMegaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
+            }
+        }
+    }
+    _farTerrainMeshes.clear();
+    _farTerrainSeed.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,7 +1544,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
 
     // Reset seed-owned far state before exact ownership is accumulated. The
     // second call in renderFarTerrain is then an inexpensive no-op.
-    resetFarTerrain(world.getSeed());
+    resetFarTerrain(world.getSeed(), world.getGenerationSettings());
 
     // Water draws recorded here render later, in the dedicated water pass
     _waterDraws.clear();
@@ -1965,7 +2055,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     _chunkStats.meshDroppedStaleCount = meshStats.droppedStale;
 }
 
-void RenderPipeline::resetFarTerrain(uint64_t worldSeed) {
+void RenderPipeline::resetFarTerrain(uint64_t worldSeed, GenerationSettings generation) {
     if (_farTerrainSeed && *_farTerrainSeed == worldSeed && _farTerrainScheduler)
         return;
 
@@ -2006,7 +2096,8 @@ void RenderPipeline::resetFarTerrain(uint64_t worldSeed) {
             _device, FAR_VERTEX_BUFFER_BYTES, FAR_INDEX_BUFFER_BYTES, FAR_VERTEX_BUFFER_SLAB_BYTES,
             FAR_INDEX_BUFFER_SLAB_BYTES);
     }
-    _farTerrainScheduler = std::make_unique<FarTerrainScheduler>(worldSeed);
+    _farTerrainScheduler =
+        std::make_unique<FarTerrainScheduler>(worldSeed, FarTerrainSchedulerLimits{}, generation);
     _farTerrainSeed = worldSeed;
     _farTerrainMeshes.reserve(8192);
     _farTerrainWanted.reserve(8192);
@@ -2045,7 +2136,7 @@ void RenderPipeline::clearExactSectionOwnership() {
 
 void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const World& world,
                                       const Vec3& cameraPosition, const float fogColor[3]) {
-    resetFarTerrain(world.getSeed());
+    resetFarTerrain(world.getSeed(), world.getGenerationSettings());
     _farMegaBuffer->drainDeferredFrees(_frameRing.completedFrame());
     _farTerrainActiveTiles.clear();
     _farTerrainCandidates.clear();
@@ -3264,12 +3355,12 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, c
 // ---------------------------------------------------------------------------
 // renderUIOverlay (Task 6.10 + hotbar)
 // ---------------------------------------------------------------------------
-void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder, const Hotbar& hotbar,
+void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
                                      const UIFrameState& uiFrame) {
     _uiOverlay->beginFrame();
-    drawGameHud(*_uiOverlay, hotbar, uiFrame, _displayWidth, _displayHeight);
+    drawGameHud(*_uiOverlay, uiFrame, _displayWidth, _displayHeight);
     if (uiFrame.screen != GameScreen::PLAYING) {
-        drawMenu(*_uiOverlay, uiFrame.menu, uiFrame.hoveredButton, _displayWidth, _displayHeight);
+        drawMenu(*_uiOverlay, uiFrame, _displayWidth, _displayHeight);
     }
     _uiOverlay->flush(encoder);
 }

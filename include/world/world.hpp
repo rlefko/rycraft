@@ -132,7 +132,7 @@ inline constexpr size_t MAX_FLUID_FRONTIER_RESUMES_PER_CUBE = 16;
 class World : public FluidWorldAccess {
 public:
     explicit World(uint32_t seed, int viewDistance = DEFAULT_RENDER_DISTANCE_CHUNKS,
-                   size_t loadedCubeLimit = MAX_LOADED_CUBES);
+                   size_t loadedCubeLimit = MAX_LOADED_CUBES, GenerationSettings generation = {});
     ~World();
 
     World(const World&) = delete;
@@ -194,6 +194,7 @@ public:
     }
 
     uint32_t getSeed() const { return seed_; }
+    const GenerationSettings& getGenerationSettings() const { return generation_; }
     int getViewDistance() const { return viewDistance_.load(std::memory_order_relaxed); }
     int getExactViewDistance() const {
         return std::min(getViewDistance(), MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
@@ -226,6 +227,7 @@ public:
 
 private:
     uint32_t seed_;
+    GenerationSettings generation_;
     std::atomic<int> viewDistance_;
 
     std::unordered_map<ChunkPos, std::shared_ptr<Chunk>> chunks_;

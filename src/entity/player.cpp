@@ -29,7 +29,9 @@ void Player::tick(World& world, const PlayerInput& in) {
     // sets on a forward double-tap or the held sprint key, and clears the
     // tick forward is released (releasing the sprint key alone keeps it —
     // it is an initiator, not a maintainer).
-    if (in.doubleTapJump) {
+    if (!in.allowFlight) {
+        flying = false; // a survival switch mid-flight drops the player
+    } else if (in.doubleTapJump) {
         flying = !flying;
         if (flying) {
             velocity.y = 0.f; // hover immediately — cancels the current fall
@@ -170,9 +172,9 @@ void Player::tick(World& world, const PlayerInput& in) {
         fallDistance += -resolvedMovement.y;
     }
 
-    // If on ground, apply fall damage and reset
+    // If on ground, apply fall damage (survival only) and reset
     if (onGround) {
-        if (fallDistance > 3.f) {
+        if (in.takesFallDamage && fallDistance > 3.f) {
             applyFallDamage();
         }
         resetFallDistance();

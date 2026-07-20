@@ -6,6 +6,7 @@
 #include "world/macro_generation.hpp"
 #include "world/surface_material.hpp"
 #include "world/view_distance.hpp"
+#include "world/world_config.hpp"
 
 #include <algorithm>
 #include <array>
@@ -754,7 +755,10 @@ public:
     static constexpr size_t LATENCY_WORKER_COUNT = 4;
 
     explicit FarTerrainScheduler(FarTerrainSource source, FarTerrainSchedulerLimits limits = {});
-    explicit FarTerrainScheduler(uint64_t worldSeed, FarTerrainSchedulerLimits limits = {});
+    // The far generator must agree with cubic emission, so it takes the same
+    // generation settings the World was built with.
+    explicit FarTerrainScheduler(uint64_t worldSeed, FarTerrainSchedulerLimits limits = {},
+                                 GenerationSettings generation = {});
     ~FarTerrainScheduler();
 
     FarTerrainScheduler(const FarTerrainScheduler&) = delete;

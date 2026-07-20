@@ -12,18 +12,35 @@
 namespace {
 
 constexpr std::array<EntityConfig, ENTITY_TYPE_COUNT> ENTITY_CONFIGS = {{
-    {0.6f, 0.9f, 0.025f, Vec3{0.9f, 0.9f, 0.9f}, MovementMode::WALK, 0.0f, 1.0f},
-    {0.9f, 1.4f, 0.020f, Vec3{0.55f, 0.27f, 0.07f}, MovementMode::WALK, 0.0f, 1.0f},
-    {0.7f, 0.9f, 0.025f, Vec3{0.9f, 0.65f, 0.75f}, MovementMode::WALK, 0.0f, 1.0f},
-    {0.4f, 0.7f, 0.030f, Vec3{0.95f, 0.95f, 0.9f}, MovementMode::WALK, 0.0f, 1.0f},
-    {0.7f, 1.5f, 0.040f, Vec3{0.55f, 0.32f, 0.16f}, MovementMode::WALK, 0.0f, 1.0f},
-    {0.7f, 1.2f, 0.038f, Vec3{0.72f, 0.68f, 0.58f}, MovementMode::CLIMB, 0.22f, 1.25f},
-    {0.4f, 0.55f, 0.045f, Vec3{0.67f, 0.58f, 0.46f}, MovementMode::HOP, 0.24f, 0.6f},
-    {0.45f, 0.35f, 0.035f, Vec3{0.25f, 0.62f, 0.23f}, MovementMode::AMPHIBIOUS_HOP, 0.28f, 0.6f},
-    {0.55f, 0.45f, 0.035f, Vec3{0.28f, 0.58f, 0.78f}, MovementMode::SWIM, 0.0f, 0.0f},
+    {0.6f, 0.9f, 0.025f, Vec3{0.9f, 0.9f, 0.9f}, MovementMode::WALK, 0.0f, 1.0f, 8,
+     ItemType::RAW_MUTTON, 2},
+    {0.9f, 1.4f, 0.020f, Vec3{0.55f, 0.27f, 0.07f}, MovementMode::WALK, 0.0f, 1.0f, 10,
+     ItemType::RAW_BEEF, 2},
+    {0.7f, 0.9f, 0.025f, Vec3{0.9f, 0.65f, 0.75f}, MovementMode::WALK, 0.0f, 1.0f, 10,
+     ItemType::RAW_PORKCHOP, 2},
+    {0.4f, 0.7f, 0.030f, Vec3{0.95f, 0.95f, 0.9f}, MovementMode::WALK, 0.0f, 1.0f, 4,
+     ItemType::RAW_CHICKEN, 1},
+    {0.7f, 1.5f, 0.040f, Vec3{0.55f, 0.32f, 0.16f}, MovementMode::WALK, 0.0f, 1.0f, 10,
+     ItemType::RAW_BEEF, 2},
+    {0.7f, 1.2f, 0.038f, Vec3{0.72f, 0.68f, 0.58f}, MovementMode::CLIMB, 0.22f, 1.25f, 10,
+     ItemType::RAW_MUTTON, 1},
+    {0.4f, 0.55f, 0.045f, Vec3{0.67f, 0.58f, 0.46f}, MovementMode::HOP, 0.24f, 0.6f, 3,
+     ItemType::RAW_CHICKEN, 1},
+    {0.45f, 0.35f, 0.035f, Vec3{0.25f, 0.62f, 0.23f}, MovementMode::AMPHIBIOUS_HOP, 0.28f, 0.6f, 5,
+     ItemType::NONE, 0},
+    {0.55f, 0.45f, 0.035f, Vec3{0.28f, 0.58f, 0.78f}, MovementMode::SWIM, 0.0f, 0.0f, 3,
+     ItemType::RAW_FISH, 1},
 }};
 
 static_assert(ENTITY_CONFIGS.size() == ENTITY_TYPE_COUNT);
+static_assert([] {
+    for (const EntityConfig& config : ENTITY_CONFIGS) {
+        if (config.maxHealth <= 0) return false;
+        if ((config.drop == ItemType::NONE) != (config.dropCount == 0)) return false;
+        if (config.drop != ItemType::NONE && !isFood(config.drop)) return false;
+    }
+    return true;
+}());
 
 bool isWaterAt(World& world, const Vec3& position, float height) {
     const int x = static_cast<int>(std::floor(position.x));
@@ -62,6 +79,7 @@ Entity::Entity(uint64_t entityId, EntityType entityType, const Vec3& spawnPos)
     , type(entityType)
     , position(spawnPos)
     , velocity(Vec3::zero())
+    , health(getConfig(entityType).maxHealth)
     , homePosition(spawnPos) {
     aabb = computeAABB();
 }

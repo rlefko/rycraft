@@ -36,7 +36,9 @@ struct StructurePlacement {
 
 class StructurePlacer {
 public:
-    explicit StructurePlacer(uint32_t worldSeed);
+    // A disabled placer emits nothing and reserves no footprints, so trees
+    // fill former structure sites deterministically for that toggle value.
+    explicit StructurePlacer(uint32_t worldSeed, bool enabled = true);
 
     // Emit every structure that intersects this chunk.
     void place(Chunk& chunk, const ChunkGenerator& gen, GenScratch& scratch) const;
@@ -51,4 +53,5 @@ public:
 
 private:
     CounterRng random_;
+    bool enabled_ = true;
 };

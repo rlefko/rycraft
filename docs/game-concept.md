@@ -44,10 +44,17 @@ The implementation boundary for each item is documented in [world-generation.md]
 
 | Screen | Purpose |
 |---|---|
-| Title | Play or quit over a live world view |
-| Playing | Captured cursor, crosshair, hotbar, world, and entities |
-| Paused | Resume, settings, or quit while simulation is frozen |
+| Title | Play or quit over the menu backdrop |
+| World select | List, play, or delete saved worlds |
+| World create | Name, seed, generation toggles, and starting game mode for a new world |
+| Playing | Captured cursor, crosshair, hotbar, health and hunger, world, and entities |
+| Paused | Resume, switch game mode, save and quit to title, or quit while simulation is frozen |
 | Settings | View distance through 512, graphics quality, controls, sensitivity, and volume |
+| Inventory | 36 item slots with a 2x2 crafting grid, or the paged creative palette |
+| Crafting | 3x3 crafting grid opened from a crafting table |
+| Furnace | Smelting input, fuel, output, and progress opened from a furnace |
+| Chest | 27 storage slots opened from a placed chest, persisted with the world |
+| Death | Respawn or return to title after health reaches zero |
 | Debug HUD | Frame, exact coverage and conservative gap distance, far parent and refinement residency, drawable coverage frontier, culling, queue, cache, fluid, fauna, and world-generation diagnostics |
 
 ## Current scope
@@ -56,4 +63,6 @@ Shipping systems include sparse 16 by 16 by 16 chunks, the finite vertical range
 
 Missing exact halos close explicitly while their real neighbors load. Aboveground openings receive lit planned surface continuations, enclosed underground openings receive dark inward caps, and missing vertical openings receive bedrock caps. The remaining horizon performance debt is the synchronous far payload: terrain, water, and canopy work publish together, and measured cold canopy construction ranges from 250 to 1,165 milliseconds. Staged canopy attachment is the planned follow-up so an otherwise ready terrain and water parent does not wait for forest geometry.
 
-Deliberately outside this version are a dynamic planet, moving plates, erosion after generation, seasons, climate change, terrain-changing weather, snow accumulation, runoff, flooding, storm fire, eruptions, lava propagation and mixing, predators, food webs, migration, multiplayer, crafting, far-terrain caves or structures, hierarchical Z-buffer occlusion, indirect command buffers, and GPU-driven draw submission. The implemented tectonics, basin erosion, climate, and volcanoes synthesize a static world. Weather affects presentation and surface wetness only. The far renderer uses adaptive immutable tile tiers, not a literal geometry clipmap.
+The survival experience borrows Minecraft's structure as a placeholder to be reshaped later. Multiple named worlds live under a saves directory (the legacy `rycraft_world` is adopted in place), each with its own seed, game mode, and generation toggles for structures, fauna, weather, and the day cycle. Survival adds a stack-based 36-slot inventory, 2x2 and 3x3 crafting, furnace smelting, block hardness with wood, stone, and iron tool tiers, block drops as collectible item entities, health and hunger with Minecraft-matched saturation-fast and food-slow regeneration, fall and drowning damage, starvation, death with an inventory scatter, respawn, and huntable animals that drop meat. The interface borrows Minecraft's stack handling too: left and right drag distribute a held stack evenly or one-per-slot, and a double-click gathers a matching stack. Utility content matches Minecraft placeholders as well: buckets scoop and pour water and lava, chests store items and persist, torches emit steady propagated block light, shears cut wool from sheep, beds set the spawn and sleep through the night, and craftable boats float on water and carry the player with WASD steering. Creative keeps free flight, instant breaking, and an infinite item palette. Game mode switches from the pause menu.
+
+Deliberately outside this version are a dynamic planet, moving plates, erosion after generation, seasons, climate change, terrain-changing weather, snow accumulation, runoff, flooding, storm fire, eruptions, lava propagation and mixing, hostile mobs and combat, experience and levels, predators, food webs, migration, multiplayer, far-terrain caves or structures, hierarchical Z-buffer occlusion, indirect command buffers, and GPU-driven draw submission. The implemented tectonics, basin erosion, climate, and volcanoes synthesize a static world. Weather affects presentation and surface wetness only. The far renderer uses adaptive immutable tile tiers, not a literal geometry clipmap.

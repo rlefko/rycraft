@@ -88,11 +88,19 @@ parseCaptureLightningOverride(std::string_view text) noexcept {
 }
 
 enum class GameScreen {
-    TITLE,          // launch screen: PLAY / QUIT, world visible behind
-    PLAYING,        // normal gameplay, cursor captured
-    PAUSED,         // ESC menu: RESUME / SETTINGS / QUIT
-    SETTINGS,       // settings panel, reached from PAUSED
-    VIDEO_SETTINGS, // per-effect video options, reached from SETTINGS
+    TITLE,                // launch screen: PLAY / QUIT, backdrop only
+    WORLD_SELECT,         // saved world list, reached from TITLE
+    WORLD_CREATE,         // name/seed/toggles form, reached from WORLD_SELECT
+    WORLD_DELETE_CONFIRM, // destructive-delete confirmation
+    PLAYING,              // normal gameplay, cursor captured
+    PAUSED,               // ESC menu: RESUME / SETTINGS / QUIT
+    SETTINGS,             // settings panel, reached from PAUSED
+    VIDEO_SETTINGS,       // per-effect video options, reached from SETTINGS
+    INVENTORY,            // player inventory + 2x2 craft grid (world frozen)
+    CRAFTING,             // crafting table 3x3 grid (world frozen)
+    FURNACE,              // furnace slots + gauges (world frozen)
+    CHEST,                // 27-slot storage block (world frozen)
+    DEATH,                // respawn / quit after health reaches zero
 };
 
 enum class MenuAction {
@@ -104,6 +112,33 @@ enum class MenuAction {
     OPEN_VIDEO_SETTINGS,
     CLOSE_VIDEO_SETTINGS,
     QUIT,
+    // World flow. Side-effectful actions (selecting, playing, creating,
+    // deleting, respawning, quitting to title) return no flow change from
+    // onMenuAction; the engine performs the effect and then drives the flow
+    // through onWorldStarted/onWorldStopped/onRespawn, mirroring how the
+    // settings steppers already work.
+    OPEN_WORLD_SELECT,
+    OPEN_WORLD_CREATE,
+    SELECT_WORLD, // MenuButton::payload = index into the cached world list
+    WORLD_LIST_UP,
+    WORLD_LIST_DOWN,
+    PLAY_SELECTED_WORLD,
+    CREATE_WORLD_CONFIRM,
+    RANDOM_SEED,
+    TOGGLE_GEN_STRUCTURES,
+    TOGGLE_GEN_FAUNA,
+    TOGGLE_GEN_WEATHER,
+    TOGGLE_GEN_DAY_CYCLE,
+    TOGGLE_CREATE_MODE,
+    REQUEST_DELETE_WORLD,
+    CONFIRM_DELETE,
+    CANCEL_DELETE,
+    WORLD_BACK,
+    RESPAWN,
+    SAVE_QUIT_TO_TITLE,
+    TOGGLE_GAME_MODE,
+    CREATIVE_PAGE_PREV,
+    CREATIVE_PAGE_NEXT,
     // Settings value steppers (handled by the engine; no screen change)
     VIEW_DISTANCE_DOWN,
     VIEW_DISTANCE_UP,
@@ -132,6 +167,15 @@ enum class MenuAction {
     SHARPEN_UP,
 };
 
+// Screens that run over a live world session (the HUD draws only there).
+constexpr bool screenHasWorldSession(GameScreen screen) {
+    return screen == GameScreen::PLAYING || screen == GameScreen::PAUSED ||
+           screen == GameScreen::SETTINGS || screen == GameScreen::VIDEO_SETTINGS ||
+           screen == GameScreen::INVENTORY || screen == GameScreen::CRAFTING ||
+           screen == GameScreen::FURNACE || screen == GameScreen::CHEST ||
+           screen == GameScreen::DEATH;
+}
+
 // What the engine must do after a transition.
 struct GameFlowEffects {
     bool captureCursor = false; // hide + pointer-lock the mouse
@@ -146,7 +190,17 @@ struct GameFlow {
     // Menus freeze the world: ticks run only while Playing.
     constexpr bool inMenu() const { return screen != GameScreen::PLAYING; }
 
-    // ESC: pause from gameplay, resume from pause, back out of settings.
+    // Screens that require a live world session behind them.
+    constexpr bool worldScreens() const { return screenHasWorldSession(screen); }
+
+    // Container screens the inventory key and container blocks open.
+    constexpr bool inContainer() const {
+        return screen == GameScreen::INVENTORY || screen == GameScreen::CRAFTING ||
+               screen == GameScreen::FURNACE || screen == GameScreen::CHEST;
+    }
+
+    // ESC: pause from gameplay, resume from pause, back out of settings,
+    // close containers, back out of the world menus. Death ignores it.
     constexpr GameFlowEffects onEscape() {
         switch (screen) {
             case GameScreen::PLAYING:
@@ -161,10 +215,75 @@ struct GameFlow {
             case GameScreen::VIDEO_SETTINGS:
                 screen = GameScreen::SETTINGS;
                 return {};
+            case GameScreen::INVENTORY:
+            case GameScreen::CRAFTING:
+            case GameScreen::FURNACE:
+            case GameScreen::CHEST:
+                screen = GameScreen::PLAYING;
+                return {.captureCursor = true, .resetTiming = true};
+            case GameScreen::WORLD_SELECT:
+                screen = GameScreen::TITLE;
+                return {};
+            case GameScreen::WORLD_CREATE:
+            case GameScreen::WORLD_DELETE_CONFIRM:
+                screen = GameScreen::WORLD_SELECT;
+                return {};
+            case GameScreen::DEATH:
             case GameScreen::TITLE:
                 return {};
         }
         return {};
+    }
+
+    // E toggles the inventory and closes any open container.
+    constexpr GameFlowEffects onInventoryKey() {
+        if (screen == GameScreen::PLAYING) {
+            screen = GameScreen::INVENTORY;
+            return {.releaseCursor = true, .resetTiming = true};
+        }
+        if (inContainer()) {
+            screen = GameScreen::PLAYING;
+            return {.captureCursor = true, .resetTiming = true};
+        }
+        return {};
+    }
+
+    // Right-clicking a crafting table, furnace, or chest while playing.
+    constexpr GameFlowEffects onContainerOpened(GameScreen container) {
+        if (screen != GameScreen::PLAYING ||
+            (container != GameScreen::CRAFTING && container != GameScreen::FURNACE &&
+             container != GameScreen::CHEST)) {
+            return {};
+        }
+        screen = container;
+        return {.releaseCursor = true, .resetTiming = true};
+    }
+
+    // The engine drives these after its side effect succeeds.
+    constexpr GameFlowEffects onWorldStarted() {
+        if (screen != GameScreen::TITLE && screen != GameScreen::WORLD_SELECT &&
+            screen != GameScreen::WORLD_CREATE) {
+            return {};
+        }
+        screen = GameScreen::PLAYING;
+        return {.captureCursor = true, .resetTiming = true};
+    }
+
+    constexpr GameFlowEffects onWorldStopped() {
+        screen = GameScreen::TITLE;
+        return {.releaseCursor = true, .resetTiming = true};
+    }
+
+    constexpr GameFlowEffects onPlayerDied() {
+        if (screen != GameScreen::PLAYING) return {};
+        screen = GameScreen::DEATH;
+        return {.releaseCursor = true, .resetTiming = true};
+    }
+
+    constexpr GameFlowEffects onRespawn() {
+        if (screen != GameScreen::DEATH) return {};
+        screen = GameScreen::PLAYING;
+        return {.captureCursor = true, .resetTiming = true};
     }
 
     constexpr GameFlowEffects onMenuAction(MenuAction action) {
@@ -193,13 +312,34 @@ struct GameFlow {
             case MenuAction::CLOSE_VIDEO_SETTINGS:
                 if (screen == GameScreen::VIDEO_SETTINGS) screen = GameScreen::SETTINGS;
                 return {};
+            case MenuAction::OPEN_WORLD_SELECT:
+                if (screen == GameScreen::TITLE) screen = GameScreen::WORLD_SELECT;
+                return {};
+            case MenuAction::OPEN_WORLD_CREATE:
+                if (screen == GameScreen::WORLD_SELECT) screen = GameScreen::WORLD_CREATE;
+                return {};
+            case MenuAction::REQUEST_DELETE_WORLD:
+                if (screen == GameScreen::WORLD_SELECT) screen = GameScreen::WORLD_DELETE_CONFIRM;
+                return {};
+            case MenuAction::CANCEL_DELETE:
+                if (screen == GameScreen::WORLD_DELETE_CONFIRM) screen = GameScreen::WORLD_SELECT;
+                return {};
+            case MenuAction::WORLD_BACK:
+                if (screen == GameScreen::WORLD_SELECT) {
+                    screen = GameScreen::TITLE;
+                } else if (screen == GameScreen::WORLD_CREATE ||
+                           screen == GameScreen::WORLD_DELETE_CONFIRM) {
+                    screen = GameScreen::WORLD_SELECT;
+                }
+                return {};
             case MenuAction::QUIT:
-                if (screen == GameScreen::TITLE || screen == GameScreen::PAUSED) {
+                if (screen == GameScreen::TITLE || screen == GameScreen::PAUSED ||
+                    screen == GameScreen::WORLD_SELECT) {
                     return {.requestQuit = true};
                 }
                 return {};
             default:
-                // Value steppers change engine settings, not the screen
+                // Value steppers and engine-side effects change no screen
                 return {};
         }
     }

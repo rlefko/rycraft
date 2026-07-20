@@ -2,6 +2,7 @@
 
 #include <common/math.hpp>
 #include <world/chunk.hpp>
+#include <world/item.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +53,9 @@ struct EntityConfig {
     MovementMode movementMode;
     float jumpImpulse;
     float stepHeight;
+    int maxHealth; // half-hearts an attack must remove
+    ItemType drop; // survival loot on death; NONE drops nothing
+    uint8_t dropCount;
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +90,7 @@ public:
     // State flags
     bool onGround = false;
     bool alive = true;
+    int health = 0; // set from EntityConfig::maxHealth at construction
 
     // AI timers
     int hungerTimer = 0;   // ticks since last eat

@@ -17,6 +17,9 @@ world_sources = files(
   'fluid.cpp',
   'serialization.cpp',
   'save_manager.cpp',
+  'recipes.cpp',
+  'furnace.cpp',
+  'world_list.cpp',
 )
 
 libworld = static_library('world',
