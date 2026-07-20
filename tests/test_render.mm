@@ -5407,6 +5407,9 @@ TEST_CASE("Mesher: a solid cuboid greedily reduces every opaque direction",
           "[render][mesher][greedy]") {
     MeshSnapshot snapshot;
     snapshot.clear();
+    // Uniform derived light (all zero) so smooth per-vertex lighting cannot
+    // split the shaded underside; this isolates the greedy-merge behavior.
+    snapshot.derivedSkyLightValid = true;
     for (int y = 3; y < 10; ++y) {
         for (int z = 4; z < 10; ++z) {
             for (int x = 2; x < 7; ++x) {
@@ -5462,15 +5465,19 @@ TEST_CASE("Mesher: reused scratch produces byte-identical output",
 }
 
 TEST_CASE("Mesher: 2x2 flat merges top face", "[render][mesher]") {
-    Chunk chunk(ChunkPos{0, 4, 0});
+    // Uniform derived light so smooth per-vertex lighting cannot split the
+    // shaded underside; this isolates the greedy merge the test targets.
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
     // 2x2 square of STONE at local y=8
-    chunk.setBlock(0, 8, 0, BlockType::STONE);
-    chunk.setBlock(1, 8, 0, BlockType::STONE);
-    chunk.setBlock(0, 8, 1, BlockType::STONE);
-    chunk.setBlock(1, 8, 1, BlockType::STONE);
+    snapshot.blocks[MeshSnapshot::index(0, 8, 0)] = BlockType::STONE;
+    snapshot.blocks[MeshSnapshot::index(1, 8, 0)] = BlockType::STONE;
+    snapshot.blocks[MeshSnapshot::index(0, 8, 1)] = BlockType::STONE;
+    snapshot.blocks[MeshSnapshot::index(1, 8, 1)] = BlockType::STONE;
 
-    LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
 
     // Without greedy merge: 4 top faces = 16 vertices
     // With greedy merge: 1 top face = 4 vertices
@@ -5614,16 +5621,20 @@ TEST_CASE("Mesher: flat flora emits explicit front and back winding",
 }
 
 TEST_CASE("Mesher: flora does not break greedy merging of the ground", "[render][mesher][flora]") {
-    Chunk chunk(ChunkPos{0, 4, 0});
     // 2x2 grass floor with one flower on top: the floor's +Y face must still
-    // merge into a single quad (flora neither occludes nor casts shade)
+    // merge into a single quad (flora neither occludes nor casts shade).
+    // Uniform derived light keeps the shaded underside from splitting so the
+    // test isolates the flora-versus-merge interaction.
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
     for (int z = 0; z < 2; ++z)
         for (int x = 0; x < 2; ++x)
-            chunk.setBlock(x, 8, z, BlockType::GRASS);
-    chunk.setBlock(0, 9, 0, BlockType::FLOWER_RED);
+            snapshot.blocks[MeshSnapshot::index(x, 8, z)] = BlockType::GRASS;
+    snapshot.blocks[MeshSnapshot::index(0, 9, 0)] = BlockType::FLOWER_RED;
 
-    LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
 
     // 2x2 slab = 24 vertices (all faces merged) + 8 flora vertices
     REQUIRE(output.vertices.size() == 32);
@@ -6785,7 +6796,11 @@ TEST_CASE("Snapshot mesher samples block light across a cubic halo",
     MeshSnapshot snapshot;
     snapshot.clear();
     snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
-    snapshot.packedLight[MeshSnapshot::index(16, 8, 8)] = 12;
+    // Smooth lighting averages each corner over the outward-plane 3x3 patch, so
+    // fill the patch uniformly to keep every corner at the tested nibble.
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+            snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8 + dz)] = 12;
 
     MeshScratch scratch;
     const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
@@ -6806,7 +6821,11 @@ TEST_CASE("Snapshot mesher decodes independent packed light channels",
     snapshot.clear();
     snapshot.derivedSkyLightValid = true;
     snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
-    snapshot.packedLight[MeshSnapshot::index(16, 8, 8)] = 0xB5;
+    // Uniform patch so each smoothed corner reads the same skylight and block
+    // light nibble the two channels are asserted against.
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+            snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8 + dz)] = 0xB5;
 
     MeshScratch scratch;
     const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
@@ -6820,6 +6839,93 @@ TEST_CASE("Snapshot mesher decodes independent packed light channels",
         }
     }
     REQUIRE(foundBoundary);
+}
+
+TEST_CASE("Snapshot mesher smooths block light per vertex across a face",
+          "[render][mesher][light][smooth]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
+    // Block light rising along +Z in the air the +X face looks into: 0 at z=7,
+    // 8 at z=8, 15 at z=9. Smooth lighting must give the +Z-side corners more
+    // block light than the -Z-side corners instead of one flat value.
+    for (int dy = -1; dy <= 1; ++dy) {
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 7)] = 0x00;
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8)] = 0x08;
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 9)] = 0x0F;
+    }
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    uint8_t low = 255;
+    uint8_t high = 0;
+    int faceVertices = 0;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) == FaceNormal::PLUS_X &&
+            static_cast<float>(vertex.px) == 16.0F) {
+            const uint8_t value = unpackBlockLight(vertex.faceAttr);
+            low = std::min(low, value);
+            high = std::max(high, value);
+            ++faceVertices;
+        }
+    }
+    REQUIRE(faceVertices == 4);
+    REQUIRE(low < high); // a gradient, not one flat per-face value
+    REQUIRE(low <= 5);   // the -Z corners see the dark end
+    REQUIRE(high >= 10); // the +Z corners see the bright end
+}
+
+TEST_CASE("Snapshot mesher merges a uniformly lit face into one quad",
+          "[render][mesher][light][smooth][greedy]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
+    // A 3x3 stone slab with uniform light in the air above it must still merge
+    // its top face to one quad despite the widened per-corner key.
+    for (int z = 6; z <= 8; ++z)
+        for (int x = 6; x <= 8; ++x)
+            snapshot.blocks[MeshSnapshot::index(x, 8, z)] = BlockType::STONE;
+    for (int z = 5; z <= 9; ++z)
+        for (int x = 5; x <= 9; ++x)
+            snapshot.packedLight[MeshSnapshot::index(x, 9, z)] = 0xF7; // sky 15, block 7
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    int topVertices = 0;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) == FaceNormal::PLUS_Y) {
+            ++topVertices;
+            REQUIRE(unpackBlockLight(vertex.faceAttr) == 7);
+            REQUIRE(unpackSkyLight(vertex.faceAttr) == 15);
+        }
+    }
+    REQUIRE(topVertices == 4);
+}
+
+TEST_CASE("Snapshot mesher excludes opaque neighbors from smoothed corners",
+          "[render][mesher][light][smooth]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
+    // A solid neighbor sits beside the lit +X face. Its cell stores no
+    // propagated light, so a corner touching it must average only the lit cells
+    // and stay at 8 rather than being pulled toward zero (which would read 6).
+    snapshot.blocks[MeshSnapshot::index(16, 8, 9)] = BlockType::STONE;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dz = -1; dz <= 1; ++dz)
+            snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8 + dz)] = 0x08;
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    bool found = false;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) == FaceNormal::PLUS_X &&
+            static_cast<float>(vertex.px) == 16.0F) {
+            REQUIRE(unpackBlockLight(vertex.faceAttr) == 8);
+            found = true;
+        }
+    }
+    REQUIRE(found);
 }
 
 TEST_CASE("Mesher: baked corner AO darkens enclosed voxel corners", "[render][mesher][ao]") {
@@ -6996,7 +7102,11 @@ TEST_CASE("Snapshot mesher uses a global sky cutoff above the cubic halo",
     snapshot.clear();
     snapshot.pos = {0, 4, 0};
     snapshot.blocks[MeshSnapshot::index(8, 4, 8)] = BlockType::STONE;
-    snapshot.skyCutoffY[MeshSnapshot::skyIndex(8, 8)] = 96;
+    // Fill the 3x3 column patch the top-face corners read so smooth lighting
+    // keeps the shaded top uniformly dark instead of blending in lit neighbors.
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dx = -1; dx <= 1; ++dx)
+            snapshot.skyCutoffY[MeshSnapshot::skyIndex(8 + dx, 8 + dz)] = 96;
 
     MeshScratch scratch;
     const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
