@@ -34,13 +34,15 @@ enum class ChunkLOD : int {
 };
 
 // Fixed-size per-thread buffers for one cubic mesh plane and its skylight
-// halo. A packed nonzero face key stores block type, sky light, block light,
-// and four corner-AO values. Zero represents an empty or consumed mask cell.
+// halo. A packed nonzero face key stores block type, the four corner-AO
+// values, and four 4-bit corner skylight and four 4-bit corner block-light
+// values (smooth per-vertex lighting), so it needs 64 bits. Zero represents
+// an empty or consumed mask cell.
 struct MeshScratch {
     static constexpr size_t MAX_FACE_CELLS = CHUNK_EDGE * CHUNK_EDGE;
     static constexpr size_t MAX_SKY_COLUMNS = (CHUNK_EDGE + 2) * (CHUNK_EDGE + 2);
 
-    std::array<uint32_t, MAX_FACE_CELLS> faceKeys{};
+    std::array<uint64_t, MAX_FACE_CELLS> faceKeys{};
     std::array<int32_t, MAX_SKY_COLUMNS> skyHeight{};
     std::array<uint8_t, MeshSnapshot::PADDED_VOLUME> exteriorAir{};
     std::array<uint16_t, MeshSnapshot::PADDED_VOLUME> exteriorFrontier{};

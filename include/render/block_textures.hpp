@@ -7,7 +7,7 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
-// Block texture mapping — the single source of truth for which texture layer
+// Block texture mapping, the single source of truth for which texture layer
 // a block face samples.
 //
 // Block textures live in a 2D array texture (one 16×16 layer per entry, see
@@ -136,15 +136,20 @@ constexpr uint8_t unpackSway(uint32_t faceAttr) {
     return static_cast<uint8_t>((faceAttr >> 22) & 3u);
 }
 
-// Water uses reserved high bits without changing the 16-byte vertex layout.
-// Values 0 through 4 encode still, west, east, north, and south flow in bits
-// 24-26. Bit 27 identifies a falling column. Bits 0-23 retain the shared
-// face, texture, sky, AO, block-light, emissive, and sway semantics.
+// Water uses high bits without changing the 16-byte vertex layout. Values 0
+// through 4 encode still, west, east, north, and south flow in bits 24-26.
+// Bit 27 identifies a falling column. Bit 30 records independent exterior
+// sky authority for water reflection and shadow fallback. Bits 0-23 retain
+// the shared face, texture, sky, AO, block-light, emissive, and sway semantics.
+inline constexpr uint32_t FLUID_EXTERIOR_SKY_ATTRIBUTE_MASK = 1U << 30U;
+
 constexpr uint32_t packFluidFaceAttr(FaceNormal face, uint8_t skyLight, uint8_t flowDirection,
-                                     bool falling, uint8_t blockLight = 0) {
+                                     bool falling, uint8_t blockLight = 0,
+                                     bool exteriorSky = true) {
     return packFaceAttr(face, static_cast<uint8_t>(BlockType::WATER), skyLight, 3, blockLight) |
            (static_cast<uint32_t>(flowDirection & 7u) << 24) |
-           (static_cast<uint32_t>(falling) << 27);
+           (static_cast<uint32_t>(falling) << 27) |
+           (exteriorSky ? FLUID_EXTERIOR_SKY_ATTRIBUTE_MASK : 0U);
 }
 
 constexpr uint8_t unpackFluidDirection(uint32_t faceAttr) {
@@ -153,4 +158,8 @@ constexpr uint8_t unpackFluidDirection(uint32_t faceAttr) {
 
 constexpr bool unpackFluidFalling(uint32_t faceAttr) {
     return ((faceAttr >> 27) & 1u) != 0;
+}
+
+constexpr bool unpackFluidExteriorSky(uint32_t faceAttr) {
+    return (faceAttr & FLUID_EXTERIOR_SKY_ATTRIBUTE_MASK) != 0U;
 }

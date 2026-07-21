@@ -90,9 +90,10 @@ BoatRenderer::BoatRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) :
     auto pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
-    pipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
-    pipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
-    pipelineDesc.rasterSampleCount = 4;
+    // The opaque scene pass carries the HDR target plus the albedo and
+    // accessibility surface attachment, and the entity fragment shader
+    // writes both, so this pipeline must declare the full MRT contract.
+    PixelFormats::configureScenePassPipeline(pipelineDesc);
 
     NSError* error = nil;
     _pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];

@@ -7,6 +7,7 @@ catch2_with_main_dep = catch2_proj.get_variable('catch2_with_main_dep')
 test_sources = files(
   'test_common.mm',
   'test_world.mm',
+  'test_weather.mm',
   'test_worldgen_advanced.mm',
   'test_geology_ecology.mm',
   'test_organic_geology.mm',
@@ -27,6 +28,7 @@ test_sources = files(
   'test_render_concurrency.mm',
   'test_engine.mm',
   'test_audio.mm',
+  'test_lightning.mm',
 )
 
 test_exe = executable('test_rycraft',
@@ -41,9 +43,12 @@ test_exe = executable('test_rycraft',
 # meson test targets that run in parallel, so the wall-clock (and the CI
 # runner minutes billed for it) drops to the slowest shard instead of the
 # sum, with no loss of coverage. Each shard finishes well inside its timeout.
-test_shard_count = '6'
-foreach shard : ['0', '1', '2', '3', '4', '5']
+# Eight shards with a wide per-shard timeout: the merged suite carries both
+# the gameplay and the lighting-weather matrices, and the slowest worldgen
+# fixtures exceeded the old budget on loaded CI runners.
+test_shard_count = '8'
+foreach shard : ['0', '1', '2', '3', '4', '5', '6', '7']
   test('rycraft tests ' + shard, test_exe,
        args : ['--shard-count', test_shard_count, '--shard-index', shard],
-       timeout : 900)
+       timeout : 1800)
 endforeach

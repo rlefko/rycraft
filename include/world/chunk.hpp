@@ -22,6 +22,19 @@ inline constexpr int WORLD_MIN_CHUNK_Y = WORLD_MIN_Y / CHUNK_EDGE;
 inline constexpr int WORLD_MAX_CHUNK_Y = WORLD_MAX_Y / CHUNK_EDGE;
 inline constexpr int WORLD_VERTICAL_CHUNKS = WORLD_MAX_CHUNK_Y - WORLD_MIN_CHUNK_Y + 1;
 inline constexpr int SEA_LEVEL = 64;
+inline constexpr int32_t INCOMPLETE_SKY_PATH_CUTOFF = WORLD_MAX_Y + 2;
+
+constexpr uint8_t packDerivedLight(uint8_t skyLight, uint8_t blockLight) {
+    return static_cast<uint8_t>(((skyLight & 0x0FU) << 4U) | (blockLight & 0x0FU));
+}
+
+constexpr uint8_t derivedSkyLight(uint8_t packedLight) {
+    return static_cast<uint8_t>(packedLight >> 4U);
+}
+
+constexpr uint8_t derivedBlockLight(uint8_t packedLight) {
+    return static_cast<uint8_t>(packedLight & 0x0FU);
+}
 
 enum class Biome : uint8_t {
     DEEP_OCEAN = 0,
@@ -94,14 +107,20 @@ public:
     void fill(BlockType type);
     void compactStorage();
 
-    // Block light is derived and never serialized. A dark cube keeps this
-    // storage empty; the first nonzero write materializes one byte per cell.
+    // Skylight and block light are derived and never serialized. The high
+    // nibble stores skylight and the low nibble stores block light. A dark
+    // cube keeps this storage empty; the first nonzero write materializes one
+    // byte per cell.
+    uint8_t getPackedLight(int localX, int localY, int localZ) const;
+    uint8_t getSkyLight(int localX, int localY, int localZ) const;
     uint8_t getBlockLight(int localX, int localY, int localZ) const;
+    void setSkyLight(int localX, int localY, int localZ, uint8_t level);
     void setBlockLight(int localX, int localY, int localZ, uint8_t level);
-    bool hasBlockLight() const { return !blockLight_.empty(); }
-    const std::vector<uint8_t>& blockLightData() const { return blockLight_; }
-    void replaceBlockLight(std::vector<uint8_t> light);
-    void clearBlockLight() { blockLight_.clear(); }
+    bool hasDerivedLight() const { return !packedLight_.empty(); }
+    bool hasBlockLight() const;
+    const std::vector<uint8_t>& packedLightData() const { return packedLight_; }
+    void replacePackedLight(std::vector<uint8_t> light);
+    void clearDerivedLight() { packedLight_.clear(); }
 
     FluidState getFluidState(int localX, int localY, int localZ) const;
     void setFluidState(int localX, int localY, int localZ, FluidState state);
@@ -137,7 +156,7 @@ private:
     BlockType uniformBlock_ = BlockType::AIR;
     std::vector<BlockType> blocks_;
     std::vector<uint8_t> fluidStates_;
-    std::vector<uint8_t> blockLight_;
+    std::vector<uint8_t> packedLight_;
 
     void materialize();
 };

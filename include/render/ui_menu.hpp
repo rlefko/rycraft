@@ -12,7 +12,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Menu layout + hit testing — pure C++ (no Metal/Cocoa) so the geometry the
+// Menu layout + hit testing, pure C++ (no Metal/Cocoa) so the geometry the
 // mouse clicks is exactly the geometry the renderer draws, and both are
 // unit-testable.
 //
@@ -193,6 +193,42 @@ struct PerformanceStats {
     uint32_t pendingFluids = 0;
     uint64_t droppedFluidUpdates = 0;
     uint64_t droppedFluidFrontiers = 0;
+    uint32_t shadowRefreshMask = 0;
+    std::array<uint32_t, 5> shadowCasterCounts{};
+    std::array<uint64_t, 5> shadowRefreshCounts{};
+    uint32_t indirectHistoryResetMask = 0;
+    bool indirectHistoryValid = false;
+    bool cloudHistoryValid = false;
+    bool froxelHistoryValid = false;
+    uint64_t atmosphereSlowRefreshCount = 0;
+    uint64_t atmosphereSkyRefreshCount = 0;
+    float indirectPersistentMB = 0.0F;
+    float cloudPersistentMB = 0.0F;
+    float froxelPersistentMB = 0.0F;
+    float integratedAtmosphericPersistentMB = 0.0F;
+    uint64_t weatherRequests = 0;
+    uint64_t weatherCoalescedRequests = 0;
+    uint64_t weatherBuildsStarted = 0;
+    uint64_t weatherSnapshotsPublished = 0;
+    uint64_t weatherStaleBuildsDiscarded = 0;
+    uint32_t weatherPendingRequests = 0;
+    bool weatherWorkerBusy = false;
+    uint32_t thunderPending = 0;
+    float weatherPressureHpa = 0.0F;
+    float weatherHumidity = 0.0F;
+    float weatherTemperatureC = 0.0F;
+    float weatherWindX = 0.0F;
+    float weatherWindZ = 0.0F;
+    float cloudCoverage = 0.0F;
+    uint8_t cloudType = 0;
+    float precipitationIntensity = 0.0F;
+    uint8_t precipitationKind = 0;
+    float stormPotential = 0.0F;
+    float weatherFogExtinction = 0.0F;
+    float aerosolDensity = 0.0F;
+    uint64_t stormId = 0;
+    float lunarPhaseEnergy = 0.0F;
+    float lunarPhaseCycle = 0.0F;
 };
 
 // Everything the UI pass needs to draw one frame.

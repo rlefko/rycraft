@@ -6,15 +6,15 @@
 #include <memory>
 
 // ---------------------------------------------------------------------------
-// Bloom — HDR bright-pass + Kawase blur pyramid.
+// Bloom, HDR bright-pass + Kawase blur pyramid.
 //
 // Pipeline (all RG11B10Float, half-resolution and below):
-//   1. Extract pass — soft-threshold the HDR scene (radiance above ~1.0)
-//   2. Kawase blur — 4-level pyramid, separable 8-tap blur
+//   1. Extract pass, soft-threshold the HDR scene (radiance above ~1.0)
+//   2. Kawase blur, 4-level pyramid, separable 8-tap blur
 // The blurred result is exposed through `bloomTexture()`; the final
 // composite in post.metal owns exposure, the bloom add, and tonemapping.
 // Per-pass constants ride setFragmentBytes (no shared per-frame buffer, so
-// no ring-buffering needed — the pass runs to completion within one encode).
+// no ring-buffering needed, the pass runs to completion within one encode).
 // ---------------------------------------------------------------------------
 class Bloom {
 public:
@@ -43,18 +43,18 @@ private:
     id<MTLDevice> _device;
 
     // ---- Pipeline states ----
-    id<MTLRenderPipelineState> _extractPipelineState;
-    id<MTLRenderPipelineState> _blurPipelineState;
+    id<MTLRenderPipelineState> _extractPipelineState{};
+    id<MTLRenderPipelineState> _blurPipelineState{};
 
     // ---- Extract pass texture (half-res) ----
-    id<MTLTexture> _extractTexture;
+    id<MTLTexture> _extractTexture{};
 
     // ---- Blur pyramid (4 mip levels, half-resolution each step) ----
     static constexpr int PYRAMID_LEVELS = 4;
-    id<MTLTexture> _blurPyramid[PYRAMID_LEVELS][2]; // [level][ping/pong]
+    id<MTLTexture> _blurPyramid[PYRAMID_LEVELS][2]{}; // [level][ping/pong]
 
     // ---- Sampler state (linear for blur) ----
-    id<MTLSamplerState> _linearSampler;
+    id<MTLSamplerState> _linearSampler{};
 
     uint32_t _width;
     uint32_t _height;

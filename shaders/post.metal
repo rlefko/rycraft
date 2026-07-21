@@ -3,13 +3,13 @@
 using namespace metal;
 
 // ---------------------------------------------------------------------------
-// Final composite — the one linear-HDR → display conversion.
+// Final composite, the one linear-HDR → display conversion.
 //
 // Samples the HDR scene and the (half-res) bloom pyramid, then applies:
 //   exposure → bloom add → Hable filmic tonemap → vibrance grade →
 //   optional CAS sharpen → dither → BGRA8 drawable.
 //
-// This pass ALWAYS runs — with bloom disabled the renderer binds a 4×4
+// This pass ALWAYS runs, with bloom disabled the renderer binds a 4×4
 // black fallback so the frame is still tonemapped (the old pipeline blitted
 // raw scene colors whenever bloom was off).
 // ---------------------------------------------------------------------------
@@ -50,7 +50,7 @@ static float3 filmic3(float3 x) {
     return float3(hableCurve(x.r), hableCurve(x.g), hableCurve(x.b)) * whiteScale;
 }
 
-// Rec.709 luminance — the shared luma everywhere in the post stack.
+// Rec.709 luminance, the shared luma everywhere in the post stack.
 static float luma(float3 c) {
     return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
 }
@@ -65,7 +65,7 @@ static float3 applyVibrance(float3 c, float vibrance) {
     return mix(float3(luma(c)), c, 1.0f + boost);
 }
 
-// Exposure + bloom + tonemap + grade for one sample position — CAS needs
+// Exposure + bloom + tonemap + grade for one sample position, CAS needs
 // the display-referred value of each tap, so the whole chain is reused.
 static float3 displayColor(texture2d<float> scene, texture2d<float> bloom, sampler s, float2 uv,
                            constant PostUniforms& post, float exposure) {
@@ -78,14 +78,14 @@ static float3 displayColor(texture2d<float> scene, texture2d<float> bloom, sampl
     return applyVibrance(mapped, post.vibrance - 1.0f);
 }
 
-// Frame-offset wrapper over the shared IGN (shader_types.hpp) — deterministic
+// Frame-offset wrapper over the shared IGN (shader_types.hpp), deterministic
 // per pixel/frame, breaks 8-bit banding in sky gradients.
 static float interleavedGradientNoise(float2 px, uint frame) {
     return interleavedGradientNoise(px + float2(frame % 64u) * 5.588238f);
 }
 
 // ---------------------------------------------------------------------------
-// Lens flare — occlusion probe + procedural ghosts.
+// Lens flare, occlusion probe + procedural ghosts.
 //
 // The probe kernel (one thread, 16 depth taps in a small grid around the
 // sun's screen position) eases FlareState.visibility toward the fraction of
@@ -94,6 +94,7 @@ static float interleavedGradientNoise(float2 px, uint frame) {
 // sun→center line plus a soft halo, all scaled by visibility × strength.
 // ---------------------------------------------------------------------------
 kernel void flareProbe(depth2d<float> sceneDepth [[texture(0)]],
+                       texture2d<float> cloudTransmittance [[texture(1)]],
                        device FlareState& flare [[buffer(0)]],
                        constant PostUniforms& post [[buffer(1)]]) {
     constexpr sampler depthPoint(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
@@ -111,6 +112,11 @@ kernel void flareProbe(depth2d<float> sceneDepth [[texture(0)]],
             }
         }
     }
+    constexpr sampler cloudSampler(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    const float4 cloud = cloudTransmittance.sample(cloudSampler, post.sunScreenUV);
+    const float cloudVisibility =
+        post.flareCloudOpacityTexture != 0u ? 1.0f - saturate(cloud.a) : saturate(cloud.r);
+    visible *= cloudVisibility;
     // Ease so the flare fades over ~10 frames instead of popping
     flare.visibility = mix(flare.visibility, visible, 0.15f);
 }

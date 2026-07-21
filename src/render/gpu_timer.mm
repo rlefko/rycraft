@@ -1,6 +1,7 @@
 #import "render/gpu_timer.hpp"
 
 #include "common/error.hpp"
+#include "render/metal_ownership.hpp"
 
 #include <cstdio>
 
@@ -11,8 +12,12 @@ GpuFrameTimer::GpuFrameTimer(id<MTLDevice> device, bool enablePassCounters)
         return;
     }
 
-    if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
-        RY_LOG_INFO("GPU pass counters requested but stage-boundary sampling is unsupported");
+    renderCountersEnabled_ =
+        [device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
+    computeCountersEnabled_ =
+        [device supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary];
+    if (!renderCountersEnabled_ && !computeCountersEnabled_) {
+        RY_LOG_INFO("GPU pass counters requested but render and compute sampling are unsupported");
         return;
     }
     id<MTLCounterSet> timestampSet = nil;
@@ -36,11 +41,19 @@ GpuFrameTimer::GpuFrameTimer(id<MTLDevice> device, bool enablePassCounters)
         sampleBuffers_[i] = [device newCounterSampleBufferWithDescriptor:desc error:&error];
         if (!sampleBuffers_[i]) {
             RY_LOG_INFO("GPU pass counters unavailable (sample buffer creation failed)");
+            resetMetalObject(desc);
             return;
         }
     }
+    resetMetalObject(desc);
     [device sampleTimestamps:&cpuAnchor_ gpuTimestamp:&gpuAnchor_];
     passCountersEnabled_ = true;
+}
+
+GpuFrameTimer::~GpuFrameTimer() {
+    for (uint32_t index = 0; index < SLOTS; ++index) {
+        resetMetalObject(sampleBuffers_[index]);
+    }
 }
 
 void GpuFrameTimer::beginFrame() {
@@ -52,7 +65,7 @@ void GpuFrameTimer::beginFrame() {
 }
 
 void GpuFrameTimer::attachPass(MTLRenderPassDescriptor* desc, const char* label) {
-    if (!passCountersEnabled_ || framePasses_.size() >= MAX_PASSES) {
+    if (!passCountersEnabled_ || !renderCountersEnabled_ || framePasses_.size() >= MAX_PASSES) {
         return;
     }
     const uint32_t startIndex = static_cast<uint32_t>(framePasses_.size()) * 2;
@@ -62,6 +75,24 @@ void GpuFrameTimer::attachPass(MTLRenderPassDescriptor* desc, const char* label)
     desc.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
     desc.sampleBufferAttachments[0].endOfFragmentSampleIndex = startIndex + 1;
     framePasses_.push_back({label, startIndex});
+}
+
+uint32_t GpuFrameTimer::beginComputePass(id<MTLComputeCommandEncoder> encoder, const char* label) {
+    if (!passCountersEnabled_ || !computeCountersEnabled_ || !encoder ||
+        framePasses_.size() >= MAX_PASSES) {
+        return UINT32_MAX;
+    }
+    const uint32_t startIndex = static_cast<uint32_t>(framePasses_.size()) * 2;
+    framePasses_.push_back({label, startIndex});
+    [encoder sampleCountersInBuffer:sampleBuffers_[slot_] atSampleIndex:startIndex withBarrier:YES];
+    return startIndex;
+}
+
+void GpuFrameTimer::endComputePass(id<MTLComputeCommandEncoder> encoder, uint32_t token) {
+    if (!passCountersEnabled_ || !computeCountersEnabled_ || !encoder || token == UINT32_MAX) {
+        return;
+    }
+    [encoder sampleCountersInBuffer:sampleBuffers_[slot_] atSampleIndex:token + 1U withBarrier:YES];
 }
 
 void GpuFrameTimer::endFrame(id<MTLCommandBuffer> commandBuffer) {

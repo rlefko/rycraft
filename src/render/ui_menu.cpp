@@ -112,7 +112,7 @@ MenuLayout buildSettingsLayout(const LayoutContext& ctx, const SettingsValues& v
 }
 
 // The video screen's ten per-effect rows. Toggle rows reuse the stepper
-// widget with both arrows bound to the same TOGGLE action — no new widget,
+// widget with both arrows bound to the same TOGGLE action, no new widget,
 // no second hit-test path.
 MenuLayout buildVideoSettingsLayout(const LayoutContext& ctx, const GraphicsSettings& gfx) {
     MenuLayout layout;
@@ -123,7 +123,7 @@ MenuLayout buildVideoSettingsLayout(const LayoutContext& ctx, const GraphicsSett
 
     auto onOff = [](bool on) { return std::string(on ? "ON" : "OFF"); };
     static constexpr const char* SHADOW_NAMES[] = {"OFF", "MEDIUM", "HIGH"};
-    static constexpr const char* CLOUD_NAMES[] = {"OFF", "FLAT", "VOLUM"};
+    static constexpr const char* QUALITY_NAMES[] = {"OFF", "MEDIUM", "HIGH"};
 
     float y = 0.5f + ctx.py(216.f);
     const float pitch = ctx.py(48.f);
@@ -133,11 +133,11 @@ MenuLayout buildVideoSettingsLayout(const LayoutContext& ctx, const GraphicsSett
     addSettingsRow(layout, ctx, "VOLUM LIGHT", onOff(gfx.volumetricLight), MenuAction::VL_TOGGLE,
                    MenuAction::VL_TOGGLE, y);
     y -= pitch;
-    addSettingsRow(layout, ctx, "CLOUDS", CLOUD_NAMES[gfx.cloudMode], MenuAction::CLOUDS_DOWN,
+    addSettingsRow(layout, ctx, "CLOUDS", QUALITY_NAMES[gfx.cloudQuality], MenuAction::CLOUDS_DOWN,
                    MenuAction::CLOUDS_UP, y);
     y -= pitch;
-    addSettingsRow(layout, ctx, "AMBIENT OCCL", onOff(gfx.ssao), MenuAction::SSAO_TOGGLE,
-                   MenuAction::SSAO_TOGGLE, y);
+    addSettingsRow(layout, ctx, "INDIRECT LIGHT", QUALITY_NAMES[gfx.indirectLightingQuality],
+                   MenuAction::INDIRECT_DOWN, MenuAction::INDIRECT_UP, y);
     y -= pitch;
     addSettingsRow(layout, ctx, "REFLECTIONS", onOff(gfx.waterReflections), MenuAction::SSR_TOGGLE,
                    MenuAction::SSR_TOGGLE, y);

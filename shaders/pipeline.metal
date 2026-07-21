@@ -1,9 +1,10 @@
 #include <metal_stdlib>
 #include <render/shader_types.hpp>
+#include <render/shadow_sampling.hpp>
 using namespace metal;
 
 // ---------------------------------------------------------------------------
-// Vertex input — bound through the vertex descriptor (not argument buffer)
+// Vertex input, bound through the vertex descriptor (not argument buffer)
 //
 // Attribute layout matches include/render/vertex.hpp:
 //   attribute(0)  uint     faceAttr          offset 0   4 bytes  (UInt)
@@ -28,7 +29,7 @@ struct VertexOutput {
     float3 vNormal;
     float2 vUV;
     float vLight;
-    float vSkyLight;          // column skylight 0-1 (cast shade, cave darkness)
+    float vSkyLight;          // propagated skylight 0-1 (ambient access)
     float vAO;                // baked corner AO 0.5-1 (per-vertex crease shading)
     float vBlockLight;        // lava block light 0-1 (warm cave glow)
     float vEmissive;          // 1 = self-lit block (lava), 0 = normally lit
@@ -48,11 +49,11 @@ struct VertexOutput {
     float4 vOverlayColor;
 };
 
-// Face indices — must match FaceNormal in include/render/vertex.hpp
+// Face indices, must match FaceNormal in include/render/vertex.hpp
 constant uint FACE_PLUS_Y = 4u;
 constant uint FACE_CROSS = 6u;
 
-// Shared exponential distance fog — one definition so the terrain, water,
+// Shared exponential distance fog, one definition so the terrain, water,
 // and entity passes can never drift apart.
 static float3 applyFog(float3 color, float3 worldPos, float3 cameraPos, float density,
                        float3 fogColor) {
@@ -61,36 +62,29 @@ static float3 applyFog(float3 color, float3 worldPos, float3 cameraPos, float de
     return mix(color, fogColor, fogFactor);
 }
 
+static float cloudShadowVisibility(float3 worldPosition, texture2d<float> cloudShadow,
+                                   constant CloudShadowUniforms& cloud) {
+    if (cloud.footprintAndTexel.x <= 0.0f) {
+        return 1.0f;
+    }
+    constexpr sampler cloudSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+    const float2 center =
+        floor(cloud.cameraPosition.xz / cloud.footprintAndTexel.y) * cloud.footprintAndTexel.y;
+    const float2 referencePosition =
+        cloudShadowReferencePosition(worldPosition, normalize(cloud.sunDirection));
+    const float2 uv = (referencePosition - center) / cloud.footprintAndTexel.x + 0.5f;
+    if (any(uv < 0.0f) || any(uv > 1.0f)) {
+        return 1.0f;
+    }
+    return mix(1.0f, cloudShadow.sample(cloudSampler, uv).r, saturate(cloud.footprintAndTexel.z));
+}
+
 // Far meshes deliberately overlap the exact radius by whole 256-block tiles.
 // Revision-matched column ownership below is the authority for that overlap:
 // a ready column clips immediately, while an unresolved or stale column keeps
 // complete coarse coverage even when it lies inside the nominal radius.
-static bool exactColumnOwnsFarFragment(float2 localPosition, uint face, bool useEmittingColumn,
-                                       constant FarTerrainOwnershipUniforms& ownership) {
-    localPosition = farTerrainExactOwnershipSamplePosition(localPosition, face, useEmittingColumn);
-    const int2 neighbor = int2(floor(localPosition / FAR_TERRAIN_TILE_EDGE_BLOCKS));
-    if (any(neighbor < int2(-FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS)) ||
-        any(neighbor > int2(FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS))) {
-        return false;
-    }
-    const float2 neighborLocal = localPosition - float2(neighbor) * FAR_TERRAIN_TILE_EDGE_BLOCKS;
-    const int2 column = clamp(int2(floor(neighborLocal / FAR_TERRAIN_EXACT_COLUMN_EDGE_BLOCKS)),
-                              int2(0), int2(FAR_TERRAIN_EXACT_COLUMNS_PER_TILE - 1));
-    const uint bit = uint(column.y * FAR_TERRAIN_EXACT_COLUMNS_PER_TILE + column.x);
-    const uint word = bit / FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD;
-    const uint tileIndex = uint((neighbor.y + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS) *
-                                    FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE +
-                                neighbor.x + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS);
-    const uint4 packed =
-        ownership.readyColumnMasks[tileIndex * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE +
-                                   word / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR];
-    return ((packed[word % FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR] >>
-             (bit % FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD)) &
-            1u) != 0u;
-}
-
 // ---------------------------------------------------------------------------
-// Face normal lookup — indices match FaceNormal enum (0=+X … 5=-Y)
+// Face normal lookup, indices match FaceNormal enum (0=+X … 5=-Y)
 // ---------------------------------------------------------------------------
 float3 getFaceNormal(uint index) {
     switch (index) {
@@ -112,7 +106,7 @@ float3 getFaceNormal(uint index) {
 }
 
 // ---------------------------------------------------------------------------
-// Vertex shader — passes world position for fog calculation
+// Vertex shader, passes world position for fog calculation
 // ---------------------------------------------------------------------------
 vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
                                constant Uniforms& uniforms [[buffer(1)]],
@@ -124,7 +118,7 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     float4 worldPos = uniforms.modelMatrix * float4(in.position + chunkOrigin.origin.xyz, 1.0);
     const float2 lodWorldPosition = worldPos.xz;
     uint sway = (in.faceAttr >> 22) & 3u;
-    worldPos.xyz = applySway(worldPos.xyz, sway, in.uv.y, uniforms.time, uniforms.swayStrength);
+    worldPos.xyz = applySway(worldPos.xyz, sway, in.uv.y, uniforms.time, uniforms.foliageWind);
     out.clipPosition = uniforms.projectionMatrix * uniforms.viewMatrix * worldPos;
     out.vWorldPosition = worldPos.xyz;
     out.vLodWorldPosition = lodWorldPosition;
@@ -136,7 +130,7 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
 
     // Unpack face normal (bits 0-2), texture layer (bits 3-10), column
     // skylight (bits 11-14), and baked corner AO (bits 15-16). The AO level
-    // 0..3 maps to 0.5..1.0 — a fully enclosed voxel corner keeps half its
+    // 0..3 maps to 0.5..1.0, a fully enclosed voxel corner keeps half its
     // light, an open corner none removed.
     uint normalIdx = in.faceAttr & 7u;
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
@@ -149,7 +143,7 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     out.vCoverageFrontier = as_type<float>(chunkOrigin.farMetadata.y);
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
     out.vAO = 0.5f + float((in.faceAttr >> 15) & 3u) * (1.0f / 6.0f);
-    // Block light (bits 17-20) and the emissive flag (bit 21) — the lava glow.
+    // Block light (bits 17-20) and the emissive flag (bit 21), the lava glow.
     out.vBlockLight = float((in.faceAttr >> 17) & 15u) / 15.0f;
     out.vEmissive = float((in.faceAttr >> 21) & 1u);
     // Shading class: every cross quad (grass, flowers, reeds, mushrooms)
@@ -173,132 +167,22 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     return out;
 }
 
-// A 16-point Poisson disk — even angular coverage with no axis-aligned
-// banding, reused for both the PCSS blocker search and the PCF filter.
-constant float2 POISSON_DISK[16] = {
-    float2(-0.613f, 0.617f),  float2(0.170f, -0.040f),  float2(-0.299f, -0.791f),
-    float2(0.645f, 0.493f),   float2(-0.651f, -0.378f), float2(0.918f, -0.126f),
-    float2(0.344f, 0.294f),   float2(-0.108f, 0.987f),  float2(-0.920f, 0.078f),
-    float2(0.542f, -0.782f),  float2(0.098f, -0.967f),  float2(-0.379f, 0.278f),
-    float2(0.895f, 0.373f),   float2(-0.759f, -0.727f), float2(0.269f, 0.766f),
-    float2(-0.288f, -0.303f),
+// ---------------------------------------------------------------------------
+// Fragment shader, sun/moon shadows + skylight + distance fog
+// ---------------------------------------------------------------------------
+struct SurfaceFragmentOutput {
+    float4 scene [[color(0)]];
+    float4 surface [[color(1)]];
 };
 
-// ---------------------------------------------------------------------------
-// Cascaded shadow sampling with PCSS-style variable penumbra — one definition
-// so terrain and entities can't drift. Returns a 0..1 lit factor (1 = fully
-// lit) that scales the direct sun/moon contribution only; ambient stays so
-// shadows never go pure black. A blocker search estimates how far occluders
-// float above the receiver, so contact points stay crisp while shadows soften
-// with distance from their caster — the Sildur soft-shadow look. The Poisson
-// disk is rotated per pixel to trade banding for dithered noise the eye reads
-// as a smooth penumbra.
-// ---------------------------------------------------------------------------
-// Penumbra tuning (multiples of shadowParams.x, the base texel radius).
-constant float SHADOW_SEARCH_SCALE = 3.0f;     // blocker-search radius
-constant float SHADOW_MAX_FILTER_SCALE = 4.0f; // widest PCF radius (soft edge)
-constant float SHADOW_PENUMBRA_GAIN = 40.0f;   // depth gap → penumbra fraction
-
-static float sampleShadow(float3 worldPos, float3 normal, float3 cameraPos, float2 screenPos,
-                          depth2d_array<float> shadowMap, sampler shadowSampler,
-                          constant ShadowUniforms& shadow) {
-    float strength = shadow.shadowParams.z;
-    if (strength <= 0.001f) {
-        return 1.0f; // shadows disabled — fully lit
-    }
-
-    float dist = distance(worldPos, cameraPos);
-
-    // Fade the whole term out near the shadow distance so the cascade edge
-    // dissolves into the baked skylight instead of popping.
-    float fade = 1.0f - saturate((dist - shadow.shadowParams.w) /
-                                 max(shadow.cascadeSplitDist.z - shadow.shadowParams.w, 1.0f));
-    if (fade <= 0.0f) {
-        return 1.0f;
-    }
-
-    int cascade = SHADOW_CASCADE_COUNT - 1;
-    for (int i = 0; i < SHADOW_CASCADE_COUNT; ++i) {
-        if (dist < shadow.cascadeSplitDist[i]) {
-            cascade = i;
-            break;
-        }
-    }
-
-    float3 offsetPos = worldPos + normal * shadow.shadowParams.y;
-    float4 lightClip = shadow.cascadeViewProj[cascade] * float4(offsetPos, 1.0f);
-    float3 ndc = lightClip.xyz / lightClip.w;
-    float2 uv = ndc.xy * 0.5f + 0.5f;
-    uv.y = 1.0f - uv.y; // Metal texture v runs down
-    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f || ndc.z > 1.0f) {
-        return 1.0f; // outside this cascade → treat as lit
-    }
-
-    float depthRef = ndc.z - 0.0015f; // constant slope-independent depth bias
-    float texel = 1.0f / float(shadowMap.get_width());
-
-    // Per-pixel Poisson rotation from an interleaved-gradient-noise hash of
-    // the SCREEN pixel — bounded coordinates keep float precision (world-space
-    // coords reach the thousands and collapse the hash), deterministic and
-    // static so the penumbra dither never crawls (convention 9).
-    float ign = interleavedGradientNoise(screenPos);
-    float ang = ign * 6.2831853f;
-    float2 rc = float2(cos(ang), sin(ang));
-    float2x2 rot = float2x2(rc.x, -rc.y, rc.y, rc.x);
-
-    // Point sampler for the raw blocker depth: Depth32Float is not linearly
-    // filterable off Apple GPUs, and averaging depths across caster edges
-    // would fabricate blocker distances anyway.
-    constexpr sampler depthSampler(mag_filter::nearest, min_filter::nearest,
-                                   address::clamp_to_edge);
-
-    // ---- Blocker search: average depth of occluders in a search radius ----
-    float searchRadius = shadow.shadowParams.x * SHADOW_SEARCH_SCALE * texel;
-    float blockerSum = 0.0f;
-    float blockerCount = 0.0f;
-    for (int k = 0; k < 16; ++k) {
-        float2 tap = uv + (rot * POISSON_DISK[k]) * searchRadius;
-        float d = shadowMap.sample(depthSampler, tap, cascade);
-        if (d < depthRef) {
-            blockerSum += d;
-            blockerCount += 1.0f;
-        }
-    }
-    if (blockerCount < 0.5f) {
-        return 1.0f; // no occluder in the search radius → fully lit
-    }
-    float avgBlocker = blockerSum / blockerCount;
-
-    // ---- Penumbra width from the blocker/receiver depth gap ----
-    // Contact (tiny gap) → tight kernel; occluder high above → wide, soft.
-    float penumbra =
-        saturate((depthRef - avgBlocker) / max(avgBlocker, 1e-4f) * SHADOW_PENUMBRA_GAIN);
-    float filterRadius =
-        mix(1.0f, shadow.shadowParams.x * SHADOW_MAX_FILTER_SCALE, penumbra) * texel;
-
-    // ---- PCF over the same rotated disk at the penumbra-scaled radius ----
-    float lit = 0.0f;
-    for (int k = 0; k < 16; ++k) {
-        float2 tap = uv + (rot * POISSON_DISK[k]) * filterRadius;
-        lit += shadowMap.sample_compare(shadowSampler, tap, cascade, depthRef);
-    }
-    lit /= 16.0f;
-
-    // Blend toward fully lit at the fade edge, and scale by strength.
-    return mix(1.0f, mix(1.0f, lit, fade), strength);
-}
-
-// ---------------------------------------------------------------------------
-// Fragment shader — sun/moon shadows + skylight + distance fog
-// ---------------------------------------------------------------------------
-fragment float4 fragmentMain(VertexOutput in [[stage_in]],
-                             texture2d_array<float> blockTextures [[texture(0)]],
-                             sampler blockSampler [[sampler(0)]],
-                             depth2d_array<float> shadowMap [[texture(1)]],
-                             sampler shadowSampler [[sampler(1)]],
-                             constant Uniforms& uniforms [[buffer(1)]],
-                             constant ShadowUniforms& shadow [[buffer(4)]],
-                             constant FarTerrainOwnershipUniforms& ownership [[buffer(5)]]) {
+fragment SurfaceFragmentOutput fragmentMain(
+    VertexOutput in [[stage_in]], texture2d_array<float> blockTextures [[texture(0)]],
+    sampler blockSampler [[sampler(0)]], depth2d_array<float> nearShadow [[texture(1)]],
+    depth2d_array<float> farShadow [[texture(2)]], depth2d<float> horizonShadow [[texture(3)]],
+    texture2d<float> cloudShadow [[texture(4)]], sampler shadowSampler [[sampler(1)]],
+    constant Uniforms& uniforms [[buffer(1)]], constant ShadowUniforms& shadow [[buffer(4)]],
+    constant FarTerrainOwnershipUniforms& ownership [[buffer(5)]],
+    constant CloudShadowUniforms& cloudShadowUniforms [[buffer(6)]]) {
     const float horizontalDistance = distance(in.vLodWorldPosition, uniforms.cameraPosition.xz);
     if (!farTerrainCoverageVisible(horizontalDistance, in.vCoverageFrontier)) {
         discard_fragment();
@@ -306,15 +190,15 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     const bool useEmittingColumn =
         farTerrainOpaqueRiserUsesEmittingColumn(in.vFace, in.vFarCanopy != 0u, in.vFarSkirt != 0u);
     if (in.vFarTerrain != 0u) {
-        bool exactOwnsFragment = exactColumnOwnsFarFragment(in.vFarLocalPosition, in.vFace,
-                                                            useEmittingColumn, ownership);
+        bool exactOwnsFragment = farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace,
+                                                                   useEmittingColumn, ownership);
         if (in.vFarSkirt != 0u) {
             const bool emittingColumnOwnedByExact =
-                exactColumnOwnsFarFragment(in.vFarLocalPosition, in.vFace, true, ownership);
+                farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace, true, ownership);
             const float2 receivingPosition =
                 farTerrainSkirtReceivingOwnershipSamplePosition(in.vFarLocalPosition, in.vFace);
             const bool receivingColumnOwnedByExact =
-                exactColumnOwnsFarFragment(receivingPosition, in.vFace, false, ownership);
+                farTerrainExactColumnOwnsFragment(receivingPosition, in.vFace, false, ownership);
             exactOwnsFragment = !farTerrainSkirtOwnersVisible(emittingColumnOwnedByExact,
                                                               receivingColumnOwnedByExact);
         }
@@ -354,7 +238,7 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     }
 
     // Emissive blocks (lava) glow at a fixed HDR level, ignoring sun, shadow,
-    // and skylight — the >1.0 output exceeds the bloom threshold naturally and
+    // and skylight, the >1.0 output exceeds the bloom threshold naturally and
     // makes lava the light source the block-light term below spreads from.
     // Kept modest so the molten orange survives tonemapping instead of
     // clipping to white when auto-exposure lifts a dark scene.
@@ -364,25 +248,35 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
         glow = applyFog(glow, in.vWorldPosition, uniforms.cameraPosition, uniforms.fogDensity,
                         uniforms.fogColor);
         glow = mix(glow, in.vOverlayColor.rgb, max(saturate(in.vOverlayColor.a), coverageFog));
-        return float4(glow, 1.0f);
+        SurfaceFragmentOutput result;
+        result.scene = float4(glow, 1.0f);
+        result.surface = float4(texColor.rgb, 0.0f);
+        return result;
     }
 
-    // Rain-soaked surfaces darken (water fills the surface pores) — scaled
+    // Rain-soaked surfaces darken (water fills the surface pores), scaled
     // by sky access so caves and covered builds stay dry during surface rain.
     texColor.rgb *= 1.0f - 0.22f * uniforms.wetness * in.vSkyLight;
 
-    // Sky access from the baked per-column skylight. Because the mesher now
-    // treats only OPAQUE blocks as sky-blockers, a tree canopy (non-opaque
-    // leaves) no longer casts a fake column shadow on the ground below — that
-    // shading comes entirely from the real cascade shadow. Genuine cover
-    // (opaque terrain: caves, overhangs) still lowers skylight and darkens.
-    float sky = 0.25f + 0.75f * in.vSkyLight;
+    // Propagated skylight controls ambient access. Direct sun is controlled by
+    // geometry orientation and the shadow map, so an overhead log cannot
+    // create a second baked column shadow.
+    float sky = in.vSkyLight;
 
-    // The real cascade shadow gates the direct sun; sampleShadow returns 1.0
-    // when shadows are disabled, so the term falls back to the sky access
-    // alone (the old fake shadow) with no branch and no doubling.
-    float lit = sampleShadow(in.vWorldPosition, in.vNormal, uniforms.cameraPosition,
-                             in.clipPosition.xy, shadowMap, shadowSampler, shadow);
+    // The real cascade shadow gates direct sun. Outside valid shadow coverage,
+    // propagated exterior access prevents distant sealed spaces from leaking
+    // directional light.
+    float lit = sampleShadowVisibility(in.vWorldPosition, in.vNormal, in.vSkyLight, nearShadow,
+                                       farShadow, horizonShadow, shadowSampler, shadow);
+    lit *= cloudShadowVisibility(in.vWorldPosition, cloudShadow, cloudShadowUniforms);
+    // A surface that cannot see the sky cannot see the sun. Inside cascade
+    // coverage the shadow map alone leaked stray sun onto opaque-covered
+    // surfaces (grazing cascade texels painted moving bands across dug tunnel
+    // walls), so cap direct sun by propagated sky access: full sun only within
+    // about one block of a genuine sky path (sky >= 14), fading out by sky 8.
+    // Non-opaque cover keeps skylight 15, so a leaf canopy never gains a second
+    // shadow, and the indirect bounce still carries light deeper inside.
+    lit *= smoothstep(0.5f, 0.9f, sky);
 
     // Two-sided flora shading: the geometric normal of the visible blade side
     // (from screen-space derivatives, flipped toward the camera) modulates the
@@ -390,7 +284,7 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     // instead of matching the sunlit side exactly. The term relaxes toward 1
     // as the sun climbs: vertical blades are edge-on to a high sun, so at noon
     // BOTH sides of every blade scored ~0.4 and all flora went uniformly dark
-    // — the facing contrast only means something at low sun angles.
+    //, the facing contrast only means something at low sun angles.
     float3 toCamera = normalize(uniforms.cameraPosition - in.vWorldPosition);
     float direct = in.vLight;
     if (in.vFoliage > 0.5f && in.vFoliage < 1.5f) {
@@ -407,12 +301,11 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     constexpr float BLOCK_LIGHT_STRENGTH = 1.5f;
     float3 blockLight = BLOCK_LIGHT_TINT * (in.vBlockLight * in.vBlockLight) * BLOCK_LIGHT_STRENGTH;
 
-    // Baked corner AO darkens ambient and direct alike — the crease shading
-    // reads as contact occlusion the same way vanilla applies it. The half-res
-    // SSAO pass layers the broader mid-scale occlusion on top in screen space.
-    float3 litColor =
-        texColor.rgb * in.vAO *
-        (uniforms.sunColor * direct * sky * lit + uniforms.ambientColor * sky + blockLight);
+    // Baked corner AO is ambient accessibility, not a shadow on direct or
+    // emitted light. Block light remains independent of both ambient terms.
+    float ambientAccess = sky * in.vAO;
+    float3 litColor = texColor.rgb * (uniforms.sunColor * direct * lit +
+                                      uniforms.ambientColor * ambientAccess + blockLight);
 
     // Rain-wet sheen: up-facing surfaces catch a moving sun gloss while wet.
     if (uniforms.wetness > 0.001f) {
@@ -426,18 +319,21 @@ fragment float4 fragmentMain(VertexOutput in [[stage_in]],
     // canopies don't self-illuminate).
     if (in.vFoliage > 0.5f) {
         float sss = pow(saturate(dot(-toCamera, uniforms.sunDirection)), 6.0f);
-        litColor += texColor.rgb * uniforms.sunColor * (sss * 0.55f * lit * in.vSkyLight);
+        litColor += texColor.rgb * uniforms.sunColor * (sss * 0.55f * lit);
     }
 
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);
     finalColor = mix(finalColor, in.vOverlayColor.rgb,
                      max(max(saturate(in.vOverlayColor.a), coverageFog), lodTerrainFog));
-    return float4(finalColor, 1.0);
+    SurfaceFragmentOutput result;
+    result.scene = float4(finalColor, 1.0f);
+    result.surface = float4(texColor.rgb, ambientAccess);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
-// Water pass — runs after the opaque scene resolves, compositing its own
+// Water pass, runs after the opaque scene resolves, compositing its own
 // pixels from the resolved color + depth: screen-space refraction with
 // depth-based absorption, procedural caustics on the submerged floor,
 // fresnel sky reflection with a sun sparkle, and animated waves. No depth
@@ -448,7 +344,8 @@ struct WaterVertexOutput {
     float3 vWorldPosition;
     float2 vFarLocalPosition;
     float3 vCameraRelativePosition;
-    float vSkyLight;
+    float vSkyLight;             // propagated ambient accessibility
+    float vExteriorSky [[flat]]; // binary water-interface authority
     float4 vOverlayColor;
     uint vFace [[flat]];
     uint vFlow [[flat]];
@@ -495,6 +392,7 @@ vertex WaterVertexOutput waterVertexMain(VertexInput in [[stage_in]],
     out.vFarLocalPosition = in.position.xz;
     out.vCameraRelativePosition = worldPos.xyz - water.cameraPosition;
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
+    out.vExteriorSky = (in.faceAttr & (1u << 30u)) != 0u ? 1.0f : 0.0f;
     out.vOverlayColor = chunkOrigin.overlayColorAndStrength;
     out.vFace = normalIdx;
     out.vFlow = flow;
@@ -515,18 +413,17 @@ static float3 filteredWaterSurfaceNormal(float2 p, float t) {
         WaterWave wave = WATER_WAVES[i];
         const float phase = dot(p, wave.dir) * wave.freq + t * wave.speed;
         const float footprint = length(float2(dfdx(phase), dfdy(phase)));
-        gradient += wave.amp * wave.freq * wave.dir * cos(phase) *
-                    waterBandVisibility(footprint);
+        gradient += wave.amp * wave.freq * wave.dir * cos(phase) * waterBandVisibility(footprint);
     }
 
     const float fineX = p.x * 1.9f + t * 2.3f;
     const float fineZ = p.y * 2.2f - t * 2.0f;
     const float diagonalX = (p.x + p.y) * 3.7f + t * 3.1f;
     const float diagonalZ = (p.y - p.x) * 3.3f - t * 2.7f;
-    gradient.x += 0.014f * cos(fineX) *
-                  waterBandVisibility(length(float2(dfdx(fineX), dfdy(fineX))));
-    gradient.y += 0.014f * cos(fineZ) *
-                  waterBandVisibility(length(float2(dfdx(fineZ), dfdy(fineZ))));
+    gradient.x +=
+        0.014f * cos(fineX) * waterBandVisibility(length(float2(dfdx(fineX), dfdy(fineX))));
+    gradient.y +=
+        0.014f * cos(fineZ) * waterBandVisibility(length(float2(dfdx(fineZ), dfdy(fineZ))));
     gradient.x += 0.007f * cos(diagonalX) *
                   waterBandVisibility(length(float2(dfdx(diagonalX), dfdy(diagonalX))));
     gradient.y += 0.007f * cos(diagonalZ) *
@@ -567,7 +464,7 @@ static float causticOctave(float2 wp, float t, int iterations) {
 // Physically the crisp web is focused by the short ripples (cell size tracks
 // ripple wavelength) and the focus blurs away with distance from the surface,
 // so shallow floors show fine sharp cells and deep floors only soft, large
-// patches from the swells — a fixed web at every depth read as painted-on.
+// patches from the swells, a fixed web at every depth read as painted-on.
 static float causticPattern(float2 worldXZ, float t, float floorDepth) {
     // Warp the lookup by the wave gradient (unscaled world xz, so it uses the
     // real per-block wave frequencies), scaled up so the web arms visibly
@@ -578,7 +475,7 @@ static float causticPattern(float2 worldXZ, float t, float floorDepth) {
     // octave is exactly periodic (a visible grid of identical ~2-block cells
     // covered every floor); the incommensurate rotated modulator varies the
     // web's brightness over a beat period of hundreds of blocks, so no
-    // repetition survives to the eye — while the arms stay sharp (summing two
+    // repetition survives to the eye, while the arms stay sharp (summing two
     // full webs blurred them into mush instead).
     const float freqA = 0.30f * 6.28318f; // ~3.3 block web cells (ripple scale)
     const float freqB = 0.11f * 6.28318f; // ~9 block modulation (swell scale)
@@ -589,8 +486,8 @@ static float causticPattern(float2 worldXZ, float t, float floorDepth) {
     const float webFootprint = max(length(dfdx(pA)), length(dfdy(pA)));
     const float modulationFootprint = max(length(dfdx(pB)), length(dfdy(pB)));
     float web = causticOctave(pA, t, 5) * waterBandVisibility(webFootprint);
-    float modulation = saturate(causticOctave(pB, t * 0.7f, 3)) *
-                       waterBandVisibility(modulationFootprint);
+    float modulation =
+        saturate(causticOctave(pB, t * 0.7f, 3)) * waterBandVisibility(modulationFootprint);
     // Defocus with depth: the crisp ripple web washes out over ~8 blocks,
     // leaving the broad swell-scale patches.
     float defocus = saturate(floorDepth * 0.12f);
@@ -658,15 +555,18 @@ static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool under
                             depth2d<float> sceneDepth, texture2d<float> sceneColor,
                             constant WaterUniforms& water) {
     constexpr sampler depthPoint(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
-    constexpr sampler colorLinear(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+    constexpr sampler colorLinear(coord::normalized, address::clamp_to_edge, filter::linear,
+                                  mip_filter::linear);
 
     const int STEPS = 24;
-    // Jitter the first stride per pixel (the engine's IGN convention): a
-    // coherent march start turned the coarse steps into visible stair bands
-    // across every reflection. The range is deliberately narrow — wide jitter
-    // traded the bands for salt-and-pepper speckle, and with MSAA instead of
-    // a temporal history there is nothing downstream to average it away.
-    float stride = 1.5f * (0.88f + 0.24f * interleavedGradientNoise(fragPx));
+    // A fixed stride makes shallow crossings form coherent stair bands. IGN
+    // breaks those bands, but at a long grazing path independent jitter
+    // becomes a black-and-bright checker because this pass has no history.
+    // Taper that bounded jitter as the reflected ray approaches horizontal;
+    // mip filtering and the confidence below handle the remaining far tail.
+    const float grazing = 1.0f - saturate(abs(dir.y));
+    const float jitter = interleavedGradientNoise(fragPx) - 0.5f;
+    float stride = 1.5f * (1.0f + jitter * waterSsrJitterAmplitude(grazing));
     float3 pos = origin;
     for (int i = 0; i < STEPS; ++i) {
         float3 prev = pos;
@@ -679,7 +579,7 @@ static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool under
         }
         float2 uv = (clip.xy / clip.w) * float2(0.5f, -0.5f) + 0.5f;
         if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
-            break; // left the screen — no data to reflect
+            break; // left the screen, no data to reflect
         }
         float sceneZ = sceneDepth.sample(depthPoint, uv);
         if (sceneZ >= 1.0f) {
@@ -689,7 +589,7 @@ static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool under
             continue; // ray still in front of the visible surface
         }
 
-        // Crossed behind the depth buffer — bisect prev..pos for the contact.
+        // Crossed behind the depth buffer, bisect prev..pos for the contact.
         float3 lo = prev, hi = pos;
         for (int j = 0; j < 6; ++j) {
             float3 mid = (lo + hi) * 0.5f;
@@ -715,27 +615,42 @@ static float4 traceWaterSSR(float3 origin, float3 dir, float2 fragPx, bool under
         }
         // Fade as the hit nears a screen edge (data runs out there).
         float2 e = smoothstep(0.0f, 0.12f, hitUV) * smoothstep(0.0f, 0.12f, 1.0f - hitUV);
-        float3 hit = sceneColor.sample(colorLinear, hitUV).rgb;
+        const float hitDistance = distance(origin, hi);
+        // A full-resolution source is correct for nearby reflections, but it
+        // aliases badly when a grazing ray compresses distant terrain into a
+        // few pixels. The copied HDR texture has a complete mip chain, so
+        // choose a bounded blur from ray angle and path length rather than
+        // sampling unrelated sharp terrain per pixel.
+        const float mipLevel = waterSsrReflectionMipLevel(grazing, hitDistance);
+        float3 hit = sceneColor.sample(colorLinear, hitUV, level(mipLevel)).rgb;
         if (underwater) {
             // The reflected ray also travels through water: absorb its path
             // per channel, so distant mirrored geometry dims into the deep
             // instead of reflecting crisp daylight colors (also hides the
             // minification shimmer of far reflections).
-            hit *= exp(-WATER_SIGMA_A * distance(origin, hi));
+            hit *= exp(-WATER_SIGMA_A * hitDistance);
         }
-        return float4(hit, e.x * e.y);
+        // Screen-space depth cannot represent a stable reflection at the
+        // horizon after the ray has traveled far enough. Fade only that
+        // unstable region back to the analytic atmosphere reflection instead
+        // of toggling neighboring pixels between a dark hit and a sky miss.
+        return float4(hit, e.x * e.y * waterSsrStabilityConfidence(grazing, hitDistance));
     }
     return float4(0.0f);
 }
 
-fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
-                                  texture2d<float> sceneColor [[texture(0)]],
-                                  depth2d<float> sceneDepth [[texture(1)]],
-                                  constant WaterUniforms& water [[buffer(3)]],
-                                  constant FarTerrainOwnershipUniforms& ownership [[buffer(5)]]) {
+fragment float4 waterFragmentMain(
+    WaterVertexOutput in [[stage_in]], texture2d<float> sceneColor [[texture(0)]],
+    depth2d<float> sceneDepth [[texture(1)]], texture2d<float> atmosphereSky [[texture(2)]],
+    texture2d<float> cloudShadow [[texture(3)]], depth2d_array<float> nearShadow [[texture(4)]],
+    depth2d_array<float> farShadow [[texture(5)]], depth2d<float> horizonShadow [[texture(6)]],
+    sampler shadowSampler [[sampler(1)]], constant WaterUniforms& water [[buffer(3)]],
+    constant ShadowUniforms& shadow [[buffer(4)]],
+    constant FarTerrainOwnershipUniforms& ownership [[buffer(5)]],
+    constant CloudShadowUniforms& cloudShadowUniforms [[buffer(6)]]) {
     const float horizontalDistance = distance(in.vWorldPosition.xz, water.cameraPosition.xz);
     if ((in.vFarTerrain != 0u &&
-         exactColumnOwnsFarFragment(in.vFarLocalPosition, in.vFace, false, ownership)) ||
+         farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace, false, ownership)) ||
         !farTerrainCoverageVisible(horizontalDistance, in.vCoverageFrontier)) {
         discard_fragment();
     }
@@ -760,9 +675,29 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // phase. It supplies filtered motion while the authored voxel plane stays
     // geometrically flat.
     float2 flowOffset = waterFlowVector(in.vFlow) * water.time * 0.7f;
+    float surfaceDetail = 1.0f;
     float3 N = in.vFace == FACE_PLUS_Y
                    ? filteredWaterSurfaceNormal(in.vWorldPosition.xz - flowOffset, water.time)
                    : getFaceNormal(in.vFace);
+    if (in.vFace == FACE_PLUS_Y) {
+        // At a glancing view the reflection projection magnifies a tiny
+        // normal change into long horizontal bands. The filtered normal above
+        // removes frequency aliases; this view-aware attenuation also keeps
+        // the stable low-frequency sky fallback from being striped by a flat
+        // surface's shading-only ripples.
+        surfaceDetail = waterGrazingWaveDetail(abs(V.y));
+        N = normalize(mix(float3(0.0f, 1.0f, 0.0f), N, surfaceDetail));
+        // A low-frequency wave can still be under-sampled after the reflection
+        // projection, even when its world-space phase passed the filter above.
+        // Derive this last gate from the reflected ray itself, which catches
+        // only adjacent pixels that would select unrelated sky or SSR samples.
+        const float3 prefilteredReflection = reflect(-V, N);
+        const float reflectedRayFootprint =
+            max(length(dfdx(prefilteredReflection)), length(dfdy(prefilteredReflection)));
+        const float reflectionDetail = waterReflectionNormalVisibility(reflectedRayFootprint);
+        surfaceDetail *= reflectionDetail;
+        N = normalize(mix(float3(0.0f, 1.0f, 0.0f), N, reflectionDetail));
+    }
     // Falling columns are the only water geometry allowed to expose vertical
     // sides. Give those faces a subtle downward streak normal so waterfalls
     // read as moving sheets while stable shorelines remain top surfaces only.
@@ -773,6 +708,20 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
         float streak = sin(streakPhase) * 0.08f * waterBandVisibility(streakFootprint);
         N = normalize(N + float3(0.0f, streak, 0.0f));
     }
+    // Packed skylight stays ambient-only. The separate water bit preserves
+    // exterior reflection and shadow-coverage fallback while a vertical light
+    // path is conservatively unresolved, without treating the 4-bit value as
+    // a fractional reflection multiplier.
+    const float exteriorSkyVisibility = waterExteriorSkyVisibility(in.vExteriorSky);
+    const float terrainVisibility =
+        sampleShadowVisibility(in.vWorldPosition, N, max(in.vSkyLight, exteriorSkyVisibility),
+                               nearShadow, farShadow, horizonShadow, shadowSampler, shadow);
+    const float cloudVisibility =
+        cloudShadowVisibility(in.vWorldPosition, cloudShadow, cloudShadowUniforms);
+    const float directVisibility = terrainVisibility * cloudVisibility;
+    // The binary exterior authority distinguishes sealed caves from open
+    // water without making temporary propagated-light differences visible at
+    // an exact or far handoff.
     // Which side of the interface this fragment shows is a per-fragment
     // geometric fact, not a camera flag: an elevated lake's underside seen
     // from dry land is still the water-to-air interface. Branching on the
@@ -788,18 +737,45 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // Reconstruct both points in the same camera-relative frame. Absolute
     // inverse-view-projection matrices lose enough precision at large world
     // coordinates to turn this thickness into a visible chunk grid.
+    // A clear scene-depth pixel has no submerged receiver. Treating the far
+    // plane as a refracted floor made horizon pixels borrow arbitrary scene
+    // color, which exposed large water panes whenever streaming or a terrain
+    // silhouette changed. It is a reflection-only case instead.
+    const bool hasOpaqueReceiver = opaqueDepth < 0.99999f;
+    const float waterSurfaceDistance = length(in.vCameraRelativePosition);
+    const float waterSurfaceFootprint =
+        max(length(dfdx(in.vCameraRelativePosition)), length(dfdy(in.vCameraRelativePosition)));
     float3 behindRelative = reconstructCameraRelative(screenUV, opaqueDepth, water);
-    float waterDepth = max(distance(behindRelative, in.vCameraRelativePosition), 0.0f);
+    const float receiverFootprint = max(length(dfdx(behindRelative)), length(dfdy(behindRelative)));
+    float waterDepth =
+        hasOpaqueReceiver ? max(distance(behindRelative, in.vCameraRelativePosition), 0.0f) : 0.0f;
+    const float verticalWaterDepth =
+        hasOpaqueReceiver ? abs(behindRelative.y - in.vCameraRelativePosition.y) : 0.0f;
+    // Refraction owns no temporal history. At a grazing path a voxel edge or
+    // far-terrain handoff can change the one scene receiver by many blocks per
+    // pixel, even though the water interface itself is continuous. Retire only
+    // that unstable transmission into the continuous reflection fallback. A
+    // shallow distant receiver can be smooth inside one coarse terrain cell,
+    // so its water-interface footprint, distance, and physical water-column
+    // depth participate as well.
+    const float refractionVisibility =
+        waterRefractionVisibility(abs(V.y), waterDepth, verticalWaterDepth, waterSurfaceDistance,
+                                  waterSurfaceFootprint, receiverFootprint, hasOpaqueReceiver);
+    const float opticalWaterDepth = waterStabilizedOpticalDepth(waterDepth, refractionVisibility);
 
     // ---- Refraction: wave-distorted resample of the scene, pinned at the
     // shoreline so shallow edges don't smear. From below the distorted tap
     // crosses the surface boundary into unrelated above-water content, so the
     // transmission samples straight through instead.
-    float distortion = underside ? 0.0f : min(waterDepth, 4.0f) * 0.25f;
+    // At a grazing view, a small screen-space refraction offset can jump
+    // across unrelated submerged receivers. Follow the same filtered surface
+    // detail as reflection: close refraction stays animated, while the
+    // distant horizon settles instead of forming horizontal bands.
+    float distortion = underside ? 0.0f : min(waterDepth, 4.0f) * 0.25f * surfaceDetail;
     float2 refractUV = clamp(screenUV + N.xz * 0.035f * distortion, 0.001f, 0.999f);
     float refractDepth = sceneDepth.sample(depthPoint, refractUV);
     if (refractDepth < in.clipPosition.z) {
-        // The distorted tap landed on something in FRONT of the surface —
+        // The distorted tap landed on something in FRONT of the surface, so
         // fall back to the undistorted sample
         refractUV = screenUV;
         refractDepth = opaqueDepth;
@@ -816,41 +792,59 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
     // above only. World-anchored (unscaled xz: causticPattern bakes its own
     // cell scale and wave warp). From below the reconstruction lands on
     // above-water content, which painted mis-oriented white bands onto the
-    // transmission — the from-below floor gets its caustics from the overlay.
-    if (!underside) {
-        float caustic =
-            causticPattern(refractedWorld.xz, water.time, depthBelow) * exp(-depthBelow * 0.22f);
-        refracted +=
-            water.sunColor * caustic * 0.4f * in.vSkyLight * saturate(water.sunDirection.y * 2.0f);
+    // transmission, the from-below floor gets its caustics from the overlay.
+    if (!underside && hasOpaqueReceiver) {
+        float caustic = causticPattern(refractedWorld.xz, water.time, depthBelow) *
+                        exp(-depthBelow * 0.22f) * surfaceDetail * refractionVisibility;
+        refracted += water.directLightRadiance * caustic * 0.4f * directVisibility *
+                     exteriorSkyVisibility * saturate(water.directLightDirection.y * 2.0f);
     }
 
     // ---- Absorption: shallow water reads turquoise and filters toward deep
     // blue with depth (red light dies first), the floor showing through
     // shallows. From above, waterDepth is the submerged column behind the
     // surface. From below it is the distance to the sky or shore in the AIR
-    // beyond the surface, which absorbs nothing — the underwater overlay
+    // beyond the surface, which absorbs nothing, the underwater overlay
     // already absorbs the eye-to-surface water segment, so absorbing here
     // turned the whole Snell window into opaque flat blue instead of a view
     // of the world above.
-    float3 shallowTint = float3(0.10f, 0.42f, 0.48f);
-    float3 deepTint = float3(0.02f, 0.10f, 0.22f);
-    float3 waterColor = mix(shallowTint, deepTint, saturate(waterDepth * 0.12f));
-    float absorb = 1.0f - exp(-waterDepth * 0.16f);
-    float3 body =
-        underside ? refracted : mix(refracted * float3(0.75f, 0.92f, 0.96f), waterColor, absorb);
+    // The intrinsic tints are the water's response to received sky light,
+    // not emission. Scale them by the surface's sky access and the day-night
+    // sky level with no constant floor, otherwise still water glows teal from
+    // its shallow tint at night and in covered caves, drawing a bright ring on
+    // the lake floor around the camera where refraction still outweighs the
+    // dark night reflection. Daylight keeps physicalSkyBlend near 1, so shallow
+    // water still reads full turquoise.
+    const float tintIllumination =
+        max(in.vSkyLight, exteriorSkyVisibility) * saturate(water.physicalSkyBlend);
+    float3 shallowTint = float3(0.10f, 0.42f, 0.48f) * tintIllumination;
+    float3 deepTint = float3(0.02f, 0.10f, 0.22f) * tintIllumination;
+    float3 waterColor = mix(shallowTint, deepTint, saturate(opticalWaterDepth * 0.12f));
+    float absorb = 1.0f - exp(-opticalWaterDepth * 0.16f);
+    const float3 transmitted = mix(refracted * float3(0.75f, 0.92f, 0.96f), waterColor, absorb);
+    float3 body = underside ? refracted : mix(waterColor, transmitted, refractionVisibility);
 
-    // ---- Fresnel reflection + sun sparkle (skylight gates both, so flooded
-    // caves reflect darkness rather than open sky). From below the physics
-    // flips: water-to-air refraction hits total internal reflection beyond the
-    // critical angle (~48.6 deg), so the surface turns into a mirror of the
-    // underwater scene (SSR provides it) instead of a window to the sky.
-    float3 R = reflect(-V, N);                // symmetric in the normal's sign
-    float3 Rsky = float3(R.x, abs(R.y), R.z); // up-facing form for sky + sparkle
+    // ---- Fresnel reflection + sun sparkle. The exterior gate keeps flooded
+    // caves from reflecting open sky without turning propagated skylight's
+    // 4-bit ambient range into a fractional reflection grid. From below the
+    // physics flips: water-to-air refraction hits total internal reflection
+    // beyond the critical angle (~48.6 deg), so the surface turns into a
+    // mirror of the underwater scene (SSR provides it) instead of a window to
+    // the sky.
+    float3 R = reflect(-V, N); // symmetric in the normal's sign
+    float3 Rsky = R;
     // Exact dielectric Fresnel for whichever side of the interface this
     // fragment shows: from the water side, total internal reflection falls
     // out of Snell's law past ~48.6 degrees, and inside that window the
     // transmission dominates (~2% reflectance near vertical).
     float fresnel = waterFresnel(cosI, underside);
+    if (!underside) {
+        // When transmission has no trustworthy receiver, the opaque-interface
+        // fallback is reflection. This is not an artistic boost to normal
+        // Fresnel: it only replaces screen-space information that does not
+        // exist or is unstable at a grazing path.
+        fresnel = mix(1.0f, fresnel, refractionVisibility);
+    }
     float3 reflection;
     if (underside) {
         // The mirror shows the underwater scene: SSR marches the reflected
@@ -858,12 +852,25 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
         // same scatter terms as the overlay. A near-black fallback here read
         // as flat dark panels, where a real internal mirror reflects
         // luminous water.
-        reflection = WATER_SCATTER * 1.5f * water.sunColor * saturate(water.sunDirection.y) *
-                         water.skyExposure +
+        reflection = WATER_SCATTER * 1.5f * water.directLightRadiance *
+                         saturate(water.directLightDirection.y) * water.skyExposure +
                      WATER_AMBIENT;
     } else {
         float horizonBlend = pow(1.0f - saturate(Rsky.y), 2.0f);
-        reflection = mix(water.zenithColor, water.horizonColor, horizonBlend);
+        const float3 palette = Rsky.y > 0.0f
+                                   ? mix(water.zenithColor, water.horizonColor, horizonBlend)
+                                   : water.horizonColor * 0.08f;
+        constexpr sampler skySampler(coord::normalized, address::clamp_to_edge, filter::linear);
+        const float2 viewHorizontal = normalize(Rsky.xz + float2(1.0e-6f, 0.0f));
+        const float2 sunHorizontal = normalize(water.solarDirection.xz + float2(1.0e-6f, 0.0f));
+        const float signedAzimuth =
+            atan2(viewHorizontal.x * sunHorizontal.y - viewHorizontal.y * sunHorizontal.x,
+                  dot(viewHorizontal, sunHorizontal));
+        const float2 skyUv =
+            float2(signedAzimuth / (2.0f * M_PI_F) + 0.5f, saturate((Rsky.y + 0.08f) / 1.08f));
+        const float3 physicalSky = atmosphereSky.sample(skySampler, skyUv).rgb;
+        reflection =
+            mix(palette, physicalSky, saturate(water.physicalSkyBlend) * step(0.0f, Rsky.y));
     }
 
     // Screen-space reflection layered over the fallback: where the reflected
@@ -875,26 +882,32 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
         reflection = mix(reflection, ssr.rgb, ssr.a * water.ssrStrength);
     }
 
-    float3 color = mix(body, reflection, fresnel * (underside ? 1.0f : in.vSkyLight));
+    float3 color = mix(body, reflection, fresnel * (underside ? 1.0f : exteriorSkyVisibility));
     if (!underside) {
-        float sunAlign = saturate(dot(Rsky, water.sunDirection));
+        float sunAlign = saturate(dot(Rsky, water.directLightDirection));
         float sparkle = pow(sunAlign, 240.0f) * 2.0f + pow(sunAlign, 32.0f) * 0.25f;
         // The glint is a specular reflection, so it obeys the same Fresnel as
         // the sky term: ~2% at normal incidence, rising toward grazing.
         // Unscaled, a zenith sun mirrored in every up-facing wave below the
         // camera and bloomed into one giant white blob on the surface.
-        color += water.sunColor * sparkle * fresnel * in.vSkyLight;
+        const float sourceAboveHorizon = step(0.0f, water.directLightDirection.y);
+        const float reflectedSkyRay = step(0.0f, Rsky.y);
+        color += water.directLightRadiance * sparkle * fresnel * directVisibility *
+                 exteriorSkyVisibility * water.directSpecularFactor * sourceAboveHorizon *
+                 reflectedSkyRay;
     }
 
     color =
         applyFog(color, in.vWorldPosition, water.cameraPosition, water.fogDensity, water.fogColor);
 
     // Hairline shorelines dissolve into the shore instead of aliasing
-    color = mix(refracted, color, saturate(waterDepth * 3.0f));
-    // Shoreline foam: a bright animated band just off the shallow edge, gated
-    // by skylight so flooded caves stay dark, and by the above-water view —
-    // foam is surface froth, so from below it painted white streaks along the
-    // waterline. Reuses the caustic web to break the band into moving flecks.
+    const float3 stableShoreTransmission = mix(waterColor, refracted, refractionVisibility);
+    color = mix(stableShoreTransmission, color, saturate(waterDepth * 3.0f));
+    // Shoreline foam is a bright animated band just off the shallow edge. The
+    // exterior gate keeps flooded caves dark without making harmless skylight
+    // nibble differences visible at an exact/far handoff. It is above-water
+    // only because from below it painted white streaks along the waterline.
+    // It reuses the caustic web to break the band into moving flecks.
     if (!underside) {
         // Kept narrow and well under full white: froth is sparse flecks, and
         // a wide bright band rimmed every water body like a glowing outline.
@@ -902,7 +915,11 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
             smoothstep(0.05f, 0.35f, waterDepth) * (1.0f - smoothstep(0.35f, 0.9f, waterDepth));
         float foam =
             foamBand * (0.35f + 0.65f * causticPattern(in.vWorldPosition.xz, water.time, 0.0f));
-        color = mix(color, float3(0.92f, 0.96f, 1.0f), saturate(foam) * 0.45f * in.vSkyLight);
+        // Foam is froth reflecting the sky, not emission. The same lit
+        // response as the water tints keeps it from glowing as bright white
+        // fringes around trunks and shorelines under moonlight.
+        color = mix(color, float3(0.92f, 0.96f, 1.0f) * tintIllumination,
+                    saturate(foam) * 0.45f * exteriorSkyVisibility);
     }
 
     color = mix(color, in.vOverlayColor.rgb, max(saturate(in.vOverlayColor.a), coverageFog));
@@ -910,7 +927,7 @@ fragment float4 waterFragmentMain(WaterVertexOutput in [[stage_in]],
 }
 
 // ---------------------------------------------------------------------------
-// Underwater overlay — fullscreen veil + floor caustics when the camera is
+// Underwater overlay, fullscreen veil + floor caustics when the camera is
 // submerged, drawn after the water surfaces with alpha blending. The light
 // shafts are now the real ray-marched volumetric pass (volumetrics.metal),
 // which replaced the old fake banded screen-space rays here.
@@ -931,7 +948,7 @@ vertex OverlayVertexOutput underwaterOverlayVertex(uint vertexID [[vertex_id]]) 
 
 // Dual-source blending: the pipeline blends result = inscatter + scene *
 // transmit, so absorption can multiply the scene PER CHANNEL (Beer-Lambert)
-// while the scattered light adds — a single alpha cannot express both.
+// while the scattered light adds, a single alpha cannot express both.
 struct UnderwaterOverlayOut {
     float4 inscatter [[color(0), index(0)]];
     float4 transmit [[color(0), index(1)]];
@@ -942,7 +959,7 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
                                                         constant WaterUniforms& water
                                                         [[buffer(3)]]) {
     float t = water.time;
-    float sunUp = saturate(water.sunDirection.y);
+    float sunUp = saturate(water.directLightDirection.y);
 
     // Camera-relative reconstruction keeps the depth path precise at large
     // world coordinates. Point sampling preserves voxel silhouettes instead
@@ -961,18 +978,16 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
     const float3 SIGMA_A = WATER_SIGMA_A;
     float3 rayDir = relative / max(dist, 1e-4f);
     float eyeY = water.cameraPosition.y;
-    float exitDist = (rayDir.y > 0.02f)
-                         ? max(water.waterSurfaceY - eyeY, 0.0f) / max(rayDir.y, 0.02f)
-                         : 3.4e38f;
+    float exitDist =
+        (rayDir.y > 0.02f) ? max(water.waterSurfaceY - eyeY, 0.0f) / max(rayDir.y, 0.02f) : 3.4e38f;
     float waterPath = min(dist, exitDist);
 
     // The light that reached the shaded point also crossed the water column
     // above it (longer when the sun sits low), so deep floors go dark, not
     // just blue. Points seen THROUGH the surface keep their above-water light,
-    // and covered water (skyExposure 0) is cave-lit already — no double dark.
-    float pointDepth = (dist <= exitDist + 0.5f)
-                           ? clamp(water.waterSurfaceY - world.y, 0.0f, 48.0f)
-                           : 0.0f;
+    // and covered water (skyExposure 0) is cave-lit already, no double dark.
+    float pointDepth =
+        (dist <= exitDist + 0.5f) ? clamp(water.waterSurfaceY - world.y, 0.0f, 48.0f) : 0.0f;
     float lightSlant = 1.0f / max(sunUp, 0.35f);
     pointDepth *= water.skyExposure;
 
@@ -981,49 +996,53 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
     // the player's feet would have none without this. The normal comes from
     // best-of-both-sides depth taps, not raw screen derivatives: a one-sided
     // derivative straddles block silhouettes and lit dashed lines along every
-    // oblique edge (the same defect ssao.metal documents), while picking the
+    // oblique edge, while picking the
     // continuous side per axis reads the true surface at edges.
     float2 texel = 1.0f / water.resolution;
     float3 pL = reconstructCameraRelative(
-        in.uv - float2(texel.x, 0.0f),
-        sceneDepth.sample(depthPoint, in.uv - float2(texel.x, 0.0f)), water);
+        in.uv - float2(texel.x, 0.0f), sceneDepth.sample(depthPoint, in.uv - float2(texel.x, 0.0f)),
+        water);
     float3 pR = reconstructCameraRelative(
-        in.uv + float2(texel.x, 0.0f),
-        sceneDepth.sample(depthPoint, in.uv + float2(texel.x, 0.0f)), water);
+        in.uv + float2(texel.x, 0.0f), sceneDepth.sample(depthPoint, in.uv + float2(texel.x, 0.0f)),
+        water);
     float3 pD = reconstructCameraRelative(
-        in.uv - float2(0.0f, texel.y),
-        sceneDepth.sample(depthPoint, in.uv - float2(0.0f, texel.y)), water);
+        in.uv - float2(0.0f, texel.y), sceneDepth.sample(depthPoint, in.uv - float2(0.0f, texel.y)),
+        water);
     float3 pU = reconstructCameraRelative(
-        in.uv + float2(0.0f, texel.y),
-        sceneDepth.sample(depthPoint, in.uv + float2(0.0f, texel.y)), water);
+        in.uv + float2(0.0f, texel.y), sceneDepth.sample(depthPoint, in.uv + float2(0.0f, texel.y)),
+        water);
     float spanL = abs(dist - length(pL)), spanR = abs(length(pR) - dist);
     float spanD = abs(dist - length(pD)), spanU = abs(length(pU) - dist);
     float3 ddxv = (spanR < spanL) ? (pR - relative) : (relative - pL);
     float3 ddyv = (spanU < spanD) ? (pU - relative) : (relative - pD);
     float3 surfaceNormal = normalize(cross(ddxv, ddyv));
+    // Screen UV grows downward, so the raw cross-product winding can invert
+    // a floor. Face the receiver toward the camera before the strict +Y gate:
+    // floors below the camera retain caustics, ceilings above it still reject.
+    surfaceNormal = orientUnderwaterReceiverNormalTowardCamera(surfaceNormal, relative);
     // The depth falloff is gentle (0.03/block) so the pool floor several
     // blocks down still catches a bright web, not only the near-surface cells.
-    float upFacing = saturate(abs(surfaceNormal.y));
     // Feather true silhouettes: when even the continuous side jumps more than
     // a surface at this distance could, the pixel straddles two surfaces and
-    // neither normal is trustworthy — fade rather than sparkle the block edge.
+    // neither normal is trustworthy, fade rather than sparkle the block edge.
     float edgeSpan = max(min(spanL, spanR), min(spanD, spanU));
-    upFacing *= 1.0f - smoothstep(dist * 0.04f + 0.15f, dist * 0.08f + 0.5f, edgeSpan);
+    const float upFacing = underwaterCausticSurfaceConfidence(surfaceNormal.y, edgeSpan, dist);
     // Caustics land only on submerged floors: refracted sunlight never lights
     // shore terrain reconstructed BEHIND the from-below surface (whose pixels
     // the surface pass already shaded), and the focusing decays with depth.
     float submerged = step(world.y, water.waterSurfaceY);
     float throughSurface = 1.0f - smoothstep(exitDist * 0.9f, exitDist * 1.1f, dist);
-    float caustic = causticPattern(world.xz, t, pointDepth) * exp(-pointDepth * 0.05f) *
-                    upFacing * submerged *
-                    throughSurface * sunUp * water.skyExposure;
+    const float directEnergy =
+        saturate(dot(max(water.directLightRadiance, 0.0f), float3(0.2126f, 0.7152f, 0.0722f)));
+    float caustic = causticPattern(world.xz, t, pointDepth) * exp(-pointDepth * 0.05f) * upFacing *
+                    submerged * throughSurface * sunUp * water.skyExposure * directEnergy;
 
     // ---- Transmittance (dual-source color 1): the scene is multiplied per
     // channel by the view-path and light-path absorption, and the caustic
-    // MODULATES that light instead of adding white — it rides the floor's own
+    // MODULATES that light instead of adding white, it rides the floor's own
     // shading, so shadowed floors get proportionally dimmer webs.
-    float3 transmit = exp(-SIGMA_A * (waterPath + pointDepth * lightSlant)) *
-                      (1.0f + caustic * 1.8f);
+    float3 transmit =
+        exp(-SIGMA_A * (waterPath + pointDepth * lightSlant)) * (1.0f + caustic * 1.8f);
 
     // ---- Inscatter (dual-source color 0): sunlight scattered into the view
     // ray by the water itself. Henyey-Greenstein makes looking toward the sun
@@ -1031,13 +1050,13 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
     // the volume decays with the camera's own depth per channel; a tiny
     // ambient floor keeps covered water from reading as a void.
     float camDepth = max(water.waterSurfaceY - eyeY, 0.0f);
-    float cosSun = dot(rayDir, normalize(water.sunDirection));
+    float cosSun = dot(rayDir, normalize(water.directLightDirection));
     const float g = 0.45f;
     float phase = (1.0f - g * g) / pow(1.0f + g * g - 2.0f * g * cosSun, 1.5f); // 1 = isotropic
-    float phaseN = phase / (1.0f + phase); // capped so the sun lobe brightens, never blows out
+    float phaseN = phase / (1.0f + phase);      // capped so the sun lobe brightens, never blows out
     const float3 SCATTER_COLOR = WATER_SCATTER; // shared with the TIR mirror fallback
     float3 volLight =
-        water.sunColor * sunUp * water.skyExposure * exp(-SIGMA_A * camDepth * 0.7f);
+        water.directLightRadiance * sunUp * water.skyExposure * exp(-SIGMA_A * camDepth * 0.7f);
     float buildup = 1.0f - exp(-0.15f * waterPath);
     float3 inscatter = SCATTER_COLOR * volLight * (0.55f + 0.9f * phaseN) * buildup;
     inscatter += WATER_AMBIENT * buildup;
@@ -1049,13 +1068,15 @@ fragment UnderwaterOverlayOut underwaterOverlayFragment(OverlayVertexOutput in [
 }
 
 // ---------------------------------------------------------------------------
-// Entity shaders — voxel-box animal models, lit like terrain
+// Entity shaders, voxel-box animal models, lit like terrain
 // ---------------------------------------------------------------------------
 struct EntityVertexOutput {
     float4 clipPosition [[position]];
     float3 vNormal;
     float3 vColor;
     float3 vWorldPosition;
+    float vSkyLight;
+    float vBlockLight;
 };
 
 vertex EntityVertexOutput entityVertexMain(device const EntityVertex* vertices [[buffer(0)]],
@@ -1070,15 +1091,33 @@ vertex EntityVertexOutput entityVertexMain(device const EntityVertex* vertices [
     out.vWorldPosition = worldPos.xyz;
     out.vNormal = normalize((entityModel.model * float4(v.normal, 0.0)).xyz);
     out.vColor = v.color;
+    out.vSkyLight = saturate(entityModel.lighting.x);
+    out.vBlockLight = saturate(entityModel.lighting.y);
     return out;
 }
 
-fragment float4 entityFragmentMain(EntityVertexOutput in [[stage_in]],
-                                   constant Uniforms& uniforms [[buffer(1)]]) {
+fragment SurfaceFragmentOutput entityFragmentMain(
+    EntityVertexOutput in [[stage_in]], depth2d_array<float> nearShadow [[texture(1)]],
+    depth2d_array<float> farShadow [[texture(2)]], depth2d<float> horizonShadow [[texture(3)]],
+    texture2d<float> cloudShadow [[texture(4)]], sampler shadowSampler [[sampler(1)]],
+    constant Uniforms& uniforms [[buffer(1)]], constant ShadowUniforms& shadow [[buffer(4)]],
+    constant CloudShadowUniforms& cloudShadowUniforms [[buffer(6)]]) {
     float light = max(dot(in.vNormal, uniforms.sunDirection), 0.0f);
-    float3 litColor = in.vColor * (uniforms.sunColor * light + uniforms.ambientColor);
+    float visibility =
+        sampleShadowVisibility(in.vWorldPosition, in.vNormal, in.vSkyLight, nearShadow, farShadow,
+                               horizonShadow, shadowSampler, shadow);
+    visibility *= cloudShadowVisibility(in.vWorldPosition, cloudShadow, cloudShadowUniforms);
+    constexpr float3 BLOCK_LIGHT_TINT = float3(1.0f, 0.55f, 0.22f);
+    constexpr float BLOCK_LIGHT_STRENGTH = 1.5f;
+    const float3 blockLight =
+        BLOCK_LIGHT_TINT * (in.vBlockLight * in.vBlockLight) * BLOCK_LIGHT_STRENGTH;
+    float3 litColor = in.vColor * (uniforms.sunColor * light * visibility +
+                                   uniforms.ambientColor * in.vSkyLight + blockLight);
 
-    return float4(applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
-                           uniforms.fogDensity, uniforms.fogColor),
-                  1.0);
+    SurfaceFragmentOutput result;
+    result.scene = float4(applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
+                                   uniforms.fogDensity, uniforms.fogColor),
+                          1.0f);
+    result.surface = float4(in.vColor, in.vSkyLight);
+    return result;
 }

@@ -2141,6 +2141,363 @@ TEST_CASE("Block properties: lava emits light, nothing else does", "[world][ligh
     REQUIRE_FALSE(isEmissive(BlockType::GLASS));
 }
 
+TEST_CASE("Chunk packs skylight and block light into independent nibbles", "[world][light]") {
+    Chunk chunk(ChunkPos{0, 4, 0});
+    chunk.setSkyLight(3, 5, 7, 12);
+    chunk.setBlockLight(3, 5, 7, 6);
+
+    REQUIRE(chunk.getPackedLight(3, 5, 7) == 0xC6);
+    REQUIRE(chunk.getSkyLight(3, 5, 7) == 12);
+    REQUIRE(chunk.getBlockLight(3, 5, 7) == 6);
+
+    chunk.setSkyLight(3, 5, 7, 4);
+    REQUIRE(chunk.getPackedLight(3, 5, 7) == 0x46);
+    chunk.setBlockLight(3, 5, 7, 0);
+    REQUIRE(chunk.getPackedLight(3, 5, 7) == 0x40);
+    REQUIRE(chunk.getSkyLight(3, 5, 7) == 4);
+    REQUIRE_FALSE(chunk.hasBlockLight());
+    REQUIRE(chunk.hasDerivedLight());
+}
+
+TEST_CASE("LightEngine: isolated opaque cover admits lateral skylight", "[world][light][sky]") {
+    Chunk chunk(ChunkPos{0, 4, 0});
+    chunk.setBlock(8, 12, 8, BlockType::LOG);
+    LightEngine::SkyLightSeedColumns seeds;
+    for (int z = 0; z < CHUNK_EDGE; ++z)
+        for (int x = 0; x < CHUNK_EDGE; ++x)
+            seeds.set(x, z, chunk.chunkY * CHUNK_EDGE);
+    seeds.set(8, 8, chunk.chunkY * CHUNK_EDGE + 13);
+
+    REQUIRE(LightEngine::floodChunk(chunk, {}, seeds));
+    REQUIRE(chunk.getSkyLight(8, 13, 8) == 15);
+    REQUIRE(chunk.getSkyLight(8, 12, 8) == 0);
+    REQUIRE(chunk.getSkyLight(8, 11, 8) == 14);
+}
+
+TEST_CASE("LightEngine: broad roofs and sealed caves remain dark", "[world][light][sky]") {
+    Chunk roof(ChunkPos{0, 4, 0});
+    for (int z = 0; z < CHUNK_EDGE; ++z)
+        for (int x = 0; x < CHUNK_EDGE; ++x)
+            roof.setBlock(x, 8, z, BlockType::STONE);
+    LightEngine::SkyLightSeedColumns roofSeeds;
+    for (int z = 0; z < CHUNK_EDGE; ++z)
+        for (int x = 0; x < CHUNK_EDGE; ++x)
+            roofSeeds.set(x, z, roof.chunkY * CHUNK_EDGE + 9);
+    REQUIRE(LightEngine::floodChunk(roof, {}, roofSeeds));
+    REQUIRE(roof.getSkyLight(8, 9, 8) == 15);
+    REQUIRE(roof.getSkyLight(8, 7, 8) == 0);
+
+    Chunk cave(ChunkPos{0, 4, 0});
+    cave.fill(BlockType::STONE);
+    cave.setBlock(8, 8, 8, BlockType::AIR);
+    REQUIRE_FALSE(LightEngine::floodChunk(cave, {}));
+    REQUIRE(cave.getSkyLight(8, 8, 8) == 0);
+}
+
+TEST_CASE("LightEngine: cave mouths receive attenuated skylight", "[world][light][sky]") {
+    Chunk cave(ChunkPos{0, 4, 0});
+    cave.fill(BlockType::STONE);
+    for (int x = 8; x < CHUNK_EDGE; ++x)
+        cave.setBlock(x, 8, 8, BlockType::AIR);
+
+    Chunk exterior(ChunkPos{1, 4, 0});
+    exterior.setSkyLight(0, 8, 8, 15);
+    LightEngine::FaceNeighbors neighbors{};
+    neighbors[1] = &exterior;
+    REQUIRE(LightEngine::floodChunk(cave, neighbors));
+    REQUIRE(cave.getSkyLight(15, 8, 8) == 14);
+    REQUIRE(cave.getSkyLight(12, 8, 8) == 11);
+    REQUIRE(cave.getSkyLight(8, 8, 8) == 7);
+}
+
+TEST_CASE("LightEngine: skylight spills through all six cubic faces",
+          "[world][light][sky][cubic]") {
+    struct FaceCase {
+        size_t neighborIndex;
+        std::array<int, 3> neighborCell;
+        std::array<int, 3> borderCell;
+        std::array<int, 3> inwardCell;
+    };
+    constexpr std::array<FaceCase, 6> cases{{
+        {0, {15, 8, 8}, {0, 8, 8}, {1, 8, 8}},
+        {1, {0, 8, 8}, {15, 8, 8}, {14, 8, 8}},
+        {2, {8, 8, 15}, {8, 8, 0}, {8, 8, 1}},
+        {3, {8, 8, 0}, {8, 8, 15}, {8, 8, 14}},
+        {4, {8, 15, 8}, {8, 0, 8}, {8, 1, 8}},
+        {5, {8, 0, 8}, {8, 15, 8}, {8, 14, 8}},
+    }};
+
+    for (const FaceCase& test : cases) {
+        Chunk self(ChunkPos{0, 0, 0});
+        Chunk neighbor(ChunkPos{0, 0, 0});
+        neighbor.setSkyLight(test.neighborCell[0], test.neighborCell[1], test.neighborCell[2], 10);
+        LightEngine::FaceNeighbors neighbors{};
+        neighbors[test.neighborIndex] = &neighbor;
+
+        const LightEngine::FloodResult result = LightEngine::floodChunk(self, neighbors);
+        REQUIRE(result.changedState);
+        REQUIRE((result.changedFaceMask & (1U << test.neighborIndex)) != 0);
+        REQUIRE(self.getSkyLight(test.borderCell[0], test.borderCell[1], test.borderCell[2]) == 9);
+        REQUIRE(self.getSkyLight(test.inwardCell[0], test.inwardCell[1], test.inwardCell[2]) == 8);
+    }
+}
+
+TEST_CASE("LightEngine: skylight converges independently of load order", "[world][light][sky]") {
+    const auto settle = [](bool sourceFirst) {
+        Chunk source(ChunkPos{0, 4, 0});
+        Chunk target(ChunkPos{1, 4, 0});
+        LightEngine::SkyLightSeedColumns sourceSeeds;
+        for (int z = 0; z < CHUNK_EDGE; ++z)
+            for (int x = 0; x < CHUNK_EDGE; ++x)
+                sourceSeeds.set(x, z, source.chunkY * CHUNK_EDGE);
+
+        LightEngine::FaceNeighbors targetNeighbors{};
+        targetNeighbors[0] = &source;
+        if (sourceFirst) {
+            LightEngine::floodChunk(source, {}, sourceSeeds);
+            LightEngine::floodChunk(target, targetNeighbors);
+        } else {
+            LightEngine::floodChunk(target, targetNeighbors);
+            LightEngine::floodChunk(source, {}, sourceSeeds);
+            LightEngine::floodChunk(target, targetNeighbors);
+        }
+        return target.packedLightData();
+    };
+
+    REQUIRE(settle(true) == settle(false));
+}
+
+TEST_CASE("LightEngine: sky authority updates remove and restore direct light",
+          "[world][light][sky][edit]") {
+    Chunk chunk(ChunkPos{0, 4, 0});
+    LightEngine::SkyLightSeedColumns openSeeds;
+    for (int z = 0; z < CHUNK_EDGE; ++z)
+        for (int x = 0; x < CHUNK_EDGE; ++x)
+            openSeeds.set(x, z, chunk.chunkY * CHUNK_EDGE);
+    REQUIRE(LightEngine::floodChunk(chunk, {}, openSeeds));
+    REQUIRE(chunk.getSkyLight(8, 7, 8) == 15);
+
+    for (int z = 0; z < CHUNK_EDGE; ++z)
+        for (int x = 0; x < CHUNK_EDGE; ++x)
+            chunk.setBlock(x, 8, z, BlockType::STONE);
+    LightEngine::SkyLightSeedColumns roofSeeds;
+    for (int z = 0; z < CHUNK_EDGE; ++z)
+        for (int x = 0; x < CHUNK_EDGE; ++x)
+            roofSeeds.set(x, z, chunk.chunkY * CHUNK_EDGE + 9);
+    REQUIRE(LightEngine::floodChunk(chunk, {}, roofSeeds));
+    REQUIRE(chunk.getSkyLight(8, 7, 8) == 0);
+
+    for (int z = 0; z < CHUNK_EDGE; ++z)
+        for (int x = 0; x < CHUNK_EDGE; ++x)
+            chunk.setBlock(x, 8, z, BlockType::AIR);
+    REQUIRE(LightEngine::floodChunk(chunk, {}, openSeeds));
+    REQUIRE(chunk.getSkyLight(8, 7, 8) == 15);
+}
+
+TEST_CASE("LightEngine: incomplete sky authority stays conservatively dark",
+          "[world][light][sky][streaming]") {
+    Chunk chunk(ChunkPos{0, 4, 0});
+    REQUIRE_FALSE(LightEngine::floodChunk(chunk, {}));
+    REQUIRE_FALSE(chunk.hasDerivedLight());
+
+    LightEngine::SkyLightSeedColumns complete;
+    complete.set(8, 8, chunk.chunkY * CHUNK_EDGE);
+    REQUIRE(LightEngine::floodChunk(chunk, {}, complete));
+    REQUIRE(chunk.getSkyLight(8, 8, 8) == 15);
+}
+
+TEST_CASE("Skylight authority includes saved edited sections above generated terrain",
+          "[world][light][sky][streaming][save]") {
+    REQUIRE(skyAuthorityTopSection(4, 7, std::nullopt) == 7);
+    REQUIRE(skyAuthorityTopSection(9, 7, std::nullopt) == 9);
+    REQUIRE(skyAuthorityTopSection(4, 7, 12) == 12);
+    REQUIRE(skyAuthorityTopSection(-3, -2, -1) == -1);
+}
+
+TEST_CASE("World publishes generated cubes with initial derived skylight", "[world][light][sky]") {
+    World world(42, 4);
+    auto chunk = world.getChunk({0, WORLD_MAX_CHUNK_Y, 0});
+    REQUIRE(chunk);
+    REQUIRE(chunk->getBlock(8, 8, 8) == BlockType::AIR);
+    REQUIRE(chunk->getSkyLight(8, 8, 8) == 15);
+}
+
+TEST_CASE("World reconciles skylight after opaque roof edits", "[world][light][sky][edit]") {
+    World world(42, 4);
+    auto chunk = world.getChunk({0, WORLD_MAX_CHUNK_Y, 0});
+    REQUIRE(chunk);
+    constexpr int32_t roofY = WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8;
+
+    for (int64_t z = 0; z < CHUNK_EDGE; ++z)
+        for (int64_t x = 0; x < CHUNK_EDGE; ++x)
+            world.setBlock(x, roofY, z, BlockType::STONE);
+    world.reconcileLight(64);
+    REQUIRE(chunk->getSkyLight(8, 7, 8) == 0);
+    REQUIRE(chunk->getSkyLight(8, 9, 8) == 15);
+
+    for (int64_t z = 0; z < CHUNK_EDGE; ++z)
+        for (int64_t x = 0; x < CHUNK_EDGE; ++x)
+            world.setBlock(x, roofY, z, BlockType::AIR);
+    world.reconcileLight(64);
+    REQUIRE(chunk->getSkyLight(8, 7, 8) == 15);
+}
+
+TEST_CASE("World skylight edits preserve negative-coordinate column mapping",
+          "[world][light][sky][edit][negative]") {
+    World world(42, 4);
+    auto chunk = world.getChunk({-1, WORLD_MAX_CHUNK_Y, -1});
+    REQUIRE(chunk);
+    constexpr int64_t worldX = -1;
+    constexpr int64_t worldZ = -1;
+    constexpr int32_t coverY = WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8;
+
+    world.setBlock(worldX, coverY, worldZ, BlockType::LOG);
+    world.reconcileLight(64);
+    REQUIRE(chunk->getSkyLight(Chunk::worldToLocal(worldX), 7, Chunk::worldToLocal(worldZ)) == 14);
+
+    world.setBlock(worldX, coverY, worldZ, BlockType::AIR);
+    world.reconcileLight(64);
+    REQUIRE(chunk->getSkyLight(Chunk::worldToLocal(worldX), 7, Chunk::worldToLocal(worldZ)) == 15);
+}
+
+TEST_CASE("World relights player edits synchronously before remeshing", "[world][light][edit]") {
+    World world(42, 4);
+    auto chunk = world.getChunk({0, WORLD_MAX_CHUNK_Y, 0});
+    REQUIRE(chunk);
+    // The snapshot below needs the full 3x3 column-plan neighborhood, which
+    // only exists once the neighboring cubes have generated.
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            REQUIRE(world.getChunk({offsetX, WORLD_MAX_CHUNK_Y, offsetZ}));
+        }
+    }
+    constexpr int32_t placeY = WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8;
+    const uint32_t versionBefore = chunk->version.load(std::memory_order_relaxed);
+
+    // The render thread rebuilds an edited near-camera cube on the very next
+    // frame, so the packed light must be correct the moment setBlock returns,
+    // with no reconcileLight pass in between.
+    world.setBlock(8, placeY, 8, BlockType::STONE);
+    REQUIRE(chunk->getSkyLight(8, 8, 8) == 0);
+    REQUIRE(chunk->getSkyLight(8, 9, 8) == 15);
+    REQUIRE(chunk->getSkyLight(8, 7, 8) == 14);
+    // One bump for the block write and one for the flood's light diff.
+    REQUIRE(chunk->version.load(std::memory_order_relaxed) >= versionBefore + 2);
+
+    MeshSnapshot snapshot;
+    REQUIRE(world.snapshotForMeshing({0, WORLD_MAX_CHUNK_Y, 0}, snapshot));
+    REQUIRE(snapshot.derivedSkyLightValid);
+    REQUIRE(snapshot.skyLightAt(8, 9, 8) == 15);
+    REQUIRE(snapshot.skyLightAt(8, 7, 8) == 14);
+
+    // The synchronous flood must already be the fixed point: later queued
+    // reconcile passes may not move any value it produced.
+    const uint8_t below = chunk->getSkyLight(8, 7, 8);
+    const uint8_t beside = chunk->getSkyLight(9, 8, 8);
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    REQUIRE(chunk->getSkyLight(8, 7, 8) == below);
+    REQUIRE(chunk->getSkyLight(9, 8, 8) == beside);
+}
+
+TEST_CASE("World spreads a placed emitter's light without a reconcile pass",
+          "[world][light][edit]") {
+    World world(42);
+    auto chunk = world.getChunk(ChunkPos{0, 4, 0});
+    REQUIRE(chunk);
+    chunk->fill(BlockType::AIR);
+
+    world.setBlock(8, 4 * CHUNK_EDGE + 8, 8, BlockType::LAVA);
+    REQUIRE(chunk->getBlockLight(8, 8, 8) == 15);
+    REQUIRE(chunk->getBlockLight(8, 9, 8) == 14);
+    REQUIRE(chunk->getBlockLight(9, 8, 8) == 14);
+}
+
+TEST_CASE("World relights the face neighbor of a border edit synchronously",
+          "[world][light][edit]") {
+    World world(42);
+    auto lower = world.getChunk(ChunkPos{0, 4, 0});
+    auto upper = world.getChunk(ChunkPos{0, 5, 0});
+    REQUIRE(lower);
+    REQUIRE(upper);
+    lower->fill(BlockType::AIR);
+    upper->fill(BlockType::AIR);
+
+    // ly == 15: the emitter's light crosses into the +Y face neighbor, which
+    // must flood in the same setBlock call rather than on a later tick.
+    world.setBlock(8, 5 * CHUNK_EDGE - 1, 8, BlockType::LAVA);
+    REQUIRE(lower->getBlockLight(8, CHUNK_EDGE - 1, 8) == 15);
+    REQUIRE(upper->getBlockLight(8, 0, 8) == 14);
+}
+
+TEST_CASE("World relights a non-border edit's face neighbor synchronously",
+          "[world][light][edit]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    auto west = world.getChunk(ChunkPos{-1, 4, 0});
+    REQUIRE(home);
+    REQUIRE(west);
+    home->fill(BlockType::AIR);
+    west->fill(BlockType::AIR);
+
+    const uint32_t westVersionBefore = west->version.load(std::memory_order_relaxed);
+    // Local x == 1 is not on the chunk border, yet the emitter still reaches the
+    // -X neighbor. The old immediate flood only covered a cell sitting exactly
+    // on a face, so this neighbor used to relight and remesh a tick late.
+    world.setBlock(1, 4 * CHUNK_EDGE + 8, 8, BlockType::LAVA);
+    REQUIRE(home->getBlockLight(1, 8, 8) == 15);
+    REQUIRE(home->getBlockLight(0, 8, 8) == 14);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 13);
+    REQUIRE(west->version.load(std::memory_order_relaxed) > westVersionBefore);
+}
+
+TEST_CASE("World relights the diagonal neighbor of a corner edit synchronously",
+          "[world][light][edit]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    auto east = world.getChunk(ChunkPos{1, 4, 0});
+    auto south = world.getChunk(ChunkPos{0, 4, 1});
+    auto diagonal = world.getChunk(ChunkPos{1, 4, 1});
+    REQUIRE(home);
+    REQUIRE(east);
+    REQUIRE(south);
+    REQUIRE(diagonal);
+    home->fill(BlockType::AIR);
+    east->fill(BlockType::AIR);
+    south->fill(BlockType::AIR);
+    diagonal->fill(BlockType::AIR);
+
+    const uint32_t diagonalVersionBefore = diagonal->version.load(std::memory_order_relaxed);
+    // A +X+Z corner emitter reaches the edge-diagonal cube, which shares no face
+    // with the edited cube. The flood chain hops home -> face -> diagonal and
+    // must light and dirty it in the same call.
+    world.setBlock(CHUNK_EDGE - 1, 4 * CHUNK_EDGE + 8, CHUNK_EDGE - 1, BlockType::LAVA);
+    REQUIRE(diagonal->getBlockLight(0, 8, 0) == 13);
+    REQUIRE(diagonal->version.load(std::memory_order_relaxed) > diagonalVersionBefore);
+}
+
+TEST_CASE("World removes a broken emitter's neighbor light synchronously", "[world][light][edit]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    auto west = world.getChunk(ChunkPos{-1, 4, 0});
+    REQUIRE(home);
+    REQUIRE(west);
+    home->fill(BlockType::AIR);
+    west->fill(BlockType::AIR);
+
+    world.setBlock(1, 4 * CHUNK_EDGE + 8, 8, BlockType::LAVA);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 13);
+    // Breaking the emitter must darken the neighbor in the same call, not a tick
+    // later; floodChunk recomputes from scratch, so removal converges too.
+    world.setBlock(1, 4 * CHUNK_EDGE + 8, 8, BlockType::AIR);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 0);
+
+    // The synchronous cross-chunk result is already the fixed point.
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 0);
+}
+
 TEST_CASE("LightEngine: lava light falls off one level per block", "[world][light]") {
     Chunk chunk(ChunkPos{0, 4, 0});
     chunk.setBlock(8, 8, 8, BlockType::LAVA); // one source in open air
@@ -2199,7 +2556,7 @@ TEST_CASE("LightEngine: flood is a pure function of chunk contents", "[world][li
     }
     LightEngine::computeSelfLight(a);
     LightEngine::computeSelfLight(b);
-    REQUIRE(a.blockLightData() == b.blockLightData());
+    REQUIRE(a.packedLightData() == b.packedLightData());
 }
 
 TEST_CASE("LightEngine: light spills across a chunk border", "[world][light]") {
@@ -2260,7 +2617,9 @@ TEST_CASE("LightEngine: block light is derived, never serialized", "[world][ligh
     Chunk original(ChunkPos{2, 4, -1});
     original.setBlock(8, 8, 8, BlockType::LAVA);
     LightEngine::computeSelfLight(original);
+    original.setSkyLight(2, 3, 4, 13);
     REQUIRE(original.hasBlockLight());
+    REQUIRE(original.getSkyLight(2, 3, 4) == 13);
 
     // The save size accounts for cubic block and fluid state, not light.
     size_t before = ChunkSerializer::serializedSize(original);
@@ -2271,6 +2630,7 @@ TEST_CASE("LightEngine: block light is derived, never serialized", "[world][ligh
     REQUIRE(restored.has_value());
     REQUIRE(restored->getBlock(8, 8, 8) == BlockType::LAVA);
     REQUIRE_FALSE(restored->hasBlockLight()); // not carried through the save
+    REQUIRE_FALSE(restored->hasDerivedLight());
     // ...but recomputable from the blocks alone.
     LightEngine::computeSelfLight(*restored);
     REQUIRE(restored->getBlockLight(9, 8, 8) == 14);

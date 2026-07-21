@@ -9,7 +9,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// AudioEngine — Core Audio RemoteIO engine for rycraft.
+// AudioEngine, Core Audio RemoteIO engine for rycraft.
 //
 // Responsibilities:
 //   • Initialize RemoteIO AudioUnit at 44.1kHz stereo
@@ -47,6 +47,10 @@ public:
     // Stop a specific voice by index.
     void stopVoice(int32_t voiceIndex);
 
+    // Smooth environmental crossfades update an existing loop without
+    // reallocating or restarting its sample buffer.
+    void setVoiceGain(int32_t voiceIndex, float gain);
+
     // Set master volume (0.0 = silent, 1.0 = full).
     void setMasterVolume(float gain);
 
@@ -65,7 +69,7 @@ private:
     static constexpr uint32_t SAMPLE_RATE = 44100;
 
     AudioVoice _voices[MAX_VOICES];
-    // Read on the Core Audio render thread, written from the main thread —
+    // Read on the Core Audio render thread, written from the main thread,
     // atomic so the concurrent access is well-defined without the voice lock.
     std::atomic<float> _masterVolume{1.0f};
     std::atomic<bool> _isRunning{false};

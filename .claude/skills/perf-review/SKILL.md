@@ -1,6 +1,6 @@
 ---
 name: perf-review
-description: Review a rycraft diff against frame and tick budgets, sparse cubic active-set limits, adaptive far-terrain LOD and culling bounds, mipmapped texture cost, unified-memory limits, cache and solver bounds, queue backpressure, lock discipline, deterministic generation, fluid work and geometry, and fauna caps. Use before committing changes to rendering, simulation, world generation, cubic or far streaming, meshing, persistence, fluids, entities, caches, worker pools, or mutexes. Reads docs/performance-conventions.md as the source of truth.
+description: Review a rycraft diff against frame and tick budgets, packed-light reconciliation, shadow refresh cadence, temporal SSGI, physical atmosphere, volumetric clouds, froxel volumes, deterministic weather and storms, sparse cubic active-set limits, adaptive far-terrain LOD, unified-memory limits, queue backpressure, and lock discipline. Use before committing changes to rendering, lighting, weather, simulation, world generation, streaming, meshing, persistence, fluids, entities, caches, worker pools, or mutexes. Reads docs/performance-conventions.md as the source of truth.
 ---
 
 # Performance Review
@@ -54,7 +54,7 @@ Classify each hit by its execution path. An allocation during startup is not a h
 Verify all of the following when streaming or rendering changes:
 
 1. Exact simulation uses `min(viewDistance, 32)` and never follows the 512-chunk visible horizon.
-2. The radius-six and vertical-four exploration band, visible saved edits, one primary section per visible column, additional exposed and cliff sections, and the targeted halo are represented. Reservation follows that order before either global cap. Mesh snapshots carry an 18 by 18 by 18 block, fluid, and block-light halo plus separate 18 by 18 sky cutoffs.
+2. The radius-six and vertical-four exploration band, visible saved edits, one primary section per visible column, additional exposed and cliff sections, and the targeted halo are represented. Reservation follows that order before either global cap. Mesh snapshots carry an 18 by 18 by 18 block, fluid, and packed voxel-light halo plus separate 18 by 18 generated-surface and sky-cutoff authority.
 3. Loaded exact cubes cannot exceed 32,768. Obsolete cubes unload before replacement generation starts, and every insertion rechecks the cap while holding the chunk-map mutex.
 4. Exact mesh candidates and renderer mesh residency cannot exceed 16,384.
 5. Unload hysteresis retains existing cubes through two extra horizontal chunks and one extra vertical cube.
@@ -62,7 +62,7 @@ Verify all of the following when streaming or rendering changes:
 7. A view-distance scan does not multiply by the complete 40-section vertical range.
 8. Active-set reconstruction does not perform cold plan construction, hydrology solving, or file I/O on the render thread.
 9. Missing collision remains closed. Ray targeting and edits use non-loading lookups and stop at an unavailable cube instead of turning interaction into synchronous generation.
-10. A compact loaded-section mask proves vertical continuity before an underground mesh receives skylight. A missing cardinal neighbor follows the generated terrain cutoff: air above it, opaque below it, a lit surface-material continuation when visible above ground, and a dark inward cap only for an underground opening. Halo residency changes invalidate every affected mesh.
+10. A compact loaded-section mask proves vertical continuity before level-15 skylight seeds a column. A missing cardinal neighbor follows the generated terrain cutoff: air above it, opaque below it, a lit surface-material continuation when visible above ground, and a dark inward cap only for an underground opening. Packed light reconciles only changed faces, and halo residency changes invalidate affected meshes.
 11. One rebuild gathers unique horizontal columns and expands the fixed plan apron once. It does not repeat the complete apron query for every surface or halo cube.
 12. Pending plans use indexed active-set dependencies, and completion notifications coalesce before rebuild. A completed plan does not scan all retained cubes or schedule one rebuild per dependent.
 13. Saved edited sections for the unique visible-column list come from one bulk in-memory manifest query under a short lock, with no file I/O.
@@ -157,6 +157,22 @@ Place every new mutex in the documented order. Inspect the complete critical sec
 
 Confirm ordinary cube generation and mesh construction run on workers. The existing near-camera edit rebuild is limited to already-meshed cubes and two builds per frame. First-time streaming must not enter that synchronous path. The steady far render loop must reuse its reserved candidate, request, key, cache-result, upload, and 4,096-entry flat grace-record buffers plus fixed tier counters. Ordinary unprotected replacements may use the grace buffer, but protected exact-loading fallbacks must bypass grace and transition-cap admission. Flag a progressive scheduler change that allocates per tile or during ordinary command encoding, while distinguishing one-time renderer-reset capacity growth from recurring frame work.
 
+## 9A. Audit lighting, atmosphere, and weather cost
+
+For packed light, record the number of reconciled cubes, 4,096-cell flood bound, queue budget, changed-face fanout, changed mesh count, and materialized bytes. Confirm a stable cube does not requeue neighbors and that derived light is never serialized. Player edits may flood at most the home cube plus three border face neighbors synchronously under the block-write lock; fluid writes must stay on the deferred queue, and edit-queued propagation drains ahead of streaming reconciles.
+
+For shadows, account for the two-slice near array, two-slice far array, and horizon texture at Medium and High. High resolutions are 4,096, 4,096, 2,048, 2,048, and 2,048. Medium resolutions are 2,048, 2,048, 1,024, 1,024, and 1,024. Confirm per-frame refresh intervals are bounded at one, one, two, four, and eight, with early refresh only for snapped projection, caster revision, or light direction. Record refreshed cascades and caster draw counts rather than treating every depth allocation as every-frame work.
+
+For screen-space lighting, account for the full-resolution min-depth pyramid and normal guide, reduced trace and denoise-scratch targets, two color histories, two depth histories, and two moments-and-age histories. There is no radiance pyramid; bounce samples the scene source at hit texels. High is half resolution with four rays and a 24-iteration Hi-Z cap plus three a-trous iterations. Medium is quarter resolution with two rays, a 16-iteration cap, and two iterations. Off retains only ambient application. Verify target allocation occurs only on construction, resize, or quality change and every history reset is constant-time.
+
+For weather, prove one utility worker, one running request, and at most one latest pending request. Each build has two fixed 81 by 81 slices. Recenter after 1,024 blocks, retain the old immutable snapshot, and never wait on the worker during ordinary gameplay. Record requests, coalescing, starts, publications, stale discards, pending count, and busy state. Lightning queries return no more than eight events. Thunder retains no more than 16 pending events and 64 remembered IDs.
+
+For atmosphere, count the fixed 256 by 64, 32 by 32, and 192 by 108 LUTs and separate slow versus sky-view refreshes. For clouds, count the 128-cubed base noise, 32-cubed erosion noise, curl map, two weather slices, quarter-resolution current and ping-pong histories, hit-depth histories, and 2,048 or 1,024-square cloud shadow. High march work is pixels times 48 view steps plus bounded 6-step light marches; Medium uses 24 plus 3. Wind update is constant work in physical blocks per second.
+
+For froxels, account for the 160 by 104 by 64 volume, integration target, half-resolution current result, and ping-pong histories. Disabling volumetric light must skip froxel injection and integration and retain only LUT aerial perspective. Underwater gating cannot add a second air-medium march.
+
+Sum every new persistent High-tier Metal resource and require no more than 768 MiB. Keep the total credible unified-memory use below 64 GB without adding overlapping RSS and Metal counters. If the route misses frame target, reductions are permitted only in this order: clouds 48 to 40 to 32 view steps, froxels 160 by 104 by 64 to 144 by 94 by 48, horizon refresh rate and resolution, then High SSRT indirect lighting from four rays with a 24-iteration cap and three a-trous iterations to three rays with a 20-iteration cap and two iterations. Detailed shadow reach, first-two-cascade 4K resolution, lighting separation, and packed-light correctness are fixed.
+
 ## 10. Measure when the claim requires it
 
 Build and run the fixed-seed diagnostic or playtest route when the diff makes a speed, memory, queue, or frame-time claim. Record:
@@ -173,7 +189,7 @@ Build and run the fixed-seed diagnostic or playtest route when the diff makes a 
 - Loaded and mesh-resident maxima
 - Far wanted, resident, drawn, frustum-culled, horizon-culled, pending, cache, and arena maxima
 
-Acceptance evidence uses an optimized build on an identified Apple M4 Max at native resolution, 4x MSAA, and `RYCRAFT_VIEW_DISTANCE=512`. Begin with seed 764891 at spawn `23029,225,-111726`, yaw 0, and pitch -17, then use the documented autopilot interval to exercise a repeatable moving route. After streaming settles, require the lowest sustained one-second rate to remain at or above 60 FPS with total unified-memory use at or below 64 GB. Record the exact M4 Max configuration, macOS version, display resolution, seed, and route. Run Metal validation separately because validation overhead does not belong in the performance measurement.
+Acceptance evidence uses an optimized build on an identified Apple M4 Max at native 3456 by 2234 resolution, 4x MSAA, and `RYCRAFT_VIEW_DISTANCE=512`. Begin with seed 764891 at spawn `23029,225,-111726`, yaw 0, and pitch -17, then use the documented autopilot interval to exercise a repeatable moving route. After streaming settles, require the lowest sustained one-second rate to remain at or above 60 FPS with total unified-memory use at or below 64 GB, new persistent High-tier Metal allocations at or below 768 MiB, and every queue settled within five seconds after movement stops. Record the exact M4 Max configuration, macOS version, display resolution, seed, route, graphics qualities, cascade refresh counts, temporal reset counts, weather-worker counts, and per-pass GPU timings. Run Metal validation separately because validation overhead does not belong in the performance measurement.
 
 At the same settled camera, record playing and paused intervals and attribute fixed-tick CPU p50, p95, and maximum with a profiler or scoped measurement. Pausing may remove simulation work, but it must not conceal a material main-thread bottleneck or produce an unexplained frame-rate multiplication.
 

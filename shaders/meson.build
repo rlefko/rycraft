@@ -1,7 +1,8 @@
 # Metal shader compilation pipeline: each .metal -> .air, then all .air -> one .metallib
 
 shader_names = ['pipeline', 'ui_overlay', 'sky', 'bloom', 'clouds', 'particles', 'post', 'exposure',
-                'shadow', 'volumetrics', 'ssao']
+                'shadow', 'volumetrics', 'atmosphere', 'screen_space_lighting',
+                'lightning']
 
 air_targets = []
 foreach name : shader_names
@@ -18,7 +19,8 @@ foreach name : shader_names
       '-o', '@OUTPUT@',
       '@INPUT@',
     ],
-    depend_files : files('../include/render/shader_types.hpp'),
+    depend_files : files('../include/render/shader_types.hpp',
+                         '../include/render/shadow_sampling.hpp'),
   )
 endforeach
 

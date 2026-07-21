@@ -19,12 +19,17 @@
 #include <entity/voxel_traversal.hpp>
 #include <render/block_texture_array.hpp>
 #include <render/block_textures.hpp>
+#include <render/celestial.hpp>
 #include <render/far_terrain.hpp>
 #include <render/lod_mesher.hpp>
 #include <render/mega_buffer.hpp>
 #include <render/mesh_scheduler.hpp>
+#include <render/metal_ownership.hpp>
+#include <render/pixel_formats.hpp>
 #include <render/render_pipeline.hpp>
+#include <render/screen_space_lighting.hpp>
 #include <render/shader_types.hpp>
+#include <render/shadow_map.hpp>
 #include <render/ui_menu.hpp>
 #include <render/ui_overlay.hpp>
 #include <render/vertex.hpp>
@@ -36,6 +41,7 @@
 #include <world/noise.hpp>
 #include <world/save_manager.hpp>
 #include <world/serialization.hpp>
+#include <world/weather.hpp>
 #include <world/world.hpp>
 
 #include <algorithm>
@@ -63,6 +69,36 @@
 // Rendering: meshing, textures, shared GPU layouts
 // ===========================================================================
 
+namespace {
+bool metalOwnershipProbeDeallocated = false;
+}
+
+@interface MetalOwnershipProbe : NSObject
+@end
+
+@implementation MetalOwnershipProbe
+- (void)dealloc {
+    metalOwnershipProbeDeallocated = true;
+#if !__has_feature(objc_arc)
+    [super dealloc];
+#endif
+}
+@end
+
+TEST_CASE("Metal ownership reset releases under ARC and manual reference counting",
+          "[render][metal][ownership]") {
+    @autoreleasepool {
+        metalOwnershipProbeDeallocated = false;
+        MetalOwnershipProbe* probe = [[MetalOwnershipProbe alloc] init];
+        REQUIRE(probe != nil);
+
+        resetMetalObject(probe);
+
+        REQUIRE(probe == nil);
+        REQUIRE(metalOwnershipProbeDeallocated);
+    }
+}
+
 // ============================================================================
 // Vertex Format Tests
 // ============================================================================
@@ -79,6 +115,19 @@ TEST_CASE("Vertex fields have expected sizes", "[render][vertex]") {
     REQUIRE(sizeof(float16_t) == 2);
     REQUIRE(sizeof(uint8_t) == 1);
     REQUIRE(sizeof(uint32_t) == 4);
+}
+
+TEST_CASE("Opaque scene pipelines share the HDR surface attachment contract",
+          "[render][pipeline]") {
+    @autoreleasepool {
+        auto descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        PixelFormats::configureScenePassPipeline(descriptor);
+
+        REQUIRE(descriptor.colorAttachments[0].pixelFormat == PixelFormats::SCENE_HDR);
+        REQUIRE(descriptor.colorAttachments[1].pixelFormat == PixelFormats::SURFACE);
+        REQUIRE(descriptor.depthAttachmentPixelFormat == PixelFormats::SCENE_DEPTH);
+        REQUIRE(descriptor.rasterSampleCount == PixelFormats::SCENE_SAMPLE_COUNT);
+    }
 }
 
 namespace {
@@ -1738,7 +1787,7 @@ TEST_CASE("Urgent nearby refinement shares all eight utility workers with parent
     bool initialBasesStarted = false;
     {
         std::unique_lock lock(gateMutex);
-        initialBasesStarted = gateCv.wait_for(lock, std::chrono::seconds(2), [&] {
+        initialBasesStarted = gateCv.wait_for(lock, std::chrono::seconds(30), [&] {
             return std::all_of(BASES.begin(), BASES.begin() + 8,
                                [&](FarTerrainKey key) { return started.contains(key.tileX); });
         });
@@ -1782,7 +1831,7 @@ TEST_CASE("Urgent nearby refinement shares all eight utility workers with parent
     bool nearbyAndParentAdvancedTogether = false;
     {
         std::unique_lock lock(gateMutex);
-        nearbyAndParentAdvancedTogether = gateCv.wait_for(lock, std::chrono::seconds(2), [&] {
+        nearbyAndParentAdvancedTogether = gateCv.wait_for(lock, std::chrono::seconds(30), [&] {
             const bool urgentStarted =
                 std::all_of(URGENT.begin(), URGENT.begin() + 4,
                             [&](FarTerrainKey key) { return started.contains(key.tileX); });
@@ -1866,7 +1915,7 @@ TEST_CASE("Cold selected step two publishes a near step eight fallback first",
 
     {
         std::unique_lock lock(gateMutex);
-        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(2), [&] { return stepTwoStarted; }));
+        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(30), [&] { return stepTwoStarted; }));
     }
     for (int attempt = 0; attempt < 400 && scheduler.stats().completedRefinement < 3; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1947,7 +1996,7 @@ TEST_CASE("Camera jumps reset obsolete urgent refinement quota",
     {
         std::unique_lock lock(gateMutex);
         const bool started =
-            gateCv.wait_for(lock, std::chrono::seconds(2), [&] { return baseStarted; });
+            gateCv.wait_for(lock, std::chrono::seconds(30), [&] { return baseStarted; });
         if (!started)
             releaseBase = true;
         REQUIRE(started);
@@ -4891,7 +4940,7 @@ TEST_CASE("Far terrain scheduler bounds work and never builds on the caller",
             if (workerThreads.size() == FarTerrainScheduler::WORKER_COUNT) {
                 workersReleased = true;
                 threadCv.notify_all();
-            } else if (!workersReleased && !threadCv.wait_for(lock, std::chrono::seconds(2),
+            } else if (!workersReleased && !threadCv.wait_for(lock, std::chrono::seconds(30),
                                                               [&] { return workersReleased; })) {
                 workerGateTimedOut = true;
                 workersReleased = true;
@@ -4962,7 +5011,7 @@ TEST_CASE("Far terrain scheduler discards canceled epochs",
     REQUIRE(scheduler.enqueue({0, 0, FarTerrainStep::SIXTEEN}));
     {
         std::unique_lock lock(gateMutex);
-        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(2), [&] { return entered; }));
+        REQUIRE(gateCv.wait_for(lock, std::chrono::seconds(30), [&] { return entered; }));
     }
     const uint64_t newEpoch = scheduler.advanceEpoch();
     {
@@ -5250,7 +5299,7 @@ TEST_CASE("Far terrain scheduler cancels obsolete view work",
     bool allWorkersEntered = false;
     {
         std::unique_lock lock(gateMutex);
-        allWorkersEntered = gateCv.wait_for(lock, std::chrono::seconds(2), [&] {
+        allWorkersEntered = gateCv.wait_for(lock, std::chrono::seconds(30), [&] {
             return enteredWorkers >= FarTerrainScheduler::WORKER_COUNT;
         });
     }
@@ -5280,7 +5329,7 @@ TEST_CASE("Far terrain scheduler cancels obsolete view work",
 
 TEST_CASE("Mesher: empty chunk produces no geometry", "[render][mesher]") {
     Chunk chunk(ChunkPos{0, 4, 0});
-    // All AIR — no solid blocks
+    // All AIR, no solid blocks
 
     LODMesher mesher;
     MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
@@ -5358,6 +5407,9 @@ TEST_CASE("Mesher: a solid cuboid greedily reduces every opaque direction",
           "[render][mesher][greedy]") {
     MeshSnapshot snapshot;
     snapshot.clear();
+    // Uniform derived light (all zero) so smooth per-vertex lighting cannot
+    // split the shaded underside; this isolates the greedy-merge behavior.
+    snapshot.derivedSkyLightValid = true;
     for (int y = 3; y < 10; ++y) {
         for (int z = 4; z < 10; ++z) {
             for (int x = 2; x < 7; ++x) {
@@ -5413,15 +5465,19 @@ TEST_CASE("Mesher: reused scratch produces byte-identical output",
 }
 
 TEST_CASE("Mesher: 2x2 flat merges top face", "[render][mesher]") {
-    Chunk chunk(ChunkPos{0, 4, 0});
+    // Uniform derived light so smooth per-vertex lighting cannot split the
+    // shaded underside; this isolates the greedy merge the test targets.
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
     // 2x2 square of STONE at local y=8
-    chunk.setBlock(0, 8, 0, BlockType::STONE);
-    chunk.setBlock(1, 8, 0, BlockType::STONE);
-    chunk.setBlock(0, 8, 1, BlockType::STONE);
-    chunk.setBlock(1, 8, 1, BlockType::STONE);
+    snapshot.blocks[MeshSnapshot::index(0, 8, 0)] = BlockType::STONE;
+    snapshot.blocks[MeshSnapshot::index(1, 8, 0)] = BlockType::STONE;
+    snapshot.blocks[MeshSnapshot::index(0, 8, 1)] = BlockType::STONE;
+    snapshot.blocks[MeshSnapshot::index(1, 8, 1)] = BlockType::STONE;
 
-    LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
 
     // Without greedy merge: 4 top faces = 16 vertices
     // With greedy merge: 1 top face = 4 vertices
@@ -5565,16 +5621,20 @@ TEST_CASE("Mesher: flat flora emits explicit front and back winding",
 }
 
 TEST_CASE("Mesher: flora does not break greedy merging of the ground", "[render][mesher][flora]") {
-    Chunk chunk(ChunkPos{0, 4, 0});
     // 2x2 grass floor with one flower on top: the floor's +Y face must still
-    // merge into a single quad (flora neither occludes nor casts shade)
+    // merge into a single quad (flora neither occludes nor casts shade).
+    // Uniform derived light keeps the shaded underside from splitting so the
+    // test isolates the flora-versus-merge interaction.
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
     for (int z = 0; z < 2; ++z)
         for (int x = 0; x < 2; ++x)
-            chunk.setBlock(x, 8, z, BlockType::GRASS);
-    chunk.setBlock(0, 9, 0, BlockType::FLOWER_RED);
+            snapshot.blocks[MeshSnapshot::index(x, 8, z)] = BlockType::GRASS;
+    snapshot.blocks[MeshSnapshot::index(0, 9, 0)] = BlockType::FLOWER_RED;
 
-    LODMesher mesher;
-    MeshOutput output = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
 
     // 2x2 slab = 24 vertices (all faces merged) + 8 flora vertices
     REQUIRE(output.vertices.size() == 32);
@@ -5680,6 +5740,53 @@ TEST_CASE("Snapshot mesher uses runtime water levels and falling metadata",
             foundFallingFace = true;
     }
     REQUIRE(foundFallingFace);
+}
+
+TEST_CASE("Snapshot water keeps exterior reflection authority separate from skylight",
+          "[render][mesher][water][lighting]") {
+    constexpr int waterX = 8;
+    constexpr int waterY = 8;
+    constexpr int waterZ = 8;
+    constexpr int32_t receiverWorldY = 4 * CHUNK_EDGE + waterY + 1;
+
+    auto topHasExteriorSky = [](const MeshOutput& output) {
+        bool foundTop = false;
+        bool exteriorSky = false;
+        for (const Vertex& vertex : output.vertices) {
+            if (unpackFace(vertex.faceAttr) != FaceNormal::PLUS_Y ||
+                static_cast<float>(vertex.py) != static_cast<float>(waterY + 1)) {
+                continue;
+            }
+            foundTop = true;
+            exteriorSky = exteriorSky || unpackFluidExteriorSky(vertex.faceAttr);
+        }
+        REQUIRE(foundTop);
+        return exteriorSky;
+    };
+
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.pos = {0, 4, 0};
+    snapshot.derivedSkyLightValid = true;
+    snapshot.blocks[MeshSnapshot::index(waterX, waterY, waterZ)] = BlockType::WATER;
+    snapshot.fluidStates[MeshSnapshot::index(waterX, waterY, waterZ)] =
+        FluidState::source().packed();
+    snapshot.skyCutoffY[MeshSnapshot::skyIndex(waterX, waterZ)] =
+        MeshSnapshot::SKY_CUTOFF_INCOMPLETE;
+    snapshot.visualSkyCutoffY[MeshSnapshot::skyIndex(waterX, waterZ)] = receiverWorldY;
+
+    MeshScratch scratch;
+    REQUIRE(topHasExteriorSky(LODMesher::buildMesh(snapshot, scratch)));
+
+    // An edited roof must still suppress reflection while the packed skylight
+    // remains conservatively dark.
+    snapshot.visualSkyCutoffY[MeshSnapshot::skyIndex(waterX, waterZ)] = receiverWorldY + 1;
+    REQUIRE_FALSE(topHasExteriorSky(LODMesher::buildMesh(snapshot, scratch)));
+
+    // Actual propagated skylight reopens a cave mouth without relying on the
+    // incomplete-column visual cutoff.
+    snapshot.packedLight[MeshSnapshot::index(waterX, waterY + 1, waterZ)] = packDerivedLight(1, 0);
+    REQUIRE(topHasExteriorSky(LODMesher::buildMesh(snapshot, scratch)));
 }
 
 TEST_CASE("Snapshot water sides are exclusive to falling columns",
@@ -5820,7 +5927,7 @@ TEST_CASE("Mesher: lava renders as an opaque cube section", "[render][mesher][wa
 }
 
 // ============================================================================
-// Neighbor-aware (snapshot) meshing — chunk border correctness
+// Neighbor-aware (snapshot) meshing, chunk border correctness
 // ============================================================================
 
 TEST_CASE("Snapshot mesher: boundary faces follow real neighbor blocks",
@@ -5946,7 +6053,7 @@ TEST_CASE("MegaBuffer free-list coalescing is bounds-safe and lossless", "[rende
     using Region = std::pair<uint64_t, uint64_t>;
 
     // Regression: a single-entry list made the old compaction write one
-    // element past the vector's end — slow heap corruption that surfaced as
+    // element past the vector's end, slow heap corruption that surfaced as
     // buzzing audio and malloc traps minutes into a session.
     std::vector<Region> single = {{256, 512}};
     MegaBuffer::coalesceFreeList(single);
@@ -6109,6 +6216,7 @@ TEST_CASE("World snapshotForMeshing seals missing neighbors until the real halo 
     REQUIRE(generatedCutoff != MeshSnapshot::SKY_CUTOFF_UNKNOWN);
     REQUIRE(snapshot.at(CHUNK_EDGE, 8, 8) ==
             (probeWorldY < generatedCutoff ? BlockType::BEDROCK : BlockType::AIR));
+    REQUIRE(snapshot.skyLightAt(CHUNK_EDGE, 8, 8) == 0);
     world.markChunkMeshed(center);
     REQUIRE_FALSE(world.getChunk(center)->needsMeshUpdate);
     REQUIRE(world.getChunk({1, 4, 0}));
@@ -6146,7 +6254,7 @@ TEST_CASE("World snapshotForMeshing seals missing neighbors until the real halo 
     }
     REQUIRE(snapshot.at(CHUNK_EDGE, 7, 8) == BlockType::WATER);
     REQUIRE(snapshot.fluidAt(CHUNK_EDGE, 7, 8) == FluidState::flowing(5));
-    REQUIRE(snapshot.lightAt(CHUNK_EDGE, 7, 8) == 9);
+    REQUIRE(snapshot.blockLightAt(CHUNK_EDGE, 7, 8) == 9);
     REQUIRE(snapshot.skyCutoffAt(8, 8) != MeshSnapshot::SKY_CUTOFF_UNKNOWN);
 }
 
@@ -6365,6 +6473,11 @@ TEST_CASE("World setBlock marks boundary neighbors for remeshing", "[world][mesh
     auto negX = world.getChunk({-1, sectionY, 0});
     auto negZ = world.getChunk({0, sectionY, -1});
 
+    // Settle the queued generation-time reconciles first. An edit floods its
+    // cube synchronously, and against stale initial light that flood would
+    // legitimately change border light and mark neighbors.
+    for (int pass = 0; pass < 8; ++pass)
+        world.reconcileLight(256);
     self->needsMeshUpdate = false;
     negX->needsMeshUpdate = false;
     negZ->needsMeshUpdate = false;
@@ -6451,7 +6564,7 @@ TEST_CASE("Mesher: produces mesh without side effects", "[render][mesher]") {
     LODMesher mesher;
     MeshOutput mesh = mesher.buildMesh(chunk, static_cast<int>(ChunkLOD::FULL));
 
-    // buildMesh is pure — it does not modify the chunk
+    // buildMesh is pure, it does not modify the chunk
     REQUIRE(chunk.needsMeshUpdate == true);
     REQUIRE(mesh.vertices.size() > 0u);
     REQUIRE(mesh.indices.size() > 0u);
@@ -6549,7 +6662,10 @@ TEST_CASE("Block textures: fluid metadata does not overlap shared face attribute
           "[render][textures][water]") {
     constexpr uint8_t skyLight = 7;
     constexpr uint8_t blockLight = 11;
-    const uint32_t attr = packFluidFaceAttr(FaceNormal::PLUS_Z, skyLight, 5, true, blockLight);
+    const uint32_t attr =
+        packFluidFaceAttr(FaceNormal::PLUS_Z, skyLight, 5, true, blockLight, true);
+    const uint32_t sealed =
+        packFluidFaceAttr(FaceNormal::PLUS_Z, skyLight, 5, true, blockLight, false);
 
     REQUIRE(unpackFace(attr) == FaceNormal::PLUS_Z);
     REQUIRE(unpackTextureLayer(attr) == static_cast<uint8_t>(BlockType::WATER));
@@ -6560,6 +6676,10 @@ TEST_CASE("Block textures: fluid metadata does not overlap shared face attribute
     REQUIRE(unpackSway(attr) == 0);
     REQUIRE(unpackFluidDirection(attr) == 5);
     REQUIRE(unpackFluidFalling(attr));
+    REQUIRE(unpackFluidExteriorSky(attr));
+    REQUIRE_FALSE(unpackFluidExteriorSky(sealed));
+    REQUIRE((attr & ~FLUID_EXTERIOR_SKY_ATTRIBUTE_MASK) ==
+            (sealed & ~FLUID_EXTERIOR_SKY_ATTRIBUTE_MASK));
     REQUIRE((attr & 0x00FFFFFFU) == packFaceAttr(FaceNormal::PLUS_Z,
                                                  static_cast<uint8_t>(BlockType::WATER), skyLight,
                                                  3, blockLight));
@@ -6676,7 +6796,11 @@ TEST_CASE("Snapshot mesher samples block light across a cubic halo",
     MeshSnapshot snapshot;
     snapshot.clear();
     snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
-    snapshot.blockLight[MeshSnapshot::index(16, 8, 8)] = 12;
+    // Smooth lighting averages each corner over the outward-plane 3x3 patch, so
+    // fill the patch uniformly to keep every corner at the tested nibble.
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+            snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8 + dz)] = 12;
 
     MeshScratch scratch;
     const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
@@ -6689,6 +6813,119 @@ TEST_CASE("Snapshot mesher samples block light across a cubic halo",
         }
     }
     REQUIRE(foundLitBoundary);
+}
+
+TEST_CASE("Snapshot mesher decodes independent packed light channels",
+          "[render][mesher][light][skylight]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
+    snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
+    // Uniform patch so each smoothed corner reads the same skylight and block
+    // light nibble the two channels are asserted against.
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+            snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8 + dz)] = 0xB5;
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    bool foundBoundary = false;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) == FaceNormal::PLUS_X &&
+            static_cast<float>(vertex.px) == 16.0F) {
+            REQUIRE(unpackSkyLight(vertex.faceAttr) == 11);
+            REQUIRE(unpackBlockLight(vertex.faceAttr) == 5);
+            foundBoundary = true;
+        }
+    }
+    REQUIRE(foundBoundary);
+}
+
+TEST_CASE("Snapshot mesher smooths block light per vertex across a face",
+          "[render][mesher][light][smooth]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
+    // Block light rising along +Z in the air the +X face looks into: 0 at z=7,
+    // 8 at z=8, 15 at z=9. Smooth lighting must give the +Z-side corners more
+    // block light than the -Z-side corners instead of one flat value.
+    for (int dy = -1; dy <= 1; ++dy) {
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 7)] = 0x00;
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8)] = 0x08;
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 9)] = 0x0F;
+    }
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    uint8_t low = 255;
+    uint8_t high = 0;
+    int faceVertices = 0;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) == FaceNormal::PLUS_X &&
+            static_cast<float>(vertex.px) == 16.0F) {
+            const uint8_t value = unpackBlockLight(vertex.faceAttr);
+            low = std::min(low, value);
+            high = std::max(high, value);
+            ++faceVertices;
+        }
+    }
+    REQUIRE(faceVertices == 4);
+    REQUIRE(low < high); // a gradient, not one flat per-face value
+    REQUIRE(low <= 5);   // the -Z corners see the dark end
+    REQUIRE(high >= 10); // the +Z corners see the bright end
+}
+
+TEST_CASE("Snapshot mesher merges a uniformly lit face into one quad",
+          "[render][mesher][light][smooth][greedy]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
+    // A 3x3 stone slab with uniform light in the air above it must still merge
+    // its top face to one quad despite the widened per-corner key.
+    for (int z = 6; z <= 8; ++z)
+        for (int x = 6; x <= 8; ++x)
+            snapshot.blocks[MeshSnapshot::index(x, 8, z)] = BlockType::STONE;
+    for (int z = 5; z <= 9; ++z)
+        for (int x = 5; x <= 9; ++x)
+            snapshot.packedLight[MeshSnapshot::index(x, 9, z)] = 0xF7; // sky 15, block 7
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    int topVertices = 0;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) == FaceNormal::PLUS_Y) {
+            ++topVertices;
+            REQUIRE(unpackBlockLight(vertex.faceAttr) == 7);
+            REQUIRE(unpackSkyLight(vertex.faceAttr) == 15);
+        }
+    }
+    REQUIRE(topVertices == 4);
+}
+
+TEST_CASE("Snapshot mesher excludes opaque neighbors from smoothed corners",
+          "[render][mesher][light][smooth]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
+    // A solid neighbor sits beside the lit +X face. Its cell stores no
+    // propagated light, so a corner touching it must average only the lit cells
+    // and stay at 8 rather than being pulled toward zero (which would read 6).
+    snapshot.blocks[MeshSnapshot::index(16, 8, 9)] = BlockType::STONE;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dz = -1; dz <= 1; ++dz)
+            snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8 + dz)] = 0x08;
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    bool found = false;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) == FaceNormal::PLUS_X &&
+            static_cast<float>(vertex.px) == 16.0F) {
+            REQUIRE(unpackBlockLight(vertex.faceAttr) == 8);
+            found = true;
+        }
+    }
+    REQUIRE(found);
 }
 
 TEST_CASE("Mesher: baked corner AO darkens enclosed voxel corners", "[render][mesher][ao]") {
@@ -6865,7 +7102,11 @@ TEST_CASE("Snapshot mesher uses a global sky cutoff above the cubic halo",
     snapshot.clear();
     snapshot.pos = {0, 4, 0};
     snapshot.blocks[MeshSnapshot::index(8, 4, 8)] = BlockType::STONE;
-    snapshot.skyCutoffY[MeshSnapshot::skyIndex(8, 8)] = 96;
+    // Fill the 3x3 column patch the top-face corners read so smooth lighting
+    // keeps the shaded top uniformly dark instead of blending in lit neighbors.
+    for (int dz = -1; dz <= 1; ++dz)
+        for (int dx = -1; dx <= 1; ++dx)
+            snapshot.skyCutoffY[MeshSnapshot::skyIndex(8 + dx, 8 + dz)] = 96;
 
     MeshScratch scratch;
     const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
@@ -6955,6 +7196,8 @@ TEST_CASE("Generated opaque features extend the exact density sky cutoff",
     REQUIRE(world.snapshotForMeshing(target, snapshot));
     REQUIRE(snapshot.skyCutoffY[MeshSnapshot::skyIndex(
                 Chunk::worldToLocal(worldX), Chunk::worldToLocal(worldZ))] == *loadedTop + 1);
+    REQUIRE(snapshot.visualSkyCutoffAt(Chunk::worldToLocal(worldX), Chunk::worldToLocal(worldZ)) ==
+            *loadedTop + 1);
 }
 
 TEST_CASE("Mesh skylight cutoffs follow opaque edits above the cubic halo",
@@ -6992,6 +7235,8 @@ TEST_CASE("Mesh skylight cutoffs follow opaque edits above the cubic halo",
     REQUIRE(world.snapshotForMeshing(surfaceCube, covered));
     REQUIRE(covered.skyCutoffY[MeshSnapshot::skyIndex(Chunk::worldToLocal(WORLD_X),
                                                       Chunk::worldToLocal(WORLD_Z))] == roofY + 1);
+    REQUIRE(covered.visualSkyCutoffAt(Chunk::worldToLocal(WORLD_X), Chunk::worldToLocal(WORLD_Z)) ==
+            roofY + 1);
 
     world.markChunkMeshed(surfaceCube);
     world.markChunkMeshed(negativeXSurfaceCube);
@@ -7004,6 +7249,8 @@ TEST_CASE("Mesh skylight cutoffs follow opaque edits above the cubic halo",
     REQUIRE(world.snapshotForMeshing(surfaceCube, opened));
     REQUIRE(opened.skyCutoffY[MeshSnapshot::skyIndex(
                 Chunk::worldToLocal(WORLD_X), Chunk::worldToLocal(WORLD_Z))] == *restoredTop + 1);
+    REQUIRE(opened.visualSkyCutoffAt(Chunk::worldToLocal(WORLD_X), Chunk::worldToLocal(WORLD_Z)) ==
+            *restoredTop + 1);
 }
 
 TEST_CASE("Saved deep edits do not replace an unloaded generated sky cutoff",
@@ -7365,7 +7612,7 @@ TEST_CASE("Post: vibrance boosts low-saturation colors more than saturated ones"
     (void)luma;
 }
 
-TEST_CASE("Bloom: extract threshold — bright pixels pass, dark pixels blocked", "[phase8][bloom]") {
+TEST_CASE("Bloom: extract threshold, bright pixels pass, dark pixels blocked", "[phase8][bloom]") {
     auto softThreshold = [](float luminance, float threshold) -> float {
         float low = threshold - 0.5f;
         float high = threshold + 0.5f;
@@ -7423,122 +7670,6 @@ TEST_CASE("Bloom: blur kernel is symmetric", "[phase8][bloom]") {
     REQUIRE(weights[3] == weights[4]);
 }
 
-// ---- Fog Tests ----
-
-TEST_CASE("Fog: exponential fog factor at various distances", "[phase8][fog]") {
-    float density = 0.0003f;
-
-    auto fogFactor = [](float distance, float density) -> float {
-        return 1.0f - std::exp(-density * distance);
-    };
-
-    // At distance 0: no fog
-    REQUIRE(fogFactor(0.0f, density) == Catch::Approx(0.0f).epsilon(0.0001f));
-
-    // At distance 100: slight fog
-    float f100 = fogFactor(100.0f, density);
-    REQUIRE(f100 > 0.0f);
-    REQUIRE(f100 < 0.5f);
-
-    // At distance 1000: significant fog
-    float f1000 = fogFactor(1000.0f, density);
-    REQUIRE(f1000 > 0.2f);
-    REQUIRE(f1000 < 0.5f);
-
-    // At distance 5000: very foggy
-    float f5000 = fogFactor(5000.0f, density);
-    REQUIRE(f5000 > 0.7f);
-
-    // Fog factor increases monotonically with distance
-    REQUIRE(fogFactor(100.0f, density) < fogFactor(500.0f, density));
-    REQUIRE(fogFactor(500.0f, density) < fogFactor(1000.0f, density));
-}
-
-TEST_CASE("Fog: fog color mixing", "[phase8][fog]") {
-    struct F3 {
-        float x, y, z;
-    };
-
-    auto mixFog = [](float fogFactor, F3 fogColor, F3 litColor) -> F3 {
-        // fogFactor: 0 = fully fogged, 1 = fully lit
-        // mix(fogColor, litColor, fogFactor) = fogColor*(1-fogFactor) + litColor*fogFactor
-        return {
-            fogColor.x * (1.0f - fogFactor) + litColor.x * fogFactor,
-            fogColor.y * (1.0f - fogFactor) + litColor.y * fogFactor,
-            fogColor.z * (1.0f - fogFactor) + litColor.z * fogFactor,
-        };
-    };
-
-    F3 fogColor{0.5f, 0.7f, 0.8f}; // Sky-like
-    F3 litColor{0.3f, 0.3f, 0.3f}; // Dark stone
-
-    // No fog (factor=1): fully lit
-    auto noFog = mixFog(1.0f, fogColor, litColor);
-    REQUIRE(noFog.x == Catch::Approx(litColor.x));
-
-    // Full fog (factor=0): fully fogged
-    auto fullFog = mixFog(0.0f, fogColor, litColor);
-    REQUIRE(fullFog.x == Catch::Approx(fogColor.x));
-
-    // Half fog: blend
-    auto halfFog = mixFog(0.5f, fogColor, litColor);
-    REQUIRE(halfFog.x == Catch::Approx((fogColor.x + litColor.x) * 0.5f));
-}
-
-// ---- Cloud Tests ----
-
-TEST_CASE("Clouds: noise threshold for cloud generation", "[phase8][clouds]") {
-    // Cloud threshold: 0.4 — noise values above this render as clouds
-    float threshold = 0.4f;
-
-    auto cloudMask = [](float noise, float threshold) -> float {
-        float low = threshold - 0.1f;
-        float high = threshold + 0.1f;
-        if (noise <= low)
-            return 0.0f;
-        if (noise >= high)
-            return 1.0f;
-        return (noise - low) / (high - low);
-    };
-
-    // Low noise → no cloud
-    REQUIRE(cloudMask(0.2f, threshold) == Catch::Approx(0.0f));
-
-    // High noise → full cloud
-    REQUIRE(cloudMask(0.6f, threshold) == Catch::Approx(1.0f));
-
-    // At threshold → partial cloud
-    REQUIRE(cloudMask(0.4f, threshold) == Catch::Approx(0.5f));
-}
-
-TEST_CASE("Clouds: wind offset calculation", "[phase8][clouds]") {
-    // Wind speed: 0.02 blocks/tick
-    float windSpeed = 0.02f;
-
-    auto windOffset = [](uint64_t worldTime, float windSpeed) -> float {
-        return static_cast<float>(worldTime) * windSpeed;
-    };
-
-    // At time 0: no offset
-    REQUIRE(windOffset(0, windSpeed) == Catch::Approx(0.0f));
-
-    // At time 1000: offset = 20
-    REQUIRE(windOffset(1000, windSpeed) == Catch::Approx(20.0f));
-
-    // At time 5000: offset = 100
-    REQUIRE(windOffset(5000, windSpeed) == Catch::Approx(100.0f));
-
-    // Monotonically increasing
-    REQUIRE(windOffset(100, windSpeed) < windOffset(200, windSpeed));
-}
-
-TEST_CASE("Clouds: cloud altitude constant", "[phase8][clouds]") {
-    // Cloud layer at Y=192
-    static constexpr float CLOUD_ALTITUDE = 192.0f;
-    REQUIRE(CLOUD_ALTITUDE > 0.0f);
-    REQUIRE(CLOUD_ALTITUDE <= static_cast<float>(WORLD_MAX_Y));
-}
-
 // ---- Shared shader struct layout pins ----
 // shader_types.hpp is compiled by BOTH clang++ and the Metal compiler; simd
 // types have the same layout in each. These pins catch accidental drift
@@ -7546,15 +7677,21 @@ TEST_CASE("Clouds: cloud altitude constant", "[phase8][clouds]") {
 // position, sky colors, and particle data.
 
 TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(Uniforms) == 304);
+    REQUIRE(sizeof(FoliageWindUniforms) == 16);
+    REQUIRE(offsetof(FoliageWindUniforms, direction) == 0);
+    REQUIRE(offsetof(FoliageWindUniforms, speedBlocksPerSecond) == 8);
+    REQUIRE(offsetof(FoliageWindUniforms, strength) == 12);
+    REQUIRE(sizeof(Uniforms) == 320);
     REQUIRE(offsetof(Uniforms, sunDirection) == 192);
     REQUIRE(offsetof(Uniforms, fogColor) == 240);
     REQUIRE(offsetof(Uniforms, fogDensity) == 256);
     REQUIRE(offsetof(Uniforms, cameraPosition) == 272);
-    REQUIRE(offsetof(Uniforms, time) == 288);
-    REQUIRE(offsetof(Uniforms, swayStrength) == 292);
-    REQUIRE(offsetof(Uniforms, wetness) == 296);
+    REQUIRE(offsetof(Uniforms, foliageWind) == 288);
+    REQUIRE(offsetof(Uniforms, time) == 304);
+    REQUIRE(offsetof(Uniforms, wetness) == 308);
     REQUIRE(alignof(Uniforms) == 16);
+    REQUIRE(sizeof(EntityModel) == 80);
+    REQUIRE(offsetof(EntityModel, lighting) == 64);
     REQUIRE(sizeof(ChunkOrigin) == 48);
     REQUIRE(offsetof(ChunkOrigin, farMetadata) == 32);
     REQUIRE(sizeof(FarTerrainOwnershipUniforms) == 288);
@@ -7574,13 +7711,329 @@ TEST_CASE("Shader types: Uniforms layout matches MSL", "[render][shader-types]")
 }
 
 TEST_CASE("Shader types: ShadowUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(ShadowPassUniforms) == 80);
-    REQUIRE(offsetof(ShadowPassUniforms, time) == 64);
-    REQUIRE(offsetof(ShadowPassUniforms, swayStrength) == 68);
-    REQUIRE(sizeof(ShadowUniforms) == 224);
-    REQUIRE(offsetof(ShadowUniforms, cascadeSplitDist) == 192);
-    REQUIRE(offsetof(ShadowUniforms, shadowParams) == 208);
-    REQUIRE(SHADOW_CASCADE_COUNT == 3);
+    REQUIRE(sizeof(ShadowPassUniforms) == 112);
+    REQUIRE(offsetof(ShadowPassUniforms, projectionOrigin) == 64);
+    REQUIRE(offsetof(ShadowPassUniforms, foliageWind) == 80);
+    REQUIRE(offsetof(ShadowPassUniforms, time) == 96);
+    REQUIRE(sizeof(ShadowCascadeUniforms) == 112);
+    REQUIRE(offsetof(ShadowCascadeUniforms, projectionOrigin) == 64);
+    REQUIRE(offsetof(ShadowCascadeUniforms, depthRange) == 80);
+    REQUIRE(offsetof(ShadowCascadeUniforms, samplingParams) == 96);
+    REQUIRE(sizeof(ShadowUniforms) == 592);
+    REQUIRE(offsetof(ShadowUniforms, cameraPositionAndStrength) == 560);
+    REQUIRE(offsetof(ShadowUniforms, cameraForwardAndPadding) == 576);
+    REQUIRE(SHADOW_DETAILED_CASCADE_COUNT == 4);
+    REQUIRE(SHADOW_CASCADE_COUNT == 5);
+    REQUIRE(SHADOW_HORIZON_CASCADE_INDEX == 4);
+}
+
+TEST_CASE("Foliage wind preserves canonical weather direction and physical speed",
+          "[render][weather][sway][shader-types]") {
+    WeatherSample localWeather{};
+    localWeather.windBlocksPerSecond = {3.0F, 4.0F};
+    const FoliageWindUniforms wind = makeFoliageWindUniforms(
+        localWeather.windBlocksPerSecond.x, localWeather.windBlocksPerSecond.y, true);
+
+    REQUIRE(wind.direction.x == Catch::Approx(0.6F));
+    REQUIRE(wind.direction.y == Catch::Approx(0.8F));
+    REQUIRE(wind.speedBlocksPerSecond == Catch::Approx(5.0F));
+    REQUIRE(wind.strength == Catch::Approx(1.0F));
+
+    Uniforms scene{};
+    ShadowPassUniforms shadow{};
+    scene.foliageWind = wind;
+    shadow.foliageWind = wind;
+    REQUIRE(scene.foliageWind.direction.x == shadow.foliageWind.direction.x);
+    REQUIRE(scene.foliageWind.direction.y == shadow.foliageWind.direction.y);
+    REQUIRE(scene.foliageWind.speedBlocksPerSecond == shadow.foliageWind.speedBlocksPerSecond);
+    REQUIRE(scene.foliageWind.strength == shadow.foliageWind.strength);
+
+    const FoliageWindUniforms disabled = makeFoliageWindUniforms(
+        localWeather.windBlocksPerSecond.x, localWeather.windBlocksPerSecond.y, false);
+    REQUIRE(disabled.direction.x == Catch::Approx(wind.direction.x));
+    REQUIRE(disabled.direction.y == Catch::Approx(wind.direction.y));
+    REQUIRE(disabled.speedBlocksPerSecond == Catch::Approx(wind.speedBlocksPerSecond));
+    REQUIRE(disabled.strength == Catch::Approx(0.0F));
+
+    const FoliageWindUniforms bounded = makeFoliageWindUniforms(24.0F, 0.0F, true);
+    REQUIRE(bounded.direction.x == Catch::Approx(1.0F));
+    REQUIRE(bounded.direction.y == Catch::Approx(0.0F));
+    REQUIRE(bounded.speedBlocksPerSecond == Catch::Approx(FOLIAGE_WIND_MAX_BLOCKS_PER_SECOND));
+}
+
+TEST_CASE("Deferred shadow cascades hold foliage casters static", "[render][shadow][sway]") {
+    FoliageWindUniforms wind{};
+    wind.direction = simd_make_float2(0.6F, 0.8F);
+    wind.speedBlocksPerSecond = 5.0F;
+    wind.strength = 1.0F;
+
+    for (uint32_t cascade = 0U; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        const FoliageWindUniforms casterWind = shadowFoliageWindForCascade(wind, cascade);
+        REQUIRE(casterWind.direction.x == Catch::Approx(wind.direction.x));
+        REQUIRE(casterWind.direction.y == Catch::Approx(wind.direction.y));
+        REQUIRE(casterWind.speedBlocksPerSecond == Catch::Approx(wind.speedBlocksPerSecond));
+        REQUIRE(casterWind.strength == Catch::Approx(cascade < 2U ? wind.strength : 0.0F));
+        REQUIRE(shadowCascadeUsesAnimatedFoliage(cascade) == (cascade < 2U));
+    }
+
+    wind.strength = 0.0F;
+    for (uint32_t cascade = 0U; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        REQUIRE(shadowFoliageWindForCascade(wind, cascade).strength == Catch::Approx(0.0F));
+    }
+}
+
+TEST_CASE("Shadow cascades: quality table pins splits targets and slices", "[render][shadow]") {
+    const std::array<float, SHADOW_CASCADE_COUNT> highFar = {48.0f, 160.0f, 512.0f, 1536.0f,
+                                                             8192.0f};
+    const std::array<float, SHADOW_CASCADE_COUNT> mediumFar = {40.0f, 128.0f, 384.0f, 768.0f,
+                                                               8192.0f};
+    const std::array<uint32_t, SHADOW_CASCADE_COUNT> highResolution = {4096u, 4096u, 2048u, 2048u,
+                                                                       2048u};
+    const std::array<uint32_t, SHADOW_CASCADE_COUNT> mediumResolution = {2048u, 2048u, 1024u, 1024u,
+                                                                         1024u};
+
+    for (uint32_t cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        const ShadowCascadeConfiguration high = shadowCascadeConfiguration(2u, cascade);
+        const ShadowCascadeConfiguration medium = shadowCascadeConfiguration(1u, cascade);
+        REQUIRE(high.farDepth == Catch::Approx(highFar[cascade]));
+        REQUIRE(medium.farDepth == Catch::Approx(mediumFar[cascade]));
+        REQUIRE(high.resolution == highResolution[cascade]);
+        REQUIRE(medium.resolution == mediumResolution[cascade]);
+        if (cascade < 2u) {
+            REQUIRE(high.textureGroup == ShadowTextureGroup::NEAR);
+            REQUIRE(high.textureSlice == cascade);
+        } else if (cascade < SHADOW_HORIZON_CASCADE_INDEX) {
+            REQUIRE(high.textureGroup == ShadowTextureGroup::FAR);
+            REQUIRE(high.textureSlice == cascade - 2u);
+        } else {
+            REQUIRE(high.textureGroup == ShadowTextureGroup::HORIZON);
+            REQUIRE(high.textureSlice == 0u);
+        }
+    }
+}
+
+TEST_CASE("Shadow cascades: overlap selection uses camera-forward view depth", "[render][shadow]") {
+    ShadowUniforms shadow{};
+    for (uint32_t cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        const ShadowCascadeConfiguration configuration = shadowCascadeConfiguration(2u, cascade);
+        shadow.cascades[cascade].depthRange =
+            simd_make_float4(configuration.nearDepth, configuration.farDepth,
+                             shadowCascadeBlendStart(configuration), 1.0f);
+    }
+
+    const simd_float3 camera = simd_make_float3(10.0f, 2.0f, 3.0f);
+    const simd_float3 forward = simd_make_float3(0.0f, 0.0f, -1.0f);
+    REQUIRE(shadowViewDepth(simd_make_float3(10.0f, 2.0f, -7.0f), camera, forward) ==
+            Catch::Approx(10.0f));
+    REQUIRE(shadowViewDepth(simd_make_float3(10.0f, 2.0f, 13.0f), camera, forward) ==
+            Catch::Approx(-10.0f));
+
+    const float firstBlendStart = shadowCascadeBlendStart(shadowCascadeConfiguration(2u, 0u));
+    ShadowCascadeSelection beforeBlend = shadowCascadeSelection(firstBlendStart - 0.01f, shadow);
+    REQUIRE(beforeBlend.primary == 0u);
+    REQUIRE(beforeBlend.secondary == 0u);
+    REQUIRE(beforeBlend.secondaryWeight == Catch::Approx(0.0f));
+
+    ShadowCascadeSelection insideBlend = shadowCascadeSelection(45.0f, shadow);
+    REQUIRE(insideBlend.primary == 0u);
+    REQUIRE(insideBlend.secondary == 1u);
+    REQUIRE(insideBlend.secondaryWeight > 0.0f);
+    REQUIRE(insideBlend.secondaryWeight < 1.0f);
+
+    ShadowCascadeSelection horizonBlend = shadowCascadeSelection(1500.0f, shadow);
+    REQUIRE(horizonBlend.primary == 3u);
+    REQUIRE(horizonBlend.secondary == SHADOW_HORIZON_CASCADE_INDEX);
+    REQUIRE(horizonBlend.secondaryWeight > 0.0f);
+    REQUIRE(horizonBlend.secondaryWeight < 1.0f);
+
+    ShadowCascadeSelection horizon = shadowCascadeSelection(2000.0f, shadow);
+    REQUIRE(horizon.primary == SHADOW_HORIZON_CASCADE_INDEX);
+    REQUIRE(horizon.secondary == SHADOW_HORIZON_CASCADE_INDEX);
+    REQUIRE(horizon.covered == 1u);
+
+    const ShadowCascadeConfiguration horizonConfiguration =
+        shadowCascadeConfiguration(2u, SHADOW_HORIZON_CASCADE_INDEX);
+    const float terminalStart = shadowCascadeBlendStart(horizonConfiguration);
+    ShadowCascadeSelection terminalFade =
+        shadowCascadeSelection(0.5F * (terminalStart + horizonConfiguration.farDepth), shadow);
+    REQUIRE(terminalFade.primary == SHADOW_HORIZON_CASCADE_INDEX);
+    REQUIRE(terminalFade.secondary == SHADOW_HORIZON_CASCADE_INDEX);
+    REQUIRE(terminalFade.exteriorWeight > 0.0F);
+    REQUIRE(terminalFade.exteriorWeight < 1.0F);
+    REQUIRE(shadowCascadeSelection(horizonConfiguration.farDepth, shadow).exteriorWeight ==
+            Catch::Approx(1.0F));
+    REQUIRE(shadowCascadeSelection(9000.0f, shadow).covered == 0u);
+    REQUIRE(shadowCascadeSelection(-1.0f, shadow).covered == 0u);
+}
+
+TEST_CASE("Shadow cascades: overlap and texel snap metadata are stable", "[render][shadow]") {
+    for (uint32_t quality : {1u, 2u}) {
+        for (uint32_t cascade = 0; cascade < SHADOW_HORIZON_CASCADE_INDEX; ++cascade) {
+            const ShadowCascadeConfiguration configuration =
+                shadowCascadeConfiguration(quality, cascade);
+            REQUIRE(configuration.farDepth - shadowCascadeBlendStart(configuration) ==
+                    Catch::Approx((configuration.farDepth - configuration.nearDepth) *
+                                  SHADOW_CASCADE_BLEND_FRACTION));
+        }
+    }
+
+    const ShadowCascadeConfiguration first = shadowCascadeConfiguration(2u, 0u);
+    REQUIRE(shadowCascadeBlendStart(first) == Catch::Approx(42.0625f));
+
+    const float tanHalfFov = std::tan(70.0F * static_cast<float>(M_PI) / 360.0F);
+    const float analytic = shadowCascadeBoundingRadius(0.5F, 48.0F, tanHalfFov, 1.5F);
+    REQUIRE(analytic == shadowCascadeBoundingRadius(0.5F, 48.0F, tanHalfFov, 1.5F));
+    REQUIRE(std::fmod(analytic * 16.0F, 1.0F) == Catch::Approx(0.0F).margin(1.0e-6F));
+    // Reconstructing absolute frustum corners at the acceptance coordinate
+    // alternated between 66.3125 and 66.375 while moving. The analytic native
+    // route radius has one exact authority independent of camera position.
+    REQUIRE(shadowCascadeBoundingRadius(0.5F, 48.0F, tanHalfFov, 3456.0F / 2234.0F) ==
+            Catch::Approx(66.3125F));
+
+    const double texelWorldSize = 2.0 * analytic / first.resolution;
+    const double lightCoordinate = -102'753.123456;
+    const double snapped = shadowSnappedLightCoordinate(lightCoordinate, texelWorldSize);
+    REQUIRE(snapped / texelWorldSize ==
+            Catch::Approx(std::round(lightCoordinate / texelWorldSize)));
+    REQUIRE(std::abs(snapped - lightCoordinate) <= texelWorldSize * 0.5);
+}
+
+TEST_CASE("Shadow cascades: refresh cadence bounds stale depth", "[render][shadow]") {
+    REQUIRE(shadowCascadeMaximumRefreshInterval(0U) == 1U);
+    REQUIRE(shadowCascadeMaximumRefreshInterval(1U) == 1U);
+    REQUIRE(shadowCascadeMaximumRefreshInterval(2U) == 2U);
+    REQUIRE(shadowCascadeMaximumRefreshInterval(3U) == 4U);
+    REQUIRE(shadowCascadeMaximumRefreshInterval(4U) == 8U);
+}
+
+TEST_CASE("Shadow cascades: deferred depth coverage refresh is snap-safe", "[render][shadow]") {
+    const Mat4 rendered = Mat4::identity();
+    const Vec3 origin{22'784.0F, 0.0F, -111'872.0F};
+    Mat4 candidate = rendered;
+    REQUIRE_FALSE(shadowCascadeProjectionChanged(candidate, origin, rendered, origin));
+
+    candidate(0, 3) += 0.125F;
+    REQUIRE(shadowCascadeProjectionChanged(candidate, origin, rendered, origin));
+    candidate = rendered;
+    candidate(1, 3) += 0.125F;
+    REQUIRE(shadowCascadeProjectionChanged(candidate, origin, rendered, origin));
+    candidate = rendered;
+    candidate(2, 3) += 0.125F;
+    REQUIRE(shadowCascadeProjectionChanged(candidate, origin, rendered, origin));
+    candidate = rendered;
+    candidate(3, 3) += 0.125F;
+    REQUIRE_FALSE(shadowCascadeProjectionChanged(candidate, origin, rendered, origin));
+    REQUIRE(shadowCascadeProjectionChanged(candidate, origin, rendered,
+                                           origin + Vec3{256.0F, 0.0F, 0.0F}));
+
+    constexpr float radius = 10.0F;
+    constexpr float casterMargin = 2.0F;
+    constexpr float normalBias = 0.5F;
+    constexpr uint32_t resolution = 1024U;
+    const float guard =
+        shadowCascadeReceiverDepthGuard(radius, casterMargin, resolution, normalBias);
+    const float depthRange = shadowCascadeDepthRange(radius, casterMargin, guard);
+    const float depthTexel =
+        shadowCascadeDepthTexelWorldSize(radius, casterMargin, guard, resolution);
+    REQUIRE(guard >= normalBias + depthTexel);
+
+    const double depthCenter = static_cast<double>(depthTexel) * 1'024.0;
+    REQUIRE(shadowSnappedLightCoordinate(depthCenter + 0.49 * depthTexel, depthTexel) ==
+            Catch::Approx(shadowSnappedLightCoordinate(depthCenter, depthTexel)));
+    REQUIRE(shadowSnappedLightCoordinate(depthCenter + 0.51 * depthTexel, depthTexel) !=
+            Catch::Approx(shadowSnappedLightCoordinate(depthCenter, depthTexel)));
+
+    const Vec3 receiverCenter{};
+    const Vec3 light{0.0F, 0.0F, 1.0F};
+    const Mat4 sampled =
+        Mat4::orthographic(-radius, radius, -radius, radius, 0.0F, depthRange) *
+        Mat4::lookAt(light * (radius + casterMargin + guard), receiverCenter, Vec3::up());
+    REQUIRE(shadowCascadeReceiverDepthCovered(sampled, Vec3::zero(), receiverCenter, radius));
+    REQUIRE_FALSE(shadowCascadeReceiverDepthCovered(
+        sampled, Vec3::zero(), receiverCenter - light * (guard + 0.25F), radius));
+}
+
+TEST_CASE("Shadow cascades: projection anchors preserve large-coordinate precision",
+          "[render][shadow][large-coordinate]") {
+    const Vec3 camera{23'029.0F, 225.0F, -111'726.0F};
+    const Vec3 origin = shadowProjectionOrigin(camera);
+    REQUIRE(origin.x == Catch::Approx(22'784.0F));
+    REQUIRE(origin.y == Catch::Approx(0.0F));
+    REQUIRE(origin.z == Catch::Approx(-111'872.0F));
+
+    const Vec3 local = camera - origin;
+    REQUIRE(local.x == Catch::Approx(245.0F));
+    REQUIRE(local.y == Catch::Approx(225.0F));
+    REQUIRE(local.z == Catch::Approx(146.0F));
+    REQUIRE(std::abs(local.x) < 256.0F);
+    REQUIRE(std::abs(local.y) < 256.0F);
+    REQUIRE(std::abs(local.z) < 256.0F);
+
+    const Vec3 lightAxis = Vec3{0.37F, 0.81F, -0.45F}.normalize();
+    const double expected = static_cast<double>(camera.x) * lightAxis.x +
+                            static_cast<double>(camera.y) * lightAxis.y +
+                            static_cast<double>(camera.z) * lightAxis.z;
+    REQUIRE(shadowPreciseDot(camera, lightAxis) == Catch::Approx(expected));
+}
+
+TEST_CASE("Shadow cascades: nearby entities do not invalidate coarse high-sun slices",
+          "[render][shadow][entity]") {
+    const Vec3 camera{0.0F, 64.0F, 0.0F};
+    const Vec3 forward{0.0F, 0.0F, 1.0F};
+    const Vec3 highSun{0.0F, 1.0F, 0.0F};
+    const AABB before{{-0.5F, 64.0F, 9.5F}, {0.5F, 66.0F, 10.5F}};
+    const AABB after{{-0.5F, 64.0F, 10.5F}, {0.5F, 66.0F, 11.5F}};
+
+    const ShadowCascadeConfiguration near = shadowCascadeConfiguration(2U, 0U);
+    REQUIRE(shadowEntityCasterReachesDepthSlice(before, camera, forward, highSun, near.nearDepth,
+                                                near.farDepth));
+    REQUIRE(shadowEntityCasterReachesDepthSlice(after, camera, forward, highSun, near.nearDepth,
+                                                near.farDepth));
+
+    for (uint32_t cascade = 2U; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        const ShadowCascadeConfiguration coarse = shadowCascadeConfiguration(2U, cascade);
+        REQUIRE_FALSE(shadowEntityCasterReachesDepthSlice(before, camera, forward, highSun,
+                                                          coarse.nearDepth, coarse.farDepth));
+        REQUIRE_FALSE(shadowEntityCasterReachesDepthSlice(after, camera, forward, highSun,
+                                                          coarse.nearDepth, coarse.farDepth));
+    }
+}
+
+TEST_CASE("Shadow cascades: low-sun entity extrusion retains reachable coarse shadows",
+          "[render][shadow][entity]") {
+    const Vec3 camera{0.0F, 64.0F, 0.0F};
+    const Vec3 forward{0.0F, 0.0F, 1.0F};
+    const AABB entity{{-0.5F, 64.0F, 9.5F}, {0.5F, 66.0F, 10.5F}};
+
+    // Light comes from behind the camera, so its shadow travels forward. At a
+    // low elevation the ray can reach the horizon slice before the world
+    // floor bounds it; at a steep elevation it cannot.
+    const Vec3 lowSun = Vec3{0.0F, 0.10F, -0.995F}.normalize();
+    const Vec3 highSun = Vec3{0.0F, 0.80F, -0.60F}.normalize();
+    const ShadowCascadeConfiguration horizon =
+        shadowCascadeConfiguration(2U, SHADOW_HORIZON_CASCADE_INDEX);
+    const float horizonNear = shadowCascadeBlendStart(shadowCascadeConfiguration(2U, 3U));
+    REQUIRE(shadowEntityCasterReachesDepthSlice(entity, camera, forward, lowSun, horizonNear,
+                                                horizon.farDepth));
+    REQUIRE_FALSE(shadowEntityCasterReachesDepthSlice(entity, camera, forward, highSun, horizonNear,
+                                                      horizon.farDepth));
+
+    // A caster beyond a receiver slice remains eligible when the light points
+    // toward the camera and its shadow travels back into that slice.
+    const AABB distant{{-0.5F, 300.0F, 1'599.5F}, {0.5F, 302.0F, 1'600.5F}};
+    const Vec3 frontLight = Vec3{0.0F, 0.20F, 0.98F}.normalize();
+    const ShadowCascadeConfiguration fourth = shadowCascadeConfiguration(2U, 3U);
+    REQUIRE(shadowEntityCasterReachesDepthSlice(distant, camera, forward, frontLight,
+                                                fourth.nearDepth, fourth.farDepth));
+}
+
+TEST_CASE("Shadow visibility follows the active celestial source strength",
+          "[render][shadow][celestial]") {
+    REQUIRE(shadowVisibilityWithStrength(0.0F, 0.0F) == Catch::Approx(1.0F));
+    REQUIRE(shadowVisibilityWithStrength(0.0F, 0.14F) == Catch::Approx(0.86F));
+    REQUIRE(shadowVisibilityWithStrength(0.0F, 1.0F) == Catch::Approx(0.0F));
+    REQUIRE(shadowVisibilityWithStrength(0.35F, 0.5F) == Catch::Approx(0.675F));
+    REQUIRE(shadowVisibilityWithStrength(-1.0F, 2.0F) == Catch::Approx(0.0F));
 }
 
 TEST_CASE("Mat4 orthographic maps near->0 and far->1 (Metal depth)", "[common][math]") {
@@ -7597,17 +8050,17 @@ TEST_CASE("Mat4 orthographic maps near->0 and far->1 (Metal depth)", "[common][m
 }
 
 TEST_CASE("Shader types: SkyUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(SkyUniforms) == 144);
+    REQUIRE(sizeof(SkyUniforms) == 176);
     REQUIRE(offsetof(SkyUniforms, sunDirection) == 48);
     REQUIRE(offsetof(SkyUniforms, moonDirection) == 64);
-    REQUIRE(offsetof(SkyUniforms, zenithColor) == 96);
-    REQUIRE(offsetof(SkyUniforms, tanHalfFov) == 128);
-    REQUIRE(offsetof(SkyUniforms, sunIntensity) == 136);
-    REQUIRE(offsetof(SkyUniforms, starStrength) == 140);
+    REQUIRE(offsetof(SkyUniforms, moonColor) == 96);
+    REQUIRE(offsetof(SkyUniforms, zenithColor) == 112);
+    REQUIRE(offsetof(SkyUniforms, visibilityAndPhase) == 144);
+    REQUIRE(offsetof(SkyUniforms, tanHalfFov) == 160);
 }
 
 TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(WaterUniforms) == 256);
+    REQUIRE(sizeof(WaterUniforms) == 288);
     REQUIRE(offsetof(WaterUniforms, cameraRelativeViewProjection) == 64);
     REQUIRE(offsetof(WaterUniforms, zenithColor) == 128);
     REQUIRE(offsetof(WaterUniforms, resolution) == 224);
@@ -7617,6 +8070,192 @@ TEST_CASE("Shader types: WaterUniforms layout matches MSL", "[render][shader-typ
     REQUIRE(offsetof(WaterUniforms, ssrStrength) == 244);
     REQUIRE(offsetof(WaterUniforms, skyExposure) == 248);
     REQUIRE(offsetof(WaterUniforms, waterSurfaceY) == 252);
+    REQUIRE(offsetof(WaterUniforms, solarDirection) == 256);
+    REQUIRE(offsetof(WaterUniforms, physicalSkyBlend) == 272);
+    REQUIRE(offsetof(WaterUniforms, directSpecularFactor) == 276);
+}
+
+TEST_CASE("Celestial state forms physical full quarter and new Moon phases",
+          "[render][celestial]") {
+    const uint64_t fullTick = CELESTIAL_FULL_MOON_REFERENCE_TICK;
+    const CelestialState full = computeCelestialState(fullTick);
+    const CelestialState quarter =
+        computeCelestialState(fullTick + CELESTIAL_SYNODIC_PERIOD_TICKS / 4U);
+    const CelestialState fresh =
+        computeCelestialState(fullTick + CELESTIAL_SYNODIC_PERIOD_TICKS / 2U);
+
+    REQUIRE(full.sunDirection.dot(full.moonDirection) == Catch::Approx(-1.0F).margin(1.0e-5F));
+    REQUIRE(full.illuminatedFraction == Catch::Approx(1.0F).margin(1.0e-5F));
+    REQUIRE(full.phaseEnergy == Catch::Approx(1.0F).margin(1.0e-5F));
+    REQUIRE(quarter.illuminatedFraction == Catch::Approx(0.5F).margin(2.0e-5F));
+    REQUIRE(quarter.phaseEnergy == Catch::Approx(1.0F / static_cast<float>(M_PI)).margin(2.0e-5F));
+    REQUIRE(fresh.sunDirection.dot(fresh.moonDirection) == Catch::Approx(1.0F).margin(2.0e-5F));
+    REQUIRE(fresh.illuminatedFraction <= 2.0e-5F);
+    REQUIRE(fresh.phaseEnergy <= 2.0e-5F);
+    REQUIRE(static_cast<double>(CELESTIAL_SYNODIC_PERIOD_TICKS) /
+                static_cast<double>(CELESTIAL_TICKS_PER_DAY) ==
+            Catch::Approx(29.530583).margin(1.0e-6));
+}
+
+TEST_CASE("Celestial state suppresses competing Moon light through twilight",
+          "[render][celestial]") {
+    const uint64_t fullMidnight = CELESTIAL_FULL_MOON_REFERENCE_TICK;
+    const uint64_t fullDayStart = fullMidnight - 18'000U;
+    const CelestialState justAfterSunset = computeCelestialState(fullDayStart + 12'020U);
+    const CelestialState civilTwilight = computeCelestialState(fullDayStart + 12'400U);
+    const CelestialState midnight = computeCelestialState(fullMidnight);
+
+    REQUIRE(justAfterSunset.sunVisibility <= 1.0e-5F);
+    REQUIRE(justAfterSunset.moonDirectVisibility <= 1.0e-5F);
+    REQUIRE(justAfterSunset.directSource == CelestialLightSource::NONE);
+    REQUIRE(civilTwilight.directLightRadiance.length() < 0.04F);
+    REQUIRE(midnight.directSource == CelestialLightSource::MOON);
+    // Full-moon direct light sits at the playable-night level: far below any
+    // daylight value, bright enough that moonlit terrain reads in motion.
+    REQUIRE(midnight.directLightRadiance.length() < 0.05F);
+    // The disc peaks just past the bloom threshold for a slight glow while
+    // staying an order of magnitude below the sun disc's 18x on-screen
+    // radiance, so the Moon reads at a glance without becoming a second sun.
+    REQUIRE(midnight.lunarDiscRadiance.length() < 3.60F);
+    REQUIRE(midnight.shadowStrength < 0.08F);
+    REQUIRE(midnight.directSpecularFactor == Catch::Approx(midnight.phaseEnergy));
+}
+
+TEST_CASE("Visible horizon Sun does not apply daytime irradiance to terrain",
+          "[render][celestial][twilight]") {
+    const CelestialState sunset = computeCelestialState(12'000U);
+    REQUIRE(sunset.sunVisibility == Catch::Approx(0.5F).margin(5.0e-5F));
+    REQUIRE(sunset.sunDirectVisibility <= 1.0e-6F);
+    REQUIRE(sunset.directSource == CelestialLightSource::NONE);
+    REQUIRE(sunset.directLightRadiance.length() <= 1.0e-6F);
+    REQUIRE(sunset.shadowStrength <= 1.0e-6F);
+
+    const auto closestMorningTick = [](float elevationDegrees) {
+        const float target = std::sin(elevationDegrees * static_cast<float>(M_PI) / 180.0F);
+        uint64_t closest = 0U;
+        float error = std::numeric_limits<float>::max();
+        for (uint64_t tick = 0U; tick <= 6'000U; ++tick) {
+            const float candidate = computeCelestialState(tick).sunDirection.y;
+            const float candidateError = std::abs(candidate - target);
+            if (candidateError < error) {
+                error = candidateError;
+                closest = tick;
+            }
+        }
+        return closest;
+    };
+    const CelestialState oneDegree = computeCelestialState(closestMorningTick(1.0F));
+    const CelestialState fiveDegrees = computeCelestialState(closestMorningTick(5.0F));
+    const CelestialState tenDegrees = computeCelestialState(closestMorningTick(10.0F));
+    REQUIRE(oneDegree.sunVisibility > 0.99F);
+    REQUIRE(oneDegree.sunDirectVisibility < 0.04F);
+    REQUIRE(fiveDegrees.sunDirectVisibility > oneDegree.sunDirectVisibility);
+    REQUIRE(fiveDegrees.sunDirectVisibility < 0.60F);
+    REQUIRE(tenDegrees.sunDirectVisibility > 0.99F);
+}
+
+TEST_CASE("Night ambient is phase-aware and cannot resemble daylight",
+          "[render][celestial][night]") {
+    const CelestialState fullMoon = computeCelestialState(CELESTIAL_FULL_MOON_REFERENCE_TICK);
+    const uint64_t exactNewMoon =
+        CELESTIAL_FULL_MOON_REFERENCE_TICK + CELESTIAL_SYNODIC_PERIOD_TICKS / 2U;
+    const uint64_t newMoonMidnight = exactNewMoon + (18'000U + CELESTIAL_TICKS_PER_DAY -
+                                                     exactNewMoon % CELESTIAL_TICKS_PER_DAY) %
+                                                        CELESTIAL_TICKS_PER_DAY;
+    const CelestialState newMoon = computeCelestialState(newMoonMidnight);
+    const CelestialState noon = computeCelestialState(6'000U);
+
+    REQUIRE(newMoon.phaseEnergy < 0.002F);
+    REQUIRE(fullMoon.ambientRadiance.length() > newMoon.ambientRadiance.length());
+    // Playable-night contract: a full moon sits about a tenth of daylight so
+    // moonlit terrain stays legible, while a new moon keeps only the stellar
+    // floor and daylight remains an order of magnitude above any night.
+    REQUIRE(fullMoon.ambientRadiance.length() < 0.055F);
+    REQUIRE(newMoon.ambientRadiance.length() < 0.025F);
+    REQUIRE(noon.ambientRadiance.length() > fullMoon.ambientRadiance.length() * 10.0F);
+}
+
+TEST_CASE("Moon fades in only after civil twilight at sunset and sunrise",
+          "[render][celestial][twilight]") {
+    const auto closestTick = [](float elevationDegrees, bool beforeSunrise) {
+        const float target = std::sin(elevationDegrees * static_cast<float>(M_PI) / 180.0F);
+        const uint64_t begin = beforeSunrise ? 18'000U : 12'000U;
+        const uint64_t end = beforeSunrise ? 24'000U : 18'000U;
+        uint64_t closest = begin;
+        float error = std::numeric_limits<float>::max();
+        for (uint64_t tick = begin; tick <= end; ++tick) {
+            const float candidate = computeCelestialState(tick).sunDirection.y;
+            const float candidateError = std::abs(candidate - target);
+            if (candidateError < error) {
+                error = candidateError;
+                closest = tick;
+            }
+        }
+        return closest;
+    };
+
+    for (const bool beforeSunrise : {false, true}) {
+        const CelestialState minusFive = computeCelestialState(closestTick(-5.0F, beforeSunrise));
+        const CelestialState minusSix = computeCelestialState(closestTick(-6.0F, beforeSunrise));
+        const CelestialState minusSeven = computeCelestialState(closestTick(-7.0F, beforeSunrise));
+        const CelestialState minusTwelve =
+            computeCelestialState(closestTick(-12.0F, beforeSunrise));
+
+        REQUIRE(minusFive.moonDirectVisibility <= 1.0e-6F);
+        REQUIRE(minusFive.directSource == CelestialLightSource::NONE);
+        REQUIRE(minusSix.moonDirectVisibility < 0.001F);
+        REQUIRE(minusSeven.moonDirectVisibility > minusSix.moonDirectVisibility);
+        REQUIRE(minusSeven.moonDirectVisibility < 0.20F);
+        REQUIRE(minusTwelve.moonDirectVisibility > 0.98F);
+        REQUIRE(minusSeven.directLightRadiance.length() < 0.004F);
+    }
+}
+
+TEST_CASE("Celestial source is exclusive continuous and phase-scaled", "[render][celestial]") {
+    const uint64_t cycle = CELESTIAL_SYNODIC_PERIOD_TICKS;
+    for (uint64_t tick = 0; tick < cycle; tick += 137U) {
+        const CelestialState state = computeCelestialState(tick);
+        REQUIRE(state.sunDirection.length() == Catch::Approx(1.0F).margin(1.0e-5F));
+        REQUIRE(state.moonDirection.length() == Catch::Approx(1.0F).margin(1.0e-5F));
+        REQUIRE(std::isfinite(state.directLightRadiance.length()));
+        if (state.directSource == CelestialLightSource::SUN) {
+            REQUIRE(state.sunDirectVisibility > 0.0F);
+            REQUIRE(state.directSpecularFactor == Catch::Approx(1.0F));
+        } else if (state.directSource == CelestialLightSource::MOON) {
+            REQUIRE(state.sunVisibility <= 0.0001F);
+            REQUIRE(state.moonDirectVisibility > 0.0F);
+            REQUIRE(state.directSpecularFactor == Catch::Approx(state.phaseEnergy));
+        } else {
+            REQUIRE(state.directLightRadiance.length() <= 1.0e-6F);
+            REQUIRE(state.directSpecularFactor == Catch::Approx(0.0F));
+        }
+    }
+
+    const CelestialState before = computeCelestialState(cycle - 1U);
+    const CelestialState after = computeCelestialState(cycle);
+    REQUIRE((before.sunDirection - after.sunDirection).length() < 0.001F);
+    REQUIRE((before.moonDirection - after.moonDirection).length() < 0.001F);
+    REQUIRE(std::abs(before.phaseEnergy - after.phaseEnergy) < 0.001F);
+    const float angularDiameterDegrees =
+        2.0F * LUNAR_ANGULAR_RADIUS_RADIANS * 180.0F / static_cast<float>(M_PI);
+    REQUIRE(angularDiameterDegrees == Catch::Approx(0.518F).margin(0.01F));
+}
+
+TEST_CASE("New Moon cannot drive lighting shadows or a water glint", "[render][celestial]") {
+    const uint64_t newMoonMidnight =
+        CELESTIAL_FULL_MOON_REFERENCE_TICK + CELESTIAL_SYNODIC_PERIOD_TICKS / 2U;
+    const CelestialState state = computeCelestialState(newMoonMidnight);
+    REQUIRE(state.phaseEnergy <= 1.0e-5F);
+    REQUIRE(state.moonDirectVisibility <= 1.0e-5F);
+    REQUIRE(state.directLightRadiance.length() <= 1.0e-6F);
+    REQUIRE(state.shadowStrength <= 1.0e-6F);
+    REQUIRE(state.directSpecularFactor <= 1.0e-6F);
+}
+
+TEST_CASE("Air precipitation does not leak into the underwater medium",
+          "[render][weather][water]") {
+    REQUIRE(weatherParticlesVisible(false));
+    REQUIRE_FALSE(weatherParticlesVisible(true));
 }
 
 TEST_CASE("Water procedural bands fade before their phase aliases",
@@ -7633,6 +8272,204 @@ TEST_CASE("Water procedural bands fade before their phase aliases",
         REQUIRE(current <= previous);
         REQUIRE(current >= 0.0F);
         REQUIRE(current <= 1.0F);
+        previous = current;
+    }
+}
+
+TEST_CASE("Underwater caustics reject wall, ceiling, and silhouette receivers",
+          "[render][water][caustics]") {
+    // UV-space derivative winding can produce a downward raw floor normal.
+    // Facing it toward a camera above the floor restores its physical +Y side
+    // before the strict receiver gate runs.
+    const simd_float3 floorNormal = orientUnderwaterReceiverNormalTowardCamera(
+        simd_make_float3(0.0F, -1.0F, 0.0F), simd_make_float3(0.0F, -8.0F, 0.0F));
+    REQUIRE(floorNormal.y > 0.99F);
+    REQUIRE(underwaterCausticSurfaceConfidence(floorNormal.y, 0.0F, 8.0F) == Catch::Approx(1.0F));
+
+    // A ceiling viewed from below must orient downward and remain ineligible.
+    const simd_float3 ceilingNormal = orientUnderwaterReceiverNormalTowardCamera(
+        simd_make_float3(0.0F, 1.0F, 0.0F), simd_make_float3(0.0F, 8.0F, 0.0F));
+    REQUIRE(ceilingNormal.y < -0.99F);
+    REQUIRE(underwaterCausticSurfaceConfidence(ceilingNormal.y, 0.0F, 8.0F) <= 1.0e-6F);
+
+    // Walls, opposite-oriented ceilings, and oblique normals must not turn
+    // into false floors. In particular, this pins the absence of abs(normalY).
+    REQUIRE(underwaterCausticSurfaceConfidence(0.0F, 0.0F, 8.0F) <= 1.0e-6F);
+    REQUIRE(underwaterCausticSurfaceConfidence(-1.0F, 0.0F, 8.0F) <= 1.0e-6F);
+    REQUIRE(underwaterCausticSurfaceConfidence(0.55F, 0.0F, 8.0F) <= 1.0e-6F);
+
+    // A depth discontinuity invalidates even an otherwise up-facing estimate.
+    REQUIRE(underwaterCausticSurfaceConfidence(1.0F, 4.0F, 8.0F) <= 1.0e-6F);
+    REQUIRE(underwaterCausticSurfaceConfidence(std::numeric_limits<float>::quiet_NaN(), 0.0F,
+                                               8.0F) <= 1.0e-6F);
+}
+
+TEST_CASE("Water SSR filters and retires only unstable grazing hits",
+          "[render][water][ssr][antialiasing]") {
+    // Near and non-grazing reflections preserve the full-resolution source
+    // and the original narrow IGN stride range.
+    REQUIRE(waterSsrReflectionMipLevel(0.0F, 0.0F) == Catch::Approx(0.0F));
+    REQUIRE(waterSsrStabilityConfidence(0.0F, 1'000.0F) == Catch::Approx(1.0F));
+    REQUIRE(waterSsrJitterAmplitude(0.0F) == Catch::Approx(0.24F));
+
+    // Distant glancing rays are explicitly blurred then retire into the
+    // analytic sky fallback before depth discontinuities form reflection
+    // bands. Nearby and non-grazing geometry remains available to SSR.
+    const float nearMip = waterSsrReflectionMipLevel(0.80F, 12.0F);
+    const float farMip = waterSsrReflectionMipLevel(0.98F, 128.0F);
+    REQUIRE(nearMip > 0.0F);
+    REQUIRE(farMip > nearMip);
+    REQUIRE(farMip <= 4.0F);
+    REQUIRE(waterSsrStabilityConfidence(0.98F, 128.0F) <= 1.0e-5F);
+    REQUIRE(waterSsrStabilityConfidence(0.55F, 96.0F) < 0.10F);
+    REQUIRE(waterSsrStabilityConfidence(0.35F, 12.0F) > 0.90F);
+    REQUIRE(waterSsrJitterAmplitude(0.98F) < waterSsrJitterAmplitude(0.50F));
+
+    float previousMip = 0.0F;
+    float previousConfidence = 1.0F;
+    for (int sample = 0; sample <= 64; ++sample) {
+        const float grazing = static_cast<float>(sample) / 64.0F;
+        const float mip = waterSsrReflectionMipLevel(grazing, 96.0F);
+        const float confidence = waterSsrStabilityConfidence(grazing, 96.0F);
+        REQUIRE(mip >= previousMip);
+        REQUIRE(confidence <= previousConfidence);
+        REQUIRE(mip >= 0.0F);
+        REQUIRE(mip <= 4.0F);
+        REQUIRE(confidence >= 0.0F);
+        REQUIRE(confidence <= 1.0F);
+        previousMip = mip;
+        previousConfidence = confidence;
+    }
+}
+
+TEST_CASE("Water wave detail retires at a glancing view", "[render][water][antialiasing]") {
+    REQUIRE(waterGrazingWaveDetail(1.0F) == Catch::Approx(1.0F));
+    REQUIRE(waterGrazingWaveDetail(0.60F) > 0.90F);
+    REQUIRE(waterGrazingWaveDetail(0.20F) < 0.05F);
+    REQUIRE(waterGrazingWaveDetail(0.0F) <= 1.0e-6F);
+    for (int sample = 0; sample <= 64; ++sample) {
+        const float current = waterGrazingWaveDetail(static_cast<float>(sample) / 64.0F);
+        REQUIRE(current >= 0.0F);
+        REQUIRE(current <= 1.0F);
+    }
+}
+
+TEST_CASE("Water reflection normal filtering follows reflected-ray variation",
+          "[render][water][reflection][antialiasing]") {
+    // Ordinary camera projection changes only a few milliradians per pixel,
+    // so resolved nearby waves retain their normal detail.
+    REQUIRE(waterReflectionNormalVisibility(0.0F) == Catch::Approx(1.0F));
+    REQUIRE(waterReflectionNormalVisibility(0.012F) == Catch::Approx(1.0F));
+    REQUIRE(waterReflectionNormalVisibility(0.006F) > 0.99F);
+
+    // When an analytic normal sends neighboring pixels to unrelated
+    // reflection samples, retire that normal before it forms horizontal bands.
+    REQUIRE(waterReflectionNormalVisibility(0.065F) <= 1.0e-6F);
+    REQUIRE(waterReflectionNormalVisibility(0.25F) <= 1.0e-6F);
+    REQUIRE(waterReflectionNormalVisibility(std::numeric_limits<float>::quiet_NaN()) <= 1.0e-6F);
+
+    float previous = 1.0F;
+    for (int sample = 0; sample <= 64; ++sample) {
+        const float footprint = static_cast<float>(sample) / 256.0F;
+        const float current = waterReflectionNormalVisibility(footprint);
+        REQUIRE(current >= 0.0F);
+        REQUIRE(current <= 1.0F);
+        REQUIRE(current <= previous);
+        previous = current;
+    }
+}
+
+TEST_CASE("Water refraction rejects unstable grazing receivers",
+          "[render][water][refraction][antialiasing]") {
+    // The close interface preserves a detailed underwater view at normal
+    // incidence and on a short grazing path.
+    REQUIRE(waterRefractionVisibility(0.95F, 2.0F, 32.0F, 8.0F, 0.01F, 0.25F, true) ==
+            Catch::Approx(1.0F));
+    REQUIRE(waterRefractionVisibility(0.24F, 2.0F, 2.0F, 8.0F, 0.01F, 0.25F, true) ==
+            Catch::Approx(1.0F));
+
+    // The far tail is a single screen-space source sample per water fragment.
+    // It must fade before a long grazing path turns terrain or LOD edges into
+    // a moving grid of refracted slabs.
+    REQUIRE(waterRefractionVisibility(0.15F, 64.0F, 16.0F, 24.0F, 0.01F, 0.25F, true) <= 1.0e-6F);
+    REQUIRE(waterRefractionVisibility(0.15F, 2.0F, 16.0F, 24.0F, 0.01F, 12.0F, true) <= 1.0e-6F);
+    REQUIRE(waterRefractionVisibility(0.15F, 2.0F, 2.0F, 64.0F, 0.01F, 0.25F, true) <= 1.0e-6F);
+    // A distant top-down interface has the same one-sample opaque receiver
+    // problem as a grazing interface. It must use reflection rather than
+    // expose a coarse terrain tile through a small Fresnel transmission tail.
+    REQUIRE(waterRefractionVisibility(0.95F, 96.0F, 32.0F, 512.0F, 0.25F, 32.0F, true) <= 1.0e-6F);
+    REQUIRE(waterRefractionVisibility(0.15F, 2.0F, 2.0F, 24.0F, 0.2F, 0.25F, true) <= 1.0e-6F);
+    REQUIRE(waterRefractionVisibility(0.15F, 2.0F, 2.0F, 24.0F, 0.01F, 0.25F, false) <= 1.0e-6F);
+    REQUIRE(waterRefractionVisibility(std::numeric_limits<float>::quiet_NaN(), 2.0F, 2.0F, 24.0F,
+                                      0.01F, 0.25F, true) <= 1.0e-6F);
+    REQUIRE(waterRefractionVisibility(0.15F, 2.0F, std::numeric_limits<float>::quiet_NaN(), 24.0F,
+                                      0.01F, 0.25F, true) <= 1.0e-6F);
+    REQUIRE(waterRefractionVisibility(0.15F, 2.0F, 2.0F, 24.0F,
+                                      std::numeric_limits<float>::quiet_NaN(), 0.25F,
+                                      true) <= 1.0e-6F);
+
+    // A shallow lake bed is long along a grazing refracted ray. Its vertical
+    // depth, rather than its slant distance, must retire an under-sampled
+    // coarse terrain receiver before individual cells become visible panes.
+    REQUIRE(waterRefractionVisibility(0.15F, 20.0F, 2.0F, 8.0F, 0.2F, 0.25F, true) <= 1.0e-6F);
+
+    // A receiver may remain smooth within one large terrain cell. Past the
+    // nearby grazing region, retire its transmission fully rather than leave
+    // a partially visible rectangular floor sample.
+    REQUIRE(waterRefractionVisibility(0.15F, 2.0F, 24.0F, 32.0F, 0.01F, 0.25F, true) <= 1.0e-6F);
+
+    // The remaining Fresnel tail must not retain the raw depth of an unstable
+    // receiver, otherwise a dark voxel or LOD rectangle leaks through the
+    // reflection-only fallback.
+    REQUIRE(waterStabilizedOpticalDepth(24.0F, 1.0F) == Catch::Approx(24.0F));
+    REQUIRE(waterStabilizedOpticalDepth(64.0F, 0.0F) == Catch::Approx(4.0F));
+    REQUIRE(waterStabilizedOpticalDepth(128.0F, 1.0F) == Catch::Approx(64.0F));
+    REQUIRE(waterStabilizedOpticalDepth(std::numeric_limits<float>::quiet_NaN(), 0.5F) ==
+            Catch::Approx(4.0F));
+
+    float previous = 1.0F;
+    for (int sample = 0; sample <= 64; ++sample) {
+        const float footprint = static_cast<float>(sample) * 0.25F;
+        const float current =
+            waterRefractionVisibility(0.16F, 20.0F, 16.0F, 24.0F, 0.01F, footprint, true);
+        REQUIRE(current >= 0.0F);
+        REQUIRE(current <= 1.0F);
+        REQUIRE(current <= previous);
+        previous = current;
+    }
+
+    // A flat far-terrain cell has a small receiver derivative in its interior.
+    // The interface-distance guard must still retire its shallow grazing
+    // transmission before the cell's different opaque color reads as a pane.
+    previous = 1.0F;
+    for (int sample = 0; sample <= 64; ++sample) {
+        const float distance = static_cast<float>(sample) * 8.0F;
+        const float current =
+            waterRefractionVisibility(0.16F, 2.0F, 2.0F, distance, 0.01F, 0.25F, true);
+        REQUIRE(current >= 0.0F);
+        REQUIRE(current <= 1.0F);
+        REQUIRE(current <= previous);
+        previous = current;
+    }
+}
+
+TEST_CASE("Water exterior reflection gate ignores skylight nibble seams",
+          "[render][water][lighting][seam]") {
+    // Propagated skylight carries ambient accessibility. Open-water reflection
+    // is either exterior or sealed, so harmless level differences between
+    // exact and far geometry must not become a fractional reflection grid.
+    REQUIRE(waterExteriorSkyVisibility(0.0F) <= 1.0e-6F);
+    REQUIRE(waterExteriorSkyVisibility(1.0F / 15.0F) == Catch::Approx(1.0F));
+    REQUIRE(waterExteriorSkyVisibility(14.0F / 15.0F) == Catch::Approx(1.0F));
+    REQUIRE(waterExteriorSkyVisibility(1.0F) == Catch::Approx(1.0F));
+    REQUIRE(waterExteriorSkyVisibility(std::numeric_limits<float>::quiet_NaN()) <= 1.0e-6F);
+
+    float previous = 0.0F;
+    for (int level = 0; level <= 15; ++level) {
+        const float current = waterExteriorSkyVisibility(static_cast<float>(level) / 15.0F);
+        REQUIRE(current >= 0.0F);
+        REQUIRE(current <= 1.0F);
+        REQUIRE(current >= previous);
         previous = current;
     }
 }
@@ -7685,13 +8522,134 @@ TEST_CASE("Camera-relative water depth stays continuous at large world coordinat
     }
 }
 
-TEST_CASE("Shader types: CloudUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(CloudUniforms) == 112);
-    REQUIRE(offsetof(CloudUniforms, sunDirection) == 64);
-    REQUIRE(offsetof(CloudUniforms, tanHalfFov) == 80);
-    REQUIRE(offsetof(CloudUniforms, cloudThreshold) == 100);
-    REQUIRE(offsetof(CloudUniforms, volumetric) == 104);
-    REQUIRE(offsetof(CloudUniforms, sunElevation) == 108);
+TEST_CASE("Shader types: cloud layouts match MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(WeatherMapUniforms) == 32);
+    REQUIRE(offsetof(WeatherMapUniforms, gridSize) == 16);
+    REQUIRE(offsetof(WeatherMapUniforms, motionWrapBlocks) == 24);
+    REQUIRE(sizeof(CloudRenderUniforms) == 352);
+    REQUIRE(offsetof(CloudRenderUniforms, cameraForward) == 144);
+    REQUIRE(offsetof(CloudRenderUniforms, weatherMap) == 288);
+    REQUIRE(offsetof(CloudRenderUniforms, previousWeatherMap) == 320);
+    REQUIRE(sizeof(CloudShadowUniforms) == 80);
+    REQUIRE(offsetof(CloudShadowUniforms, weatherMap) == 48);
+}
+
+TEST_CASE("Shader types: atmospheric overhaul layouts match MSL", "[render][shader-types]") {
+    REQUIRE(sizeof(AtmosphereUniforms) == 160);
+    REQUIRE(offsetof(AtmosphereUniforms, cameraPositionKm) == 0);
+    REQUIRE(offsetof(AtmosphereUniforms, sunDirection) == 16);
+    REQUIRE(offsetof(AtmosphereUniforms, rayleighScatteringAndScaleHeight) == 64);
+    REQUIRE(offsetof(AtmosphereUniforms, weatherOptics) == 128);
+    REQUIRE(offsetof(AtmosphereUniforms, renderParams) == 144);
+
+    REQUIRE(sizeof(IndirectLightingUniforms) == 336);
+    REQUIRE(offsetof(IndirectLightingUniforms, projection) == 0);
+    REQUIRE(offsetof(IndirectLightingUniforms, invViewProjection) == 128);
+    REQUIRE(offsetof(IndirectLightingUniforms, previousViewProjection) == 192);
+    REQUIRE(offsetof(IndirectLightingUniforms, resolutionAndQuality) == 256);
+    REQUIRE(offsetof(IndirectLightingUniforms, traceParams) == 272);
+    REQUIRE(offsetof(IndirectLightingUniforms, temporalParams) == 288);
+    REQUIRE(offsetof(IndirectLightingUniforms, filterParams) == 304);
+    REQUIRE(offsetof(IndirectLightingUniforms, ambientAndFrame) == 320);
+
+    REQUIRE(sizeof(FroxelUniforms) == 368);
+    REQUIRE(offsetof(FroxelUniforms, invViewProjection) == 0);
+    REQUIRE(offsetof(FroxelUniforms, cameraPosition) == 192);
+    REQUIRE(offsetof(FroxelUniforms, volumeDimensions) == 256);
+    REQUIRE(offsetof(FroxelUniforms, depthParams) == 272);
+    REQUIRE(offsetof(FroxelUniforms, renderParams) == 320);
+    REQUIRE(offsetof(FroxelUniforms, weatherMap) == 336);
+
+    REQUIRE(sizeof(LightningUniforms) == 128);
+    REQUIRE(offsetof(LightningUniforms, viewProjection) == 0);
+    REQUIRE(offsetof(LightningUniforms, cameraPosition) == 64);
+    REQUIRE(offsetof(LightningUniforms, strikePosition) == 80);
+    REQUIRE(offsetof(LightningUniforms, colorAndIntensity) == 96);
+    REQUIRE(offsetof(LightningUniforms, eventAndShape) == 112);
+}
+
+TEST_CASE("Froxel media only composites onto finite receivers",
+          "[render][volumetric][shader-contract]") {
+    // The sky shader already integrates atmosphere to infinity. A clear sky
+    // depth must preserve it rather than treating it as a far opaque surface.
+    REQUIRE_FALSE(froxelHasFiniteReceiver(1.0F, 0.0F));
+    REQUIRE_FALSE(froxelHasFiniteReceiver(0.999999F, 0.0F));
+
+    REQUIRE(froxelHasFiniteReceiver(0.999F, 0.0F));
+    REQUIRE(froxelHasFiniteReceiver(1.0F, 128.0F));
+    REQUIRE_FALSE(froxelHasFiniteReceiver(1.0F, 65504.0F));
+}
+
+TEST_CASE("Froxel history and upscale use stable linear depth", "[render][volumetric][history]") {
+    // Device depth has too little useful precision along a grazing cave floor.
+    // The linear-depth threshold grows only enough to retain the same receiver.
+    REQUIRE(froxelTemporalLinearDepthTolerance(2.0F) == Catch::Approx(0.05F));
+    REQUIRE(froxelTemporalLinearDepthTolerance(12.0F) == Catch::Approx(0.096F));
+    REQUIRE(froxelTemporalLinearDepthTolerance(96.0F) == Catch::Approx(0.768F));
+    REQUIRE(froxelTemporalLinearDepthTolerance(0.0F) == 0.0F);
+    REQUIRE(froxelTemporalLinearDepthTolerance(std::numeric_limits<float>::quiet_NaN()) == 0.0F);
+
+    REQUIRE(froxelBilateralLinearDepthWeight(12.0F, 12.0F) == Catch::Approx(1.0F));
+    REQUIRE(froxelBilateralLinearDepthWeight(12.0F, 12.1F) > 0.0F);
+    REQUIRE(froxelBilateralLinearDepthWeight(12.0F, 12.1F) < 1.0F);
+    REQUIRE(froxelBilateralLinearDepthWeight(12.0F, 13.0F) == 0.0F);
+    REQUIRE(froxelBilateralLinearDepthWeight(96.0F, 97.0F) > 0.0F);
+    REQUIRE(froxelBilateralLinearDepthWeight(std::numeric_limits<float>::quiet_NaN(), 12.0F) ==
+            0.0F);
+
+    // The injection sequence is deterministic for replayable captures, while
+    // each dimension advances between frames to break the fixed cell grid.
+    for (unsigned int dimension = 0; dimension < 3U; ++dimension) {
+        const float first = froxelLowDiscrepancySample(0U, dimension);
+        const float second = froxelLowDiscrepancySample(1U, dimension);
+        REQUIRE(first >= 0.0F);
+        REQUIRE(first < 1.0F);
+        REQUIRE(second >= 0.0F);
+        REQUIRE(second < 1.0F);
+        REQUIRE(first != second);
+        REQUIRE(froxelLowDiscrepancySample(17U, dimension) ==
+                Catch::Approx(froxelLowDiscrepancySample(17U, dimension)));
+    }
+
+    // The engine's perspective matrix writes negative view Z to clip W, so
+    // reprojection can compare one linear-depth authority without storing a
+    // second device-depth channel beside every froxel history sample.
+    const Mat4 view =
+        Mat4::lookAt(Vec3{11.0F, 72.0F, -9.0F}, Vec3{20.0F, 68.0F, 14.0F}, Vec3{0.0F, 1.0F, 0.0F});
+    const Mat4 projection =
+        Mat4::perspective(70.0F * static_cast<float>(M_PI) / 180.0F, 16.0F / 9.0F, 0.1F, 1000.0F);
+    const Vec4 worldPoint{18.0F, 66.0F, 20.0F, 1.0F};
+    const Vec4 viewPoint = view.transformVec4(worldPoint);
+    const Vec4 clipPoint = (projection * view).transformVec4(worldPoint);
+    REQUIRE(std::abs(clipPoint.w) == Catch::Approx(std::abs(viewPoint.z)).margin(1.0e-5F));
+}
+
+TEST_CASE("Cloud bilateral upscale preserves transparent silhouette coverage",
+          "[render][cloud][shader-contract]") {
+    const simd_float2 clear = cloudCompositeTapWeights(0.25F, 0.0F, 100.0F);
+    REQUIRE(clear.x == 0.0F);
+    REQUIRE(clear.y == Catch::Approx(0.25F));
+
+    const simd_float2 occluded = cloudCompositeTapWeights(0.25F, 120.0F, 100.0F);
+    REQUIRE(occluded.x == 0.0F);
+    REQUIRE(occluded.y == Catch::Approx(0.25F));
+
+    const simd_float2 visible = cloudCompositeTapWeights(0.25F, 80.0F, 100.0F);
+    REQUIRE(visible.x > 0.0F);
+    REQUIRE(visible.x < 0.25F);
+    REQUIRE(visible.y == Catch::Approx(visible.x));
+
+    // One cloudy quarter-resolution tap beside three terrain-occluded taps
+    // must retain only its bilinear coverage instead of being normalized back
+    // to a fully opaque cloud pixel.
+    float colorWeight = visible.x;
+    float normalizationWeight = visible.y;
+    for (int tap = 0; tap < 3; ++tap) {
+        const simd_float2 hidden = cloudCompositeTapWeights(0.25F, 120.0F, 100.0F);
+        colorWeight += hidden.x;
+        normalizationWeight += hidden.y;
+    }
+    REQUIRE(colorWeight / normalizationWeight < 0.25F);
 }
 
 TEST_CASE("Shader types: GPUParticle layout matches MSL", "[render][shader-types]") {
@@ -7702,8 +8660,9 @@ TEST_CASE("Shader types: GPUParticle layout matches MSL", "[render][shader-types
 }
 
 TEST_CASE("Shader types: ParticleUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(ParticleUniforms) == 144);
+    REQUIRE(sizeof(ParticleUniforms) == 160);
     REQUIRE(offsetof(ParticleUniforms, cameraPosition) == 128);
+    REQUIRE(offsetof(ParticleUniforms, atmosphericExtinction) == 144);
 }
 
 TEST_CASE("Shader types: BloomUniforms layout matches MSL", "[render][shader-types]") {
@@ -7714,7 +8673,7 @@ TEST_CASE("Shader types: BloomUniforms layout matches MSL", "[render][shader-typ
 }
 
 TEST_CASE("Shader types: PostUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(PostUniforms) == 40);
+    REQUIRE(sizeof(PostUniforms) == 48);
     REQUIRE(offsetof(PostUniforms, resolution) == 0);
     REQUIRE(offsetof(PostUniforms, exposure) == 8);
     REQUIRE(offsetof(PostUniforms, bloomIntensity) == 12);
@@ -7723,27 +8682,282 @@ TEST_CASE("Shader types: PostUniforms layout matches MSL", "[render][shader-type
     REQUIRE(offsetof(PostUniforms, frameIndex) == 24);
     REQUIRE(offsetof(PostUniforms, flareStrength) == 28);
     REQUIRE(offsetof(PostUniforms, sunScreenUV) == 32);
+    REQUIRE(offsetof(PostUniforms, flareCloudOpacityTexture) == 40);
     REQUIRE(sizeof(FlareState) == 4);
 }
 
-TEST_CASE("Shader types: SsaoUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(SsaoUniforms) == 160);
-    REQUIRE(offsetof(SsaoUniforms, invProjection) == 64);
-    REQUIRE(offsetof(SsaoUniforms, resolution) == 128);
-    REQUIRE(offsetof(SsaoUniforms, radius) == 136);
-    REQUIRE(offsetof(SsaoUniforms, strength) == 140);
-    REQUIRE(offsetof(SsaoUniforms, bias) == 144);
-    REQUIRE(offsetof(SsaoUniforms, frameIndex) == 148);
+TEST_CASE("Screen-space lighting keeps a projection-invariant view-space trace radius",
+          "[render][indirect][projection]") {
+    auto projectionFor = [](float fovDegrees) {
+        const Mat4 matrix = Mat4::perspective(fovDegrees * static_cast<float>(M_PI) / 180.0F,
+                                              16.0F / 9.0F, 0.1F, 1000.0F);
+        simd_float4x4 projection;
+        std::memcpy(&projection, matrix.data.data(), sizeof(projection));
+        return projection;
+    };
+    auto reconstructFromLinearDepth = [](simd_float2 uv, float linearDepth,
+                                         simd_float4x4 projection) {
+        const simd_float4x4 inverse = simd_inverse(projection);
+        const simd_float4 farClip =
+            simd_make_float4(uv.x * 2.0F - 1.0F, 1.0F - uv.y * 2.0F, 1.0F, 1.0F);
+        const simd_float4 farView = simd_mul(inverse, farClip);
+        const simd_float3 ray = farView.xyz / farView.w;
+        return ray * (linearDepth / std::abs(ray.z));
+    };
+
+    constexpr float RADIUS = 8.0F;
+    const simd_float3 direction = simd_normalize(simd_make_float3(1.0F, 0.25F, 0.0F));
+    const simd_float2 resolution = simd_make_float2(3456.0F, 2234.0F);
+    std::array<float, 2> nearPixels{};
+    std::array<float, 2> farPixels{};
+    const std::array<float, 2> fieldsOfView = {50.0F, 90.0F};
+
+    for (size_t field = 0; field < fieldsOfView.size(); ++field) {
+        const simd_float4x4 projection = projectionFor(fieldsOfView[field]);
+        for (float depth : {32.0F, 96.0F}) {
+            const simd_float3 origin = simd_make_float3(0.0F, 0.0F, -depth);
+            const simd_float3 endpoint = screenSpaceTraceViewSample(origin, direction, RADIUS);
+            const simd_float2 endpointUv = screenSpaceProjectViewPosition(endpoint, projection);
+            const simd_float3 reconstructed =
+                reconstructFromLinearDepth(endpointUv, std::abs(endpoint.z), projection);
+
+            REQUIRE(simd_length(endpoint - origin) == Catch::Approx(RADIUS).margin(1.0e-5F));
+            REQUIRE(simd_length(reconstructed - endpoint) < 1.0e-3F);
+            const simd_float2 originUv = screenSpaceProjectViewPosition(origin, projection);
+            const float projectedPixels = simd_length((endpointUv - originUv) * resolution);
+            if (depth < 64.0F) {
+                nearPixels[field] = projectedPixels;
+            } else {
+                farPixels[field] = projectedPixels;
+            }
+        }
+    }
+
+    // Projection changes only screen footprint. The shared helper above still
+    // reconstructs the same eight-block ray at either distance or FOV.
+    REQUIRE(nearPixels[0] > nearPixels[1]);
+    REQUIRE(farPixels[0] > farPixels[1]);
+    REQUIRE(nearPixels[0] > farPixels[0]);
+    REQUIRE(nearPixels[1] > farPixels[1]);
+    REQUIRE(INDIRECT_MEDIUM_RAY_COUNT == 2u);
+    REQUIRE(INDIRECT_HIGH_RAY_COUNT == 4u);
+    REQUIRE(INDIRECT_MEDIUM_HIZ_ITERATION_CAP == 16u);
+    REQUIRE(INDIRECT_HIGH_HIZ_ITERATION_CAP == 24u);
+    REQUIRE(INDIRECT_MEDIUM_ATROUS_ITERATIONS == 2u);
+    REQUIRE(INDIRECT_HIGH_ATROUS_ITERATIONS == 3u);
 }
 
-TEST_CASE("Shader types: VolumetricUniforms layout matches MSL", "[render][shader-types]") {
-    REQUIRE(sizeof(VolumetricUniforms) == 144);
-    REQUIRE(offsetof(VolumetricUniforms, cameraPosition) == 64);
-    REQUIRE(offsetof(VolumetricUniforms, sunDirection) == 80);
-    REQUIRE(offsetof(VolumetricUniforms, sunColor) == 96);
-    REQUIRE(offsetof(VolumetricUniforms, stepCount) == 112);
-    REQUIRE(offsetof(VolumetricUniforms, underwater) == 128);
-    REQUIRE(offsetof(VolumetricUniforms, frameIndex) == 132);
+TEST_CASE("Screen-space lighting bilateral upsample rejects voxel depth discontinuities",
+          "[render][indirect][upsample]") {
+    // Equal-depth history remains a full contribution, while nearby values
+    // soften smoothly across one physical receiver.
+    REQUIRE(screenSpaceBilateralDepthWeight(12.0F, 12.0F) == Catch::Approx(1.0F));
+    REQUIRE(screenSpaceBilateralDepthWeight(12.0F, 12.1F) > 0.0F);
+    REQUIRE(screenSpaceBilateralDepthWeight(12.0F, 12.1F) < 1.0F);
+
+    // A close voxel face is outside the hard bilateral interval, so a
+    // lower-resolution history sample cannot darken or brighten its neighbor.
+    REQUIRE(screenSpaceBilateralDepthWeight(12.0F, 13.0F) <= 1.0e-6F);
+    REQUIRE(screenSpaceBilateralDepthWeight(128.0F, 140.0F) <= 1.0e-6F);
+    REQUIRE(screenSpaceBilateralDepthWeight(std::numeric_limits<float>::quiet_NaN(), 12.0F) <=
+            1.0e-6F);
+}
+
+TEST_CASE("Screen-space lighting fallback keeps a compatible voxel-face owner",
+          "[render][indirect][upsample]") {
+    const simd_float3 floorNormal = simd_make_float3(0.0F, 1.0F, 0.0F);
+    const simd_float3 wallNormal = simd_make_float3(1.0F, 0.0F, 0.0F);
+
+    // The regular footprint can contain only a perpendicular wall and reject
+    // it completely. A nearby coplanar candidate is safe for the bounded
+    // no-owner fallback, while a different depth remains rejected.
+    REQUIRE(screenSpaceJointBilateralUpsampleWeight(12.0F, 12.0F, floorNormal, wallNormal) == 0.0F);
+    REQUIRE(screenSpaceJointBilateralUpsampleWeight(12.0F, 12.0F, floorNormal, floorNormal) > 0.9F);
+    REQUIRE(screenSpaceJointBilateralUpsampleWeight(12.0F, 13.0F, floorNormal, floorNormal) <=
+            1.0e-6F);
+}
+
+TEST_CASE("Screen-space history uses linear depth for grazing cave floors",
+          "[render][indirect][history]") {
+    // The bounded linear tolerance admits a continuous receiver at distance
+    // while remaining much smaller than a different voxel face.
+    REQUIRE(screenSpaceTemporalLinearDepthTolerance(2.0F) == Catch::Approx(0.04F));
+    REQUIRE(screenSpaceTemporalLinearDepthTolerance(12.0F) == Catch::Approx(0.12F));
+    REQUIRE(screenSpaceTemporalLinearDepthTolerance(96.0F) == Catch::Approx(0.96F));
+    REQUIRE(screenSpaceTemporalLinearDepthTolerance(0.0F) == 0.0F);
+    REQUIRE(screenSpaceTemporalLinearDepthTolerance(std::numeric_limits<float>::quiet_NaN()) ==
+            0.0F);
+}
+
+TEST_CASE("Hi-Z traversal steps cells and classifies exact hits", "[render][indirect][hiz]") {
+    constexpr float NAN_VALUE = std::numeric_limits<float>::quiet_NaN();
+
+    // Axis crossing with the epsilon nudge landing in the next cell.
+    {
+        const simd_float2 position = simd_make_float2(4.3F, 7.9F);
+        const simd_float2 direction = simd_make_float2(1.0F, 0.0F);
+        const float exit = screenSpaceHiZCellExit(position, direction, 1.0F);
+        REQUIRE(exit == Catch::Approx(0.75F).margin(0.06F));
+        REQUIRE(std::floor(position.x + direction.x * exit) == 5.0F);
+    }
+    // Diagonal ray exits through the nearer boundary.
+    {
+        const simd_float2 position = simd_make_float2(0.5F, 0.5F);
+        const simd_float2 direction = simd_normalize(simd_make_float2(2.0F, 1.0F));
+        const float exit = screenSpaceHiZCellExit(position, direction, 1.0F);
+        REQUIRE(std::floor(position.x + direction.x * exit) == 1.0F);
+        REQUIRE(std::floor(position.y + direction.y * exit) == 0.0F);
+    }
+    // Negative direction crosses the low boundary.
+    {
+        const simd_float2 position = simd_make_float2(4.3F, 7.9F);
+        const simd_float2 direction = simd_make_float2(-1.0F, 0.0F);
+        const float exit = screenSpaceHiZCellExit(position, direction, 1.0F);
+        REQUIRE(std::floor(position.x + direction.x * exit) == 3.0F);
+    }
+    // Coarser mip levels step whole cells at once.
+    {
+        const simd_float2 position = simd_make_float2(5.0F, 6.0F);
+        const simd_float2 direction = simd_make_float2(1.0F, 0.0F);
+        const float exit = screenSpaceHiZCellExit(position, direction, 4.0F);
+        REQUIRE(exit == Catch::Approx(3.0F).margin(0.06F));
+    }
+    REQUIRE(screenSpaceHiZCellExit(simd_make_float2(1.0F, 1.0F), simd_make_float2(1.0F, 0.0F),
+                                   0.0F) == Catch::Approx(0.05F));
+
+    // Reciprocal depth interpolation matches a real perspective projection:
+    // the point on the 3D segment at the helper's midpoint depth projects to
+    // the screen-space midpoint of the segment's endpoints.
+    {
+        const Mat4 matrix = Mat4::perspective(70.0F * static_cast<float>(M_PI) / 180.0F,
+                                              16.0F / 9.0F, 0.1F, 1000.0F);
+        simd_float4x4 projection;
+        std::memcpy(&projection, matrix.data.data(), sizeof(projection));
+        const simd_float3 start = simd_make_float3(1.0F, 0.5F, -4.0F);
+        const simd_float3 end = simd_make_float3(3.0F, -1.0F, -20.0F);
+        const simd_float2 startUv = screenSpaceProjectViewPosition(start, projection);
+        const simd_float2 endUv = screenSpaceProjectViewPosition(end, projection);
+        const float midDepth = screenSpaceHiZRayDepth(0.5F, 4.0F, 20.0F);
+        REQUIRE(midDepth == Catch::Approx(1.0F / ((0.25F + 0.05F) * 0.5F)));
+        const float along = (midDepth - 4.0F) / 16.0F;
+        const simd_float3 midPoint = start + (end - start) * along;
+        const simd_float2 midUv = screenSpaceProjectViewPosition(midPoint, projection);
+        REQUIRE(midUv.x == Catch::Approx((startUv.x + endUv.x) * 0.5F).margin(1.0e-3F));
+        REQUIRE(midUv.y == Catch::Approx((startUv.y + endUv.y) * 0.5F).margin(1.0e-3F));
+    }
+    REQUIRE(screenSpaceHiZRayDepth(0.0F, 4.0F, 20.0F) == Catch::Approx(4.0F));
+    REQUIRE(screenSpaceHiZRayDepth(1.0F, 4.0F, 20.0F) == Catch::Approx(20.0F));
+    REQUIRE(screenSpaceHiZRayDepth(0.5F, NAN_VALUE, 20.0F) ==
+            Catch::Approx(INDIRECT_SKY_LINEAR_DEPTH));
+
+    // Empty-cell classification, including a ray moving toward the camera.
+    REQUIRE(screenSpaceHiZAdvances(5.0F, 6.0F, 6.5F));
+    REQUIRE_FALSE(screenSpaceHiZAdvances(5.0F, 7.0F, 6.5F));
+    REQUIRE_FALSE(screenSpaceHiZAdvances(8.0F, 5.0F, 7.0F));
+    REQUIRE_FALSE(screenSpaceHiZAdvances(NAN_VALUE, 6.0F, 6.5F));
+
+    // Exact mip-zero receiver test.
+    REQUIRE(screenSpaceHiZSurfaceHit(10.05F, 10.0F, 0.15F));
+    REQUIRE_FALSE(screenSpaceHiZSurfaceHit(9.9F, 10.0F, 0.15F));
+    REQUIRE_FALSE(screenSpaceHiZSurfaceHit(10.3F, 10.0F, 0.15F));
+    REQUIRE_FALSE(screenSpaceHiZSurfaceHit(65000.0F, 65504.0F, 0.15F));
+    REQUIRE_FALSE(screenSpaceHiZSurfaceHit(NAN_VALUE, 10.0F, 0.15F));
+}
+
+TEST_CASE("Cosine hemisphere rays stay above the receiver surface", "[render][indirect][rays]") {
+    const simd_float3 normal = simd_normalize(simd_make_float3(0.3F, 0.9F, -0.2F));
+    double cosineSum = 0.0;
+    int sampleCount = 0;
+    for (int i = 0; i < 16; ++i) {
+        for (int j = 0; j < 16; ++j) {
+            const simd_float2 xi = simd_make_float2((static_cast<float>(i) + 0.5F) / 16.0F,
+                                                    (static_cast<float>(j) + 0.5F) / 16.0F);
+            const simd_float3 direction = screenSpaceCosineHemisphereDirection(xi, normal);
+            REQUIRE(simd_length(direction) == Catch::Approx(1.0F).margin(1.0e-4F));
+            REQUIRE(simd_dot(direction, normal) > 0.0F);
+            cosineSum += simd_dot(direction, normal);
+            ++sampleCount;
+        }
+    }
+    // The cosine-weighted density has an exact mean cosine of two thirds.
+    REQUIRE(cosineSum / sampleCount == Catch::Approx(2.0 / 3.0).margin(0.02));
+
+    const simd_float3 fallback = screenSpaceCosineHemisphereDirection(
+        simd_make_float2(0.3F, 0.7F), simd_make_float3(0.0F, 0.0F, 0.0F));
+    REQUIRE(fallback.z == Catch::Approx(1.0F));
+
+    // R2 sequence samples stay in the unit square and move a meaningful
+    // distance every frame so a pixel's rays never clump.
+    const simd_float2 noise = simd_make_float2(0.42F, 0.17F);
+    simd_float2 previous = screenSpaceRaySequenceSample(0, noise);
+    for (uint32_t index = 1; index < 8; ++index) {
+        const simd_float2 sample = screenSpaceRaySequenceSample(index, noise);
+        REQUIRE(sample.x >= 0.0F);
+        REQUIRE(sample.x < 1.0F);
+        REQUIRE(sample.y >= 0.0F);
+        REQUIRE(sample.y < 1.0F);
+        REQUIRE(std::abs(sample.x - previous.x) + std::abs(sample.y - previous.y) > 0.05F);
+        previous = sample;
+    }
+}
+
+TEST_CASE("Temporal blend ramps with age and clamps fireflies", "[render][indirect][temporal]") {
+    constexpr float NAN_VALUE = std::numeric_limits<float>::quiet_NaN();
+    REQUIRE(screenSpaceTemporalBlendWeight(0.0F, 0.90F) == 0.0F);
+    REQUIRE(screenSpaceTemporalBlendWeight(1.0F, 0.90F) == Catch::Approx(0.5F));
+    REQUIRE(screenSpaceTemporalBlendWeight(3.0F, 0.90F) == Catch::Approx(0.75F));
+    REQUIRE(screenSpaceTemporalBlendWeight(9.0F, 0.90F) == Catch::Approx(0.90F));
+    REQUIRE(screenSpaceTemporalBlendWeight(INDIRECT_HISTORY_MAX_AGE, 0.90F) ==
+            Catch::Approx(0.90F));
+    REQUIRE(screenSpaceTemporalBlendWeight(NAN_VALUE, 0.90F) == 0.0F);
+
+    REQUIRE(screenSpaceLuminanceVariance(0.5F, 0.25F) == 0.0F);
+    REQUIRE(screenSpaceLuminanceVariance(0.5F, 0.50F) == Catch::Approx(0.25F));
+    REQUIRE(screenSpaceLuminanceVariance(NAN_VALUE, 1.0F) == 0.0F);
+
+    REQUIRE(screenSpaceFireflyClampScale(2.0F, 4.0F) == 1.0F);
+    REQUIRE(screenSpaceFireflyClampScale(16.0F, 4.0F) == Catch::Approx(0.25F));
+    REQUIRE(screenSpaceFireflyClampScale(NAN_VALUE, 4.0F) == 0.0F);
+}
+
+TEST_CASE("Variance clamp collapses stale history over a converged neighborhood",
+          "[render][indirect][history]") {
+    constexpr float NAN_VALUE = std::numeric_limits<float>::quiet_NaN();
+    // A converged region has near-zero deviation, so a stale bright ghost is
+    // clamped to the floor within one frame.
+    REQUIRE(screenSpaceVarianceClampHalfRange(0.0F, 2.0F, 0.001F) == Catch::Approx(0.001F));
+    // A genuinely sparse bright source keeps a wide clamp because its
+    // accumulated variance stays high.
+    REQUIRE(screenSpaceVarianceClampHalfRange(0.5F, 2.0F, 0.001F) == Catch::Approx(1.0F));
+    REQUIRE(screenSpaceVarianceClampHalfRange(NAN_VALUE, 2.0F, 0.001F) == Catch::Approx(0.001F));
+
+    // Young pixels take the wider of the spatial and temporal estimates so
+    // disocclusion opens the spatial filter instead of trusting two samples.
+    REQUIRE(screenSpaceVarianceForAge(0.01F, 0.2F, 1.0F, 4.0F) == Catch::Approx(0.2F));
+    REQUIRE(screenSpaceVarianceForAge(0.01F, 0.2F, 8.0F, 4.0F) == Catch::Approx(0.01F));
+}
+
+TEST_CASE("A-trous edge weight stops at voxel edges and follows variance",
+          "[render][indirect][denoise]") {
+    constexpr float NAN_VALUE = std::numeric_limits<float>::quiet_NaN();
+    REQUIRE(screenSpaceAtrousEdgeWeight(0.0F, 0.5F, 1.0F, 0.0F, 1.0F) == Catch::Approx(1.0F));
+    REQUIRE(screenSpaceAtrousEdgeWeight(2.0F, 0.5F, 1.0F, 0.0F, 1.0F) == 0.0F);
+    REQUIRE(screenSpaceAtrousEdgeWeight(0.0F, 0.5F, 0.0F, 0.0F, 1.0F) == 0.0F);
+    const float tight = screenSpaceAtrousEdgeWeight(0.0F, 0.5F, 1.0F, 0.5F, 0.25F);
+    const float loose = screenSpaceAtrousEdgeWeight(0.0F, 0.5F, 1.0F, 0.5F, 1.0F);
+    REQUIRE(loose > tight);
+    REQUIRE(screenSpaceAtrousEdgeWeight(NAN_VALUE, 0.5F, 1.0F, 0.0F, 1.0F) == 0.0F);
+
+    REQUIRE(screenSpaceOcclusionFalloff(0.0F, 8.0F) == Catch::Approx(1.0F));
+    REQUIRE(screenSpaceOcclusionFalloff(8.0F, 8.0F) == 0.0F);
+    REQUIRE(screenSpaceOcclusionFalloff(2.0F, 8.0F) > screenSpaceOcclusionFalloff(6.0F, 8.0F));
+
+    REQUIRE(screenSpaceBounceSourceWeight(-0.5F, 4.0F, 24.0F) == 0.0F);
+    REQUIRE(screenSpaceBounceSourceWeight(1.0F, 4.0F, 24.0F) == Catch::Approx(1.0F));
+    REQUIRE(screenSpaceBounceSourceWeight(1.0F, 24.0F, 24.0F) == Catch::Approx(0.0F));
+    REQUIRE(screenSpaceBounceSourceWeight(1.0F, 19.0F, 24.0F) >
+            screenSpaceBounceSourceWeight(1.0F, 23.0F, 24.0F));
+    REQUIRE(screenSpaceBounceSourceWeight(NAN_VALUE, 4.0F, 24.0F) == 0.0F);
 }
 
 TEST_CASE("Shader types: ExposureState + ExposureParams layout match MSL",

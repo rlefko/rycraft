@@ -3,7 +3,7 @@
 using namespace metal;
 
 // ---------------------------------------------------------------------------
-// Particle Shader — Billboard rain and snow particles
+// Particle Shader, Billboard rain and snow particles
 //
 // Vertex shader: transforms particle world position to clip space, passes
 // particle type to fragment shader.
@@ -20,16 +20,16 @@ struct ParticleVertexOutput {
     float4 clipPosition [[position]];
     float pointSize [[point_size]];
     float particleType;
+    float viewDistance;
+    float atmosphericExtinction;
 };
 
 // ---------------------------------------------------------------------------
-// Vertex shader — transform particle to clip space
+// Vertex shader, transform particle to clip space
 // ---------------------------------------------------------------------------
-vertex ParticleVertexOutput particleVertexMain(
-    device const GPUParticle* particles [[buffer(0)]],
-    constant ParticleUniforms& uniforms [[buffer(1)]],
-    uint vertexID [[vertex_id]]
-) {
+vertex ParticleVertexOutput particleVertexMain(device const GPUParticle* particles [[buffer(0)]],
+                                               constant ParticleUniforms& uniforms [[buffer(1)]],
+                                               uint vertexID [[vertex_id]]) {
     device const GPUParticle& particle = particles[vertexID];
 
     // Transform particle world position to clip space
@@ -40,6 +40,8 @@ vertex ParticleVertexOutput particleVertexMain(
     ParticleVertexOutput out;
     out.clipPosition = clipPos;
     out.particleType = particle.type;
+    out.viewDistance = length(viewPos.xyz);
+    out.atmosphericExtinction = uniforms.atmosphericExtinction;
 
     // Point sprite size shrinks with distance (clamped so far particles stay visible)
     float dist = max(length(viewPos.xyz), 1.0f);
@@ -49,12 +51,10 @@ vertex ParticleVertexOutput particleVertexMain(
 }
 
 // ---------------------------------------------------------------------------
-// Fragment shader — rain (thin line) or snow (soft circle)
+// Fragment shader, rain (thin line) or snow (soft circle)
 // ---------------------------------------------------------------------------
-fragment float4 particleFragmentMain(
-    ParticleVertexOutput in [[stage_in]],
-    float2 pointCoord [[point_coord]]
-) {
+fragment float4 particleFragmentMain(ParticleVertexOutput in [[stage_in]],
+                                     float2 pointCoord [[point_coord]]) {
     // pointCoord: [0,1] × [0,1] within the point sprite
     // Center of point: (0.5, 0.5)
     float2 center = float2(0.5);
@@ -73,7 +73,11 @@ fragment float4 particleFragmentMain(
         float3 rainColor = float3(0.55, 0.60, 0.75);
         float alpha = lineAlpha * vertAlpha * 0.6;
 
-        return float4(rainColor, alpha);
+        const float transmittance =
+            exp(-max(in.atmosphericExtinction, 0.0f) * max(in.viewDistance, 0.0f));
+        // Straight-alpha blending applies alpha to RGB once. Attenuate alpha
+        // only so atmospheric transmittance is not squared by the blend unit.
+        return float4(rainColor, alpha * transmittance);
     }
 
     // Snow: type == 1.0
@@ -85,5 +89,7 @@ fragment float4 particleFragmentMain(
     float3 snowColor = float3(0.95, 0.95, 0.98);
     float alpha = snowAlpha * 0.8;
 
-    return float4(snowColor, alpha);
+    const float transmittance =
+        exp(-max(in.atmosphericExtinction, 0.0f) * max(in.viewDistance, 0.0f));
+    return float4(snowColor, alpha * transmittance);
 }

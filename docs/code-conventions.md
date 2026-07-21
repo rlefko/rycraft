@@ -10,6 +10,8 @@ A concept gets exactly one definition, in one header, and everyone imports it. C
 |---------|------|
 | Block types + solidity/opacity/transparency | `world/block_properties.hpp` |
 | Chunk keys | `world/chunk_pos.hpp` (`ChunkPos`) |
+| Packed derived skylight and block light | `world/chunk.hpp` (`packDerivedLight`, `derivedSkyLight`, `derivedBlockLight`) |
+| Voxel-light flood and changed-face reporting | `world/light_engine.hpp` (`LightEngine::floodChunk`) |
 | Surface sampling support | `world/macro_generation.hpp` (`SurfaceFootprint`) |
 | Water-body identity | `world/basin_solver.hpp` (`WaterBodyId`) |
 | Lithology transition data | `world/macro_generation.hpp` (`LithologyBlend`) |
@@ -19,6 +21,12 @@ A concept gets exactly one definition, in one header, and everyone imports it. C
 | Per-column far ownership data | `render/far_terrain.hpp` (`FarTerrainExactHandoff`) |
 | Far fragment and paired skirt visibility | `render/shader_types.hpp` |
 | Far LOD tiers, parent residency, and transition timing | `render/far_terrain.hpp` |
+| Regional weather samples, snapshots, and storm events | `world/weather.hpp` |
+| Regional weather grid resolution and spacing | `world/weather_grid.hpp` |
+| Direct celestial selection, phases, true solar state, and day length | `render/celestial.hpp` (`CelestialState`, `computeCelestialState`) |
+| Shadow cascade count, ranges, blends, and GPU records | `render/shader_types.hpp` and `render/shadow_map.hpp` |
+| Indirect, atmosphere, cloud, lightning, and froxel GPU layouts | `render/shader_types.hpp` |
+| Screen-space temporal reset reasons | `render/screen_space_lighting.hpp` |
 | Coordinate-addressed generation randomness | `common/counter_rng.hpp` (`CounterRng`) |
 | Seed hashing and serial visual-effect randomness | `common/random.hpp` |
 | GPU-shared struct layouts | `render/shader_types.hpp` |

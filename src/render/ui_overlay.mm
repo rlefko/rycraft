@@ -1,6 +1,7 @@
 #import "render/ui_overlay.hpp"
 
 #include "common/error.hpp"
+#include "world/weather.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -535,12 +536,17 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
         "Tropical Dry Forest",
     };
     constexpr const char* boundaryNames[] = {"None", "Convergent", "Divergent", "Transform"};
+    constexpr const char* cloudNames[] = {"Clear", "Cirrus", "Stratus", "Cumulus", "Storm"};
+    constexpr const char* precipitationNames[] = {"None", "Rain", "Snow"};
     static_assert(static_cast<size_t>(Biome::COUNT) == std::size(biomeNames));
     static_assert(std::size(boundaryNames) == 4);
+    static_assert(static_cast<size_t>(CloudType::CUMULONIMBUS) + 1U == std::size(cloudNames));
+    static_assert(static_cast<size_t>(PrecipitationKind::SNOW) + 1U ==
+                  std::size(precipitationNames));
     const float hudX = 8.0f / static_cast<float>(_width);
     const float hudY = 1.0f - 8.0f / static_cast<float>(_height);
     const float bgWidth = 440.0f / static_cast<float>(_width);
-    const float bgHeight = 220.0f / static_cast<float>(_height);
+    const float bgHeight = 350.0f / static_cast<float>(_height);
     const float lineHeight = (FONT_HEIGHT + 2) / static_cast<float>(_height);
     float textY = hudY - lineHeight;
     drawQuad(hudX - 4.0f / _width, hudY - bgHeight, bgWidth, bgHeight, 0.0f, 0.0f, 0.0f, 0.72f);
@@ -553,7 +559,7 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
         std::snprintf(buffer, size, "%llu", static_cast<unsigned long long>(value));
         return buffer;
     };
-    char a[24], b[24], c[24];
+    char a[24], b[24], c[24], diagnostics[160];
     auto nextLine = [&] { textY -= lineHeight; };
 
     drawString("FPS", hudX, textY, 1.0f, 1.0f, 1.0f, 0.3f);
@@ -749,4 +755,123 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
     drawString("Arena MB", hudX + 280.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
     floatToString(stats.farMeshMB, c, sizeof(c));
     drawString(c, hudX + 360.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    nextLine();
+
+    drawString("Shadow mask", hudX, textY, 1.0f, 1.0f, 0.75f, 0.35f);
+    drawString(integerText(stats.shadowRefreshMask, a, sizeof(a)), hudX + 104.0f / _width, textY,
+               1.0f, 1.0f, 0.75f, 0.35f);
+    drawString("GI V/R", hudX + 168.0f / _width, textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    drawString(integerText(stats.indirectHistoryValid ? 1 : 0, b, sizeof(b)),
+               hudX + 232.0f / _width, textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    drawString("/", hudX + 248.0f / _width, textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    drawString(integerText(stats.indirectHistoryResetMask, c, sizeof(c)), hudX + 264.0f / _width,
+               textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    drawString("C/F", hudX + 328.0f / _width, textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    drawString(integerText(stats.cloudHistoryValid ? 1 : 0, a, sizeof(a)), hudX + 360.0f / _width,
+               textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    drawString("/", hudX + 376.0f / _width, textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    drawString(integerText(stats.froxelHistoryValid ? 1 : 0, b, sizeof(b)), hudX + 392.0f / _width,
+               textY, 1.0f, 0.7f, 0.9f, 1.0f);
+    nextLine();
+
+    drawString("Shadow selected", hudX, textY, 1.0f, 1.0f, 0.75f, 0.35f);
+    std::snprintf(diagnostics, sizeof(diagnostics), "%u/%u/%u/%u/%u", stats.shadowCasterCounts[0],
+                  stats.shadowCasterCounts[1], stats.shadowCasterCounts[2],
+                  stats.shadowCasterCounts[3], stats.shadowCasterCounts[4]);
+    drawString(diagnostics, hudX + 128.0f / _width, textY, 1.0f, 1.0f, 0.75f, 0.35f);
+    nextLine();
+
+    drawString("Shadow refreshes", hudX, textY, 1.0f, 1.0f, 0.75f, 0.35f);
+    std::snprintf(diagnostics, sizeof(diagnostics), "%llu/%llu/%llu/%llu/%llu",
+                  static_cast<unsigned long long>(stats.shadowRefreshCounts[0]),
+                  static_cast<unsigned long long>(stats.shadowRefreshCounts[1]),
+                  static_cast<unsigned long long>(stats.shadowRefreshCounts[2]),
+                  static_cast<unsigned long long>(stats.shadowRefreshCounts[3]),
+                  static_cast<unsigned long long>(stats.shadowRefreshCounts[4]));
+    drawString(diagnostics, hudX + 136.0f / _width, textY, 1.0f, 1.0f, 0.75f, 0.35f);
+    nextLine();
+
+    drawString("Atmos LUT S/V", hudX, textY, 1.0f, 0.65f, 0.85f, 1.0f);
+    std::snprintf(diagnostics, sizeof(diagnostics), "%llu/%llu",
+                  static_cast<unsigned long long>(stats.atmosphereSlowRefreshCount),
+                  static_cast<unsigned long long>(stats.atmosphereSkyRefreshCount));
+    drawString(diagnostics, hudX + 112.0f / _width, textY, 1.0f, 0.65f, 0.85f, 1.0f);
+    nextLine();
+
+    drawString("Memory MB I/C/F/A", hudX, textY, 1.0f, 0.65f, 0.85f, 1.0f);
+    std::snprintf(diagnostics, sizeof(diagnostics), "%.0f/%.0f/%.0f/%.0f",
+                  static_cast<double>(stats.indirectPersistentMB),
+                  static_cast<double>(stats.cloudPersistentMB),
+                  static_cast<double>(stats.froxelPersistentMB),
+                  static_cast<double>(stats.integratedAtmosphericPersistentMB));
+    drawString(diagnostics, hudX + 152.0f / _width, textY, 1.0f, 0.65f, 0.85f, 1.0f);
+    nextLine();
+
+    drawString("Weather jobs R/C/B/P", hudX, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    std::snprintf(diagnostics, sizeof(diagnostics), "%llu/%llu/%llu/%llu",
+                  static_cast<unsigned long long>(stats.weatherRequests),
+                  static_cast<unsigned long long>(stats.weatherCoalescedRequests),
+                  static_cast<unsigned long long>(stats.weatherBuildsStarted),
+                  static_cast<unsigned long long>(stats.weatherSnapshotsPublished));
+    drawString(diagnostics, hudX + 168.0f / _width, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    nextLine();
+
+    drawString("Weather stale/Q/busy", hudX, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    std::snprintf(diagnostics, sizeof(diagnostics), "%llu/%u/%u",
+                  static_cast<unsigned long long>(stats.weatherStaleBuildsDiscarded),
+                  stats.weatherPendingRequests, stats.weatherWorkerBusy ? 1U : 0U);
+    drawString(diagnostics, hudX + 168.0f / _width, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    drawString("Thunder Q", hudX + 296.0f / _width, textY, 1.0f, 0.8f, 0.8f, 1.0f);
+    drawString(integerText(stats.thunderPending, a, sizeof(a)), hudX + 376.0f / _width, textY, 1.0f,
+               0.8f, 0.8f, 1.0f);
+    nextLine();
+
+    drawString("Weather P/RH/T", hudX, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    floatToString(stats.weatherPressureHpa, a, sizeof(a));
+    floatToString(stats.weatherHumidity * 100.0F, b, sizeof(b));
+    floatToString(stats.weatherTemperatureC, c, sizeof(c));
+    drawString(a, hudX + 136.0f / _width, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    drawString(b, hudX + 208.0f / _width, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    drawString(c, hudX + 272.0f / _width, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    nextLine();
+
+    drawString("Wind X/Z", hudX, textY, 1.0f, 0.55f, 0.9f, 0.75f);
+    floatToString(stats.weatherWindX, a, sizeof(a));
+    floatToString(stats.weatherWindZ, b, sizeof(b));
+    drawString(a, hudX + 80.0f / _width, textY, 1.0f, 0.55f, 0.9f, 0.75f);
+    drawString(b, hudX + 136.0f / _width, textY, 1.0f, 0.55f, 0.9f, 0.75f);
+    drawString("Cloud", hudX + 200.0f / _width, textY, 1.0f, 0.75f, 0.85f, 1.0f);
+    const size_t cloudType = std::min<size_t>(stats.cloudType, std::size(cloudNames) - 1U);
+    drawString(cloudNames[cloudType], hudX + 256.0f / _width, textY, 1.0f, 0.75f, 0.85f, 1.0f);
+    floatToString(stats.cloudCoverage * 100.0F, c, sizeof(c));
+    drawString(c, hudX + 368.0f / _width, textY, 1.0f, 0.75f, 0.85f, 1.0f);
+    nextLine();
+
+    drawString("Precip", hudX, textY, 1.0f, 0.55f, 0.75f, 1.0f);
+    const size_t precipitation =
+        std::min<size_t>(stats.precipitationKind, std::size(precipitationNames) - 1U);
+    drawString(precipitationNames[precipitation], hudX + 64.0f / _width, textY, 1.0f, 0.55f, 0.75f,
+               1.0f);
+    floatToString(stats.precipitationIntensity * 100.0F, a, sizeof(a));
+    drawString(a, hudX + 120.0f / _width, textY, 1.0f, 0.55f, 0.75f, 1.0f);
+    drawString("Storm", hudX + 184.0f / _width, textY, 1.0f, 0.75f, 0.65f, 1.0f);
+    floatToString(stats.stormPotential * 100.0F, b, sizeof(b));
+    drawString(b, hudX + 240.0f / _width, textY, 1.0f, 0.75f, 0.65f, 1.0f);
+    nextLine();
+
+    drawString("Fog/Aerosol", hudX, textY, 1.0f, 0.75f, 0.75f, 0.9f);
+    std::snprintf(a, sizeof(a), "%.5f", static_cast<double>(stats.weatherFogExtinction));
+    floatToString(stats.aerosolDensity, b, sizeof(b));
+    drawString(a, hudX + 104.0f / _width, textY, 1.0f, 0.75f, 0.75f, 0.9f);
+    drawString(b, hudX + 184.0f / _width, textY, 1.0f, 0.75f, 0.75f, 0.9f);
+    drawString("Strike", hudX + 248.0f / _width, textY, 1.0f, 0.8f, 0.8f, 1.0f);
+    drawString(unsignedText(stats.stormId, c, sizeof(c)), hudX + 304.0f / _width, textY, 1.0f, 0.8f,
+               0.8f, 1.0f);
+    nextLine();
+
+    drawString("Moon cycle/energy", hudX, textY, 1.0f, 0.75f, 0.8f, 1.0f);
+    floatToString(stats.lunarPhaseCycle, a, sizeof(a));
+    floatToString(stats.lunarPhaseEnergy, b, sizeof(b));
+    drawString(a, hudX + 144.0f / _width, textY, 1.0f, 0.75f, 0.8f, 1.0f);
+    drawString(b, hudX + 208.0f / _width, textY, 1.0f, 0.75f, 0.8f, 1.0f);
 }

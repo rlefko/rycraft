@@ -6,6 +6,7 @@
 #include "world/chunk_generator.hpp"
 #include "world/chunk_pos.hpp"
 #include "world/fluid.hpp"
+#include "world/light_engine.hpp"
 #include "world/mesh_snapshot.hpp"
 #include "world/view_distance.hpp"
 
@@ -72,6 +73,14 @@ inline constexpr int HORIZONTAL_UNLOAD_HYSTERESIS_CHUNKS = 2;
 inline constexpr int VERTICAL_UNLOAD_HYSTERESIS_CUBES = 1;
 inline constexpr size_t COLUMN_PLAN_REBUILD_BATCH = 128;
 inline constexpr size_t COLUMN_PLAN_REBUILD_COOLDOWN_TICKS = 4;
+
+// A skylight seed is authoritative only after every vertical section through
+// generated terrain and any saved edited section above it is resident.
+constexpr int32_t skyAuthorityTopSection(int32_t cubeSection, int32_t generatedCutoffSection,
+                                         std::optional<int32_t> savedEditedCeiling) {
+    return std::max(
+        {cubeSection, generatedCutoffSection, savedEditedCeiling.value_or(WORLD_MIN_CHUNK_Y)});
+}
 
 // Exact streaming uses stable lanes before distance. A newer active-set epoch
 // outranks queued work from an old camera position, the exploration and
@@ -145,6 +154,7 @@ public:
     // that must never make absent world data interactive.
     std::optional<BlockType> findBlockIfLoaded(int64_t x, int32_t y, int64_t z) const;
     BlockType getBlockIfLoaded(int64_t x, int32_t y, int64_t z) const;
+    uint8_t getPackedLightIfLoaded(int64_t x, int32_t y, int64_t z) const;
     BlockType getCollisionBlockIfLoaded(int64_t x, int32_t y, int64_t z) const;
     bool isChunkLoaded(ChunkPos pos) const;
     bool shouldMeshChunk(ChunkPos pos) const;
@@ -195,8 +205,8 @@ public:
     void updatePlayerPosition(int64_t playerX, int64_t playerZ) {
         updatePlayerPosition(playerX, SEA_LEVEL, playerZ);
     }
-    // Pull block light across all six cube faces until quiescent, bounded so a
-    // simulation tick cannot stall on a large lighting update.
+    // Reconcile packed skylight and block light across all six cube faces,
+    // bounded so a simulation tick cannot stall on a large lighting update.
     void reconcileLight(int budgetCubes);
 
     void unloadDistantChunks();
@@ -251,6 +261,12 @@ private:
     // retain an override for mesh snapshots.
     std::unordered_map<SkyColumnKey, int32_t, SkyColumnKeyHash> skyCutoffOverrides_;
     std::unordered_set<ColumnPos> skyOverrideChunkColumns_;
+    // Visible save-manifest authority prevents an unloaded edited roof above
+    // generated terrain from being treated as proven open sky. Columns in the
+    // known set have completed one bulk manifest lookup; the ceiling records
+    // only columns that contain saved edited sections.
+    std::unordered_set<ColumnPos> skyManifestKnownColumns_;
+    std::unordered_map<ColumnPos, int32_t> savedEditedSectionCeilings_;
 
     SaveManager* saveManager_ = nullptr;
     ChunkGenerator generator_;
@@ -339,23 +355,52 @@ private:
     std::deque<ChunkPos> fluidResumeQueue_;          // guarded by pendingMutex_
     std::unordered_set<ChunkPos> fluidResumeQueued_; // guarded by pendingMutex_
 
-    // Cubes whose derived block light may be stale because a neighbor loaded
-    // or an edit landed. The queue is deduplicated and drained on the tick
-    // thread. lightMutex_ is never held while acquiring chunksMutex_.
+    // Cubes whose derived packed lighting may be stale because a neighbor
+    // loaded, unloaded, or changed. The queue is deduplicated and drained on
+    // the tick thread. lightMutex_ is never held while acquiring chunksMutex_.
     std::vector<ChunkPos> lightQueue_;
     std::unordered_set<ChunkPos> lightQueued_;
+    // Deep propagation from player edits drains ahead of streaming churn.
+    // The shared queue pops newest-first and an already-queued position keeps
+    // its buried slot, so an edit's spread could otherwise starve for seconds
+    // while generation keeps queueing fresher entries on top of it.
+    std::vector<ChunkPos> editLightQueue_;
+    std::unordered_set<ChunkPos> editLightQueued_;
     mutable std::mutex lightMutex_;
 
-    void queueLightReconcile(ChunkPos pos);
+    // Fluid updates run up to 1,024 cells per tick, so their relight must
+    // stay on the budgeted reconcile queue. Player edits are a handful per
+    // tick and are remeshed by the render thread before the next tick, so
+    // they flood synchronously under the same lock as the block write.
+    enum class LightUrgency : uint8_t { DEFERRED, IMMEDIATE };
+
+    void queueLightReconcile(ChunkPos pos, LightUrgency urgency = LightUrgency::DEFERRED);
     void queueFaceNeighbors(ChunkPos pos);
     void queueLightReconcileWithNeighbors(ChunkPos pos);
+    void ensureSavedSkyAuthority(ColumnPos column);
+    LightEngine::SkyLightSeedColumns skyLightSeedsLocked(ChunkPos pos,
+                                                         const ColumnPlan* plan) const;
+    void initializeChunkLightLocked(ChunkPos pos, const ColumnPlan* plan);
+    bool reconcileCubeLocked(ChunkPos pos, const ColumnPlan* plan, LightUrgency urgency);
+
+    // A single edit's light reaches at most one cube in each direction (max
+    // level 15, one step per block, 16-block edge), so its whole affected
+    // neighborhood is a subset of the 3x3x3 around the edit. Drain the IMMEDIATE
+    // queue to its fixed point synchronously under the block-write lock, using
+    // the nine prefetched column plans, so adjacent cubes never wait a tick to
+    // relight. The cap is a pathological safety valve; any residue falls back to
+    // the per-tick reconcile.
+    static constexpr int EDIT_SYNC_LIGHT_FLOOD_CAP = 96;
+    int drainEditLightNeighborhoodLocked(
+        ChunkPos home, const std::array<std::shared_ptr<const ColumnPlan>, 9>& columnPlans);
 
     void generateChunk(const std::shared_ptr<Chunk>& chunk);
     void generateChunkAsync(ChunkPos pos, int64_t priority);
     void generateColumnPlanAsync(ColumnPos pos, int64_t priority);
     std::shared_ptr<Chunk> loadOrGenerateChunk(ChunkPos pos, bool* loadedFromSave = nullptr);
     bool shouldRetain(ChunkPos pos) const;
-    void setBlockLoaded(BlockPos position, BlockType type, std::optional<FluidState> fluidState);
+    void setBlockLoaded(BlockPos position, BlockType type, std::optional<FluidState> fluidState,
+                        LightUrgency urgency = LightUrgency::DEFERRED);
     bool refreshSkyCutoffLocked(int64_t worldX, int64_t worldZ);
     bool refreshSkyOverrideColumnLocked(ColumnPos column);
     bool extendGeneratedSkyCutoffsLocked(const Chunk& chunk);

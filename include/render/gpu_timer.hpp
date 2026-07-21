@@ -4,19 +4,20 @@
 
 #include "common/ema.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// GpuFrameTimer — real GPU time per frame, and per pass on request.
+// GpuFrameTimer, real GPU time per frame, and per pass on request.
 //
 // Whole-frame timing reads the command buffer's GPUStartTime/GPUEndTime in a
 // completed handler and is always on (the handler is the frame's only extra
 // work). Per-pass timing samples MTLCounterSampleBuffer timestamps at stage
 // boundaries and exists only when requested at construction AND the device
-// supports stage-boundary sampling — otherwise attachPass() is a no-op and
+// supports stage-boundary sampling, otherwise attachPass() is a no-op and
 // no sample buffers are allocated, so the disabled path costs nothing.
 //
 // Completed handlers outlive teardown races by capturing a shared_ptr to the
@@ -25,6 +26,7 @@
 class GpuFrameTimer {
 public:
     GpuFrameTimer(id<MTLDevice> device, bool enablePassCounters);
+    ~GpuFrameTimer();
 
     // Rotate to the next sample-buffer slot. Call once at the top of a frame.
     void beginFrame();
@@ -33,6 +35,11 @@ public:
     // attach it to the pass. No-op when pass counters are off or the frame's
     // pass capacity is exhausted.
     void attachPass(MTLRenderPassDescriptor* desc, const char* label);
+
+    // Timestamp a sequence of compute dispatches encoded between these two
+    // calls. The returned token is opaque and may represent a disabled timer.
+    uint32_t beginComputePass(id<MTLComputeCommandEncoder> encoder, const char* label);
+    void endComputePass(id<MTLComputeCommandEncoder> encoder, uint32_t token);
 
     // Install the completed handler that records the frame's GPU ms and
     // resolves this frame's pass samples. Call once per frame before commit.
@@ -46,7 +53,7 @@ public:
     std::string passBreakdown() const;
 
 private:
-    static constexpr uint32_t MAX_PASSES = 16;
+    static constexpr uint32_t MAX_PASSES = 32;
     static constexpr uint32_t SLOTS = 3; // matches the deepest frames-in-flight
 
     struct PassSample {
@@ -73,6 +80,8 @@ private:
     std::vector<PassSample> framePasses_;
     uint32_t slot_ = 0;
     bool passCountersEnabled_ = false;
+    bool renderCountersEnabled_ = false;
+    bool computeCountersEnabled_ = false;
 
     // Calibration anchor for converting GPU timestamp ticks to nanoseconds.
     MTLTimestamp cpuAnchor_ = 0;

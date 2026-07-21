@@ -6,7 +6,7 @@
 enum class EntityType : uint8_t;
 
 // ---------------------------------------------------------------------------
-// SoundEffect — Procedural sound effect generation.
+// SoundEffect, Procedural sound effect generation.
 //
 // Generates PCM audio samples at 44100 Hz for various game events.
 // All generation functions are pure: same parameters → same output.
@@ -16,6 +16,7 @@ enum class EntityType : uint8_t;
 //   • Block place: noise burst with frequency sweep (800→200ms, 0.08s)
 //   • Footstep: low-frequency thud (80-120Hz, 0.12s)
 //   • Ambient wind: filtered noise, continuous loop
+//   • Thunder: seeded broadband crack and rolling low-frequency tail
 //   • Animal: simple tone sequences per entity type
 // ---------------------------------------------------------------------------
 class SoundEffect {
@@ -41,6 +42,9 @@ public:
 
     // Environmental sounds
     static std::vector<float> generateAmbientWind(uint32_t durationSeconds = 4);
+    static std::vector<float> generateRainAmbience(uint32_t durationSeconds = 4);
+    static std::vector<float> generateSnowAmbience(uint32_t durationSeconds = 4);
+    static std::vector<float> generateThunder(uint64_t eventId, float intensity = 1.0F);
 
     // Entity sounds (tone sequences)
     static std::vector<float> generateSheepBaa();

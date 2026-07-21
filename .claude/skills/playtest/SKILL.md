@@ -1,6 +1,6 @@
 ---
 name: playtest
-description: Build and run rycraft with Metal validation, use deterministic diagnostics to locate features, capture real PNG frames, inspect cubic terrain, adaptive far LOD, mipmapped textures, culling, HDR effects, partial water, flora, and fauna, and report what the game actually shows. Use for player-visible changes, rendering reviews, world-generation acceptance, menus, fauna, fluids, culling, LOD, textures, or screenshot requests.
+description: Build and run rycraft with Metal validation, use deterministic diagnostics, capture real PNG frames, inspect packed cave lighting, cascade motion, temporal SSGI, physical atmosphere, volumetric cloud layers, weather, lightning and thunder, celestial transitions, cubic terrain, far LOD, water, flora, and fauna, and report what the game actually shows. Use for player-visible changes, rendering reviews, world-generation acceptance, menus, lighting, weather, fauna, fluids, culling, LOD, textures, or screenshot requests.
 ---
 
 # Playtest
@@ -98,15 +98,17 @@ The engine supports:
 | `RYCRAFT_SPAWN_BOAT=1` | Drop a boat a few blocks ahead of spawn to capture it floating or beached |
 | `RYCRAFT_BLOOM=0..1` | Scale or disable bloom |
 | `RYCRAFT_VIEW_DISTANCE=4..512` | Override visible distance; exact simulation remains capped at radius 32 |
-| `RYCRAFT_TIME=0..23999` and `RYCRAFT_TIME_FREEZE=1` | Pin time of day for repeatable shadow, sky, and flare captures |
-| `RYCRAFT_WEATHER=rain\|clear` | Pin weather and its wetness state |
+| `RYCRAFT_TIME=unsignedTicks` and `RYCRAFT_TIME_FREEZE=1` | Pin an absolute uint64 world tick for repeatable time of day, lunar phase, shadow, sky, and flare captures |
+| `RYCRAFT_WEATHER=clear\|overcast\|rain\|storm\|snow` | Pin deterministic weather, clouds, precipitation, storm state, and wetness |
+| `RYCRAFT_CAPTURE_LIGHTNING=x,z,id,ageTicks` | With `RYCRAFT_CAPTURE`, inject one deterministic visual strike after the weather snapshot is ready; age must not exceed the absolute world tick |
 | `RYCRAFT_YAW=degrees` and `RYCRAFT_PITCH=degrees` | Point the capture camera after spawn validation |
 | `RYCRAFT_AUTOPILOT=walk\|sprint\|fly` | Exercise a repeatable ground route or an obstacle-independent aerial streaming route |
 | `RYCRAFT_AUTOPILOT_START_FRAME=N` and `RYCRAFT_AUTOPILOT_STOP_FRAME=N` | Bound movement to a fixed interval so queue settling can be measured afterward |
 | `RYCRAFT_AUTOPAUSE_FRAME=N` | Enter the real paused screen at a fixed frame for a same-scene playing-versus-paused timing comparison |
 | `RYCRAFT_PERF_WARMUP_FRAMES=N` and `RYCRAFT_PERF_FRAMES=N` | Exclude warmup, record a bounded performance window, print summary lines, and quit |
-| `RYCRAFT_SHADOWS=0..2`, `RYCRAFT_CLOUDS=0..2` | Override shadow and cloud quality without saving preferences |
-| `RYCRAFT_VL`, `RYCRAFT_SSAO`, `RYCRAFT_SSR`, `RYCRAFT_WAVING`, `RYCRAFT_LENS_FLARE` | Toggle individual graphics effects with 0 or 1 |
+| `RYCRAFT_SHADOWS=0..2`, `RYCRAFT_CLOUD_QUALITY=0..2`, `RYCRAFT_INDIRECT_LIGHT=0..2` | Override shadow, cloud, and indirect-light quality without saving preferences |
+| `RYCRAFT_VL`, `RYCRAFT_SSR`, `RYCRAFT_WAVING`, `RYCRAFT_LENS_FLARE` | Toggle individual graphics effects with 0 or 1 |
+| `RYCRAFT_CLOUDS=0..2`, `RYCRAFT_SSAO=0\|1` | Legacy cloud and indirect-light aliases for older capture scripts |
 | `RYCRAFT_VIBRANCE=0..10`, `RYCRAFT_SHARPEN=0..10` | Override final-grade controls |
 | `RYCRAFT_GPU_COUNTERS=1` | Enable diagnostic per-pass GPU timestamps |
 | `RYCRAFT_SPAWN_LAVA=1`, `RYCRAFT_SPAWN_WATER=1` | Create disposable validation scenes near spawn |
@@ -127,6 +129,27 @@ RYCRAFT_START_SCREEN=playing \
 ```
 
 Poll for the capture for no more than 45 seconds, then terminate only that recorded process ID. Do not use a broad `killall` that could stop another workspace's game.
+
+### Integrated lighting, atmosphere, and weather matrix
+
+Use seed 764891, spawn `23029,225,-111726`, yaw 0, pitch -17, view distance 512, and explicit `RYCRAFT_TIME_FREEZE=1`. Capture at 3456 by 2234 when the native display route is available. Keep Metal validation and shader validation separate from the unvalidated performance run.
+
+Capture settled stills and motion sequences for:
+
+- Crooked forests, isolated logs, and broad overhangs at several solar angles. The underside may be in direct shadow, but propagated ambient light must not become a black vertical column merely because a solid block exists somewhere above it.
+- A cave entrance from outside and inside, a sealed cave, and a lava-lit interior. The entrance should show propagated skylight and near-field screen-space bounce, the sealed cave should remain dark without an emitter, and lava block or emissive light must remain independent of ambient accessibility.
+- Forward motion through endpoints 48, 160, 512, and 1,536 on High, then into the 8,192-block horizon map. Repeat Medium at 40, 128, 384, and 768. Inspect the final 12.5 percent of each range for continuous shadow blend, no camera-centered ring, no resolution pop, no double-cast exact or far silhouette, and no stale projection.
+- Ordinary camera motion followed by teleport, resize, FOV change, indirect quality change, cloud quality change, forced time, forced weather, and world reload. Verify valid history settles, each discontinuity rejects old indirect, cloud, and froxel data, and no ghost survives disocclusion. Disoccluded regions must fill with a smooth bounce estimate within about eight frames rather than staying black or speckled, and no bright splotch may survive after its source leaves the frame during rotation.
+- Place and break blocks indoors and under an overhang. The placed block must be lit correctly on the very next frame with no dark window, no lingering dark halo on the wall behind it, and no reconcile-queue delay visible as a black face.
+- `clear`, `overcast`, `rain`, `storm`, and `snow` at representative dawn, noon, dusk, and night times. Compare pressure, humidity, temperature, wind, cloud coverage and type, precipitation, storm potential, fog, aerosol, and cloud bounds in F3. Rain or snow must follow temperature. Foliage and particles must move with the same wind vector.
+- Views below, inside, and above stratus, cumulus, cumulonimbus, and cirrus layers. Fly through a layer and past a mountain intersection. Inspect density variation in all three dimensions, bounded physical wind speed, temporal stability, bilateral terrain edges, cloud shadow agreement, and no repeating slab or fast 80-block-per-second drift.
+- Lightning before and behind clouds, the diffuse atmospheric flash, delayed thunder, repeated deterministic event IDs, and a reload after an older storm bucket. Confirm no backlog replay, block edit, fluid update, fire, or terrain change.
+- Dawn, noon, dusk, and night physical atmosphere with clear and aerosol-heavy weather. Inspect horizon response, sun angular size, altitude response, cloud attenuation, shafts, fog silhouettes, finite color, and no old artistic daytime gradient.
+- A clear, frozen daytime sky-and-ground coherence capture. Record the absolute time, cloud quality, weather preset, and relevant F3 weather and atmosphere diagnostics. Reject a dark or night-like sky above terrain receiving daylight illumination, or a daylight sky paired with stale nighttime direct illumination.
+- Sunset and sunrise through civil twilight, then representative new, quarter, half, three-quarter, and full lunar phases. Only one directional light may contribute. The sun must disappear from direct light, flare, water glint, and reflection below the horizon. The moon must stay subdued through twilight, then scale its disc, direct light, and shadows by phase without blooming into a flat white circle.
+- Water above and below the surface under clear daylight, moonlight, overcast sky, cloud shadow, fog, and shafts. Air fog must stop at the water surface, and underwater absorption must remain the sole submerged medium.
+
+For every motion sequence, record cascade refreshes, indirect-history validity and reset reason, cloud and froxel history validity, atmosphere LUT refreshes, weather request and worker state, cloud type, storm or lightning ID, and the GPU timing for each new pass. Open every PNG and inspect the corresponding log. A stable event ID or zero validation count is not visual evidence by itself.
 
 ## 5. World-generation capture matrix
 
@@ -180,7 +203,7 @@ Across the exact-to-far overlap, compare matching terrain profiles and water bou
 
 Use oblique views of distant textured slopes and alpha-cutout flora to inspect the complete block-texture mip chain. Look for reduced shimmer and moire patterns, preserved foliage coverage, no sudden mip bands, and the expected crisp nearest-filtered appearance when magnified nearby.
 
-The implementation uses adaptive immutable tile tiers, not a literal geometry clipmap. Its conservative 256-bin terrain-horizon test is not a hierarchical Z buffer. Draws are bounded direct indexed commands, not an indirect command buffer. Report only the mechanisms and evidence actually observed.
+The implementation uses adaptive immutable tile tiers, not a literal geometry clipmap. Its conservative 256-bin terrain-horizon test is not a hierarchical Z buffer; the renderer's only depth pyramid belongs to screen-space indirect lighting and serves ray traversal, not visibility. Draws are bounded direct indexed commands, not an indirect command buffer. Report only the mechanisms and evidence actually observed.
 
 ### Cubic vertical exploration
 
@@ -244,7 +267,7 @@ At one fixed coordinate, capture an F3 frame and compare every displayed value w
 
 ### M4 Max performance acceptance
 
-Run performance acceptance separately from Metal validation with an optimized build. Use an identified Apple M4 Max, native display resolution, 4x MSAA, and the user-reported seed-764891 starting view:
+Run performance acceptance separately from Metal validation with an optimized build. Use an identified Apple M4 Max, native 3456 by 2234 display resolution, 4x MSAA, and the user-reported seed-764891 starting view:
 
 ```bash
 RYCRAFT_WORLD_SEED=764891 RYCRAFT_SPAWN=23029,225,-111726 \
@@ -259,6 +282,7 @@ Allow streaming to settle, then measure the moving route long enough to expose r
 - Lowest sustained one-second frame rate of at least 60 FPS
 - No sustained generation-related frame time above 20 ms
 - At most 64 GB total unified-memory use
+- At most 768 MiB of persistent High-tier Metal allocations added for shadows, indirect lighting, atmosphere, clouds, lightning, and froxels
 - No more than 32,768 loaded exact cubes or 16,384 exact mesh-resident cubes
 - Far CPU cache at or below 9,280 tiles and 3 GiB
 - Every cold step-32 horizon parent resident within two seconds
@@ -268,8 +292,9 @@ Allow streaming to settle, then measure the moving route long enough to expose r
 - While exact streaming is busy, no more than four refinement uploads advance per frame while the 32-parent lane remains available
 - When exact streaming is idle, no more than 32 parent uploads and 12 refinement uploads advance per frame
 - Exact generation, exact mesh, and far queues settling within five seconds after movement stops
+- Weather latest-wins work retaining at most one running and one pending request, with its replacement available or the prior snapshot retained within five seconds
 
-Record frame p50 and p95, the lowest sustained one-second frame rate, exact loaded and meshed maxima, far wanted, resident, drawn, frustum-culled, horizon-culled, pending, cache, and arena maxima, upload maxima, and queue settle time. Apple Silicon uses unified memory. Report process RSS and Metal allocation or resident counters separately, then state the highest credible unified-memory total without adding overlapping counters.
+Record frame p50 and p95, the lowest sustained one-second frame rate, exact loaded and meshed maxima, far wanted, resident, drawn, frustum-culled, horizon-culled, pending, cache, and arena maxima, upload maxima, cascade refresh counts, temporal reset counts, weather worker counts, atmosphere refreshes, cloud and froxel persistent bytes, GPU pass timings, and queue settle time. Apple Silicon uses unified memory. Report process RSS and Metal allocation or resident counters separately, then state the highest credible unified-memory total without adding overlapping counters.
 
 At the same settled camera and settings, record a playing interval followed by a paused interval. Attribute fixed-tick CPU p50, p95, and maximum with a profiler or scoped measurement. Pausing may remove simulation work, but it must not conceal a material main-thread bottleneck or produce an unexplained frame-rate multiplication. Hardware results are acceptance evidence, not pass or fail CI checks. CI continues to enforce deterministic work limits, queue caps, cache bounds, and allocation invariants.
 

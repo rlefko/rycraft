@@ -1,16 +1,23 @@
 #import "render/render_pipeline.hpp"
 
 #include "common/error.hpp"
+#include "common/random.hpp"
+#include "render/atmosphere.hpp"
+#include "render/atmospheric_memory.hpp"
 #include "render/block_textures.hpp"
 #include "render/bloom.hpp"
 #include "render/boat_renderer.hpp"
+#include "render/celestial.hpp"
+#include "render/cloud_renderer.hpp"
 #include "render/entity_renderer.hpp"
 #include "render/item_entity_renderer.hpp"
+#include "render/lightning_renderer.hpp"
 #include "render/lod_mesher.hpp"
+#include "render/metal_ownership.hpp"
 #include "render/pixel_formats.hpp"
 #include "render/post_stack.hpp"
+#include "render/screen_space_lighting.hpp"
 #include "render/shadow_map.hpp"
-#include "render/ssao.hpp"
 #include "render/volumetrics.hpp"
 
 #include "engine/camera.hpp"
@@ -19,6 +26,7 @@
 #include "render/ui_overlay.hpp"
 #include "world/chunk.hpp"
 #include "world/chunk_pos.hpp"
+#include "world/weather.hpp"
 #include "world/world.hpp"
 
 #import <ImageIO/ImageIO.h>
@@ -33,10 +41,6 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
-
-// One in-game day in 20 Hz ticks — shared by the animation clock, the
-// morning-fog window, and the day/night cycle so they can never drift.
-constexpr uint64_t TICKS_PER_DAY = 24000;
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -113,7 +117,7 @@ farTerrainOccluderIntersectsExact(const FarTerrainBounds& patch, ColumnPos tile,
 }
 
 RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
-                               uint32_t height)
+                               uint32_t height, uint64_t worldSeed)
     : _device(device), _frameRing(device, FRAME_RING_SLOT_BYTES), _bloomIntensity(1.0f),
       _displayWidth(width), _displayHeight(height), _frustumPlanes{} {
     if (const char* overlay = std::getenv("RYCRAFT_WORLDGEN_OVERLAY")) {
@@ -170,12 +174,13 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     pipelineDesc.fragmentFunction = fragmentFunc;
     pipelineDesc.vertexDescriptor = vertexDesc;
 
-    pipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
-    pipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
-    pipelineDesc.rasterSampleCount = 4;
+    PixelFormats::configureScenePassPipeline(pipelineDesc);
 
     NSError* error = nil;
     _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    resetMetalObject(pipelineDesc);
+    resetMetalObject(vertexFunc);
+    resetMetalObject(fragmentFunc);
     if (!_pipelineState) {
         NSString* msg = [NSString stringWithFormat:@"Failed to create render pipeline state: %@",
                                                    error.localizedDescription];
@@ -187,6 +192,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     depthDesc.depthCompareFunction = MTLCompareFunctionLess;
     depthDesc.depthWriteEnabled = true;
     _depthState = [_device newDepthStencilStateWithDescriptor:depthDesc];
+    resetMetalObject(depthDesc);
     if (!_depthState) {
         RY_LOG_FATAL("Failed to create depth stencil state");
     }
@@ -196,6 +202,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     noWriteDepthDesc.depthCompareFunction = MTLCompareFunctionLessEqual;
     noWriteDepthDesc.depthWriteEnabled = false;
     _noDepthWriteState = [_device newDepthStencilStateWithDescriptor:noWriteDepthDesc];
+    resetMetalObject(noWriteDepthDesc);
     if (!_noDepthWriteState) {
         RY_LOG_FATAL("Failed to create no-write depth stencil state");
     }
@@ -215,21 +222,26 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     skyPipelineDesc.vertexFunction = skyVertexFunc;
     skyPipelineDesc.fragmentFunction = skyFragmentFunc;
     skyPipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+    skyPipelineDesc.colorAttachments[1].pixelFormat = PixelFormats::SURFACE;
     skyPipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
     skyPipelineDesc.rasterSampleCount = 4;
 
     _skyPipelineState = [_device newRenderPipelineStateWithDescriptor:skyPipelineDesc error:&error];
+    resetMetalObject(skyPipelineDesc);
+    resetMetalObject(skyVertexFunc);
+    resetMetalObject(skyFragmentFunc);
     if (!_skyPipelineState) {
         NSString* msg = [NSString stringWithFormat:@"Failed to create sky pipeline state: %@",
                                                    error.localizedDescription];
         RY_LOG_FATAL(msg.UTF8String);
     }
 
-    // Sky depth state: always pass, never write — the sky sits behind everything
+    // Sky depth state: always pass, never write, the sky sits behind everything
     auto skyDepthDesc = [[MTLDepthStencilDescriptor alloc] init];
     skyDepthDesc.depthCompareFunction = MTLCompareFunctionAlways;
     skyDepthDesc.depthWriteEnabled = false;
     _skyDepthState = [_device newDepthStencilStateWithDescriptor:skyDepthDesc];
+    resetMetalObject(skyDepthDesc);
     if (!_skyDepthState) {
         RY_LOG_FATAL("Failed to create sky depth stencil state");
     }
@@ -242,7 +254,7 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     highlightPipelineDesc.vertexFunction = highlightVertexFunc;
     highlightPipelineDesc.fragmentFunction = highlightFragmentFunc;
     highlightPipelineDesc.vertexDescriptor = vertexDesc;
-    highlightPipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+    PixelFormats::configureScenePassPipeline(highlightPipelineDesc);
     highlightPipelineDesc.colorAttachments[0].blendingEnabled = true;
     highlightPipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
     highlightPipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
@@ -252,11 +264,11 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         MTLBlendFactorOneMinusSourceAlpha;
     highlightPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
         MTLBlendFactorOneMinusSourceAlpha;
-    highlightPipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
-    highlightPipelineDesc.rasterSampleCount = 4;
-
     _highlightPipelineState = [_device newRenderPipelineStateWithDescriptor:highlightPipelineDesc
                                                                       error:&error];
+    resetMetalObject(highlightPipelineDesc);
+    resetMetalObject(highlightVertexFunc);
+    resetMetalObject(highlightFragmentFunc);
     if (!_highlightPipelineState) {
         NSString* msg = [NSString stringWithFormat:@"Failed to create highlight pipeline state: %@",
                                                    error.localizedDescription];
@@ -330,8 +342,12 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         waterDesc.fragmentFunction = waterFragmentFunc;
         waterDesc.vertexDescriptor = vertexDesc;
         waterDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+        waterDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
         waterDesc.rasterSampleCount = 1;
         _waterPipelineState = [_device newRenderPipelineStateWithDescriptor:waterDesc error:&error];
+        resetMetalObject(waterDesc);
+        resetMetalObject(waterVertexFunc);
+        resetMetalObject(waterFragmentFunc);
         if (!_waterPipelineState) {
             NSString* msg = [NSString stringWithFormat:@"Failed to create water pipeline: %@",
                                                        error.localizedDescription];
@@ -349,12 +365,13 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         overlayDesc.vertexFunction = overlayVertexFunc;
         overlayDesc.fragmentFunction = overlayFragmentFunc;
         overlayDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+        overlayDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
         overlayDesc.colorAttachments[0].blendingEnabled = true;
         overlayDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
         overlayDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
         // Dual-source blending: result = inscatter + scene * transmit. The
         // fragment's color(0) index(0) is the inscattered light and index(1)
-        // the per-channel Beer-Lambert transmittance — a single alpha cannot
+        // the per-channel Beer-Lambert transmittance, a single alpha cannot
         // express spectral absorption (red must die faster than blue).
         overlayDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
         overlayDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
@@ -363,6 +380,9 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         overlayDesc.rasterSampleCount = 1;
         _underwaterOverlayState = [_device newRenderPipelineStateWithDescriptor:overlayDesc
                                                                           error:&error];
+        resetMetalObject(overlayDesc);
+        resetMetalObject(overlayVertexFunc);
+        resetMetalObject(overlayFragmentFunc);
         if (!_underwaterOverlayState) {
             NSString* msg =
                 [NSString stringWithFormat:@"Failed to create underwater overlay pipeline: %@",
@@ -381,37 +401,6 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     _uiOverlay = std::make_unique<UIOverlay>(_device, shaderLibrary, _displayWidth, _displayHeight);
     _uiOverlay->setIconAtlas(_blockTextures->texture(), _blockTextures->sampler());
 
-    // ---- Cloud pipeline state (Phase 8) ----
-    id<MTLFunction> cloudVertexFunc = [shaderLibrary newFunctionWithName:@"cloudVertexMain"];
-    id<MTLFunction> cloudFragmentFunc = [shaderLibrary newFunctionWithName:@"cloudFragmentMain"];
-
-    if (cloudVertexFunc && cloudFragmentFunc) {
-        auto cloudPipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
-        cloudPipelineDesc.vertexFunction = cloudVertexFunc;
-        cloudPipelineDesc.fragmentFunction = cloudFragmentFunc;
-        cloudPipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
-        cloudPipelineDesc.colorAttachments[0].blendingEnabled = true;
-        cloudPipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-        cloudPipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-        cloudPipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-        cloudPipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-        cloudPipelineDesc.colorAttachments[0].destinationRGBBlendFactor =
-            MTLBlendFactorOneMinusSourceAlpha;
-        cloudPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
-            MTLBlendFactorOneMinusSourceAlpha;
-        cloudPipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
-        cloudPipelineDesc.rasterSampleCount = 4;
-
-        _cloudPipelineState = [_device newRenderPipelineStateWithDescriptor:cloudPipelineDesc
-                                                                      error:&error];
-    }
-
-    // Cloud depth state (depth test, no write)
-    auto cloudDepthDesc = [[MTLDepthStencilDescriptor alloc] init];
-    cloudDepthDesc.depthCompareFunction = MTLCompareFunctionLess;
-    cloudDepthDesc.depthWriteEnabled = false;
-    _cloudDepthState = [_device newDepthStencilStateWithDescriptor:cloudDepthDesc];
-
     // ---- Bloom post-processing (HDR extract + blur) ----
     _bloom = std::make_unique<Bloom>(_device, shaderLibrary, _displayWidth, _displayHeight);
     _bloom->setIntensity(_bloomIntensity);
@@ -422,12 +411,16 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     // ---- Cascaded shadow maps (share the chunk vertex layout) ----
     _shadowMap = std::make_unique<ShadowMap>(_device, shaderLibrary, vertexDesc);
 
-    // ---- Volumetric light shafts ----
+    // ---- Physical atmosphere, indirect lighting, clouds, and volumetrics ----
+    _atmosphere = std::make_unique<AtmosphereRenderer>(_device, shaderLibrary);
+    _screenSpaceLighting = std::make_unique<ScreenSpaceLighting>(_device, shaderLibrary,
+                                                                 _displayWidth, _displayHeight);
+    _clouds = std::make_unique<CloudRenderer>(_device, shaderLibrary, _displayWidth, _displayHeight,
+                                              worldSeed);
+    _lightning = std::make_unique<LightningRenderer>(_device, shaderLibrary);
     _volumetrics =
         std::make_unique<Volumetrics>(_device, shaderLibrary, _displayWidth, _displayHeight);
-
-    // ---- Screen-space ambient occlusion ----
-    _ssao = std::make_unique<Ssao>(_device, shaderLibrary, _displayWidth, _displayHeight);
+    _indirectHistoryState = std::make_unique<IndirectHistoryState>();
 
     // ---- Weather Particle System ----
     _particles = std::make_unique<ParticleSystem>(_device, shaderLibrary);
@@ -444,12 +437,24 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 }
 
 // ---------------------------------------------------------------------------
-// allocateSceneTargets — (re)create the MSAA + resolve textures at the
+// allocateSceneTargets, (re)create the MSAA + resolve textures at the
 // current drawable size. MSAA targets are memoryless: their tile contents
 // are resolved at pass end (color into _colorResolve, depth into
 // _depthResolve for the water pass) and never loaded or stored.
 // ---------------------------------------------------------------------------
+void RenderPipeline::releaseSceneTargets() {
+    resetMetalObject(_colorMSAA);
+    resetMetalObject(_surfaceMSAA);
+    resetMetalObject(_depthMSAA);
+    resetMetalObject(_colorResolve);
+    resetMetalObject(_surfaceResolve);
+    resetMetalObject(_depthResolve);
+    resetMetalObject(_mediaDepthResolve);
+    resetMetalObject(_sceneColorCopy);
+}
+
 void RenderPipeline::allocateSceneTargets() {
+    releaseSceneTargets();
     auto colorMSAADesc = [[MTLTextureDescriptor alloc] init];
     colorMSAADesc.textureType = MTLTextureType2DMultisample;
     colorMSAADesc.pixelFormat = PixelFormats::SCENE_HDR;
@@ -463,6 +468,15 @@ void RenderPipeline::allocateSceneTargets() {
         RY_LOG_FATAL("Failed to allocate MSAA color texture");
     }
 
+    MTLTextureDescriptor* surfaceMSAADesc = [colorMSAADesc copy];
+    surfaceMSAADesc.pixelFormat = PixelFormats::SURFACE;
+    _surfaceMSAA = [_device newTextureWithDescriptor:surfaceMSAADesc];
+    resetMetalObject(surfaceMSAADesc);
+    resetMetalObject(colorMSAADesc);
+    if (!_surfaceMSAA) {
+        RY_LOG_FATAL("Failed to allocate MSAA surface-data texture");
+    }
+
     auto depthMSAADesc = [[MTLTextureDescriptor alloc] init];
     depthMSAADesc.textureType = MTLTextureType2DMultisample;
     depthMSAADesc.pixelFormat = PixelFormats::SCENE_DEPTH;
@@ -472,6 +486,7 @@ void RenderPipeline::allocateSceneTargets() {
     depthMSAADesc.usage = MTLTextureUsageRenderTarget;
     depthMSAADesc.storageMode = MTLStorageModeMemoryless;
     _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
+    resetMetalObject(depthMSAADesc);
     if (!_depthMSAA) {
         RY_LOG_FATAL("Failed to allocate MSAA depth texture");
     }
@@ -485,6 +500,18 @@ void RenderPipeline::allocateSceneTargets() {
     _colorResolve = [_device newTextureWithDescriptor:colorResolveDesc];
     if (!_colorResolve) {
         RY_LOG_FATAL("Failed to allocate color resolve texture");
+    }
+
+    auto surfaceResolveDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:PixelFormats::SURFACE
+                                                           width:_displayWidth
+                                                          height:_displayHeight
+                                                       mipmapped:false];
+    surfaceResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    surfaceResolveDesc.storageMode = MTLStorageModePrivate;
+    _surfaceResolve = [_device newTextureWithDescriptor:surfaceResolveDesc];
+    if (!_surfaceResolve) {
+        RY_LOG_FATAL("Failed to allocate surface-data resolve texture");
     }
 
     // ---- Water pass inputs ----
@@ -501,17 +528,25 @@ void RenderPipeline::allocateSceneTargets() {
     if (!_depthResolve) {
         RY_LOG_FATAL("Failed to allocate depth resolve texture");
     }
+    _mediaDepthResolve = [_device newTextureWithDescriptor:depthResolveDesc];
+    _mediaDepthResolve.label = @"Opaque and Water Media Depth";
+    if (!_mediaDepthResolve) {
+        RY_LOG_FATAL("Failed to allocate media depth texture");
+    }
 
-    // Refraction samples a copy of the resolved color (a render target
-    // cannot sample itself)
+    // Refraction samples level zero of a copy of the resolved color (a render
+    // target cannot sample itself). SSR additionally uses the complete HDR
+    // mip pyramid so long grazing reflections cannot minify sharp distant
+    // geometry into a checkerboard of hit-or-sky decisions.
     auto sceneCopyDesc =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:PixelFormats::SCENE_HDR
                                                            width:_displayWidth
                                                           height:_displayHeight
-                                                       mipmapped:false];
+                                                       mipmapped:true];
     sceneCopyDesc.usage = MTLTextureUsageShaderRead;
     sceneCopyDesc.storageMode = MTLStorageModePrivate;
     _sceneColorCopy = [_device newTextureWithDescriptor:sceneCopyDesc];
+    _sceneColorCopy.label = @"Water Reflection and Refraction Pyramid";
     if (!_sceneColorCopy) {
         RY_LOG_FATAL("Failed to allocate scene copy texture");
     }
@@ -527,11 +562,13 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                             const UIFrameState& uiFrame,
                             const std::vector<std::shared_ptr<Entity>>* entities,
                             const std::vector<ItemEntity>* itemEntities,
-                            const std::vector<Boat>* boats) {
+                            const std::vector<Boat>* boats,
+                            std::shared_ptr<const WeatherSnapshot> weatherSnapshot,
+                            const std::vector<LightningEvent>* lightningEvents) {
     if (!drawable || !queue)
         return;
 
-    // Track the true drawable size (pixels, not view points — 2x on Retina)
+    // Track the true drawable size (pixels, not view points, 2x on Retina)
     // so the scene targets always match the surface we resolve into.
     if (drawable.texture.width != _displayWidth || drawable.texture.height != _displayHeight) {
         resize(static_cast<uint32_t>(drawable.texture.width),
@@ -574,7 +611,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
 
     // Fill the sky's per-pixel-ray inputs (the sun/moon are true
     // direction-projected discs now, so the atmosphere needs the camera
-    // basis — computeDayNightUniforms only knows the time of day).
+    // basis, computeDayNightUniforms only knows the time of day).
     {
         Vec3 camFwd = camera.forward();
         Vec3 camRight = camera.right();
@@ -587,6 +624,15 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
             static_cast<float>(_displayWidth) / static_cast<float>(std::max(_displayHeight, 1u));
     }
 
+    const Vec3 cameraPosition = camera.getPosition();
+    WeatherSample localWeather{};
+    if (weatherSnapshot) {
+        localWeather = weatherSnapshot->sample(cameraPosition.x, cameraPosition.z, worldTime);
+    }
+    const FoliageWindUniforms foliageWind = makeFoliageWindUniforms(
+        localWeather.windBlocksPerSecond.x, localWeather.windBlocksPerSecond.y, _gfx.wavingFoliage);
+    _clouds->setQuality(_gfx.cloudQuality);
+
     // Create command buffer
     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
     if (!commandBuffer)
@@ -597,11 +643,33 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     // Claim a frames-in-flight slot: every per-frame uniform block below
     // sub-allocates from it, so the CPU never rewrites data the GPU reads.
     _frameRing.waitAndBegin();
+    if (weatherSnapshot) {
+        _clouds->updateWeather(*weatherSnapshot, worldTime,
+                               static_cast<uint32_t>(_frameRing.frameIndex()));
+    }
     FrameRing::Alloc skyAlloc = _frameRing.push(&skyUniforms, sizeof(SkyUniforms));
 
-    // ---- Scene pass: sky → chunks → highlight → particles → clouds ----
-    // Everything renders into the 4x MSAA target and resolves once into
-    // _colorResolve. The memoryless depth buffer is discarded at pass end.
+    // Slow atmosphere LUTs and the snapped cloud transmittance map precede
+    // every geometry pass that samples them.
+    const AtmosphereUniforms atmosphereUniforms = earthAtmosphereUniforms(
+        cameraPosition.y, skyUniforms.sunDirection, simd_make_float3(1.0F, 1.0F, 0.98F),
+        std::max(localWeather.aerosolDensity, 0.08F), localWeather.relativeHumidity,
+        static_cast<uint32_t>(_frameRing.frameIndex()));
+    _atmosphere->encode(commandBuffer, atmosphereUniforms, false, _gpuTimer.get());
+    if (weatherSnapshot && _gfx.cloudQuality > 0 && shadowStrength > 0.0001F) {
+        CloudShadowUniforms cloudShadow{};
+        cloudShadow.cameraPosition =
+            simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+        cloudShadow.sunDirection =
+            simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
+        cloudShadow.footprintAndTexel =
+            simd_make_float4(16'384.0F, 0.0F, 1.0F, static_cast<float>(_frameRing.frameIndex()));
+        _clouds->encodeShadow(commandBuffer, cloudShadow, _gpuTimer.get());
+    }
+
+    // ---- Scene pass: sky, opaque chunks, entities, and highlights ----
+    // Geometry renders into the 4x MSAA targets and resolves once into the
+    // HDR color, linear-depth source, and surface-data attachments.
     auto renderPassDesc = [[MTLRenderPassDescriptor alloc] init];
     renderPassDesc.colorAttachments[0].texture = _colorMSAA;
     renderPassDesc.colorAttachments[0].resolveTexture = _colorResolve;
@@ -609,6 +677,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderPassDesc.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.colorAttachments[0].clearColor = MTLClearColorMake(
         skyUniforms.horizonColor.x, skyUniforms.horizonColor.y, skyUniforms.horizonColor.z, 1.0f);
+    renderPassDesc.colorAttachments[1].texture = _surfaceMSAA;
+    renderPassDesc.colorAttachments[1].resolveTexture = _surfaceResolve;
+    renderPassDesc.colorAttachments[1].loadAction = MTLLoadActionClear;
+    renderPassDesc.colorAttachments[1].storeAction = MTLStoreActionMultisampleResolve;
+    renderPassDesc.colorAttachments[1].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
     // Depth resolves out of tile memory (min filter: nearest sample) so the
     // water pass can depth-test and reconstruct world positions.
@@ -627,11 +700,13 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     const auto& loadedChunks = loadedSnapshot ? *loadedSnapshot : emptyChunks;
 
     // ---- Shadow cascades (depth-only passes before the scene pass) ----
-    renderShadows(commandBuffer, loadedChunks, camera, sunDirection, shadowStrength);
+    renderShadows(commandBuffer, loadedChunks, entities, camera, sunDirection, shadowStrength,
+                  foliageWind);
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
     if (!encoder) {
+        resetMetalObject(renderPassDesc);
         _frameRing.cancelFrame(); // nothing encoded references the slot
         return;
     }
@@ -639,14 +714,14 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderSky(encoder, skyAlloc);
 
     // Underwater the whole scene sinks into a dense blue veil (light
-    // attenuation) — owned entirely by the underwater overlay's depth-based
+    // attenuation), owned entirely by the underwater overlay's depth-based
     // scattering, so the scene/water passes apply no fog of their own below the
     // surface (two fogs stacked over-darkened the near water).
     const bool cameraUnderwater = uiFrame.cameraUnderwater;
     _cameraUnderwater = cameraUnderwater;
 
     // Sky exposure of the camera's water column: 0 when solid ground seals it
-    // (aquifers, roofed lakes — the same surface-height gate rain spawning
+    // (aquifers, roofed lakes, the same surface-height gate rain spawning
     // uses). Sunlight cannot reach covered water, so the underwater caustics,
     // sun-driven murk, and volumetric shafts all scale by this. Eased so
     // swimming under an overhang lip fades rather than pops.
@@ -676,24 +751,24 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
 
     const float fogColor[3] = {skyUniforms.horizonColor.x, skyUniforms.horizonColor.y,
                                skyUniforms.horizonColor.z};
+    // Air extinction belongs exclusively to the froxel or LUT aerial-
+    // perspective path later in the frame. The geometry and water shaders
+    // keep their compatibility fog inputs neutral so atmospheric density is
+    // never applied twice. Underwater absorption remains a separate medium.
     const float savedFogDensity = _fogDensity;
-    {
-        // Morning fog: a dawn haze that thickens fog and burns off by
-        // mid-morning (worldTime 0 is sunrise; peak just after, gone ~2500).
-        float t = static_cast<float>(worldTime % TICKS_PER_DAY);
-        float fromDawn = std::min(std::abs(t - 700.0f), 24000.0f - std::abs(t - 700.0f));
-        float morning = std::max(0.0f, 1.0f - fromDawn / 1800.0f);
-        _fogDensity *= 1.0f + 5.0f * morning * morning;
-    }
-    if (cameraUnderwater) {
-        _fogDensity = 0.0f; // the overlay owns the underwater murk
-    }
+    _fogDensity = 0.0F;
     renderChunks(encoder, world, loadedChunks, viewMatrix, projectionMatrix, camera.getPosition(),
-                 sunDirection, sunColor, ambientColor, fogColor);
+                 sunDirection, sunColor, ambientColor, fogColor, foliageWind);
 
     if (entities && _entityRenderer) {
-        _entityRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset, *entities,
-                                [this](const AABB& aabb) { return isChunkInFrustum(aabb); });
+        _entityRenderer->render(
+            encoder, _frameUniforms.buffer, _frameUniforms.offset, *entities,
+            [this](const AABB& aabb) { return isChunkInFrustum(aabb); },
+            [&world](const Vec3& position) {
+                return world.getPackedLightIfLoaded(static_cast<int64_t>(std::floor(position.x)),
+                                                    static_cast<int32_t>(std::floor(position.y)),
+                                                    static_cast<int64_t>(std::floor(position.z)));
+            });
     }
     if (itemEntities && _itemEntityRenderer) {
         _itemEntityRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset,
@@ -709,61 +784,174 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         renderBlockHighlight(encoder, highlightedBlock.value(), viewMatrix, projectionMatrix);
     }
 
-    if (_particles) {
-        _particles->render(encoder, _frameRing, viewMatrix, projectionMatrix, camera.getPosition());
-    }
-
-    if (_gfx.cloudMode != 0) {
-        renderClouds(encoder, camera, worldTime, sunDirection, skyUniforms.sunIntensity);
-    }
-
     [encoder endEncoding];
+    resetMetalObject(renderPassDesc);
 
-    // ---- Screen-space ambient occlusion (darkens creases/caves) ----
-    // Applied to the resolved opaque scene *before* water and volumetrics so it
-    // only darkens opaque ambient — never the translucent water surface or the
-    // additive light shafts, which AO (an opaque-ambient term) must not touch.
-    if (_gfx.ssao) {
-        SsaoUniforms su{};
-        std::memcpy(&su.projection, projectionMatrix.data.data(), sizeof(su.projection));
-        su.invProjection = simd_inverse(su.projection);
-        su.resolution = _ssao->resolution();
-        su.radius = 0.5f;
-        su.strength = 0.6f;
-        su.bias = 0.06f; // grazing ground has a steep depth slope; a bigger
-                         // bias keeps flat surfaces from self-occluding (streaks)
-        su.frameIndex = static_cast<uint32_t>(_frameRing.frameIndex());
-        _ssao->encode(commandBuffer, _colorResolve, _depthResolve, su);
+    // ---- GTAO, ambient accessibility, and near-field diffuse SSGI ----
+    simd_float4x4 projection{};
+    simd_float4x4 viewProjection{};
+    std::memcpy(&projection, projectionMatrix.data.data(), sizeof(projection));
+    std::memcpy(&viewProjection, vpMatrix.data.data(), sizeof(viewProjection));
+    if (_hasPreviousWorldTime &&
+        (worldTime < _previousWorldTime || worldTime > _previousWorldTime + 4U)) {
+        ++_forcedStateRevision;
+    }
+    const bool weatherSnapshotPresent = weatherSnapshot != nullptr;
+    if (weatherSnapshotPresent != _weatherSnapshotWasPresent) {
+        ++_forcedStateRevision;
+    }
+    if (weatherSnapshot) {
+        const uint8_t weatherPreset = static_cast<uint8_t>(weatherSnapshot->preset());
+        if (_weatherSnapshotWasPresent && weatherPreset != _previousWeatherPreset) {
+            ++_forcedStateRevision;
+        }
+        _previousWeatherPreset = weatherPreset;
+    }
+    _weatherSnapshotWasPresent = weatherSnapshotPresent;
+    IndirectHistoryState currentHistory{};
+    currentHistory.width = _displayWidth;
+    currentHistory.height = _displayHeight;
+    currentHistory.cameraPosition = cameraPosition;
+    currentHistory.fovDegrees = camera.FOV();
+    currentHistory.worldIdentity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&world)) ^
+                                   (static_cast<uint64_t>(world.getSeed()) << 32U);
+    currentHistory.forcedStateRevision = _forcedStateRevision;
+    currentHistory.quality = _gfx.indirectLightingQuality;
+    currentHistory.directLightSource = _activeCelestialSource;
+    // Ambient-only mode has no SSGI depth history to invalidate. Treat that
+    // state as stable so disabling indirect light cannot erase the independent
+    // cloud and froxel temporal histories every frame.
+    currentHistory.priorDepthValid =
+        _gfx.indirectLightingQuality == 0 || _screenSpaceLighting->historyValid();
+    const uint32_t historyReset = indirectHistoryResetMask(*_indirectHistoryState, currentHistory);
+    _indirectHistoryResetMask = historyReset;
+    _screenSpaceLighting->setQuality(_gfx.indirectLightingQuality);
+    if (historyReset != INDIRECT_HISTORY_STABLE) {
+        _screenSpaceLighting->resetHistory();
+        _clouds->resetHistory();
+        _volumetrics->resetHistory();
+    }
+    *_indirectHistoryState = currentHistory;
+
+    IndirectLightingUniforms indirect{};
+    indirect.projection = projection;
+    indirect.invProjection = simd_inverse(projection);
+    indirect.invViewProjection = simd_inverse(viewProjection);
+    indirect.previousViewProjection = _previousViewProjection;
+    // The final term calibrates one visible bounce against our unit direct
+    // sunlight. Keep it below direct illumination while preserving a readable
+    // spill from a sunlit voxel into an otherwise dark cave entrance.
+    indirect.traceParams = simd_make_float4(8.0F, 0.15F, 0.70F, 0.65F);
+    // Color history clamps at two accumulated standard deviations so a
+    // sparse-but-real bright source survives, while ambient occlusion clamps
+    // at one so disocclusion darkening reacts within a frame.
+    indirect.temporalParams = simd_make_float4(0.90F, 2.0F, 1.0F, 4.0F);
+    // The day-night sky level (1 in daylight, 0 deep at night) scales the
+    // additive SSGI bounce so night auto-exposure cannot amplify the near-field
+    // one-bounce into a camera-following ground disk. It reuses the same
+    // celestial signal the water tint fades by, so the two never drift.
+    const float dayNightSkyLevel = std::clamp(1.0F - skyUniforms.visibilityAndPhase.w, 0.0F, 1.0F);
+    indirect.filterParams = simd_make_float4(_gfx.indirectLightingQuality >= 2 ? 24.0F : 16.0F,
+                                             4.0F, 4.0F, dayNightSkyLevel);
+    indirect.ambientAndFrame = simd_make_float4(ambientColor[0], ambientColor[1], ambientColor[2],
+                                                static_cast<float>(_frameRing.frameIndex()));
+    _screenSpaceLighting->encode(commandBuffer, _colorResolve, _depthResolve, _surfaceResolve,
+                                 indirect, _gpuTimer.get());
+
+    // ---- Quarter-resolution physical volumetric clouds ----
+    if (weatherSnapshot && _gfx.cloudQuality > 0) {
+        CloudRenderUniforms cloud{};
+        cloud.invViewProjection = simd_inverse(viewProjection);
+        cloud.previousViewProjection = _previousViewProjection;
+        cloud.cameraPosition =
+            simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+        cloud.cameraForward = skyUniforms.cameraForward;
+        cloud.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
+        cloud.sunRadiance = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
+        cloud.skyIrradiance = simd_make_float3(ambientColor[0], ambientColor[1], ambientColor[2]);
+        cloud.layerBounds = simd_make_float4(96.0F, 768.0F, 16.0F, CLOUD_HORIZON_VIEW_DEPTH);
+        cloud.densityParams = simd_make_float4(1.0F, 0.38F, 0.035F, 0.18F);
+        cloud.phaseParams = simd_make_float4(0.78F, -0.20F, 0.82F, 0.0F);
+        cloud.resolutionAndFrame.z = static_cast<float>(_frameRing.frameIndex());
+        _clouds->encode(commandBuffer, _colorResolve, _depthResolve, cloud, _gpuTimer.get());
+    }
+
+    // ---- Deterministic cloud-aware lightning ----
+    if (lightningEvents && !lightningEvents->empty()) {
+        _lightning->encode(commandBuffer, _colorResolve, _depthResolve, _clouds->resolvedHitDepth(),
+                           viewProjection,
+                           simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z),
+                           *lightningEvents, worldTime, 20.0F, _gpuTimer.get());
+        _lastLightningEventId = _lightning->stats().lastEventId;
+    } else {
+        _lastLightningEventId = 0;
     }
 
     // ---- Water pass (refraction/reflection/caustics over the resolved scene) ----
     renderWater(commandBuffer, viewMatrix, projectionMatrix, camera.getPosition(), cameraUnderwater,
-                skyUniforms, fogColor);
+                skyUniforms, sunDirection, sunColor, fogColor);
     _fogDensity = savedFogDensity;
 
-    // ---- Volumetric light shafts (over the resolved opaque + water) ----
-    // Needs the shadow cascades: when shadows are off their matrices are zero
-    // and the march would divide by zero, so gate on shadowQuality too.
-    if (_gfx.volumetricLight && _gfx.shadowQuality > 0 && shadowStrength > 0.001f) {
-        VolumetricUniforms vu{};
-        std::memcpy(&vu.invViewProjection, &vpMatrix, sizeof(vu.invViewProjection));
-        vu.invViewProjection = simd_inverse(vu.invViewProjection);
-        Vec3 camPos = camera.getPosition();
-        vu.cameraPosition = simd_make_float3(camPos.x, camPos.y, camPos.z);
-        vu.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
-        vu.sunColor = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
-        vu.stepCount = 24.0f;
-        // Covered water (aquifers, roofed lakes) receives no sunlight: the
-        // cascades cannot occlude terrain hundreds of blocks up, so without
-        // this gate sealed pockets grew impossible sun shafts.
-        vu.density = 0.055f * (cameraUnderwater ? _uwSkyExposure : 1.0f);
-        vu.anisotropy = 0.6f; // forward scatter → bright halo toward the light
-        vu.maxDistance = 96.0f;
-        vu.underwater = cameraUnderwater ? 1.0f : 0.0f;
-        vu.frameIndex = static_cast<uint32_t>(_frameRing.frameIndex());
-        _volumetrics->encode(commandBuffer, _colorResolve, _depthResolve,
-                             _shadowMap->depthTexture(), _shadowMap->comparisonSampler(), vu,
-                             _sceneShadowUniforms);
+    // ---- Unified air medium (over opaque, clouds, and water) ----
+    // The same weather, atmosphere, terrain-shadow, and cloud-shadow state
+    // feeds fog and shafts. Disabling volumetric lighting retains the cheap
+    // LUT aerial-perspective path. Underwater absorption remains exclusively
+    // in the water renderer.
+    FroxelUniforms froxel{};
+    froxel.invViewProjection = simd_inverse(viewProjection);
+    froxel.previousViewProjection = _previousViewProjection;
+    froxel.viewProjection = viewProjection;
+    froxel.cameraPosition = simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
+    froxel.lightDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
+    froxel.lightRadiance = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
+    froxel.solarDirection = skyUniforms.sunDirection;
+    froxel.volumeDimensions = simd_make_uint4(FROXEL_WIDTH, FROXEL_HEIGHT, FROXEL_DEPTH,
+                                              static_cast<uint32_t>(_frameRing.frameIndex()));
+    froxel.depthParams = simd_make_float4(0.1F, SHADOW_HORIZON_DISTANCE, 16'384.0F,
+                                          cameraUnderwater ? _uwSurfaceY : -65'536.0F);
+    froxel.mediumParams = simd_make_float4(std::max(savedFogDensity, 0.0F), 0.92F, 0.62F, 800.0F);
+    froxel.weatherParams =
+        simd_make_float4(std::max(localWeather.aerosolDensity, 0.0F),
+                         std::clamp(localWeather.relativeHumidity, 0.0F, 1.0F),
+                         std::clamp(localWeather.precipitationIntensity, 0.0F, 1.0F),
+                         std::max(localWeather.fogExtinction, 0.0F));
+    if (weatherSnapshot) {
+        froxel.weatherMap = _clouds->weatherMapForCamera(froxel.cameraPosition);
+    }
+    froxel.renderParams =
+        simd_make_float4(0.90F, historyReset == INDIRECT_HISTORY_STABLE ? 1.0F : 0.0F,
+                         shadowStrength, cameraUnderwater ? 1.0F : 0.0F);
+    _volumetrics->encode(
+        commandBuffer, _colorResolve, _mediaDepthResolve, _shadowMap->nearDepthTexture(),
+        _shadowMap->farDepthTexture(), _shadowMap->horizonDepthTexture(),
+        _atmosphere->skyViewTexture(), _clouds ? _clouds->shadowTexture() : nil,
+        _clouds ? _clouds->resolvedHitDepth() : nil,
+        weatherSnapshot ? _clouds->weatherCloudTexture() : nil,
+        weatherSnapshot ? _clouds->weatherLayerTexture() : nil, _shadowMap->comparisonSampler(),
+        froxel, _sceneShadowUniforms, _clouds ? _clouds->shadowUniforms() : CloudShadowUniforms{},
+        _gfx.volumetricLight, _gpuTimer.get());
+
+    // ---- Depth-tested weather particles ----
+    // Draw precipitation after the air medium so particles receive analytic
+    // atmospheric attenuation without being fogged a second time.
+    if (_particles && weatherParticlesVisible(cameraUnderwater)) {
+        auto weatherPass = [[MTLRenderPassDescriptor alloc] init];
+        weatherPass.colorAttachments[0].texture = _colorResolve;
+        weatherPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        weatherPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        weatherPass.depthAttachment.texture = _mediaDepthResolve;
+        weatherPass.depthAttachment.loadAction = MTLLoadActionLoad;
+        weatherPass.depthAttachment.storeAction = MTLStoreActionStore;
+        _gpuTimer->attachPass(weatherPass, "weatherParticles");
+        id<MTLRenderCommandEncoder> weatherEncoder =
+            [commandBuffer renderCommandEncoderWithDescriptor:weatherPass];
+        if (weatherEncoder) {
+            weatherEncoder.label = @"Atmospherically Attenuated Weather";
+            _particles->render(weatherEncoder, _frameRing, viewMatrix, projectionMatrix,
+                               cameraPosition, localWeather, savedFogDensity);
+            [weatherEncoder endEncoding];
+        }
+        resetMetalObject(weatherPass);
     }
 
     // ---- Auto-exposure (measure the finished HDR scene, ease adaptation) ----
@@ -789,16 +977,18 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         if (sunClip.w > 1e-4f) { // sun in front of the camera
             sunUV = simd_make_float2((sunClip.x / sunClip.w) * 0.5f + 0.5f,
                                      0.5f - (sunClip.y / sunClip.w) * 0.5f);
-            // Fade out as the sun crosses the screen edge — the probe has no
+            // Fade out as the sun crosses the screen edge, the probe has no
             // depth data outside the frame, and a hard cut would pop.
             float edge =
                 std::min(std::min(sunUV.x, 1.0f - sunUV.x), std::min(sunUV.y, 1.0f - sunUV.y));
             float fade = std::clamp((edge + 0.1f) / 0.2f, 0.0f, 1.0f);
-            flareStrength = skyUniforms.sunIntensity * fade;
+            flareStrength = skyUniforms.visibilityAndPhase.x * fade;
         }
     }
     if (flareStrength > 0.0f) {
-        _postStack->encodeFlareProbe(commandBuffer, _depthResolve, sunUV);
+        _postStack->encodeFlareProbe(commandBuffer, _mediaDepthResolve,
+                                     _gfx.cloudQuality > 0 ? _clouds->resolvedCloudTexture() : nil,
+                                     sunUV);
     }
 
     // ---- Final composite (always runs: tonemap + grade + sharpen) ----
@@ -821,6 +1011,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         renderUIOverlay(uiEncoder, uiFrame);
         [uiEncoder endEncoding];
     }
+    resetMetalObject(uiPassDesc);
 
     // ---- Optional frame capture (playtest verification) ----
     if (!_capturePath.empty()) {
@@ -828,6 +1019,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     }
 
     _gpuTimer->endFrame(commandBuffer);
+    _previousViewProjection = viewProjection;
+    _previousWorldTime = worldTime;
+    _hasPreviousWorldTime = true;
     _frameRing.signalOnCompletion(commandBuffer);
 
     // Present and commit
@@ -911,7 +1105,7 @@ void RenderPipeline::endWorldSession() {
 }
 
 // ---------------------------------------------------------------------------
-// Frame capture — copy the finished drawable into a shared texture and write
+// Frame capture, copy the finished drawable into a shared texture and write
 // it out as a PNG once the GPU finishes. Lets automated playtests inspect
 // real frames without macOS screen-recording permissions.
 // ---------------------------------------------------------------------------
@@ -998,89 +1192,55 @@ void RenderPipeline::encodeFrameCapture(id<MTLCommandBuffer> commandBuffer,
 void RenderPipeline::computeDayNightUniforms(uint64_t worldTime, float sunDirection[3],
                                              float sunColor[3], float ambientColor[3],
                                              SkyUniforms& skyUniforms, float& shadowStrength) {
-    // Full day = 24000 ticks (20 minutes real time at 20Hz)
+    const CelestialState celestial = computeCelestialState(worldTime);
+    _lunarPhaseEnergy = celestial.phaseEnergy;
+    _lunarPhaseCycle = celestial.phaseCycle;
+    _directSpecularFactor = celestial.directSpecularFactor;
+    _activeCelestialSource = static_cast<uint8_t>(celestial.directSource);
+    sunDirection[0] = celestial.directLightDirection.x;
+    sunDirection[1] = celestial.directLightDirection.y;
+    sunDirection[2] = celestial.directLightDirection.z;
+    sunColor[0] = celestial.directLightRadiance.x;
+    sunColor[1] = celestial.directLightRadiance.y;
+    sunColor[2] = celestial.directLightRadiance.z;
+    ambientColor[0] = celestial.ambientRadiance.x;
+    ambientColor[1] = celestial.ambientRadiance.y;
+    ambientColor[2] = celestial.ambientRadiance.z;
+    shadowStrength = celestial.shadowStrength;
 
-    // Orbital angle: 0 = dawn, PI/2 = noon, PI = dusk, 3PI/2 = midnight
-    float dayFraction =
-        static_cast<float>(worldTime % TICKS_PER_DAY) / static_cast<float>(TICKS_PER_DAY);
-    float orbitalAngle = dayFraction * 2.0f * static_cast<float>(M_PI);
-
-    // Real sun position (slight Z tilt for depth); the sky's sun disc uses
-    // this. sunElevation: 1 at noon, -1 at midnight. The moon rides opposite.
-    float realSun[3] = {std::cos(orbitalAngle), std::sin(orbitalAngle), 0.3f};
-    float sunElevation = std::sin(orbitalAngle);
-    float realMoon[3] = {-realSun[0], -realSun[1], 0.3f};
-
-    auto blend3 = [](const float a[3], const float b[3], float t, float out[3]) {
-        for (int i = 0; i < 3; ++i) {
-            out[i] = a[i] + (b[i] - a[i]) * t;
-        }
+    const float daylight = std::clamp((celestial.sunDirection.y + 0.10F) / 0.45F, 0.0F, 1.0F);
+    const float night = celestial.starVisibility;
+    const simd_float3 twilightZenith = simd_make_float3(0.15F, 0.10F, 0.30F);
+    const simd_float3 twilightHorizon = simd_make_float3(0.60F, 0.30F, 0.20F);
+    const simd_float3 dayZenith = simd_make_float3(0.20F, 0.40F, 0.80F);
+    const simd_float3 dayHorizon = simd_make_float3(0.53F, 0.81F, 0.92F);
+    const simd_float3 nightZenith = simd_make_float3(0.02F, 0.02F, 0.05F);
+    const simd_float3 nightHorizon = simd_make_float3(0.05F, 0.05F, 0.10F);
+    const auto mixColor = [](simd_float3 from, simd_float3 to, float amount) {
+        return from + (to - from) * amount;
     };
 
-    // ---- Sun lit color: white at noon, orange at sunrise/sunset ----
-    float sunColorDay[3] = {1.0f, 0.95f + 0.05f * std::clamp(sunElevation, 0.0f, 1.0f),
-                            0.9f + 0.1f * std::clamp(sunElevation, 0.0f, 1.0f)};
-    float sunColorSunset[3] = {1.0f, 0.5f, 0.2f};
-    float dayBlend = std::clamp(sunElevation / 0.35f, 0.0f, 1.0f);
-    float nightBlend = std::clamp((-sunElevation - 0.05f) / 0.30f, 0.0f, 1.0f);
-    float sunLit[3];
-    blend3(sunColorSunset, sunColorDay, dayBlend, sunLit);
-
-    // ---- Ambient: bright at noon, dim (never black) at night so caves and
-    // night surfaces keep a floor of sky/moon bounce ----
-    float ambientDay[3] = {0.35f, 0.35f, 0.4f};
-    float ambientNight[3] = {0.1f, 0.1f, 0.15f};
-    float ambientT = std::clamp((sunElevation + 0.2f) / 0.6f, 0.0f, 1.0f);
-    blend3(ambientNight, ambientDay, ambientT, ambientColor);
-
-    // ---- Sky palette (also the fog color) ----
-    float dayZenith[3] = {0.2f, 0.4f, 0.8f};
-    float dayHorizon[3] = {0.53f, 0.81f, 0.92f};
-    float nightZenith[3] = {0.02f, 0.02f, 0.05f};
-    float nightHorizon[3] = {0.05f, 0.05f, 0.1f};
-    float twilightZenith[3] = {0.15f, 0.1f, 0.3f};
-    float twilightHorizon[3] = {0.6f, 0.3f, 0.2f};
-    float zenith[3];
-    float horizon[3];
-    blend3(twilightZenith, dayZenith, dayBlend, zenith);
-    blend3(zenith, nightZenith, nightBlend, zenith);
-    blend3(twilightHorizon, dayHorizon, dayBlend, horizon);
-    blend3(horizon, nightHorizon, nightBlend, horizon);
-
-    skyUniforms.zenithColor = simd_make_float3(zenith[0], zenith[1], zenith[2]);
-    skyUniforms.horizonColor = simd_make_float3(horizon[0], horizon[1], horizon[2]);
-    skyUniforms.sunDirection = simd_make_float3(realSun[0], realSun[1], realSun[2]);
-    skyUniforms.moonDirection = simd_make_float3(realMoon[0], realMoon[1], realMoon[2]);
-    skyUniforms.sunColor = simd_make_float3(sunLit[0], sunLit[1], sunLit[2]);
-    skyUniforms.sunIntensity = std::max(0.0f, sunElevation);
-    skyUniforms.starStrength = std::clamp(-sunElevation / 0.2f, 0.0f, 1.0f);
-
-    // ---- Active directional light for terrain + shadows ----
-    // Sun while above the horizon, moon below it. Each fades to nothing at the
-    // horizon crossing (grazing light is near-zero there anyway), so the
-    // discrete direction swap lands where the term is invisible — no pop. The
-    // moon is a dim cool light so nights stay navigable, not pitch black.
-    float sunFade = std::clamp(sunElevation / 0.10f, 0.0f, 1.0f);
-    float moonFade = std::clamp(-sunElevation / 0.15f, 0.0f, 1.0f);
-    const float moonlight[3] = {0.16f, 0.20f, 0.38f};
-
-    if (sunElevation >= 0.0f) {
-        for (int i = 0; i < 3; ++i) {
-            sunDirection[i] = realSun[i];
-            sunColor[i] = sunLit[i] * sunFade;
-        }
-        shadowStrength = 0.85f * sunFade;
-    } else {
-        for (int i = 0; i < 3; ++i) {
-            sunDirection[i] = realMoon[i];
-            sunColor[i] = moonlight[i] * moonFade;
-        }
-        shadowStrength = 0.30f * moonFade; // moon shadows are soft and faint
-    }
+    skyUniforms.sunDirection = simd_make_float3(celestial.sunDirection.x, celestial.sunDirection.y,
+                                                celestial.sunDirection.z);
+    skyUniforms.moonDirection = simd_make_float3(
+        celestial.moonDirection.x, celestial.moonDirection.y, celestial.moonDirection.z);
+    skyUniforms.sunColor =
+        simd_make_float3(celestial.solarDiscRadiance.x, celestial.solarDiscRadiance.y,
+                         celestial.solarDiscRadiance.z);
+    skyUniforms.moonColor =
+        simd_make_float3(celestial.lunarDiscRadiance.x, celestial.lunarDiscRadiance.y,
+                         celestial.lunarDiscRadiance.z);
+    skyUniforms.zenithColor =
+        mixColor(mixColor(twilightZenith, dayZenith, daylight), nightZenith, night);
+    skyUniforms.horizonColor =
+        mixColor(mixColor(twilightHorizon, dayHorizon, daylight), nightHorizon, night);
+    skyUniforms.visibilityAndPhase =
+        simd_make_float4(celestial.sunVisibility, celestial.moonVisibility, celestial.phaseEnergy,
+                         celestial.starVisibility);
 }
 
 // ---------------------------------------------------------------------------
-// renderSky — fullscreen gradient drawn first in the scene pass
+// renderSky, fullscreen gradient drawn first in the scene pass
 // ---------------------------------------------------------------------------
 void RenderPipeline::renderSky(id<MTLRenderCommandEncoder> encoder,
                                const FrameRing::Alloc& skyUniforms) {
@@ -1088,72 +1248,157 @@ void RenderPipeline::renderSky(id<MTLRenderCommandEncoder> encoder,
     [encoder setDepthStencilState:_skyDepthState];
     [encoder setVertexBuffer:skyUniforms.buffer offset:skyUniforms.offset atIndex:1];
     [encoder setFragmentBuffer:skyUniforms.buffer offset:skyUniforms.offset atIndex:1];
+    [encoder setFragmentTexture:_atmosphere->skyViewTexture() atIndex:0];
+    [encoder setFragmentTexture:_atmosphere->transmittanceTexture() atIndex:1];
 
     // Draw fullscreen quad (6 vertices, no index buffer)
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 }
 
 // ---------------------------------------------------------------------------
-// renderShadows — depth-only cascade passes. Uses last frame's uploaded mesh
+// renderShadows, depth-only cascade passes. Uses last frame's uploaded mesh
 // registry (a streaming chunk casting a shadow one frame late is invisible),
 // so it can run before renderChunks rebuilds it. A no-op at shadowQuality 0 or
 // zero strength (the horizon crossing), where _sceneShadowUniforms carries
-// strength 0 and the chunk fragment falls back to the baked skylight. The
+// strength 0 and the chunk fragment falls back to propagated skylight. The
 // active light (sun by day, moon by night) and its strength come from
-// computeDayNightUniforms. (Entities don't cast yet — small animals.)
+// computeDayNightUniforms. Exact chunks, far terrain, canopies, and entities
+// cast into the cascades selected by their shared ownership masks.
 // ---------------------------------------------------------------------------
 void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
                                    const std::vector<std::shared_ptr<Chunk>>& loadedChunks,
+                                   const std::vector<std::shared_ptr<Entity>>* entities,
                                    const Camera& camera, const float lightDirection[3],
-                                   float strength) {
+                                   float strength, const FoliageWindUniforms& foliageWind) {
+    _shadowCasterCounts.fill(0U);
     if (_gfx.shadowQuality == 0 || strength <= 0.001f) {
+        _shadowRefreshMask = 0U;
         _sceneShadowUniforms = ShadowUniforms{}; // strength 0 → chunk reads full sun
         return;
     }
 
-    _shadowMap->setResolution(_gfx.shadowQuality >= 2 ? 2048 : 1536);
+    _shadowMap->setQuality(static_cast<uint32_t>(_gfx.shadowQuality));
 
     Vec3 lightDir{lightDirection[0], lightDirection[1], lightDirection[2]};
-    constexpr float SHADOW_DISTANCE = 160.0f;
-    _shadowMap->computeCascades(camera.getPosition(), camera.forward(), camera.right(), camera.up(),
-                                camera.FOV() * static_cast<float>(M_PI) / 180.0f,
-                                static_cast<float>(_displayWidth) /
-                                    static_cast<float>(std::max(_displayHeight, 1u)),
-                                lightDir, SHADOW_DISTANCE, strength);
+    _shadowMap->computeCascades(
+        camera.getPosition(), camera.forward(), camera.FOV() * static_cast<float>(M_PI) / 180.0f,
+        static_cast<float>(_displayWidth) / static_cast<float>(std::max(_displayHeight, 1u)),
+        lightDir, strength);
+    std::array<uint64_t, SHADOW_CASCADE_COUNT> casterRevisions{};
+    const auto addCasterRevision = [&](uint64_t revision, const AABB& bounds) {
+        for (int cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+            if (_shadowMap->cascadeContains(cascade, bounds)) {
+                ++_shadowCasterCounts[static_cast<size_t>(cascade)];
+                casterRevisions[static_cast<size_t>(cascade)] ^= hash64(revision);
+            }
+        }
+    };
+    for (const auto& chunk : loadedChunks) {
+        if (!chunk) {
+            continue;
+        }
+        const auto mesh = _chunkMeshes.find(chunk->pos());
+        if (mesh != _chunkMeshes.end() && mesh->second.uploaded) {
+            const ChunkPos position = chunk->pos();
+            const uint64_t key = static_cast<uint64_t>(position.x) ^
+                                 (static_cast<uint64_t>(static_cast<uint32_t>(position.y)) << 21U) ^
+                                 (static_cast<uint64_t>(position.z) << 37U) ^
+                                 mesh->second.builtVersion;
+            addCasterRevision(key, chunk->getAABB());
+        }
+    }
+    for (const FarShadowDrawPlan& plan : _farShadowDrawPlans) {
+        const auto resident = _farTerrainMeshes.find(plan.key);
+        if (resident != _farTerrainMeshes.end()) {
+            const FarTerrainBounds& bounds = resident->second.surfaceBounds;
+            const AABB casterBounds{
+                {static_cast<float>(bounds.minX), bounds.minY, static_cast<float>(bounds.minZ)},
+                {static_cast<float>(bounds.maxX), bounds.maxY, static_cast<float>(bounds.maxZ)}};
+            const uint64_t revision = static_cast<uint64_t>(plan.coordinate.x) ^
+                                      (static_cast<uint64_t>(plan.coordinate.z) << 32U) ^
+                                      resident->second.deterministicHash ^
+                                      (static_cast<uint64_t>(plan.farMetadata.z) << 7U) ^
+                                      (static_cast<uint64_t>(plan.farMetadata.w) << 39U);
+            addCasterRevision(revision, casterBounds);
+        }
+    }
+    if (entities) {
+        for (const auto& entity : *entities) {
+            if (!entity || !entity->alive) {
+                continue;
+            }
+            const uint64_t revision =
+                entity->id ^
+                static_cast<uint64_t>(std::bit_cast<uint32_t>(entity->position.x)) << 1U ^
+                static_cast<uint64_t>(std::bit_cast<uint32_t>(entity->position.y)) << 22U ^
+                static_cast<uint64_t>(std::bit_cast<uint32_t>(entity->position.z)) << 43U;
+            for (int cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+                if (_shadowMap->entityCasterAffectsCascade(cascade, entity->aabb)) {
+                    ++_shadowCasterCounts[static_cast<size_t>(cascade)];
+                    casterRevisions[static_cast<size_t>(cascade)] ^= hash64(revision);
+                }
+            }
+        }
+    }
+    const uint32_t refreshMask =
+        _shadowMap->selectRefreshMask(_frameRing.frameIndex(), casterRevisions, lightDir);
+    _shadowRefreshMask = refreshMask;
     _sceneShadowUniforms = _shadowMap->shadowUniforms();
 
     for (int cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+        if ((refreshMask & (1U << static_cast<uint32_t>(cascade))) == 0U) {
+            continue;
+        }
         MTLRenderPassDescriptor* passDesc = _shadowMap->passDescriptor(cascade);
-        _gpuTimer->attachPass(passDesc, "shadow");
+        const char* passName = cascade < 2   ? "shadowNear"
+                               : cascade < 4 ? "shadowFar"
+                                             : "shadowHorizon";
+        _gpuTimer->attachPass(passDesc, passName);
         id<MTLRenderCommandEncoder> encoder =
             [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
-        if (!encoder)
+        if (!encoder) {
+            resetMetalObject(passDesc);
             continue;
+        }
 
         [encoder setRenderPipelineState:_shadowMap->chunkPipeline()];
         [encoder setDepthStencilState:_shadowMap->depthState()];
         [encoder setCullMode:MTLCullModeNone]; // greedy meshes are single-sided
         // Slope-scaled depth bias fights acne on faces near-parallel to the sun.
         // The clamp caps the slope term: vertical flora quads have near-infinite
-        // light-space slope, so they always land ON the clamp — at 0.005 NDC
+        // light-space slope, so they always land ON the clamp, at 0.005 NDC
         // (~0.7 blocks along the light) stems sank into the ground, detaching
         // every flower's shadow from its base and erasing thin grass shadows
         // entirely. Cascade 0 (where that contact detail is visible) gets a
         // 10x tighter clamp and leans on the receiver normal offset for acne;
-        // the far cascades keep the wide clamp — their NDC unit spans several
+        // the far cascades keep the wide clamp, their NDC unit spans several
         // blocks, so a tight clamp reintroduces acne at low sun while a
         // ~1-block caster offset is invisible at 20+ blocks away.
-        [encoder setDepthBias:1.0f slopeScale:2.5f clamp:(cascade == 0 ? 0.0005f : 0.005f)];
+        const float biasClamp = cascade == 0   ? 0.0005f
+                                : cascade == 1 ? 0.0010f
+                                : cascade < 4  ? 0.0030f
+                                               : 0.0060f;
+        [encoder setDepthBias:1.0f + 0.35f * static_cast<float>(cascade)
+                   slopeScale:2.5f
+                        clamp:biasClamp];
         [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
         [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
 
         ShadowPassUniforms passUniforms{};
         std::memcpy(&passUniforms.lightViewProj, _shadowMap->cascadeViewProj(cascade).data.data(),
                     sizeof(float) * 16);
+        const Vec3& projectionOrigin = _shadowMap->cascadeProjectionOrigin(cascade);
+        passUniforms.projectionOrigin =
+            simd_make_float4(projectionOrigin.x, projectionOrigin.y, projectionOrigin.z, 0.0F);
+        passUniforms.foliageWind =
+            shadowFoliageWindForCascade(foliageWind, static_cast<uint32_t>(cascade));
         passUniforms.time = _animTime;
-        passUniforms.swayStrength = _gfx.wavingFoliage ? 1.0f : 0.0f;
         [encoder setVertexBytes:&passUniforms length:sizeof(passUniforms) atIndex:1];
+        const FarTerrainOwnershipUniforms noFarOwnership{};
+        [encoder setFragmentBytes:&noFarOwnership length:sizeof(noFarOwnership) atIndex:5];
 
+        // Exact meshes cast first. Far terrain then uses the same ownership
+        // mask as the color pass, followed by the entity-specific vertex path.
         for (auto& chunk : loadedChunks) {
             if (!chunk || !chunk->generated)
                 continue;
@@ -1181,7 +1426,53 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
                                indexBuffer:meshState.alloc.indexBuffer
                          indexBufferOffset:meshState.alloc.indexOffset];
         }
+
+        // Replay the prior color pass's exact far draw authority. Transition
+        // source and target topologies retain their monotonic flags and the
+        // connected-coverage frontier, so hidden islands cannot cast and a
+        // retiring canopy never leaves a stale shadow behind.
+        const FarTerrainExactHandoff& shadowHandoff =
+            _farTerrainExactCoverage.sample(camera.getPosition().x, camera.getPosition().z);
+        for (const FarShadowDrawPlan& plan : _farShadowDrawPlans) {
+            const auto resident = _farTerrainMeshes.find(plan.key);
+            if (resident == _farTerrainMeshes.end() || !resident->second.uploaded ||
+                resident->second.opaqueIndexCount == 0) {
+                continue;
+            }
+            const FarTerrainMeshState& state = resident->second;
+            const FarTerrainBounds& bounds = state.surfaceBounds;
+            const AABB aabb{
+                {static_cast<float>(bounds.minX), bounds.minY, static_cast<float>(bounds.minZ)},
+                {static_cast<float>(bounds.maxX), bounds.maxY, static_cast<float>(bounds.maxZ)}};
+            if (!_shadowMap->cascadeContains(cascade, aabb)) {
+                continue;
+            }
+
+            ChunkOrigin origin{};
+            origin.origin = simd_make_float4(static_cast<float>(state.bounds.minX), 0.0F,
+                                             static_cast<float>(state.bounds.minZ), 0.0F);
+            origin.farMetadata = plan.farMetadata;
+            const FarTerrainOwnershipUniforms ownership =
+                farTerrainOwnershipUniforms(plan.coordinate, shadowHandoff);
+            [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
+            [encoder setFragmentBytes:&ownership length:sizeof(ownership) atIndex:5];
+            [encoder setVertexBuffer:state.alloc.vertexBuffer
+                              offset:state.alloc.vertexOffset
+                             atIndex:0];
+            [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:state.opaqueIndexCount
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:state.alloc.indexBuffer
+                         indexBufferOffset:state.alloc.indexOffset];
+        }
+        if (entities && _entityRenderer) {
+            _entityRenderer->renderShadows(
+                encoder, passUniforms, *entities, [this, cascade](const AABB& bounds) {
+                    return _shadowMap->entityCasterAffectsCascade(cascade, bounds);
+                });
+        }
         [encoder endEncoding];
+        resetMetalObject(passDesc);
     }
 }
 
@@ -1193,7 +1484,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                                   const Mat4& viewMatrix, const Mat4& projectionMatrix,
                                   const Vec3& cameraPosition, const float sunDirection[3],
                                   const float sunColor[3], const float ambientColor[3],
-                                  const float fogColor[3]) {
+                                  const float fogColor[3], const FoliageWindUniforms& foliageWind) {
     // Bind pipeline state
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setDepthStencilState:_depthState];
@@ -1227,9 +1518,9 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // Camera position for fog distance calculation
     uniforms.cameraPosition = simd_make_float3(camX, camY, camZ);
 
-    // Foliage sway clock + the waving toggle (0 freezes blades at rest)
+    // Scene and shadow passes use the same weather wind and animation clock.
+    uniforms.foliageWind = foliageWind;
     uniforms.time = _animTime;
-    uniforms.swayStrength = _gfx.wavingFoliage ? 1.0f : 0.0f;
     uniforms.wetness = _cameraUnderwater ? 0.0f : _wetness;
 
     // Upload to GPU (kept for the entity renderer + water vertex stage too)
@@ -1241,15 +1532,20 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
     [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
 
-    // Shadow sampling: the cascade array + comparison sampler + uniforms. When
-    // shadows are off the depth array still binds (validation requires a
-    // texture at the slot) but strength 0 keeps the fragment fully lit.
+    // Shadow sampling: two detailed arrays, the horizon texture, one
+    // comparison sampler, and one shared uniform block. Disabled shadows keep
+    // all targets bound for validation while strength zero returns full light.
     FrameRing::Alloc shadowAlloc = _frameRing.push(&_sceneShadowUniforms, sizeof(ShadowUniforms));
-    [encoder setFragmentTexture:_shadowMap->depthTexture() atIndex:1];
+    [encoder setFragmentTexture:_shadowMap->nearDepthTexture() atIndex:1];
+    [encoder setFragmentTexture:_shadowMap->farDepthTexture() atIndex:2];
+    [encoder setFragmentTexture:_shadowMap->horizonDepthTexture() atIndex:3];
+    [encoder setFragmentTexture:_clouds->shadowTexture() atIndex:4];
     [encoder setFragmentSamplerState:_shadowMap->comparisonSampler() atIndex:1];
     [encoder setFragmentBuffer:shadowAlloc.buffer offset:shadowAlloc.offset atIndex:4];
     const FarTerrainOwnershipUniforms noFarOwnership{};
     [encoder setFragmentBytes:&noFarOwnership length:sizeof(noFarOwnership) atIndex:5];
+    const CloudShadowUniforms& cloudShadow = _clouds->shadowUniforms();
+    [encoder setFragmentBytes:&cloudShadow length:sizeof(cloudShadow) atIndex:6];
 
     // Reset seed-owned far state before exact ownership is accumulated. The
     // second call in renderFarTerrain is then an inexpensive no-op.
@@ -1271,7 +1567,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     };
 
     // Recycle regions whose last GPU reader has finished, then sweep mesh
-    // allocations of chunks the world has since unloaded — freed space can
+    // allocations of chunks the world has since unloaded, freed space can
     // serve this frame's builds once its deferral window closes.
     _megaBuffer->drainDeferredFrees(_frameRing.completedFrame());
     _liveChunksByPosition.clear();
@@ -1436,6 +1732,12 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     _meshScheduler->drainCompleted(_pendingResults);
     constexpr int MAX_MESH_UPLOADS_PER_FRAME = 64;
     constexpr size_t MAX_UPLOAD_BYTES_PER_FRAME = 32 * 1024 * 1024;
+    // An edit synchronously relights its whole affected neighborhood (home cube
+    // plus the face, edge, and corner cubes light can reach), so let the edit
+    // fast path rebuild all of them in the same frame instead of trickling two
+    // per frame. It only bites on the post-edit frame and stays inside the
+    // upload count and byte budgets below.
+    constexpr int MAX_EDIT_SYNC_BUILDS_PER_FRAME = 8;
     constexpr int MAX_ASYNC_UPLOADS_PER_FRAME = MAX_MESH_UPLOADS_PER_FRAME - 2;
     constexpr size_t MAX_ASYNC_UPLOAD_BYTES_PER_FRAME =
         MAX_UPLOAD_BYTES_PER_FRAME - 4 * 1024 * 1024;
@@ -1450,7 +1752,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         ChunkPos key = result.pos;
         const auto live = _liveChunksByPosition.find(key);
         if (live == _liveChunksByPosition.end()) {
-            ++resultsConsumed; // chunk unloaded while meshing — drop
+            ++resultsConsumed; // chunk unloaded while meshing, drop
             continue;
         }
         if (!shouldMesh(key)) {
@@ -1499,7 +1801,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     //    synchronously so breaking a block never shows a stale frame.
     int syncBuilds = 0;
     for (auto& chunk : loadedChunks) {
-        if (!chunk || !chunk->generated || syncBuilds >= 2 || uploads >= MAX_MESH_UPLOADS_PER_FRAME)
+        if (!chunk || !chunk->generated || syncBuilds >= MAX_EDIT_SYNC_BUILDS_PER_FRAME ||
+            uploads >= MAX_MESH_UPLOADS_PER_FRAME)
             continue;
         if (std::abs(chunk->chunkX - camChunkX) > 2 || std::abs(chunk->chunkY - camChunkY) > 2 ||
             std::abs(chunk->chunkZ - camChunkZ) > 2)
@@ -1583,7 +1886,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         const uint64_t schedulerDistance =
             static_cast<uint64_t>(chunkDx * chunkDx + chunkDz * chunkDz + chunkDy * chunkDy * 2);
         if (!_meshScheduler->enqueue(pos, requestedVersion, lane, schedulerDistance)) {
-            break; // in-flight cap reached — re-prioritized next frame
+            break; // in-flight cap reached, re-prioritized next frame
         }
         ChunkMeshState* state = makeMeshSlot(pos);
         if (!state) {
@@ -1786,6 +2089,7 @@ void RenderPipeline::resetFarTerrain(uint64_t worldSeed, GenerationSettings gene
     _farTerrainDisplayedByTile.clear();
     _farTerrainComplexityByTile.clear();
     _farTerrainTransitions.clear();
+    _farShadowDrawPlans.clear();
     _farTerrainNearGraceStartedAt.clear();
     _farTerrainResults.clear();
     _farTerrainCandidates.clear();
@@ -2542,6 +2846,7 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
     uint32_t refinementDrawn = 0;
     uint32_t frustumCulled = 0;
     uint32_t occlusionCulled = 0;
+    _farShadowDrawPlans.clear();
     auto displayedKeyFor = [&](ColumnPos coordinate) -> std::optional<FarTerrainKey> {
         if (!_farTerrainActiveTiles.contains(coordinate))
             return std::nullopt;
@@ -2712,6 +3017,7 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
             origin.farMetadata.y = std::bit_cast<uint32_t>(coverage.distanceBlocks);
             origin.farMetadata.z = std::bit_cast<uint32_t>(plan.progress);
             origin.farMetadata.w = plan.flags;
+            _farShadowDrawPlans.push_back({coordinate, plan.key, origin.farMetadata});
 
             // Canopies use a monotonic target-in, source-out exchange, so
             // unrelated forest summaries never pass through an empty phase.
@@ -2818,25 +3124,64 @@ FarTerrainGenerationCacheStats RenderPipeline::farGenerationCacheStats() const {
                                 : FarTerrainGenerationCacheStats{};
 }
 
+RenderPipeline::AtmosphericRenderStats RenderPipeline::atmosphericRenderStats() const {
+    AtmosphericRenderStats stats;
+    stats.shadowRefreshMask = _shadowRefreshMask;
+    stats.shadowCasterCounts = _shadowCasterCounts;
+    if (_shadowMap) {
+        for (uint32_t cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+            stats.shadowRefreshCounts[cascade] = _shadowMap->refreshCount(cascade);
+        }
+    }
+    stats.indirectHistoryResetMask = _indirectHistoryResetMask;
+    stats.indirectHistoryValid = _screenSpaceLighting && _screenSpaceLighting->historyValid();
+    stats.cloudHistoryValid = _clouds && _clouds->historyValid();
+    stats.froxelHistoryValid = _volumetrics && _volumetrics->historyValid();
+    stats.atmosphereSlowRefreshCount = _atmosphere ? _atmosphere->slowRefreshCount() : 0U;
+    stats.atmosphereSkyRefreshCount = _atmosphere ? _atmosphere->skyRefreshCount() : 0U;
+    stats.indirectPersistentBytes =
+        _screenSpaceLighting ? _screenSpaceLighting->persistentBytes() : 0U;
+    stats.cloudPersistentBytes = _clouds ? _clouds->persistentBytes() : 0U;
+    stats.froxelPersistentBytes = _volumetrics ? _volumetrics->persistentBytes() : 0U;
+    const uint64_t sceneTargetBytes =
+        atmosphericSceneTargetMemoryBytes(_displayWidth, _displayHeight);
+    const uint64_t shadowBytes = _shadowMap ? shadowMapMemoryBytes(_shadowMap->quality()) : 0U;
+    stats.integratedPersistentBytes = sceneTargetBytes + shadowBytes + atmosphereLutMemoryBytes() +
+                                      stats.indirectPersistentBytes + stats.cloudPersistentBytes +
+                                      stats.froxelPersistentBytes + LIGHTNING_RENDERER_MEMORY_BYTES;
+    stats.lightningEventId = _lastLightningEventId;
+    stats.lunarPhaseEnergy = _lunarPhaseEnergy;
+    stats.lunarPhaseCycle = _lunarPhaseCycle;
+    return stats;
+}
+
 // ---------------------------------------------------------------------------
-// renderWater — the water surfaces recorded by renderChunks, drawn into the
-// resolved scene color with their own compositing (refraction from a copy
-// of the scene, manual depth test against the resolved depth). Nearest
-// chunks draw last so the closest surface owns the pixel. Ends with the
-// underwater veil + god rays when the camera is submerged.
+// renderWater, the water surfaces recorded by renderChunks, drawn into the
+// resolved scene color with refraction from a copy of the scene. The shader
+// rejects water behind opaque depth, and hardware depth writes the nearest
+// visible interface into media depth for later atmospheric passes. The
+// underwater absorption and scattering overlay runs here when submerged.
 // ---------------------------------------------------------------------------
 void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4& viewMatrix,
                                  const Mat4& projectionMatrix, const Vec3& cameraPosition,
                                  bool cameraUnderwater, const SkyUniforms& skyUniforms,
-                                 const float fogColor[3]) {
-    if (_waterDraws.empty() && !cameraUnderwater)
-        return;
-
-    // Refraction input: copy the resolved scene (a render target cannot
-    // sample itself)
-    if (!_waterDraws.empty()) {
-        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
-        if (blit) {
+                                 const float directLightDirection[3],
+                                 const float directLightRadiance[3], const float fogColor[3]) {
+    // Preserve opaque depth, then let visible water surfaces replace it with
+    // the nearer interface. Later air-medium and precipitation passes stop at
+    // this combined depth instead of fogging or raining through water.
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    if (blit) {
+        [blit copyFromTexture:_depthResolve
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(0, 0, 0)
+                   sourceSize:MTLSizeMake(_depthResolve.width, _depthResolve.height, 1)
+                    toTexture:_mediaDepthResolve
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        if (!_waterDraws.empty()) {
             [blit copyFromTexture:_colorResolve
                       sourceSlice:0
                       sourceLevel:0
@@ -2846,8 +3191,18 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
                  destinationSlice:0
                  destinationLevel:0
                 destinationOrigin:MTLOriginMake(0, 0, 0)];
-            [blit endEncoding];
+            // The level-zero copy remains the exact refraction source. Build
+            // lower levels only while SSR can consume them. The persistent
+            // allocation is accounted as a complete pyramid at every quality;
+            // this conditional skips only the per-frame filtering work.
+            if (_gfx.waterReflections) {
+                [blit generateMipmapsForTexture:_sceneColorCopy];
+            }
         }
+        [blit endEncoding];
+    }
+    if (_waterDraws.empty() && !cameraUnderwater) {
+        return;
     }
 
     WaterUniforms wu{};
@@ -2863,8 +3218,10 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     wu.invCameraRelativeViewProjection = simd_inverse(wu.cameraRelativeViewProjection);
     wu.zenithColor = skyUniforms.zenithColor;
     wu.horizonColor = skyUniforms.horizonColor;
-    wu.sunDirection = skyUniforms.sunDirection;
-    wu.sunColor = skyUniforms.sunColor;
+    wu.directLightDirection =
+        simd_make_float3(directLightDirection[0], directLightDirection[1], directLightDirection[2]);
+    wu.directLightRadiance =
+        simd_make_float3(directLightRadiance[0], directLightRadiance[1], directLightRadiance[2]);
     wu.cameraPosition = simd_make_float3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
     wu.fogColor = simd_make_float3(fogColor[0], fogColor[1], fogColor[2]);
     wu.resolution =
@@ -2877,18 +3234,26 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
     wu.ssrStrength = _gfx.waterReflections ? 1.0f : 0.0f;
     wu.skyExposure = _uwSkyExposure;
     wu.waterSurfaceY = _uwSurfaceY;
+    wu.solarDirection = skyUniforms.sunDirection;
+    wu.physicalSkyBlend = 1.0F - skyUniforms.visibilityAndPhase.w;
+    wu.directSpecularFactor = _directSpecularFactor;
     FrameRing::Alloc waterAlloc = _frameRing.push(&wu, sizeof(WaterUniforms));
 
     auto passDesc = [[MTLRenderPassDescriptor alloc] init];
     passDesc.colorAttachments[0].texture = _colorResolve;
     passDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
     passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+    passDesc.depthAttachment.texture = _mediaDepthResolve;
+    passDesc.depthAttachment.loadAction = MTLLoadActionLoad;
+    passDesc.depthAttachment.storeAction = MTLStoreActionStore;
     _gpuTimer->attachPass(passDesc, "water");
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
-    if (!encoder)
+    if (!encoder) {
+        resetMetalObject(passDesc);
         return;
+    }
 
     if (!_waterDraws.empty()) {
         // Back-to-front: the nearest surface draws last and wins the pixel
@@ -2896,12 +3261,24 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
                   [](const WaterDraw& a, const WaterDraw& b) { return a.distSq > b.distSq; });
 
         [encoder setRenderPipelineState:_waterPipelineState];
+        [encoder setDepthStencilState:_depthState];
         [encoder setCullMode:MTLCullModeNone]; // surface visible from below
         [encoder setVertexBuffer:_frameUniforms.buffer offset:_frameUniforms.offset atIndex:1];
         [encoder setVertexBuffer:waterAlloc.buffer offset:waterAlloc.offset atIndex:3];
         [encoder setFragmentBuffer:waterAlloc.buffer offset:waterAlloc.offset atIndex:3];
         [encoder setFragmentTexture:_sceneColorCopy atIndex:0];
         [encoder setFragmentTexture:_depthResolve atIndex:1];
+        [encoder setFragmentTexture:_atmosphere->skyViewTexture() atIndex:2];
+        [encoder setFragmentTexture:_clouds->shadowTexture() atIndex:3];
+        [encoder setFragmentTexture:_shadowMap->nearDepthTexture() atIndex:4];
+        [encoder setFragmentTexture:_shadowMap->farDepthTexture() atIndex:5];
+        [encoder setFragmentTexture:_shadowMap->horizonDepthTexture() atIndex:6];
+        [encoder setFragmentSamplerState:_shadowMap->comparisonSampler() atIndex:1];
+        FrameRing::Alloc shadowAlloc =
+            _frameRing.push(&_sceneShadowUniforms, sizeof(ShadowUniforms));
+        [encoder setFragmentBuffer:shadowAlloc.buffer offset:shadowAlloc.offset atIndex:4];
+        const CloudShadowUniforms& cloudShadow = _clouds->shadowUniforms();
+        [encoder setFragmentBytes:&cloudShadow length:sizeof(cloudShadow) atIndex:6];
 
         for (const WaterDraw& draw : _waterDraws) {
             ChunkOrigin origin{draw.origin, draw.overlayColorAndStrength, draw.farMetadata};
@@ -2920,12 +3297,14 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
 
     if (cameraUnderwater) {
         [encoder setRenderPipelineState:_underwaterOverlayState];
+        [encoder setDepthStencilState:_noDepthWriteState];
         [encoder setFragmentBuffer:waterAlloc.buffer offset:waterAlloc.offset atIndex:3];
         [encoder setFragmentTexture:_depthResolve atIndex:1];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     }
 
     [encoder endEncoding];
+    resetMetalObject(passDesc);
 }
 
 // ---------------------------------------------------------------------------
@@ -2964,15 +3343,22 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, c
     ChunkOrigin zeroOrigin{};
     [encoder setVertexBytes:&zeroOrigin length:sizeof(zeroOrigin) atIndex:2];
     // The highlight shares fragmentMain, which now samples the atlas AND the
-    // shadow cascade. Bind both (a disabled shadow block — strength 0 — keeps
+    // shadow cascade. Bind both (a disabled shadow block, strength 0, keeps
     // the yellow wireframe fully lit) so it never reads stale chunk-loop state.
     [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
     [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
     ShadowUniforms noShadows{};
     FrameRing::Alloc noShadowAlloc = _frameRing.push(&noShadows, sizeof(ShadowUniforms));
-    [encoder setFragmentTexture:_shadowMap->depthTexture() atIndex:1];
+    [encoder setFragmentTexture:_shadowMap->nearDepthTexture() atIndex:1];
+    [encoder setFragmentTexture:_shadowMap->farDepthTexture() atIndex:2];
+    [encoder setFragmentTexture:_shadowMap->horizonDepthTexture() atIndex:3];
+    [encoder setFragmentTexture:_clouds->shadowTexture() atIndex:4];
     [encoder setFragmentSamplerState:_shadowMap->comparisonSampler() atIndex:1];
     [encoder setFragmentBuffer:noShadowAlloc.buffer offset:noShadowAlloc.offset atIndex:4];
+    const FarTerrainOwnershipUniforms noFarOwnership{};
+    [encoder setFragmentBytes:&noFarOwnership length:sizeof(noFarOwnership) atIndex:5];
+    const CloudShadowUniforms noCloudShadow{};
+    [encoder setFragmentBytes:&noCloudShadow length:sizeof(noCloudShadow) atIndex:6];
 
     // Draw 12 lines (24 vertices) for wireframe box
     [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:24];
@@ -2994,7 +3380,18 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
 // ---------------------------------------------------------------------------
 // Destructor
 // ---------------------------------------------------------------------------
-RenderPipeline::~RenderPipeline() = default;
+RenderPipeline::~RenderPipeline() {
+    releaseSceneTargets();
+    resetMetalObject(_pipelineState);
+    resetMetalObject(_depthState);
+    resetMetalObject(_skyPipelineState);
+    resetMetalObject(_skyDepthState);
+    resetMetalObject(_noDepthWriteState);
+    resetMetalObject(_highlightPipelineState);
+    resetMetalObject(_highlightVertexBuffer);
+    resetMetalObject(_waterPipelineState);
+    resetMetalObject(_underwaterOverlayState);
+}
 
 // ---------------------------------------------------------------------------
 // resize()
@@ -3016,8 +3413,11 @@ void RenderPipeline::resize(uint32_t width, uint32_t height) {
     if (_volumetrics) {
         _volumetrics->resize(_displayWidth, _displayHeight);
     }
-    if (_ssao) {
-        _ssao->resize(_displayWidth, _displayHeight);
+    if (_screenSpaceLighting) {
+        _screenSpaceLighting->resize(_displayWidth, _displayHeight);
+    }
+    if (_clouds) {
+        _clouds->resize(_displayWidth, _displayHeight);
     }
 }
 
@@ -3032,22 +3432,28 @@ void RenderPipeline::setBloomIntensity(float intensity) {
 }
 
 // ---------------------------------------------------------------------------
-// setGraphicsSettings — the engine pushes a copy on init and on every video
+// setGraphicsSettings, the engine pushes a copy on init and on every video
 // settings change; passes read the copy each frame and skip when disabled.
 // ---------------------------------------------------------------------------
 void RenderPipeline::setGraphicsSettings(const GraphicsSettings& gfx) {
     _gfx = gfx;
     setBloomIntensity(gfx.bloomIntensity()); // level 5 = stock 1.0; 0 skips
+    if (_screenSpaceLighting) {
+        _screenSpaceLighting->setQuality(gfx.indirectLightingQuality);
+    }
+    if (_clouds) {
+        _clouds->setQuality(gfx.cloudQuality);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// tickParticles — Update weather particle physics each game tick
+// tickParticles, Update weather particle physics each game tick
 // ---------------------------------------------------------------------------
 void RenderPipeline::tickParticles(float dt, const World& world, const Vec3& playerPosition,
-                                   bool raining) {
+                                   const WeatherSample& weather) {
     if (!_particles)
         return;
-    _particles->tick(dt, world, playerPosition, raining);
+    _particles->tick(dt, world, playerPosition, weather);
 }
 
 // ---------------------------------------------------------------------------
@@ -3102,56 +3508,4 @@ bool RenderPipeline::isChunkInFrustum(const AABB& chunkAABB) const {
     }
 
     return true;
-}
-
-// ============================================================================
-// renderClouds — alpha-blended cloud layer, drawn last in the scene pass
-// ============================================================================
-void RenderPipeline::renderClouds(id<MTLRenderCommandEncoder> encoder, const Camera& camera,
-                                  uint64_t worldTime, const float sunDirection[3],
-                                  float sunIntensity) {
-    if (!_cloudPipelineState)
-        return;
-
-    // Cloud uniforms
-    CloudUniforms cloudUniforms{};
-
-    Vec3 camPos = camera.getPosition();
-    Vec3 camFwd = camera.forward();
-    Vec3 camRight = camera.right();
-    Vec3 camUp = camera.up();
-    cloudUniforms.cameraPosition = simd_make_float3(camPos.x, camPos.y, camPos.z);
-    cloudUniforms.cameraForward = simd_make_float3(camFwd.x, camFwd.y, camFwd.z);
-    cloudUniforms.cameraRight = simd_make_float3(camRight.x, camRight.y, camRight.z);
-    cloudUniforms.cameraUp = simd_make_float3(camUp.x, camUp.y, camUp.z);
-    cloudUniforms.sunDirection =
-        simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
-
-    // Projection shape for per-pixel ray reconstruction
-    cloudUniforms.tanHalfFov = std::tan(camera.FOV() * 0.5f * static_cast<float>(M_PI) / 180.0f);
-    cloudUniforms.aspect =
-        static_cast<float>(_displayWidth) / static_cast<float>(std::max(_displayHeight, 1u));
-
-    // Wind offset: worldTime * windSpeed (0.02 blocks/tick)
-    cloudUniforms.windOffset = static_cast<float>(worldTime) * 0.02f;
-
-    // Cloud parameters
-    cloudUniforms.cloudAltitude = 192.0f;
-    cloudUniforms.noiseFrequency = 0.005f;
-    cloudUniforms.cloudThreshold = 0.55f;
-    cloudUniforms.volumetric = _gfx.cloudMode >= 2 ? 1.0f : 0.0f;
-    // Sun height 0..1 from the sky's single source (NOT the active light's
-    // direction — that swaps to the MOON below the horizon, whose +y at
-    // midnight would keep clouds daytime-bright all night).
-    cloudUniforms.sunElevation = sunIntensity;
-
-    FrameRing::Alloc cloudAlloc = _frameRing.push(&cloudUniforms, sizeof(cloudUniforms));
-
-    [encoder setRenderPipelineState:_cloudPipelineState];
-    [encoder setDepthStencilState:_cloudDepthState];
-    [encoder setVertexBuffer:cloudAlloc.buffer offset:cloudAlloc.offset atIndex:0];
-    [encoder setFragmentBuffer:cloudAlloc.buffer offset:cloudAlloc.offset atIndex:0];
-
-    // Draw fullscreen quad (6 vertices)
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 }

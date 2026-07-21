@@ -244,6 +244,7 @@ void World::generateChunkAsync(ChunkPos pos, int64_t priority) {
         }
         bool loadedFromSave = false;
         auto chunk = loadOrGenerateChunk(pos, &loadedFromSave);
+        const auto lightPlan = generator_.findColumnPlan({pos.x, pos.z});
         bool inserted = false;
         {
             std::lock_guard<std::mutex> lock(chunksMutex_);
@@ -266,6 +267,7 @@ void World::generateChunkAsync(ChunkPos pos, int64_t priority) {
                     }
                     markHaloNeighborMeshesDirtyLocked(pos);
                     markSkyContinuityBelowLocked({pos.x, pos.z}, pos.y);
+                    initializeChunkLightLocked(pos, lightPlan.get());
                 }
             } else if (retainedChunks_.contains(pos) && !shuttingDown_.load()) {
                 loadedCubeAdmissionsRejected_.fetch_add(1, std::memory_order_relaxed);
@@ -362,9 +364,7 @@ std::shared_ptr<Chunk> World::loadOrGenerateChunk(ChunkPos pos, bool* loadedFrom
     if (saveManager_) {
         if (auto loaded = saveManager_->loadChunk(pos)) {
             if (loadedFromSave) *loadedFromSave = true;
-            auto chunk = std::make_shared<Chunk>(std::move(*loaded));
-            LightEngine::computeSelfLight(*chunk);
-            return chunk;
+            return std::make_shared<Chunk>(std::move(*loaded));
         }
     }
 
@@ -375,7 +375,6 @@ std::shared_ptr<Chunk> World::loadOrGenerateChunk(ChunkPos pos, bool* loadedFrom
         genMs_.record(
             std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start)
                 .count());
-        LightEngine::computeSelfLight(*chunk);
         return chunk;
     } catch (const std::exception& error) {
         RY_LOG_ERROR(
@@ -389,6 +388,7 @@ std::shared_ptr<Chunk> World::loadOrGenerateChunk(ChunkPos pos, bool* loadedFrom
 
 std::shared_ptr<Chunk> World::getChunk(ChunkPos pos) {
     if (!validChunkY(pos.y)) return nullptr;
+    ensureSavedSkyAuthority({pos.x, pos.z});
     {
         std::lock_guard<std::mutex> lock(chunksMutex_);
         auto it = chunks_.find(pos);
@@ -401,6 +401,7 @@ std::shared_ptr<Chunk> World::getChunk(ChunkPos pos) {
 
     bool loadedFromSave = false;
     auto chunk = loadOrGenerateChunk(pos, &loadedFromSave);
+    const auto lightPlan = generator_.findColumnPlan({pos.x, pos.z});
     std::shared_ptr<Chunk> result;
     bool inserted = false;
     {
@@ -427,6 +428,7 @@ std::shared_ptr<Chunk> World::getChunk(ChunkPos pos) {
                 }
                 markHaloNeighborMeshesDirtyLocked(pos);
                 markSkyContinuityBelowLocked({pos.x, pos.z}, pos.y);
+                initializeChunkLightLocked(pos, lightPlan.get());
             }
             result = it->second;
         }
@@ -448,6 +450,16 @@ BlockType World::getBlock(int64_t x, int32_t y, int64_t z) {
 
 BlockType World::getBlockIfLoaded(int64_t x, int32_t y, int64_t z) const {
     return findBlockIfLoaded(x, y, z).value_or(BlockType::AIR);
+}
+
+uint8_t World::getPackedLightIfLoaded(int64_t x, int32_t y, int64_t z) const {
+    if (y < WORLD_MIN_Y || y > WORLD_MAX_Y) return 0;
+    const ChunkPos pos{Chunk::worldToChunk(x), Chunk::worldToChunkY(y), Chunk::worldToChunk(z)};
+    std::lock_guard<std::mutex> lock(chunksMutex_);
+    const auto found = chunks_.find(pos);
+    if (found == chunks_.end() || !found->second->generated) return 0;
+    return found->second->getPackedLight(Chunk::worldToLocal(x), Chunk::worldToLocalY(y),
+                                         Chunk::worldToLocal(z));
 }
 
 std::optional<BlockType> World::findBlockIfLoaded(int64_t x, int32_t y, int64_t z) const {
@@ -484,24 +496,60 @@ void World::setBlock(int64_t x, int32_t y, int64_t z, BlockType type) {
     if (y < WORLD_MIN_Y || y > WORLD_MAX_Y) return;
     const BlockPos position{x, y, z};
     setBlockLoaded(position, type,
-                   type == BlockType::WATER ? std::optional(FluidState::source()) : std::nullopt);
+                   type == BlockType::WATER ? std::optional(FluidState::source()) : std::nullopt,
+                   LightUrgency::IMMEDIATE);
     fluidScheduler_.activateBlockChange(position);
 }
 
-void World::setBlockLoaded(BlockPos position, BlockType type,
-                           std::optional<FluidState> fluidState) {
+void World::setBlockLoaded(BlockPos position, BlockType type, std::optional<FluidState> fluidState,
+                           LightUrgency urgency) {
     if (position.y < WORLD_MIN_Y || position.y > WORLD_MAX_Y) return;
     const ChunkPos pos{Chunk::worldToChunk(position.x), Chunk::worldToChunkY(position.y),
                        Chunk::worldToChunk(position.z)};
+    const int lx = Chunk::worldToLocal(position.x);
+    const int ly = Chunk::worldToLocalY(position.y);
+    const int lz = Chunk::worldToLocal(position.z);
+
+    // The home cube floods first so its fresh borders seed neighbors, then the
+    // rest of the affected neighborhood drains synchronously. The 27 cubes of
+    // the 3x3x3 share nine XZ columns; prefetch those column plans before
+    // chunksMutex_, matching the reconcileLight convention, so neither the
+    // immediate floods nor the neighborhood drain calls the generator under the
+    // lock. The plan for offset (dx, dz) lives at index (dx + 1) + (dz + 1) * 3.
+    std::array<ChunkPos, 4> immediateCubes{};
+    std::array<std::shared_ptr<const ColumnPlan>, 9> columnPlans{};
+    size_t immediateCount = 0;
+    const auto planForOffset = [&columnPlans, pos](ChunkPos cube) -> const ColumnPlan* {
+        const int64_t dx = cube.x - pos.x;
+        const int64_t dz = cube.z - pos.z;
+        return columnPlans[static_cast<size_t>((dx + 1) + (dz + 1) * 3)].get();
+    };
+    if (urgency == LightUrgency::IMMEDIATE) {
+        immediateCubes[immediateCount++] = pos;
+        if (lx == 0) immediateCubes[immediateCount++] = {pos.x - 1, pos.y, pos.z};
+        if (lx == CHUNK_EDGE - 1) immediateCubes[immediateCount++] = {pos.x + 1, pos.y, pos.z};
+        if (lz == 0) immediateCubes[immediateCount++] = {pos.x, pos.y, pos.z - 1};
+        if (lz == CHUNK_EDGE - 1) immediateCubes[immediateCount++] = {pos.x, pos.y, pos.z + 1};
+        if (ly == 0 && validChunkY(pos.y - 1)) {
+            immediateCubes[immediateCount++] = {pos.x, pos.y - 1, pos.z};
+        }
+        if (ly == CHUNK_EDGE - 1 && validChunkY(pos.y + 1)) {
+            immediateCubes[immediateCount++] = {pos.x, pos.y + 1, pos.z};
+        }
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                columnPlans[static_cast<size_t>((dx + 1) + (dz + 1) * 3)] =
+                    generator_.findColumnPlan({pos.x + dx, pos.z + dz});
+            }
+        }
+    }
+
     std::lock_guard<std::mutex> lock(chunksMutex_);
     auto it = chunks_.find(pos);
     if (it == chunks_.end()) return;
 
     const BlockType oldBlock = it->second->getBlockWorld(position.x, position.y, position.z);
     it->second->setBlockWorld(position.x, position.y, position.z, type);
-    const int lx = Chunk::worldToLocal(position.x);
-    const int ly = Chunk::worldToLocalY(position.y);
-    const int lz = Chunk::worldToLocal(position.z);
     it->second->setFluidState(lx, ly, lz, fluidState.value_or(FluidState::source()));
     it->second->modifiedSinceSave = true;
     it->second->needsMeshUpdate = true;
@@ -535,12 +583,37 @@ void World::setBlockLoaded(BlockPos position, BlockType type,
     // Any edit can add or remove an emitter or open or seal a light path.
     // Reconcile the edited cube and its full 3D neighborhood. Deduplication
     // keeps repeated fluid changes within the per-tick lighting budget.
+    const auto floodedSynchronously = [&](ChunkPos queued) {
+        for (size_t cube = 0; cube < immediateCount; ++cube) {
+            if (immediateCubes[cube] == queued) return true;
+        }
+        return false;
+    };
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
             for (int offsetX = -1; offsetX <= 1; ++offsetX) {
-                queueLightReconcile({pos.x + offsetX, pos.y + offsetY, pos.z + offsetZ});
+                const ChunkPos queued{pos.x + offsetX, pos.y + offsetY, pos.z + offsetZ};
+                // Cubes the synchronous flood already fixed would only rerun
+                // as no-diff floods; their changed borders requeue neighbors
+                // on their own.
+                if (floodedSynchronously(queued)) continue;
+                queueLightReconcile(queued, urgency);
             }
         }
+    }
+
+    // Flooding here, under the same chunksMutex_ hold as the block write and
+    // version bumps, guarantees no mesh snapshot can pair post-edit blocks
+    // with pre-edit packed light. The home cube floods first so border
+    // neighbors seed from its fresh levels, then the neighborhood drain
+    // converges the rest before the edit returns, so adjacent cubes light and
+    // remesh this tick instead of waiting for the next reconcile.
+    for (size_t cube = 0; cube < immediateCount; ++cube) {
+        reconcileCubeLocked(immediateCubes[cube], planForOffset(immediateCubes[cube]),
+                            LightUrgency::IMMEDIATE);
+    }
+    if (urgency == LightUrgency::IMMEDIATE) {
+        drainEditLightNeighborhoodLocked(pos, columnPlans);
     }
 }
 
@@ -664,6 +737,7 @@ void World::markColumnMeshesDirtyLocked(ColumnPos column) {
         if (found == chunks_.end() || !found->second->generated) continue;
         found->second->needsMeshUpdate = true;
         found->second->version.fetch_add(1, std::memory_order_relaxed);
+        queueLightReconcile(found->first);
     }
 }
 
@@ -695,6 +769,7 @@ void World::markSkyContinuityBelowLocked(ColumnPos column, int32_t changedSectio
                 if (found == chunks_.end() || !found->second->generated) continue;
                 found->second->needsMeshUpdate = true;
                 found->second->version.fetch_add(1, std::memory_order_relaxed);
+                queueLightReconcile(found->first);
             }
         }
     }
@@ -731,8 +806,16 @@ void World::refreshSavedSkyCutoffsLocked(ChunkPos pos) {
     }
 }
 
-void World::queueLightReconcile(ChunkPos pos) {
+void World::queueLightReconcile(ChunkPos pos, LightUrgency urgency) {
     std::lock_guard<std::mutex> lock(lightMutex_);
+    // A position may sit in both queue tiers; the later pop floods again
+    // with no diff, which is cheaper than searching the other queue for it.
+    if (urgency == LightUrgency::IMMEDIATE) {
+        if (editLightQueued_.insert(pos).second) {
+            editLightQueue_.push_back(pos);
+        }
+        return;
+    }
     if (lightQueued_.insert(pos).second) {
         lightQueue_.push_back(pos);
     }
@@ -752,61 +835,204 @@ void World::queueLightReconcileWithNeighbors(ChunkPos pos) {
     queueFaceNeighbors(pos);
 }
 
+void World::ensureSavedSkyAuthority(ColumnPos column) {
+    if (!saveManager_) return;
+    {
+        std::lock_guard<std::mutex> lock(chunksMutex_);
+        if (skyManifestKnownColumns_.contains(column)) return;
+    }
+
+    const std::vector<int32_t> savedSections = saveManager_->savedSections(column);
+    std::optional<int32_t> savedCeiling;
+    if (!savedSections.empty()) {
+        savedCeiling = std::clamp(*std::max_element(savedSections.begin(), savedSections.end()),
+                                  WORLD_MIN_CHUNK_Y, WORLD_MAX_CHUNK_Y);
+    }
+
+    std::lock_guard<std::mutex> lock(chunksMutex_);
+    if (!skyManifestKnownColumns_.insert(column).second) return;
+    if (savedCeiling) savedEditedSectionCeilings_.insert_or_assign(column, *savedCeiling);
+    markSkyColumnMeshesDirtyLocked(column);
+}
+
+LightEngine::SkyLightSeedColumns World::skyLightSeedsLocked(ChunkPos pos,
+                                                            const ColumnPlan* plan) const {
+    LightEngine::SkyLightSeedColumns result;
+    if (!plan) return result;
+
+    const ColumnPos column{pos.x, pos.z};
+    if (saveManager_ && !skyManifestKnownColumns_.contains(column)) return result;
+
+    const auto loadedMask = loadedSectionMasks_.find(column);
+    if (loadedMask == loadedSectionMasks_.end()) return result;
+
+    const int64_t baseX = pos.x * CHUNK_EDGE;
+    const int64_t baseZ = pos.z * CHUNK_EDGE;
+    std::optional<int32_t> savedCeiling;
+    if (const auto saved = savedEditedSectionCeilings_.find(column);
+        saved != savedEditedSectionCeilings_.end()) {
+        savedCeiling = saved->second;
+    }
+    for (int z = 0; z < CHUNK_EDGE; ++z) {
+        for (int x = 0; x < CHUNK_EDGE; ++x) {
+            int32_t cutoff = std::clamp(plan->surfaceY(x, z) + 1, WORLD_MIN_Y, WORLD_MAX_Y + 1);
+            if (const auto edited = skyCutoffOverrides_.find({baseX + x, baseZ + z});
+                edited != skyCutoffOverrides_.end()) {
+                cutoff = edited->second;
+            }
+
+            const int32_t cutoffBlock = std::clamp(cutoff - 1, WORLD_MIN_Y, WORLD_MAX_Y);
+            const int32_t cutoffSection = Chunk::worldToChunkY(cutoffBlock);
+            const int32_t lastRequiredSection =
+                skyAuthorityTopSection(pos.y, cutoffSection, savedCeiling);
+            const uint64_t requiredMask = sectionRangeMask(pos.y, lastRequiredSection);
+            if ((loadedMask->second & requiredMask) == requiredMask) {
+                result.set(x, z, cutoff);
+            }
+        }
+    }
+    return result;
+}
+
+void World::initializeChunkLightLocked(ChunkPos pos, const ColumnPlan* plan) {
+    const auto found = chunks_.find(pos);
+    if (found == chunks_.end() || !found->second->generated) return;
+    const auto neighbor = [&](ChunkPos neighborPos) -> const Chunk* {
+        const auto candidate = chunks_.find(neighborPos);
+        return candidate != chunks_.end() && candidate->second->generated ? candidate->second.get()
+                                                                          : nullptr;
+    };
+    const LightEngine::FaceNeighbors faces = {
+        neighbor({pos.x - 1, pos.y, pos.z}),
+        neighbor({pos.x + 1, pos.y, pos.z}),
+        neighbor({pos.x, pos.y, pos.z - 1}),
+        neighbor({pos.x, pos.y, pos.z + 1}),
+        validChunkY(pos.y - 1) ? neighbor({pos.x, pos.y - 1, pos.z}) : nullptr,
+        validChunkY(pos.y + 1) ? neighbor({pos.x, pos.y + 1, pos.z}) : nullptr,
+    };
+    LightEngine::floodChunk(*found->second, faces, skyLightSeedsLocked(pos, plan));
+}
+
+bool World::reconcileCubeLocked(ChunkPos pos, const ColumnPlan* plan, LightUrgency urgency) {
+    auto it = chunks_.find(pos);
+    if (it == chunks_.end() || !it->second->generated) {
+        return false;
+    }
+    auto neighborPtr = [&](ChunkPos neighborPos) -> Chunk* {
+        auto n = chunks_.find(neighborPos);
+        return (n != chunks_.end() && n->second->generated) ? n->second.get() : nullptr;
+    };
+    std::array<Chunk*, 6> faces = {
+        neighborPtr({pos.x - 1, pos.y, pos.z}),
+        neighborPtr({pos.x + 1, pos.y, pos.z}),
+        neighborPtr({pos.x, pos.y, pos.z - 1}),
+        neighborPtr({pos.x, pos.y, pos.z + 1}),
+        validChunkY(pos.y - 1) ? neighborPtr({pos.x, pos.y - 1, pos.z}) : nullptr,
+        validChunkY(pos.y + 1) ? neighborPtr({pos.x, pos.y + 1, pos.z}) : nullptr,
+    };
+
+    const LightEngine::SkyLightSeedColumns skySeeds = skyLightSeedsLocked(pos, plan);
+    const bool hasDirectSky = std::ranges::any_of(skySeeds.cutoffY, [&](int32_t cutoff) {
+        return cutoff <= pos.y * CHUNK_EDGE + CHUNK_EDGE - 1;
+    });
+    auto dark = [](const Chunk* chunk) { return !chunk || !chunk->hasDerivedLight(); };
+    if (!it->second->hasDerivedLight() && std::all_of(faces.begin(), faces.end(), dark) &&
+        !hasBlockLightEmitter(*it->second) && !hasDirectSky) {
+        return false;
+    }
+
+    LightEngine::FaceNeighbors neighbors = {faces[0], faces[1], faces[2],
+                                            faces[3], faces[4], faces[5]};
+    const LightEngine::FloodResult result =
+        LightEngine::floodChunk(*it->second, neighbors, skySeeds);
+    if (result.changedState) {
+        it->second->needsMeshUpdate = true;
+        it->second->version.fetch_add(1, std::memory_order_relaxed);
+        // This chunk's border light moved: each face-neighbor both SAMPLES
+        // that border (so its border faces must re-mesh even if its own
+        // stored light is unchanged, such as a solid wall at the seam) and
+        // may pull in more light (so it must re-reconcile). Spread stays in
+        // the queue tier it started in so edit-driven propagation cannot
+        // sink back into the starving streaming queue.
+        constexpr std::array<ChunkPos, 6> OFFSETS = {
+            ChunkPos{-1, 0, 0}, ChunkPos{1, 0, 0},  ChunkPos{0, 0, -1},
+            ChunkPos{0, 0, 1},  ChunkPos{0, -1, 0}, ChunkPos{0, 1, 0},
+        };
+        for (size_t face = 0; face < OFFSETS.size(); ++face) {
+            if ((result.changedFaceMask & (1U << face)) == 0) continue;
+            if (Chunk* neighbor = faces[face]) {
+                neighbor->needsMeshUpdate = true;
+                neighbor->version.fetch_add(1, std::memory_order_relaxed);
+            }
+            const ChunkPos offset = OFFSETS[face];
+            queueLightReconcile({pos.x + offset.x, pos.y + offset.y, pos.z + offset.z}, urgency);
+        }
+    }
+    return result.changedState;
+}
+
 void World::reconcileLight(int budgetCubes) {
     for (int processed = 0; processed < budgetCubes; ++processed) {
         ChunkPos pos;
+        LightUrgency urgency = LightUrgency::DEFERRED;
         {
             std::lock_guard<std::mutex> lock(lightMutex_);
-            if (lightQueue_.empty()) {
+            if (!editLightQueue_.empty()) {
+                pos = editLightQueue_.back();
+                editLightQueue_.pop_back();
+                editLightQueued_.erase(pos);
+                urgency = LightUrgency::IMMEDIATE;
+            } else if (!lightQueue_.empty()) {
+                pos = lightQueue_.back();
+                lightQueue_.pop_back();
+                lightQueued_.erase(pos);
+            } else {
                 return;
             }
-            pos = lightQueue_.back();
-            lightQueue_.pop_back();
-            lightQueued_.erase(pos);
         }
 
+        const auto lightPlan = generator_.findColumnPlan({pos.x, pos.z});
         std::lock_guard<std::mutex> lock(chunksMutex_);
-        auto it = chunks_.find(pos);
-        if (it == chunks_.end() || !it->second->generated) {
+        reconcileCubeLocked(pos, lightPlan.get(), urgency);
+    }
+}
+
+int World::drainEditLightNeighborhoodLocked(
+    ChunkPos home, const std::array<std::shared_ptr<const ColumnPlan>, 9>& columnPlans) {
+    // Runs with chunksMutex_ held. reconcileCubeLocked re-enqueues a neighbor
+    // whenever a shared border changed, so popping the IMMEDIATE queue until it
+    // empties floods the whole connected affected set to its fixed point.
+    std::vector<ChunkPos> outOfRange;
+    int processed = 0;
+    while (processed < EDIT_SYNC_LIGHT_FLOOD_CAP) {
+        ChunkPos pos;
+        {
+            std::lock_guard<std::mutex> lock(lightMutex_);
+            if (editLightQueue_.empty()) break;
+            pos = editLightQueue_.back();
+            editLightQueue_.pop_back();
+            editLightQueued_.erase(pos);
+        }
+        const int64_t dx = pos.x - home.x;
+        const int64_t dz = pos.z - home.z;
+        if (dx < -1 || dx > 1 || dz < -1 || dz > 1) {
+            // A single edit's light cannot reach a column two cubes away; if the
+            // queue ever holds one (unrelated churn), leave it for the tick
+            // drain rather than calling the generator under the lock.
+            outOfRange.push_back(pos);
             continue;
         }
-        auto neighborPtr = [&](ChunkPos neighborPos) -> Chunk* {
-            auto n = chunks_.find(neighborPos);
-            return (n != chunks_.end() && n->second->generated) ? n->second.get() : nullptr;
-        };
-        std::array<Chunk*, 6> faces = {
-            neighborPtr({pos.x - 1, pos.y, pos.z}),
-            neighborPtr({pos.x + 1, pos.y, pos.z}),
-            neighborPtr({pos.x, pos.y, pos.z - 1}),
-            neighborPtr({pos.x, pos.y, pos.z + 1}),
-            validChunkY(pos.y - 1) ? neighborPtr({pos.x, pos.y - 1, pos.z}) : nullptr,
-            validChunkY(pos.y + 1) ? neighborPtr({pos.x, pos.y + 1, pos.z}) : nullptr,
-        };
-
-        auto dark = [](const Chunk* chunk) { return !chunk || !chunk->hasBlockLight(); };
-        if (!it->second->hasBlockLight() && std::all_of(faces.begin(), faces.end(), dark) &&
-            !hasBlockLightEmitter(*it->second)) {
-            continue;
-        }
-
-        LightEngine::FaceNeighbors neighbors = {faces[0], faces[1], faces[2],
-                                                faces[3], faces[4], faces[5]};
-        if (LightEngine::floodChunk(*it->second, neighbors)) {
-            it->second->needsMeshUpdate = true;
-            it->second->version.fetch_add(1, std::memory_order_relaxed);
-            // This chunk's border light moved: each face-neighbor both SAMPLES
-            // that border (so its border faces must re-mesh even if its own
-            // stored light is unchanged, such as a solid wall at the seam) and
-            // may pull in more light (so it must re-reconcile).
-            for (Chunk* neighbor : faces) {
-                if (neighbor) {
-                    neighbor->needsMeshUpdate = true;
-                    neighbor->version.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-            queueFaceNeighbors(pos);
+        reconcileCubeLocked(pos, columnPlans[static_cast<size_t>((dx + 1) + (dz + 1) * 3)].get(),
+                            LightUrgency::IMMEDIATE);
+        ++processed;
+    }
+    if (!outOfRange.empty()) {
+        std::lock_guard<std::mutex> lock(lightMutex_);
+        for (const ChunkPos& pos : outOfRange) {
+            if (editLightQueued_.insert(pos).second) editLightQueue_.push_back(pos);
         }
     }
+    return processed;
 }
 
 FluidCell World::readFluidCell(FluidPos position) const {
@@ -932,6 +1158,7 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
             const int32_t generatedCutoff = plan->surfaceY(localX, localZ) + 1;
             out.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(x, z)] = generatedCutoff;
             out.skyCutoffY[MeshSnapshot::skyIndex(x, z)] = generatedCutoff;
+            out.visualSkyCutoffY[MeshSnapshot::skyIndex(x, z)] = generatedCutoff;
         }
     }
 
@@ -948,6 +1175,11 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
                 if (edited != skyCutoffOverrides_.end()) {
                     out.skyCutoffY[MeshSnapshot::skyIndex(x, z)] = edited->second;
                 }
+                // Preserve the complete geometric cutoff for water-interface
+                // classification before incomplete streaming authority closes
+                // the ordinary skylight path below.
+                out.visualSkyCutoffY[MeshSnapshot::skyIndex(x, z)] =
+                    out.skyCutoffY[MeshSnapshot::skyIndex(x, z)];
 
                 // A plan tells us where generated terrain reaches the sky, but
                 // it cannot make an absent vertical section visible. Until every
@@ -959,10 +1191,20 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
                 const int32_t cutoff = out.skyCutoffY[MeshSnapshot::skyIndex(x, z)];
                 const int32_t cutoffBlock = std::clamp(cutoff - 1, WORLD_MIN_Y, WORLD_MAX_Y);
                 const int32_t cutoffSection = Chunk::worldToChunkY(cutoffBlock);
-                const int32_t lastRequiredSection = std::max(pos.y, cutoffSection);
+                const ColumnPos skyColumn{columnX, columnZ};
+                std::optional<int32_t> savedCeiling;
+                if (const auto saved = savedEditedSectionCeilings_.find(skyColumn);
+                    saved != savedEditedSectionCeilings_.end()) {
+                    savedCeiling = saved->second;
+                }
+                const int32_t lastRequiredSection =
+                    skyAuthorityTopSection(pos.y, cutoffSection, savedCeiling);
                 const auto loadedMask = loadedSectionMasks_.find({columnX, columnZ});
                 const uint64_t requiredMask = sectionRangeMask(pos.y, lastRequiredSection);
-                const bool completeSkyPath = loadedMask != loadedSectionMasks_.end() &&
+                const bool manifestAuthority =
+                    !saveManager_ || skyManifestKnownColumns_.contains(skyColumn);
+                const bool completeSkyPath = manifestAuthority &&
+                                             loadedMask != loadedSectionMasks_.end() &&
                                              (loadedMask->second & requiredMask) == requiredMask;
                 if (!completeSkyPath) {
                     out.skyCutoffY[MeshSnapshot::skyIndex(x, z)] =
@@ -999,6 +1241,7 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
         }
 
         out.version = self->second->version.load(std::memory_order_relaxed);
+        out.derivedSkyLightValid = true;
         for (int y = -1; y <= CHUNK_EDGE; ++y) {
             const int oy = y < 0 ? -1 : (y >= CHUNK_EDGE ? 1 : 0);
             const int localY = y < 0 ? CHUNK_EDGE - 1 : (y >= CHUNK_EDGE ? 0 : y);
@@ -1014,7 +1257,7 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
                         out.blocks[target] = source->getBlock(localX, localY, localZ);
                         out.fluidStates[target] =
                             source->getFluidState(localX, localY, localZ).packed();
-                        out.blockLight[target] = source->getBlockLight(localX, localY, localZ);
+                        out.packedLight[target] = source->getPackedLight(localX, localY, localZ);
                     } else if (pos.y + oy < WORLD_MIN_CHUNK_Y) {
                         out.blocks[MeshSnapshot::index(x, y, z)] = BlockType::BEDROCK;
                     } else if (validChunkY(pos.y + oy)) {
@@ -1025,11 +1268,13 @@ bool World::snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const {
                         // geometry, and underground light closure intact.
                         const int32_t worldY = pos.y * CHUNK_EDGE + y;
                         const int32_t generatedCutoff = out.generatedSurfaceCutoffAt(x, z);
-                        out.blocks[MeshSnapshot::index(x, y, z)] =
-                            generatedCutoff == MeshSnapshot::SKY_CUTOFF_UNKNOWN ||
-                                    worldY < generatedCutoff
-                                ? BlockType::BEDROCK
-                                : BlockType::AIR;
+                        const int target = MeshSnapshot::index(x, y, z);
+                        const bool generatedSkyOpen =
+                            generatedCutoff != MeshSnapshot::SKY_CUTOFF_UNKNOWN &&
+                            worldY >= generatedCutoff;
+                        out.blocks[target] = generatedSkyOpen ? BlockType::AIR : BlockType::BEDROCK;
+                    } else {
+                        out.packedLight[MeshSnapshot::index(x, y, z)] = packDerivedLight(15, 0);
                     }
                 }
             }
@@ -1526,6 +1771,21 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
     if (saveManager_) savedSections = saveManager_->savedSectionsForColumns(visibleColumns);
     if (cancelIfStale()) return false;
 
+    std::unordered_set<ColumnPos> manifestKnownColumns;
+    std::unordered_map<ColumnPos, int32_t> savedSectionCeilings;
+    if (saveManager_) {
+        manifestKnownColumns.reserve(visibleColumns.size());
+        manifestKnownColumns.insert(visibleColumns.begin(), visibleColumns.end());
+        savedSectionCeilings.reserve(savedSections.size());
+        for (const auto& [column, sections] : savedSections) {
+            if (!sections.empty()) {
+                savedSectionCeilings.emplace(
+                    column, std::clamp(*std::max_element(sections.begin(), sections.end()),
+                                       WORLD_MIN_CHUNK_Y, WORLD_MAX_CHUNK_Y));
+            }
+        }
+    }
+
     std::unordered_set<ChunkPos> wantedSet;
     std::unordered_map<ChunkPos, uint8_t> wantedPriority;
     std::unordered_set<ChunkPos> surfaceRequirements;
@@ -1831,6 +2091,48 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
         size_t retainedCubeCount = 0;
         {
             std::lock_guard<std::mutex> chunksLock(chunksMutex_);
+            std::unordered_set<ColumnPos> changedManifestColumns;
+            if (skyManifestKnownColumns_ != manifestKnownColumns ||
+                savedEditedSectionCeilings_ != savedSectionCeilings) {
+                changedManifestColumns.reserve(
+                    skyManifestKnownColumns_.size() + manifestKnownColumns.size() +
+                    savedEditedSectionCeilings_.size() + savedSectionCeilings.size());
+                for (ColumnPos column : skyManifestKnownColumns_) {
+                    if (!manifestKnownColumns.contains(column)) {
+                        changedManifestColumns.insert(column);
+                    }
+                }
+                for (ColumnPos column : manifestKnownColumns) {
+                    if (!skyManifestKnownColumns_.contains(column)) {
+                        changedManifestColumns.insert(column);
+                    }
+                }
+                for (const auto& [column, ceiling] : savedEditedSectionCeilings_) {
+                    const auto replacement = savedSectionCeilings.find(column);
+                    if (replacement == savedSectionCeilings.end() ||
+                        replacement->second != ceiling) {
+                        changedManifestColumns.insert(column);
+                    }
+                }
+                for (const auto& [column, ceiling] : savedSectionCeilings) {
+                    const auto previous = savedEditedSectionCeilings_.find(column);
+                    if (previous == savedEditedSectionCeilings_.end() ||
+                        previous->second != ceiling) {
+                        changedManifestColumns.insert(column);
+                    }
+                }
+            }
+            skyManifestKnownColumns_ = std::move(manifestKnownColumns);
+            savedEditedSectionCeilings_ = std::move(savedSectionCeilings);
+            if (!changedManifestColumns.empty()) {
+                for (const auto& [position, chunk] : chunks_) {
+                    if (!chunk || !chunk->generated ||
+                        !changedManifestColumns.contains({position.x, position.z})) {
+                        continue;
+                    }
+                    queueLightReconcile(position);
+                }
+            }
             retainedChunks_ = std::move(retained);
             retainedCubeCount = retainedChunks_.size();
             if (meshCandidateChunks_ != wantedSet) {

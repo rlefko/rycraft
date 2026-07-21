@@ -8,7 +8,7 @@
 // ---------------------------------------------------------------------------
 // MeshSnapshot holds one 16x16x16 cube plus a one-block halo on every face,
 // edge, and corner. Meshing consumes the immutable 18x18x18 block, fluid, and
-// derived block-light fields without holding the world mutex.
+// derived packed-light fields without holding the world mutex.
 //
 // Coordinates accept [-1, CHUNK_EDGE] on all axes. Loaded halo cells keep
 // face culling, corner AO, partial-fluid corners, and light continuous across
@@ -25,7 +25,7 @@ struct MeshSnapshot {
     // A real opaque block at WORLD_MAX_Y has cutoff WORLD_MAX_Y + 1. Keep the
     // conservative incomplete-load marker distinct so top-of-world roofs do
     // not become indistinguishable from a missing vertical section.
-    static constexpr int32_t SKY_CUTOFF_INCOMPLETE = WORLD_MAX_Y + 2;
+    static constexpr int32_t SKY_CUTOFF_INCOMPLETE = INCOMPLETE_SKY_PATH_CUTOFF;
 
     enum MissingFace : uint8_t {
         MISSING_PLUS_X = 1U << 0U,
@@ -38,6 +38,10 @@ struct MeshSnapshot {
 
     ChunkPos pos{};
     uint32_t version = 0;
+    // Production world snapshots set this after copying the packed halo.
+    // Standalone tests and tools may leave it false to derive bounded column
+    // light from skyCutoffY.
+    bool derivedSkyLightValid = false;
     // Cardinal in-range neighbors absent when the snapshot was published.
     // The mesher seals underground openings and reconstructs a lit planned
     // surface silhouette. A later neighbor load dirties this mesh and replaces
@@ -45,7 +49,8 @@ struct MeshSnapshot {
     uint8_t missingNeighborFaces = 0;
     std::array<BlockType, PADDED_VOLUME> blocks{};
     std::array<uint8_t, PADDED_VOLUME> fluidStates{};
-    std::array<uint8_t, PADDED_VOLUME> blockLight{};
+    // High nibble is skylight and low nibble is block light, matching Chunk.
+    std::array<uint8_t, PADDED_VOLUME> packedLight{};
 
     // Immutable generated-terrain cutoff and top material for each padded XZ
     // column. Unlike skyCutoffY, this cutoff is never made conservative by an
@@ -59,17 +64,24 @@ struct MeshSnapshot {
     // cubes. SKY_CUTOFF_UNKNOWN asks standalone tests/tools to derive a
     // bounded cutoff from the blocks available in this snapshot.
     std::array<int32_t, SKY_COLUMNS> skyCutoffY{};
+    // The unoccluded geometric cutoff before an incomplete vertical path
+    // turns skyCutoffY into SKY_CUTOFF_INCOMPLETE. Water uses this only to
+    // classify a visible exterior interface while keeping light propagation
+    // conservatively dark. Edited roofs remain part of this authority.
+    std::array<int32_t, SKY_COLUMNS> visualSkyCutoffY{};
 
     MeshSnapshot() { clear(); }
 
     void clear() {
         blocks.fill(BlockType::AIR);
         fluidStates.fill(FluidState::source().packed());
-        blockLight.fill(0);
+        packedLight.fill(0);
         generatedSurfaceCutoffY.fill(SKY_CUTOFF_UNKNOWN);
         generatedSurfaceMaterial.fill(BlockType::STONE);
         skyCutoffY.fill(SKY_CUTOFF_UNKNOWN);
+        visualSkyCutoffY.fill(SKY_CUTOFF_UNKNOWN);
         missingNeighborFaces = 0;
+        derivedSkyLightValid = false;
     }
     void resize() { clear(); }
 
@@ -84,6 +96,13 @@ struct MeshSnapshot {
             return SKY_CUTOFF_UNKNOWN;
         }
         return skyCutoffY[skyIndex(x, z)];
+    }
+
+    int32_t visualSkyCutoffAt(int x, int z) const {
+        if (x < -1 || x > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {
+            return SKY_CUTOFF_UNKNOWN;
+        }
+        return visualSkyCutoffY[skyIndex(x, z)];
     }
 
     int32_t generatedSurfaceCutoffAt(int x, int z) const {
@@ -107,11 +126,19 @@ struct MeshSnapshot {
         return blocks[index(x, y, z)];
     }
 
-    uint8_t lightAt(int x, int y, int z) const {
+    uint8_t packedLightAt(int x, int y, int z) const {
         if (x < -1 || x > CHUNK_EDGE || y < -1 || y > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {
             return 0;
         }
-        return blockLight[index(x, y, z)];
+        return packedLight[index(x, y, z)];
+    }
+
+    uint8_t skyLightAt(int x, int y, int z) const {
+        return derivedSkyLight(packedLightAt(x, y, z));
+    }
+
+    uint8_t blockLightAt(int x, int y, int z) const {
+        return derivedBlockLight(packedLightAt(x, y, z));
     }
 
     FluidState fluidAt(int x, int y, int z) const {

@@ -131,7 +131,7 @@ TEST_CASE("Audio engine: master volume clamping", "[phase8][audio]") {
 TEST_CASE("Audio engine: real playSound path mixes and drains through the callback",
           "[phase8][audio]") {
     // Exercise the ACTUAL AudioEngine mixer (not a reimplemented copy). No
-    // initialize() — the render callback never touches the AudioUnit, so this
+    // initialize(), the render callback never touches the AudioUnit, so this
     // runs headlessly. This is the path whose one-sided locking used to trap.
     AudioEngine engine;
 
@@ -171,6 +171,53 @@ TEST_CASE("Audio engine: real playSound path mixes and drains through the callba
     abl.mBuffers[0].mData = out3;
     engine.audioCallback(&abl);
     REQUIRE(out3[0] == Catch::Approx(0.25f)); // 0.5 sample × 0.5 master
+
+    engine.setMasterVolume(1.0F);
+    int32_t voice3 = engine.playSound(buf, SoundEffect::SAMPLE_RATE, 1.0F, true);
+    REQUIRE(voice3 >= 0);
+    engine.setVoiceGain(voice3, 0.2F);
+    float out4[kFrames * 2] = {0.f};
+    abl.mBuffers[0].mData = out4;
+    engine.audioCallback(&abl);
+    REQUIRE(out4[0] == Catch::Approx(0.1F));
+}
+
+TEST_CASE("Audio engine: looping voices wrap without gaps and preserve phase",
+          "[phase8][audio][weather]") {
+    AudioEngine engine;
+    const std::vector<float> loop = {0.125F, 0.25F, 0.5F};
+    REQUIRE(engine.playSound(loop, SoundEffect::SAMPLE_RATE, 1.0F, true) >= 0);
+
+    constexpr uint32_t kFirstFrames = 8;
+    float first[kFirstFrames * 2] = {0.0F};
+    AudioBufferList output;
+    output.mNumberBuffers = 1;
+    output.mBuffers[0].mNumberChannels = 2;
+    output.mBuffers[0].mDataByteSize = sizeof(first);
+    output.mBuffers[0].mData = first;
+
+    engine.audioCallback(&output);
+
+    const float expectedFirst[kFirstFrames] = {0.125F, 0.25F, 0.5F,   0.125F,
+                                               0.25F,  0.5F,  0.125F, 0.25F};
+    for (uint32_t frame = 0; frame < kFirstFrames; ++frame) {
+        REQUIRE(first[frame * 2] == Catch::Approx(expectedFirst[frame]));
+        REQUIRE(first[frame * 2 + 1] == Catch::Approx(expectedFirst[frame]));
+    }
+
+    // Eight frames leave a three-sample loop at phase two. The next callback
+    // must continue there, wrap again, and fill its entire output block.
+    constexpr uint32_t kSecondFrames = 5;
+    float second[kSecondFrames * 2] = {0.0F};
+    output.mBuffers[0].mDataByteSize = sizeof(second);
+    output.mBuffers[0].mData = second;
+    engine.audioCallback(&output);
+
+    const float expectedSecond[kSecondFrames] = {0.5F, 0.125F, 0.25F, 0.5F, 0.125F};
+    for (uint32_t frame = 0; frame < kSecondFrames; ++frame) {
+        REQUIRE(second[frame * 2] == Catch::Approx(expectedSecond[frame]));
+        REQUIRE(second[frame * 2 + 1] == Catch::Approx(expectedSecond[frame]));
+    }
 }
 
 // ---- SFX Tests ----
@@ -209,6 +256,24 @@ TEST_CASE("SFX: ambient wind generates correct duration", "[phase8][sfx]") {
     // Expected duration: 2s at 44100 Hz = 88200 samples
     uint32_t expected = 2 * SoundEffect::SAMPLE_RATE;
     REQUIRE(samples.size() == expected);
+}
+
+TEST_CASE("SFX: procedural precipitation beds are bounded deterministic loops",
+          "[phase8][sfx][weather]") {
+    const auto rain = SoundEffect::generateRainAmbience(1);
+    const auto rainAgain = SoundEffect::generateRainAmbience(1);
+    const auto snow = SoundEffect::generateSnowAmbience(1);
+    REQUIRE(rain.size() == SoundEffect::SAMPLE_RATE);
+    REQUIRE(snow.size() == SoundEffect::SAMPLE_RATE);
+    REQUIRE(rain == rainAgain);
+    for (float sample : rain) {
+        REQUIRE(sample >= -1.0F);
+        REQUIRE(sample <= 1.0F);
+    }
+    for (float sample : snow) {
+        REQUIRE(sample >= -1.0F);
+        REQUIRE(sample <= 1.0F);
+    }
 }
 
 TEST_CASE("SFX: animal sounds generate non-empty buffers", "[phase8][sfx]") {

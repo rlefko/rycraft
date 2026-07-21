@@ -29,10 +29,12 @@ Controls: use WASD to move and the mouse to look. Space jumps, Ctrl or a double-
 - **Climate-driven forests:** oak, large oak, birch, spruce, acacia, jungle, mangrove, palm, willow, alpine scrub, and fallen-log forms use continuous biome suitability, temperature, precipitation, soil, slope, elevation, lithology, tectonic stress, light, and hydrology. Dense forest biomes receive high canopy cover. Ordinary roots reject water and unsupported substrates, while mangroves and willows accept only their suitable shallow-water habitats and extend trunks or roots to the solid floor. Coarse step-32 geometry trusts that block-resolution habitat and root-water decision instead of rejecting a tree because unrelated water occurs elsewhere in its 32 by 32 cell, then grounds the accepted trunk on the displayed voxel.
 - **Building and persistence:** loaded-only raycast block editing, lit planned silhouettes at aboveground loading fronts, closed and dark unresolved openings underground, an outline highlight, LZ4-compressed RYCH v4 cubic saves beneath the generator-version-three region root, bounded coalesced save work, and manifests for edited vertical sections and indexed fluid frontiers.
 - **Habitat fauna:** sheep, cows, pigs, chickens, deer, goats, rabbits, frogs, and fish use deterministic territories, bounded populations, procedural voxel models, and movement-specific AI.
-- **A full day:** a twenty-minute day and night cycle with moving sun, dawn and dusk skies, procedural clouds, weather, and skylight shading.
-- **Native presentation:** linear HDR with texel-snapped shadow cascades, baked and screen-space ambient occlusion, volumetric clouds and light, weather, post-resolve water and screen-space reflections, exposure, bloom, lens flare, tonemapping, sharpening, complete alpha-aware block-texture mipmaps, trilinear 8x-anisotropic minification, and a native Metal UI.
+- **A full day and regional weather:** a twenty-minute day and night cycle drives an Earth-like atmosphere, one active sun or moon light, moon phases, stars, and physically scaled twilight. Deterministic pressure, moisture, temperature, instability, and front fields produce local wind, cloud type, rain, snow, fog, and non-destructive thunderstorms without changing blocks or gameplay rules.
+- **Native presentation:** linear HDR with four blended detailed shadow cascades through 1,536 blocks, a coarse terrain horizon shadow through 8,192 blocks, propagated skylight, ray traced screen-space GTAO and temporally denoised near-field diffuse SSGI, physical atmosphere LUTs, true volumetric cloud layers and cloud shadows, unified froxel fog and shafts, post-resolve water and screen-space reflections, exposure, bloom, lens flare, tonemapping, sharpening, complete alpha-aware block-texture mipmaps, trilinear 8x-anisotropic minification, and a native Metal UI.
 
 The generator uses bounded research-informed approximations so cubes remain fast to query in any order. See [world generation and persistence](docs/world-generation.md) for the implemented algorithms, limitations, and research references.
+
+Screen-space indirect lighting is intentionally near-field. Geometry or radiance outside the current frame cannot contribute colored bounce, while propagated skylight remains view-independent and supplies ambient accessibility through cave entrances and around loaded overhangs.
 
 Known limitation: far terrain, water, and canopy geometry still publish as one synchronous tile payload. Measured canopy work on cold tiles ranges from 250 to 1,165 milliseconds, so canopy-heavy construction can delay an otherwise ready terrain and water parent. Staged canopy attachment is a follow-up performance improvement. Missing exact halos already close with lit surface continuations, dark inward underground caps, or vertical bedrock caps while the real neighbor loads.
 
@@ -89,7 +91,11 @@ RYCRAFT_VIEW_DISTANCE=512 ./build/src/rycraft
 ./build/src/rycraft_worldgen_inspect 42
 MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ./build/src/rycraft
 RYCRAFT_CAPTURE=/tmp/frame.png RYCRAFT_CAPTURE_FRAME=500 ./build/src/rycraft
+RYCRAFT_START_SCREEN=playing RYCRAFT_WEATHER=storm RYCRAFT_TIME=6002 RYCRAFT_TIME_FREEZE=1 \
+  RYCRAFT_CAPTURE=/tmp/lightning.png RYCRAFT_CAPTURE_LIGHTNING=23080,-111650,17,2 ./build/src/rycraft
 RYCRAFT_BLOOM=0 ./build/src/rycraft
+RYCRAFT_WEATHER=storm RYCRAFT_TIME=6000 RYCRAFT_TIME_FREEZE=1 ./build/src/rycraft
+RYCRAFT_CLOUD_QUALITY=2 RYCRAFT_INDIRECT_LIGHT=2 RYCRAFT_SHADOWS=2 ./build/src/rycraft
 RYCRAFT_NATIVE_WINDOW=1 RYCRAFT_PERF_WARMUP_FRAMES=1200 RYCRAFT_PERF_FRAMES=1200 ./build-release/src/rycraft
 RYCRAFT_WORLD_SEED=764891 RYCRAFT_SPAWN=23029,225,-111726 RYCRAFT_YAW=0 RYCRAFT_PITCH=-17 RYCRAFT_VIEW_DISTANCE=512 ./build-release/src/rycraft
 ```
@@ -97,6 +103,10 @@ RYCRAFT_WORLD_SEED=764891 RYCRAFT_SPAWN=23029,225,-111726 RYCRAFT_YAW=0 RYCRAFT_
 `rycraft_worldgen_inspect [seed] [sample_x sample_z]` reports deterministic feature locations, surface footprints, water-body and shoreline data, lithology and material palettes, former-grid artifact measurements, far-parent coverage counts, separate column-plan, basin, shoreline-contour, and macro-control cache information, benchmark timing, and a route hash as JSON. The positional seed is optional and takes precedence over `RYCRAFT_WORLD_SEED`.
 
 `RYCRAFT_WORLDGEN_OVERLAY` accepts exactly `geology`, `hydrology`, `climate`, or `biome`. Performance acceptance is measured at native resolution with 4x MSAA and view distance 512 on an Apple M4 Max. The target is a lowest sustained one-second rate of at least 60 FPS, with exact cubic simulation capped at radius 32 and total unified-memory use capped at 64 GB. Hardware timing is reported separately from the deterministic limits enforced in CI. See [performance conventions](docs/performance-conventions.md) for the canonical seed-764891 route, measured CPU microbenchmarks, and the current validation status.
+
+`RYCRAFT_WEATHER` accepts `clear`, `overcast`, `rain`, `storm`, or `snow` for stable captures. `RYCRAFT_CLOUD_QUALITY` and `RYCRAFT_INDIRECT_LIGHT` accept 0 through 2 for Off, Medium, and High. `RYCRAFT_CLOUDS` and `RYCRAFT_SSAO` remain compatibility aliases for older scripts.
+
+`RYCRAFT_TIME` accepts an absolute unsigned 64-bit decimal world tick. The remainder modulo 24,000 selects time of day, while the complete saved age selects the lunar phase. For a PNG capture, `RYCRAFT_CAPTURE_LIGHTNING=x,z,id,ageTicks` injects one deterministic visual strike after regional weather is available. Its age must not exceed `RYCRAFT_TIME`; values from 0 through 11 select the visible flash interval.
 
 ## Troubleshooting
 
