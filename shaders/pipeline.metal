@@ -270,12 +270,13 @@ fragment SurfaceFragmentOutput fragmentMain(
                                        farShadow, horizonShadow, shadowSampler, shadow);
     lit *= cloudShadowVisibility(in.vWorldPosition, cloudShadow, cloudShadowUniforms);
     // A surface that cannot see the sky cannot see the sun. Inside cascade
-    // coverage the shadow map alone let a stray ray reach opaque-covered
-    // surfaces (a sunbeam down a mine shaft cast harsh bands across the deep
-    // tunnel walls), so cap direct sun by propagated sky access. Non-opaque
-    // cover keeps full skylight, so this never adds a second shadow under a leaf
-    // canopy; it only removes direct light from genuinely sealed cells.
-    lit *= smoothstep(0.0f, 0.1f, sky);
+    // coverage the shadow map alone leaked stray sun onto opaque-covered
+    // surfaces (grazing cascade texels painted moving bands across dug tunnel
+    // walls), so cap direct sun by propagated sky access: full sun only within
+    // about one block of a genuine sky path (sky >= 14), fading out by sky 8.
+    // Non-opaque cover keeps skylight 15, so a leaf canopy never gains a second
+    // shadow, and the indirect bounce still carries light deeper inside.
+    lit *= smoothstep(0.5f, 0.9f, sky);
 
     // Two-sided flora shading: the geometric normal of the visible blade side
     // (from screen-space derivatives, flipped toward the camera) modulates the
