@@ -221,19 +221,36 @@ kernel void volumetricCloudMarchKernel(
         return;
     }
 
-    const uint viewSteps = uint(uniforms.renderParams.x + 0.5f);
+    uint viewSteps = uint(uniforms.renderParams.x + 0.5f);
     const uint lightSteps = uint(uniforms.renderParams.y + 0.5f);
+    const float horizontalSpan = (exit - entry) * length(ray.xz);
+    const uint weatherCoverageSteps =
+        uint(ceil(horizontalSpan / max(uniforms.weatherMap.cellSpacing, 1.0f)));
+    viewSteps = max(viewSteps, min(weatherCoverageSteps, 64u));
     const float stepLength = (exit - entry) / float(viewSteps);
     const float jitter = fract(sin(dot(float2(gid), float2(12.9898f, 78.233f)) +
                                    uniforms.resolutionAndFrame.z * 0.6180339f) *
                                43758.5453f);
-    float distance = entry + jitter * stepLength;
     float transmittance = 1.0f;
     float3 scattering = 0.0f;
     float hitDepth = 0.0f;
     const float phase = dualLobePhase(dot(ray, uniforms.sunDirection), uniforms.phaseParams.x,
                                       uniforms.phaseParams.y, uniforms.phaseParams.z);
     for (uint step = 0; step < viewSteps; ++step) {
+        const float segmentBegin = entry + float(step) * stepLength;
+        const float segmentEnd = min(segmentBegin + stepLength, exit);
+        const float segmentMiddle = (segmentBegin + segmentEnd) * 0.5f;
+        const float3 middlePosition = uniforms.cameraPosition + ray * segmentMiddle;
+        const float2 middleRelativeXZ = middlePosition.xz - uniforms.cameraPosition.xz;
+        const float4 localLayer = weatherField(weatherLayer, middleRelativeXZ, uniforms.weatherMap);
+        const float2 localInterval = cloudRaySegmentLayerIntersection(
+            uniforms.cameraPosition.y, ray.y, segmentBegin, segmentEnd, localLayer.x, localLayer.y);
+        if (localInterval.y <= localInterval.x) {
+            continue;
+        }
+        const float localJitter = fract(jitter + float(step) * 0.6180339f);
+        const float distance = mix(localInterval.x, localInterval.y, localJitter);
+        const float localStepLength = localInterval.y - localInterval.x;
         const float3 position = uniforms.cameraPosition + ray * distance;
         const float density =
             sampleCloudDensity(position, baseNoise, erosionNoise, curlNoise, weatherCloud,
@@ -254,14 +271,15 @@ kernel void volumetricCloudMarchKernel(
                     lightDensity * uniforms.densityParams.z, lightStepLength);
             }
             const float extinction = density * uniforms.densityParams.z;
-            const float sampleTransmittance = beerLambertTransmittance(extinction, stepLength);
+            const float sampleTransmittance = beerLambertTransmittance(extinction, localStepLength);
             const float3 skyIrradiance =
                 uniforms.sunRadiance * lightTransmittance * phase +
                 uniforms.skyIrradiance *
                     (0.55f + uniforms.densityParams.w * (1.0f - lightTransmittance));
             const float3 groundIrradiance =
                 uniforms.skyIrradiance * float3(0.24f, 0.27f, 0.21f) *
-                smoothstep(0.0f, 0.35f, (position.y - lowY) / (highY - lowY));
+                smoothstep(0.0f, 0.35f,
+                           (position.y - localLayer.x) / max(localLayer.y - localLayer.x, 1.0f));
             scattering +=
                 transmittance * (skyIrradiance + groundIrradiance) * (1.0f - sampleTransmittance);
             transmittance *= sampleTransmittance;
@@ -269,7 +287,6 @@ kernel void volumetricCloudMarchKernel(
                 break;
             }
         }
-        distance += stepLength;
     }
     output.write(float4(scattering, 1.0f - transmittance), gid);
     hitDepthOutput.write(hitDepth, gid);

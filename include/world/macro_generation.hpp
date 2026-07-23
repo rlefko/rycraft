@@ -4,16 +4,25 @@
 #include "world/alpine_morphology.hpp"
 #include "world/basin_solver.hpp"
 #include "world/chunk.hpp"
+#include "world/native_hydrology.hpp"
 #include "world/noise.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <span>
 #include <utility>
 
 namespace worldgen {
+
+namespace learned {
+class WorldGenerationContext;
+struct PhysicalTerrainSample;
+} // namespace learned
 
 struct Vector2d {
     double x = 0.0;
@@ -21,6 +30,8 @@ struct Vector2d {
 };
 
 inline constexpr int64_t HOTSPOT_LATTICE_EDGE = 16'384;
+inline constexpr double LEGACY_WORLD_METERS_PER_BLOCK = 8.0;
+inline constexpr double LEGACY_LAPSE_RATE_C_PER_METER = -0.0065;
 
 struct HotspotChainPrimitive {
     Vector2d sourcePlateVelocity;
@@ -68,10 +79,9 @@ constexpr int surfaceFootprintWidth(SurfaceFootprint footprint) noexcept {
     return static_cast<int>(footprint);
 }
 
-// Exact columns and every filtered far footprint use the same post-erosion
-// detail scales. Keeping these shared prevents the handoff from changing
-// terrain amplitude while preserving extra dry-land texture and a supported
-// sea-floor cap below source water.
+// Legacy v3 columns and filtered far footprints use these post-erosion detail
+// scales. Generator v4 uses its separately bounded, slope-gated residual only
+// after canonical routing and outside the water-clearance bands.
 inline constexpr double DRY_RELIEF_DETAIL_SCALE = 1.5;
 inline constexpr double OCEAN_FLOOR_DETAIL_SCALE = 0.25;
 
@@ -84,10 +94,10 @@ inline constexpr size_t MACRO_CONTROL_SAMPLE_COUNT =
 inline constexpr size_t MACRO_CONTROL_CACHE_CAPACITY = 1'024;
 inline constexpr size_t MACRO_CONTROL_CACHE_BYTE_BUDGET = 128ull * 1024 * 1024;
 
-// Climate varies at substantially longer wavelengths than the two-block far
-// tier. A small, globally aligned control lattice lets every far footprint
-// share a filtered field without repeating the bounded 4,096-block moisture
-// integration at every mesh vertex.
+// The context-free v3 diagnostic path uses a globally aligned control lattice
+// to share its filtered far-climate field without repeating the bounded
+// 4,096-block moisture integration at every mesh vertex. Learned v4 bypasses
+// these controls and reads its physical climate authority directly.
 inline constexpr int FAR_CLIMATE_CONTROL_TILE_EDGE = 256;
 inline constexpr int FAR_CLIMATE_CONTROL_SPACING = 128;
 inline constexpr int FAR_CLIMATE_CONTROL_CORE_EDGE =
@@ -95,8 +105,12 @@ inline constexpr int FAR_CLIMATE_CONTROL_CORE_EDGE =
 inline constexpr int FAR_CLIMATE_CONTROL_GRID_EDGE = FAR_CLIMATE_CONTROL_CORE_EDGE + 2;
 inline constexpr size_t FAR_CLIMATE_CONTROL_SAMPLE_COUNT =
     FAR_CLIMATE_CONTROL_GRID_EDGE * FAR_CLIMATE_CONTROL_GRID_EDGE;
-inline constexpr size_t FAR_CLIMATE_CONTROL_CACHE_CAPACITY = 1'024;
-inline constexpr size_t FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET = 8ull * 1024 * 1024;
+// A 512-chunk legacy diagnostic horizon can touch roughly 3,600 distinct
+// 256-block climate controls. Retaining that parent disk avoids rebuilding and
+// evicting the same v3 controls while coarse meshes converge. Entries are
+// allocated on demand, and v4 should retain none.
+inline constexpr size_t FAR_CLIMATE_CONTROL_CACHE_CAPACITY = 4'096;
+inline constexpr size_t FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET = 32ull * 1024 * 1024;
 
 struct MacroControlCacheMetrics {
     size_t entries = 0;
@@ -153,6 +167,10 @@ struct HydrologySample {
     uint64_t transitionOwnerId = 0;
     Vector2d flowDirection;
     double surfaceElevation = 0.0;
+    // Dimensionless gradient of the canonical pre-water substrate. v4 uses
+    // this native-authority field for ecology and material decisions so an
+    // old macro-control lattice cannot create a visible slope phase.
+    double terrainSlope = 0.0;
     double waterSurface = 0.0;
     double discharge = 0.0;
     double sediment = 0.0;
@@ -172,6 +190,11 @@ struct HydrologySample {
     double lakeLossMm = 0.0;
     double lakeOverflowMmSquareKilometers = 0.0;
     double lakeSpillSurface = 0.0;
+    double baseflow = 0.0;
+    double precipitationSeasonality = 0.0;
+    double groundwaterRechargeMm = 0.0;
+    double groundwaterHead = 0.0;
+    double hydroperiod = 0.0;
     double waterfallTop = 0.0;
     double waterfallBottom = 0.0;
     double waterfallWidth = 0.0;
@@ -186,12 +209,20 @@ struct HydrologySample {
     bool waterfall = false;
     bool waterfallAnchor = false;
     bool delta = false;
+    bool estuary = false;
+    bool brackish = false;
+    bool perennial = false;
+    bool ephemeral = false;
+    bool wetland = false;
 };
 
 struct ClimateFields {
     Vector2d wind;
     double temperatureC = 0.0;
+    double temperatureVariabilityC = 0.0;
     double annualPrecipitationMm = 0.0;
+    double precipitationCoefficientOfVariation = 0.0;
+    double lapseRateCPerMeter = 0.0;
     double potentialEvapotranspirationMm = 0.0;
     double aridity = 0.0;
     double relativeHumidity = 0.0;
@@ -281,10 +312,28 @@ struct SurfaceSample {
     BiomeSuitability suitability;
     BiomeBlend biome;
     Ecotope ecotopes = Ecotope::NONE;
+    // Optional mesh and collision top for an exact emitted column. Macro and
+    // coarse samples leave this unset and geometryTerrainHeight falls back to
+    // terrainHeight explicitly. Emitted heights are integer block planes in
+    // the supported range, so float retains them exactly while fitting the
+    // preexisting alignment slot in cached ColumnPlan samples.
+    float emittedTerrainHeight = std::numeric_limits<float>::quiet_NaN();
+    // The canonical physical terrain authority used by climate, soil,
+    // ecological suitability, and hydrology. Exact cubic emission must not
+    // overwrite this continuous value with an integer voxel top.
     double terrainHeight = 0.0;
     double waterSurface = 0.0;
     double slope = 0.0;
 };
+
+// Exact voxel geometry is a separate authority from the learned physical
+// terrain. The finite fallback makes callers safe for macro samples that have
+// no emitted column while preventing an unset field from becoming geometry.
+inline double geometryTerrainHeight(const SurfaceSample& sample) noexcept {
+    return std::isfinite(sample.emittedTerrainHeight)
+               ? static_cast<double>(sample.emittedTerrainHeight)
+               : sample.terrainHeight;
+}
 
 // Coordinate-pure finished fluid state for one generated surface column.
 // Standing water owns an implicit source top. Routed channels quantize their
@@ -299,17 +348,29 @@ struct GeneratedFluidColumn {
     bool standing = false;
 };
 
+// Converts an ordinary analytical river stage into the nearest representable
+// static eighth-block top. Standing bodies and explicit falls retain their
+// canonical source or falling states.
+void quantizeGeneratedRiverSurface(HydrologySample& hydrology) noexcept;
+
 GeneratedFluidColumn generatedFluidColumn(const SurfaceSample& surface) noexcept;
 
-// Immutable view of one cached C2 macro-control tile. Exact ColumnPlans pin
-// this lightweight handle so climate, soil, suitability, slope, and
-// continuous geological signals use the same reconstruction as far terrain
-// without retaining a callback into the generator.
+// Immutable continuous macro view retained by an exact ColumnPlan. Legacy
+// generation shares one cached C2 control tile, while generator v4 copies a
+// compact learned stencil. Both paths avoid retaining a callback into the
+// generator.
 class MacroControlView {
 public:
     MacroControlView() = default;
 
     explicit operator bool() const noexcept { return impl_ != nullptr; }
+    [[nodiscard]] bool usesLearnedAuthority() const noexcept;
+    // Copies the 6 by 6 quantized native stencil needed by this exact chunk
+    // from no more than four validated authority pages. A deferred page
+    // aborts plan construction before hydrology or density work begins, and
+    // the compact stencil serves every later in-chunk reconstruction without
+    // retaining a page outside the authority cache budget.
+    void prepareLearnedAuthority() const;
     void reconstructContinuous(double x, double z, SurfaceSample& destination) const;
 
 private:
@@ -332,6 +393,12 @@ public:
         size_t macroControlCacheByteBudget = MACRO_CONTROL_CACHE_BYTE_BUDGET,
         size_t farClimateControlCacheCapacity = FAR_CLIMATE_CONTROL_CACHE_CAPACITY,
         size_t farClimateControlCacheByteBudget = FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET);
+    MacroGenerationSampler(
+        uint64_t worldSeed, std::shared_ptr<learned::WorldGenerationContext> generationContext,
+        size_t macroControlCacheCapacity = MACRO_CONTROL_CACHE_CAPACITY,
+        size_t macroControlCacheByteBudget = MACRO_CONTROL_CACHE_BYTE_BUDGET,
+        size_t farClimateControlCacheCapacity = FAR_CLIMATE_CONTROL_CACHE_CAPACITY,
+        size_t farClimateControlCacheByteBudget = FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET);
     ~MacroGenerationSampler();
 
     MacroGenerationSampler(const MacroGenerationSampler&) = delete;
@@ -340,6 +407,10 @@ public:
     HotspotChainPrimitive hotspotChain(int64_t cellX, int64_t cellZ) const;
     GeologySample sampleGeology(double x, double z) const;
     HydrologySample sampleHydrology(double x, double z) const;
+    // Builds or loads exactly one immutable FINAL native hydrology owner
+    // without requesting an unrelated decorated terrain sample at its center
+    // or claiming that cross-page canonical semantics are prepared.
+    void prepareNativeHydrologyOwner(int64_t ownerPageX, int64_t ownerPageZ) const;
     ClimateFields sampleClimate(double x, double z, double terrainHeight) const;
     SoilSample sampleSoil(double x, double z, const GeologySample& geology,
                           const HydrologySample& hydrology, const ClimateFields& climate) const;
@@ -357,6 +428,11 @@ public:
     // retained across all points that share a 64-block control tile.
     void sampleSurfaceGrid(int64_t originX, int64_t originZ, int spacing, int sampleEdge,
                            SurfaceFootprint footprint, std::span<SurfaceSample> output) const;
+    // Weather needs only the learned physical elevation and climate channels.
+    // Keeping this query separate prevents a horizon snapshot from routing
+    // hydrology or constructing geology, soil, biome, and ecology fields.
+    void sampleClimateGrid(int64_t originX, int64_t originZ, int spacing, int sampleEdge,
+                           std::span<SurfaceSample> output) const;
     void sampleGeometryGrid(int64_t originX, int64_t originZ, int spacingX, int spacingZ,
                             int sampleWidth, int sampleHeight, SurfaceFootprint footprint,
                             std::span<SurfaceSample> output) const;
@@ -369,16 +445,61 @@ public:
                              std::span<HydrologySample> output) const;
     void sampleHydrologyPoints(std::span<const ColumnPos> positions,
                                std::span<HydrologySample> output) const;
+    // Stage-free v4 point batch for coarse preview consumers. It keeps exact
+    // per-position routed wet/dry fields without constructing ordinary-stage
+    // reconciliation tiles. Legacy generation falls back to the normal path.
+    void sampleCoarseHydrologyPoints(std::span<const ColumnPos> positions,
+                                     std::span<HydrologySample> output) const;
+    // Produces a per-point mask for the conservative page-local dry proof.
+    // A zero mask requires the ordinary canonical sampling path. This API is
+    // v4-only and deliberately does not mark the owner semantically prepared.
+    void certifyNativeHydrologyDryPoints(std::span<const ColumnPos> positions,
+                                         std::span<HydrologySample> output,
+                                         std::span<uint8_t> certified) const;
+    // Runs only the bounded native dry proof. It neither fetches decorated
+    // learned terrain nor installs or marks semantic owner authority.
+    void certifyNativeHydrologyDryMask(std::span<const ColumnPos> positions,
+                                       std::span<uint8_t> certified) const;
+    // Atomically replaces the startup-only exact dry footprint after both the
+    // native proof and final learned-terrain adaptation confirm that every
+    // requested column remains dry. A rejected candidate leaves the prior
+    // footprint intact. `beforeInstall` runs after all proof and adaptation
+    // work, immediately before the atomic replacement, so asynchronous
+    // callers can reject an obsolete request without publishing its proof.
+    [[nodiscard]] bool
+    replaceNativeHydrologyDryFootprint(std::span<const ColumnPos> positions,
+                                       std::span<HydrologySample> output,
+                                       const std::function<void()>& beforeInstall = {}) const;
+    [[nodiscard]] bool
+    nativeHydrologyDryFootprintContains(std::span<const ColumnPos> positions) const;
+    void clearNativeHydrologyDryFootprint() const;
+    // Reduces already routed v4 native hydrology to globally aligned 32-block
+    // topology cells for far-water admission. Legacy callers receive an empty
+    // topology field and continue through their existing sampling path.
+    void sampleNativeHydrologyTopologyGrid(int64_t originX, int64_t originZ, int cellWidth,
+                                           int cellHeight,
+                                           std::span<NativeHydrologyTopologyCell> output) const;
     // Reconstructs final macro fields at arbitrary integer positions while
     // batching their basin lookups. This is the coordinate-pure point
     // counterpart to sampleSurfaceGrid for sparse feature anchors.
     void sampleSurfacePoints(std::span<const ColumnPos> positions, SurfaceFootprint footprint,
                              std::span<SurfaceSample> output) const;
+    // PREVIEW flora is temporary coverage. It needs learned physical climate,
+    // broad elevation, and a conservative ocean mask, but must not trigger a
+    // block-exact Fill-Spill-Merge owner before any vegetation can publish.
+    // FINAL ecology continues through sampleSurfacePoints and canonical
+    // hydrology.
+    void samplePreviewEcologyPoints(std::span<const ColumnPos> positions,
+                                    SurfaceFootprint footprint,
+                                    std::span<SurfaceSample> output) const;
     MacroControlCacheMetrics macroControlCacheMetrics() const;
     MacroControlCacheMetrics farClimateControlCacheMetrics() const;
+    NativeHydrologyCacheMetrics nativeHydrologyCacheMetrics() const;
     void clearMacroControlCache() const;
-    BasinCacheMetrics basinCacheMetrics() const { return basinSolver_.cacheMetrics(); }
-    void clearBasinCache() const { basinSolver_.clear(); }
+    BasinCacheMetrics basinCacheMetrics() const {
+        return legacyBasinSolver_ ? legacyBasinSolver_->cacheMetrics() : BasinCacheMetrics{};
+    }
+    void clearBasinCache() const;
 
     // Relief before channel incision. This is useful for density construction
     // and deterministic diagnostics.
@@ -388,6 +509,12 @@ public:
     // plans retain the resulting block-resolution height while reconstructing
     // climate and ecology from their shared continuous control tile.
     double reliefDetail(double x, double z, SurfaceFootprint footprint) const;
+    // Applies the bounded v4 dry-surface residual to a sample reconstructed
+    // from canonical hydrology. Exact ColumnPlans call this after restoring
+    // their block-resolution water authority so exact and far terrain retain
+    // the same coordinate-pure physical surface.
+    void applyV4SurfaceDetail(double x, double z, SurfaceFootprint footprint,
+                              SurfaceSample& surface) const;
 
 private:
     friend class MacroControlView;
@@ -404,12 +531,30 @@ private:
     DrainageNode drainageNode(int64_t cellX, int64_t cellZ) const;
     DrainageNode downstreamNode(const DrainageNode& node) const;
     HydrologySample sampleHydrologyFallback(double x, double z) const;
+    // Geometry consumers need the final authority samples used to correct
+    // canonical hydrology so they can derive climate without issuing a second
+    // query for every output. The public hydrology APIs intentionally retain
+    // their existing surface-only contract.
+    void
+    sampleHydrologyGridWithTerrain(int64_t originX, int64_t originZ, int spacingX, int spacingZ,
+                                   int sampleWidth, int sampleHeight,
+                                   std::span<HydrologySample> output,
+                                   std::span<learned::PhysicalTerrainSample> learnedTerrain) const;
+    void sampleHydrologyPointsWithTerrain(
+        std::span<const ColumnPos> positions, std::span<HydrologySample> output,
+        std::span<learned::PhysicalTerrainSample> learnedTerrain,
+        bool reconcileOrdinaryStage = true) const;
     HydrologySample sampleClimateHydrology(double x, double z) const;
     ClimateFields sampleClimateWithHydrology(double x, double z, double terrainHeight,
                                              bool canonicalHydrology,
                                              const HydrologySample* localHydrology = nullptr) const;
     double provisionalRainfall(double x, double z, double elevation) const;
     double provisionalPotentialEvapotranspiration(double x, double z, double elevation) const;
+    BasinSolver::HydroclimateFunction learnedHydroclimateFunction() const;
+    NativeHydrologyInputFunction nativeHydrologyInputFunction() const;
+    double preHydrologyElevationMeters(double x, double z,
+                                       const learned::PhysicalTerrainSample& learnedTerrain) const;
+    double v4VolcanicReliefBlocks(double x, double z) const;
     double terrainSlope(double x, double z) const;
     double alpineSurfaceDetail(double x, double z, SurfaceFootprint footprint,
                                const GeologySample& geology, const HydrologySample& hydrology,
@@ -418,20 +563,27 @@ private:
                                   SurfaceSample& surface) const;
     SurfaceSample sampleSurfaceDirect(double x, double z, SurfaceFootprint footprint) const;
     std::shared_ptr<const MacroControlTile> controlTile(int64_t tileX, int64_t tileZ) const;
-    SurfaceSample sampleSurfaceFromControlTile(const MacroControlTile& tile, double x, double z,
-                                               SurfaceFootprint footprint,
-                                               const HydrologySample* hydrology = nullptr) const;
+    SurfaceSample sampleSurfaceFromControlTile(
+        const MacroControlTile* tile, double x, double z, SurfaceFootprint footprint,
+        const HydrologySample* hydrology = nullptr,
+        const learned::PhysicalTerrainSample* learnedTerrain = nullptr) const;
     std::shared_ptr<const FarClimateControlTile> farClimateControlTile(int64_t tileX,
                                                                        int64_t tileZ) const;
-    SurfaceSample
-    sampleSurfaceFromFarClimateControlTile(const FarClimateControlTile& tile, double x, double z,
-                                           SurfaceFootprint footprint,
-                                           const HydrologySample* hydrology = nullptr) const;
+    SurfaceSample sampleSurfaceFromFarClimateControlTile(
+        const FarClimateControlTile* tile, double x, double z, SurfaceFootprint footprint,
+        const HydrologySample* hydrology = nullptr,
+        const learned::PhysicalTerrainSample* learnedTerrain = nullptr) const;
 
     uint64_t cacheTag_ = 0;
+    std::shared_ptr<learned::WorldGenerationContext> generationContext_;
     CounterRng random_;
-    AlpineMorphologySampler alpineMorphology_;
-    mutable BasinSolver basinSolver_;
+    // These v3 engines may reshape the synthetic macro surface through
+    // fluvial, talus, glacial, and alpine passes. Learned v4 owns neither
+    // object, which makes bypassing those legacy postprocessors structural
+    // instead of relying only on call-site conditions.
+    std::unique_ptr<AlpineMorphologySampler> legacyAlpineMorphology_;
+    mutable std::unique_ptr<BasinSolver> legacyBasinSolver_;
+    std::shared_ptr<NativeHydrologyRouter> nativeHydrologyRouter_;
     mutable std::unique_ptr<MacroControlTileCache> macroControlCache_;
     mutable std::unique_ptr<FarClimateControlTileCache> farClimateControlCache_;
     SimplexNoise continentalNoise_;

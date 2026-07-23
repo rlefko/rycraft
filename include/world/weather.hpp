@@ -2,6 +2,7 @@
 
 #include "common/math.hpp"
 #include "world/macro_generation.hpp"
+#include "world/physical_scale.hpp"
 #include "world/weather_grid.hpp"
 
 #include <algorithm>
@@ -96,25 +97,33 @@ struct WeatherSystemStats {
     uint64_t requests = 0;
     uint64_t coalescedRequests = 0;
     uint64_t buildsStarted = 0;
+    uint64_t buildsDeferred = 0;
+    uint64_t buildsFailed = 0;
     uint64_t snapshotsPublished = 0;
     uint64_t staleBuildsDiscarded = 0;
+    uint64_t lightningDiscoveryBuilds = 0;
+    uint64_t lightningDiscoveryCacheHits = 0;
     size_t pendingRequests = 0;
     bool workerBusy = false;
 };
 
 std::optional<WeatherPreset> weatherPresetFromString(std::string_view value) noexcept;
 Vec2 weatherAdvectionVelocity(const worldgen::ClimateFields& climate) noexcept;
-CloudLayerBounds cloudLayerBounds(CloudType type, float terrainHeight,
-                                  float relativeHumidity) noexcept;
+CloudLayerBounds
+cloudLayerBounds(CloudType type, float terrainHeight, float relativeHumidity,
+                 WorldPhysicalScale physicalScale = LEGACY_WORLD_PHYSICAL_SCALE) noexcept;
 float cloudProfileDensity(CloudType type, float normalizedHeight) noexcept;
-WeatherSample deriveWeatherSample(uint64_t worldSeed, double worldX, double worldZ,
-                                  uint64_t worldTick, const worldgen::SurfaceSample& staticClimate,
-                                  WeatherPreset preset = WeatherPreset::NATURAL) noexcept;
+WeatherSample
+deriveWeatherSample(uint64_t worldSeed, double worldX, double worldZ, uint64_t worldTick,
+                    const worldgen::SurfaceSample& staticClimate,
+                    WeatherPreset preset = WeatherPreset::NATURAL,
+                    WorldPhysicalScale physicalScale = LEGACY_WORLD_PHYSICAL_SCALE) noexcept;
 std::optional<LightningEvent> lightningEventForCell(uint64_t worldSeed, int64_t stormCellX,
                                                     int64_t stormCellZ, uint64_t timeBucket,
                                                     const WeatherSample& weather) noexcept;
 double thunderDelaySeconds(const LightningEvent& event, double listenerX, double listenerY,
-                           double listenerZ) noexcept;
+                           double listenerZ,
+                           WorldPhysicalScale physicalScale = LEGACY_WORLD_PHYSICAL_SCALE) noexcept;
 
 // An immutable pair of weather grids. Readers may retain this object while a
 // replacement is built and published by WeatherSystem's utility worker.
@@ -169,13 +178,23 @@ public:
     static constexpr uint64_t LIGHTNING_BUCKET_TICKS = 40;
     static constexpr size_t MAX_LIGHTNING_EVENTS_PER_QUERY = 8;
 
+    static constexpr uint64_t lightningTickForBucket(uint64_t timeBucket,
+                                                     uint64_t tickOffset) noexcept {
+        constexpr uint64_t MAXIMUM_TICK = std::numeric_limits<uint64_t>::max();
+        if (timeBucket > MAXIMUM_TICK / LIGHTNING_BUCKET_TICKS) return MAXIMUM_TICK;
+        const uint64_t bucketStart = timeBucket * LIGHTNING_BUCKET_TICKS;
+        if (tickOffset > MAXIMUM_TICK - bucketStart) return MAXIMUM_TICK;
+        return bucketStart + tickOffset;
+    }
+
     using ClimateGridSampler =
         std::function<void(int64_t originX, int64_t originZ, int spacing, int sampleEdge,
                            std::span<worldgen::SurfaceSample> output)>;
 
     explicit WeatherSystem(const ChunkGenerator& generator);
     WeatherSystem(uint64_t worldSeed, ClimateGridSampler climateGridSampler,
-                  WeatherPreset preset = WeatherPreset::NATURAL);
+                  WeatherPreset preset = WeatherPreset::NATURAL,
+                  WorldPhysicalScale physicalScale = LEGACY_WORLD_PHYSICAL_SCALE);
     ~WeatherSystem();
 
     WeatherSystem(const WeatherSystem&) = delete;
@@ -186,6 +205,7 @@ public:
     uint64_t requestSnapshot(int64_t cameraX, int64_t cameraZ, uint64_t worldTick);
     void setPreset(WeatherPreset preset);
     WeatherPreset preset() const;
+    WorldPhysicalScale physicalScale() const noexcept { return physicalScale_; }
 
     std::shared_ptr<const WeatherSnapshot> latestSnapshot() const;
     WeatherSample sample(double worldX, double worldZ, uint64_t worldTick) const;
@@ -207,13 +227,22 @@ private:
         bool sameBuild(const Request& other) const noexcept;
     };
 
+    struct LightningDiscoveryCacheEntry {
+        uint64_t snapshotRequestId = 0;
+        uint64_t timeBucket = 0;
+        std::vector<LightningEvent> events;
+    };
+
     uint64_t enqueueLocked(int64_t cameraX, int64_t cameraZ, uint64_t worldTick,
                            WeatherPreset preset);
     std::shared_ptr<const WeatherSnapshot> buildSnapshot(const Request& request) const;
+    std::vector<LightningEvent> lightningEventsForBucket(const WeatherSnapshot& snapshot,
+                                                         uint64_t timeBucket) const;
     void workerMain();
 
     uint64_t worldSeed_ = 0;
     ClimateGridSampler climateGridSampler_;
+    WorldPhysicalScale physicalScale_ = LEGACY_WORLD_PHYSICAL_SCALE;
 
     mutable std::mutex mutex_;
     mutable std::condition_variable requestCondition_;
@@ -228,4 +257,10 @@ private:
     std::optional<Request> pendingRequest_;
     std::shared_ptr<const WeatherSnapshot> snapshot_;
     WeatherSystemStats stats_;
+
+    static constexpr size_t MAX_LIGHTNING_DISCOVERY_CACHE_ENTRIES = 4;
+    mutable std::mutex lightningDiscoveryMutex_;
+    mutable std::vector<LightningDiscoveryCacheEntry> lightningDiscoveryCache_;
+    mutable uint64_t lightningDiscoveryBuilds_ = 0;
+    mutable uint64_t lightningDiscoveryCacheHits_ = 0;
 };

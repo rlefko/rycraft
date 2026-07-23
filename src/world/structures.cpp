@@ -197,15 +197,21 @@ void StructurePlacer::place(Chunk& chunk, const ChunkGenerator& gen, GenScratch&
 
     for (int64_t rz = minRegionZ; rz <= maxRegionZ; ++rz) {
         for (int64_t rx = minRegionX; rx <= maxRegionX; ++rx) {
-            const StructurePlacement& p = regionPlacement(rx, rz, gen, scratch);
-            if (!p.valid) continue;
-            // Skip footprints that cannot touch this chunk
-            if (p.anchorX + p.halfX < out.baseX - 1 ||
-                p.anchorX - p.halfX > out.baseX + CHUNK_WIDTH ||
-                p.anchorZ + p.halfZ < out.baseZ - 1 ||
-                p.anchorZ - p.halfZ > out.baseZ + CHUNK_DEPTH) {
+            // Reject coordinate-pure candidates before terrain validation.
+            // Neighboring structure regions can place their anchor more than
+            // six chunks away. Validating those irrelevant anchors used to
+            // construct distant ColumnPlans and escape the certified cold
+            // spawn footprint even though their blocks could not reach this
+            // chunk.
+            const StructurePlacement candidate = unvalidatedPlacement(random_, rx, rz);
+            if (candidate.anchorX + candidate.halfX < out.baseX - 1 ||
+                candidate.anchorX - candidate.halfX > out.baseX + CHUNK_WIDTH ||
+                candidate.anchorZ + candidate.halfZ < out.baseZ - 1 ||
+                candidate.anchorZ - candidate.halfZ > out.baseZ + CHUNK_DEPTH) {
                 continue;
             }
+            const StructurePlacement& p = regionPlacement(rx, rz, gen, scratch);
+            if (!p.valid) continue;
 
             bool desert = gen.biomeAt(p.anchorX, p.anchorZ, scratch) == Biome::DESERT;
             BlockType stoneBlock = desert ? BlockType::SANDSTONE : BlockType::COBBLESTONE;

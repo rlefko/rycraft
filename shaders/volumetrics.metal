@@ -151,8 +151,9 @@ kernel void froxelInjectKernel(
         return;
     }
 
-    const float heightScale = max(uniforms.mediumParams.w, 1.0f);
-    const float heightDensity = exp(-max(worldPosition.y - 64.0f, 0.0f) / heightScale);
+    const float altitudeMeters =
+        froxelAltitudeMeters(worldPosition.y, uniforms.physicalScale.y, uniforms.physicalScale.z);
+    const float heightDensity = froxelHeightDensity(altitudeMeters, uniforms.mediumParams.w);
     float aerosol = max(uniforms.weatherParams.x, 0.0f);
     float humidity = saturate(uniforms.weatherParams.y);
     float precipitation = saturate(uniforms.weatherParams.z);
@@ -239,7 +240,8 @@ kernel void froxelIntegrateKernel(texture3d<float, access::read> froxels [[textu
             froxelSliceDepth(slice, uniforms.volumeDimensions.z, nearDepth, farDepth);
         const float sliceFar =
             froxelSliceDepth(slice + 1u, uniforms.volumeDimensions.z, nearDepth, farDepth);
-        const float segmentLength = sliceFar - sliceNear;
+        const float segmentLength =
+            froxelPhysicalDistance(sliceFar - sliceNear, uniforms.physicalScale.x);
         const uint3 coordinate = uint3(gid, slice);
         const float4 medium = froxels.read(coordinate);
         const float segmentTransmittance = beerLambertTransmittance(medium.a, segmentLength);
@@ -412,7 +414,8 @@ fragment float4 aerialPerspectiveFragment(FroxelVertexOut in [[stage_in]],
     }
     const float3 scenePosition = hit.worldPosition;
     const float farDepth = max(uniforms.depthParams.y, 1.0f);
-    const float distance = min(hit.distance, farDepth);
+    const float distance =
+        froxelPhysicalDistance(min(hit.distance, farDepth), uniforms.physicalScale.x);
     const float aerosol = max(uniforms.weatherParams.x, 0.0f);
     const float humidity = saturate(uniforms.weatherParams.y);
     const float precipitation = saturate(uniforms.weatherParams.z);

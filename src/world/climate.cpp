@@ -103,7 +103,7 @@ ColumnShape ClimateSampler::shapeColumn(double x, double z) const {
 
     // Cave entrance mask: where this exceeds 0.4 (and the column is well
     // above sea level) caves keep full strength up to the surface.
-    shape.entrance = entrance_.octave2D(x / 140.0, z / 140.0, 2);
+    shape.entrance = caveEntrance(x, z);
 
     // Ravines: thin ridged lines; edge ramps 0 → 1 across the canyon lip.
     double rav = ravine_.ridged2D(x / 280.0, z / 280.0, 2);
@@ -111,6 +111,10 @@ ColumnShape ClimateSampler::shapeColumn(double x, double z) const {
     shape.ravineFloor = std::max(12.0, shape.height - 46.0 * shape.ravineEdge);
 
     return shape;
+}
+
+double ClimateSampler::caveEntrance(double x, double z) const {
+    return entrance_.octave2D(x / 140.0, z / 140.0, 2);
 }
 
 Biome ClimateSampler::selectBiome(const ColumnShape& shape) {

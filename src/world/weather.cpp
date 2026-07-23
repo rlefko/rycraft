@@ -16,7 +16,7 @@
 namespace {
 
 constexpr double TICKS_PER_SECOND = 20.0;
-constexpr double THUNDER_SPEED_BLOCKS_PER_SECOND = 343.0;
+constexpr double SPEED_OF_SOUND_METERS_PER_SECOND = 343.0;
 constexpr uint64_t PRESSURE_STREAM = 0x5745415448455201ULL;
 constexpr uint64_t MOISTURE_STREAM = 0x5745415448455202ULL;
 constexpr uint64_t AIR_MASS_STREAM = 0x5745415448455203ULL;
@@ -264,10 +264,56 @@ Vec2 weatherAdvectionVelocity(const worldgen::ClimateFields& climate) noexcept {
     return direction * speed;
 }
 
-CloudLayerBounds cloudLayerBounds(CloudType type, float terrainHeight,
-                                  float relativeHumidity) noexcept {
+CloudLayerBounds cloudLayerBounds(CloudType type, float terrainHeight, float relativeHumidity,
+                                  WorldPhysicalScale physicalScale) noexcept {
     const float humidity = std::clamp(relativeHumidity, 0.0f, 1.0f);
     CloudLayerBounds result;
+    if (usesGeneratorV4PhysicalScale(physicalScale)) {
+        const auto aboveTerrain = [&](double meters) {
+            return static_cast<float>(
+                worldYAboveTerrainMeters(terrainHeight, meters, physicalScale));
+        };
+        const auto aboveSea = [&](double meters) {
+            return static_cast<float>(worldYFromAltitudeMeters(meters, physicalScale));
+        };
+        switch (type) {
+            case CloudType::CLEAR:
+                result.baseY = std::max(aboveSea(3'000.0), aboveTerrain(1'000.0));
+                result.topY =
+                    result.baseY +
+                    300.0F / static_cast<float>(physicalScale.positiveVerticalMetersPerBlock);
+                break;
+            case CloudType::CIRRUS:
+                result.baseY = std::max(aboveSea(6'000.0), aboveTerrain(1'500.0));
+                result.topY = result.baseY +
+                              (450.0F + humidity * 300.0F) /
+                                  static_cast<float>(physicalScale.positiveVerticalMetersPerBlock);
+                break;
+            case CloudType::STRATUS:
+                result.baseY = std::max(aboveSea(1'000.0), aboveTerrain(300.0));
+                result.topY = result.baseY +
+                              (225.0F + humidity * 180.0F) /
+                                  static_cast<float>(physicalScale.positiveVerticalMetersPerBlock);
+                break;
+            case CloudType::CUMULUS:
+                result.baseY = std::max(aboveSea(1'500.0), aboveTerrain(450.0));
+                result.topY = result.baseY +
+                              (435.0F + humidity * 390.0F) /
+                                  static_cast<float>(physicalScale.positiveVerticalMetersPerBlock);
+                break;
+            case CloudType::CUMULONIMBUS:
+                result.baseY = std::max(aboveSea(1'200.0), aboveTerrain(375.0));
+                result.topY =
+                    std::max(aboveSea(8'000.0),
+                             result.baseY + (3'000.0F + humidity * 2'000.0F) /
+                                                static_cast<float>(
+                                                    physicalScale.positiveVerticalMetersPerBlock));
+                break;
+        }
+        result.baseY = std::max(result.baseY, aboveTerrain(75.0));
+        result.topY = std::max(result.topY, result.baseY + 8.0F);
+        return result;
+    }
     switch (type) {
         case CloudType::CLEAR:
             result = {300.0f, 340.0f};
@@ -315,7 +361,7 @@ float cloudProfileDensity(CloudType type, float normalizedHeight) noexcept {
 
 WeatherSample deriveWeatherSample(uint64_t worldSeed, double worldX, double worldZ,
                                   uint64_t worldTick, const worldgen::SurfaceSample& staticClimate,
-                                  WeatherPreset preset) noexcept {
+                                  WeatherPreset preset, WorldPhysicalScale physicalScale) noexcept {
     const CounterRng random(worldSeed);
     const Vec2 advection = weatherAdvectionVelocity(staticClimate.climate);
     const double seconds = static_cast<double>(worldTick) / TICKS_PER_SECOND;
@@ -422,8 +468,8 @@ WeatherSample deriveWeatherSample(uint64_t worldSeed, double worldX, double worl
     result.cloudType =
         classifyCloudType(result.cloudCoverage, result.stormPotential, static_cast<float>(front),
                           static_cast<float>(instability));
-    const CloudLayerBounds bounds =
-        cloudLayerBounds(result.cloudType, result.terrainHeight, result.relativeHumidity);
+    const CloudLayerBounds bounds = cloudLayerBounds(result.cloudType, result.terrainHeight,
+                                                     result.relativeHumidity, physicalScale);
     result.cloudBaseY = bounds.baseY;
     result.cloudTopY = bounds.topY;
     if (precipitation == 0.0) {
@@ -433,6 +479,10 @@ WeatherSample deriveWeatherSample(uint64_t worldSeed, double worldX, double worl
             temperature <= 0.0 ? PrecipitationKind::SNOW : PrecipitationKind::RAIN;
     }
     applyPreset(result, preset);
+    const CloudLayerBounds resolvedBounds = cloudLayerBounds(
+        result.cloudType, result.terrainHeight, result.relativeHumidity, physicalScale);
+    result.cloudBaseY = resolvedBounds.baseY;
+    result.cloudTopY = resolvedBounds.topY;
     if (preset != WeatherPreset::NATURAL) {
         result.cloudOffsetBlocks = {static_cast<double>(result.windBlocksPerSecond.x) * seconds,
                                     static_cast<double>(result.windBlocksPerSecond.y) * seconds};
@@ -463,11 +513,10 @@ std::optional<LightningEvent> lightningEventForCell(uint64_t worldSeed, int64_t 
     const double unitX = static_cast<double>(block[0]) / 4'294'967'296.0;
     const double unitZ = static_cast<double>(block[1]) / 4'294'967'296.0;
     const float unitHeight = static_cast<float>(block[2]) / 4'294'967'296.0f;
-    const uint64_t bucketStart = timeBucket * WeatherSystem::LIGHTNING_BUCKET_TICKS;
     LightningEvent event;
     event.id = random.u64(LIGHTNING_ID_STREAM, stormCellX, bucketLow, stormCellZ, bucketHigh);
-    event.tick =
-        bucketStart + static_cast<uint64_t>(block[3] % WeatherSystem::LIGHTNING_BUCKET_TICKS);
+    event.tick = WeatherSystem::lightningTickForBucket(
+        timeBucket, static_cast<uint64_t>(block[3] % WeatherSystem::LIGHTNING_BUCKET_TICKS));
     event.x = (static_cast<double>(stormCellX) + 0.15 + unitX * 0.70) *
               WeatherSystem::LIGHTNING_CELL_EDGE;
     event.z = (static_cast<double>(stormCellZ) + 0.15 + unitZ * 0.70) *
@@ -479,11 +528,11 @@ std::optional<LightningEvent> lightningEventForCell(uint64_t worldSeed, int64_t 
 }
 
 double thunderDelaySeconds(const LightningEvent& event, double listenerX, double listenerY,
-                           double listenerZ) noexcept {
+                           double listenerZ, WorldPhysicalScale physicalScale) noexcept {
     const double dx = event.x - listenerX;
     const double dy = static_cast<double>(event.y) - listenerY;
     const double dz = event.z - listenerZ;
-    return std::sqrt(dx * dx + dy * dy + dz * dz) / THUNDER_SPEED_BLOCKS_PER_SECOND;
+    return worldDistanceMeters(dx, dy, dz, physicalScale) / SPEED_OF_SOUND_METERS_PER_SECOND;
 }
 
 WeatherSnapshot::WeatherSnapshot(uint64_t requestId, int64_t centerX, int64_t centerZ,
@@ -566,14 +615,15 @@ bool WeatherSystem::Request::sameBuild(const Request& other) const noexcept {
 }
 
 WeatherSystem::WeatherSystem(const ChunkGenerator& generator)
-    : WeatherSystem(generator.seed(), [&generator](int64_t originX, int64_t originZ, int spacing,
-                                                   int sampleEdge,
-                                                   std::span<worldgen::SurfaceSample> output) {
-        // The generator outlives this system. The destructor joins the
-        // worker before that non-owning reference can become invalid.
-        generator.sampleFarSurfaceGrid(originX, originZ, spacing, sampleEdge,
-                                       worldgen::SurfaceFootprint::BLOCK_32, output);
-    }) {
+    : WeatherSystem(
+          generator.seed(),
+          [&generator](int64_t originX, int64_t originZ, int spacing, int sampleEdge,
+                       std::span<worldgen::SurfaceSample> output) {
+              // The generator outlives this system. The destructor joins the
+              // worker before that non-owning reference can become invalid.
+              generator.sampleWeatherClimateGrid(originX, originZ, spacing, sampleEdge, output);
+          },
+          WeatherPreset::NATURAL, worldPhysicalScale(generator.usesLearnedAuthority())) {
     if (const char* environment = std::getenv("RYCRAFT_WEATHER")) {
         if (const auto environmentPreset = weatherPresetFromString(environment)) {
             setPreset(*environmentPreset);
@@ -582,9 +632,10 @@ WeatherSystem::WeatherSystem(const ChunkGenerator& generator)
 }
 
 WeatherSystem::WeatherSystem(uint64_t worldSeed, ClimateGridSampler climateGridSampler,
-                             WeatherPreset preset)
+                             WeatherPreset preset, WorldPhysicalScale physicalScale)
     : worldSeed_(worldSeed)
     , climateGridSampler_(std::move(climateGridSampler))
+    , physicalScale_(physicalScale.valid() ? physicalScale : LEGACY_WORLD_PHYSICAL_SCALE)
     , preset_(preset) {
     if (!climateGridSampler_) {
         RY_LOG_FATAL("Weather system requires a climate grid sampler");
@@ -693,11 +744,12 @@ std::shared_ptr<const WeatherSnapshot> WeatherSystem::buildSnapshot(const Reques
                                                                     WeatherSnapshot::GRID_SPACING);
             const double worldZ = static_cast<double>(originZ + static_cast<int64_t>(sampleZ) *
                                                                     WeatherSnapshot::GRID_SPACING);
-            first[index] = deriveWeatherSample(worldSeed_, worldX, worldZ, request.firstTick,
-                                               staticClimate[index], request.preset);
+            first[index] =
+                deriveWeatherSample(worldSeed_, worldX, worldZ, request.firstTick,
+                                    staticClimate[index], request.preset, physicalScale_);
             second[index] = deriveWeatherSample(
                 worldSeed_, worldX, worldZ, request.firstTick + WeatherSnapshot::TIME_SLICE_TICKS,
-                staticClimate[index], request.preset);
+                staticClimate[index], request.preset, physicalScale_);
         }
     }
     return std::make_shared<WeatherSnapshot>(request.id, request.centerX, request.centerZ,
@@ -720,19 +772,41 @@ void WeatherSystem::workerMain() {
             ++stats_.buildsStarted;
         }
 
-        std::shared_ptr<const WeatherSnapshot> built = buildSnapshot(request);
+        std::shared_ptr<const WeatherSnapshot> built;
+        bool deferred = false;
+        bool failed = false;
+        try {
+            built = buildSnapshot(request);
+        } catch (const worldgen::learned::GenerationFailureException& exception) {
+            deferred = exception.status() == worldgen::learned::AuthorityStatus::DEFERRED;
+            failed = !deferred;
+            if (failed) {
+                RY_LOG_ERROR(std::string("Weather climate authority failed: ") + exception.what());
+            }
+        } catch (const std::exception& exception) {
+            failed = true;
+            RY_LOG_ERROR(std::string("Weather snapshot construction failed: ") + exception.what());
+        } catch (...) {
+            failed = true;
+            RY_LOG_ERROR("Weather snapshot construction failed with an unknown exception");
+        }
 
         {
             std::lock_guard lock(mutex_);
             workerBusy_ = false;
             if (stopping_) return;
+            if (deferred) ++stats_.buildsDeferred;
+            if (failed) ++stats_.buildsFailed;
             if (built && request.id == latestRequestId_) {
                 snapshot_ = std::move(built);
                 ++stats_.snapshotsPublished;
                 snapshotCondition_.notify_all();
             } else if (request.id != latestRequestId_) {
                 ++stats_.staleBuildsDiscarded;
-            } else if (!built) {
+            } else if (!built || deferred || failed) {
+                // The fixed tick requests the same immutable snapshot again.
+                // Releasing the desired request gives that retry a fresh ID;
+                // the worker never spins or waits on inference itself.
                 desiredRequest_.reset();
             }
         }
@@ -754,7 +828,70 @@ WeatherSample WeatherSystem::sample(double worldX, double worldZ, uint64_t world
     }
     if (current) return current->sample(worldX, worldZ, worldTick);
     return deriveWeatherSample(worldSeed_, worldX, worldZ, worldTick, fallbackClimate(),
-                               currentPreset);
+                               currentPreset, physicalScale_);
+}
+
+std::vector<LightningEvent> WeatherSystem::lightningEventsForBucket(const WeatherSnapshot& snapshot,
+                                                                    uint64_t timeBucket) const {
+    std::lock_guard lock(lightningDiscoveryMutex_);
+    const auto cached =
+        std::find_if(lightningDiscoveryCache_.begin(), lightningDiscoveryCache_.end(),
+                     [&snapshot, timeBucket](const LightningDiscoveryCacheEntry& entry) {
+                         return entry.snapshotRequestId == snapshot.requestId() &&
+                                entry.timeBucket == timeBucket;
+                     });
+    if (cached != lightningDiscoveryCache_.end()) {
+        ++lightningDiscoveryCacheHits_;
+        return cached->events;
+    }
+
+    const int64_t maximumX =
+        snapshot.originX() +
+        static_cast<int64_t>(WeatherSnapshot::GRID_EDGE - 1) * WeatherSnapshot::GRID_SPACING;
+    const int64_t maximumZ =
+        snapshot.originZ() +
+        static_cast<int64_t>(WeatherSnapshot::GRID_EDGE - 1) * WeatherSnapshot::GRID_SPACING;
+    const int64_t minimumCellX =
+        world_coord::floorDiv(snapshot.originX(), static_cast<int64_t>(LIGHTNING_CELL_EDGE));
+    const int64_t maximumCellX =
+        world_coord::floorDiv(maximumX, static_cast<int64_t>(LIGHTNING_CELL_EDGE));
+    const int64_t minimumCellZ =
+        world_coord::floorDiv(snapshot.originZ(), static_cast<int64_t>(LIGHTNING_CELL_EDGE));
+    const int64_t maximumCellZ =
+        world_coord::floorDiv(maximumZ, static_cast<int64_t>(LIGHTNING_CELL_EDGE));
+    const uint64_t sampleTick = lightningTickForBucket(timeBucket, LIGHTNING_BUCKET_TICKS / 2);
+
+    std::vector<LightningEvent> discovered;
+    for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
+        for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
+            const double sampleX = (static_cast<double>(cellX) + 0.5) * LIGHTNING_CELL_EDGE;
+            const double sampleZ = (static_cast<double>(cellZ) + 0.5) * LIGHTNING_CELL_EDGE;
+            const WeatherSample weather = snapshot.sample(sampleX, sampleZ, sampleTick);
+            const auto event = lightningEventForCell(worldSeed_, cellX, cellZ, timeBucket, weather);
+            if (!event) continue;
+            LightningEvent resolved = *event;
+            const WeatherSample strikeWeather =
+                snapshot.sample(resolved.x, resolved.z, resolved.tick);
+            resolved.y = strikeWeather.terrainHeight;
+            discovered.push_back(resolved);
+        }
+    }
+    std::sort(discovered.begin(), discovered.end(),
+              [](const LightningEvent& left, const LightningEvent& right) {
+                  if (left.tick != right.tick) return left.tick < right.tick;
+                  return left.id < right.id;
+              });
+
+    if (lightningDiscoveryCache_.size() >= MAX_LIGHTNING_DISCOVERY_CACHE_ENTRIES) {
+        lightningDiscoveryCache_.erase(lightningDiscoveryCache_.begin());
+    }
+    lightningDiscoveryCache_.push_back({
+        .snapshotRequestId = snapshot.requestId(),
+        .timeBucket = timeBucket,
+        .events = discovered,
+    });
+    ++lightningDiscoveryBuilds_;
+    return discovered;
 }
 
 std::vector<LightningEvent> WeatherSystem::lightningEvents(uint64_t previousTick,
@@ -765,38 +902,14 @@ std::vector<LightningEvent> WeatherSystem::lightningEvents(uint64_t previousTick
         previousTick = currentTick - LIGHTNING_BUCKET_TICKS;
     }
 
-    const int64_t maximumX =
-        current->originX() +
-        static_cast<int64_t>(WeatherSnapshot::GRID_EDGE - 1) * WeatherSnapshot::GRID_SPACING;
-    const int64_t maximumZ =
-        current->originZ() +
-        static_cast<int64_t>(WeatherSnapshot::GRID_EDGE - 1) * WeatherSnapshot::GRID_SPACING;
-    const int64_t minimumCellX =
-        world_coord::floorDiv(current->originX(), static_cast<int64_t>(LIGHTNING_CELL_EDGE));
-    const int64_t maximumCellX =
-        world_coord::floorDiv(maximumX, static_cast<int64_t>(LIGHTNING_CELL_EDGE));
-    const int64_t minimumCellZ =
-        world_coord::floorDiv(current->originZ(), static_cast<int64_t>(LIGHTNING_CELL_EDGE));
-    const int64_t maximumCellZ =
-        world_coord::floorDiv(maximumZ, static_cast<int64_t>(LIGHTNING_CELL_EDGE));
     const uint64_t firstBucket = previousTick / LIGHTNING_BUCKET_TICKS;
     const uint64_t lastBucket = currentTick / LIGHTNING_BUCKET_TICKS;
     std::vector<LightningEvent> events;
     for (uint64_t bucket = firstBucket; bucket <= lastBucket; ++bucket) {
-        const uint64_t sampleTick = bucket * LIGHTNING_BUCKET_TICKS + LIGHTNING_BUCKET_TICKS / 2;
-        for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
-            for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
-                const double sampleX = (static_cast<double>(cellX) + 0.5) * LIGHTNING_CELL_EDGE;
-                const double sampleZ = (static_cast<double>(cellZ) + 0.5) * LIGHTNING_CELL_EDGE;
-                const WeatherSample weather = current->sample(sampleX, sampleZ, sampleTick);
-                const auto event = lightningEventForCell(worldSeed_, cellX, cellZ, bucket, weather);
-                if (event && event->tick > previousTick && event->tick <= currentTick) {
-                    LightningEvent resolved = *event;
-                    const WeatherSample strikeWeather =
-                        current->sample(resolved.x, resolved.z, resolved.tick);
-                    resolved.y = strikeWeather.terrainHeight;
-                    events.push_back(resolved);
-                }
+        const std::vector<LightningEvent> bucketEvents = lightningEventsForBucket(*current, bucket);
+        for (const LightningEvent& event : bucketEvents) {
+            if (event.tick > previousTick && event.tick <= currentTick) {
+                events.push_back(event);
             }
         }
         if (bucket == std::numeric_limits<uint64_t>::max()) break;
@@ -813,10 +926,18 @@ std::vector<LightningEvent> WeatherSystem::lightningEvents(uint64_t previousTick
 }
 
 WeatherSystemStats WeatherSystem::stats() const {
-    std::lock_guard lock(mutex_);
-    WeatherSystemStats result = stats_;
-    result.pendingRequests = pendingRequest_ ? 1 : 0;
-    result.workerBusy = workerBusy_;
+    WeatherSystemStats result;
+    {
+        std::lock_guard lock(mutex_);
+        result = stats_;
+        result.pendingRequests = pendingRequest_ ? 1 : 0;
+        result.workerBusy = workerBusy_;
+    }
+    {
+        std::lock_guard lock(lightningDiscoveryMutex_);
+        result.lightningDiscoveryBuilds = lightningDiscoveryBuilds_;
+        result.lightningDiscoveryCacheHits = lightningDiscoveryCacheHits_;
+    }
     return result;
 }
 
