@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "model_revision": "ad2df557eca5645f588766101cf3bc3682455c3e",
+  "model_repository": "xandergos/terrain-diffusion-30m-onnx",
+  "generation": {
+    "model_block_scale": 4,
+    "meters_per_block": 7.5,
+    "terrain_authority_schema_version": 1,
+    "windows": {
+      "coarse": {"edge": 64, "stride": 48, "inference_steps": 20, "batch_size": 1},
+      "latent": {"edge": 64, "stride": 32, "inference_steps": 2, "batch_size": 4},
+      "decoder": {"edge": 256, "stride": 192, "inference_steps": 1, "batch_size": 4}
+    }
+  },
+  "assets": [
+    {
+      "name": "base_model.onnx",
+      "bytes": 2029994361,
+      "sha256": "543de788f73d0a4012685c908259f615601102aace4751aeccec64154ba145c0",
+      "url": "https://huggingface.co/xandergos/terrain-diffusion-30m-onnx/resolve/ad2df557eca5645f588766101cf3bc3682455c3e/base_model.onnx"
+    },
+    {
+      "name": "coarse_model.onnx",
+      "bytes": 22497125,
+      "sha256": "d6ca15b21b2e35d5e594a9ac7a4249a2376590c0ad2b5b49a1e6e2d033450008",
+      "url": "https://huggingface.co/xandergos/terrain-diffusion-30m-onnx/resolve/ad2df557eca5645f588766101cf3bc3682455c3e/coarse_model.onnx"
+    },
+    {
+      "name": "decoder_model.onnx",
+      "bytes": 223854143,
+      "sha256": "6473ae47ca6ec4d743d30fe4f5d381fe4158899714eff09b762005bdbdef68c1",
+      "url": "https://huggingface.co/xandergos/terrain-diffusion-30m-onnx/resolve/ad2df557eca5645f588766101cf3bc3682455c3e/decoder_model.onnx"
+    },
+    {
+      "name": "pipeline_data.json",
+      "bytes": 12226,
+      "sha256": "e3132c3ef0c65d8613615f9278ffe23bbd9363ddcd87f1cc6f18456bcc9efe5c",
+      "url": "https://huggingface.co/xandergos/terrain-diffusion-30m-onnx/resolve/ad2df557eca5645f588766101cf3bc3682455c3e/pipeline_data.json"
+    },
+    {
+      "name": "world_pipeline_config.json",
+      "bytes": 774,
+      "sha256": "c60f0b74d89317e64cfc623fbfdd828f1b5b2e50aa75020ac4001103381853bd",
+      "url": "https://huggingface.co/xandergos/terrain-diffusion-30m-onnx/resolve/ad2df557eca5645f588766101cf3bc3682455c3e/world_pipeline_config.json"
+    }
+  ],
+  "runtime": {
+    "name": "onnxruntime-osx-arm64-1.27.1.tgz",
+    "version": "1.27.1",
+    "directory": "onnxruntime-osx-arm64-1.27.1",
+    "dylib": "lib/libonnxruntime.1.27.1.dylib",
+    "bytes": 31959937,
+    "sha256": "e42b77a7281cc6e55141bf44fcfbac2c782b823a491bbb6ac33c781dd991f8a6",
+    "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.1/onnxruntime-osx-arm64-1.27.1.tgz"
+  },
+  "qualification": {
+    "schema_version": 2,
+    "quantization_scale": 256,
+    "sha256": "6ccf5b56fc32d13df9e7a333a4e68f71c9a0f15191e57375a2e4785c463a41df",
+    "execution_mode": "sequential",
+    "provider": "CoreML",
+    "model_cache_directory": "coreml-cache-v3-base4-decoder4x256",
+    "provider_options": {
+      "ModelFormat": "MLProgram",
+      "MLComputeUnits": "ALL",
+      "RequireStaticInputShapes": "1",
+      "EnableOnSubgraphs": "0"
+    },
+    "models": [
+      {
+        "name": "coarse_model.onnx",
+        "inputs": [[1, 11, 64, 64], [1], [1], [1], [1], [1], [1]],
+        "output": [1, 6, 64, 64]
+      },
+      {
+        "name": "base_model.onnx",
+        "inputs": [[4, 5, 64, 64], [4], [4, 58]],
+        "output": [4, 5, 64, 64]
+      },
+      {
+        "name": "decoder_model.onnx",
+        "inputs": [[4, 5, 256, 256], [4]],
+        "output": [4, 1, 256, 256]
+      }
+    ]
+  }
+}
