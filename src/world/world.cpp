@@ -142,17 +142,15 @@ uint64_t allocateWorldInstanceId() {
     return id;
 }
 
-std::optional<FluidState>
-canonicalCollisionFluidState(const worldgen::SurfaceSample& surface, int32_t surfaceY,
-                             int32_t worldY) noexcept {
+std::optional<FluidState> canonicalCollisionFluidState(const worldgen::SurfaceSample& surface,
+                                                       int32_t surfaceY, int32_t worldY) noexcept {
     const worldgen::GeneratedFluidColumn fluid = worldgen::generatedFluidColumn(surface);
     const bool explicitFallOwner =
         surface.hydrology.transitionOwnerKind == worldgen::WaterTransitionKind::EXPLICIT_FALL &&
         surface.hydrology.transitionOwnerId != 0;
     const bool explicitFallingLip =
-        explicitFallOwner &&
-        (surface.hydrology.generatedFluidLevel == 7 ||
-         surface.waterSurface <= surface.hydrology.waterfallBottom + 0.125001);
+        explicitFallOwner && (surface.hydrology.generatedFluidLevel == 7 ||
+                              surface.waterSurface <= surface.hydrology.waterfallBottom + 0.125001);
     const bool waterfallOverlay =
         explicitFallingLip && surface.hydrology.waterfall &&
         surface.hydrology.waterfallTop >= surface.hydrology.waterfallBottom + 0.5 &&
@@ -251,22 +249,18 @@ selectStableMeshCandidates(const std::unordered_map<ChunkPos, uint8_t>& candidat
         const int64_t dx = position.x - center.x;
         const int64_t dy = static_cast<int64_t>(position.y) - center.y;
         const int64_t dz = position.z - center.z;
-        const uint64_t horizontalDistanceSquared =
-            static_cast<uint64_t>(dx * dx + dz * dz);
+        const uint64_t horizontalDistanceSquared = static_cast<uint64_t>(dx * dx + dz * dz);
         const uint64_t verticalDistanceSquared = static_cast<uint64_t>(dy * dy);
-        const double horizontalDistance =
-            std::sqrt(static_cast<double>(horizontalDistanceSquared));
+        const double horizontalDistance = std::sqrt(static_cast<double>(horizontalDistanceSquared));
         ranked.push_back({
             .position = position,
             .priority = priority,
             .previouslyResident = previouslyResident,
             .horizontalDistanceSquared = horizontalDistanceSquared,
             .verticalDistanceSquared = verticalDistanceSquared,
-            .stableHorizontalDistance =
-                std::max(0.0, horizontalDistance -
-                                  (previouslyResident
-                                       ? EXACT_MESH_RESIDENCY_HYSTERESIS_CHUNKS
-                                       : 0.0)),
+            .stableHorizontalDistance = std::max(
+                0.0, horizontalDistance -
+                         (previouslyResident ? EXACT_MESH_RESIDENCY_HYSTERESIS_CHUNKS : 0.0)),
         });
     }
     std::sort(ranked.begin(), ranked.end(),
@@ -440,8 +434,7 @@ bool World::playableSpawnCollisionReady(int64_t worldX, int32_t worldY, int64_t 
              offsetX <= PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS; ++offsetX) {
             for (int offsetY = -PLAYABLE_SPAWN_COLLISION_VERTICAL_HALO_CUBES;
                  offsetY <= PLAYABLE_SPAWN_COLLISION_VERTICAL_HALO_CUBES; ++offsetY) {
-                const ChunkPos position{centerX + offsetX, centerY + offsetY,
-                                        centerZ + offsetZ};
+                const ChunkPos position{centerX + offsetX, centerY + offsetY, centerZ + offsetZ};
                 if (!validChunkY(position.y)) continue;
                 const auto found = chunks_.find(position);
                 if (found == chunks_.end() || !found->second || !found->second->generated) {
@@ -684,12 +677,10 @@ void World::generateChunkAsync(ChunkPos pos, int64_t priority) {
     if (pendingGenerations_.contains(pos)) return;
     if (const auto lane = exactPriorityByCube_.find(pos); lane != exactPriorityByCube_.end()) {
         const uint64_t squared = exactStreamingCubePriorityDistance(pos, exactPriorityCenter_);
-        priority = exactStreamingTaskPriority(activeSetEpoch_, lane->second,
-                                              squared);
+        priority = exactStreamingTaskPriority(activeSetEpoch_, lane->second, squared);
     }
     ThreadPool::TaskHandle handle;
-    std::future<void> future =
-        pool->submitTrackedWithPriority(priority, handle, std::move(work));
+    std::future<void> future = pool->submitTrackedWithPriority(priority, handle, std::move(work));
     pendingGenerations_[pos] = {std::move(future), handle, priority};
 }
 
@@ -730,9 +721,9 @@ void World::generateColumnPlanAsync(ColumnPos pos, int64_t priority) {
         ColumnPlanCompletionAction completionAction = ColumnPlanCompletionAction::DROP;
         {
             std::lock_guard<std::mutex> lock(pendingMutex_);
-            completionAction = columnPlanCompletionAction(
-                planAvailable, shuttingDown_.load(), exactPriorityByPlan_.contains(pos),
-                columnPlanRetries_.contains(pos));
+            completionAction = columnPlanCompletionAction(planAvailable, shuttingDown_.load(),
+                                                          exactPriorityByPlan_.contains(pos),
+                                                          columnPlanRetries_.contains(pos));
             if (completionAction == ColumnPlanCompletionAction::PUBLISH) {
                 ++completedPlansSinceRebuild_;
             } else if (completionAction == ColumnPlanCompletionAction::REQUEUE) {
@@ -774,8 +765,7 @@ void World::generateColumnPlanAsync(ColumnPos pos, int64_t priority) {
                                               static_cast<uint64_t>(dx * dx + dz * dz));
     }
     ThreadPool::TaskHandle handle;
-    std::future<void> future =
-        pool->submitTrackedWithPriority(priority, handle, std::move(work));
+    std::future<void> future = pool->submitTrackedWithPriority(priority, handle, std::move(work));
     pendingColumnPlans_[pos] = {std::move(future), handle, priority};
 }
 
@@ -961,8 +951,7 @@ BlockType World::getCollisionBlockIfLoaded(int64_t x, int32_t y, int64_t z) cons
     if (y < WORLD_MIN_Y) return BlockType::BEDROCK;
     if (y > WORLD_MAX_Y) return BlockType::AIR;
 
-    const ChunkPos section{Chunk::worldToChunk(x), Chunk::worldToChunkY(y),
-                           Chunk::worldToChunk(z)};
+    const ChunkPos section{Chunk::worldToChunk(x), Chunk::worldToChunkY(y), Chunk::worldToChunk(z)};
     const ColumnPos column{section.x, section.z};
     const std::shared_ptr<const ExactSurfaceCoverageSnapshot> coverage =
         getExactSurfaceCoverageSnapshot();
@@ -988,8 +977,7 @@ BlockType World::getCollisionBlockIfLoaded(int64_t x, int32_t y, int64_t z) cons
 float World::getCollisionFluidHeightIfLoaded(int64_t x, int32_t y, int64_t z) const {
     if (y < WORLD_MIN_Y || y > WORLD_MAX_Y) return 0.0F;
 
-    const ChunkPos section{Chunk::worldToChunk(x), Chunk::worldToChunkY(y),
-                           Chunk::worldToChunk(z)};
+    const ChunkPos section{Chunk::worldToChunk(x), Chunk::worldToChunkY(y), Chunk::worldToChunk(z)};
     const std::shared_ptr<const ExactSurfaceCoverageSnapshot> coverage =
         getExactSurfaceCoverageSnapshot();
     const std::shared_ptr<const ExactCollisionOwnershipSnapshot> collision =
@@ -1013,9 +1001,8 @@ float World::getCollisionFluidHeightIfLoaded(int64_t x, int32_t y, int64_t z) co
     const std::optional<FluidState> state =
         canonicalCollisionFluidState(surface, plan->surfaceY(localX, localZ), y);
     if (!state) return 0.0F;
-    return getCollisionBlockIfLoaded(x, y + 1, z) == BlockType::WATER
-               ? 1.0F
-               : fluidSurfaceHeight(*state);
+    return getCollisionBlockIfLoaded(x, y + 1, z) == BlockType::WATER ? 1.0F
+                                                                      : fluidSurfaceHeight(*state);
 }
 
 bool World::isChunkLoaded(ChunkPos pos) const {
@@ -1635,10 +1622,10 @@ void World::queuePublicationLightLocked(ChunkPos pos) {
     const auto first = publicationLightQueue_.begin() +
                        static_cast<std::vector<PublicationLightQueueEntry>::difference_type>(
                            publicationLightQueueHead_);
-    const auto insertion = std::find_if(
-        first, publicationLightQueue_.end(), [priority](const PublicationLightQueueEntry& queued) {
-            return queued.priority < priority;
-        });
+    const auto insertion = std::find_if(first, publicationLightQueue_.end(),
+                                        [priority](const PublicationLightQueueEntry& queued) {
+                                            return queued.priority < priority;
+                                        });
     publicationLightQueue_.insert(insertion, {pos, nextPublicationLightQueueToken_, priority});
     const size_t queuedCount = publicationLightQueue_.size() - publicationLightQueueHead_;
     publicationLightDeferredQueue_.store(queuedCount, std::memory_order_relaxed);
@@ -1653,11 +1640,11 @@ void World::reprioritizePublicationLightLocked(ChunkPos center) {
     for (auto iterator = first; iterator != publicationLightQueue_.end(); ++iterator) {
         iterator->priority = exactPublicationLightPriority(iterator->position, center);
     }
-    std::stable_sort(first, publicationLightQueue_.end(),
-                     [](const PublicationLightQueueEntry& left,
-                        const PublicationLightQueueEntry& right) {
-                         return left.priority > right.priority;
-                     });
+    std::stable_sort(
+        first, publicationLightQueue_.end(),
+        [](const PublicationLightQueueEntry& left, const PublicationLightQueueEntry& right) {
+            return left.priority > right.priority;
+        });
 }
 
 size_t World::settleChunkPublicationLightLocked(ChunkPos pos,
@@ -1873,11 +1860,9 @@ size_t World::drainPublicationLightLocked(ChunkPos first, const LightColumnPlans
     // The initial flood is part of the same bounded publication transaction.
     // Cap its follow-up budget one lower so a large fixed-tick allowance can
     // never turn the 32-flood safety bound into 33 floods.
-    const size_t transactionBudget =
-        std::min(floodBudget, PUBLICATION_LIGHT_SYNC_FLOOD_CAP);
-    const size_t followup = settleChunkPublicationLightLocked(first, initial, currentMask,
-                                                              columnPlans, {},
-                                                              transactionBudget - 1);
+    const size_t transactionBudget = std::min(floodBudget, PUBLICATION_LIGHT_SYNC_FLOOD_CAP);
+    const size_t followup = settleChunkPublicationLightLocked(
+        first, initial, currentMask, columnPlans, {}, transactionBudget - 1);
     const size_t total = 1 + followup;
     publicationLightSyncFloods_.fetch_add(total, std::memory_order_relaxed);
     recordLoadedCubeHighWater(publicationLightMaxSyncFloods_, total);
@@ -2363,8 +2348,7 @@ std::shared_ptr<const ExactSurfaceCoverageSnapshot> World::getExactSurfaceCovera
 
 std::shared_ptr<const ExactCollisionOwnershipSnapshot>
 World::getExactCollisionOwnershipSnapshot() const {
-    return std::atomic_load_explicit(&exactCollisionOwnershipSnapshot_,
-                                     std::memory_order_acquire);
+    return std::atomic_load_explicit(&exactCollisionOwnershipSnapshot_, std::memory_order_acquire);
 }
 
 bool World::publishExactCollisionOwnership(uint64_t coverageEpoch,
@@ -2483,10 +2467,9 @@ void World::queueGenerationLocked(ChunkPos pos) {
     if (generationsInFlight_.contains(pos) || !genBacklogSet_.insert(pos).second) return;
     const auto lane = exactPriorityByCube_.find(pos);
     const uint8_t priorityLane = lane == exactPriorityByCube_.end() ? 0 : lane->second;
-    genBacklog_.push(
-        {pos, exactStreamingTaskPriority(
-                  activeSetEpoch_, priorityLane,
-                  exactStreamingCubePriorityDistance(pos, exactPriorityCenter_))});
+    genBacklog_.push({pos, exactStreamingTaskPriority(
+                               activeSetEpoch_, priorityLane,
+                               exactStreamingCubePriorityDistance(pos, exactPriorityCenter_))});
 }
 
 void World::registerPlanDependenciesLocked(ChunkPos pos) {
@@ -2846,9 +2829,9 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
                 if (std::abs(dx) <= EXPLORATION_RADIUS_CHUNKS &&
                     std::abs(dz) <= EXPLORATION_RADIUS_CHUNKS &&
                     withinExactStreamingRadius(dx, dz, EXPLORATION_RADIUS_CHUNKS)) {
-                    const uint8_t priority =
-                        dx == 0 && dz == 0 ? EXACT_STREAMING_CAMERA_PRIORITY_LANE
-                                          : EXACT_STREAMING_EXPLORATION_PRIORITY_LANE;
+                    const uint8_t priority = dx == 0 && dz == 0
+                                                 ? EXACT_STREAMING_CAMERA_PRIORITY_LANE
+                                                 : EXACT_STREAMING_EXPLORATION_PRIORITY_LANE;
                     for (int haloZ = -EXACT_STREAMING_HORIZONTAL_MESH_HALO_CHUNKS;
                          haloZ <= EXACT_STREAMING_HORIZONTAL_MESH_HALO_CHUNKS; ++haloZ) {
                         for (int haloX = -EXACT_STREAMING_HORIZONTAL_MESH_HALO_CHUNKS;
@@ -2946,8 +2929,7 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
         const int64_t chunkZ = column.z;
         const uint8_t surfacePriority = exactStreamingSurfacePriorityLane(dx, dz);
         const uint8_t floraPriority = exactStreamingFloraPriorityLane(dx, dz);
-        const uint8_t primarySurfacePriority =
-            exactStreamingPrimarySurfacePriorityLane(dx, dz);
+        const uint8_t primarySurfacePriority = exactStreamingPrimarySurfacePriorityLane(dx, dz);
         if (const auto plan = generator_.findColumnPlan(column)) {
             for (int32_t section : plan->floraOwnershipSections()) {
                 addFloraOwnershipRequirement({chunkX, section, chunkZ}, floraPriority);
@@ -3006,9 +2988,9 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
             for (int oy = -EXPLORATION_VERTICAL_RADIUS_CUBES;
                  oy <= EXPLORATION_VERTICAL_RADIUS_CUBES; ++oy) {
                 const int32_t y = centerY + oy;
-                addWanted({chunkX, y, chunkZ},
-                          dx == 0 && dz == 0 ? EXACT_STREAMING_CAMERA_PRIORITY_LANE
-                                            : EXACT_STREAMING_EXPLORATION_PRIORITY_LANE);
+                addWanted({chunkX, y, chunkZ}, dx == 0 && dz == 0
+                                                   ? EXACT_STREAMING_CAMERA_PRIORITY_LANE
+                                                   : EXACT_STREAMING_EXPLORATION_PRIORITY_LANE);
             }
         }
     }
@@ -3209,10 +3191,10 @@ bool World::rebuildActiveSet(const ActiveSetRequest& request) {
         const ChunkPos priorityCenter{centerX, centerY, centerZ};
         const uint64_t leftDistance = exactStreamingCubePriorityDistance(left, priorityCenter);
         const uint64_t rightDistance = exactStreamingCubePriorityDistance(right, priorityCenter);
-        const int64_t leftPriority = exactStreamingTaskPriority(
-            0, retainedPriority.at(left), leftDistance);
-        const int64_t rightPriority = exactStreamingTaskPriority(
-            0, retainedPriority.at(right), rightDistance);
+        const int64_t leftPriority =
+            exactStreamingTaskPriority(0, retainedPriority.at(left), leftDistance);
+        const int64_t rightPriority =
+            exactStreamingTaskPriority(0, retainedPriority.at(right), rightDistance);
         if (leftPriority != rightPriority) return leftPriority < rightPriority;
         if (left.x != right.x) return left.x > right.x;
         if (left.z != right.z) return left.z > right.z;
@@ -3444,12 +3426,11 @@ void World::pumpGeneration() {
         const auto planBacklogLess = [&](ColumnPos left, ColumnPos right) {
             const auto priorityFor = [&](ColumnPos position) {
                 const auto lane = exactPriorityByPlan_.find(position);
-                const uint8_t priorityLane =
-                    lane == exactPriorityByPlan_.end() ? 0 : lane->second;
+                const uint8_t priorityLane = lane == exactPriorityByPlan_.end() ? 0 : lane->second;
                 const int64_t dx = position.x - exactPriorityCenter_.x;
                 const int64_t dz = position.z - exactPriorityCenter_.z;
-                return exactStreamingTaskPriority(
-                    0, priorityLane, static_cast<uint64_t>(dx * dx + dz * dz));
+                return exactStreamingTaskPriority(0, priorityLane,
+                                                  static_cast<uint64_t>(dx * dx + dz * dz));
             };
             const int64_t leftPriority = priorityFor(left);
             const int64_t rightPriority = priorityFor(right);
@@ -3458,15 +3439,13 @@ void World::pumpGeneration() {
             return left.z > right.z;
         };
         const auto insertPlanBacklog = [&](ColumnPos position) {
-            const auto insertion = std::lower_bound(columnPlanBacklog_.begin(),
-                                                    columnPlanBacklog_.end(), position,
-                                                    planBacklogLess);
+            const auto insertion = std::lower_bound(
+                columnPlanBacklog_.begin(), columnPlanBacklog_.end(), position, planBacklogLess);
             columnPlanBacklog_.insert(insertion, position);
         };
         for (auto it = pendingGenerations_.begin(); it != pendingGenerations_.end();) {
             if (!it->second.future.valid() ||
-                it->second.future.wait_for(std::chrono::seconds(0)) ==
-                    std::future_status::ready) {
+                it->second.future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                 const ChunkPos completed = it->first;
                 if (it->second.future.valid()) {
                     try {
@@ -3496,8 +3475,7 @@ void World::pumpGeneration() {
         }
         for (auto it = pendingColumnPlans_.begin(); it != pendingColumnPlans_.end();) {
             if (!it->second.future.valid() ||
-                it->second.future.wait_for(std::chrono::seconds(0)) ==
-                    std::future_status::ready) {
+                it->second.future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                 const ColumnPos completed = it->first;
                 if (it->second.future.valid()) {
                     try {
@@ -3520,8 +3498,8 @@ void World::pumpGeneration() {
                 const bool alreadyQueued =
                     std::ranges::find(columnPlanBacklog_, completed) != columnPlanBacklog_.end();
                 const bool planAvailable = generator_.findColumnPlan(completed) != nullptr;
-                const bool generationAvailable = generationFailure() == std::nullopt &&
-                                                 !shuttingDown_.load();
+                const bool generationAvailable =
+                    generationFailure() == std::nullopt && !shuttingDown_.load();
                 const ColumnPlanRetryPublicationAction retryAction =
                     columnPlanRetryPublicationAction(true, retryRequested, requiredNow,
                                                      alreadyQueued, planAvailable,
@@ -3565,8 +3543,7 @@ void World::pumpGeneration() {
         for (ChunkPos position : generationsInFlight_) {
             if (exactPriorityByCube_.contains(position)) ++currentGenerationJobs;
         }
-        while (generationAvailable &&
-               currentGenerationJobs < EXACT_GENERATION_SUBMISSION_LIMIT &&
+        while (generationAvailable && currentGenerationJobs < EXACT_GENERATION_SUBMISSION_LIMIT &&
                !genBacklog_.empty()) {
             const GenerationBacklogEntry entry = genBacklog_.top();
             const ChunkPos pos = entry.position;

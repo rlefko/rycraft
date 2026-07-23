@@ -163,18 +163,18 @@ public:
     // one-row and one-column strips. Authority point batches retain their
     // immutable pages through one stage-free query; geometry point batches
     // are deterministically converted into stage-free runs before overlays.
-    void sampleCoarseNativeHydrologyAuthorityGrid(
-        int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth,
-        int sampleHeight, std::span<worldgen::HydrologySample> output) const;
-    void sampleCoarseNativeHydrologyAuthorityPoints(
-        std::span<const ColumnPos> positions,
-        std::span<worldgen::HydrologySample> output) const;
-    void sampleCoarseNativeHydrologyGeometryGrid(
-        int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth,
-        int sampleHeight, std::span<worldgen::SurfaceSample> output) const;
-    void sampleCoarseNativeHydrologyGeometryPoints(
-        std::span<const ColumnPos> positions,
-        std::span<worldgen::SurfaceSample> output) const;
+    void
+    sampleCoarseNativeHydrologyAuthorityGrid(int64_t originX, int64_t originZ, int spacingX,
+                                             int spacingZ, int sampleWidth, int sampleHeight,
+                                             std::span<worldgen::HydrologySample> output) const;
+    void
+    sampleCoarseNativeHydrologyAuthorityPoints(std::span<const ColumnPos> positions,
+                                               std::span<worldgen::HydrologySample> output) const;
+    void sampleCoarseNativeHydrologyGeometryGrid(int64_t originX, int64_t originZ, int spacingX,
+                                                 int spacingZ, int sampleWidth, int sampleHeight,
+                                                 std::span<worldgen::SurfaceSample> output) const;
+    void sampleCoarseNativeHydrologyGeometryPoints(std::span<const ColumnPos> positions,
+                                                   std::span<worldgen::SurfaceSample> output) const;
     // Compact v4 topology reduction for globally aligned 32-block far cells.
     // It conservatively marks only cells that can hide a native water feature
     // between their coarse terrain samples.

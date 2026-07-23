@@ -1075,8 +1075,8 @@ void sampleStageFreePointRuns(std::span<const ColumnPos> positions, std::span<Sa
         size_t last = first + 1;
         int64_t spacing = 2;
         if (last < unique.size() && unique[last].position.z == row) {
-            const __int128 candidate = static_cast<__int128>(unique[last].position.x) -
-                                       unique[first].position.x;
+            const __int128 candidate =
+                static_cast<__int128>(unique[last].position.x) - unique[first].position.x;
             if (candidate <= std::numeric_limits<int>::max()) {
                 spacing = static_cast<int64_t>(candidate);
                 ++last;
@@ -1965,8 +1965,7 @@ void ChunkGenerator::samplePlanFreeExactSurfaceGrid(
                 volcanismAt(worldX, worldZ, surface.geology, scratch);
             surfaceY = boundedLearnedSurfaceY(surface, surfaceY, learnedAuthority_);
             if (!learnedAuthority_ && !hasCanonicalWaterFeature(surface.hydrology) &&
-                volcanism.craterLake &&
-                volcanism.craterProfileInfluence > 1.0e-4) {
+                volcanism.craterLake && volcanism.craterProfileInfluence > 1.0e-4) {
                 surfaceY = std::clamp(static_cast<int>(std::ceil(surface.terrainHeight)) - 1,
                                       WORLD_MIN_Y, WORLD_MAX_Y);
             }
@@ -2340,8 +2339,8 @@ void ChunkGenerator::sampleFarEcologyPoints(std::span<const ColumnPos> positions
         surface.waterSurface = surface.hydrology.waterSurface;
         surface.slope = std::max(0.0, surface.hydrology.terrainSlope);
         if (hasCanonicalWaterFeature(surface.hydrology)) {
-            surface.terrainHeight = std::min(surface.terrainHeight,
-                                             surface.hydrology.surfaceElevation);
+            surface.terrainHeight =
+                std::min(surface.terrainHeight, surface.hydrology.surfaceElevation);
         }
         surface.hydrology.surfaceElevation = surface.terrainHeight;
         const VolcanicColumnSample& volcanism =
@@ -3169,8 +3168,7 @@ const VolcanicColumnSample& ChunkGenerator::volcanismAt(int64_t x, int64_t z,
             const bool candidateCraterWet = profileDistance < volcano.craterLakeRadius;
             if (volcano.craterLake && profileDistance <= craterAuthorityLimit &&
                 ((candidateCraterWet && !selectedCraterWet) ||
-                 (candidateCraterWet == selectedCraterWet &&
-                  craterScore < selectedCraterScore))) {
+                 (candidateCraterWet == selectedCraterWet && craterScore < selectedCraterScore))) {
                 selectedCraterScore = craterScore;
                 selectedCraterWet = candidateCraterWet;
                 result.craterFactor = crater;
@@ -3698,9 +3696,9 @@ void ChunkGenerator::fillColumn(Chunk& chunk, int lx, int lz,
     const bool legacySealedHydrologySupport =
         !learnedAuthority_ && (surface.hydrology.channelBank || surface.hydrology.lakeBank ||
                                surface.hydrology.waterfall);
-    const bool coherentCraterProfile =
-        !learnedAuthority_ && !preserveCanonicalWater && volcanism.craterLake &&
-        volcanism.craterProfileInfluence > 1.0e-4;
+    const bool coherentCraterProfile = !learnedAuthority_ && !preserveCanonicalWater &&
+                                       volcanism.craterLake &&
+                                       volcanism.craterProfileInfluence > 1.0e-4;
     double waterSurface = hasSurfaceWater(surface.hydrology)
                               ? surface.waterSurface
                               : -std::numeric_limits<double>::infinity();

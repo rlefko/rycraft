@@ -549,8 +549,7 @@ v4NearEntryClosureStatus(const V4NearEntryClosureInput& input) noexcept {
         input.currentProtectedEpoch != input.closureProtectedEpoch) {
         return V4NearEntryClosureStatus::EpochMismatch;
     }
-    if (input.currentAnchor != input.closureAnchor)
-        return V4NearEntryClosureStatus::AnchorMismatch;
+    if (input.currentAnchor != input.closureAnchor) return V4NearEntryClosureStatus::AnchorMismatch;
     if (!input.connectedPreviewParentPrefixReady)
         return V4NearEntryClosureStatus::PreviewParentPrefixIncomplete;
     if (input.finalTargetCountsByStep != V4_ENTRY_FINAL_TARGETS_BY_STEP)

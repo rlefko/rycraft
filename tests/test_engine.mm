@@ -7,12 +7,15 @@
 #include <common/math.hpp>
 #include <common/random.hpp>
 #include <common/thread_pool.hpp>
+#include <engine/application_termination.hpp>
 #include <engine/game_state.hpp>
 #include <engine/input_bindings.hpp>
 #include <engine/inventory.hpp>
 #include <engine/mining.hpp>
+#include <engine/playtest_fixture.hpp>
 #include <engine/slot_interaction.hpp>
 #include <engine/survival.hpp>
+#include <engine/v4_world_startup.hpp>
 #include <entity/ai.hpp>
 #include <entity/entity.hpp>
 #include <entity/physics.hpp>
@@ -50,23 +53,143 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 // ============================================================================
 // Vec3 Tests
 // ============================================================================
 
+TEST_CASE("Application termination quiescence is ordered and idempotent",
+          "[engine][shutdown][fake][regression]") {
+    const std::vector<std::string> expected{
+        "save",       "cancel-bootstrap", "stop-render",
+        "stop-world", "release-contexts", "release-runtime",
+    };
+
+    for (int repetition = 0; repetition < 16; ++repetition) {
+        std::vector<std::string> calls;
+        ApplicationTerminationActions actions{
+            .saveDurableState =
+                [&] {
+                    calls.emplace_back("save");
+                    return true;
+                },
+            .cancelBootstrap = [&] { calls.emplace_back("cancel-bootstrap"); },
+            .stopRenderWorkers = [&] { calls.emplace_back("stop-render"); },
+            .stopWorldAndGenerationWorkers = [&] { calls.emplace_back("stop-world"); },
+            .releaseGenerationOwners = [&] { calls.emplace_back("release-contexts"); },
+            .releaseRuntime = [&] { calls.emplace_back("release-runtime"); },
+        };
+        ApplicationTerminationQuiescence quiescence;
+
+        REQUIRE(quiescence.quiesce(actions));
+        REQUIRE(quiescence.persistenceResolved());
+        REQUIRE(quiescence.quiesced());
+        REQUIRE(calls == expected);
+
+        REQUIRE(quiescence.quiesce(actions));
+        REQUIRE(calls == expected);
+
+        quiescence.resetForWorldSession();
+        REQUIRE_FALSE(quiescence.persistenceResolved());
+        REQUIRE_FALSE(quiescence.quiesced());
+        calls.clear();
+        REQUIRE(quiescence.quiesce(actions));
+        REQUIRE(calls == expected);
+    }
+}
+
+TEST_CASE("Application termination retries a failed durable save before teardown",
+          "[engine][shutdown][fake][save-failure]") {
+    std::vector<std::string> calls;
+    bool saveSucceeds = false;
+    ApplicationTerminationActions actions{
+        .saveDurableState =
+            [&] {
+                calls.emplace_back("save");
+                return saveSucceeds;
+            },
+        .cancelBootstrap = [&] { calls.emplace_back("cancel-bootstrap"); },
+        .stopRenderWorkers = [&] { calls.emplace_back("stop-render"); },
+        .stopWorldAndGenerationWorkers = [&] { calls.emplace_back("stop-world"); },
+        .releaseGenerationOwners = [&] { calls.emplace_back("release-contexts"); },
+        .releaseRuntime = [&] { calls.emplace_back("release-runtime"); },
+    };
+    ApplicationTerminationQuiescence quiescence;
+
+    REQUIRE_FALSE(quiescence.quiesce(actions));
+    REQUIRE_FALSE(quiescence.persistenceResolved());
+    REQUIRE_FALSE(quiescence.quiesced());
+    REQUIRE(calls == std::vector<std::string>{"save"});
+
+    saveSucceeds = true;
+    REQUIRE(quiescence.quiesce(actions));
+    const std::vector<std::string> expectedAfterRetry{
+        "save",
+        "save",
+        "cancel-bootstrap",
+        "stop-render",
+        "stop-world",
+        "release-contexts",
+        "release-runtime",
+    };
+    REQUIRE(calls == expectedAfterRetry);
+}
+
+TEST_CASE("Application destruction can force quiescence after persistence fails",
+          "[engine][shutdown][fake][destructor]") {
+    std::vector<std::string> calls;
+    ApplicationTerminationActions actions{
+        .saveDurableState =
+            [&] {
+                calls.emplace_back("save");
+                return false;
+            },
+        .cancelBootstrap = [&] { calls.emplace_back("cancel-bootstrap"); },
+        .stopRenderWorkers = [&] { calls.emplace_back("stop-render"); },
+        .stopWorldAndGenerationWorkers = [&] { calls.emplace_back("stop-world"); },
+        .releaseGenerationOwners = [&] { calls.emplace_back("release-contexts"); },
+        .releaseRuntime = [&] { calls.emplace_back("release-runtime"); },
+    };
+    ApplicationTerminationQuiescence quiescence;
+
+    REQUIRE_FALSE(quiescence.quiesce(actions));
+    REQUIRE(quiescence.quiesce(actions, false));
+    REQUIRE(quiescence.quiesced());
+    const std::vector<std::string> expected{
+        "save",       "cancel-bootstrap", "stop-render",
+        "stop-world", "release-contexts", "release-runtime",
+    };
+    REQUIRE(calls == expected);
+}
+
 TEST_CASE("Physical atmosphere parameters and volume helpers stay finite",
           "[render][atmosphere][volumetrics]") {
-    AtmosphereUniforms atmosphere =
-        earthAtmosphereUniforms(225.0F, simd_make_float3(0.3F, 0.8F, 0.2F),
-                                simd_make_float3(18.0F, 17.5F, 16.0F), 1.25F, 0.7F, 7);
+    AtmosphereUniforms atmosphere = earthAtmosphereUniforms(
+        225.0F, LEGACY_WORLD_PHYSICAL_SCALE, simd_make_float3(0.3F, 0.8F, 0.2F),
+        simd_make_float3(18.0F, 17.5F, 16.0F), 1.25F, 0.7F, 7);
     REQUIRE(atmosphereUniformsFinite(atmosphere));
     REQUIRE(atmosphere.atmosphereRadii.x == Catch::Approx(6360.0F));
     REQUIRE(atmosphere.atmosphereRadii.y == Catch::Approx(6460.0F));
     REQUIRE(atmosphere.atmosphereRadii.z == Catch::Approx(0.004675F));
     REQUIRE(atmosphere.weatherOptics.z == Catch::Approx(0.0F));
+    REQUIRE(atmosphere.cameraPositionKm.y == Catch::Approx(6360.225F).margin(0.001F));
+    REQUIRE(atmosphere.atmosphereRadii.w == Catch::Approx(0.001F));
+
+    const AtmosphereUniforms v4SeaLevel = earthAtmosphereUniforms(
+        64.0F, GENERATOR_V4_PHYSICAL_SCALE, simd_make_float3(0.3F, 0.8F, 0.2F),
+        simd_make_float3(18.0F, 17.5F, 16.0F), 1.25F, 0.7F, 7);
+    const AtmosphereUniforms v4Summit = earthAtmosphereUniforms(
+        1'407.0F, GENERATOR_V4_PHYSICAL_SCALE, simd_make_float3(0.3F, 0.8F, 0.2F),
+        simd_make_float3(18.0F, 17.5F, 16.0F), 1.25F, 0.7F, 7);
+    REQUIRE(v4SeaLevel.cameraPositionKm.y == Catch::Approx(6360.0F));
+    REQUIRE(v4Summit.cameraPositionKm.y == Catch::Approx(6370.0725F).margin(0.001F));
+    REQUIRE(v4Summit.atmosphereRadii.w == Catch::Approx(0.0075F));
     REQUIRE(ATMOSPHERE_RADIANCE_SCALE ==
             Catch::Approx(16.0F * static_cast<float>(M_PI)).margin(1.0e-6F));
 
@@ -101,6 +224,49 @@ TEST_CASE("Physical atmosphere parameters and volume helpers stay finite",
     REQUIRE(beerLambertTransmittance(0.02F, 0.0F) == Catch::Approx(1.0F));
     REQUIRE(beerLambertTransmittance(0.02F, 100.0F) < beerLambertTransmittance(0.02F, 10.0F));
     REQUIRE(beerLambertTransmittance(-1.0F, 100.0F) == Catch::Approx(1.0F));
+}
+
+TEST_CASE("Remote lightning height refinement never generates exact terrain",
+          "[engine][weather][lightning][streaming]") {
+    World world(42);
+    constexpr int64_t REMOTE_X = 400'000;
+    constexpr int64_t REMOTE_Z = -300'000;
+    const ColumnPos remoteColumn{Chunk::worldToChunk(REMOTE_X), Chunk::worldToChunk(REMOTE_Z)};
+    REQUIRE_FALSE(world.generator().findColumnPlan(remoteColumn));
+
+    LightningEvent event;
+    event.x = static_cast<double>(REMOTE_X);
+    event.y = 217.0F;
+    event.z = static_cast<double>(REMOTE_Z);
+    event.cloudY = 450.0F;
+    REQUIRE_NOTHROW(resolveLightningTerrainHeightIfLoaded(world, event));
+    REQUIRE(event.y == 217.0F);
+    REQUIRE(event.cloudY == 450.0F);
+    REQUIRE_FALSE(world.generator().findColumnPlan(remoteColumn));
+    REQUIRE(world.getPendingChunkCount() == 0);
+}
+
+TEST_CASE("Loaded lightning resolves to the top fluid surface",
+          "[engine][weather][lightning][water]") {
+    World world(42);
+    const std::shared_ptr<Chunk> loaded = world.getChunk(ChunkPos{0, 4, 0});
+    REQUIRE(loaded);
+    loaded->fill(BlockType::AIR);
+    loaded->setBlock(8, 0, 8, BlockType::STONE);
+    loaded->setBlock(8, 1, 8, BlockType::WATER);
+    loaded->setFluidState(8, 1, 8, FluidState::source());
+    loaded->setBlock(8, 2, 8, BlockType::WATER);
+    loaded->setFluidState(8, 2, 8, FluidState::flowing(4));
+
+    LightningEvent event;
+    event.x = 8.25;
+    event.y = 200.0F;
+    event.z = 8.75;
+    event.cloudY = 66.0F;
+    resolveLightningTerrainHeightIfLoaded(world, event);
+
+    REQUIRE(event.y == Catch::Approx(66.5F));
+    REQUIRE(event.cloudY == Catch::Approx(67.5F));
 }
 
 TEST_CASE("Atmosphere transmittance stops at the lower boundary",
@@ -165,6 +331,55 @@ TEST_CASE("Volumetric cloud noise tiles in three dimensions and wind uses physic
     REQUIRE(wrappedCloudOffset(100.0, 12.0, 10.0) == Catch::Approx(220.0));
     REQUIRE(wrappedCloudOffset(CLOUD_MOTION_WRAP_BLOCKS - 6.0, 12.0, 1.0) == Catch::Approx(6.0));
     REQUIRE(wrappedCloudOffset(2.0, -4.0, 1.0) == Catch::Approx(CLOUD_MOTION_WRAP_BLOCKS - 2.0));
+}
+
+TEST_CASE("Cloud sessions lazily bind seed-owned noise and retain full v4 layer bounds",
+          "[render][clouds][session][v4][height]") {
+    constexpr uint64_t SEED = 764891;
+    REQUIRE(cloudWorldBindingChanged(false, 0, 0, 17, SEED));
+    REQUIRE_FALSE(cloudWorldBindingChanged(true, 17, SEED, 17, SEED));
+    REQUIRE(cloudWorldBindingChanged(true, 17, SEED, 18, SEED));
+    REQUIRE(cloudWorldBindingChanged(true, 17, SEED, 17, SEED + 1));
+
+    // No constructor-owned seed-zero volume is required. The first real
+    // binding generates once, equal-seed sessions reuse it, and a new seed
+    // regenerates the seed-owned textures.
+    REQUIRE(cloudNoiseRegenerationRequired(false, 0, 0));
+    REQUIRE_FALSE(cloudNoiseRegenerationRequired(true, SEED, SEED));
+    REQUIRE(cloudNoiseRegenerationRequired(true, SEED, SEED + 1));
+    REQUIRE(cloudBaseNoise(3, 7, 11, 32, SEED) !=
+            Catch::Approx(cloudBaseNoise(3, 7, 11, 32, SEED + 1)));
+
+    WeatherSample lowland{};
+    lowland.cloudBaseY = 197.0F;
+    lowland.cloudTopY = 240.0F;
+    WeatherSample nextLowland = lowland;
+    nextLowland.cloudBaseY = 198.0F;
+    nextLowland.cloudTopY = 242.0F;
+    WeatherSample summit = lowland;
+    summit.cloudBaseY = 1'450.0F;
+    summit.cloudTopY = 1'900.0F;
+    std::vector<WeatherSample> first(WeatherSnapshot::GRID_SAMPLE_COUNT, lowland);
+    std::vector<WeatherSample> second(WeatherSnapshot::GRID_SAMPLE_COUNT, nextLowland);
+    second[WeatherSnapshot::GRID_SAMPLE_COUNT / 2] = summit;
+    WeatherSnapshot snapshot(1, 0, 0, 0, WeatherPreset::NATURAL, std::move(first),
+                             std::move(second));
+    const simd_float2 bounds = cloudSnapshotMarchLayerBounds(snapshot);
+    REQUIRE(bounds.x == Catch::Approx(196.0F));
+    REQUIRE(bounds.y == Catch::Approx(1'901.0F));
+    REQUIRE(bounds.y > static_cast<float>(WORLD_MAX_Y));
+
+    // The broad snapshot envelope only clips the ray. Each weather-cell
+    // segment intersects its own local slab, preserving both a thin lowland
+    // cloud and a remote summit cloud within the same coarse march.
+    const simd_float2 lowlandInterval =
+        cloudRaySegmentLayerIntersection(100.0F, 1.0F, 0.0F, 2'000.0F, 197.0F, 240.0F);
+    REQUIRE(lowlandInterval.x == Catch::Approx(97.0F));
+    REQUIRE(lowlandInterval.y == Catch::Approx(140.0F));
+    const simd_float2 summitInterval =
+        cloudRaySegmentLayerIntersection(100.0F, 1.0F, 0.0F, 2'000.0F, 1'450.0F, 1'900.0F);
+    REQUIRE(summitInterval.x == Catch::Approx(1'350.0F));
+    REQUIRE(summitInterval.y == Catch::Approx(1'800.0F));
 }
 
 TEST_CASE("Regional cloud motion wraps coherently and ignores camera movement",
@@ -341,7 +556,8 @@ TEST_CASE("Screen-space lighting memory follows quality at native resolution",
     REQUIRE(medium.historyDepthBytes == 3'856'896);
     REQUIRE(medium.momentsBytes == 7'713'792);
     REQUIRE(medium.scratchBytes == 3'856'896);
-    REQUIRE(medium.totalBytes() == 99'054'800);
+    REQUIRE(medium.reactiveHistoryBytes == 964'224);
+    REQUIRE(medium.totalBytes() == 100'019'024);
 
     const ScreenSpaceLightingMemoryFootprint high =
         screenSpaceLightingMemoryFootprint(WIDTH, HEIGHT, 2);
@@ -353,7 +569,8 @@ TEST_CASE("Screen-space lighting memory follows quality at native resolution",
     REQUIRE(high.historyDepthBytes == 15'441'408);
     REQUIRE(high.momentsBytes == 30'882'816);
     REQUIRE(high.scratchBytes == 15'441'408);
-    REQUIRE(high.totalBytes() == 180'146'384);
+    REQUIRE(high.reactiveHistoryBytes == 3'860'352);
+    REQUIRE(high.totalBytes() == 184'006'736);
     REQUIRE(screenSpaceLightingMemoryFootprint(WIDTH, HEIGHT, -4).totalBytes() == off.totalBytes());
     REQUIRE(screenSpaceLightingMemoryFootprint(WIDTH, HEIGHT, 8).totalBytes() == high.totalBytes());
 }
@@ -385,6 +602,8 @@ TEST_CASE("Screen-space lighting history resets for every discontinuity",
         .fovDegrees = 70.0F,
         .worldIdentity = 17,
         .forcedStateRevision = 9,
+        .lightEditRevision = 11,
+        .timeDiscontinuityRevision = 13,
         .quality = 2,
         .directLightSource = 1,
         .priorDepthValid = true,
@@ -412,6 +631,10 @@ TEST_CASE("Screen-space lighting history resets for every discontinuity",
                 INDIRECT_HISTORY_INVALID_DEPTH);
     requireOnly([](IndirectHistoryState& state) { ++state.directLightSource; },
                 INDIRECT_HISTORY_LIGHT_SOURCE);
+    requireOnly([](IndirectHistoryState& state) { ++state.lightEditRevision; },
+                INDIRECT_HISTORY_LIGHT_EDIT);
+    requireOnly([](IndirectHistoryState& state) { ++state.timeDiscontinuityRevision; },
+                INDIRECT_HISTORY_TIME_DISCONTINUITY);
 
     IndirectHistoryState continuous = previous;
     continuous.cameraPosition.x += 8.0F;
@@ -427,27 +650,51 @@ TEST_CASE("Screen-space lighting history resets for every discontinuity",
     ++allReasons.forcedStateRevision;
     allReasons.priorDepthValid = false;
     ++allReasons.directLightSource;
+    ++allReasons.lightEditRevision;
+    ++allReasons.timeDiscontinuityRevision;
     constexpr uint32_t EVERY_REASON =
         INDIRECT_HISTORY_RESIZE | INDIRECT_HISTORY_TELEPORT | INDIRECT_HISTORY_WORLD_CHANGE |
         INDIRECT_HISTORY_FOV_CHANGE | INDIRECT_HISTORY_QUALITY_CHANGE |
         INDIRECT_HISTORY_FORCED_STATE | INDIRECT_HISTORY_INVALID_DEPTH |
-        INDIRECT_HISTORY_LIGHT_SOURCE;
+        INDIRECT_HISTORY_LIGHT_SOURCE | INDIRECT_HISTORY_LIGHT_EDIT |
+        INDIRECT_HISTORY_TIME_DISCONTINUITY;
     REQUIRE(indirectHistoryResetMask(previous, allReasons) == EVERY_REASON);
+
+    REQUIRE(atmosphericHistoryResetMask(INDIRECT_HISTORY_LIGHT_EDIT) == INDIRECT_HISTORY_STABLE);
+    REQUIRE(atmosphericHistoryResetMask(INDIRECT_HISTORY_QUALITY_CHANGE) ==
+            INDIRECT_HISTORY_STABLE);
+    REQUIRE(atmosphericHistoryResetMask(INDIRECT_HISTORY_INVALID_DEPTH) == INDIRECT_HISTORY_STABLE);
+    REQUIRE(
+        atmosphericHistoryResetMask(INDIRECT_HISTORY_WORLD_CHANGE | INDIRECT_HISTORY_LIGHT_EDIT) ==
+        INDIRECT_HISTORY_WORLD_CHANGE);
+
+    REQUIRE_FALSE(indirectLightingTimeDiscontinuity(false, 100, 1));
+    REQUIRE_FALSE(indirectLightingTimeDiscontinuity(true, 100, 108));
+    REQUIRE(indirectLightingTimeDiscontinuity(true, 100, 109));
+    REQUIRE(indirectLightingTimeDiscontinuity(true, 100, 99));
+
+    REQUIRE_FALSE(exactMeshPublicationInvalidatesHistory(false, true, 8, 8));
+    REQUIRE_FALSE(exactMeshPublicationInvalidatesHistory(true, false, 8, 8));
+    REQUIRE_FALSE(exactMeshPublicationInvalidatesHistory(true, true, 7, 8));
+    REQUIRE(exactMeshPublicationInvalidatesHistory(true, true, 8, 8));
+    REQUIRE(exactMeshPublicationInvalidatesHistory(true, true, 9, 8));
+    REQUIRE(indirectLightingRevision(19, 3) == 22);
 }
 
-TEST_CASE("Cloud memory omits frame and shadow targets when disabled", "[render][clouds][memory]") {
+TEST_CASE("Cloud memory omits seeded noise and frame targets when disabled",
+          "[render][clouds][memory]") {
     constexpr uint32_t WIDTH = 3456;
     constexpr uint32_t HEIGHT = 2234;
     const CloudRendererMemoryFootprint off = cloudRendererMemoryFootprint(WIDTH, HEIGHT, 0);
     REQUIRE(off.quarterWidth == 1);
     REQUIRE(off.quarterHeight == 1);
     REQUIRE(off.shadowEdge == 0);
-    REQUIRE(off.noiseBytes == 2'162'688);
+    REQUIRE(off.noiseBytes == 0);
     REQUIRE(off.weatherBytes == 2'519'424);
     REQUIRE(off.neutralShadowBytes == 2);
     REQUIRE(off.frameTargetBytes == 0);
     REQUIRE(off.shadowBytes == 0);
-    REQUIRE(off.totalBytes() == 4'682'114);
+    REQUIRE(off.totalBytes() == 2'519'426);
 
     const CloudRendererMemoryFootprint medium = cloudRendererMemoryFootprint(WIDTH, HEIGHT, 1);
     REQUIRE(medium.quarterWidth == 864);
@@ -470,17 +717,17 @@ TEST_CASE("Cloud memory omits frame and shadow targets when disabled", "[render]
     REQUIRE(waterReflectionPyramidMemoryBytes(0, HEIGHT) == 0);
     REQUIRE(waterReflectionPyramidMemoryBytes(3, 5) == 144);
     REQUIRE(waterReflectionPyramidMemoryBytes(WIDTH, HEIGHT) == 82'347'408);
-    REQUIRE(atmosphericSceneTargetMemoryBytes(WIDTH, HEIGHT) == 236'761'488);
-    REQUIRE(integrated.sceneTargetBytes == 236'761'488);
+    REQUIRE(atmosphericSceneTargetMemoryBytes(WIDTH, HEIGHT) == 244'482'192);
+    REQUIRE(integrated.sceneTargetBytes == 244'482'192);
     REQUIRE(integrated.shadowBytes == 184'549'376);
-    REQUIRE(integrated.indirectBytes == 180'146'384);
+    REQUIRE(integrated.indirectBytes == 184'006'736);
     REQUIRE(integrated.atmosphereBytes == 305'152);
     REQUIRE(integrated.cloudBytes == 27'534'082);
     REQUIRE(integrated.volumetricBytes == 86'525'723);
     REQUIRE(integrated.lightningBytes == 2);
-    REQUIRE(integrated.totalBytes() == 715'822'207);
+    REQUIRE(integrated.totalBytes() == 727'403'263);
     REQUIRE(integrated.totalBytes() < HIGH_TIER_BUDGET);
-    REQUIRE(HIGH_TIER_BUDGET - integrated.totalBytes() == 89'484'161);
+    REQUIRE(HIGH_TIER_BUDGET - integrated.totalBytes() == 77'903'105);
 }
 
 TEST_CASE("Atmospheric diagnostics preserve all cascade worker and memory counters",
@@ -498,6 +745,8 @@ TEST_CASE("Atmospheric diagnostics preserve all cascade worker and memory counte
     REQUIRE(hudStats.shadowCasterCounts.size() == SHADOW_CASCADE_COUNT);
     REQUIRE(hudStats.shadowRefreshCounts.size() == SHADOW_CASCADE_COUNT);
     REQUIRE(hudStats.weatherRequests == 0U);
+    REQUIRE(hudStats.weatherBuildsDeferred == 0U);
+    REQUIRE(hudStats.weatherBuildsFailed == 0U);
     REQUIRE(hudStats.weatherPendingRequests == 0U);
     REQUIRE_FALSE(hudStats.weatherWorkerBusy);
     REQUIRE(hudStats.thunderPending == 0U);
@@ -506,16 +755,50 @@ TEST_CASE("Atmospheric diagnostics preserve all cascade worker and memory counte
     WeatherSystemStats weatherStats;
     weatherStats.requests = 9U;
     weatherStats.coalescedRequests = 4U;
+    weatherStats.buildsDeferred = 3U;
+    weatherStats.buildsFailed = 2U;
     weatherStats.pendingRequests = 1U;
     weatherStats.workerBusy = true;
     REQUIRE(weatherStats.requests == 9U);
     REQUIRE(weatherStats.coalescedRequests == 4U);
+    REQUIRE(weatherStats.buildsDeferred == 3U);
+    REQUIRE(weatherStats.buildsFailed == 2U);
     REQUIRE(weatherStats.pendingRequests == 1U);
     REQUIRE(weatherStats.workerBusy);
 }
 // ===========================================================================
 // Engine: game flow, menus, input, hotbar
 // ===========================================================================
+
+TEST_CASE("Playtest screen names remain valid until deferred world entry", "[engine][flow]") {
+    REQUIRE(gameScreenFromEnvironment("title") == GameScreen::TITLE);
+    REQUIRE(gameScreenFromEnvironment("worlds") == GameScreen::WORLD_SELECT);
+    REQUIRE(gameScreenFromEnvironment("create") == GameScreen::WORLD_CREATE);
+    REQUIRE(gameScreenFromEnvironment("delete") == GameScreen::WORLD_DELETE_CONFIRM);
+    REQUIRE(gameScreenFromEnvironment("playing") == GameScreen::PLAYING);
+    REQUIRE(gameScreenFromEnvironment("paused") == GameScreen::PAUSED);
+    REQUIRE(gameScreenFromEnvironment("settings") == GameScreen::SETTINGS);
+    REQUIRE(gameScreenFromEnvironment("video") == GameScreen::VIDEO_SETTINGS);
+    REQUIRE(gameScreenFromEnvironment("inventory") == GameScreen::INVENTORY);
+    REQUIRE(gameScreenFromEnvironment("crafting") == GameScreen::CRAFTING);
+    REQUIRE(gameScreenFromEnvironment("furnace") == GameScreen::FURNACE);
+    REQUIRE(gameScreenFromEnvironment("chest") == GameScreen::CHEST);
+    REQUIRE(gameScreenFromEnvironment("death") == GameScreen::DEATH);
+    REQUIRE_FALSE(gameScreenFromEnvironment("unknown"));
+}
+
+TEST_CASE("Material playtest fixture is opt-in and capture-only",
+          "[engine][playtest][materials][save]") {
+    REQUIRE_FALSE(materialPlaytestFixtureEnabled(nullptr, nullptr));
+    REQUIRE_FALSE(materialPlaytestFixtureEnabled("1", nullptr));
+    REQUIRE_FALSE(materialPlaytestFixtureEnabled("1", ""));
+    REQUIRE_FALSE(materialPlaytestFixtureEnabled("1", "0"));
+    REQUIRE_FALSE(materialPlaytestFixtureEnabled("0", "/tmp/frame.png"));
+    REQUIRE(materialPlaytestFixtureEnabled("1", "/tmp/frame.png"));
+    REQUIRE(MATERIAL_PLAYTEST_BLOCKS == std::array{BlockType::BED, BlockType::CHEST,
+                                                   BlockType::TORCH, BlockType::FURNACE,
+                                                   BlockType::FURNACE_LIT});
+}
 
 TEST_CASE("Unsigned decimal capture ticks reject signs invalid text and overflow",
           "[engine][capture][time]") {
@@ -541,6 +824,10 @@ TEST_CASE("Capture lightning override parses finite coordinates ID and rendered 
     REQUIRE(parsed->z == Catch::Approx(-111'726.5));
     REQUIRE(parsed->id == std::numeric_limits<uint64_t>::max());
     REQUIRE(parsed->ageTicks == 7U);
+    const auto exponent = parseCaptureLightningOverride("1.25e2,-.5,17,2");
+    REQUIRE(exponent);
+    REQUIRE(exponent->x == Catch::Approx(125.0));
+    REQUIRE(exponent->z == Catch::Approx(-0.5));
 
     REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,17"));
     REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,17,2,extra"));
@@ -552,6 +839,9 @@ TEST_CASE("Capture lightning override parses finite coordinates ID and rendered 
     REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,17,-2"));
     REQUIRE_FALSE(parseCaptureLightningOverride("23029,-111726,18446744073709551616,2"));
     REQUIRE_FALSE(parseCaptureLightningOverride("23029, -111726,17,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("1e,-111726,17,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride(".,-111726,17,2"));
+    REQUIRE_FALSE(parseCaptureLightningOverride("1e-10000,-111726,17,2"));
 }
 
 TEST_CASE("InputBindings save/load round-trips a custom binding", "[engine][bindings]") {
@@ -743,6 +1033,20 @@ TEST_CASE("Settings reuse the supported world view-distance contract", "[engine]
     STATIC_REQUIRE(SettingsValues::DEFAULT_VIEW_DISTANCE == DEFAULT_RENDER_DISTANCE_CHUNKS);
     STATIC_REQUIRE(SettingsValues::VIEW_DISTANCES.front() == MIN_RENDER_DISTANCE_CHUNKS);
     STATIC_REQUIRE(SettingsValues::VIEW_DISTANCES.back() == MAX_RENDER_DISTANCE_CHUNKS);
+}
+
+TEST_CASE("Capture settings can use an isolated path without changing home",
+          "[capture][engine][settings]") {
+    const char* previousValue = std::getenv("RYCRAFT_SETTINGS_PATH");
+    const std::optional<std::string> previous =
+        previousValue ? std::optional<std::string>{previousValue} : std::nullopt;
+    REQUIRE(setenv("RYCRAFT_SETTINGS_PATH", "/tmp/rycraft-isolated-settings.json", 1) == 0);
+    CHECK(settingsPath() == "/tmp/rycraft-isolated-settings.json");
+    if (previous) {
+        REQUIRE(setenv("RYCRAFT_SETTINGS_PATH", previous->c_str(), 1) == 0);
+    } else {
+        REQUIRE(unsetenv("RYCRAFT_SETTINGS_PATH") == 0);
+    }
 }
 
 TEST_CASE("Default clear-weather fog preserves the eight-kilometer horizon",
@@ -946,6 +1250,19 @@ TEST_CASE("GameFlow: world session transitions", "[ui][flow]") {
     flow.onEscape();
     REQUIRE(flow.screen == GameScreen::TITLE);
 
+    // A stale or legacy row requires a second, explicit confirmation before
+    // the engine can create a separate successor profile.
+    flow.onMenuAction(MenuAction::OPEN_WORLD_SELECT);
+    flow.onMenuAction(MenuAction::REQUEST_V4_SUCCESSOR);
+    REQUIRE(flow.screen == GameScreen::WORLD_SUCCESSOR_CONFIRM);
+    flow.onMenuAction(MenuAction::CANCEL_V4_SUCCESSOR);
+    REQUIRE(flow.screen == GameScreen::WORLD_SELECT);
+    flow.onMenuAction(MenuAction::REQUEST_V4_SUCCESSOR);
+    flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::WORLD_SELECT);
+    flow.onEscape();
+    REQUIRE(flow.screen == GameScreen::TITLE);
+
     // Side-effectful actions never change the screen by themselves.
     flow.onMenuAction(MenuAction::OPEN_WORLD_SELECT);
     auto fx = flow.onMenuAction(MenuAction::PLAY_SELECTED_WORLD);
@@ -1030,6 +1347,51 @@ TEST_CASE("GameFlow: death ignores escape until respawn", "[ui][flow]") {
     REQUIRE(flow.screen == GameScreen::PAUSED);
 }
 
+TEST_CASE("GameFlow restores the exact live screen after generation recovery", "[ui][flow]") {
+    GameFlow flow;
+
+    auto effects = flow.onGenerationRecovered(GameScreen::PLAYING);
+    REQUIRE(flow.screen == GameScreen::PLAYING);
+    REQUIRE(effects.captureCursor);
+    REQUIRE_FALSE(effects.releaseCursor);
+    REQUIRE(effects.resetTiming);
+
+    effects = flow.onGenerationRecovered(GameScreen::FURNACE);
+    REQUIRE(flow.screen == GameScreen::FURNACE);
+    REQUIRE_FALSE(effects.captureCursor);
+    REQUIRE(effects.releaseCursor);
+    REQUIRE(effects.resetTiming);
+
+    effects = flow.onGenerationRecovered(GameScreen::WORLD_SELECT);
+    REQUIRE(flow.screen == GameScreen::FURNACE);
+    REQUIRE_FALSE(effects.captureCursor);
+    REQUIRE_FALSE(effects.releaseCursor);
+}
+
+TEST_CASE("Frame capture timing begins with eligible rendered scenes", "[engine][capture]") {
+    FrameCaptureClock clock;
+    for (uint64_t frame = 0; frame < 240; ++frame) {
+        const FrameCaptureActions actions = clock.onRenderedFrame(240);
+        REQUIRE_FALSE(actions.capture);
+        REQUIRE_FALSE(actions.quit);
+    }
+
+    FrameCaptureActions actions = clock.onRenderedFrame(240);
+    REQUIRE(actions.capture);
+    REQUIRE_FALSE(actions.quit);
+    for (uint64_t frame = 0; frame < 59; ++frame) {
+        actions = clock.onRenderedFrame(240);
+        REQUIRE_FALSE(actions.capture);
+        REQUIRE_FALSE(actions.quit);
+    }
+    actions = clock.onRenderedFrame(240);
+    REQUIRE_FALSE(actions.capture);
+    REQUIRE(actions.quit);
+    actions = clock.onRenderedFrame(240);
+    REQUIRE_FALSE(actions.capture);
+    REQUIRE_FALSE(actions.quit);
+}
+
 TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][menu]") {
     SettingsValues values;
     GraphicsSettings gfx;
@@ -1067,6 +1429,18 @@ TEST_CASE("Menu layouts: buttons sit on-screen and inside their panel", "[ui][me
     REQUIRE(buildMenuLayout(GameScreen::PLAYING, 1024.f, 768.f, values, gfx).buttons.empty());
 }
 
+TEST_CASE("Video settings names the compatibility toggle as indirect lighting",
+          "[ui][menu][indirect]") {
+    SettingsValues values;
+    GraphicsSettings gfx;
+    const MenuLayout layout =
+        buildMenuLayout(GameScreen::VIDEO_SETTINGS, 1024.f, 768.f, values, gfx);
+    REQUIRE(std::ranges::any_of(
+        layout.texts, [](const MenuText& text) { return text.text == "INDIRECT LIGHT"; }));
+    REQUIRE_FALSE(std::ranges::any_of(
+        layout.texts, [](const MenuText& text) { return text.text == "AMBIENT OCCL"; }));
+}
+
 TEST_CASE("Menu hit test: button centers hit, gaps miss", "[ui][menu]") {
     SettingsValues values;
     GraphicsSettings gfx;
@@ -1099,6 +1473,16 @@ TEST_CASE("World select layout scrolls selects and guards actions", "[ui][worlds
     REQUIRE(buttonWith(empty, MenuAction::WORLD_BACK));
     REQUIRE_FALSE(buttonWith(empty, MenuAction::WORLD_LIST_UP));
 
+    ctx.allowWorldCreation = false;
+    ctx.worldCreationUnavailableReason = "NEW V4 WORLDS ARE NOT AVAILABLE IN THIS BUILD";
+    MenuLayout v4Only = buildScreenLayout(GameScreen::WORLD_SELECT, 1024.f, 768.f, ctx);
+    REQUIRE_FALSE(buttonWith(v4Only, MenuAction::OPEN_WORLD_CREATE));
+    REQUIRE(std::ranges::any_of(v4Only.texts, [](const MenuText& text) {
+        return text.text == "NEW V4 WORLDS ARE NOT AVAILABLE IN THIS BUILD";
+    }));
+    ctx.allowWorldCreation = true;
+    ctx.worldCreationUnavailableReason.clear();
+
     // Seven rows: five visible with correct payloads, scroll arrows appear
     // on the scrollable side only.
     for (int i = 0; i < 7; ++i) {
@@ -1120,6 +1504,30 @@ TEST_CASE("World select layout scrolls selects and guards actions", "[ui][worlds
     REQUIRE(buttonWith(list, MenuAction::WORLD_LIST_DOWN));
     REQUIRE(buttonWith(list, MenuAction::PLAY_SELECTED_WORLD));
     REQUIRE(buttonWith(list, MenuAction::REQUEST_DELETE_WORLD));
+
+    ctx.selectedWorldRequiresV4Successor = true;
+    const MenuLayout successor = buildScreenLayout(GameScreen::WORLD_SELECT, 1024.f, 768.f, ctx);
+    REQUIRE(std::ranges::any_of(successor.buttons, [](const MenuButton& button) {
+        return button.action == MenuAction::REQUEST_V4_SUCCESSOR &&
+               button.label == "CREATE V4 SUCCESSOR";
+    }));
+    REQUIRE_FALSE(std::ranges::any_of(successor.buttons, [](const MenuButton& button) {
+        return button.action == MenuAction::PLAY_SELECTED_WORLD;
+    }));
+
+    ctx.successorWorldName = "World 1";
+    const MenuLayout successorConfirm =
+        buildScreenLayout(GameScreen::WORLD_SUCCESSOR_CONFIRM, 1024.f, 768.f, ctx);
+    REQUIRE(std::ranges::any_of(successorConfirm.texts, [](const MenuText& text) {
+        return text.text == "World 1 WILL REMAIN UNCHANGED";
+    }));
+    REQUIRE(std::ranges::any_of(successorConfirm.buttons, [](const MenuButton& button) {
+        return button.action == MenuAction::CONFIRM_V4_SUCCESSOR;
+    }));
+    REQUIRE(std::ranges::any_of(successorConfirm.buttons, [](const MenuButton& button) {
+        return button.action == MenuAction::CANCEL_V4_SUCCESSOR;
+    }));
+    ctx.selectedWorldRequiresV4Successor = false;
 
     // Scrolled to the bottom: rows start at the clamped offset.
     ctx.worldSelect.scroll = 99;
@@ -1167,6 +1575,18 @@ TEST_CASE("World create layout gates the create button on a name", "[ui][worlds]
     ctx.caretVisible = false;
     MenuLayout blink = buildScreenLayout(GameScreen::WORLD_CREATE, 1024.f, 768.f, ctx);
     REQUIRE_FALSE(blink.textFields[1].caret);
+    STATIC_REQUIRE(WorldCreateState::MAX_SEED_LENGTH == 20);
+}
+
+TEST_CASE("Title and Worlds launches never request a persistence profile",
+          "[engine][worlds][v4][startup][regression]") {
+    STATIC_REQUIRE_FALSE(launchRequestsWorldSession(std::nullopt, false));
+    STATIC_REQUIRE_FALSE(launchRequestsWorldSession(GameScreen::TITLE, false));
+    STATIC_REQUIRE_FALSE(launchRequestsWorldSession(GameScreen::WORLD_SELECT, false));
+    STATIC_REQUIRE_FALSE(launchRequestsWorldSession(GameScreen::WORLD_CREATE, false));
+    STATIC_REQUIRE_FALSE(launchRequestsWorldSession(GameScreen::WORLD_SUCCESSOR_CONFIRM, false));
+    STATIC_REQUIRE(launchRequestsWorldSession(GameScreen::PLAYING, false));
+    STATIC_REQUIRE(launchRequestsWorldSession(std::nullopt, true));
 }
 
 TEST_CASE("Typed hit-testing distinguishes fields and buttons", "[ui][worlds]") {
@@ -1198,6 +1618,526 @@ TEST_CASE("Text field filtering enforces charset and length", "[ui][worlds]") {
     REQUIRE(filterTextField("", true, 10).empty());
 }
 
+TEST_CASE("Generator v4 world list includes only root profiles", "[engine][worlds][v4]") {
+    TempDir directory("v4_world_list");
+    const std::filesystem::path root = directory.path();
+    const std::string fingerprint(64, 'a');
+    const auto publish = [&](const std::string& name, uint64_t seed) {
+        const std::filesystem::path path = root / name;
+        SaveManager saves(path.string(), SaveManager::Profile::GeneratorV4);
+        SaveManager::WorldMetadata metadata;
+        metadata.seed = seed;
+        metadata.generationFingerprint = fingerprint;
+        metadata.spawnFinalized = true;
+        metadata.spawnSafetyRevision = SaveManager::GENERATOR_V4_SPAWN_SAFETY_REVISION;
+        metadata.spawnPos = Vec3{8.f, 80.f, 8.f};
+        metadata.playerPos = Vec3{9.f, 80.f, 9.f};
+        metadata.safeSpawnPos = metadata.spawnPos;
+        metadata.generatorVersion = SaveManager::GENERATOR_V4_VERSION;
+        metadata.name = name;
+        REQUIRE(saves.saveMetadata(metadata));
+    };
+
+    publish(GENERATOR_V4_WORLD_DIRECTORY, 7);
+    const std::string sibling = std::string(GENERATOR_V4_WORLD_DIRECTORY) +
+                                "-seed-0000000000000008-fingerprint-" + fingerprint;
+    publish(sibling, 8);
+    REQUIRE(createWorld("Legacy", 9, GameMode::CREATIVE, {}, root.string()).has_value());
+
+    const std::vector<WorldSummary> worlds = listGeneratorV4Worlds(root.string());
+    REQUIRE(worlds.size() == 2);
+    REQUIRE(std::ranges::all_of(worlds, [](const WorldSummary& world) {
+        return world.metadata.generatorVersion == SaveManager::GENERATOR_V4_VERSION;
+    }));
+    const std::vector<WorldSummary> selectable = listWorldsForGeneratorV4(root.string());
+    REQUIRE(selectable.size() == 3);
+    REQUIRE(std::ranges::count_if(selectable, [](const WorldSummary& world) {
+                return world.requiresGeneratorV4Successor();
+            }) == 1);
+    REQUIRE(deleteWorld((root / sibling).string(), root.string()));
+    REQUIRE(listGeneratorV4Worlds(root.string()).size() == 1);
+}
+
+TEST_CASE("Generator v4 atomic near-entry closure requires the complete FINAL wavefront",
+          "[engine][v4][entry][near-closure]") {
+    STATIC_REQUIRE(V4_ENTRY_FINAL_TARGET_STEPS == std::array<uint8_t, 5>{1, 2, 4, 8, 16});
+    STATIC_REQUIRE(V4_ENTRY_FINAL_TARGETS_BY_STEP == std::array<uint32_t, 5>{4, 8, 12, 16, 20});
+    STATIC_REQUIRE(V4_ENTRY_FINAL_TARGET_COUNT == 60);
+    STATIC_REQUIRE(V4_ENTRY_COLLISION_CUBE_COUNT == 27);
+    STATIC_REQUIRE(v4NearEntryFinalCompatibleProgress(10, 9, 60) == 0);
+    STATIC_REQUIRE(v4NearEntryFinalCompatibleProgress(0, 0, 60) == 0);
+    STATIC_REQUIRE(v4NearEntryFinalCompatibleProgress(10, 10, 24) == 24);
+    STATIC_REQUIRE(v4NearEntryFinalCompatibleProgress(10, 10, 61) == 60);
+
+    V4NearEntryClosureInput input;
+    input.currentViewEpoch = 31;
+    input.closureViewEpoch = 31;
+    input.currentWorldEpoch = 17;
+    input.closureWorldEpoch = 17;
+    input.currentProtectedEpoch = 9;
+    input.closureProtectedEpoch = 9;
+    input.currentAnchor = {-12, 24};
+    input.closureAnchor = input.currentAnchor;
+    input.connectedPreviewParentPrefixReady = true;
+    input.finalTargetCountsByStep = V4_ENTRY_FINAL_TARGETS_BY_STEP;
+    input.matchingFinalParentsUploaded = V4_ENTRY_FINAL_TARGET_COUNT;
+    input.matchingFinalParentsResident = V4_ENTRY_FINAL_TARGET_COUNT;
+    input.matchingFinalChildrenUploaded = V4_ENTRY_FINAL_TARGET_COUNT;
+    input.matchingFinalChildrenResident = V4_ENTRY_FINAL_TARGET_COUNT;
+    input.exactCompatibleTargets = V4_ENTRY_FINAL_TARGET_COUNT;
+    input.collisionCubesReady = V4_ENTRY_COLLISION_CUBE_COUNT;
+    input.exactMeshesRequired = 27;
+    input.matchingExactMeshesReady = input.exactMeshesRequired;
+    input.currentExactMeshRevision = 73;
+    input.readyExactMeshRevision = 73;
+
+    CHECK(v4NearEntryClosureStatus(input) == V4NearEntryClosureStatus::Ready);
+    CHECK(v4NearEntryClosureReady(input));
+}
+
+TEST_CASE("Generator v4 atomic near-entry closure fails closed for stale or partial state",
+          "[engine][v4][entry][near-closure]") {
+    const auto complete = [] {
+        V4NearEntryClosureInput input;
+        input.currentViewEpoch = 31;
+        input.closureViewEpoch = 31;
+        input.currentWorldEpoch = 17;
+        input.closureWorldEpoch = 17;
+        input.currentProtectedEpoch = 9;
+        input.closureProtectedEpoch = 9;
+        input.currentAnchor = {-12, 24};
+        input.closureAnchor = input.currentAnchor;
+        input.connectedPreviewParentPrefixReady = true;
+        input.finalTargetCountsByStep = V4_ENTRY_FINAL_TARGETS_BY_STEP;
+        input.matchingFinalParentsUploaded = V4_ENTRY_FINAL_TARGET_COUNT;
+        input.matchingFinalParentsResident = V4_ENTRY_FINAL_TARGET_COUNT;
+        input.matchingFinalChildrenUploaded = V4_ENTRY_FINAL_TARGET_COUNT;
+        input.matchingFinalChildrenResident = V4_ENTRY_FINAL_TARGET_COUNT;
+        input.exactCompatibleTargets = V4_ENTRY_FINAL_TARGET_COUNT;
+        input.collisionCubesReady = V4_ENTRY_COLLISION_CUBE_COUNT;
+        input.exactMeshesRequired = 27;
+        input.matchingExactMeshesReady = input.exactMeshesRequired;
+        input.currentExactMeshRevision = 73;
+        input.readyExactMeshRevision = 73;
+        return input;
+    };
+    const auto rejectsAs = [&](V4NearEntryClosureInput input, V4NearEntryClosureStatus expected) {
+        CAPTURE(input.currentViewEpoch, input.closureViewEpoch, input.currentWorldEpoch,
+                input.closureWorldEpoch, input.currentProtectedEpoch, input.closureProtectedEpoch,
+                input.currentAnchor.minimumTileX, input.currentAnchor.minimumTileZ,
+                input.closureAnchor.minimumTileX, input.closureAnchor.minimumTileZ);
+        CHECK(v4NearEntryClosureStatus(input) == expected);
+        CHECK_FALSE(v4NearEntryClosureReady(input));
+    };
+
+    SECTION("stale identity") {
+        auto input = complete();
+        ++input.closureViewEpoch;
+        rejectsAs(input, V4NearEntryClosureStatus::EpochMismatch);
+        input = complete();
+        ++input.closureWorldEpoch;
+        rejectsAs(input, V4NearEntryClosureStatus::EpochMismatch);
+        input = complete();
+        ++input.closureProtectedEpoch;
+        rejectsAs(input, V4NearEntryClosureStatus::EpochMismatch);
+        input = complete();
+        ++input.closureAnchor.minimumTileX;
+        rejectsAs(input, V4NearEntryClosureStatus::AnchorMismatch);
+    }
+
+    SECTION("retained prior closure is not retagged by the current request epoch") {
+        RenderPipeline::ChunkRenderStats streaming;
+        streaming.farProtectedNearCurrentEpoch = 10;
+        streaming.farProtectedNearClosureEpoch = 9;
+        streaming.farProtectedNearAnchorTileX = -12;
+        streaming.farProtectedNearAnchorTileZ = 24;
+        streaming.farProtectedNearViewEpoch = 31;
+        streaming.farProtectedNearWorldEpoch = 17;
+        streaming.farProtectedNearTargetCountsByStep = V4_ENTRY_FINAL_TARGETS_BY_STEP;
+        streaming.farProtectedNearFinalParentCount = V4_ENTRY_FINAL_TARGET_COUNT;
+        streaming.farProtectedNearFinalTargetCount = V4_ENTRY_FINAL_TARGET_COUNT;
+        streaming.farProtectedNearExactCompatibleTargetCount = V4_ENTRY_FINAL_TARGET_COUNT;
+        streaming.farProtectedNearResidentTileCount = V4_ENTRY_FINAL_TARGET_COUNT;
+        streaming.farProtectedNearReady = true;
+
+        auto input = complete();
+        input.currentProtectedEpoch = streaming.farProtectedNearCurrentEpoch;
+        input.closureProtectedEpoch = streaming.farProtectedNearClosureEpoch;
+        input.currentAnchor = {-11, 24};
+        input.closureAnchor = {streaming.farProtectedNearAnchorTileX,
+                               streaming.farProtectedNearAnchorTileZ};
+        input.finalTargetCountsByStep = streaming.farProtectedNearTargetCountsByStep;
+        input.matchingFinalParentsUploaded = streaming.farProtectedNearFinalParentCount;
+        input.matchingFinalParentsResident = streaming.farProtectedNearFinalParentCount;
+        input.matchingFinalChildrenUploaded = streaming.farProtectedNearFinalTargetCount;
+        input.matchingFinalChildrenResident = streaming.farProtectedNearFinalTargetCount;
+        input.exactCompatibleTargets = streaming.farProtectedNearExactCompatibleTargetCount;
+        rejectsAs(input, V4NearEntryClosureStatus::EpochMismatch);
+
+        // Even an accidental epoch restamp cannot conceal the stale anchor.
+        input.closureProtectedEpoch = input.currentProtectedEpoch;
+        rejectsAs(input, V4NearEntryClosureStatus::AnchorMismatch);
+    }
+
+    SECTION("preview parent prefix") {
+        auto input = complete();
+        input.connectedPreviewParentPrefixReady = false;
+        rejectsAs(input, V4NearEntryClosureStatus::PreviewParentPrefixIncomplete);
+    }
+
+    SECTION("protected topology") {
+        auto input = complete();
+        ++input.finalTargetCountsByStep[0];
+        --input.finalTargetCountsByStep[1];
+        rejectsAs(input, V4NearEntryClosureStatus::ProtectedTopologyMismatch);
+    }
+
+    SECTION("FINAL parent upload and residency") {
+        auto input = complete();
+        --input.matchingFinalParentsUploaded;
+        rejectsAs(input, V4NearEntryClosureStatus::FinalParentsIncomplete);
+        input = complete();
+        --input.matchingFinalParentsResident;
+        rejectsAs(input, V4NearEntryClosureStatus::FinalParentsIncomplete);
+    }
+
+    SECTION("FINAL child upload and residency") {
+        auto input = complete();
+        --input.matchingFinalChildrenUploaded;
+        rejectsAs(input, V4NearEntryClosureStatus::FinalChildrenIncomplete);
+        input = complete();
+        --input.matchingFinalChildrenResident;
+        rejectsAs(input, V4NearEntryClosureStatus::FinalChildrenIncomplete);
+    }
+
+    SECTION("exact compatibility and transitions") {
+        auto input = complete();
+        --input.exactCompatibleTargets;
+        rejectsAs(input, V4NearEntryClosureStatus::ExactCompatibilityIncomplete);
+        input = complete();
+        input.lodTransitionMismatches = 1;
+        rejectsAs(input, V4NearEntryClosureStatus::TransitionMismatch);
+        input = complete();
+        input.authorityTransitionMismatches = 1;
+        rejectsAs(input, V4NearEntryClosureStatus::TransitionMismatch);
+    }
+
+    SECTION("collision and current-revision exact meshes") {
+        auto input = complete();
+        --input.collisionCubesReady;
+        rejectsAs(input, V4NearEntryClosureStatus::CollisionIncomplete);
+        input = complete();
+        ++input.collisionCubesReady;
+        rejectsAs(input, V4NearEntryClosureStatus::CollisionIncomplete);
+        input = complete();
+        input.exactMeshesRequired = 0;
+        input.matchingExactMeshesReady = 0;
+        rejectsAs(input, V4NearEntryClosureStatus::ExactMeshesIncomplete);
+        input = complete();
+        --input.matchingExactMeshesReady;
+        rejectsAs(input, V4NearEntryClosureStatus::ExactMeshesIncomplete);
+        input = complete();
+        ++input.readyExactMeshRevision;
+        rejectsAs(input, V4NearEntryClosureStatus::ExactMeshRevisionMismatch);
+    }
+}
+
+TEST_CASE("Terrain bootstrap menu exposes every fail-closed startup action",
+          "[engine][ui][bootstrap]") {
+    using namespace worldgen::bootstrap;
+    const auto actions = [](const MenuLayout& layout) {
+        std::vector<MenuAction> result;
+        for (const MenuButton& button : layout.buttons)
+            result.push_back(button.action);
+        return result;
+    };
+    const auto containsText = [](const MenuLayout& layout, std::string_view value) {
+        return std::ranges::any_of(layout.texts, [&](const MenuText& text) {
+            return text.text.find(value) != std::string::npos;
+        });
+    };
+
+    TerrainBootstrapSnapshot required;
+    required.state = TerrainBootstrapState::ModelRequired;
+    required.detail = "The verified generator v4 terrain model is required";
+    const MenuLayout requiredLayout = buildTerrainBootstrapLayout(required, 1024.f, 768.f);
+    CHECK(containsText(requiredLayout, "MODEL REQUIRED"));
+    CHECK(actions(requiredLayout) ==
+          std::vector<MenuAction>{MenuAction::DOWNLOAD_MODEL, MenuAction::QUIT});
+
+    for (const TerrainBootstrapState state : {
+             TerrainBootstrapState::Downloading,
+             TerrainBootstrapState::Verifying,
+             TerrainBootstrapState::Compiling,
+             TerrainBootstrapState::Loading,
+         }) {
+        TerrainBootstrapSnapshot active{
+            .state = state,
+            .completedBytes = 50,
+            .totalBytes = 100,
+            .currentAsset = "base_model.onnx",
+            .detail = "Preparing generator v4",
+        };
+        const MenuLayout layout = buildTerrainBootstrapLayout(active, 1024.f, 768.f);
+        CHECK(layout.progressFraction == Catch::Approx(0.5f));
+        CHECK(layout.progressTrack.w > 0.f);
+        CHECK(actions(layout) ==
+              std::vector<MenuAction>{MenuAction::CANCEL_MODEL, MenuAction::QUIT});
+    }
+
+    TerrainBootstrapSnapshot localPack{
+        .state = TerrainBootstrapState::Compiling,
+        .completedBytes = 100,
+        .totalBytes = 100,
+        .reusingInstalledPack = true,
+        .detail = "Reusing the local model pack; preparing Core ML sessions",
+    };
+    const MenuLayout localPackLayout = buildTerrainBootstrapLayout(localPack, 1024.f, 768.f);
+    CHECK(containsText(localPackLayout, "LOCAL PACK REUSED - NO DOWNLOAD"));
+
+    TerrainBootstrapSnapshot failed;
+    failed.state = TerrainBootstrapState::Failed;
+    failed.detail = "Verification failed";
+    failed.failure = TerrainBootstrapFailure{
+        .code = TerrainBootstrapFailureCode::Integrity,
+        .message = "Verification failed",
+        .retryable = true,
+    };
+    const MenuLayout failedLayout = buildTerrainBootstrapLayout(failed, 1024.f, 768.f);
+    CHECK(containsText(failedLayout, "FAILED"));
+    CHECK(actions(failedLayout) == std::vector<MenuAction>{MenuAction::RETRY_MODEL,
+                                                           MenuAction::REPAIR_MODEL,
+                                                           MenuAction::QUIT});
+
+    failed.failure->retryable = false;
+    const MenuLayout terminalLayout = buildTerrainBootstrapLayout(failed, 1024.f, 768.f);
+    CHECK(actions(terminalLayout) == std::vector<MenuAction>{MenuAction::QUIT});
+
+    const MenuLayout profileFailureLayout =
+        buildTerrainBootstrapLayout(failed, 1024.f, 768.f, true);
+    CHECK(actions(profileFailureLayout) ==
+          std::vector<MenuAction>{MenuAction::OPEN_WORLD_SELECT, MenuAction::QUIT});
+
+    TerrainBootstrapSnapshot ready;
+    ready.state = TerrainBootstrapState::Ready;
+    const MenuLayout readyLayout = buildTerrainBootstrapLayout(ready, 1024.f, 768.f);
+    CHECK(containsText(readyLayout, "READY"));
+    CHECK(readyLayout.buttons.empty());
+
+    const MenuLayout preparing =
+        buildV4WorldPreparationLayout({.safeSpawnReady = true,
+                                       .configuredHorizonRadiusChunks = 512,
+                                       .entryHorizonRadiusChunks = 96,
+                                       .connectedParentRadiusChunks = 48.0F,
+                                       .farBaseReady = 9,
+                                       .farBaseRequired = 12,
+                                       .elapsedSeconds = 8.5},
+                                      1024.f, 768.f);
+    CHECK(containsText(preparing, "PREPARING WORLD"));
+    CHECK(containsText(preparing, "SAFE SPAWN READY"));
+    CHECK(containsText(preparing, "CONNECTED ENTRY FRONTIER 48/96 CHUNKS"));
+    CHECK(containsText(preparing, "ENTRY 96 CHUNKS / CONFIGURED 512 CHUNKS"));
+    CHECK(preparing.progressFraction == Catch::Approx(0.60f));
+    CHECK(actions(preparing) == std::vector<MenuAction>{MenuAction::QUIT});
+
+    const MenuLayout nonfiniteFrontier = buildV4WorldPreparationLayout(
+        {.safeSpawnReady = true,
+         .configuredHorizonRadiusChunks = 512,
+         .entryHorizonRadiusChunks = 96,
+         .connectedParentRadiusChunks = std::numeric_limits<float>::quiet_NaN(),
+         .farBaseReady = 9,
+         .farBaseRequired = 12},
+        1024.f, 768.f);
+    CHECK(containsText(nonfiniteFrontier, "CONNECTED ENTRY FRONTIER 0/96 CHUNKS"));
+    CHECK(nonfiniteFrontier.progressFraction == Catch::Approx(0.2f));
+
+    const MenuLayout incompleteShortHorizon =
+        buildV4WorldPreparationLayout({.safeSpawnReady = true,
+                                       .configuredHorizonRadiusChunks = 64,
+                                       .entryHorizonRadiusChunks = 64,
+                                       .connectedParentRadiusChunks = 64.0F,
+                                       .farBaseReady = 99,
+                                       .farBaseRequired = 100},
+                                      1024.f, 768.f);
+    CHECK(containsText(incompleteShortHorizon, "CONNECTED ENTRY FRONTIER 64/64 CHUNKS"));
+    CHECK_FALSE(containsText(incompleteShortHorizon, "PROTECTED NEAR TERRAIN"));
+
+    const MenuLayout preparingCompleteHorizon =
+        buildV4WorldPreparationLayout({.safeSpawnReady = true,
+                                       .configuredHorizonRadiusChunks = 512,
+                                       .entryHorizonRadiusChunks = 96,
+                                       .farBaseReady = 12,
+                                       .farBaseRequired = 12,
+                                       .elapsedSeconds = 12.0},
+                                      1024.f, 768.f);
+    CHECK(containsText(preparingCompleteHorizon, "CONNECTED ENTRY FRONTIER READY"));
+    CHECK(preparingCompleteHorizon.progressFraction == Catch::Approx(1.0f));
+
+    const MenuLayout preparingConnectedPrefix =
+        buildV4WorldPreparationLayout({.safeSpawnReady = true,
+                                       .configuredHorizonRadiusChunks = 512,
+                                       .entryHorizonRadiusChunks = 96,
+                                       .connectedParentRadiusChunks = 96.0F,
+                                       .farBaseReady = 9,
+                                       .farBaseRequired = 12,
+                                       .elapsedSeconds = 13.0},
+                                      1024.f, 768.f);
+    CHECK(containsText(preparingConnectedPrefix, "CONNECTED ENTRY FRONTIER READY"));
+    CHECK(preparingConnectedPrefix.progressFraction == Catch::Approx(1.0f));
+
+    const MenuLayout preparingNearDetail =
+        buildV4WorldPreparationLayout({.safeSpawnReady = true,
+                                       .configuredHorizonRadiusChunks = 512,
+                                       .entryHorizonRadiusChunks = 96,
+                                       .connectedParentRadiusChunks = 96.0F,
+                                       .farBaseReady = 9,
+                                       .farBaseRequired = 12,
+                                       .nearFinalReady = 24,
+                                       .nearFinalRequired = 60,
+                                       .elapsedSeconds = 13.0},
+                                      1024.f, 768.f);
+    CHECK(containsText(preparingNearDetail, "CONNECTED ENTRY FRONTIER READY"));
+    CHECK(containsText(preparingNearDetail, "NEAR DETAIL 24/60"));
+    CHECK(preparingNearDetail.progressFraction == Catch::Approx(0.76f));
+
+    const MenuLayout readyNearDetail =
+        buildV4WorldPreparationLayout({.safeSpawnReady = true,
+                                       .configuredHorizonRadiusChunks = 512,
+                                       .entryHorizonRadiusChunks = 96,
+                                       .connectedParentRadiusChunks = 96.0F,
+                                       .farBaseReady = 9,
+                                       .farBaseRequired = 12,
+                                       .nearFinalReady = 60,
+                                       .nearFinalRequired = 60},
+                                      1024.f, 768.f);
+    CHECK(containsText(readyNearDetail, "NEAR DETAIL READY"));
+    CHECK(readyNearDetail.progressFraction == Catch::Approx(1.0f));
+
+    const MenuLayout locating = buildV4WorldPreparationLayout({.drySpawnValidated = false,
+                                                               .safeSpawnReady = false,
+                                                               .farBaseReady = 0,
+                                                               .farBaseRequired = 0,
+                                                               .elapsedSeconds = 1.0},
+                                                              1024.f, 768.f);
+    CHECK(containsText(locating, "LOCATING DRY LAND"));
+    CHECK(containsText(locating, "HORIZON WAITS FOR DRY LAND"));
+    CHECK(locating.progressFraction == Catch::Approx(-1.0f));
+
+    const MenuLayout preparingFinalTerrain =
+        buildV4WorldPreparationLayout({.drySpawnValidated = true,
+                                       .finalSpawnTerrainReady = false,
+                                       .safeSpawnReady = false,
+                                       .farBaseReady = 0,
+                                       .farBaseRequired = 0,
+                                       .elapsedSeconds = 1.5},
+                                      1024.f, 768.f);
+    CHECK(containsText(preparingFinalTerrain, "PREPARING FINAL TERRAIN"));
+    CHECK(containsText(preparingFinalTerrain, "HORIZON WAITS FOR FINAL TERRAIN"));
+    CHECK_FALSE(containsText(preparingFinalTerrain, "ENTRY HORIZON 0/0"));
+    CHECK(preparingFinalTerrain.progressFraction == Catch::Approx(-1.0f));
+
+    const MenuLayout waitingForSafeSpawn = buildV4WorldPreparationLayout({.drySpawnValidated = true,
+                                                                          .safeSpawnReady = false,
+                                                                          .farBaseReady = 0,
+                                                                          .farBaseRequired = 0,
+                                                                          .elapsedSeconds = 2.0},
+                                                                         1024.f, 768.f);
+    CHECK(containsText(waitingForSafeSpawn, "FINALIZING SAFE SPAWN"));
+    CHECK(containsText(waitingForSafeSpawn, "HORIZON WAITS FOR SAFE SPAWN"));
+    CHECK_FALSE(containsText(waitingForSafeSpawn, "ENTRY HORIZON 0/0"));
+    CHECK(waitingForSafeSpawn.progressFraction == Catch::Approx(-1.0f));
+
+    const MenuLayout initializingHorizon =
+        buildV4WorldPreparationLayout({.drySpawnValidated = true,
+                                       .safeSpawnReady = true,
+                                       .configuredHorizonRadiusChunks = 512,
+                                       .entryHorizonRadiusChunks = 96,
+                                       .farBaseReady = 0,
+                                       .farBaseRequired = 0,
+                                       .elapsedSeconds = 3.0},
+                                      1024.f, 768.f);
+    CHECK(containsText(initializingHorizon, "SAFE SPAWN READY"));
+    CHECK(containsText(initializingHorizon, "INITIALIZING CONNECTED ENTRY FRONTIER"));
+    CHECK(containsText(initializingHorizon, "ENTRY 96 CHUNKS / CONFIGURED 512 CHUNKS"));
+    CHECK_FALSE(containsText(initializingHorizon, "ENTRY HORIZON 0/0"));
+    CHECK(initializingHorizon.progressFraction == Catch::Approx(-1.0f));
+}
+
+TEST_CASE("Generator v4 entry frontier includes protected detail at every tile corner",
+          "[engine][v4][entry][far-terrain]") {
+    constexpr float ENTRY_RADIUS_BLOCKS =
+        static_cast<float>(V4_ENTRY_CONNECTED_PARENT_RADIUS_CHUNKS * CHUNK_EDGE);
+    constexpr double ENTRY_RADIUS_SQUARED =
+        static_cast<double>(ENTRY_RADIUS_BLOCKS) * ENTRY_RADIUS_BLOCKS;
+    const std::array<std::pair<double, double>, 4> cameraCorners{
+        std::pair{0.25, 0.25},
+        std::pair{0.25, static_cast<double>(FAR_TERRAIN_TILE_EDGE) - 0.25},
+        std::pair{static_cast<double>(FAR_TERRAIN_TILE_EDGE) - 0.25, 0.25},
+        std::pair{static_cast<double>(FAR_TERRAIN_TILE_EDGE) - 0.25,
+                  static_cast<double>(FAR_TERRAIN_TILE_EDGE) - 0.25},
+    };
+
+    for (const auto [cameraX, cameraZ] : cameraCorners) {
+        CAPTURE(cameraX, cameraZ);
+        std::vector<FarTerrainViewTile> selected;
+        selectFarTerrainView(cameraX, cameraZ, MAX_RENDER_DISTANCE_CHUNKS, selected);
+        REQUIRE_FALSE(selected.empty());
+
+        std::vector<FarTerrainKey> protectedTargets;
+        const ColumnPos protectedAnchor = farTerrainProtectedNearAnchor(cameraX, cameraZ);
+        buildFarTerrainProtectedNearTargets(protectedAnchor, selected, protectedTargets);
+        REQUIRE(protectedTargets.size() == FAR_TERRAIN_PROTECTED_NEAR_TARGET_COUNT);
+        std::unordered_set<ColumnPos> protectedCoordinates;
+        protectedCoordinates.reserve(protectedTargets.size());
+        for (const FarTerrainKey target : protectedTargets)
+            protectedCoordinates.insert({target.tileX, target.tileZ});
+        std::unordered_map<ColumnPos, const FarTerrainViewTile*> selectedByCoordinate;
+        selectedByCoordinate.reserve(selected.size());
+        for (const FarTerrainViewTile& tile : selected)
+            selectedByCoordinate.emplace(ColumnPos{tile.key.tileX, tile.key.tileZ}, &tile);
+        const auto selectedTile = [&](ColumnPos coordinate) -> const FarTerrainViewTile* {
+            const auto found = selectedByCoordinate.find(coordinate);
+            return found == selectedByCoordinate.end() ? nullptr : found->second;
+        };
+        const FarTerrainCoverageFrontier frontier =
+            farTerrainCoverageFrontier(selected, [&](FarTerrainKey key) {
+                const ColumnPos coordinate{key.tileX, key.tileZ};
+                const FarTerrainViewTile* tile = selectedTile(coordinate);
+                return tile && (tile->distanceSquared < ENTRY_RADIUS_SQUARED ||
+                                protectedCoordinates.contains(coordinate));
+            });
+
+        REQUIRE_FALSE(frontier.complete);
+        REQUIRE(frontier.distanceBlocks >= ENTRY_RADIUS_BLOCKS);
+        const float opaqueRadius =
+            frontier.distanceBlocks - farTerrainCoverageFadeBlocks(frontier.distanceBlocks);
+        REQUIRE(opaqueRadius >= 84.0F * CHUNK_EDGE);
+
+        for (const FarTerrainKey target : protectedTargets) {
+            const FarTerrainViewTile* tile = selectedTile({target.tileX, target.tileZ});
+            REQUIRE(tile != nullptr);
+            CHECK(tile->distanceSquared < frontier.distanceSquaredBlocks);
+            CHECK(farTerrainCoverageDrawEligible(tile->distanceSquared, frontier));
+        }
+    }
+}
+
+TEST_CASE("V4 world-open failures expose only valid recovery paths",
+          "[engine][bootstrap][worlds]") {
+    CHECK_FALSE(v4WorldOpenFailureRetryable(V4WorldOpenStatus::Ready));
+    CHECK(v4WorldOpenFailureRetryable(V4WorldOpenStatus::BootstrapNotReady));
+    CHECK(v4WorldOpenFailureRetryable(V4WorldOpenStatus::PersistenceFailure));
+    CHECK_FALSE(v4WorldOpenFailureRetryable(V4WorldOpenStatus::InvalidWorldDirectory));
+    CHECK_FALSE(v4WorldOpenFailureRetryable(V4WorldOpenStatus::MissingMetadata));
+    CHECK_FALSE(v4WorldOpenFailureRetryable(V4WorldOpenStatus::IdentityConflict));
+
+    CHECK(v4WorldOpenFailureAllowsWorldSelection(V4WorldOpenStatus::InvalidWorldDirectory));
+    CHECK(v4WorldOpenFailureAllowsWorldSelection(V4WorldOpenStatus::MissingMetadata));
+    CHECK(v4WorldOpenFailureAllowsWorldSelection(V4WorldOpenStatus::IdentityConflict));
+    CHECK_FALSE(v4WorldOpenFailureAllowsWorldSelection(V4WorldOpenStatus::BootstrapNotReady));
+    CHECK_FALSE(v4WorldOpenFailureAllowsWorldSelection(V4WorldOpenStatus::PersistenceFailure));
+}
+
 TEST_CASE("Font covers every character the menus draw", "[ui][font]") {
     GraphicsSettings gfx;
     std::string needed = "0123456789.:/-+ ";
@@ -1212,9 +2152,11 @@ TEST_CASE("Font covers every character the menus draw", "[ui][font]") {
     ctx.worldCreate.name = "AZaz09 ._-";
     ctx.worldCreate.seedText = "0123456789";
     ctx.deleteWorldName = "A world_NAME.42-x";
+    ctx.successorWorldName = "A world_NAME.42-x";
     for (GameScreen screen :
          {GameScreen::TITLE, GameScreen::PAUSED, GameScreen::SETTINGS, GameScreen::VIDEO_SETTINGS,
-          GameScreen::WORLD_SELECT, GameScreen::WORLD_CREATE, GameScreen::WORLD_DELETE_CONFIRM}) {
+          GameScreen::WORLD_SELECT, GameScreen::WORLD_CREATE, GameScreen::WORLD_DELETE_CONFIRM,
+          GameScreen::WORLD_SUCCESSOR_CONFIRM}) {
         MenuLayout layout = buildScreenLayout(screen, 1024.f, 768.f, ctx);
         for (const auto& text : layout.texts)
             needed += text.text;
@@ -1230,6 +2172,26 @@ TEST_CASE("Font covers every character the menus draw", "[ui][font]") {
         if (isWorldNameChar(static_cast<char>(c)))
             needed += static_cast<char>(c);
     }
+    worldgen::bootstrap::TerrainBootstrapSnapshot bootstrap;
+    bootstrap.state = worldgen::bootstrap::TerrainBootstrapState::Failed;
+    bootstrap.detail = "Model verification failed";
+    bootstrap.failure = worldgen::bootstrap::TerrainBootstrapFailure{
+        .code = worldgen::bootstrap::TerrainBootstrapFailureCode::Integrity,
+        .message = bootstrap.detail,
+        .retryable = true,
+    };
+    MenuLayout bootstrapLayout = buildTerrainBootstrapLayout(bootstrap, 1024.f, 768.f);
+    for (const auto& text : bootstrapLayout.texts)
+        needed += text.text;
+    for (const auto& button : bootstrapLayout.buttons)
+        needed += button.label;
+    MenuLayout preparationLayout = buildV4WorldPreparationLayout(
+        {.safeSpawnReady = false, .farBaseReady = 1, .farBaseRequired = 2, .elapsedSeconds = 3.0},
+        1024.f, 768.f);
+    for (const auto& text : preparationLayout.texts)
+        needed += text.text;
+    for (const auto& button : preparationLayout.buttons)
+        needed += button.label;
     // Plus everything the debug HUD prints
     needed += "FPS: Chunks: Entities: Frame: ";
 
@@ -1489,6 +2451,32 @@ TEST_CASE("Inventory: consume and tool damage empty the selected slot", "[invent
     inventory.setSlot(0, ItemStack{ItemType::COAL, 4, 0});
     REQUIRE_FALSE(inventory.damageSelectedTool());
     REQUIRE(inventory.getSlot(0).count == 4);
+}
+
+TEST_CASE("Inventory exchanges one stacked bucket without losing either result", "[inventory]") {
+    Inventory inventory;
+    inventory.setSlot(0, ItemStack{ItemType::BUCKET, 3, 0});
+    inventory.selectSlot(0);
+
+    REQUIRE(inventory.exchangeOneSelected(ItemStack{ItemType::WATER_BUCKET, 1, 0}).empty());
+    REQUIRE(inventory.getSlot(0) == ItemStack{ItemType::BUCKET, 2, 0});
+    REQUIRE(inventory.getSlot(1) == ItemStack{ItemType::WATER_BUCKET, 1, 0});
+
+    Inventory full;
+    for (int slot = 0; slot < Inventory::SLOTS; ++slot) {
+        full.setSlot(slot, ItemStack{ItemType::STICK, 64, 0});
+    }
+    full.setSlot(0, ItemStack{ItemType::BUCKET, 3, 0});
+    full.selectSlot(0);
+    REQUIRE(full.exchangeOneSelected(ItemStack{ItemType::LAVA_BUCKET, 1, 0}) ==
+            ItemStack{ItemType::LAVA_BUCKET, 1, 0});
+    REQUIRE(full.getSlot(0) == ItemStack{ItemType::BUCKET, 2, 0});
+
+    Inventory filled;
+    filled.setSlot(4, ItemStack{ItemType::WATER_BUCKET, 1, 0});
+    filled.selectSlot(4);
+    REQUIRE(filled.exchangeOneSelected(ItemStack{ItemType::BUCKET, 1, 0}).empty());
+    REQUIRE(filled.getSlot(4) == ItemStack{ItemType::BUCKET, 1, 0});
 }
 
 // ---- Performance HUD Tests ----
@@ -2037,6 +3025,35 @@ TEST_CASE("Outside drops and container close return items", "[slots]") {
     cursor = ItemStack{ItemType::COAL, 3, 0};
     const auto overflow = collectOnClose(access, cursor);
     REQUIRE(overflow.size() == 2);
+    REQUIRE(preserveCarriedOverflow(overflow, cursor, grid));
+    REQUIRE(cursor == ItemStack{itemFromBlock(BlockType::LOG), 2, 0});
+    REQUIRE(grid[0] == ItemStack{ItemType::COAL, 3, 0});
+    REQUIRE_FALSE(hasExtendedCarriedCrafting(grid));
+
+    std::array<ItemStack, 9> extendedGrid{};
+    extendedGrid[8] = ItemStack{ItemType::COAL, 1, 0};
+    REQUIRE(hasExtendedCarriedCrafting(extendedGrid));
+}
+
+TEST_CASE("Death drops include persisted cursor and crafting stacks", "[slots][death]") {
+    std::array<ItemStack, 36> inventory{};
+    std::array<ItemStack, 9> grid{};
+    inventory[0] = ItemStack{ItemType::COAL, 12, 0};
+    inventory[35] = ItemStack{ItemType::IRON_PICKAXE, 1, 117};
+    ItemStack cursor{ItemType::DIAMOND, 3, 0};
+    grid[0] = ItemStack{itemFromBlock(BlockType::PLANKS), 8, 0};
+    grid[8] = ItemStack{ItemType::STICK, 2, 0};
+
+    const std::vector<ItemStack> drops = collectDeathDrops(inventory, cursor, grid);
+
+    REQUIRE(drops == std::vector<ItemStack>{ItemStack{ItemType::COAL, 12, 0},
+                                            ItemStack{ItemType::IRON_PICKAXE, 1, 117},
+                                            ItemStack{ItemType::DIAMOND, 3, 0},
+                                            ItemStack{itemFromBlock(BlockType::PLANKS), 8, 0},
+                                            ItemStack{ItemType::STICK, 2, 0}});
+    REQUIRE(std::ranges::all_of(inventory, [](const ItemStack& stack) { return stack.empty(); }));
+    REQUIRE(cursor.empty());
+    REQUIRE(std::ranges::all_of(grid, [](const ItemStack& stack) { return stack.empty(); }));
 }
 
 TEST_CASE("Furnace layout exposes three slots and two gauges", "[ui][containers]") {
@@ -2224,6 +3241,28 @@ TEST_CASE("Mining restarts when the held tool changes mid-mine", "[mining]") {
     REQUIRE(state.ticksElapsed == 1);
     REQUIRE(state.ticksNeeded > fastNeeded);
     REQUIRE(state.tool == ItemType::NONE);
+}
+
+TEST_CASE("Bed respawn validation waits for resident safe cells", "[survival][bed]") {
+    CHECK(validateBedSpawnCells(std::nullopt, BlockType::AIR, BlockType::AIR) ==
+          BedSpawnValidation::DEFERRED);
+    CHECK(validateBedSpawnCells(BlockType::BED, std::nullopt, BlockType::AIR) ==
+          BedSpawnValidation::DEFERRED);
+    CHECK(validateBedSpawnCells(BlockType::BED, BlockType::AIR, BlockType::AIR) ==
+          BedSpawnValidation::VALID);
+    CHECK(validateBedSpawnCells(BlockType::AIR, BlockType::AIR, BlockType::AIR) ==
+          BedSpawnValidation::INVALID);
+    CHECK(validateBedSpawnCells(BlockType::BED, BlockType::STONE, BlockType::AIR) ==
+          BedSpawnValidation::INVALID);
+    CHECK(validateBedSpawnCells(BlockType::BED, BlockType::WATER, BlockType::AIR) ==
+          BedSpawnValidation::INVALID);
+    CHECK(validateBedSpawnCells(BlockType::BED, BlockType::AIR, BlockType::LAVA) ==
+          BedSpawnValidation::INVALID);
+
+    const Vec3 spawn{12.5f, 65.f, -8.5f};
+    CHECK(bedSpawnAnchoredToBlock(spawn, 12, 64, -9));
+    CHECK_FALSE(bedSpawnAnchoredToBlock(spawn, 12, 65, -9));
+    CHECK_FALSE(bedSpawnAnchoredToBlock(spawn, 13, 64, -9));
 }
 
 TEST_CASE("Survival exhaustion spends saturation then food", "[survival]") {

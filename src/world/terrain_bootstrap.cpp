@@ -180,7 +180,7 @@ struct CompletionMarkerFileStamp {
 std::optional<CompletionMarkerFileStamp>
 completionMarkerFileStamp(const std::filesystem::path& path, uint64_t expectedBytes,
                           std::string& errorMessage) {
-    struct stat status{};
+    struct stat status {};
     if (::lstat(path.c_str(), &status) != 0) {
         errorMessage =
             "Could not inspect terrain model completion marker input: " + path.filename().string();

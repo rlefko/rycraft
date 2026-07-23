@@ -4,15 +4,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -263,6 +267,27 @@ TEST_CASE("Cloud profile helpers keep physical layers finite and bounded", "[wea
     }
 }
 
+TEST_CASE("Generator v4 cloud layers remain above the tallest terrain",
+          "[weather][cloud][v4][height]") {
+    constexpr float SUMMIT_Y = 1'407.0F;
+    for (const CloudType type : {CloudType::CLEAR, CloudType::CIRRUS, CloudType::STRATUS,
+                                 CloudType::CUMULUS, CloudType::CUMULONIMBUS}) {
+        const CloudLayerBounds bounds =
+            cloudLayerBounds(type, SUMMIT_Y, 0.9F, GENERATOR_V4_PHYSICAL_SCALE);
+        REQUIRE(std::isfinite(bounds.baseY));
+        REQUIRE(std::isfinite(bounds.topY));
+        REQUIRE(bounds.baseY > SUMMIT_Y);
+        REQUIRE(bounds.topY > bounds.baseY);
+    }
+
+    worldgen::SurfaceSample summitClimate = climateSample(8.0, 0.9);
+    summitClimate.terrainHeight = SUMMIT_Y;
+    const WeatherSample storm = deriveWeatherSample(
+        7, 0.0, 0.0, 0, summitClimate, WeatherPreset::STORM, GENERATOR_V4_PHYSICAL_SCALE);
+    REQUIRE(storm.cloudBaseY > SUMMIT_Y);
+    REQUIRE(storm.cloudTopY > storm.cloudBaseY);
+}
+
 TEST_CASE("Weather worker batches one immutable grid and interpolates it",
           "[weather][worker][snapshot][batch]") {
     struct Probe {
@@ -428,6 +453,73 @@ TEST_CASE("Weather worker keeps one latest pending request", "[weather][worker][
     }
 }
 
+TEST_CASE("Weather worker survives a climate sampler failure and accepts a retry",
+          "[weather][worker][failure]") {
+    std::atomic<uint32_t> calls = 0;
+    WeatherSystem system(91, [&](int64_t originX, int64_t originZ, int spacing, int edge,
+                                 std::span<worldgen::SurfaceSample> output) {
+        if (calls.fetch_add(1, std::memory_order_relaxed) == 0)
+            throw std::runtime_error("synthetic climate failure");
+        fillClimateGrid(originX, originZ, spacing, edge, output);
+    });
+
+    const uint64_t failedRequest = system.requestSnapshot(0, 0, 0);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (system.stats().buildsFailed == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    REQUIRE(system.stats().buildsFailed == 1);
+    REQUIRE_FALSE(system.latestSnapshot());
+
+    const uint64_t retryRequest = system.requestSnapshot(0, 0, 0);
+    REQUIRE(retryRequest > failedRequest);
+    REQUIRE(system.waitForSnapshot(retryRequest, std::chrono::seconds(3)));
+    REQUIRE(system.stats().snapshotsPublished == 1);
+    REQUIRE(calls.load(std::memory_order_relaxed) == 2);
+}
+
+TEST_CASE("Weather teardown joins an active climate build before releasing its sampler",
+          "[weather][worker][thread][shutdown][regression]") {
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool entered = false;
+        bool release = false;
+    } gate;
+    auto system = std::make_unique<WeatherSystem>(
+        91, [&](int64_t originX, int64_t originZ, int spacing, int edge,
+                std::span<worldgen::SurfaceSample> output) {
+            {
+                std::unique_lock lock(gate.mutex);
+                gate.entered = true;
+                gate.condition.notify_all();
+                gate.condition.wait(lock, [&] { return gate.release; });
+            }
+            fillClimateGrid(originX, originZ, spacing, edge, output);
+        });
+    system->requestSnapshot(0, 0, 0);
+    bool entered = false;
+    {
+        std::unique_lock lock(gate.mutex);
+        entered =
+            gate.condition.wait_for(lock, std::chrono::seconds(3), [&] { return gate.entered; });
+        if (!entered)
+            gate.release = true;
+    }
+    if (!entered)
+        gate.condition.notify_all();
+    REQUIRE(entered);
+
+    std::future<void> teardown = std::async(std::launch::async, [&] { system.reset(); });
+    REQUIRE(teardown.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    {
+        std::lock_guard lock(gate.mutex);
+        gate.release = true;
+    }
+    gate.condition.notify_all();
+    REQUIRE(teardown.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    REQUIRE_NOTHROW(teardown.get());
+}
+
 TEST_CASE("Lightning events are deterministic non-destructive weather data",
           "[weather][lightning][determinism]") {
     WeatherSample storm =
@@ -466,6 +558,21 @@ TEST_CASE("Lightning events are deterministic non-destructive weather data",
     REQUIRE_FALSE(lightningEventForCell(764891, selectedX, selectedZ, BUCKET, clear));
 }
 
+TEST_CASE("Lightning ticks saturate in the final representable bucket",
+          "[weather][lightning][overflow]") {
+    constexpr uint64_t MAXIMUM_TICK = std::numeric_limits<uint64_t>::max();
+    constexpr uint64_t FINAL_BUCKET = MAXIMUM_TICK / WeatherSystem::LIGHTNING_BUCKET_TICKS;
+    constexpr uint64_t FINAL_BUCKET_START = FINAL_BUCKET * WeatherSystem::LIGHTNING_BUCKET_TICKS;
+    constexpr uint64_t FINAL_OFFSET = MAXIMUM_TICK - FINAL_BUCKET_START;
+
+    STATIC_REQUIRE(WeatherSystem::lightningTickForBucket(FINAL_BUCKET, 0) == FINAL_BUCKET_START);
+    STATIC_REQUIRE(WeatherSystem::lightningTickForBucket(FINAL_BUCKET, FINAL_OFFSET) ==
+                   MAXIMUM_TICK);
+    STATIC_REQUIRE(WeatherSystem::lightningTickForBucket(FINAL_BUCKET, FINAL_OFFSET + 1) ==
+                   MAXIMUM_TICK);
+    STATIC_REQUIRE(WeatherSystem::lightningTickForBucket(FINAL_BUCKET + 1, 0) == MAXIMUM_TICK);
+}
+
 TEST_CASE("Thunder delay uses physical sound speed", "[weather][lightning][thunder]") {
     LightningEvent event;
     event.x = 343.0;
@@ -473,6 +580,11 @@ TEST_CASE("Thunder delay uses physical sound speed", "[weather][lightning][thund
     event.z = 0.0;
     REQUIRE(thunderDelaySeconds(event, 0.0, 0.0, 0.0) == Catch::Approx(1.0));
     REQUIRE(thunderDelaySeconds(event, 343.0, 0.0, 0.0) == Catch::Approx(0.0));
+
+    event.x = 343.0 / GENERATOR_V4_PHYSICAL_SCALE.horizontalMetersPerBlock;
+    event.y = static_cast<float>(GENERATOR_V4_PHYSICAL_SCALE.altitudeDatumY);
+    REQUIRE(thunderDelaySeconds(event, 0.0, GENERATOR_V4_PHYSICAL_SCALE.altitudeDatumY, 0.0,
+                                GENERATOR_V4_PHYSICAL_SCALE) == Catch::Approx(1.0));
 }
 
 TEST_CASE("Lightning queries cap work and do not replay an unloaded backlog",
@@ -495,4 +607,34 @@ TEST_CASE("Lightning queries cap work and do not replay an unloaded backlog",
         REQUIRE(event.tick > 360);
         REQUIRE(event.tick <= 400);
     }
+}
+
+TEST_CASE("Lightning discovery caches each weather snapshot bucket",
+          "[weather][lightning][cache]") {
+    WeatherSystem system(764891, fillClimateGrid, WeatherPreset::STORM);
+    const uint64_t firstRequest = system.requestSnapshot(0, 0, 0);
+    REQUIRE(system.waitForSnapshot(firstRequest, std::chrono::seconds(10)));
+
+    const std::vector<LightningEvent> first = system.lightningEvents(1, 39);
+    const WeatherSystemStats afterFirst = system.stats();
+    REQUIRE(afterFirst.lightningDiscoveryBuilds == 1);
+    REQUIRE(afterFirst.lightningDiscoveryCacheHits == 0);
+
+    const std::vector<LightningEvent> repeated = system.lightningEvents(1, 39);
+    const WeatherSystemStats afterRepeated = system.stats();
+    REQUIRE(repeated.size() == first.size());
+    REQUIRE(afterRepeated.lightningDiscoveryBuilds == afterFirst.lightningDiscoveryBuilds);
+    REQUIRE(afterRepeated.lightningDiscoveryCacheHits ==
+            afterFirst.lightningDiscoveryCacheHits + 1);
+
+    system.lightningEvents(40, 79);
+    const WeatherSystemStats afterNextBucket = system.stats();
+    REQUIRE(afterNextBucket.lightningDiscoveryBuilds == afterRepeated.lightningDiscoveryBuilds + 1);
+
+    const uint64_t recenteredRequest = system.requestSnapshot(2'048, 0, 0);
+    REQUIRE(recenteredRequest > firstRequest);
+    REQUIRE(system.waitForSnapshot(recenteredRequest, std::chrono::seconds(10)));
+    system.lightningEvents(1, 39);
+    const WeatherSystemStats afterRecenter = system.stats();
+    REQUIRE(afterRecenter.lightningDiscoveryBuilds == afterNextBucket.lightningDiscoveryBuilds + 1);
 }

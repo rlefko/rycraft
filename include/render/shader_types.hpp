@@ -656,9 +656,8 @@ farTerrainExactColumnOwnsFragment(simd_float2 localPosition, unsigned int face,
     const unsigned int tileIndex = unsigned((neighbor.y + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS) *
                                                 FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE +
                                             neighbor.x + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS);
-    const unsigned int vectorIndex =
-        tileIndex * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE +
-        word / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR;
+    const unsigned int vectorIndex = tileIndex * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE +
+                                     word / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR;
     const simd_uint4 packed = floraOwnership ? ownership.floraReadyColumnMasks[vectorIndex]
                                              : ownership.readyColumnMasks[vectorIndex];
     return ((packed[word % FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR] >>

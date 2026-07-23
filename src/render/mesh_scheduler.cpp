@@ -139,9 +139,8 @@ std::optional<MeshCanceledRequest> MeshScheduler::cancelQueued(ChunkPos position
     std::optional<MeshCanceledRequest> canceled;
     {
         std::lock_guard<std::mutex> lock(jobMutex_);
-        const auto iterator = std::find_if(jobs_.begin(), jobs_.end(), [&](const MeshJob& job) {
-            return job.pos == position;
-        });
+        const auto iterator = std::find_if(jobs_.begin(), jobs_.end(),
+                                           [&](const MeshJob& job) { return job.pos == position; });
         if (iterator == jobs_.end()) return std::nullopt;
         canceled = MeshCanceledRequest{iterator->pos, iterator->requestedVersion};
         jobs_.erase(iterator);
@@ -152,8 +151,8 @@ std::optional<MeshCanceledRequest> MeshScheduler::cancelQueued(ChunkPos position
     return canceled;
 }
 
-size_t MeshScheduler::reprioritizeQueued(
-    const std::function<MeshRequestPriority(ChunkPos)>& priorityFor) {
+size_t
+MeshScheduler::reprioritizeQueued(const std::function<MeshRequestPriority(ChunkPos)>& priorityFor) {
     if (!priorityFor) return 0;
     size_t changed = 0;
     {

@@ -1730,8 +1730,7 @@ bool farTerrainRefinementRequestBefore(const FarTerrainRefinementCacheRequest& f
                                    ? std::max(0.0, second.projectedErrorPixels)
                                    : 0.0;
     if (firstError != secondError) return firstError > secondError;
-    if (first.coordinate.x != second.coordinate.x)
-        return first.coordinate.x < second.coordinate.x;
+    if (first.coordinate.x != second.coordinate.x) return first.coordinate.x < second.coordinate.x;
     return first.coordinate.z < second.coordinate.z;
 }
 
@@ -2415,8 +2414,7 @@ farTerrainProtectedFinalTerrainRegions(std::span<const FarTerrainKey> targets) {
         const FarTerrainFinalBaseAuthorityDependencies dependencies =
             farTerrainFinalBaseAuthorityDependencies(
                 {target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP});
-        for (const FarTerrainNativeHydrologyDependency& dependency :
-             dependencies.nativeHydrology) {
+        for (const FarTerrainNativeHydrologyDependency& dependency : dependencies.nativeHydrology) {
             owners.emplace(dependency.ownerPageZ, dependency.ownerPageX);
         }
     }
@@ -2438,16 +2436,14 @@ farTerrainProtectedFinalTerrainRegions(std::span<const FarTerrainKey> targets) {
         const bool hasDown = mayExtendDown && owners.contains(down);
         if (hasRight) group.push_back(right);
         if (hasDown) group.push_back(down);
-        if ((hasRight || hasDown) && mayExtendRight && mayExtendDown &&
-            owners.contains(diagonal)) {
+        if ((hasRight || hasDown) && mayExtendRight && mayExtendDown && owners.contains(diagonal)) {
             group.push_back(diagonal);
         }
 
         NativeRect combined = worldgen::nativeHydrologyFinalTerrainRegion(originX, originZ);
         for (size_t index = 1; index < group.size(); ++index) {
             const auto [ownerZ, ownerX] = group[index];
-            const NativeRect member =
-                worldgen::nativeHydrologyFinalTerrainRegion(ownerX, ownerZ);
+            const NativeRect member = worldgen::nativeHydrologyFinalTerrainRegion(ownerX, ownerZ);
             combined.rowBegin = std::min(combined.rowBegin, member.rowBegin);
             combined.columnBegin = std::min(combined.columnBegin, member.columnBegin);
             combined.rowEnd = std::max(combined.rowEnd, member.rowEnd);
@@ -2621,9 +2617,8 @@ std::optional<FarTerrainStep> protectedNearStepForRole(FarTerrainProtectedNearRo
 bool farTerrainProtectedNearTargetKey(const std::optional<ColumnPos>& anchor,
                                       FarTerrainKey key) noexcept {
     if (!anchor || farTerrainIsBaseStep(key.step)) return false;
-    const std::optional<FarTerrainStep> required =
-        protectedNearStepForRole(farTerrainProtectedNearRole(
-            *anchor, ColumnPos{key.tileX, key.tileZ}));
+    const std::optional<FarTerrainStep> required = protectedNearStepForRole(
+        farTerrainProtectedNearRole(*anchor, ColumnPos{key.tileX, key.tileZ}));
     return required && *required == key.step;
 }
 
@@ -3043,16 +3038,15 @@ void buildFarTerrainCriticalResidencyOrder(std::span<const FarTerrainKey> target
     for (const FarTerrainStep bridge : {FarTerrainStep::TWO, FarTerrainStep::FOUR,
                                         FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN}) {
         for (const FarTerrainKey target : targets) {
-            if (farTerrainStepSize(bridge) <= farTerrainStepSize(target.step))
-                continue;
+            if (farTerrainStepSize(bridge) <= farTerrainStepSize(target.step)) continue;
             output.push_back({target.tileX, target.tileZ, bridge});
         }
     }
 }
 
-void buildFarTerrainTieredCriticalResidencyOrder(
-    std::span<const FarTerrainKey> currentTargets,
-    std::span<const FarTerrainKey> predictedTargets, std::vector<FarTerrainKey>& output) {
+void buildFarTerrainTieredCriticalResidencyOrder(std::span<const FarTerrainKey> currentTargets,
+                                                 std::span<const FarTerrainKey> predictedTargets,
+                                                 std::vector<FarTerrainKey>& output) {
     buildFarTerrainCriticalResidencyOrder(currentTargets, output);
     std::unordered_set<FarTerrainKey, FarTerrainKeyHash> seen(output.begin(), output.end());
     std::vector<FarTerrainKey> predicted;
@@ -3206,8 +3200,8 @@ bool farTerrainExactSectionOwnsSurface(bool previouslyPublished, uint32_t builtR
 
 bool farTerrainExactSectionDrawAllowed(bool sectionRequired, bool columnFullyReady,
                                        bool coverageParentDrawable) noexcept {
-    return farTerrainExactVisualOwnership(sectionRequired, columnFullyReady,
-                                          coverageParentDrawable, true)
+    return farTerrainExactVisualOwnership(sectionRequired, columnFullyReady, coverageParentDrawable,
+                                          true)
         .drawExact;
 }
 
@@ -4469,8 +4463,8 @@ FarTerrainMesher::buildInternal(FarTerrainKey key, const FarTerrainSource& sourc
     };
     const auto surfaceMaterialAt = [&](const FarSurfaceSample& surface, int64_t worldX,
                                        int64_t worldZ) {
-        const double rank =
-            source.materialRank ? source.materialRank(worldX, worldZ) : materialRank(worldX, worldZ);
+        const double rank = source.materialRank ? source.materialRank(worldX, worldZ)
+                                                : materialRank(worldX, worldZ);
         BlockType material =
             worldgen::surface_material::selectMaterial(surface.materialPalette, rank);
         return material == BlockType::AIR ? BlockType::STONE : material;
@@ -5041,14 +5035,14 @@ FarTerrainMesher::buildInternal(FarTerrainKey key, const FarTerrainSource& sourc
             const float z0 = static_cast<float>(z);
             const float z1 = z0 + 1.0F;
             if (cell.terrain[0] > eastTop) {
-                pushTerrainRiser(*mesh, FaceNormal::PLUS_X, cell.material, boundary, z1, boundary, z0,
-                                 eastTop, cell.terrain[0]);
+                pushTerrainRiser(*mesh, FaceNormal::PLUS_X, cell.material, boundary, z1, boundary,
+                                 z0, eastTop, cell.terrain[0]);
             } else if (eastTop > cell.terrain[0]) {
                 const BlockType eastMaterial =
                     surfaceMaterialAt(east, mesh->originX + FAR_TERRAIN_TILE_EDGE,
                                       mesh->originZ + static_cast<int64_t>(z));
-                pushTerrainRiser(*mesh, FaceNormal::MINUS_X, eastMaterial, boundary, z0, boundary, z1,
-                                 cell.terrain[0], eastTop);
+                pushTerrainRiser(*mesh, FaceNormal::MINUS_X, eastMaterial, boundary, z0, boundary,
+                                 z1, cell.terrain[0], eastTop);
             }
         }
         for (int x = 0; x < cellEdge; ++x) {
@@ -5058,14 +5052,14 @@ FarTerrainMesher::buildInternal(FarTerrainKey key, const FarTerrainSource& sourc
             const float x0 = static_cast<float>(x);
             const float x1 = x0 + 1.0F;
             if (cell.terrain[0] > southTop) {
-                pushTerrainRiser(*mesh, FaceNormal::PLUS_Z, cell.material, x0, boundary, x1, boundary,
-                                 southTop, cell.terrain[0]);
+                pushTerrainRiser(*mesh, FaceNormal::PLUS_Z, cell.material, x0, boundary, x1,
+                                 boundary, southTop, cell.terrain[0]);
             } else if (southTop > cell.terrain[0]) {
                 const BlockType southMaterial =
                     surfaceMaterialAt(south, mesh->originX + static_cast<int64_t>(x),
                                       mesh->originZ + FAR_TERRAIN_TILE_EDGE);
-                pushTerrainRiser(*mesh, FaceNormal::MINUS_Z, southMaterial, x1, boundary, x0, boundary,
-                                 cell.terrain[0], southTop);
+                pushTerrainRiser(*mesh, FaceNormal::MINUS_Z, southMaterial, x1, boundary, x0,
+                                 boundary, cell.terrain[0], southTop);
             }
         }
     }
@@ -6842,8 +6836,8 @@ FarTerrainMesher::generatorGeometrySource(std::shared_ptr<ChunkGenerator> genera
             std::vector<worldgen::SurfaceSample> samples(positions.size());
             generator->sampleFarHabitatPoints(positions, samples);
             for (size_t index = 0; index < samples.size(); ++index) {
-                output[index] = vertexHeight(
-                    std::floor(worldgen::geometryTerrainHeight(samples[index]) + 0.5));
+                output[index] =
+                    vertexHeight(std::floor(worldgen::geometryTerrainHeight(samples[index]) + 0.5));
             }
             return;
         }
@@ -8659,8 +8653,7 @@ void FarTerrainScheduler::pumpCanopyAuthority() {
 
 bool FarTerrainScheduler::retainWanted(
     const std::unordered_set<FarTerrainKey, FarTerrainKeyHash>& wanted,
-    const std::vector<FarTerrainKey>& nearestFirst,
-    std::span<const FarTerrainKey> criticalKeys) {
+    const std::vector<FarTerrainKey>& nearestFirst, std::span<const FarTerrainKey> criticalKeys) {
     std::unordered_set<FarTerrainKey, FarTerrainKeyHash> canonicalCriticalKeys;
     canonicalCriticalKeys.reserve(criticalKeys.size());
     std::vector<FarTerrainKey> canonicalCriticalNearestFirst;
@@ -8892,8 +8885,7 @@ bool FarTerrainScheduler::retainWanted(
         completedBaseCount_.fetch_sub(completedBaseRemoved, std::memory_order_relaxed);
         completedRefinementCount_.fetch_sub(completedRefinementRemoved, std::memory_order_relaxed);
         std::stable_sort(completed_.begin(), completed_.end(),
-                         [this](const FarTerrainResult& first,
-                                const FarTerrainResult& second) {
+                         [this](const FarTerrainResult& first, const FarTerrainResult& second) {
                              return completedResultBeforeLocked(first, second);
                          });
     }
@@ -8922,8 +8914,7 @@ bool FarTerrainScheduler::retainWanted(
     return true;
 }
 
-bool FarTerrainScheduler::refreshCriticalPriorities(
-    std::span<const FarTerrainKey> criticalKeys) {
+bool FarTerrainScheduler::refreshCriticalPriorities(std::span<const FarTerrainKey> criticalKeys) {
     std::unordered_set<FarTerrainKey, FarTerrainKeyHash> canonicalKeys;
     std::vector<FarTerrainKey> canonicalNearestFirst;
     canonicalKeys.reserve(criticalKeys.size());
@@ -8949,8 +8940,7 @@ bool FarTerrainScheduler::refreshCriticalPriorities(
             const FarTerrainKey key = canonicalNearestFirst[index];
             priorities.emplace(
                 key, static_cast<uint32_t>(std::min(index, static_cast<size_t>(UINT32_MAX))));
-            if (coordinatePriorities
-                    .try_emplace({key.tileX, key.tileZ}, nextCoordinatePriority)
+            if (coordinatePriorities.try_emplace({key.tileX, key.tileZ}, nextCoordinatePriority)
                     .second &&
                 nextCoordinatePriority != std::numeric_limits<uint32_t>::max()) {
                 ++nextCoordinatePriority;
@@ -8962,8 +8952,7 @@ bool FarTerrainScheduler::refreshCriticalPriorities(
         criticalPriorities_ = std::move(priorities);
         const auto refresh = [&](Job& job) {
             job.cameraNearCritical = criticalWantedKeys_.contains(job.key);
-            if (const auto priority =
-                    coordinatePriorities.find({job.key.tileX, job.key.tileZ});
+            if (const auto priority = coordinatePriorities.find({job.key.tileX, job.key.tileZ});
                 priority != coordinatePriorities.end()) {
                 job.viewPriority = priority->second;
             }
@@ -8980,8 +8969,7 @@ bool FarTerrainScheduler::refreshCriticalPriorities(
         {
             std::lock_guard completedLock(completedMutex_);
             std::stable_sort(completed_.begin(), completed_.end(),
-                             [this](const FarTerrainResult& first,
-                                    const FarTerrainResult& second) {
+                             [this](const FarTerrainResult& first, const FarTerrainResult& second) {
                                  return completedResultBeforeLocked(first, second);
                              });
         }
@@ -9720,8 +9708,7 @@ bool FarTerrainScheduler::completedResultBeforeLocked(
 
     const auto coordinateRank = [&](FarTerrainKey key) {
         if (!wantedMembership_) return std::numeric_limits<uint32_t>::max();
-        const auto found =
-            wantedMembership_->coordinatePriorities.find({key.tileX, key.tileZ});
+        const auto found = wantedMembership_->coordinatePriorities.find({key.tileX, key.tileZ});
         return found == wantedMembership_->coordinatePriorities.end()
                    ? std::numeric_limits<uint32_t>::max()
                    : found->second;
@@ -9757,8 +9744,8 @@ bool FarTerrainScheduler::storeCompleted(FarTerrainResult result) {
     }
     std::lock_guard lock(completedMutex_);
     const bool resultBase = farTerrainIsBaseStep(result.key.step);
-    const auto insertion = std::find_if(
-        completed_.begin(), completed_.end(), [&](const FarTerrainResult& queued) {
+    const auto insertion =
+        std::find_if(completed_.begin(), completed_.end(), [&](const FarTerrainResult& queued) {
             return completedResultBeforeLocked(result, queued);
         });
     completed_.insert(insertion, std::move(result));
@@ -9829,9 +9816,8 @@ void FarTerrainScheduler::storeCache(std::shared_ptr<const FarTerrainMesh> mesh)
         const auto criticalPriorityRank = [&](FarTerrainKey candidate) {
             if (!membership) return std::numeric_limits<uint32_t>::max();
             const auto priority = criticalPriorities_.find(candidate);
-            return priority == criticalPriorities_.end()
-                       ? std::numeric_limits<uint32_t>::max()
-                       : priority->second;
+            return priority == criticalPriorities_.end() ? std::numeric_limits<uint32_t>::max()
+                                                         : priority->second;
         };
         const uint32_t incomingCriticalRank = criticalPriorityRank(key);
         const auto coordinatePriorityRank = [&](FarTerrainKey candidate) {
@@ -9845,9 +9831,8 @@ void FarTerrainScheduler::storeCache(std::shared_ptr<const FarTerrainMesh> mesh)
         const auto broadPriorityRank = [&](FarTerrainKey candidate) {
             if (!membership) return std::numeric_limits<uint32_t>::max();
             const auto priority = membership->priorities.find(candidate);
-            return priority == membership->priorities.end()
-                       ? std::numeric_limits<uint32_t>::max()
-                       : priority->second;
+            return priority == membership->priorities.end() ? std::numeric_limits<uint32_t>::max()
+                                                            : priority->second;
         };
         const auto sameClassBefore = [&](FarTerrainKey first, FarTerrainKey second) {
             const ProtectionClass priorityClass = protectionClass(first);
@@ -9928,8 +9913,7 @@ void FarTerrainScheduler::storeCache(std::shared_ptr<const FarTerrainMesh> mesh)
                     if (candidateClass < victimClass) victim = candidate;
                     continue;
                 }
-                const uint32_t candidateCoordinateRank =
-                    coordinatePriorityRank(candidate->first);
+                const uint32_t candidateCoordinateRank = coordinatePriorityRank(candidate->first);
                 const uint32_t victimCoordinateRank = coordinatePriorityRank(victim->first);
                 if (candidateClass != ProtectionClass::Critical &&
                     candidateCoordinateRank != victimCoordinateRank) {
@@ -10424,18 +10408,16 @@ void FarTerrainScheduler::canopyWorkerLoop() {
             });
             if (!running_.load(std::memory_order_relaxed)) return;
             if (!dispatchReady()) continue;
-            const bool previewPhase =
-                std::ranges::any_of(canopyJobs_, [](const CanopyJob& queued) {
-                    return queued.ecologyQuality == FarTerrainAuthorityQuality::PREVIEW;
-                });
+            const bool previewPhase = std::ranges::any_of(canopyJobs_, [](const CanopyJob& queued) {
+                return queued.ecologyQuality == FarTerrainAuthorityQuality::PREVIEW;
+            });
             const FarTerrainAuthorityQuality selectedQuality =
                 previewPhase ? FarTerrainAuthorityQuality::PREVIEW
                              : FarTerrainAuthorityQuality::FINAL;
             const auto firstInPhase =
-                std::find_if(canopyJobs_.begin(), canopyJobs_.end(),
-                             [&](const CanopyJob& queued) {
-                                 return queued.ecologyQuality == selectedQuality;
-                             });
+                std::find_if(canopyJobs_.begin(), canopyJobs_.end(), [&](const CanopyJob& queued) {
+                    return queued.ecologyQuality == selectedQuality;
+                });
             // Step 1 evaluates every exact tree candidate in a full 256 by
             // 256 block tile. During cold streaming it can therefore occupy
             // the only optional lane long enough to leave every already
@@ -10457,10 +10439,9 @@ void FarTerrainScheduler::canopyWorkerLoop() {
                 previewPhase && coarseCoverage != canopyJobs_.end() &&
                 stepOne != canopyJobs_.end() &&
                 coarseCanopyDispatchStreak_ < COARSE_COVERAGE_DISPATCH_BURST;
-            const auto selected =
-                establishCoarseCoverage
-                    ? coarseCoverage
-                    : previewPhase && stepOne != canopyJobs_.end() ? stepOne : firstInPhase;
+            const auto selected = establishCoarseCoverage                        ? coarseCoverage
+                                  : previewPhase && stepOne != canopyJobs_.end() ? stepOne
+                                                                                 : firstInPhase;
             if (previewPhase && stepOne != canopyJobs_.end() &&
                 selected->key.step != FarTerrainStep::ONE) {
                 ++coarseCanopyDispatchStreak_;
@@ -10514,8 +10495,8 @@ void FarTerrainScheduler::canopyWorkerLoop() {
             std::snprintf(line, sizeof(line),
                           "Far flora job started tile %lld,%lld step %d ecology %s ground %s",
                           static_cast<long long>(job.key.tileX),
-                          static_cast<long long>(job.key.tileZ),
-                          farTerrainStepSize(job.key.step), ecologyQuality, groundingQuality);
+                          static_cast<long long>(job.key.tileZ), farTerrainStepSize(job.key.step),
+                          ecologyQuality, groundingQuality);
             RY_LOG_INFO(line);
         }
         try {
@@ -10530,8 +10511,7 @@ void FarTerrainScheduler::canopyWorkerLoop() {
                 job.key, ecologySource,
                 sourceFor(job.groundingQuality,
                           worldgen::learned::AuthorityRequestPriority::VISIBLE_FINAL_REFINEMENT),
-                job.groundingQuality,
-                job.ecologyQuality, &buildDiagnostics);
+                job.groundingQuality, job.ecologyQuality, &buildDiagnostics);
         } catch (const worldgen::learned::GenerationFailureException& error) {
             authorityDeferred = error.status() == worldgen::learned::AuthorityStatus::DEFERRED;
             result.failed = !authorityDeferred;
@@ -10649,8 +10629,7 @@ void FarTerrainScheduler::canopyWorkerLoop() {
     }
 }
 
-const FarTerrainSource&
-FarTerrainScheduler::sourceFor(
+const FarTerrainSource& FarTerrainScheduler::sourceFor(
     FarTerrainAuthorityQuality authorityQuality,
     worldgen::learned::AuthorityRequestPriority authorityPriority) const {
     if (authorityQuality == FarTerrainAuthorityQuality::PREVIEW && previewSource_.sample) {

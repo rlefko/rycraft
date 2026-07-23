@@ -72,8 +72,8 @@ public:
     // Higher values start first among work that has not begun. Equal-priority
     // submissions retain FIFO order. Running work is never interrupted.
     template <typename F, typename... Args>
-    auto submitWithPriority(int64_t priority, F&& f, Args&&... args)
-        -> std::future<std::invoke_result_t<F, Args...>> {
+    auto submitWithPriority(int64_t priority, F&& f,
+                            Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
         return submitWithPriorityImpl(priority, nullptr, std::forward<F>(f),
                                       std::forward<Args>(args)...);
     }
@@ -101,8 +101,8 @@ public:
 
 private:
     template <typename F, typename... Args>
-    auto submitWithPriorityImpl(int64_t priority, TaskHandle* handle, F&& f, Args&&... args)
-        -> std::future<std::invoke_result_t<F, Args...>> {
+    auto submitWithPriorityImpl(int64_t priority, TaskHandle* handle, F&& f,
+                                Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
         using ReturnType = std::invoke_result_t<F, Args...>;
 
         auto cancellation = std::make_shared<std::atomic<bool>>(false);
@@ -127,8 +127,7 @@ private:
                 throw std::runtime_error("ThreadPool is shutting down");
             }
             const uint64_t taskId = state->nextTaskId++;
-            state->tasks.push(
-                {priority, state->nextSequence++, taskId, [task]() { (*task)(); }});
+            state->tasks.push({priority, state->nextSequence++, taskId, [task]() { (*task)(); }});
             if (handle) {
                 handle->id = taskId;
                 handle->owner = state.get();
@@ -158,8 +157,8 @@ private:
         uint64_t nextTaskId = 1;   // guarded by queueMutex; zero is an invalid handle
         std::mutex queueMutex;
         std::condition_variable condition;
-        bool stop = false;          // guarded by queueMutex
-        size_t activeWorkers = 0;   // guarded by queueMutex
+        bool stop = false;        // guarded by queueMutex
+        size_t activeWorkers = 0; // guarded by queueMutex
     };
 
     std::shared_ptr<State> state_;

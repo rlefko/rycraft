@@ -1,5 +1,12 @@
 #pragma once
 
+#include "common/math.hpp"
+#include "world/block_properties.hpp"
+
+#include <cmath>
+#include <cstdint>
+#include <optional>
+
 // ---------------------------------------------------------------------------
 // Survival stats - food, saturation, exhaustion, air, and the regeneration,
 // starvation, and drowning timers. Pure C++ so the whole loop is unit-
@@ -46,6 +53,34 @@ struct SurvivalStats {
     static constexpr float EXHAUST_MINE_BLOCK = 0.005f;
     static constexpr float EXHAUST_ATTACK = 0.1f;
 };
+
+enum class BedSpawnValidation : uint8_t {
+    DEFERRED,
+    VALID,
+    INVALID,
+};
+
+// A bed respawn is valid only after all three cells are resident. The bed must
+// still exist and both player cells must remain breathable. Missing cells stay
+// deferred so a distant valid bed is not discarded before streaming reaches it.
+constexpr BedSpawnValidation validateBedSpawnCells(std::optional<BlockType> bed,
+                                                   std::optional<BlockType> feet,
+                                                   std::optional<BlockType> head) noexcept {
+    if (!bed || !feet || !head) return BedSpawnValidation::DEFERRED;
+    if (*bed != BlockType::BED) return BedSpawnValidation::INVALID;
+    const auto breathable = [](BlockType block) {
+        return !isSolid(block) && block != BlockType::WATER && block != BlockType::LAVA;
+    };
+    return breathable(*feet) && breathable(*head) ? BedSpawnValidation::VALID
+                                                  : BedSpawnValidation::INVALID;
+}
+
+inline bool bedSpawnAnchoredToBlock(Vec3 spawn, int64_t blockX, int32_t blockY,
+                                    int64_t blockZ) noexcept {
+    return static_cast<int64_t>(std::floor(spawn.x)) == blockX &&
+           static_cast<int32_t>(std::floor(spawn.y)) - 1 == blockY &&
+           static_cast<int64_t>(std::floor(spawn.z)) == blockZ;
+}
 
 struct SurvivalTickInputs {
     bool sprinting = false;

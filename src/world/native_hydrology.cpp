@@ -33,9 +33,8 @@
 
 namespace worldgen {
 
-double native_hydrology_detail::receiverAxisProgress(double worldX, double worldZ,
-                                                     double sourceX, double sourceZ,
-                                                     double receiverX,
+double native_hydrology_detail::receiverAxisProgress(double worldX, double worldZ, double sourceX,
+                                                     double sourceZ, double receiverX,
                                                      double receiverZ) noexcept {
     const double directionX = receiverX - sourceX;
     const double directionZ = receiverZ - sourceZ;
@@ -46,8 +45,9 @@ double native_hydrology_detail::receiverAxisProgress(double worldX, double world
     return std::isfinite(amount) ? std::clamp(amount, 0.0, 1.0) : 0.0;
 }
 
-double native_hydrology_detail::explicitFallPublishedWaterSurface(
-    bool waterfall, double waterfallBottom, double ordinaryWaterSurface) noexcept {
+double
+native_hydrology_detail::explicitFallPublishedWaterSurface(bool waterfall, double waterfallBottom,
+                                                           double ordinaryWaterSurface) noexcept {
     return waterfall ? waterfallBottom : ordinaryWaterSurface;
 }
 
@@ -430,8 +430,7 @@ struct NativePage {
     // basin whose true spill lies beyond the local page.
     uint8_t openSpillReceivingEdgeMask = 0;
     mutable std::mutex ordinaryStageTilesMutex;
-    mutable std::map<OrdinaryStageTileKey, OrdinaryStageTileCacheEntry>
-        ordinaryStageTiles;
+    mutable std::map<OrdinaryStageTileKey, OrdinaryStageTileCacheEntry> ordinaryStageTiles;
     mutable std::map<OrdinaryStageTileKey, std::shared_ptr<OrdinaryStageTileFlight>>
         ordinaryStageTileFlights;
     mutable std::list<OrdinaryStageTileKey> ordinaryStageTileRecency;
@@ -615,8 +614,7 @@ std::vector<uint8_t> serializePage(const NativePage& page) {
     appendVector(bytes, page.waterBodyIds, appendU64);
     bytes.insert(bytes.end(), page.streamOrder.begin(), page.streamOrder.end());
     bytes.insert(bytes.end(), page.flags.begin(), page.flags.end());
-    bytes.insert(bytes.end(), page.waterfallBranchMasks.begin(),
-                 page.waterfallBranchMasks.end());
+    bytes.insert(bytes.end(), page.waterfallBranchMasks.begin(), page.waterfallBranchMasks.end());
     std::vector<std::pair<WaterBodyId, LakeStats>> lakeStats(page.lakeStats.begin(),
                                                              page.lakeStats.end());
     std::ranges::sort(lakeStats, {}, &decltype(lakeStats)::value_type::first);
@@ -732,9 +730,9 @@ std::shared_ptr<const NativePage> deserializePage(uint64_t seed, PageKey expecte
     page->flags.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
                        bytes.begin() + static_cast<std::ptrdiff_t>(offset + RASTER_CELLS));
     offset += RASTER_CELLS;
-    page->waterfallBranchMasks.assign(
-        bytes.begin() + static_cast<std::ptrdiff_t>(offset),
-        bytes.begin() + static_cast<std::ptrdiff_t>(offset + RASTER_CELLS));
+    page->waterfallBranchMasks.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                                      bytes.begin() +
+                                          static_cast<std::ptrdiff_t>(offset + RASTER_CELLS));
     offset += RASTER_CELLS;
     for (uint32_t index = 0; index < lakeStatsCount; ++index) {
         WaterBodyId body = NO_WATER_BODY;
@@ -1978,8 +1976,7 @@ std::shared_ptr<const NativePage> buildPage(uint64_t seed,
 }
 
 uint8_t computeWaterfallBranchMask(const NativePage& page, size_t sourceCell) {
-    if ((page.flags[sourceCell] & (CELL_RIVER | CELL_WATERFALL)) !=
-        (CELL_RIVER | CELL_WATERFALL)) {
+    if ((page.flags[sourceCell] & (CELL_RIVER | CELL_WATERFALL)) != (CELL_RIVER | CELL_WATERFALL)) {
         return 0;
     }
     const std::array<int32_t, 2> targets{page.receiverFirst[sourceCell],
@@ -2147,10 +2144,10 @@ void buildNativePageSamplingIndexes(NativePage& page) {
             localZ % NATIVE_HYDROLOGY_RASTER_SPACING != 0) {
             continue;
         }
-        const int rasterX = static_cast<int>(localX / NATIVE_HYDROLOGY_RASTER_SPACING) +
-                            RASTER_APRON;
-        const int rasterZ = static_cast<int>(localZ / NATIVE_HYDROLOGY_RASTER_SPACING) +
-                            RASTER_APRON;
+        const int rasterX =
+            static_cast<int>(localX / NATIVE_HYDROLOGY_RASTER_SPACING) + RASTER_APRON;
+        const int rasterZ =
+            static_cast<int>(localZ / NATIVE_HYDROLOGY_RASTER_SPACING) + RASTER_APRON;
         if (!inside(rasterX, rasterZ)) continue;
         const int source = indexOf(rasterX, rasterZ);
         const size_t sourceCell = static_cast<size_t>(source);
@@ -2163,13 +2160,13 @@ void buildNativePageSamplingIndexes(NativePage& page) {
                                              .standingBody = summary.waterBodyId});
     }
     std::ranges::sort(page.receiverOwnedOutlets);
-    page.receiverOwnedOutlets.erase(
-        std::unique(page.receiverOwnedOutlets.begin(), page.receiverOwnedOutlets.end(),
-                    [](const ReceiverOwnedOutletIndexEntry& first,
-                       const ReceiverOwnedOutletIndexEntry& second) {
-                        return first.source == second.source;
-                    }),
-        page.receiverOwnedOutlets.end());
+    page.receiverOwnedOutlets.erase(std::unique(page.receiverOwnedOutlets.begin(),
+                                                page.receiverOwnedOutlets.end(),
+                                                [](const ReceiverOwnedOutletIndexEntry& first,
+                                                   const ReceiverOwnedOutletIndexEntry& second) {
+                                                    return first.source == second.source;
+                                                }),
+                                    page.receiverOwnedOutlets.end());
 
     std::vector<uint8_t> horizontal(RASTER_CELLS, 0);
     for (int z = 0; z < RASTER_EDGE; ++z) {
@@ -2420,21 +2417,22 @@ bool ordinaryRibbonsShareStageAuthority(const ChannelStageCandidate& candidate,
     // local stage blend.
     if (candidate.body == selected.body) return sharePersistedEndpoint;
     if (sharePersistedEndpoint) return true;
-    return std::abs(candidate.stage - selected.stage) <=
-           MINIMUM_EXPLICIT_CHANNEL_FALL_DROP_BLOCKS;
+    return std::abs(candidate.stage - selected.stage) <= MINIMUM_EXPLICIT_CHANNEL_FALL_DROP_BLOCKS;
 }
 
 const ReceiverOwnedOutletIndexEntry* receiverOwnedOutlet(const NativePage& page, int source) {
-    const auto outlet = std::ranges::lower_bound(
-        page.receiverOwnedOutlets, source, {}, &ReceiverOwnedOutletIndexEntry::source);
+    const auto outlet = std::ranges::lower_bound(page.receiverOwnedOutlets, source, {},
+                                                 &ReceiverOwnedOutletIndexEntry::source);
     return outlet != page.receiverOwnedOutlets.end() && outlet->source == source
                ? std::to_address(outlet)
                : nullptr;
 }
 
-std::pair<int64_t, int64_t> canonicalOutletFallAnchor(
-    const NativePage& page, int sourceX, int sourceZ, const std::array<int32_t, 2>& targets,
-    const std::array<double, 2>& branchWeights, size_t selectedBranch) {
+std::pair<int64_t, int64_t> canonicalOutletFallAnchor(const NativePage& page, int sourceX,
+                                                      int sourceZ,
+                                                      const std::array<int32_t, 2>& targets,
+                                                      const std::array<double, 2>& branchWeights,
+                                                      size_t selectedBranch) {
     struct CandidateSet {
         std::array<std::pair<int, int>, 2> offsets{};
         size_t count = 0;
@@ -2449,8 +2447,7 @@ std::pair<int64_t, int64_t> canonicalOutletFallAnchor(
         const int targetZ = targets[branch] / RASTER_EDGE;
         const int deltaX = targetX - sourceX;
         const int deltaZ = targetZ - sourceZ;
-        if (std::abs(deltaX) > 1 || std::abs(deltaZ) > 1 ||
-            (deltaX == 0 && deltaZ == 0)) {
+        if (std::abs(deltaX) > 1 || std::abs(deltaZ) > 1 || (deltaX == 0 && deltaZ == 0)) {
             result.offsets[0] = {deltaX * NATIVE_HYDROLOGY_RASTER_SPACING,
                                  deltaZ * NATIVE_HYDROLOGY_RASTER_SPACING};
             result.count = 1;
@@ -2466,12 +2463,10 @@ std::pair<int64_t, int64_t> canonicalOutletFallAnchor(
         }
         if (deltaX != 0) {
             const int midpointX = deltaX > 0 ? NATIVE_HYDROLOGY_RASTER_SPACING : 0;
-            result.offsets = {{{midpointX, 0},
-                               {midpointX, NATIVE_HYDROLOGY_RASTER_SPACING}}};
+            result.offsets = {{{midpointX, 0}, {midpointX, NATIVE_HYDROLOGY_RASTER_SPACING}}};
         } else {
             const int midpointZ = deltaZ > 0 ? NATIVE_HYDROLOGY_RASTER_SPACING : 0;
-            result.offsets = {{{0, midpointZ},
-                               {NATIVE_HYDROLOGY_RASTER_SPACING, midpointZ}}};
+            result.offsets = {{{0, midpointZ}, {NATIVE_HYDROLOGY_RASTER_SPACING, midpointZ}}};
         }
         result.count = 2;
         return result;
@@ -2493,9 +2488,8 @@ std::pair<int64_t, int64_t> canonicalOutletFallAnchor(
                 firstOffset == secondOffset) {
                 continue;
             }
-            const auto rank =
-                std::tuple{first + second, firstOffset.first, firstOffset.second,
-                           secondOffset.first, secondOffset.second};
+            const auto rank = std::tuple{first + second, firstOffset.first, firstOffset.second,
+                                         secondOffset.first, secondOffset.second};
             if (!found || rank < selectedRank) {
                 found = true;
                 selectedRank = rank;
@@ -2506,12 +2500,10 @@ std::pair<int64_t, int64_t> canonicalOutletFallAnchor(
     if (!found || selectedBranch >= selected.size() || candidates[selectedBranch].count == 0)
         return {page.originX, page.originZ};
 
-    const int64_t sourceWorldX =
-        page.originX + static_cast<int64_t>(sourceX - RASTER_APRON) *
-                           NATIVE_HYDROLOGY_RASTER_SPACING;
-    const int64_t sourceWorldZ =
-        page.originZ + static_cast<int64_t>(sourceZ - RASTER_APRON) *
-                           NATIVE_HYDROLOGY_RASTER_SPACING;
+    const int64_t sourceWorldX = page.originX + static_cast<int64_t>(sourceX - RASTER_APRON) *
+                                                    NATIVE_HYDROLOGY_RASTER_SPACING;
+    const int64_t sourceWorldZ = page.originZ + static_cast<int64_t>(sourceZ - RASTER_APRON) *
+                                                    NATIVE_HYDROLOGY_RASTER_SPACING;
     return {sourceWorldX + selected[selectedBranch].first,
             sourceWorldZ + selected[selectedBranch].second};
 }
@@ -2525,8 +2517,7 @@ std::optional<double> denseOrdinaryChannelStage(const NativePage& page, double g
     for (const int z : {z0, z0 + 1}) {
         for (const int x : {x0, x0 + 1}) {
             const size_t cell = static_cast<size_t>(indexOf(x, z));
-            if ((page.flags[cell] & CELL_RIVER) == 0 ||
-                (page.flags[cell] & CELL_WATERFALL) != 0 ||
+            if ((page.flags[cell] & CELL_RIVER) == 0 || (page.flags[cell] & CELL_WATERFALL) != 0 ||
                 !std::isfinite(page.waterSurface[cell])) {
                 return std::nullopt;
             }
@@ -2662,17 +2653,14 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                 const int targetZ = target / RASTER_EDGE;
                 const double sourceStage = page.waterSurface[sourceCell];
                 const double targetStage = page.waterSurface[targetCell];
-                const bool branchHasFall =
-                    receiverBranchHasExplicitFall(page, sourceCell, branch);
+                const bool branchHasFall = receiverBranchHasExplicitFall(page, sourceCell, branch);
                 const bool outletBranchHasFall =
-                    persistedOutlet != nullptr &&
-                    persistedOutlet->standingStage - targetStage >=
-                        MINIMUM_EXPLICIT_CHANNEL_FALL_DROP_BLOCKS;
+                    persistedOutlet != nullptr && persistedOutlet->standingStage - targetStage >=
+                                                      MINIMUM_EXPLICIT_CHANNEL_FALL_DROP_BLOCKS;
                 const bool branchOwnsFall = branchHasFall || outletBranchHasFall;
                 const double fallTopStage =
                     outletBranchHasFall
-                        ? std::max(sourceStage,
-                                   static_cast<double>(persistedOutlet->standingStage))
+                        ? std::max(sourceStage, static_cast<double>(persistedOutlet->standingStage))
                         : sourceStage;
                 const double width = channelWidth(page, sourceCell, branchWeights[branch]);
                 const double startX = static_cast<double>(page.originX) +
@@ -2697,13 +2685,11 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                 // so projection on that edge recovers the Bezier parameter and
                 // remains monotone across the complete wide ribbon.
                 const double receiverAxisAmount =
-                    ((worldX - startX) * (endX - startX) +
-                     (worldZ - startZ) * (endZ - startZ)) /
+                    ((worldX - startX) * (endX - startX) + (worldZ - startZ) * (endZ - startZ)) /
                     (run * run);
                 const double hydraulicAmount = native_hydrology_detail::receiverAxisProgress(
                     worldX, worldZ, startX, startZ, endX, endZ);
-                const double maximumProjectionWidth =
-                    width + (branchOwnsFall ? 2.0 : 0.0);
+                const double maximumProjectionWidth = width + (branchOwnsFall ? 2.0 : 0.0);
                 if (!channelCurveCanImprove(worldX, worldZ, startX, startZ, endX, endZ, run,
                                             maximumProjectionWidth,
                                             std::max(bestNormalizedDistance, 1.0))) {
@@ -2824,8 +2810,7 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                 // complete lateral width on and downstream of the plane.
                 const double fallBeginAlong = branchOwnsFall ? 0.0 : fallEndAlong;
                 const bool candidateWaterfall =
-                    branchOwnsFall &&
-                    receiverAxisAmount >= -CHANNEL_PROJECTION_TIE_EPSILON &&
+                    branchOwnsFall && receiverAxisAmount >= -CHANNEL_PROJECTION_TIE_EPSILON &&
                     queryAlong >= fallBeginAlong - CHANNEL_PROJECTION_TIE_EPSILON &&
                     queryAlong < fallEndAlong - CHANNEL_PROJECTION_TIE_EPSILON;
                 const double projectionWidth = width + (candidateWaterfall ? 2.0 : 0.0);
@@ -2852,8 +2837,8 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                     // every far-water tier. Two active branches select distinct
                     // corners, and the widened fall ribbon includes each corner
                     // even though learned native samples represent block centers.
-                    const auto anchor = canonicalOutletFallAnchor(
-                        page, sourceX, sourceZ, targets, branchWeights, branch);
+                    const auto anchor = canonicalOutletFallAnchor(page, sourceX, sourceZ, targets,
+                                                                  branchWeights, branch);
                     waterfallAnchorX = anchor.first;
                     waterfallAnchorZ = anchor.second;
                 } else if (branchHasFall) {
@@ -2895,8 +2880,7 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                                  (static_cast<double>(candidateZ) - startZ) * (endZ - startZ)) /
                                 (run * run);
                             if (candidateDistance > width * 0.5 ||
-                                candidateReceiverAxisAmount <
-                                    -CHANNEL_PROJECTION_TIE_EPSILON ||
+                                candidateReceiverAxisAmount < -CHANNEL_PROJECTION_TIE_EPSILON ||
                                 candidateAlong < fallBeginAlong - CHANNEL_PROJECTION_TIE_EPSILON ||
                                 candidateAlong >= fallEndAlong - CHANNEL_PROJECTION_TIE_EPSILON) {
                                 continue;
@@ -2919,9 +2903,8 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                 }
                 const double candidateStage =
                     branchOwnsFall
-                        ? (receiverAxisAmount < -CHANNEL_PROJECTION_TIE_EPSILON
-                               ? fallTopStage
-                               : targetStage)
+                        ? (receiverAxisAmount < -CHANNEL_PROJECTION_TIE_EPSILON ? fallTopStage
+                                                                                : targetStage)
                         : std::lerp(sourceStage, targetStage, hydraulicAmount);
                 const bool candidateInside =
                     normalizedDistance <= 1.0 + CHANNEL_PROJECTION_TIE_EPSILON;
@@ -2991,10 +2974,9 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                     page.discharge[sourceCell] *
                     ((page.flags[sourceCell] & CELL_DELTA) != 0 ? branchWeights[branch] : 1.0);
                 best.gradient =
-                    branchOwnsFall
-                        ? std::max(static_cast<double>(page.channelGradient[sourceCell]),
-                                   (fallTopStage - targetStage) / run)
-                        : page.channelGradient[sourceCell];
+                    branchOwnsFall ? std::max(static_cast<double>(page.channelGradient[sourceCell]),
+                                              (fallTopStage - targetStage) / run)
+                                   : page.channelGradient[sourceCell];
                 best.waterfallTop = candidateWaterfall ? fallTopStage : 0.0;
                 best.waterfallBottom = candidateWaterfall ? targetStage : 0.0;
                 best.waterfallAnchorX = static_cast<double>(waterfallAnchorX);
@@ -3013,8 +2995,7 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                 best.waterfall = candidateWaterfall;
                 best.routedFallEdge = branchOwnsFall;
                 best.routedFallUpstream =
-                    branchOwnsFall &&
-                    receiverAxisAmount < -CHANNEL_PROJECTION_TIE_EPSILON;
+                    branchOwnsFall && receiverAxisAmount < -CHANNEL_PROJECTION_TIE_EPSILON;
                 best.waterfallAnchor = false;
                 best.delta = (page.flags[sourceCell] & CELL_DELTA) != 0;
                 best.estuary = (page.flags[sourceCell] & CELL_ESTUARY) != 0;
@@ -3049,12 +3030,10 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
             const int targetX = best.target % RASTER_EDGE;
             const int targetZ = best.target / RASTER_EDGE;
             const double targetWorldX = static_cast<double>(page.originX) +
-                                        (targetX - RASTER_APRON) *
-                                            NATIVE_HYDROLOGY_RASTER_SPACING +
+                                        (targetX - RASTER_APRON) * NATIVE_HYDROLOGY_RASTER_SPACING +
                                         NATIVE_SAMPLE_WORLD_CENTER_OFFSET;
             const double targetWorldZ = static_cast<double>(page.originZ) +
-                                        (targetZ - RASTER_APRON) *
-                                            NATIVE_HYDROLOGY_RASTER_SPACING +
+                                        (targetZ - RASTER_APRON) * NATIVE_HYDROLOGY_RASTER_SPACING +
                                         NATIVE_SAMPLE_WORLD_CENTER_OFFSET;
             const double targetConeStage =
                 page.waterSurface[static_cast<size_t>(best.target)] +
@@ -3062,11 +3041,10 @@ ChannelProjection projectChannelCore(const NativePage& page, double worldX, doub
                     RIVER_MAXIMUM_ORDINARY_STAGE_DROP_PER_BLOCK;
             const double alongAmount =
                 std::clamp(best.distanceAlong / std::max(1.0, best.segmentLength), 0.0, 1.0);
-            const double smoothAlong =
-                alongAmount * alongAmount * (3.0 - 2.0 * alongAmount);
+            const double smoothAlong = alongAmount * alongAmount * (3.0 - 2.0 * alongAmount);
             best.stage = std::lerp(best.stage, std::min(best.stage, targetConeStage), smoothAlong);
-            best.routeStage = std::lerp(best.routeStage,
-                                        std::min(best.routeStage, targetConeStage), smoothAlong);
+            best.routeStage =
+                std::lerp(best.routeStage, std::min(best.routeStage, targetConeStage), smoothAlong);
         }
     }
 
@@ -3177,8 +3155,7 @@ receiverOwnedStandingConnection(const NativePage& page, const ChannelProjection&
         };
     }
 
-    if (const ReceiverOwnedOutletIndexEntry* outlet =
-            receiverOwnedOutlet(page, channel.source)) {
+    if (const ReceiverOwnedOutletIndexEntry* outlet = receiverOwnedOutlet(page, channel.source)) {
         return ReceiverOwnedStandingConnection{
             .stage = outlet->standingStage,
             .distance = channel.distanceAlong,
@@ -3198,30 +3175,25 @@ void applyReceiverOwnedStandingBackwater(const NativePage& page, bool lake,
     if (lake || !channelInside) return;
     const std::optional<ReceiverOwnedStandingConnection> connection =
         receiverOwnedStandingConnection(page, channel);
-    const double effectiveReach =
-        std::min(STANDING_BACKWATER_REACH_BLOCKS, channel.segmentLength);
+    const double effectiveReach = std::min(STANDING_BACKWATER_REACH_BLOCKS, channel.segmentLength);
     if (!connection || effectiveReach <= 1.0e-9 || connection->distance > effectiveReach) return;
 
     // A proven receiver edge approaches its standing stage with zero slope at
     // both ends of the bounded blend. Outlet reaches descend away from the
     // lake; inflows rise away from it. Unrelated spatially nearby bodies never
     // enter this calculation.
-    const double distanceAmount =
-        std::clamp(connection->distance / effectiveReach, 0.0, 1.0);
-    const double smoothDistance =
-        distanceAmount * distanceAmount * (3.0 - 2.0 * distanceAmount);
+    const double distanceAmount = std::clamp(connection->distance / effectiveReach, 0.0, 1.0);
+    const double smoothDistance = distanceAmount * distanceAmount * (3.0 - 2.0 * distanceAmount);
     const double signedOrdinaryDrop =
         connection->outlet ? -MINIMUM_EXPLICIT_CHANNEL_FALL_DROP_BLOCKS * smoothDistance
                            : MINIMUM_EXPLICIT_CHANNEL_FALL_DROP_BLOCKS * smoothDistance;
     const double targetStage = connection->stage + signedOrdinaryDrop;
     channel.stage = std::lerp(channel.stage, targetStage, 1.0 - smoothDistance);
-    channel.routeStage =
-        std::lerp(channel.routeStage, targetStage, 1.0 - smoothDistance);
+    channel.routeStage = std::lerp(channel.routeStage, targetStage, 1.0 - smoothDistance);
 }
 
 double channelBedDepthAt(const ChannelProjection& channel) {
-    if (channel.body == NO_WATER_BODY || channel.width <= 0.0 ||
-        !std::isfinite(channel.distance)) {
+    if (channel.body == NO_WATER_BODY || channel.width <= 0.0 || !std::isfinite(channel.distance)) {
         return 0.0;
     }
     const double interior =
@@ -3240,10 +3212,8 @@ bool channelRibbonSupported(const ChannelProjection& channel, double undisturbed
             std::min(channel.width * 0.5, CONFLICTING_REACH_CENTERLINE_SUPPORT_BLOCKS)) {
         return false;
     }
-    constexpr double ROUTED_CENTERLINE_SUPPORT_BLOCKS =
-        NATIVE_HYDROLOGY_RASTER_SPACING * 0.75;
-    if (channel.distance <=
-        std::min(channel.width * 0.5, ROUTED_CENTERLINE_SUPPORT_BLOCKS)) {
+    constexpr double ROUTED_CENTERLINE_SUPPORT_BLOCKS = NATIVE_HYDROLOGY_RASTER_SPACING * 0.75;
+    if (channel.distance <= std::min(channel.width * 0.5, ROUTED_CENTERLINE_SUPPORT_BLOCKS)) {
         return true;
     }
     return undisturbed <= channel.stage + channelBedDepthAt(channel) + 1.0e-6;
@@ -3258,8 +3228,7 @@ constexpr int32_t ORDINARY_STAGE_MAXIMUM_RAW_ROUTE_DROP_EIGHTHS =
 constexpr int32_t ORDINARY_STAGE_MAXIMUM_VISIBLE_DROP_EIGHTHS = 1;
 static_assert(ORDINARY_STAGE_MAXIMUM_RAW_ROUTE_DROP_EIGHTHS == 3);
 
-constexpr bool unresolvedRawOrdinaryStageContact(int32_t routeDrop,
-                                                  int32_t publishedDrop) {
+constexpr bool unresolvedRawOrdinaryStageContact(int32_t routeDrop, int32_t publishedDrop) {
     return routeDrop > ORDINARY_STAGE_MAXIMUM_RAW_ROUTE_DROP_EIGHTHS &&
            publishedDrop > ORDINARY_STAGE_MAXIMUM_VISIBLE_DROP_EIGHTHS;
 }
@@ -3298,29 +3267,25 @@ struct RawOrdinaryStagePixel {
     bool wet = false;
 };
 
-using NativeStagePageResolver =
-    std::function<std::shared_ptr<const NativePage>(PageKey)>;
+using NativeStagePageResolver = std::function<std::shared_ptr<const NativePage>(PageKey)>;
 
 uint32_t effectiveOrdinaryReach(const NativePage& page, const ChannelProjection& channel) {
     uint32_t reach = channel.ordinaryReach;
     if (channel.routedFallEdge && !channel.routedFallUpstream && channel.target >= 0) {
-        const uint32_t receivingReach =
-            page.ordinaryReachIds[static_cast<size_t>(channel.target)];
+        const uint32_t receivingReach = page.ordinaryReachIds[static_cast<size_t>(channel.target)];
         if (receivingReach != 0) reach = receivingReach;
     }
     return reach;
 }
 
 RawOrdinaryStagePixel rawOrdinaryStagePixel(const NativePage& page, int64_t worldX,
-                                             int64_t worldZ) {
-    const double gridX =
-        (static_cast<double>(worldX) - static_cast<double>(page.originX)) /
-            NATIVE_HYDROLOGY_RASTER_SPACING +
-        RASTER_APRON + WORLD_SAMPLE_NATIVE_OFFSET;
-    const double gridZ =
-        (static_cast<double>(worldZ) - static_cast<double>(page.originZ)) /
-            NATIVE_HYDROLOGY_RASTER_SPACING +
-        RASTER_APRON + WORLD_SAMPLE_NATIVE_OFFSET;
+                                            int64_t worldZ) {
+    const double gridX = (static_cast<double>(worldX) - static_cast<double>(page.originX)) /
+                             NATIVE_HYDROLOGY_RASTER_SPACING +
+                         RASTER_APRON + WORLD_SAMPLE_NATIVE_OFFSET;
+    const double gridZ = (static_cast<double>(worldZ) - static_cast<double>(page.originZ)) /
+                             NATIVE_HYDROLOGY_RASTER_SPACING +
+                         RASTER_APRON + WORLD_SAMPLE_NATIVE_OFFSET;
     const double undisturbed = reconstruct(page.rawElevation, gridX, gridZ);
     const bool ocean = undisturbed < SEA_LEVEL;
     const bool lake = !ocean && reconstruct(page.lakeShoreDistance, gridX, gridZ) > 0.0;
@@ -3331,9 +3296,8 @@ RawOrdinaryStagePixel rawOrdinaryStagePixel(const NativePage& page, int64_t worl
     const size_t nearestCell = static_cast<size_t>(indexOf(nearestX, nearestZ));
     if (page.channelProximity[nearestCell] == 0) return {};
 
-    ChannelProjection channel = projectChannelCore(page, static_cast<double>(worldX),
-                                                    static_cast<double>(worldZ), gridX, gridZ,
-                                                    false);
+    ChannelProjection channel = projectChannelCore(
+        page, static_cast<double>(worldX), static_cast<double>(worldZ), gridX, gridZ, false);
     applyReceiverOwnedStandingBackwater(page, false, channel);
     if (channel.waterfall || !channelRibbonSupported(channel, undisturbed) ||
         channel.body == NO_WATER_BODY || !std::isfinite(channel.stage)) {
@@ -3366,8 +3330,7 @@ RawOrdinaryStagePixel rawOrdinaryStagePixel(const NativePage& page, int64_t worl
     }
     return {
         .stageEighths = static_cast<int32_t>(std::llround(channel.stage * 8.0)),
-        .routeStageEighths =
-            static_cast<int32_t>(std::llround(channel.routeStage * 8.0)),
+        .routeStageEighths = static_cast<int32_t>(std::llround(channel.routeStage * 8.0)),
         .body = channel.body,
         .owner = page.key,
         .ordinaryReach = reach,
@@ -3399,17 +3362,15 @@ bool ordinaryStagePixelsSharePersistedJunction(const RawOrdinaryStagePixel& firs
     });
 }
 
-std::optional<double> ordinaryStageProjectedRouteDistance(
-    const RawOrdinaryStagePixel& first, const RawOrdinaryStagePixel& second) {
+std::optional<double> ordinaryStageProjectedRouteDistance(const RawOrdinaryStagePixel& first,
+                                                          const RawOrdinaryStagePixel& second) {
     if (!ordinaryStagePixelsSharePersistedJunction(first, second)) return std::nullopt;
     const std::pair firstStart{first.topologyStartX, first.topologyStartZ};
     const std::pair firstEnd{first.topologyEndX, first.topologyEndZ};
     const std::pair secondStart{second.topologyStartX, second.topologyStartZ};
     const std::pair secondEnd{second.topologyEndX, second.topologyEndZ};
-    const double firstAlong =
-        std::clamp(first.topologyDistanceAlong, 0.0, first.topologyLength);
-    const double secondAlong =
-        std::clamp(second.topologyDistanceAlong, 0.0, second.topologyLength);
+    const double firstAlong = std::clamp(first.topologyDistanceAlong, 0.0, first.topologyLength);
+    const double secondAlong = std::clamp(second.topologyDistanceAlong, 0.0, second.topologyLength);
     if (firstStart == secondStart && firstEnd == secondEnd)
         return std::abs(firstAlong - secondAlong);
     if (firstStart == secondEnd && firstEnd == secondStart)
@@ -3421,8 +3382,7 @@ std::optional<double> ordinaryStageProjectedRouteDistance(
             pixel.topologyStartZ == pixel.topologyEndZ) {
             return 0.0;
         }
-        const double along =
-            std::clamp(pixel.topologyDistanceAlong, 0.0, pixel.topologyLength);
+        const double along = std::clamp(pixel.topologyDistanceAlong, 0.0, pixel.topologyLength);
         if (endpoint == std::pair{pixel.topologyStartX, pixel.topologyStartZ}) return along;
         return std::max(0.0, pixel.topologyLength - along);
     };
@@ -3484,8 +3444,7 @@ std::vector<int32_t> solveOrdinaryStageInfimum(std::span<const RawOrdinaryStageP
                 continue;
             }
             const int neighborIndex = neighborZ * edge + neighborX;
-            const RawOrdinaryStagePixel& neighbor =
-                pixels[static_cast<size_t>(neighborIndex)];
+            const RawOrdinaryStagePixel& neighbor = pixels[static_cast<size_t>(neighborIndex)];
             if (!ordinaryStagePixelsConnected(pixel, neighbor)) {
                 continue;
             }
@@ -3522,8 +3481,8 @@ void validateRawOrdinaryStageContacts(const OrdinaryStageDomain& domain) {
             if (!pixel.wet) continue;
             for (const auto [offsetX, offsetZ] : {std::pair{1, 0}, std::pair{0, 1}}) {
                 if (x + offsetX >= domain.edge || z + offsetZ >= domain.edge) continue;
-                const RawOrdinaryStagePixel& adjacent = domain.pixels[static_cast<size_t>(
-                    (z + offsetZ) * domain.edge + x + offsetX)];
+                const RawOrdinaryStagePixel& adjacent =
+                    domain.pixels[static_cast<size_t>((z + offsetZ) * domain.edge + x + offsetX)];
                 if (!ordinaryStagePixelsSharePersistedJunction(pixel, adjacent)) continue;
                 const std::optional<double> routeDistance =
                     ordinaryStageProjectedRouteDistance(pixel, adjacent);
@@ -3544,32 +3503,28 @@ void validateRawOrdinaryStageContacts(const OrdinaryStageDomain& domain) {
                 // solved-domain validator below proves it remains satisfied.
                 // Keep rejecting a bad local route grade whenever the
                 // published ordinary contact has not already reconciled it.
-                const int32_t publishedDrop =
-                    std::abs(adjacent.stageEighths - pixel.stageEighths);
+                const int32_t publishedDrop = std::abs(adjacent.stageEighths - pixel.stageEighths);
                 if (!unresolvedRawOrdinaryStageContact(routeDrop, publishedDrop)) continue;
                 const int64_t worldX = domain.originX + x;
                 const int64_t worldZ = domain.originZ + z;
                 throw std::runtime_error(
-                        "raw ordinary stage contact exceeds the explicit-fall bound at (" +
-                        std::to_string(worldX) + ", " + std::to_string(worldZ) + ") -> (" +
-                        std::to_string(worldX + offsetX) + ", " +
-                        std::to_string(worldZ + offsetZ) + "), stages " +
-                        std::to_string(pixel.routeStageEighths) + " -> " +
-                        std::to_string(adjacent.routeStageEighths) + ", published " +
-                        std::to_string(pixel.stageEighths) + " -> " +
-                        std::to_string(adjacent.stageEighths) + ", route distance " +
-                        std::to_string(*routeDistance) + ", body " +
-                        std::to_string(pixel.body) + ", reaches " +
-                        std::to_string(pixel.ordinaryReach) + " -> " +
-                        std::to_string(adjacent.ordinaryReach) + ", edges (" +
-                        std::to_string(pixel.topologyStartX) + ", " +
-                        std::to_string(pixel.topologyStartZ) + ") -> (" +
-                        std::to_string(pixel.topologyEndX) + ", " +
-                        std::to_string(pixel.topologyEndZ) + ") and (" +
-                        std::to_string(adjacent.topologyStartX) + ", " +
-                        std::to_string(adjacent.topologyStartZ) + ") -> (" +
-                        std::to_string(adjacent.topologyEndX) + ", " +
-                        std::to_string(adjacent.topologyEndZ) + ")");
+                    "raw ordinary stage contact exceeds the explicit-fall bound at (" +
+                    std::to_string(worldX) + ", " + std::to_string(worldZ) + ") -> (" +
+                    std::to_string(worldX + offsetX) + ", " + std::to_string(worldZ + offsetZ) +
+                    "), stages " + std::to_string(pixel.routeStageEighths) + " -> " +
+                    std::to_string(adjacent.routeStageEighths) + ", published " +
+                    std::to_string(pixel.stageEighths) + " -> " +
+                    std::to_string(adjacent.stageEighths) + ", route distance " +
+                    std::to_string(*routeDistance) + ", body " + std::to_string(pixel.body) +
+                    ", reaches " + std::to_string(pixel.ordinaryReach) + " -> " +
+                    std::to_string(adjacent.ordinaryReach) + ", edges (" +
+                    std::to_string(pixel.topologyStartX) + ", " +
+                    std::to_string(pixel.topologyStartZ) + ") -> (" +
+                    std::to_string(pixel.topologyEndX) + ", " + std::to_string(pixel.topologyEndZ) +
+                    ") and (" + std::to_string(adjacent.topologyStartX) + ", " +
+                    std::to_string(adjacent.topologyStartZ) + ") -> (" +
+                    std::to_string(adjacent.topologyEndX) + ", " +
+                    std::to_string(adjacent.topologyEndZ) + ")");
             }
         }
     }
@@ -3615,8 +3570,8 @@ void validateSolvedOrdinaryStageContacts(const OrdinaryStageDomain& domain) {
 }
 
 OrdinaryStageDomain sampleOrdinaryStageDomain(const NativePage& page, int64_t tileOriginX,
-                                               int64_t tileOriginZ, int halo,
-                                               const NativeStagePageResolver* resolvePage) {
+                                              int64_t tileOriginZ, int halo,
+                                              const NativeStagePageResolver* resolvePage) {
     OrdinaryStageDomain domain;
     domain.originX = tileOriginX - halo;
     domain.originZ = tileOriginZ - halo;
@@ -3672,8 +3627,7 @@ OrdinaryStageDomain cropOrdinaryStageDomain(const OrdinaryStageDomain& source, i
     return result;
 }
 
-bool ordinaryStageCoresEqual(const OrdinaryStageDomain& first,
-                             const OrdinaryStageDomain& second) {
+bool ordinaryStageCoresEqual(const OrdinaryStageDomain& first, const OrdinaryStageDomain& second) {
     for (int z = 0; z < ORDINARY_STAGE_TILE_EDGE; ++z) {
         for (int x = 0; x < ORDINARY_STAGE_TILE_EDGE; ++x) {
             const int firstIndex = (z + first.halo) * first.edge + x + first.halo;
@@ -3687,18 +3641,17 @@ bool ordinaryStageCoresEqual(const OrdinaryStageDomain& first,
     return true;
 }
 
-std::shared_ptr<const OrdinaryStageTile> finishOrdinaryStageTile(
-    int64_t tileOriginX, int64_t tileOriginZ, const OrdinaryStageDomain& authority) {
+std::shared_ptr<const OrdinaryStageTile>
+finishOrdinaryStageTile(int64_t tileOriginX, int64_t tileOriginZ,
+                        const OrdinaryStageDomain& authority) {
     auto tile = std::make_shared<OrdinaryStageTile>();
     tile->originX = tileOriginX;
     tile->originZ = tileOriginZ;
     tile->certifiedHalo = static_cast<uint8_t>(authority.halo);
     for (int z = 0; z < ORDINARY_STAGE_TILE_EDGE; ++z) {
         for (int x = 0; x < ORDINARY_STAGE_TILE_EDGE; ++x) {
-            const int domainIndex =
-                (z + authority.halo) * authority.edge + x + authority.halo;
-            const RawOrdinaryStagePixel& pixel =
-                authority.pixels[static_cast<size_t>(domainIndex)];
+            const int domainIndex = (z + authority.halo) * authority.edge + x + authority.halo;
+            const RawOrdinaryStagePixel& pixel = authority.pixels[static_cast<size_t>(domainIndex)];
             if (!pixel.wet) continue;
             tile->entries.push_back({
                 .index = static_cast<uint16_t>(z * ORDINARY_STAGE_TILE_EDGE + x),
@@ -3711,13 +3664,12 @@ std::shared_ptr<const OrdinaryStageTile> finishOrdinaryStageTile(
     return tile;
 }
 
-std::shared_ptr<const OrdinaryStageTile> buildOrdinaryStageTile(
-    const NativePage& page, int64_t tileOriginX, int64_t tileOriginZ,
-    const NativeStagePageResolver* resolvePage) {
+std::shared_ptr<const OrdinaryStageTile>
+buildOrdinaryStageTile(const NativePage& page, int64_t tileOriginX, int64_t tileOriginZ,
+                       const NativeStagePageResolver* resolvePage) {
     OrdinaryStageDomain certificate = sampleOrdinaryStageDomain(
         page, tileOriginX, tileOriginZ, ORDINARY_STAGE_CERTIFICATE_HALO, resolvePage);
-    OrdinaryStageDomain primary =
-        cropOrdinaryStageDomain(certificate, ORDINARY_STAGE_PRIMARY_HALO);
+    OrdinaryStageDomain primary = cropOrdinaryStageDomain(certificate, ORDINARY_STAGE_PRIMARY_HALO);
     if (ordinaryStageCoresEqual(primary, certificate))
         return finishOrdinaryStageTile(tileOriginX, tileOriginZ, primary);
 
@@ -3728,11 +3680,9 @@ std::shared_ptr<const OrdinaryStageTile> buildOrdinaryStageTile(
     return finishOrdinaryStageTile(tileOriginX, tileOriginZ, certificate);
 }
 
-std::shared_ptr<const OrdinaryStageTile> ordinaryStageTile(const NativePage& page,
-                                                            int64_t tileOriginX,
-                                                            int64_t tileOriginZ,
-                                                            const NativeStagePageResolver*
-                                                                resolvePage) {
+std::shared_ptr<const OrdinaryStageTile>
+ordinaryStageTile(const NativePage& page, int64_t tileOriginX, int64_t tileOriginZ,
+                  const NativeStagePageResolver* resolvePage) {
     const OrdinaryStageTileKey key{tileOriginX, tileOriginZ};
     std::shared_ptr<OrdinaryStageTileFlight> flight;
     bool builder = false;
@@ -3764,10 +3714,10 @@ std::shared_ptr<const OrdinaryStageTile> ordinaryStageTile(const NativePage& pag
     try {
         const std::shared_ptr<const OrdinaryStageTile> built =
             buildOrdinaryStageTile(page, tileOriginX, tileOriginZ, resolvePage);
-        const uint64_t buildNanoseconds = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - buildStart)
-                .count());
+        const uint64_t buildNanoseconds =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - buildStart)
+                                      .count());
         constexpr size_t CACHE_ENTRY_OVERHEAD_BYTES = 128;
         const size_t builtBytes = sizeof(OrdinaryStageTile) +
                                   built->entries.capacity() * sizeof(OrdinaryStageTileEntry) +
@@ -3793,8 +3743,7 @@ std::shared_ptr<const OrdinaryStageTile> ordinaryStageTile(const NativePage& pag
                      .bytes = builtBytes,
                      .recency = page.ordinaryStageTileRecency.begin(),
                  });
-        if (!inserted.second)
-            throw std::logic_error("ordinary stage tile cache insertion failed");
+        if (!inserted.second) throw std::logic_error("ordinary stage tile cache insertion failed");
         page.ordinaryStageTileBytes += builtBytes;
         page.ordinaryStageTilePeakBytes =
             std::max(page.ordinaryStageTilePeakBytes, page.ordinaryStageTileBytes);
@@ -3823,8 +3772,8 @@ std::shared_ptr<const OrdinaryStageTile> ordinaryStageTile(const NativePage& pag
 void applyOrdinaryStageAuthority(const NativePage& page, double worldX, double worldZ,
                                  ChannelProjection& channel,
                                  const NativeStagePageResolver* resolvePage) {
-    if (channel.body == NO_WATER_BODY || channel.waterfall ||
-        worldX != std::floor(worldX) || worldZ != std::floor(worldZ)) {
+    if (channel.body == NO_WATER_BODY || channel.waterfall || worldX != std::floor(worldX) ||
+        worldZ != std::floor(worldZ)) {
         return;
     }
     const int64_t blockX = static_cast<int64_t>(worldX);
@@ -3833,10 +3782,10 @@ void applyOrdinaryStageAuthority(const NativePage& page, double worldX, double w
     const int64_t tileOriginZ = world_coord::floorMultiple(blockZ, ORDINARY_STAGE_TILE_EDGE);
     const std::shared_ptr<const OrdinaryStageTile> tile =
         ordinaryStageTile(page, tileOriginX, tileOriginZ, resolvePage);
-    const uint16_t index = static_cast<uint16_t>(
-        (blockZ - tileOriginZ) * ORDINARY_STAGE_TILE_EDGE + blockX - tileOriginX);
-    const auto found = std::ranges::lower_bound(tile->entries, index, {},
-                                                 &OrdinaryStageTileEntry::index);
+    const uint16_t index = static_cast<uint16_t>((blockZ - tileOriginZ) * ORDINARY_STAGE_TILE_EDGE +
+                                                 blockX - tileOriginX);
+    const auto found =
+        std::ranges::lower_bound(tile->entries, index, {}, &OrdinaryStageTileEntry::index);
     const uint32_t reach = effectiveOrdinaryReach(page, channel);
     if (found == tile->entries.end() || found->index != index || found->body != channel.body ||
         reach == 0 || found->ordinaryReach != reach) {
@@ -3862,8 +3811,8 @@ BasinSample samplePage(const NativePage& page, double x, double z,
     const double signedLakeDistance = reconstruct(page.lakeShoreDistance, gridX, gridZ);
     const bool ocean = undisturbed < SEA_LEVEL;
     const bool lake = !ocean && signedLakeDistance > 0.0;
-    const std::optional<size_t> nearbyLakeCell = lake ? supportingLakeCell(page, gridX, gridZ)
-                                                      : std::nullopt;
+    const std::optional<size_t> nearbyLakeCell =
+        lake ? supportingLakeCell(page, gridX, gridZ) : std::nullopt;
     const size_t lakeCell = lake && nearbyLakeCell ? *nearbyLakeCell : cell;
     const double lakeStage = lake ? page.waterSurface[lakeCell] : 0.0;
     ChannelProjection channel = page.channelProximity[cell] != 0
@@ -3880,10 +3829,8 @@ BasinSample samplePage(const NativePage& page, double x, double z,
                          std::isfinite(page.waterSurface[cell]);
 
     BasinSample result;
-    result.flowX =
-        river || waterfall ? channel.flowX : reconstruct(page.flowX, gridX, gridZ);
-    result.flowZ =
-        river || waterfall ? channel.flowZ : reconstruct(page.flowZ, gridX, gridZ);
+    result.flowX = river || waterfall ? channel.flowX : reconstruct(page.flowX, gridX, gridZ);
+    result.flowZ = river || waterfall ? channel.flowZ : reconstruct(page.flowZ, gridX, gridZ);
     const double flowLength = std::hypot(result.flowX, result.flowZ);
     if (flowLength > 1.0e-9) {
         result.flowX /= flowLength;
@@ -3898,11 +3845,11 @@ BasinSample samplePage(const NativePage& page, double x, double z,
     // where the widened ribbon overlaps the upstream lake or downstream
     // ocean classification. Publish the receiving stage there; retaining a
     // standing body's top stage turns the curtain into a horizontal shelf.
-    const double ordinaryWaterSurface = ocean    ? SEA_LEVEL
-                                        : lake     ? lakeStage
-                                        : river    ? channel.stage
-                                        : wetland  ? page.waterSurface[cell]
-                                                   : 0.0;
+    const double ordinaryWaterSurface = ocean     ? SEA_LEVEL
+                                        : lake    ? lakeStage
+                                        : river   ? channel.stage
+                                        : wetland ? page.waterSurface[cell]
+                                                  : 0.0;
     result.waterSurface = native_hydrology_detail::explicitFallPublishedWaterSurface(
         waterfall, channel.waterfallBottom, ordinaryWaterSurface);
     if (river || wetland) {
@@ -3998,8 +3945,8 @@ BasinSample sampleNativeLatticeCell(const NativePage& page, double x, double z, 
     const double signedLakeDistance = reconstruct(page.lakeShoreDistance, gridX, gridZ);
     const bool ocean = undisturbed < SEA_LEVEL;
     const bool lake = !ocean && signedLakeDistance > 0.0;
-    const std::optional<size_t> nearbyLakeCell = lake ? supportingLakeCell(page, gridX, gridZ)
-                                                      : std::nullopt;
+    const std::optional<size_t> nearbyLakeCell =
+        lake ? supportingLakeCell(page, gridX, gridZ) : std::nullopt;
     const size_t lakeCell = lake && nearbyLakeCell ? *nearbyLakeCell : cell;
     const double lakeStage = lake ? page.waterSurface[lakeCell] : 0.0;
     ChannelProjection channel = page.channelProximity[cell] != 0
@@ -4016,10 +3963,8 @@ BasinSample sampleNativeLatticeCell(const NativePage& page, double x, double z, 
                          std::isfinite(page.waterSurface[cell]);
 
     BasinSample result;
-    result.flowX =
-        river || waterfall ? channel.flowX : reconstruct(page.flowX, gridX, gridZ);
-    result.flowZ =
-        river || waterfall ? channel.flowZ : reconstruct(page.flowZ, gridX, gridZ);
+    result.flowX = river || waterfall ? channel.flowX : reconstruct(page.flowX, gridX, gridZ);
+    result.flowZ = river || waterfall ? channel.flowZ : reconstruct(page.flowZ, gridX, gridZ);
     const double flowLength = std::hypot(result.flowX, result.flowZ);
     if (flowLength > 1.0e-9) {
         result.flowX /= flowLength;
@@ -4030,11 +3975,11 @@ BasinSample sampleNativeLatticeCell(const NativePage& page, double x, double z, 
     }
     result.surfaceElevation = undisturbed;
     result.terrainSlope = std::hypot(slopeX, slopeZ);
-    const double ordinaryWaterSurface = ocean    ? SEA_LEVEL
-                                        : lake     ? lakeStage
-                                        : river    ? channel.stage
-                                        : wetland  ? page.waterSurface[cell]
-                                                   : 0.0;
+    const double ordinaryWaterSurface = ocean     ? SEA_LEVEL
+                                        : lake    ? lakeStage
+                                        : river   ? channel.stage
+                                        : wetland ? page.waterSurface[cell]
+                                                  : 0.0;
     result.waterSurface = native_hydrology_detail::explicitFallPublishedWaterSurface(
         waterfall, channel.waterfallBottom, ordinaryWaterSurface);
     if (river || wetland) {
@@ -5941,9 +5886,9 @@ public:
         return true;
     }
 
-    std::shared_ptr<const NativePage> getOrCreate(
-        PageKey key, const NativeHydrologyInputFunction& input,
-        learned::AuthorityRequestPriority priority) const {
+    std::shared_ptr<const NativePage>
+    getOrCreate(PageKey key, const NativeHydrologyInputFunction& input,
+                learned::AuthorityRequestPriority priority) const {
         std::shared_ptr<Flight> flight;
         bool builder = false;
         uint64_t buildEpoch = 0;
@@ -6086,12 +6031,10 @@ public:
                     const learned::AuthorityRequestPriority retainedPriority =
                         flight->priority.load(std::memory_order_relaxed);
                     recency.push_front(key);
-                    entries.emplace(
-                        key,
-                        Entry{.page = page,
-                              .bytes = page->byteSize(),
-                              .priority = retainedPriority,
-                              .recency = recency.begin()});
+                    entries.emplace(key, Entry{.page = page,
+                                               .bytes = page->byteSize(),
+                                               .priority = retainedPriority,
+                                               .recency = recency.begin()});
                     metrics.bytes += page->byteSize();
                     while (metrics.bytes > cacheByteBudget && !recency.empty()) {
                         if (!evictPageFor(retainedPriority)) break;
@@ -6818,8 +6761,9 @@ public:
         }
 
         const std::shared_ptr<const NativePage> ownerPage = resolvePage(owner);
-        const NativeStagePageResolver stagePageResolver =
-            [&](PageKey key) { return resolvePage(key); };
+        const NativeStagePageResolver stagePageResolver = [&](PageKey key) {
+            return resolvePage(key);
+        };
         const BasinSample ownerSample =
             samplePage(*ownerPage, x, z, &stagePageResolver, reconcileOrdinaryStage);
         BasinSample resolvedOwner = ownerSample;
@@ -6870,9 +6814,8 @@ public:
             candidates.push_back({
                 .page = page,
                 .sample = containsQuery
-                              ? samplePage(*page, x, z, &stagePageResolver,
-                                           reconcileOrdinaryStage)
-                                        : BasinSample{},
+                              ? samplePage(*page, x, z, &stagePageResolver, reconcileOrdinaryStage)
+                              : BasinSample{},
                 .containsQuery = containsQuery,
             });
         }
@@ -6888,8 +6831,7 @@ public:
     }
 
     BasinSample sample(double x, double z, const NativeHydrologyInputFunction& input,
-                       bool* certifiedDryHit,
-                       learned::AuthorityRequestPriority priority) const {
+                       bool* certifiedDryHit, learned::AuthorityRequestPriority priority) const {
         const auto footprint = certifiedDrySnapshot();
         if (const BasinSample* certified =
                 findCertifiedDrySample(footprint, BasinSamplePosition{.x = x, .z = z})) {
@@ -7161,10 +7103,10 @@ public:
                           : 0;
         const int latticeStepX = nativeLattice ? spacingX / NATIVE_HYDROLOGY_RASTER_SPACING : 0;
         const int latticeStepZ = nativeLattice ? spacingZ / NATIVE_HYDROLOGY_RASTER_SPACING : 0;
-        const auto resolvePage =
-            [&](PageKey key) { return getOrCreate(key, input, priority); };
-        const NativeStagePageResolver stagePageResolver =
-            [&](PageKey key) { return resolvePage(key); };
+        const auto resolvePage = [&](PageKey key) { return getOrCreate(key, input, priority); };
+        const NativeStagePageResolver stagePageResolver = [&](PageKey key) {
+            return resolvePage(key);
+        };
         // The graph-minorant stage tile is block-column authority. Coarser
         // terrain/water grids consume native topology and raw routed stages;
         // building thousands of one-block halo samples for a sparse parent
@@ -7177,13 +7119,13 @@ public:
                 const double worldX = static_cast<double>(static_cast<int64_t>(
                     static_cast<__int128>(originX) + static_cast<__int128>(sampleX) * spacingX));
                 BasinSample sample =
-                    nativeLattice ? sampleNativeLatticeCell(*page, worldX, worldZ,
-                                                            latticeOriginX + sampleX * latticeStepX,
-                                                            latticeOriginZ + sampleZ * latticeStepZ,
-                                                            &stagePageResolver,
-                                                            reconcileOrdinaryStage)
-                                  : samplePage(*page, worldX, worldZ, &stagePageResolver,
-                                               reconcileOrdinaryStage);
+                    nativeLattice
+                        ? sampleNativeLatticeCell(*page, worldX, worldZ,
+                                                  latticeOriginX + sampleX * latticeStepX,
+                                                  latticeOriginZ + sampleZ * latticeStepZ,
+                                                  &stagePageResolver, reconcileOrdinaryStage)
+                        : samplePage(*page, worldX, worldZ, &stagePageResolver,
+                                     reconcileOrdinaryStage);
                 const int sampleRasterX =
                     nativeLattice
                         ? latticeOriginX + sampleX * latticeStepX
@@ -7268,10 +7210,10 @@ public:
             for (int rasterZ = 0; rasterZ < TOPOLOGY_CELL_RASTER_EDGE; ++rasterZ) {
                 for (int rasterX = 0; rasterX < TOPOLOGY_CELL_RASTER_EDGE; ++rasterX) {
                     const BasinSamplePosition position{
-                        .x = static_cast<double>(
-                            worldX + rasterX * NATIVE_HYDROLOGY_RASTER_SPACING),
-                        .z = static_cast<double>(
-                            worldZ + rasterZ * NATIVE_HYDROLOGY_RASTER_SPACING),
+                        .x =
+                            static_cast<double>(worldX + rasterX * NATIVE_HYDROLOGY_RASTER_SPACING),
+                        .z =
+                            static_cast<double>(worldZ + rasterZ * NATIVE_HYDROLOGY_RASTER_SPACING),
                     };
                     if (!findCertifiedDrySample(certifiedFootprint, position)) return false;
                 }
@@ -7402,8 +7344,7 @@ public:
 
     void samplePoints(std::span<const BasinSamplePosition> positions,
                       const NativeHydrologyInputFunction& input, std::span<BasinSample> output,
-                      std::span<uint8_t> certifiedDryHits,
-                      bool reconcileOrdinaryStage,
+                      std::span<uint8_t> certifiedDryHits, bool reconcileOrdinaryStage,
                       learned::AuthorityRequestPriority priority) const {
         // Terrain and far-water meshes ask for dense grids. Resolving each
         // sample through the global LRU turned one page into hundreds of
@@ -7480,8 +7421,7 @@ public:
             result.ordinaryStageTileFailures += entry.page->ordinaryStageTileFailures;
             result.ordinaryStageTileBuildNanoseconds +=
                 entry.page->ordinaryStageTileBuildNanoseconds;
-            result.ordinaryStageTileExpandedBuilds +=
-                entry.page->ordinaryStageTileExpandedBuilds;
+            result.ordinaryStageTileExpandedBuilds += entry.page->ordinaryStageTileExpandedBuilds;
             result.ordinaryStageTileBuildWaits += entry.page->ordinaryStageTileBuildWaits;
         }
         return result;
@@ -7490,8 +7430,7 @@ public:
     void recordOrdinaryStageCoarseGridSamples(size_t sampleCount) const {
         std::lock_guard lock(mutex);
         const uint64_t count = static_cast<uint64_t>(sampleCount);
-        if (std::numeric_limits<uint64_t>::max() - metrics.ordinaryStageCoarseGridSamples <
-            count) {
+        if (std::numeric_limits<uint64_t>::max() - metrics.ordinaryStageCoarseGridSamples < count) {
             metrics.ordinaryStageCoarseGridSamples = std::numeric_limits<uint64_t>::max();
         } else {
             metrics.ordinaryStageCoarseGridSamples += count;
@@ -7591,8 +7530,8 @@ NativeHydrologyRouter::certifyDryFootprint(std::span<const BasinSamplePosition> 
                                            const NativeHydrologyInputFunction& input,
                                            learned::AuthorityRequestPriority priority) const {
     NativeHydrologyDryFootprintCertificate certificate;
-    if (!impl_->certifyDryFootprint(positions, input, certificate.positions_,
-                                    certificate.samples_, priority)) {
+    if (!impl_->certifyDryFootprint(positions, input, certificate.positions_, certificate.samples_,
+                                    priority)) {
         return std::nullopt;
     }
     certificate.issuer_ = impl_.get();
@@ -7636,8 +7575,7 @@ void NativeHydrologyRouter::sampleGrid(int64_t originX, int64_t originZ, int spa
     };
     const int64_t lastX = checkedLastCoordinate(originX, spacingX, sampleWidth);
     const int64_t lastZ = checkedLastCoordinate(originZ, spacingZ, sampleHeight);
-    if (spacingX != 1 || spacingZ != 1)
-        impl_->recordOrdinaryStageCoarseGridSamples(output.size());
+    if (spacingX != 1 || spacingZ != 1) impl_->recordOrdinaryStageCoarseGridSamples(output.size());
     if (!impl_->hasCertifiedDryFootprint() &&
         impl_->sampleInteriorGrid(originX, originZ, lastX, lastZ, spacingX, spacingZ, sampleWidth,
                                   sampleHeight, input, output, priority)) {
@@ -7657,8 +7595,8 @@ void NativeHydrologyRouter::sampleGrid(int64_t originX, int64_t originZ, int spa
             positions.push_back({static_cast<double>(worldX), static_cast<double>(worldZ)});
         }
     }
-    impl_->samplePoints(positions, input, output, certifiedDryHits,
-                        spacingX == 1 && spacingZ == 1, priority);
+    impl_->samplePoints(positions, input, output, certifiedDryHits, spacingX == 1 && spacingZ == 1,
+                        priority);
 }
 
 void NativeHydrologyRouter::samplePoints(std::span<const BasinSamplePosition> positions,
@@ -7673,10 +7611,11 @@ void NativeHydrologyRouter::samplePoints(std::span<const BasinSamplePosition> po
     impl_->samplePoints(positions, input, output, certifiedDryHits, true, priority);
 }
 
-void NativeHydrologyRouter::sampleCoarsePoints(
-    std::span<const BasinSamplePosition> positions, const NativeHydrologyInputFunction& input,
-    std::span<BasinSample> output, std::span<uint8_t> certifiedDryHits,
-    learned::AuthorityRequestPriority priority) const {
+void NativeHydrologyRouter::sampleCoarsePoints(std::span<const BasinSamplePosition> positions,
+                                               const NativeHydrologyInputFunction& input,
+                                               std::span<BasinSample> output,
+                                               std::span<uint8_t> certifiedDryHits,
+                                               learned::AuthorityRequestPriority priority) const {
     if (positions.size() != output.size() ||
         (!certifiedDryHits.empty() && certifiedDryHits.size() != positions.size())) {
         throw std::invalid_argument("invalid coarse native hydrology point batch");
@@ -7685,11 +7624,12 @@ void NativeHydrologyRouter::sampleCoarsePoints(
     impl_->samplePoints(positions, input, output, certifiedDryHits, false, priority);
 }
 
-void NativeHydrologyRouter::sampleTopologyGrid(
-    int64_t originX, int64_t originZ, int cellWidth, int cellHeight,
-    const NativeHydrologyInputFunction& input,
-    std::span<NativeHydrologyTopologyCell> output, std::span<uint8_t> certifiedDryHits,
-    learned::AuthorityRequestPriority priority) const {
+void NativeHydrologyRouter::sampleTopologyGrid(int64_t originX, int64_t originZ, int cellWidth,
+                                               int cellHeight,
+                                               const NativeHydrologyInputFunction& input,
+                                               std::span<NativeHydrologyTopologyCell> output,
+                                               std::span<uint8_t> certifiedDryHits,
+                                               learned::AuthorityRequestPriority priority) const {
     impl_->sampleTopologyGrid(originX, originZ, cellWidth, cellHeight, input, output,
                               certifiedDryHits, priority);
 }

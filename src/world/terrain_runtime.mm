@@ -1064,8 +1064,7 @@ public:
                 std::max(modelMetrics.maximumInferenceNanoseconds, elapsedNanoseconds);
             const size_t phaseIndex = static_cast<size_t>(phase);
             if (phaseIndex < runtimeMetrics.phases.size()) {
-                TerrainRuntimeMetrics::Phase& phaseMetrics =
-                    runtimeMetrics.phases[phaseIndex];
+                TerrainRuntimeMetrics::Phase& phaseMetrics = runtimeMetrics.phases[phaseIndex];
                 ++phaseMetrics.calls;
                 phaseMetrics.inferenceNanoseconds += elapsedNanoseconds;
                 ++phaseMetrics.modelCalls[static_cast<size_t>(model)];

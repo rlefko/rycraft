@@ -45,8 +45,8 @@ TEST_CASE("Tectonic relief is deterministic continuous and vertically bounded",
     for (const auto [x, z] : FIXTURES) {
         const worldgen::SurfaceSample emitted = generator.sampleFarSurface(x, z);
         REQUIRE(std::isfinite(emitted.terrainHeight));
-        REQUIRE(emitted.terrainHeight >= -112.0);
-        REQUIRE(emitted.terrainHeight <= 480.0);
+        REQUIRE(emitted.terrainHeight >= static_cast<double>(WORLD_MIN_Y));
+        REQUIRE(emitted.terrainHeight <= static_cast<double>(WORLD_MAX_Y));
     }
 }
 

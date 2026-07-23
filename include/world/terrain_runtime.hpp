@@ -21,8 +21,7 @@ inline constexpr std::string_view ONNX_RUNTIME_VERSION = "1.27.1";
 inline constexpr std::string_view ONNX_RUNTIME_ARCHIVE = "onnxruntime-osx-arm64-1.27.1.tgz";
 inline constexpr std::string_view ONNX_RUNTIME_DIRECTORY = "onnxruntime-osx-arm64-1.27.1";
 inline constexpr std::string_view ONNX_RUNTIME_DYLIB = "lib/libonnxruntime.1.27.1.dylib";
-inline constexpr std::string_view CORE_ML_CACHE_DIRECTORY =
-    "coreml-cache-v3-base4-decoder4x256";
+inline constexpr std::string_view CORE_ML_CACHE_DIRECTORY = "coreml-cache-v3-base4-decoder4x256";
 inline constexpr std::string_view CORE_ML_PROVIDER_NAME = "CoreML";
 struct CoreMlProviderOption {
     std::string_view key;

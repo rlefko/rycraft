@@ -1203,13 +1203,10 @@ describeGroundFlora(const CounterRng& random, const worldgen::SurfaceSample& sur
     const double roll = random.uniform01(FLORA_STREAM, x, terrainY, z, 0);
     const double kindRoll = random.uniform01(FLORA_STREAM, x, terrainY, z, 1);
     const Biome biome = ditheredBiome(surface, random, FLORA_BIOME_STREAM, x, z);
-    const Biome substrateBiome =
-        worldgen::surface_material::materialBiome(surface, random, x, z);
-    const double barrenWeight =
-        worldgen::biomeBlendWeight(surface.biome, Biome::VOLCANIC_BARREN);
-    const double volcanicStress =
-        std::max(barrenWeight,
-                 std::clamp((surface.geology.volcanicActivity - 0.32) / 0.42, 0.0, 1.0));
+    const Biome substrateBiome = worldgen::surface_material::materialBiome(surface, random, x, z);
+    const double barrenWeight = worldgen::biomeBlendWeight(surface.biome, Biome::VOLCANIC_BARREN);
+    const double volcanicStress = std::max(
+        barrenWeight, std::clamp((surface.geology.volcanicActivity - 0.32) / 0.42, 0.0, 1.0));
     const double growthFit = 1.0 - volcanicStress;
     if (growthFit <= 0.01 || substrateBiome == Biome::VOLCANIC_BARREN ||
         worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::GEOTHERMAL)) {
@@ -1217,12 +1214,9 @@ describeGroundFlora(const CounterRng& random, const worldgen::SurfaceSample& sur
     }
 
     const double riparianInfluence = std::max(
-        {worldgen::MacroGenerationSampler::ecotopeInfluence(surface,
-                                                            worldgen::Ecotope::RIVERBANK),
-         worldgen::MacroGenerationSampler::ecotopeInfluence(surface,
-                                                            worldgen::Ecotope::LAKESHORE),
-         worldgen::MacroGenerationSampler::ecotopeInfluence(surface,
-                                                            worldgen::Ecotope::FLOODPLAIN),
+        {worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::RIVERBANK),
+         worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::LAKESHORE),
+         worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::FLOODPLAIN),
          worldgen::biomeBlendWeight(surface.biome, Biome::MANGROVE),
          worldgen::biomeBlendWeight(surface.biome, Biome::FLOODED_GRASSLAND)});
     if (surface.soil.moisture > 0.50 && roll < 0.22 * riparianInfluence * growthFit) {
@@ -1270,9 +1264,8 @@ describeGroundFlora(const CounterRng& random, const worldgen::SurfaceSample& sur
         biome == Biome::TAIGA || biome == Biome::TEMPERATE_CONIFER_FOREST ||
         biome == Biome::TROPICAL_CONIFER_FOREST) {
         plant = kindRoll < 0.62 ? BlockType::FERN : BlockType::SHRUB;
-    } else if (biome == Biome::SHRUBLAND || biome == Biome::STEPPE ||
-               biome == Biome::SAVANNA || biome == Biome::MEDITERRANEAN_WOODLAND ||
-               biome == Biome::TROPICAL_DRY_FOREST) {
+    } else if (biome == Biome::SHRUBLAND || biome == Biome::STEPPE || biome == Biome::SAVANNA ||
+               biome == Biome::MEDITERRANEAN_WOODLAND || biome == Biome::TROPICAL_DRY_FOREST) {
         plant = kindRoll < 0.52 ? BlockType::SHRUB : BlockType::TALL_GRASS;
     } else if (kindRoll > 0.87) {
         plant = BlockType::FLOWER_BLUE;
@@ -1594,9 +1587,9 @@ FeaturePlacer::collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ, int6
 }
 
 std::vector<FarFlora> FeaturePlacer::collectFarFlora(int64_t minimumX, int64_t minimumZ,
-                                                      int64_t maximumX, int64_t maximumZ,
-                                                      int lodStep,
-                                                      const ChunkGenerator& generator) const {
+                                                     int64_t maximumX, int64_t maximumZ,
+                                                     int lodStep,
+                                                     const ChunkGenerator& generator) const {
     std::vector<FarFlora> result;
     if (minimumX >= maximumX || minimumZ >= maximumZ) return result;
 
@@ -1633,22 +1626,18 @@ std::vector<FarFlora> FeaturePlacer::collectFarFlora(int64_t minimumX, int64_t m
                 if ((retentionRank & 7U) >= retentionSlots) continue;
                 const int quadrantX = (slot & 1) * 4;
                 const int quadrantZ = (slot >> 1) * 4;
-                const int offsetX =
-                    quadrantX + random_.uniformInt(FAR_FLORA_CANDIDATE_STREAM, cellX, slot, cellZ,
-                                                   0, 0, 3);
-                const int offsetZ =
-                    quadrantZ + random_.uniformInt(FAR_FLORA_CANDIDATE_STREAM, cellX, slot, cellZ,
-                                                   1, 0, 3);
+                const int offsetX = quadrantX + random_.uniformInt(FAR_FLORA_CANDIDATE_STREAM,
+                                                                   cellX, slot, cellZ, 0, 0, 3);
+                const int offsetZ = quadrantZ + random_.uniformInt(FAR_FLORA_CANDIDATE_STREAM,
+                                                                   cellX, slot, cellZ, 1, 0, 3);
                 const std::optional<int64_t> x = appendCoordinate(cellX, offsetX);
                 const std::optional<int64_t> z = appendCoordinate(cellZ, offsetZ);
                 if (!x.has_value() || !z.has_value() || *x < minimumX || *x >= maximumX ||
                     *z < minimumZ || *z >= maximumZ) {
                     continue;
                 }
-                candidates.push_back({.position = {*x, *z},
-                                      .cellX = cellX,
-                                      .cellZ = cellZ,
-                                      .slot = slot});
+                candidates.push_back(
+                    {.position = {*x, *z}, .cellX = cellX, .cellZ = cellZ, .slot = slot});
             }
         }
     }
@@ -1738,8 +1727,8 @@ void FeaturePlacer::placeFlora(Chunk& chunk, const ChunkGenerator& generator,
                     writer.setIfAir(x, waterTop + 1, z, BlockType::LILY_PAD);
                 }
             }
-            const std::optional<GroundFloraDescription> description = describeGroundFlora(
-                random_, surface, x, terrainY, z, supportsFlora);
+            const std::optional<GroundFloraDescription> description =
+                describeGroundFlora(random_, surface, x, terrainY, z, supportsFlora);
             if (!description.has_value()) continue;
             for (int offset = 1; offset <= description->height; ++offset) {
                 if (!writer.setIfAir(x, terrainY + offset, z, description->block)) break;

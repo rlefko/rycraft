@@ -67,8 +67,7 @@ inline constexpr size_t NATIVE_HYDROLOGY_MAX_BUILD_BYTES = 64U * 1024U * 1024U;
 // Quantized ordinary-stage tiles are derived from immutable page authority and
 // retained in a separate per-page LRU. Keeping this cache bounded prevents a
 // sparse river scan from silently expanding the persisted-page working set.
-inline constexpr size_t NATIVE_HYDROLOGY_ORDINARY_STAGE_TILE_CACHE_BYTE_BUDGET =
-    1U * 1024U * 1024U;
+inline constexpr size_t NATIVE_HYDROLOGY_ORDINARY_STAGE_TILE_CACHE_BYTE_BUDGET = 1U * 1024U * 1024U;
 // A 2,048-block route owns substantial temporary Priority-Flood state. Keep
 // enough independent pages in flight to use the available Apple Silicon CPU
 // cores while bounding the worst-case scratch reservation to one GiB.
@@ -105,8 +104,7 @@ namespace native_hydrology_detail {
 // footprint, even when the same column is categorically part of a standing
 // lake or ocean. Its receiving stage must therefore override that standing
 // body's otherwise selected surface.
-[[nodiscard]] double explicitFallPublishedWaterSurface(bool waterfall,
-                                                       double waterfallBottom,
+[[nodiscard]] double explicitFallPublishedWaterSurface(bool waterfall, double waterfallBottom,
                                                        double ordinaryWaterSurface) noexcept;
 
 } // namespace native_hydrology_detail
@@ -429,8 +427,7 @@ public:
     // requested root through one page-retaining query.
     void sampleCoarsePoints(std::span<const BasinSamplePosition> positions,
                             const NativeHydrologyInputFunction& input,
-                            std::span<BasinSample> output,
-                            std::span<uint8_t> certifiedDryHits = {},
+                            std::span<BasinSample> output, std::span<uint8_t> certifiedDryHits = {},
                             learned::AuthorityRequestPriority priority =
                                 learned::AuthorityRequestPriority::COARSE_PREVIEW) const;
     // Samples a regular grid of globally aligned 32-block half-open cells.

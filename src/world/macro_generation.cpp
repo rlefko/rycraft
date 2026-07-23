@@ -2297,8 +2297,7 @@ void MacroGenerationSampler::prepareNativeHydrologyOwner(int64_t ownerPageX,
         throw std::logic_error("Native hydrology owner preparation requires generator v4");
     }
     try {
-        nativeHydrologyRouter_->prepareOwner(ownerPageX, ownerPageZ,
-                                             nativeHydrologyInputFunction(),
+        nativeHydrologyRouter_->prepareOwner(ownerPageX, ownerPageZ, nativeHydrologyInputFunction(),
                                              generationContext_->requestPriority());
     } catch (const learned::GenerationFailureException& failure) {
         if (failure.status() == learned::AuthorityStatus::FAILED)
@@ -2327,10 +2326,9 @@ void MacroGenerationSampler::sampleNativeHydrologyTopologyGrid(
     }
     std::vector<uint8_t> certifiedDryHits(output.size());
     try {
-        nativeHydrologyRouter_->sampleTopologyGrid(originX, originZ, cellWidth, cellHeight,
-                                                   nativeHydrologyInputFunction(), output,
-                                                   certifiedDryHits,
-                                                   generationContext_->requestPriority());
+        nativeHydrologyRouter_->sampleTopologyGrid(
+            originX, originZ, cellWidth, cellHeight, nativeHydrologyInputFunction(), output,
+            certifiedDryHits, generationContext_->requestPriority());
     } catch (const learned::GenerationFailureException& failure) {
         if (failure.status() == learned::AuthorityStatus::FAILED)
             generationContext_->latchFailure(failure.failure());
@@ -2442,8 +2440,8 @@ void MacroGenerationSampler::sampleHydrologyPoints(std::span<const ColumnPos> po
     sampleHydrologyPointsWithTerrain(positions, output, {});
 }
 
-void MacroGenerationSampler::sampleCoarseHydrologyPoints(
-    std::span<const ColumnPos> positions, std::span<HydrologySample> output) const {
+void MacroGenerationSampler::sampleCoarseHydrologyPoints(std::span<const ColumnPos> positions,
+                                                         std::span<HydrologySample> output) const {
     sampleHydrologyPointsWithTerrain(positions, output, {}, false);
 }
 
@@ -2574,9 +2572,8 @@ bool MacroGenerationSampler::replaceNativeHydrologyDryFootprint(
 
     std::optional<NativeHydrologyDryFootprintCertificate> certificate;
     try {
-        certificate = nativeHydrologyRouter_->certifyDryFootprint(basinPositions,
-                                                                  nativeHydrologyInputFunction(),
-                                                                  generationContext_->requestPriority());
+        certificate = nativeHydrologyRouter_->certifyDryFootprint(
+            basinPositions, nativeHydrologyInputFunction(), generationContext_->requestPriority());
     } catch (const learned::GenerationFailureException& failure) {
         if (failure.status() == learned::AuthorityStatus::FAILED)
             generationContext_->latchFailure(failure.failure());
@@ -2774,9 +2771,9 @@ void MacroGenerationSampler::sampleSurfacePoints(std::span<const ColumnPos> posi
     }
 }
 
-void MacroGenerationSampler::samplePreviewEcologyPoints(
-    std::span<const ColumnPos> positions, SurfaceFootprint footprint,
-    std::span<SurfaceSample> output) const {
+void MacroGenerationSampler::samplePreviewEcologyPoints(std::span<const ColumnPos> positions,
+                                                        SurfaceFootprint footprint,
+                                                        std::span<SurfaceSample> output) const {
     if (positions.size() != output.size()) {
         throw std::invalid_argument("invalid preview ecology sample points");
     }
@@ -2832,21 +2829,19 @@ void MacroGenerationSampler::samplePreviewEcologyPoints(
         provisional.waterSurface = SEA_LEVEL;
         provisional.shoreWaterSurface = SEA_LEVEL;
         provisional.flowDirection = {1.0, 0.0};
-        provisional.terrainSlope =
-            std::hypot((east - west) / (2.0 * SLOPE_SAMPLE_OFFSET),
-                       (north - south) / (2.0 * SLOPE_SAMPLE_OFFSET));
+        provisional.terrainSlope = std::hypot((east - west) / (2.0 * SLOPE_SAMPLE_OFFSET),
+                                              (north - south) / (2.0 * SLOPE_SAMPLE_OFFSET));
         provisional.ocean = learnedTerrain[base].elevationMeters < 0.0;
         provisional.lakeShoreDistance = provisional.ocean ? 0.0 : -1.0e9;
         provisional.generatedFluidLevel = provisional.ocean ? 7 : 0;
         provisional.groundwaterHead = center - 12.0;
         provisional.hydroperiod = provisional.ocean ? 1.0 : 0.0;
 
-        output[index] =
-            surfaceFootprintWidth(footprint) >= 2
-                ? sampleSurfaceFromFarClimateControlTile(nullptr, x, z, footprint, &provisional,
-                                                         &learnedTerrain[base])
-                : sampleSurfaceFromControlTile(nullptr, x, z, footprint, &provisional,
-                                               &learnedTerrain[base]);
+        output[index] = surfaceFootprintWidth(footprint) >= 2
+                            ? sampleSurfaceFromFarClimateControlTile(
+                                  nullptr, x, z, footprint, &provisional, &learnedTerrain[base])
+                            : sampleSurfaceFromControlTile(nullptr, x, z, footprint, &provisional,
+                                                           &learnedTerrain[base]);
     }
 }
 

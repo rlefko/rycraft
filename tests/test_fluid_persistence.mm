@@ -16,6 +16,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -371,7 +372,7 @@ TEST_CASE("Generator version three preserves metadata and isolates legacy cube d
         REQUIRE(metadata.has_value());
         REQUIRE(metadata->generatorVersion == 2);
         REQUIRE(metadata->seed == 9182);
-        REQUIRE(metadata->spawnPos == Vec3{12.0F, 91.0F, -33.0F});
+        REQUIRE(metadata->playerPos == Vec3{12.0F, 91.0F, -33.0F});
         REQUIRE(metadata->worldTime == 4455);
         REQUIRE(metadata->player.yaw == 37.0F);
         REQUIRE(metadata->player.inventory[2] ==
@@ -386,6 +387,87 @@ TEST_CASE("Generator version three preserves metadata and isolates legacy cube d
                                     SaveManager::CURRENT_REGIONS_DIRECTORY));
     SaveManager reopened(directory.path());
     REQUIRE(reopened.loadMetadata()->generatorVersion == SaveManager::CURRENT_GENERATOR_VERSION);
+}
+
+TEST_CASE("Generator v4 preserves gameplay state across the expanded world range",
+          "[save][generator-v4][gameplay][vertical-range]") {
+    TempDir directory("generator_v4_gameplay_persistence");
+    constexpr uint64_t seed = 0x0123'4567'89AB'CDEFULL;
+    constexpr std::string_view fingerprint{
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    constexpr Vec3 safeSpawn{12.5F, 84.0F, -7.5F};
+    constexpr Vec3 bedSpawn{48.5F, 1'390.0F, 32.5F};
+    constexpr Vec3 playerPos{-24.5F, -112.0F, 18.5F};
+
+    SaveManager saves(directory.path(), SaveManager::Profile::GeneratorV4);
+    SaveManager::WorldMetadata metadata;
+    metadata.seed = seed;
+    metadata.generationFingerprint = fingerprint;
+    metadata.spawnFinalized = true;
+    metadata.spawnSafetyRevision = SaveManager::GENERATOR_V4_SPAWN_SAFETY_REVISION;
+    metadata.spawnPos = bedSpawn;
+    metadata.playerPos = playerPos;
+    metadata.safeSpawnPos = safeSpawn;
+    metadata.worldTime = 12'345;
+    metadata.name = "Learned Frontier";
+    metadata.gameMode = GameMode::SURVIVAL;
+    metadata.generation = GenerationSettings{false, true, false, true};
+    metadata.player.hunger = 9;
+    metadata.player.inventory.fill(ItemStack{});
+    metadata.player.inventory[35] = ItemStack{ItemType::LAVA_BUCKET, 1, 0};
+    REQUIRE(saves.saveMetadata(metadata));
+
+    Chunk top(ChunkPos{2, WORLD_MAX_CHUNK_Y, -3});
+    top.setBlock(1, CHUNK_EDGE - 1, 1, BlockType::TORCH);
+    top.setBlock(2, CHUNK_EDGE - 1, 1, BlockType::FURNACE_LIT);
+    top.setBlock(3, CHUNK_EDGE - 1, 1, BlockType::BED);
+    top.generated = true;
+    saves.saveChunk(top);
+    Chunk bottom(ChunkPos{2, WORLD_MIN_CHUNK_Y, -3});
+    bottom.setBlock(1, 0, 1, BlockType::CHEST);
+    bottom.generated = true;
+    saves.saveChunk(bottom);
+
+    FurnaceMap furnaces;
+    FurnaceState furnace;
+    furnace.input = ItemStack{ItemType::RAW_BEEF, 1, 0};
+    furnace.burnTicksRemaining = 80;
+    furnaces[{33, WORLD_MAX_Y, -47}] = furnace;
+    furnaces[{33, WORLD_MAX_Y + 1, -47}] = furnace;
+    ChestMap chests;
+    chests[{33, WORLD_MIN_Y, -47}].slots[0] = ItemStack{ItemType::DIAMOND, 3, 0};
+    chests[{33, WORLD_MIN_Y - 1, -47}] = ChestState{};
+    REQUIRE(saves.saveBlockEntities(furnaces, chests));
+    REQUIRE(saves.flush());
+
+    const auto loaded = saves.loadMetadata();
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->seed == seed);
+    CHECK(loaded->generationFingerprint == fingerprint);
+    CHECK(loaded->spawnPos == bedSpawn);
+    CHECK(loaded->playerPos == playerPos);
+    REQUIRE(loaded->safeSpawnPos.has_value());
+    CHECK(*loaded->safeSpawnPos == safeSpawn);
+    CHECK(loaded->name == "Learned Frontier");
+    CHECK(loaded->gameMode == GameMode::SURVIVAL);
+    CHECK(loaded->generation == GenerationSettings{false, true, false, true});
+    CHECK(loaded->player.hunger == 9);
+    CHECK(loaded->player.inventory[35] == ItemStack{ItemType::LAVA_BUCKET, 1, 0});
+
+    REQUIRE(saves.loadChunk({2, WORLD_MAX_CHUNK_Y, -3}).has_value());
+    CHECK(saves.loadChunk({2, WORLD_MAX_CHUNK_Y, -3})->getBlock(2, CHUNK_EDGE - 1, 1) ==
+          BlockType::FURNACE_LIT);
+    REQUIRE(saves.loadChunk({2, WORLD_MIN_CHUNK_Y, -3}).has_value());
+    CHECK(saves.loadChunk({2, WORLD_MIN_CHUNK_Y, -3})->getBlock(1, 0, 1) == BlockType::CHEST);
+    const SaveManager::BlockEntities entities = saves.loadBlockEntities();
+    CHECK(entities.furnaces.size() == 1);
+    CHECK(entities.furnaces.contains({33, WORLD_MAX_Y, -47}));
+    CHECK(entities.chests.size() == 1);
+    CHECK(entities.chests.contains({33, WORLD_MIN_Y, -47}));
+    CHECK(std::filesystem::exists(std::filesystem::path(directory.path()) /
+                                  SaveManager::V4_REGIONS_DIRECTORY));
+    CHECK_FALSE(std::filesystem::exists(std::filesystem::path(directory.path()) /
+                                        SaveManager::CURRENT_REGIONS_DIRECTORY));
 }
 
 TEST_CASE("Generated rapid and waterfall states survive cubic persistence",

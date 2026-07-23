@@ -434,8 +434,7 @@ struct PhysicalTerrainSample {
 // channel units. Transient FINAL grids deliberately contain dequantized RYTA
 // values, so this inverse is exact and lets a containing grid publish the
 // same page payload as direct page inference without another model call.
-QuantizedTerrainSample quantizePhysicalTerrainSample(
-    const PhysicalTerrainSample& sample) noexcept;
+QuantizedTerrainSample quantizePhysicalTerrainSample(const PhysicalTerrainSample& sample) noexcept;
 PhysicalTerrainSample dequantizeTerrainSample(const QuantizedTerrainSample& sample) noexcept;
 
 struct PhysicalTerrainGrid {
@@ -705,9 +704,9 @@ public:
     AuthorityResult<std::shared_ptr<const PhysicalTerrainGrid>> queryTransientFinalNativeGrid(
         NativeRect region,
         AuthorityRequestPriority priority = AuthorityRequestPriority::EXPLORATION_EXACT) override;
-    AuthorityResult<std::shared_ptr<const PhysicalTerrainGrid>> queryTransientFinalNativeGrid(
-        NativeRect region, AuthorityRequestPriority priority,
-        ProtectedHandoffEpoch epoch) override;
+    AuthorityResult<std::shared_ptr<const PhysicalTerrainGrid>>
+    queryTransientFinalNativeGrid(NativeRect region, AuthorityRequestPriority priority,
+                                  ProtectedHandoffEpoch epoch) override;
     AuthorityResult<CoarseSpawnGrid> queryCoarseSpawnGrid(
         CoarseSpawnRegion region,
         AuthorityRequestPriority priority = AuthorityRequestPriority::SPAWN) override;
@@ -799,10 +798,10 @@ public:
     // in lexical order after duplicate removal. Deferred means at least one
     // page is still queued, building, or waiting for queue capacity. Only a
     // ready result proves the complete closure is cached and published.
-    AuthorityResult<bool> requestAuthorityPages(
-        std::span<const TerrainPageCoordinate> coordinates,
-        AuthorityRequestPriority priority = AuthorityRequestPriority::SPAWN,
-        ProtectedHandoffEpoch epoch = {}) const;
+    AuthorityResult<bool>
+    requestAuthorityPages(std::span<const TerrainPageCoordinate> coordinates,
+                          AuthorityRequestPriority priority = AuthorityRequestPriority::SPAWN,
+                          ProtectedHandoffEpoch epoch = {}) const;
     // Enqueues the one to four pages that support scale-four bilinear
     // reconstruction at a block coordinate.
     AuthorityResult<bool>
@@ -814,9 +813,10 @@ public:
     AuthorityResult<std::vector<PhysicalTerrainSample>>
     queryNativePoints(std::span<const NativePoint> points,
                       std::optional<AuthorityRequestPriority> priority = std::nullopt) const;
-    AuthorityResult<std::shared_ptr<const PhysicalTerrainGrid>> queryTransientFinalNativeGrid(
-        NativeRect region, std::optional<AuthorityRequestPriority> priority = std::nullopt,
-        ProtectedHandoffEpoch epoch = {}) const;
+    AuthorityResult<std::shared_ptr<const PhysicalTerrainGrid>>
+    queryTransientFinalNativeGrid(NativeRect region,
+                                  std::optional<AuthorityRequestPriority> priority = std::nullopt,
+                                  ProtectedHandoffEpoch epoch = {}) const;
     AuthorityResult<CoarseSpawnGrid>
     queryCoarseSpawnGrid(CoarseSpawnRegion region,
                          std::optional<AuthorityRequestPriority> priority = std::nullopt) const;

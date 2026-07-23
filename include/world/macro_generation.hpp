@@ -540,10 +540,10 @@ private:
                                    int sampleWidth, int sampleHeight,
                                    std::span<HydrologySample> output,
                                    std::span<learned::PhysicalTerrainSample> learnedTerrain) const;
-    void sampleHydrologyPointsWithTerrain(
-        std::span<const ColumnPos> positions, std::span<HydrologySample> output,
-        std::span<learned::PhysicalTerrainSample> learnedTerrain,
-        bool reconcileOrdinaryStage = true) const;
+    void sampleHydrologyPointsWithTerrain(std::span<const ColumnPos> positions,
+                                          std::span<HydrologySample> output,
+                                          std::span<learned::PhysicalTerrainSample> learnedTerrain,
+                                          bool reconcileOrdinaryStage = true) const;
     HydrologySample sampleClimateHydrology(double x, double z) const;
     ClimateFields sampleClimateWithHydrology(double x, double z, double terrainHeight,
                                              bool canonicalHydrology,

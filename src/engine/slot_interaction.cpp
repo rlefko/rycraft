@@ -402,3 +402,40 @@ std::vector<ItemStack> collectOnClose(const SlotAccess& access, ItemStack& curso
     if (access.craftResult) access.craftResult->clear();
     return overflow;
 }
+
+bool preserveCarriedOverflow(std::span<const ItemStack> overflow, ItemStack& cursor,
+                             std::span<ItemStack, 9> craftGrid) {
+    for (const ItemStack& stack : overflow) {
+        if (stack.empty()) continue;
+        if (cursor.empty()) {
+            cursor = stack;
+            continue;
+        }
+        const auto available =
+            std::ranges::find_if(craftGrid, [](const ItemStack& slot) { return slot.empty(); });
+        if (available == craftGrid.end()) return false;
+        *available = stack;
+    }
+    return true;
+}
+
+bool hasExtendedCarriedCrafting(std::span<const ItemStack, 9> craftGrid) {
+    return std::ranges::any_of(craftGrid.subspan(4),
+                               [](const ItemStack& stack) { return !stack.empty(); });
+}
+
+std::vector<ItemStack> collectDeathDrops(std::span<ItemStack> inventory, ItemStack& cursor,
+                                         std::span<ItemStack, 9> craftGrid) {
+    std::vector<ItemStack> drops;
+    drops.reserve(inventory.size() + 1 + craftGrid.size());
+    const auto transfer = [&drops](ItemStack& stack) {
+        if (!stack.empty()) drops.push_back(stack);
+        stack.clear();
+    };
+    for (ItemStack& stack : inventory)
+        transfer(stack);
+    transfer(cursor);
+    for (ItemStack& stack : craftGrid)
+        transfer(stack);
+    return drops;
+}

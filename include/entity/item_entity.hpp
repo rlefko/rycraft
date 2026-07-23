@@ -1,5 +1,6 @@
 #pragma once
 
+#include "world/chunk.hpp"
 #include "world/item.hpp"
 
 #include <common/math.hpp>
@@ -26,6 +27,7 @@ struct ItemEntity {
     int ageTicks = 0;
     int pickupDelay = 10; // ticks before pickup and merge eligibility
     bool onGround = false;
+    uint8_t renderPackedLight = FULL_SKY_PACKED_LIGHT; // fixed-tick sky/block lighting probe
 
     static constexpr float SIZE = 0.25f;
     static constexpr int DESPAWN_TICKS = 6000; // 5 minutes at 20 Hz

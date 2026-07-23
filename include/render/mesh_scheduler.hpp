@@ -136,8 +136,7 @@ public:
     // moving from their distant edge into the camera band. Refresh every
     // unstarted request in place so it immediately follows the current camera
     // instead of retaining the lane captured by an older frame.
-    size_t reprioritizeQueued(
-        const std::function<MeshRequestPriority(ChunkPos)>& priorityFor);
+    size_t reprioritizeQueued(const std::function<MeshRequestPriority(ChunkPos)>& priorityFor);
 
     // Move finished results into the consumer's bounded pending vector. The
     // consumer calls this once per frame, including when no new result is

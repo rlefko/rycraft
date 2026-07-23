@@ -127,10 +127,10 @@ constexpr ExactMeshCandidatePriority exactMeshCandidatePriority(int64_t dx, int6
                                                                 bool surfaceRequired,
                                                                 bool floraRequired) noexcept {
     const uint64_t horizontalSquared = static_cast<uint64_t>(dx * dx + dz * dz);
-    const uint64_t verticalDistance = std::min(
-        static_cast<uint64_t>(dy * dy) * uint64_t{2}, EXACT_MESH_VERTICAL_PRIORITY_SPAN - 1U);
-    const uint64_t rawDistance = horizontalSquared * EXACT_MESH_VERTICAL_PRIORITY_SPAN +
-                                 verticalDistance;
+    const uint64_t verticalDistance = std::min(static_cast<uint64_t>(dy * dy) * uint64_t{2},
+                                               EXACT_MESH_VERTICAL_PRIORITY_SPAN - 1U);
+    const uint64_t rawDistance =
+        horizontalSquared * EXACT_MESH_VERTICAL_PRIORITY_SPAN + verticalDistance;
     const uint64_t boundedSublaneDistance =
         std::min(rawDistance, EXACT_FLORA_MESH_SUBLANE_OFFSET - 1U);
     if (dx == 0 && dz == 0) return {MeshPriorityLane::CAMERA_COLUMN, boundedSublaneDistance};
@@ -173,10 +173,8 @@ constexpr ExactMeshUploadPriority exactMeshUploadPriority(ChunkPos position, Chu
     const int64_t dy = static_cast<int64_t>(position.y) - camera.y;
     const int64_t dz = position.z - camera.z;
     const int64_t explorationRadius = std::max(explorationRadiusChunks, 0);
-    const bool explorationBand =
-        dx * dx + dz * dz <= explorationRadius * explorationRadius;
-    return {exactMeshCandidatePriority(dx, dy, dz, explorationBand, surfaceRequired,
-                                       floraRequired),
+    const bool explorationBand = dx * dx + dz * dz <= explorationRadius * explorationRadius;
+    return {exactMeshCandidatePriority(dx, dy, dz, explorationBand, surfaceRequired, floraRequired),
             position};
 }
 
@@ -184,10 +182,8 @@ constexpr bool exactMeshUploadRanksBefore(ExactMeshUploadPriority left,
                                           ExactMeshUploadPriority right) noexcept {
     if (left.candidate != right.candidate)
         return exactMeshCandidateRanksBefore(left.candidate, right.candidate);
-    if (left.position.x != right.position.x)
-        return left.position.x < right.position.x;
-    if (left.position.z != right.position.z)
-        return left.position.z < right.position.z;
+    if (left.position.x != right.position.x) return left.position.x < right.position.x;
+    if (left.position.z != right.position.z) return left.position.z < right.position.z;
     return left.position.y < right.position.y;
 }
 
@@ -196,8 +192,7 @@ constexpr bool exactMeshUploadRanksBefore(ExactMeshUploadPriority left,
 // owners and successful uploads from the current drain are never candidates:
 // the latter have committed GPU storage but intentionally wait for the
 // post-drain atomic column handoff before becoming exact owners.
-constexpr bool exactMeshRegistryVictimEligible(bool exactOwned,
-                                               bool committedThisDrain) noexcept {
+constexpr bool exactMeshRegistryVictimEligible(bool exactOwned, bool committedThisDrain) noexcept {
     return !exactOwned && !committedThisDrain;
 }
 
@@ -355,8 +350,7 @@ farCanopyLodCompletionAction(bool fallbackPresent, bool sourceCanopyPresent,
     if (targetCanopyPresent)
         return fallbackPresent ? FarCanopyLodCompletionAction::RETIRE_FALLBACK
                                : FarCanopyLodCompletionAction::NONE;
-    if (fallbackPresent)
-        return FarCanopyLodCompletionAction::RETAIN_FALLBACK;
+    if (fallbackPresent) return FarCanopyLodCompletionAction::RETAIN_FALLBACK;
     return sourceCanopyPresent ? FarCanopyLodCompletionAction::ADOPT_SOURCE
                                : FarCanopyLodCompletionAction::NONE;
 }
@@ -420,8 +414,7 @@ constexpr size_t farTerrainWorkerBudget(bool exactStreamingDebt, bool localTerra
     return FarTerrainScheduler::WORKER_COUNT;
 }
 
-constexpr bool farTerrainOrdinaryCoverageWorkEnabled(bool gameplayScene,
-                                                     bool exactStreamingDebt,
+constexpr bool farTerrainOrdinaryCoverageWorkEnabled(bool gameplayScene, bool exactStreamingDebt,
                                                      bool localTerrainDebt) noexcept {
     return !gameplayScene || (!exactStreamingDebt && !localTerrainDebt);
 }
@@ -437,8 +430,7 @@ constexpr size_t farTerrainCanopyWorkerBudget(bool gameplayScene, bool connected
                                               bool localTerrainDebt,
                                               bool exactStreamingDebt) noexcept {
     if (!gameplayScene) return 0;
-    if (localTerrainDebt)
-        return connectedPrefixReady ? size_t{1} : size_t{0};
+    if (localTerrainDebt) return connectedPrefixReady ? size_t{1} : size_t{0};
     if (exactStreamingDebt) return 1;
     return connectedPrefixReady ? FarTerrainScheduler::CANOPY_WORKER_COUNT : size_t{1};
 }
@@ -459,13 +451,14 @@ constexpr bool farTerrainCanopyHasNearExactSurfaceDebt(bool exactStreamingDebt,
     return exactStreamingDebt && !(nearestIncompleteSurfaceBlocks > protectedRadiusBlocks);
 }
 
-constexpr bool farTerrainCanopyHasNearExactPublicationDebt(
-    bool exactStreamingDebt, float nearestIncompleteSurfaceBlocks,
-    float nearestIncompleteFloraBlocks, int floraRadiusChunks) noexcept {
+constexpr bool farTerrainCanopyHasNearExactPublicationDebt(bool exactStreamingDebt,
+                                                           float nearestIncompleteSurfaceBlocks,
+                                                           float nearestIncompleteFloraBlocks,
+                                                           int floraRadiusChunks) noexcept {
     return farTerrainCanopyHasNearExactSurfaceDebt(
                exactStreamingDebt, nearestIncompleteSurfaceBlocks, floraRadiusChunks) ||
-           farTerrainCanopyHasNearExactSurfaceDebt(
-               exactStreamingDebt, nearestIncompleteFloraBlocks, floraRadiusChunks);
+           farTerrainCanopyHasNearExactSurfaceDebt(exactStreamingDebt, nearestIncompleteFloraBlocks,
+                                                   floraRadiusChunks);
 }
 
 // A tree can span several vertical sections. Terrain-bearing sections may
@@ -493,14 +486,14 @@ farTerrainProtectedDesiredStep(std::optional<FarTerrainStep> desired,
 // the anchor commits or is abandoned. Active and requested anchors are both
 // retained because movement keeps the active surface drawable while its
 // replacement is assembled.
-inline bool farTerrainProtectedGpuResidencyRequired(
-    FarTerrainKey key, const std::optional<ColumnPos>& activeAnchor,
-    const std::optional<ColumnPos>& requestedAnchor) noexcept {
+inline bool
+farTerrainProtectedGpuResidencyRequired(FarTerrainKey key,
+                                        const std::optional<ColumnPos>& activeAnchor,
+                                        const std::optional<ColumnPos>& requestedAnchor) noexcept {
     const ColumnPos coordinate{key.tileX, key.tileZ};
     const auto requiredByAnchor = [&](const std::optional<ColumnPos>& anchor) {
         if (!anchor) return false;
-        const FarTerrainProtectedNearRole role =
-            farTerrainProtectedNearRole(*anchor, coordinate);
+        const FarTerrainProtectedNearRole role = farTerrainProtectedNearRole(*anchor, coordinate);
         if (role == FarTerrainProtectedNearRole::NONE) return false;
         if (farTerrainIsBaseStep(key.step)) return true;
         switch (role) {
@@ -588,8 +581,7 @@ public:
     // same frame-ring transaction that presents the modal preparation UI.
     // No gameplay geometry, shadows, postprocessing, or canopy is encoded.
     void renderV4Preparation(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
-                             const UIFrameState& uiFrame, World& world,
-                             const Camera& camera);
+                             const UIFrameState& uiFrame, World& world, const Camera& camera);
 
     // Detach every renderer structure that references or is keyed by the
     // current World: the mesh scheduler (it captures a const World& lazily

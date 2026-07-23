@@ -1,12 +1,19 @@
 #pragma once
 
-#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <string_view>
+
+class World;
+struct LightningEvent;
+
+// Refines a weather-grid strike only from already resident cubes. Remote
+// strikes retain their learned coarse height and never construct an exact
+// column plan or hydrology owner on the fixed tick.
+void resolveLightningTerrainHeightIfLoaded(const World& world, LightningEvent& event);
 
 // ---------------------------------------------------------------------------
 // Game flow, which screen the player is on and how input transitions it.
@@ -47,13 +54,61 @@ namespace game_state_detail {
 
 inline std::optional<double> parseFiniteDecimal(std::string_view text) noexcept {
     if (text.empty()) return std::nullopt;
-    double result = 0.0;
-    const char* const begin = text.data();
-    const char* const end = begin + text.size();
-    const auto parsed = std::from_chars(begin, end, result, std::chars_format::general);
-    if (parsed.ec != std::errc{} || parsed.ptr != end || !std::isfinite(result)) {
-        return std::nullopt;
+
+    std::size_t cursor = 0;
+    bool negative = false;
+    if (text[cursor] == '+' || text[cursor] == '-') {
+        negative = text[cursor] == '-';
+        if (++cursor == text.size()) return std::nullopt;
     }
+
+    long double significand = 0.0L;
+    std::size_t fractionalDigits = 0;
+    bool sawDigit = false;
+    while (cursor < text.size() && text[cursor] >= '0' && text[cursor] <= '9') {
+        sawDigit = true;
+        significand = significand * 10.0L + static_cast<int>(text[cursor] - '0');
+        if (!std::isfinite(significand)) return std::nullopt;
+        ++cursor;
+    }
+    if (cursor < text.size() && text[cursor] == '.') {
+        ++cursor;
+        while (cursor < text.size() && text[cursor] >= '0' && text[cursor] <= '9') {
+            sawDigit = true;
+            significand = significand * 10.0L + static_cast<int>(text[cursor] - '0');
+            if (!std::isfinite(significand)) return std::nullopt;
+            ++fractionalDigits;
+            ++cursor;
+        }
+    }
+    if (!sawDigit) return std::nullopt;
+
+    int explicitExponent = 0;
+    if (cursor < text.size() && (text[cursor] == 'e' || text[cursor] == 'E')) {
+        if (++cursor == text.size()) return std::nullopt;
+        bool exponentNegative = false;
+        if (text[cursor] == '+' || text[cursor] == '-') {
+            exponentNegative = text[cursor] == '-';
+            if (++cursor == text.size()) return std::nullopt;
+        }
+        bool sawExponentDigit = false;
+        while (cursor < text.size() && text[cursor] >= '0' && text[cursor] <= '9') {
+            sawExponentDigit = true;
+            const int digit = text[cursor] - '0';
+            if (explicitExponent > 10'000) return std::nullopt;
+            explicitExponent = explicitExponent * 10 + digit;
+            ++cursor;
+        }
+        if (!sawExponentDigit) return std::nullopt;
+        if (exponentNegative) explicitExponent = -explicitExponent;
+    }
+    if (cursor != text.size() || fractionalDigits > 10'000) return std::nullopt;
+
+    const int decimalExponent = explicitExponent - static_cast<int>(fractionalDigits);
+    if (decimalExponent < -10'000 || decimalExponent > 10'000) return std::nullopt;
+    const long double scaled = significand * std::pow(10.0L, decimalExponent);
+    const double result = static_cast<double>(negative ? -scaled : scaled);
+    if (!std::isfinite(result) || (significand != 0.0L && result == 0.0)) return std::nullopt;
     return result;
 }
 
@@ -88,20 +143,38 @@ parseCaptureLightningOverride(std::string_view text) noexcept {
 }
 
 enum class GameScreen {
-    TITLE,                // launch screen: PLAY / QUIT, backdrop only
-    WORLD_SELECT,         // saved world list, reached from TITLE
-    WORLD_CREATE,         // name/seed/toggles form, reached from WORLD_SELECT
-    WORLD_DELETE_CONFIRM, // destructive-delete confirmation
-    PLAYING,              // normal gameplay, cursor captured
-    PAUSED,               // ESC menu: RESUME / SETTINGS / QUIT
-    SETTINGS,             // settings panel, reached from PAUSED
-    VIDEO_SETTINGS,       // per-effect video options, reached from SETTINGS
-    INVENTORY,            // player inventory + 2x2 craft grid (world frozen)
-    CRAFTING,             // crafting table 3x3 grid (world frozen)
-    FURNACE,              // furnace slots + gauges (world frozen)
-    CHEST,                // 27-slot storage block (world frozen)
-    DEATH,                // respawn / quit after health reaches zero
+    TITLE,                   // launch screen: PLAY / QUIT, backdrop only
+    WORLD_SELECT,            // saved world list, reached from TITLE
+    WORLD_CREATE,            // name/seed/toggles form, reached from WORLD_SELECT
+    WORLD_DELETE_CONFIRM,    // destructive-delete confirmation
+    WORLD_SUCCESSOR_CONFIRM, // explicit legacy/stale v4 successor confirmation
+    PLAYING,                 // normal gameplay, cursor captured
+    PAUSED,                  // ESC menu: RESUME / SETTINGS / QUIT
+    SETTINGS,                // settings panel, reached from PAUSED
+    VIDEO_SETTINGS,          // per-effect video options, reached from SETTINGS
+    INVENTORY,               // player inventory + 2x2 craft grid (world frozen)
+    CRAFTING,                // crafting table 3x3 grid (world frozen)
+    FURNACE,                 // furnace slots + gauges (world frozen)
+    CHEST,                   // 27-slot storage block (world frozen)
+    DEATH,                   // respawn / quit after health reaches zero
 };
+
+constexpr std::optional<GameScreen> gameScreenFromEnvironment(std::string_view name) {
+    if (name == "title") return GameScreen::TITLE;
+    if (name == "worlds") return GameScreen::WORLD_SELECT;
+    if (name == "create") return GameScreen::WORLD_CREATE;
+    if (name == "delete") return GameScreen::WORLD_DELETE_CONFIRM;
+    if (name == "playing") return GameScreen::PLAYING;
+    if (name == "paused") return GameScreen::PAUSED;
+    if (name == "settings") return GameScreen::SETTINGS;
+    if (name == "video") return GameScreen::VIDEO_SETTINGS;
+    if (name == "inventory") return GameScreen::INVENTORY;
+    if (name == "crafting") return GameScreen::CRAFTING;
+    if (name == "furnace") return GameScreen::FURNACE;
+    if (name == "chest") return GameScreen::CHEST;
+    if (name == "death") return GameScreen::DEATH;
+    return std::nullopt;
+}
 
 enum class MenuAction {
     NONE,
@@ -123,6 +196,9 @@ enum class MenuAction {
     WORLD_LIST_UP,
     WORLD_LIST_DOWN,
     PLAY_SELECTED_WORLD,
+    REQUEST_V4_SUCCESSOR,
+    CONFIRM_V4_SUCCESSOR,
+    CANCEL_V4_SUCCESSOR,
     CREATE_WORLD_CONFIRM,
     RANDOM_SEED,
     TOGGLE_GEN_STRUCTURES,
@@ -139,6 +215,13 @@ enum class MenuAction {
     TOGGLE_GAME_MODE,
     CREATIVE_PAGE_PREV,
     CREATIVE_PAGE_NEXT,
+    // Generator v4 installation and fail-closed recovery actions. These are
+    // handled by the engine and deliberately do not change the current
+    // gameplay screen by themselves.
+    DOWNLOAD_MODEL,
+    CANCEL_MODEL,
+    RETRY_MODEL,
+    REPAIR_MODEL,
     // Settings value steppers (handled by the engine; no screen change)
     VIEW_DISTANCE_DOWN,
     VIEW_DISTANCE_UP,
@@ -176,12 +259,49 @@ constexpr bool screenHasWorldSession(GameScreen screen) {
            screen == GameScreen::DEATH;
 }
 
+// Ordinary launches stay on the title or Worlds screens without selecting,
+// creating, or migrating a persistence profile. Capture and performance
+// sessions may still request gameplay explicitly through automaticGameplay.
+constexpr bool launchRequestsWorldSession(std::optional<GameScreen> requestedScreen,
+                                          bool automaticGameplay) noexcept {
+    return automaticGameplay || (requestedScreen && screenHasWorldSession(*requestedScreen));
+}
+
 // What the engine must do after a transition.
 struct GameFlowEffects {
     bool captureCursor = false; // hide + pointer-lock the mouse
     bool releaseCursor = false; // unhide + free the mouse
     bool resetTiming = false;   // zero the tick accumulator + mouse delta
     bool requestQuit = false;   // save and terminate
+};
+
+struct FrameCaptureActions {
+    bool capture = false;
+    bool quit = false;
+};
+
+// Capture timing starts when the requested scene is actually drawable. This
+// keeps asynchronous world preparation from consuming the requested frame
+// budget before the first full scene can render.
+struct FrameCaptureClock {
+    uint64_t renderedFrames = 0;
+    std::optional<uint64_t> capturedAt;
+    bool quitRequested = false;
+
+    constexpr FrameCaptureActions onRenderedFrame(uint64_t captureFrame,
+                                                  uint64_t quitDelayFrames = 60) {
+        FrameCaptureActions actions;
+        if (!capturedAt && renderedFrames >= captureFrame) {
+            capturedAt = renderedFrames;
+            actions.capture = true;
+        } else if (capturedAt && !quitRequested &&
+                   renderedFrames >= *capturedAt + quitDelayFrames) {
+            quitRequested = true;
+            actions.quit = true;
+        }
+        ++renderedFrames;
+        return actions;
+    }
 };
 
 struct GameFlow {
@@ -226,6 +346,7 @@ struct GameFlow {
                 return {};
             case GameScreen::WORLD_CREATE:
             case GameScreen::WORLD_DELETE_CONFIRM:
+            case GameScreen::WORLD_SUCCESSOR_CONFIRM:
                 screen = GameScreen::WORLD_SELECT;
                 return {};
             case GameScreen::DEATH:
@@ -262,7 +383,7 @@ struct GameFlow {
     // The engine drives these after its side effect succeeds.
     constexpr GameFlowEffects onWorldStarted() {
         if (screen != GameScreen::TITLE && screen != GameScreen::WORLD_SELECT &&
-            screen != GameScreen::WORLD_CREATE) {
+            screen != GameScreen::WORLD_CREATE && screen != GameScreen::WORLD_SUCCESSOR_CONFIRM) {
             return {};
         }
         screen = GameScreen::PLAYING;
@@ -284,6 +405,17 @@ struct GameFlow {
         if (screen != GameScreen::DEATH) return {};
         screen = GameScreen::PLAYING;
         return {.captureCursor = true, .resetTiming = true};
+    }
+
+    // A generation failure temporarily replaces the live-world screen with a
+    // recovery gate. Restore the exact prior screen only after the entry gate
+    // is ready again, including paused and container screens.
+    constexpr GameFlowEffects onGenerationRecovered(GameScreen priorScreen) {
+        if (!screenHasWorldSession(priorScreen)) return {};
+        screen = priorScreen;
+        return {.captureCursor = priorScreen == GameScreen::PLAYING,
+                .releaseCursor = priorScreen != GameScreen::PLAYING,
+                .resetTiming = true};
     }
 
     constexpr GameFlowEffects onMenuAction(MenuAction action) {
@@ -321,14 +453,23 @@ struct GameFlow {
             case MenuAction::REQUEST_DELETE_WORLD:
                 if (screen == GameScreen::WORLD_SELECT) screen = GameScreen::WORLD_DELETE_CONFIRM;
                 return {};
+            case MenuAction::REQUEST_V4_SUCCESSOR:
+                if (screen == GameScreen::WORLD_SELECT)
+                    screen = GameScreen::WORLD_SUCCESSOR_CONFIRM;
+                return {};
             case MenuAction::CANCEL_DELETE:
                 if (screen == GameScreen::WORLD_DELETE_CONFIRM) screen = GameScreen::WORLD_SELECT;
+                return {};
+            case MenuAction::CANCEL_V4_SUCCESSOR:
+                if (screen == GameScreen::WORLD_SUCCESSOR_CONFIRM)
+                    screen = GameScreen::WORLD_SELECT;
                 return {};
             case MenuAction::WORLD_BACK:
                 if (screen == GameScreen::WORLD_SELECT) {
                     screen = GameScreen::TITLE;
                 } else if (screen == GameScreen::WORLD_CREATE ||
-                           screen == GameScreen::WORLD_DELETE_CONFIRM) {
+                           screen == GameScreen::WORLD_DELETE_CONFIRM ||
+                           screen == GameScreen::WORLD_SUCCESSOR_CONFIRM) {
                     screen = GameScreen::WORLD_SELECT;
                 }
                 return {};

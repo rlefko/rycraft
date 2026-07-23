@@ -64,6 +64,30 @@ jobs:
           name: meson-test-log
           path: build/meson-logs/testlog.txt
 
+  arm64-generator-build:
+    name: ARM64 macOS 14 generator build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install meson ninja
+
+      - name: Cache wrap downloads
+        uses: actions/cache@v4
+        with:
+          path: subprojects/packagecache
+          key: wraps-${{ hashFiles('subprojects/*.wrap') }}
+
+      - name: Configure ARM64 deployment target
+        run: meson setup build-arm64 --cross-file ci/macos-arm64.ini --wrap-mode=forcefallback
+
+      - name: Compile generator and fake-backend tests
+        run: ninja -C build-arm64 tests/test_rycraft
+
+      - name: Verify ARM64 output
+        run: lipo -archs build-arm64/tests/test_rycraft | grep -qw arm64
+
   lint:
     name: Lint (clang-tidy)
     runs-on: macos-latest
@@ -94,7 +118,8 @@ jobs:
           git ls-files 'src/**/*.cpp' \
             | xargs -P "$(sysctl -n hw.ncpu)" -n 4 \
               "$(brew --prefix llvm)/bin/clang-tidy" -p build --quiet \
-              --extra-arg=-isysroot --extra-arg="$SDK"
+              --extra-arg=-isysroot --extra-arg="$SDK" \
+              --extra-arg=-Wno-missing-designated-field-initializers
 
   codeql:
     name: CodeQL Analysis

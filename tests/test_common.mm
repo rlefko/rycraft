@@ -34,9 +34,16 @@
 #include <world/serialization.hpp>
 #include <world/world.hpp>
 
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <future>
+#include <memory>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 // ============================================================================
 // Vec3 Tests
@@ -453,6 +460,78 @@ TEST_CASE("ThreadPool size", "[thread]") {
     REQUIRE(pool.size() == 3);
 }
 
+TEST_CASE("ThreadPool reprioritizes accepted work before it starts",
+          "[thread][priority][movement][regression]") {
+    ThreadPool pool(1);
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool blockerStarted = false;
+    bool releaseBlocker = false;
+    std::vector<int> order;
+
+    auto blocker = pool.submit([&] {
+        std::unique_lock lock(mutex);
+        blockerStarted = true;
+        condition.notify_all();
+        condition.wait(lock, [&] { return releaseBlocker; });
+    });
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE(condition.wait_for(lock, std::chrono::seconds(1), [&] { return blockerStarted; }));
+    }
+
+    ThreadPool::TaskHandle movedNear;
+    auto originallyDistant =
+        pool.submitTrackedWithPriority(1, movedNear, [&] { order.push_back(1); });
+    auto medium = pool.submitWithPriority(5, [&] { order.push_back(5); });
+    REQUIRE(pool.reprioritize(movedNear, 10));
+
+    {
+        std::lock_guard lock(mutex);
+        releaseBlocker = true;
+    }
+    condition.notify_all();
+    blocker.get();
+    originallyDistant.get();
+    medium.get();
+    REQUIRE(order == std::vector<int>{1, 5});
+    REQUIRE_FALSE(pool.reprioritize(movedNear, 20));
+}
+
+TEST_CASE("ThreadPool cancels queued work without invoking its callable",
+          "[thread][priority][cancellation][movement][regression]") {
+    ThreadPool pool(1);
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool blockerStarted = false;
+    bool releaseBlocker = false;
+    bool canceledCallableRan = false;
+
+    auto blocker = pool.submit([&] {
+        std::unique_lock lock(mutex);
+        blockerStarted = true;
+        condition.notify_all();
+        condition.wait(lock, [&] { return releaseBlocker; });
+    });
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE(condition.wait_for(lock, std::chrono::seconds(1), [&] { return blockerStarted; }));
+    }
+
+    ThreadPool::TaskHandle stale;
+    auto canceled = pool.submitTrackedWithPriority(1, stale, [&] { canceledCallableRan = true; });
+    REQUIRE(pool.cancelQueued(stale));
+    {
+        std::lock_guard lock(mutex);
+        releaseBlocker = true;
+    }
+    condition.notify_all();
+    blocker.get();
+    REQUIRE_THROWS_AS(canceled.get(), ThreadPool::TaskCanceled);
+    REQUIRE_FALSE(canceledCallableRan);
+    REQUIRE_FALSE(pool.cancelQueued(stale));
+}
+
 TEST_CASE("ThreadPool bounds latency-sensitive workers", "[thread][priority]") {
     REQUIRE_NOTHROW(ThreadPool(3, ThreadPriority::UTILITY, 2));
     REQUIRE_THROWS_AS(ThreadPool(2, ThreadPriority::UTILITY, 3), std::invalid_argument);
@@ -468,7 +547,92 @@ TEST_CASE("ThreadPool destructor joins", "[thread]") {
             return 1;
         });
         f.get();
-    } // pool destroyed here — should join cleanly
+    } // pool destroyed here, so it must join cleanly
+}
+
+TEST_CASE("ThreadPool shutdown joins before captured ownership is released",
+          "[thread][shutdown][regression]") {
+    std::shared_ptr<ThreadPool> pool = std::make_shared<ThreadPool>(2);
+    const std::weak_ptr<ThreadPool> weakPool = pool;
+    std::vector<std::future<void>> futures;
+    for (int task = 0; task < 32; ++task) {
+        futures.push_back(pool->submit([owner = pool] {
+            (void)owner;
+            std::this_thread::yield();
+        }));
+    }
+    for (std::future<void>& future : futures)
+        future.wait();
+
+    REQUIRE_NOTHROW(pool->shutdown());
+    REQUIRE_NOTHROW(pool->shutdown());
+    REQUIRE_THROWS_AS(pool->submit([] {}), std::runtime_error);
+    pool.reset();
+    REQUIRE(weakPool.expired());
+}
+
+TEST_CASE("ThreadPool worker shutdown detaches only itself and drains accepted work",
+          "[thread][shutdown][regression]") {
+    auto pool = std::make_shared<ThreadPool>(1);
+    std::atomic<int> drained{0};
+    std::promise<void> acceptedBeforeShutdown;
+    const std::shared_future<void> releaseShutdown = acceptedBeforeShutdown.get_future().share();
+    std::future<void> shutdown = pool->submit([owner = pool, releaseShutdown] {
+        releaseShutdown.wait();
+        owner->shutdown();
+    });
+    std::future<void> accepted = pool->submit([&drained] { drained.store(1); });
+    acceptedBeforeShutdown.set_value();
+
+    REQUIRE(shutdown.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    REQUIRE_NOTHROW(shutdown.get());
+    REQUIRE(accepted.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    REQUIRE_NOTHROW(accepted.get());
+    REQUIRE(drained.load() == 1);
+    REQUIRE_NOTHROW(pool->shutdown());
+}
+
+TEST_CASE("ThreadPool state outlives destruction on its worker",
+          "[thread][shutdown][lifetime][regression]") {
+    std::shared_ptr<ThreadPool> pool = std::make_shared<ThreadPool>(1);
+    const std::weak_ptr<ThreadPool> weakPool = pool;
+    std::promise<void> started;
+    std::promise<void> release;
+    std::shared_future<void> releaseSignal = release.get_future().share();
+    std::future<void> owner = pool->submit([retained = pool, &started, releaseSignal] {
+        (void)retained;
+        started.set_value();
+        releaseSignal.wait();
+    });
+    std::future<int> accepted = pool->submit([] { return 42; });
+
+    started.get_future().wait();
+    pool.reset();
+    release.set_value();
+
+    REQUIRE(owner.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    REQUIRE_NOTHROW(owner.get());
+    REQUIRE(accepted.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    REQUIRE(accepted.get() == 42);
+    REQUIRE(weakPool.expired());
+}
+
+TEST_CASE("Concurrent worker shutdown calls do not block the worker being joined",
+          "[thread][shutdown][concurrency][regression]") {
+    ThreadPool pool(2);
+    std::barrier rendezvous(2);
+    auto stopFromWorker = [&] {
+        rendezvous.arrive_and_wait();
+        pool.shutdown();
+    };
+    std::future<void> first = pool.submit(stopFromWorker);
+    std::future<void> second = pool.submit(stopFromWorker);
+
+    REQUIRE(first.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    REQUIRE(second.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    REQUIRE_NOTHROW(first.get());
+    REQUIRE_NOTHROW(second.get());
+    REQUIRE_NOTHROW(pool.shutdown());
 }
 
 TEST_CASE("SeededRng is deterministic and bounded", "[common]") {

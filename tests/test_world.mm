@@ -29,7 +29,10 @@
 #include <world/chunk_generator.hpp>
 #include <world/chunk_pos.hpp>
 #include <world/climate.hpp>
+#include <world/features.hpp>
 #include <world/fluid.hpp>
+#include <world/furnace.hpp>
+#include <world/learned_terrain.hpp>
 #include <world/light_engine.hpp>
 #include <world/noise.hpp>
 #include <world/ores.hpp>
@@ -43,6 +46,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <limits>
 #include <memory>
@@ -60,11 +64,100 @@ TEST_CASE("Cubic world constants describe the supported vertical range", "[chunk
     STATIC_REQUIRE(CHUNK_EDGE == 16);
     STATIC_REQUIRE(CHUNK_VOLUME == 4096);
     STATIC_REQUIRE(WORLD_MIN_Y == -128);
-    STATIC_REQUIRE(WORLD_MAX_Y == 511);
+    STATIC_REQUIRE(WORLD_MAX_Y == 1407);
     STATIC_REQUIRE(WORLD_MIN_CHUNK_Y == -8);
-    STATIC_REQUIRE(WORLD_MAX_CHUNK_Y == 31);
-    STATIC_REQUIRE(WORLD_VERTICAL_CHUNKS == 40);
+    STATIC_REQUIRE(WORLD_MAX_CHUNK_Y == 87);
+    STATIC_REQUIRE(WORLD_VERTICAL_CHUNKS == 96);
+    STATIC_REQUIRE(VerticalSectionMask::WORD_COUNT == 2);
     STATIC_REQUIRE(SEA_LEVEL == 64);
+}
+
+TEST_CASE("World instances retain distinct renderer identities", "[world][render]") {
+    World first(42, 4);
+    World second(42, 4);
+
+    REQUIRE(first.getSeed() == second.getSeed());
+    REQUIRE(first.instanceId() != second.instanceId());
+}
+
+TEST_CASE("Vertical section masks span both words without undefined shifts",
+          "[chunk][coords][regression]") {
+    VerticalSectionMask sections;
+    REQUIRE(sections.empty());
+    REQUIRE(sections.highestSection() == WORLD_MIN_CHUNK_Y - 1);
+    REQUIRE_FALSE(sections.contains(WORLD_MIN_CHUNK_Y - 1));
+    REQUIRE_FALSE(sections.contains(WORLD_MAX_CHUNK_Y + 1));
+    REQUIRE_FALSE(sections.containsRange(WORLD_MIN_CHUNK_Y, WORLD_MAX_CHUNK_Y));
+
+    constexpr int32_t LAST_FIRST_WORD_SECTION = WORLD_MIN_CHUNK_Y + 63;
+    constexpr int32_t FIRST_SECOND_WORD_SECTION = WORLD_MIN_CHUNK_Y + 64;
+    for (int32_t section = LAST_FIRST_WORD_SECTION - 1; section <= FIRST_SECOND_WORD_SECTION + 1;
+         ++section) {
+        sections.set(section);
+    }
+
+    REQUIRE(sections.contains(LAST_FIRST_WORD_SECTION));
+    REQUIRE(sections.contains(FIRST_SECOND_WORD_SECTION));
+    REQUIRE(sections.highestSection() == FIRST_SECOND_WORD_SECTION + 1);
+    REQUIRE(sections.containsRange(LAST_FIRST_WORD_SECTION - 1, FIRST_SECOND_WORD_SECTION + 1));
+    REQUIRE_FALSE(sections.containsRange(FIRST_SECOND_WORD_SECTION, FIRST_SECOND_WORD_SECTION + 2));
+
+    std::vector<int32_t> ascending;
+    REQUIRE(sections.visitSetSections(LAST_FIRST_WORD_SECTION - 4, FIRST_SECOND_WORD_SECTION + 4,
+                                      [&](int32_t section) {
+                                          ascending.push_back(section);
+                                          return true;
+                                      }) == 4);
+    REQUIRE(ascending == std::vector<int32_t>{LAST_FIRST_WORD_SECTION - 1, LAST_FIRST_WORD_SECTION,
+                                              FIRST_SECOND_WORD_SECTION,
+                                              FIRST_SECOND_WORD_SECTION + 1});
+    std::vector<int32_t> descending;
+    REQUIRE(sections.visitSetSectionsDescending(
+                LAST_FIRST_WORD_SECTION - 4, FIRST_SECOND_WORD_SECTION + 4, [&](int32_t section) {
+                    descending.push_back(section);
+                    return descending.size() < 3;
+                }) == 3);
+    REQUIRE(descending == std::vector<int32_t>{FIRST_SECOND_WORD_SECTION + 1,
+                                               FIRST_SECOND_WORD_SECTION, LAST_FIRST_WORD_SECTION});
+
+    sections.reset(FIRST_SECOND_WORD_SECTION);
+    REQUIRE_FALSE(sections.contains(FIRST_SECOND_WORD_SECTION));
+    REQUIRE_FALSE(sections.containsRange(LAST_FIRST_WORD_SECTION, FIRST_SECOND_WORD_SECTION + 1));
+    sections.reset(WORLD_MIN_CHUNK_Y - 1);
+    sections.reset(WORLD_MAX_CHUNK_Y + 1);
+    REQUIRE_FALSE(sections.empty());
+
+    for (int32_t section = WORLD_MIN_CHUNK_Y; section <= WORLD_MAX_CHUNK_Y; ++section) {
+        sections.set(section);
+    }
+    REQUIRE(sections.highestSection() == WORLD_MAX_CHUNK_Y);
+    REQUIRE(sections.containsRange(WORLD_MIN_CHUNK_Y, WORLD_MAX_CHUNK_Y));
+    REQUIRE_FALSE(sections.containsRange(WORLD_MAX_CHUNK_Y, WORLD_MIN_CHUNK_Y));
+    for (int32_t section = WORLD_MIN_CHUNK_Y; section <= WORLD_MAX_CHUNK_Y; ++section) {
+        sections.reset(section);
+    }
+    REQUIRE(sections.empty());
+}
+
+TEST_CASE("World exposes failures latched by shared far generation authority",
+          "[world][generator-v4][failure][regression]") {
+    worldgen::learned::GenerationIdentity identity;
+    identity.seed = 42;
+    identity.modelPackHash.fill(0x31U);
+    identity.runtimeHash.fill(0x72U);
+    auto backend = std::make_shared<worldgen::learned::DeterministicFakeTerrainBackend>();
+    auto authority = std::make_shared<worldgen::learned::CachedTerrainAuthority>(
+        identity, std::filesystem::path{}, std::move(backend));
+    auto context = std::make_shared<worldgen::learned::WorldGenerationContext>(
+        identity, std::move(authority), worldgen::learned::AuthorityQuality::FINAL);
+    World world(identity.seed, MIN_RENDER_DISTANCE_CHUNKS, MAX_LOADED_CUBES, context);
+
+    context->latchFailure({.code = worldgen::learned::GenerationFailureCode::INFERENCE_FAILED,
+                           .message = "Far terrain authority failed",
+                           .retriable = true});
+    REQUIRE(world.generationFailure() == "Far terrain authority failed");
+    REQUIRE(world.retryGeneration());
+    REQUIRE_FALSE(world.generationFailure());
 }
 
 TEST_CASE("Floor division and local coordinates are canonical for negatives", "[chunk][coords]") {
@@ -226,10 +319,16 @@ TEST_CASE("New workshop blocks render light and break like their materials", "[b
     REQUIRE(blockDefinition(BlockType::FURNACE).material == BlockMaterial::ROCK);
     REQUIRE(blockLightEmission(BlockType::FURNACE) == 0);
     REQUIRE(blockLightEmission(BlockType::FURNACE_LIT) == 13);
-    REQUIRE(isFlora(BlockType::TORCH));
+    REQUIRE_FALSE(isFlora(BlockType::TORCH));
+    REQUIRE(isFloorTorch(BlockType::TORCH));
+    REQUIRE(rendersAsCross(BlockType::TORCH));
     REQUIRE_FALSE(isSolid(BlockType::TORCH));
     REQUIRE(blockLightEmission(BlockType::TORCH) == 14);
     REQUIRE(isEmissive(BlockType::TORCH));
+    REQUIRE(rendersAsLowBox(BlockType::BED));
+    REQUIRE_FALSE(isOpaque(BlockType::BED));
+    REQUIRE(blockCollisionHeight(BlockType::BED) == BED_COLLISION_HEIGHT);
+    REQUIRE_FALSE(hasFullBlockCollision(BlockType::BED));
 }
 
 TEST_CASE("Block properties distinguish flora liquids and cubes", "[block]") {
@@ -264,6 +363,7 @@ TEST_CASE("Block properties distinguish flora liquids and cubes", "[block]") {
         REQUIRE_FALSE(isSolid(block));
     }
     REQUIRE(blockDefinition(BlockType::LILY_PAD).renderShape == BlockRenderShape::FLAT);
+    REQUIRE(blockDefinition(BlockType::TORCH).renderShape == BlockRenderShape::TORCH_CROSS);
     REQUIRE(isLeafBlock(BlockType::MANGROVE_LEAVES));
     REQUIRE(isSolid(BlockType::BASALT));
     REQUIRE(isOpaque(BlockType::BASALT));
@@ -552,6 +652,95 @@ TEST_CASE("Structure candidates use full-width region coordinates and stable ord
         REQUIRE(signature[5] >= 0);
         REQUIRE(signature[5] <= 3);
     }
+}
+
+TEST_CASE("Structure placement validates only candidates that can reach the target chunk",
+          "[structure][worldgen][work-limit]") {
+    constexpr uint32_t SEED = 112233;
+    ChunkGenerator generator(SEED);
+    StructurePlacer structures(SEED);
+    GenScratch scratch;
+    scratch.reset(&generator);
+    Chunk chunk(ChunkPos{0, 4, 0});
+    chunk.fill(BlockType::AIR);
+
+    structures.place(chunk, generator, scratch);
+
+    // One 8 by 8 region owns the target chunk. Neighboring regions are
+    // examined geometrically, but their distant candidates must not trigger
+    // terrain plans or enter the validated-placement cache.
+    REQUIRE(scratch.structurePlacements.size() <= 1);
+}
+
+TEST_CASE("Bounded structure validation preserves every reachable structure output",
+          "[structure][worldgen][determinism][regression]") {
+    constexpr uint32_t SEED = 112233;
+    ChunkGenerator generator(SEED);
+    StructurePlacer structures(SEED);
+    GenScratch searchScratch;
+    searchScratch.reset(&generator);
+    std::optional<StructurePlacement> accepted;
+    for (int64_t regionZ = -2; regionZ <= 2 && !accepted; ++regionZ) {
+        for (int64_t regionX = -2; regionX <= 2; ++regionX) {
+            const StructurePlacement placement =
+                structures.regionPlacement(regionX, regionZ, generator, searchScratch);
+            if (placement.valid) {
+                accepted = placement;
+                break;
+            }
+        }
+    }
+    REQUIRE(accepted);
+
+    const int64_t minimumChunkX = Chunk::worldToChunk(accepted->anchorX - accepted->halfX);
+    const int64_t maximumChunkX = Chunk::worldToChunk(accepted->anchorX + accepted->halfX);
+    const int64_t minimumChunkZ = Chunk::worldToChunk(accepted->anchorZ - accepted->halfZ);
+    const int64_t maximumChunkZ = Chunk::worldToChunk(accepted->anchorZ + accepted->halfZ);
+    const int32_t minimumChunkY = Chunk::worldToChunkY(accepted->floorY - 8);
+    const int32_t maximumChunkY = Chunk::worldToChunkY(accepted->floorY + 6);
+    size_t comparedChunks = 0;
+    size_t nonemptyChunks = 0;
+    for (int64_t chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; ++chunkZ) {
+        for (int64_t chunkX = minimumChunkX; chunkX <= maximumChunkX; ++chunkX) {
+            for (int32_t chunkY = minimumChunkY; chunkY <= maximumChunkY; ++chunkY) {
+                const ChunkPos position{chunkX, chunkY, chunkZ};
+                Chunk eager(position);
+                eager.fill(BlockType::AIR);
+                GenScratch eagerScratch;
+                eagerScratch.reset(&generator);
+                const int64_t minimumRegionX = world_coord::floorDiv(
+                    chunkX - 1, static_cast<int64_t>(STRUCTURE_REGION_CHUNKS));
+                const int64_t maximumRegionX = world_coord::floorDiv(
+                    chunkX + 1, static_cast<int64_t>(STRUCTURE_REGION_CHUNKS));
+                const int64_t minimumRegionZ = world_coord::floorDiv(
+                    chunkZ - 1, static_cast<int64_t>(STRUCTURE_REGION_CHUNKS));
+                const int64_t maximumRegionZ = world_coord::floorDiv(
+                    chunkZ + 1, static_cast<int64_t>(STRUCTURE_REGION_CHUNKS));
+                for (int64_t regionZ = minimumRegionZ; regionZ <= maximumRegionZ; ++regionZ) {
+                    for (int64_t regionX = minimumRegionX; regionX <= maximumRegionX; ++regionX) {
+                        static_cast<void>(
+                            structures.regionPlacement(regionX, regionZ, generator, eagerScratch));
+                    }
+                }
+                structures.place(eager, generator, eagerScratch);
+
+                Chunk bounded(position);
+                bounded.fill(BlockType::AIR);
+                GenScratch boundedScratch;
+                boundedScratch.reset(&generator);
+                structures.place(bounded, generator, boundedScratch);
+
+                REQUIRE(bounded.copyBlocks() == eager.copyBlocks());
+                ++comparedChunks;
+                if (std::ranges::any_of(bounded.copyBlocks(),
+                                        [](BlockType block) { return block != BlockType::AIR; })) {
+                    ++nonemptyChunks;
+                }
+            }
+        }
+    }
+    REQUIRE(comparedChunks > 0);
+    REQUIRE(nonemptyChunks > 0);
 }
 
 TEST_CASE("Generator handles cubes beyond supported vertical bounds", "[worldgen][bounds]") {
@@ -935,7 +1124,11 @@ TEST_CASE("Column plans cache immutable cubic surface data", "[worldgen][column-
     REQUIRE(first == cached);
     REQUIRE(first->chunkColumn() == column);
     REQUIRE_FALSE(first->exposedSections().empty());
+    REQUIRE_FALSE(first->floraOwnershipSections().empty());
     REQUIRE(std::is_sorted(first->exposedSections().begin(), first->exposedSections().end()));
+    REQUIRE(std::is_sorted(first->floraOwnershipSections().begin(),
+                           first->floraOwnershipSections().end()));
+    REQUIRE(std::ranges::includes(first->exposedSections(), first->floraOwnershipSections()));
     for (int32_t section : first->exposedSections()) {
         REQUIRE(section >= WORLD_MIN_CHUNK_Y);
         REQUIRE(section <= WORLD_MAX_CHUNK_Y);
@@ -960,6 +1153,208 @@ TEST_CASE("Column plans cache immutable cubic surface data", "[worldgen][column-
     REQUIRE(std::isfinite(planned.climate.annualPrecipitationMm));
     REQUIRE(planned.soil.moisture >= 0.0);
     REQUIRE(planned.soil.moisture <= 1.0);
+}
+
+TEST_CASE("Column plans expose flora ownership separately from generation support",
+          "[worldgen][column-plan][flora][streaming]") {
+    ChunkGenerator generator(2468);
+    const auto plan = generator.getColumnPlan({0, 0});
+    REQUIRE_FALSE(plan->floraOwnershipSections().empty());
+    REQUIRE(std::ranges::includes(plan->exposedSections(), plan->floraOwnershipSections()));
+    for (int localZ = 0; localZ < CHUNK_EDGE; ++localZ) {
+        for (int localX = 0; localX < CHUNK_EDGE; ++localX) {
+            const int surfaceY = plan->surfaceY(localX, localZ);
+            for (int offset = 1; offset <= feature_generation::GROUND_FLORA_MAXIMUM_VERTICAL_OFFSET;
+                 ++offset) {
+                REQUIRE(std::ranges::binary_search(plan->floraOwnershipSections(),
+                                                   Chunk::worldToChunkY(surfaceY + offset)));
+            }
+        }
+    }
+
+    const auto flatSurface = [](int64_t, int64_t) {
+        worldgen::SurfaceSample surface;
+        surface.terrainHeight = 40.0;
+        surface.hydrology.surfaceElevation = 40.0;
+        surface.waterSurface = 40.0;
+        return surface;
+    };
+    const auto waterfall = [](int64_t, int64_t) {
+        worldgen::HydrologySample hydrology;
+        hydrology.surfaceElevation = 40.0;
+        hydrology.waterSurface = 600.0;
+        hydrology.waterfall = true;
+        hydrology.waterfallTop = 600.0;
+        hydrology.waterfallBottom = 40.0;
+        hydrology.waterfallWidth = 2.0;
+        hydrology.flowDirection = {1.0, 0.0};
+        return hydrology;
+    };
+    ColumnPlan verticalWater(
+        {0, 0}, flatSurface, [](int64_t, int64_t) { return 40.0; },
+        [](const ColumnPlan&) {
+            ColumnPlanSurfaceGrid surfaces{};
+            surfaces.fill(40);
+            return surfaces;
+        },
+        waterfall);
+    const int32_t waterfallTopSection = Chunk::worldToChunkY(599);
+    REQUIRE(std::ranges::binary_search(verticalWater.exposedSections(), waterfallTopSection));
+    REQUIRE(
+        std::ranges::binary_search(verticalWater.surfaceOwnershipSections(), waterfallTopSection));
+    REQUIRE_FALSE(
+        std::ranges::binary_search(verticalWater.floraOwnershipSections(), waterfallTopSection));
+}
+
+TEST_CASE("Column plan exposure covers every generated block above its terrain cutoff",
+          "[worldgen][column-plan][skylight][occupancy][regression]") {
+    ChunkGenerator generator(2468);
+    constexpr ColumnPos column{-2, 3};
+    const auto plan = generator.getColumnPlan(column);
+    REQUIRE(plan);
+
+    int minimumTerrainY = WORLD_MAX_Y;
+    for (int z = 0; z < CHUNK_EDGE; ++z) {
+        for (int x = 0; x < CHUNK_EDGE; ++x) {
+            minimumTerrainY = std::min(minimumTerrainY, plan->surfaceY(x, z));
+        }
+    }
+    const int32_t firstSection = Chunk::worldToChunkY(minimumTerrainY);
+    const int32_t lastSection =
+        std::min(WORLD_MAX_CHUNK_Y, Chunk::worldToChunkY(plan->maximumSurfaceY()) + 1);
+    size_t provenEmptySections = 0;
+    for (int32_t section = firstSection; section <= lastSection; ++section) {
+        if (plan->exposesSection(section))
+            continue;
+        Chunk cube(ChunkPos{column.x, section, column.z});
+        generator.generate(cube);
+        ++provenEmptySections;
+        for (int z = 0; z < CHUNK_EDGE; ++z) {
+            for (int x = 0; x < CHUNK_EDGE; ++x) {
+                const int cutoffY = plan->surfaceY(x, z) + 1;
+                for (int y = 0; y < CHUNK_EDGE; ++y) {
+                    const int worldY = section * CHUNK_EDGE + y;
+                    if (worldY < cutoffY)
+                        continue;
+                    CAPTURE(section, x, y, z, cutoffY, cube.getBlock(x, y, z));
+                    REQUIRE(cube.getBlock(x, y, z) == BlockType::AIR);
+                }
+            }
+        }
+    }
+    REQUIRE(provenEmptySections > 0);
+}
+
+TEST_CASE("Column plans retain canonical parent-owned wetland authority",
+          "[worldgen][column-plan][wetland][exact][determinism]") {
+    constexpr int WETLAND_X = 7;
+    constexpr int WETLAND_Z = 9;
+    constexpr worldgen::WaterBodyId PARENT_BODY = 0x5745'544C'414E'4404ULL;
+    const auto drySurface = [](int64_t, int64_t) {
+        worldgen::SurfaceSample sample;
+        sample.terrainHeight = 63.875;
+        sample.hydrology.surfaceElevation = 63.875;
+        sample.hydrology.waterSurface = 0.0;
+        sample.waterSurface = 0.0;
+        return sample;
+    };
+    const auto hydrology = [](int64_t x, int64_t z) {
+        worldgen::HydrologySample sample;
+        sample.surfaceElevation = 63.875;
+        if (x != WETLAND_X || z != WETLAND_Z)
+            return sample;
+        sample.waterBodyId = PARENT_BODY;
+        sample.waterSurface = 64.0;
+        sample.wetland = true;
+        sample.groundwaterHead = 64.25;
+        sample.hydroperiod = 0.80;
+        return sample;
+    };
+    ColumnPlan plan(
+        {0, 0}, drySurface, [](int64_t, int64_t) { return 63.875; },
+        [](const ColumnPlan&) {
+            ColumnPlanSurfaceGrid surfaces{};
+            surfaces.fill(63);
+            return surfaces;
+        },
+        hydrology);
+
+    const worldgen::SurfaceSample wetland = plan.sample(WETLAND_X, WETLAND_Z);
+    REQUIRE(wetland.hydrology.wetland);
+    REQUIRE_FALSE(wetland.hydrology.ocean);
+    REQUIRE_FALSE(wetland.hydrology.lake);
+    REQUIRE_FALSE(wetland.hydrology.river);
+    REQUIRE(wetland.hydrology.waterBodyId == PARENT_BODY);
+    REQUIRE(wetland.hydrology.waterSurface == Catch::Approx(64.0));
+    REQUIRE(wetland.hydrology.surfaceElevation == Catch::Approx(63.875));
+    REQUIRE(wetland.hydrology.groundwaterHead == Catch::Approx(64.25));
+    REQUIRE(wetland.hydrology.hydroperiod == Catch::Approx(0.80).margin(1.0 / 255.0));
+    REQUIRE(wetland.waterSurface == Catch::Approx(64.0));
+
+    const worldgen::SurfaceSample dry = plan.sample(WETLAND_X - 1, WETLAND_Z);
+    REQUIRE_FALSE(dry.hydrology.wetland);
+    REQUIRE(dry.hydrology.waterBodyId == worldgen::NO_WATER_BODY);
+    REQUIRE(dry.hydrology.waterSurface == Catch::Approx(0.0));
+}
+
+TEST_CASE("Column plans retain canonical estuary and distributary identity",
+          "[worldgen][column-plan][hydrology][estuary][delta][brackish]") {
+    constexpr int MOUTH_X = 11;
+    constexpr int MOUTH_Z = 5;
+    constexpr worldgen::WaterBodyId RIVER_BODY = 0x4553'5455'4152'5901ULL;
+    const auto drySurface = [](int64_t, int64_t) {
+        worldgen::SurfaceSample sample;
+        sample.terrainHeight = 63.875;
+        sample.hydrology.surfaceElevation = 63.875;
+        return sample;
+    };
+    const auto hydrology = [](int64_t x, int64_t z) {
+        worldgen::HydrologySample sample;
+        sample.surfaceElevation = 63.875;
+        if (x != MOUTH_X || z != MOUTH_Z)
+            return sample;
+        sample.waterBodyId = RIVER_BODY;
+        sample.waterSurface = 64.0;
+        sample.flowDirection = {0.8, 0.6};
+        sample.discharge = 640.0;
+        sample.channelDistance = 0.0;
+        sample.channelWidth = 6.0;
+        sample.channelDepth = 0.125;
+        sample.channelGradient = 0.002;
+        sample.groundwaterHead = 64.0;
+        sample.streamOrder = 4;
+        sample.distributaryCount = 2;
+        sample.river = true;
+        sample.delta = true;
+        sample.estuary = true;
+        sample.brackish = true;
+        return sample;
+    };
+    ColumnPlan plan(
+        {0, 0}, drySurface, [](int64_t, int64_t) { return 63.875; },
+        [](const ColumnPlan&) {
+            ColumnPlanSurfaceGrid surfaces{};
+            surfaces.fill(63);
+            return surfaces;
+        },
+        hydrology);
+
+    const worldgen::SurfaceSample mouth = plan.sample(MOUTH_X, MOUTH_Z);
+    REQUIRE(mouth.hydrology.river);
+    REQUIRE(mouth.hydrology.delta);
+    REQUIRE(mouth.hydrology.estuary);
+    REQUIRE(mouth.hydrology.brackish);
+    REQUIRE_FALSE(mouth.hydrology.ocean);
+    REQUIRE_FALSE(mouth.hydrology.lake);
+    REQUIRE(mouth.hydrology.waterBodyId == RIVER_BODY);
+    REQUIRE(mouth.hydrology.waterSurface == Catch::Approx(64.0));
+    REQUIRE(mouth.hydrology.surfaceElevation == Catch::Approx(63.875));
+
+    const worldgen::SurfaceSample dry = plan.sample(MOUTH_X - 1, MOUTH_Z);
+    REQUIRE_FALSE(dry.hydrology.river);
+    REQUIRE_FALSE(dry.hydrology.delta);
+    REQUIRE_FALSE(dry.hydrology.estuary);
+    REQUIRE_FALSE(dry.hydrology.brackish);
 }
 
 TEST_CASE("Column plans expose tree reach from every neighboring face",
@@ -1195,6 +1590,30 @@ TEST_CASE("RYCH v4 dense cube round-trips coordinates blocks and fluid", "[seria
     REQUIRE(restored->generated);
 }
 
+TEST_CASE("RYCH v4 preserves edits and fluid at both vertical limits",
+          "[serialization][bounds][regression]") {
+    Chunk bottom(ChunkPos{-2, WORLD_MIN_CHUNK_Y, 3});
+    bottom.setBlock(4, 0, 9, BlockType::BEDROCK);
+    bottom.generated = true;
+    auto restoredBottom = ChunkSerializer::deserialize(ChunkSerializer::serialize(bottom));
+    REQUIRE(restoredBottom.has_value());
+    REQUIRE(restoredBottom->pos() == bottom.pos());
+    REQUIRE(restoredBottom->getBlock(4, 0, 9) == BlockType::BEDROCK);
+    REQUIRE(restoredBottom->getWorldPosition().y == Catch::Approx(static_cast<float>(WORLD_MIN_Y)));
+
+    Chunk top(ChunkPos{5, WORLD_MAX_CHUNK_Y, -7});
+    top.setBlock(12, CHUNK_EDGE - 1, 1, BlockType::WATER);
+    top.setFluidState(12, CHUNK_EDGE - 1, 1, FluidState::falling(3));
+    top.generated = true;
+    auto restoredTop = ChunkSerializer::deserialize(ChunkSerializer::serialize(top));
+    REQUIRE(restoredTop.has_value());
+    REQUIRE(restoredTop->pos() == top.pos());
+    REQUIRE(restoredTop->getBlock(12, CHUNK_EDGE - 1, 1) == BlockType::WATER);
+    REQUIRE(restoredTop->getFluidState(12, CHUNK_EDGE - 1, 1) == FluidState::falling(3));
+    REQUIRE(restoredTop->getWorldPosition().y + CHUNK_EDGE - 1 ==
+            Catch::Approx(static_cast<float>(WORLD_MAX_Y)));
+}
+
 TEST_CASE("RYCH v4 preserves compact uniform cubes", "[serialization][storage]") {
     Chunk original(ChunkPos{-12, 31, 44});
     original.fill(BlockType::STONE);
@@ -1319,6 +1738,28 @@ TEST_CASE("SaveManager coalesces queued snapshots by cubic position", "[save][pe
     REQUIRE(durable->getBlock(2, 3, 4) == BlockType::OBSIDIAN);
 }
 
+TEST_CASE("SaveManager teardown releases a paused writer and drains accepted saves",
+          "[save][thread][shutdown][regression]") {
+    TempDir directory("save_teardown_drain");
+    const auto hooks = std::make_shared<SaveManager::TestHooks>();
+    hooks->pauseWrites.store(true, std::memory_order_release);
+    constexpr ChunkPos POSITION{-17, 11, 23};
+    {
+        auto saves = std::make_unique<SaveManager>(directory.path(), hooks);
+        Chunk edited(POSITION);
+        edited.setBlock(4, 5, 6, BlockType::DIAMOND_ORE);
+        edited.generated = true;
+        saves->saveChunk(edited);
+        REQUIRE(saves->pendingSaveCount() == 1);
+        REQUIRE_NOTHROW(saves.reset());
+    }
+
+    SaveManager reopened(directory.path());
+    const std::optional<Chunk> loaded = reopened.loadChunk(POSITION);
+    REQUIRE(loaded);
+    REQUIRE(loaded->getBlock(4, 5, 6) == BlockType::DIAMOND_ORE);
+}
+
 TEST_CASE("SaveManager snapshots edited sections under one manifest lock", "[save][performance]") {
     TempDir directory("manifest_bulk_lookup");
     SaveManager saves(directory.path());
@@ -1348,7 +1789,7 @@ TEST_CASE("SaveManager metadata records the cubic format version", "[save]") {
     auto metadata = saves.loadMetadata();
     REQUIRE(metadata.has_value());
     REQUIRE(metadata->seed == 12345);
-    REQUIRE(metadata->spawnPos == Vec3{100.f, 80.f, -50.f});
+    REQUIRE(metadata->playerPos == Vec3{100.f, 80.f, -50.f});
     REQUIRE(metadata->worldTime == 9876543210ULL);
     REQUIRE(metadata->chunkFormatVersion == CHUNK_VERSION);
     REQUIRE(metadata->generatorVersion == SaveManager::CURRENT_GENERATOR_VERSION);
@@ -1373,7 +1814,7 @@ TEST_CASE("SaveManager preserves non-chunk player metadata", "[save][metadata]")
 
     REQUIRE(loaded.has_value());
     REQUIRE(loaded->seed == 9191);
-    REQUIRE(loaded->spawnPos == Vec3{12.0f, 88.0f, -4.0f});
+    REQUIRE(loaded->playerPos == Vec3{12.0f, 88.0f, -4.0f});
     REQUIRE(loaded->worldTime == 123456);
     REQUIRE(loaded->player.yaw == Catch::Approx(127.5f));
     REQUIRE(loaded->player.pitch == Catch::Approx(-31.25f));
@@ -1410,6 +1851,336 @@ TEST_CASE("World returns boundary blocks without loading invalid cubes", "[world
     REQUIRE(world.getBlock(0, WORLD_MIN_Y - 1, 0) == BlockType::BEDROCK);
     REQUIRE(world.getBlock(0, WORLD_MAX_Y + 1, 0) == BlockType::AIR);
     REQUIRE(world.getLoadedChunkCount() == 0);
+}
+
+TEST_CASE("World block edits report only committed resident changes",
+          "[world][edit][transaction][regression]") {
+    World world(42);
+    const uint64_t initialLightingRevision = world.lightingRevision();
+
+    REQUIRE_FALSE(world.trySetBlock(0, SEA_LEVEL, 0, BlockType::STONE));
+    REQUIRE_FALSE(world.trySetBlock(0, WORLD_MIN_Y - 1, 0, BlockType::STONE));
+    REQUIRE_FALSE(world.trySetBlock(0, WORLD_MAX_Y + 1, 0, BlockType::STONE));
+    REQUIRE(world.getLoadedChunkCount() == 0);
+    REQUIRE(world.getPendingFluidCount() == 0);
+    REQUIRE(world.lightingRevision() == initialLightingRevision);
+
+    auto bottom = world.getChunk({0, WORLD_MIN_CHUNK_Y, 0});
+    auto top = world.getChunk({0, WORLD_MAX_CHUNK_Y, 0});
+    REQUIRE(bottom);
+    REQUIRE(top);
+    bottom->fill(BlockType::AIR);
+    top->fill(BlockType::AIR);
+    bottom->modifiedSinceSave = false;
+    top->modifiedSinceSave = false;
+    bottom->needsMeshUpdate = false;
+    top->needsMeshUpdate = false;
+
+    const uint64_t bottomVersionBefore = bottom->version.load(std::memory_order_relaxed);
+    REQUIRE(world.trySetBlock(2, WORLD_MIN_Y, 3, BlockType::STONE));
+    REQUIRE(world.findBlockIfLoaded(2, WORLD_MIN_Y, 3) == BlockType::STONE);
+    REQUIRE(bottom->modifiedSinceSave);
+    REQUIRE(bottom->needsMeshUpdate);
+    REQUIRE(bottom->version.load(std::memory_order_relaxed) > bottomVersionBefore);
+    REQUIRE(world.lightingRevision() > initialLightingRevision);
+
+    const uint64_t noOpLightingRevision = world.lightingRevision();
+    const uint64_t noOpVersion = bottom->version.load(std::memory_order_relaxed);
+    const size_t noOpPendingFluids = world.getPendingFluidCount();
+    REQUIRE_FALSE(world.trySetBlock(2, WORLD_MIN_Y, 3, BlockType::STONE));
+    REQUIRE(world.lightingRevision() == noOpLightingRevision);
+    REQUIRE(bottom->version.load(std::memory_order_relaxed) == noOpVersion);
+    REQUIRE(world.getPendingFluidCount() == noOpPendingFluids);
+
+    REQUIRE(world.trySetBlock(4, WORLD_MAX_Y, 5, BlockType::TORCH));
+    REQUIRE(world.findBlockIfLoaded(4, WORLD_MAX_Y, 5) == BlockType::TORCH);
+    REQUIRE(top->getBlockLight(4, CHUNK_EDGE - 1, 5) == 14);
+}
+
+TEST_CASE("World skips proven-empty gaps in sparse sky authority",
+          "[world][snapshot][skylight][publication][regression]") {
+    World world(42, 4, MAX_LOADED_CUBES, GenerationSettings{.structures = false});
+    std::array<std::shared_ptr<const ColumnPlan>, 9> plans;
+    int32_t firstRequiredSection = WORLD_MAX_CHUNK_Y;
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            auto plan = world.generator().getColumnPlan({offsetX, offsetZ});
+            REQUIRE(plan);
+            REQUIRE_FALSE(plan->exposedSections().empty());
+            firstRequiredSection = std::min(firstRequiredSection, plan->exposedSections().front());
+            plans[static_cast<size_t>((offsetZ + 1) * 3 + offsetX + 1)] = std::move(plan);
+        }
+    }
+    const int32_t targetSection = firstRequiredSection - 4;
+    REQUIRE(targetSection >= WORLD_MIN_CHUNK_Y);
+    const ChunkPos target{0, targetSection, 0};
+    REQUIRE(world.getChunk(target));
+
+    const auto& centerPlan = plans[4];
+    const int32_t missingRequiredSection = centerPlan->exposedSections().back();
+    REQUIRE(missingRequiredSection > targetSection);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const auto& plan = plans[static_cast<size_t>((offsetZ + 1) * 3 + offsetX + 1)];
+            for (const int32_t section : plan->exposedSections()) {
+                if (offsetX == 0 && offsetZ == 0 && section == missingRequiredSection)
+                    continue;
+                REQUIRE(world.getChunk({offsetX, section, offsetZ}));
+            }
+        }
+    }
+
+    MeshSnapshot missingRequired;
+    REQUIRE_FALSE(world.snapshotForMeshing(target, missingRequired));
+
+    std::optional<int32_t> provenEmptyGap;
+    for (int32_t section = targetSection + 1; section < missingRequiredSection; ++section) {
+        if (!centerPlan->exposesSection(section)) {
+            provenEmptyGap = section;
+            break;
+        }
+    }
+    REQUIRE(provenEmptyGap);
+    REQUIRE_FALSE(world.isChunkLoaded({0, *provenEmptyGap, 0}));
+
+    REQUIRE(world.getChunk({0, missingRequiredSection, 0}));
+    MeshSnapshot connected;
+    REQUIRE(world.snapshotForMeshing(target, connected));
+    REQUIRE(connected.derivedSkyLightValid);
+    REQUIRE_FALSE(world.isChunkLoaded({0, *provenEmptyGap, 0}));
+
+    const auto firstVisibleLight = connected.packedLight;
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    MeshSnapshot settled;
+    REQUIRE(world.snapshotForMeshing(target, settled));
+    REQUIRE(settled.packedLight == firstVisibleLight);
+
+    // Removing the planned surface invalidates the sparse proof below it. A
+    // nonexposed density section can still own the next opaque block, so the
+    // edited column must fail closed until its bounded contiguous hull loads.
+    constexpr int LOCAL_X = 8;
+    constexpr int LOCAL_Z = 8;
+    const int32_t localSurfaceY = centerPlan->surfaceY(LOCAL_X, LOCAL_Z);
+    const int32_t localSurfaceSection = Chunk::worldToChunkY(localSurfaceY);
+    std::optional<int32_t> unloadedOpaqueSection;
+    for (int32_t section = localSurfaceSection - 1; section > targetSection; --section) {
+        if (centerPlan->exposesSection(section) || world.isChunkLoaded({0, section, 0}))
+            continue;
+        Chunk probe(ChunkPos{0, section, 0});
+        world.generator().generateCube(probe);
+        for (int localY = CHUNK_EDGE - 1; localY >= 0; --localY) {
+            if (isOpaque(probe.getBlock(LOCAL_X, localY, LOCAL_Z))) {
+                unloadedOpaqueSection = section;
+                break;
+            }
+        }
+        if (unloadedOpaqueSection)
+            break;
+    }
+    REQUIRE(unloadedOpaqueSection);
+    REQUIRE_FALSE(world.isChunkLoaded({0, *unloadedOpaqueSection, 0}));
+    const auto plannedSurfaceBlock = world.findBlockIfLoaded(LOCAL_X, localSurfaceY, LOCAL_Z);
+    REQUIRE(plannedSurfaceBlock);
+    REQUIRE(isOpaque(*plannedSurfaceBlock));
+
+    int removedOpaqueBlocks = 0;
+    for (int32_t section = *unloadedOpaqueSection + 1; section <= WORLD_MAX_CHUNK_Y; ++section) {
+        if (!world.isChunkLoaded({0, section, 0}))
+            continue;
+        for (int localY = 0; localY < CHUNK_EDGE; ++localY) {
+            const int32_t worldY = section * CHUNK_EDGE + localY;
+            const auto block = world.findBlockIfLoaded(LOCAL_X, worldY, LOCAL_Z);
+            if (!block || !isOpaque(*block))
+                continue;
+            REQUIRE(world.trySetBlock(LOCAL_X, worldY, LOCAL_Z, BlockType::AIR));
+            ++removedOpaqueBlocks;
+        }
+    }
+    REQUIRE(removedOpaqueBlocks > 0);
+    MeshSnapshot incompleteLoweredCutoff;
+    REQUIRE_FALSE(world.snapshotForMeshing(target, incompleteLoweredCutoff));
+    REQUIRE_FALSE(world.isChunkLoaded({0, *unloadedOpaqueSection, 0}));
+
+    const int32_t maximumSurfaceSection =
+        Chunk::worldToChunkY(std::clamp(centerPlan->maximumSurfaceY(), WORLD_MIN_Y, WORLD_MAX_Y));
+    for (int32_t section = targetSection; section <= maximumSurfaceSection; ++section) {
+        REQUIRE(world.getChunk({0, section, 0}));
+    }
+
+    std::optional<int32_t> expectedCutoff;
+    for (int32_t worldY = maximumSurfaceSection * CHUNK_EDGE + CHUNK_EDGE - 1;
+         worldY >= targetSection * CHUNK_EDGE; --worldY) {
+        const auto block = world.findBlockIfLoaded(LOCAL_X, worldY, LOCAL_Z);
+        if (!block || !isOpaque(*block))
+            continue;
+        expectedCutoff = worldY + 1;
+        break;
+    }
+    REQUIRE(expectedCutoff);
+    MeshSnapshot loweredCutoff;
+    REQUIRE(world.snapshotForMeshing(target, loweredCutoff));
+    REQUIRE(loweredCutoff.skyCutoffAt(LOCAL_X, LOCAL_Z) == *expectedCutoff);
+}
+
+TEST_CASE("World withholds a first mesh until every sparse saved sky section is loaded",
+          "[world][snapshot][skylight][save][publication][regression]") {
+    TempDir directory("sparse_saved_skylight");
+    SaveManager saves(directory.path());
+    constexpr int32_t TARGET_SECTION = 4;
+    constexpr int32_t ROOF_SECTION = 20;
+    constexpr ChunkPos TARGET{0, TARGET_SECTION, 0};
+    constexpr ChunkPos ROOF{0, ROOF_SECTION, 0};
+
+    Chunk target(TARGET);
+    target.fill(BlockType::AIR);
+    target.generated = true;
+    saves.saveChunk(target);
+    Chunk roof(ROOF);
+    roof.fill(BlockType::AIR);
+    roof.setBlock(8, 8, 8, BlockType::STONE);
+    roof.generated = true;
+    saves.saveChunk(roof);
+    REQUIRE(saves.flush());
+
+    World world(42, 4);
+    world.setSaveManager(&saves);
+    REQUIRE(world.getChunk(TARGET));
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const ColumnPos column{offsetX, offsetZ};
+            const auto plan = world.generator().getColumnPlan(column);
+            REQUIRE(plan);
+            // This same-section halo also completes the empty save-manifest
+            // lookup for neighboring columns.
+            REQUIRE(world.getChunk({column.x, TARGET_SECTION, column.z}));
+            for (const int32_t section : plan->exposedSections()) {
+                if (section < TARGET_SECTION)
+                    continue;
+                REQUIRE(world.getChunk({column.x, section, column.z}));
+            }
+        }
+    }
+
+    MeshSnapshot missingRoof;
+    REQUIRE_FALSE(world.snapshotForMeshing(TARGET, missingRoof));
+    REQUIRE_FALSE(world.isChunkLoaded({0, 12, 0}));
+
+    REQUIRE(world.getChunk(ROOF));
+    MeshSnapshot firstVisible;
+    REQUIRE(world.snapshotForMeshing(TARGET, firstVisible));
+    REQUIRE(firstVisible.derivedSkyLightValid);
+    REQUIRE(firstVisible.skyCutoffAt(8, 8) == ROOF_SECTION * CHUNK_EDGE + 9);
+    REQUIRE_FALSE(world.isChunkLoaded({0, 12, 0}));
+
+    const auto firstVisibleLight = firstVisible.packedLight;
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    MeshSnapshot settled;
+    REQUIRE(world.snapshotForMeshing(TARGET, settled));
+    REQUIRE(settled.packedLight == firstVisibleLight);
+}
+
+TEST_CASE("Resident flora waits for saved sky authority before its first mesh",
+          "[world][snapshot][skylight][save][publication][flora][regression]") {
+    TempDir directory("resident_saved_skylight");
+    SaveManager saves(directory.path());
+    constexpr ChunkPos TARGET{0, WORLD_MAX_CHUNK_Y, 0};
+    constexpr int32_t TARGET_Y = WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8;
+    constexpr int64_t MOVED_CHUNK_X = 3;
+
+    Chunk saved(TARGET);
+    // Keep the saved plant in a sky-open stone shaft. When this column's
+    // manifest is unknown, authoritative skylight from the still-active east
+    // neighbor cannot leak sideways into the test cell and make the stale
+    // value depend on light-queue order.
+    saved.fill(BlockType::STONE);
+    for (int localY = 8; localY < CHUNK_EDGE; ++localY)
+        saved.setBlock(8, localY, 8, BlockType::AIR);
+    saved.setBlock(8, 7, 8, BlockType::GRASS);
+    saved.setBlock(8, 8, 8, BlockType::SHRUB);
+    saved.generated = true;
+    saves.saveChunk(saved);
+    REQUIRE(saves.flush());
+
+    World world(42, 4);
+    world.setExactStreamingDistance(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+    world.setSaveManager(&saves);
+    std::shared_ptr<Chunk> target;
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            REQUIRE(world.generator().getColumnPlan({offsetX, offsetZ}));
+            const std::shared_ptr<Chunk> resident = world.getChunk({offsetX, TARGET.y, offsetZ});
+            REQUIRE(resident);
+            if (offsetX == 0 && offsetZ == 0)
+                target = resident;
+        }
+    }
+    REQUIRE(target);
+    REQUIRE(target->getBlock(8, 8, 8) == BlockType::SHRUB);
+    REQUIRE(target->getSkyLight(8, 8, 8) == MAX_DERIVED_LIGHT_LEVEL);
+    REQUIRE(world.isChunkLoaded(TARGET));
+    world.generateAroundPlayer(0, TARGET_Y, 0);
+    REQUIRE(world.isChunkLoaded(TARGET));
+
+    // Moving the active manifest away while retaining the loaded cube is a
+    // production streaming state. Ordinary reconciliation removes its direct
+    // sky seed because the saved ceiling is unknown, but unloading has not run.
+    world.generateAroundPlayer(MOVED_CHUNK_X * CHUNK_EDGE, TARGET_Y, 0);
+    REQUIRE(target->generated);
+    REQUIRE(world.isChunkLoaded(TARGET));
+    for (int pass = 0; pass < 8; ++pass)
+        world.reconcileLight(64);
+    REQUIRE(world.isChunkLoaded(TARGET));
+    const uint8_t staleSky = target->getSkyLight(8, 8, 8);
+    REQUIRE(staleSky < MAX_DERIVED_LIGHT_LEVEL);
+
+    MeshSnapshot unknownManifest;
+    REQUIRE_FALSE(world.snapshotForMeshing(TARGET, unknownManifest));
+
+    // The return rebuild publishes the complete manifest in one bulk snapshot.
+    // The already resident cube must remain unavailable until its packed light
+    // catches up with that newly authoritative snapshot.
+    world.generateAroundPlayer(0, TARGET_Y, 0);
+    MeshSnapshot firstVisible;
+    bool ready = world.snapshotForMeshing(TARGET, firstVisible);
+    if (ready) {
+        // A lightly loaded worker set may finish the bounded publication
+        // transaction inside the active-set rebuild. It may publish only the
+        // final sky value, never the stale dim mesh from the prior manifest.
+        REQUIRE(firstVisible.skyLightAt(8, 8, 8) == MAX_DERIVED_LIGHT_LEVEL);
+    }
+    for (int pass = 0; pass < 32 && !ready; ++pass) {
+        world.reconcileLight(32);
+        ready = world.snapshotForMeshing(TARGET, firstVisible);
+    }
+    REQUIRE(ready);
+    REQUIRE(firstVisible.derivedSkyLightValid);
+    REQUIRE(firstVisible.skyLightAt(8, 8, 8) == MAX_DERIVED_LIGHT_LEVEL);
+
+    MeshScratch scratch;
+    const MeshOutput firstMesh = LODMesher::buildMesh(firstVisible, scratch);
+    int shrubVertices = 0;
+    for (const Vertex& vertex : firstMesh.vertices) {
+        if (unpackTextureLayer(vertex.faceAttr) != static_cast<uint8_t>(BlockType::SHRUB)) {
+            continue;
+        }
+        ++shrubVertices;
+        REQUIRE(unpackFace(vertex.faceAttr) == FaceNormal::CROSS);
+        REQUIRE(unpackSkyLight(vertex.faceAttr) == MAX_DERIVED_LIGHT_LEVEL);
+    }
+    REQUIRE(shrubVertices > 0);
+
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    MeshSnapshot settled;
+    REQUIRE(world.snapshotForMeshing(TARGET, settled));
+    REQUIRE(settled.packedLight == firstVisible.packedLight);
+    const MeshOutput settledMesh = LODMesher::buildMesh(settled, scratch);
+    REQUIRE(settledMesh.vertices.size() == firstMesh.vertices.size());
+    REQUIRE(std::memcmp(settledMesh.vertices.data(), firstMesh.vertices.data(),
+                        firstMesh.vertices.size() * sizeof(Vertex)) == 0);
+    REQUIRE(settledMesh.indices == firstMesh.indices);
 }
 
 TEST_CASE("World caches cubes by X Y and Z", "[world]") {
@@ -1482,6 +2253,139 @@ TEST_CASE("Exact streaming priority preserves camera lanes across cold work and 
     REQUIRE(exactStreamingTaskPriority(EPOCH, 6, 4) > exactStreamingTaskPriority(EPOCH, 6, 64));
     REQUIRE(exactStreamingTaskPriority(EPOCH + 1, 3, 4'096) >
             exactStreamingTaskPriority(EPOCH, 7, 0));
+
+    // Broad and medium work never occupy every exact worker. A newly queued
+    // camera epoch can therefore begin without waiting for a complete stale
+    // generation wave to finish.
+    STATIC_REQUIRE(exactStreamingPlanSubmissionLimit(EXACT_STREAMING_SURFACE_PRIORITY_LANE) == 2);
+    STATIC_REQUIRE(exactStreamingPlanSubmissionLimit(EXACT_STREAMING_EDITED_PRIORITY_LANE) == 2);
+    STATIC_REQUIRE(exactStreamingPlanSubmissionLimit(EXACT_STREAMING_EXPLORATION_PRIORITY_LANE) ==
+                   3);
+    STATIC_REQUIRE(exactStreamingPlanSubmissionLimit(EXACT_STREAMING_CAMERA_PRIORITY_LANE) ==
+                   MAX_COLD_COLUMN_PLANS);
+    STATIC_REQUIRE(exactStreamingCubeSubmissionLimit(EXACT_STREAMING_SURFACE_PRIORITY_LANE) == 3);
+    STATIC_REQUIRE(exactStreamingCubeSubmissionLimit(EXACT_STREAMING_EDITED_PRIORITY_LANE) == 3);
+    STATIC_REQUIRE(exactStreamingCubeSubmissionLimit(EXACT_STREAMING_EXPLORATION_PRIORITY_LANE) ==
+                   4);
+    STATIC_REQUIRE(exactStreamingCubeSubmissionLimit(EXACT_STREAMING_CAMERA_PRIORITY_LANE) ==
+                   EXACT_GENERATION_SUBMISSION_LIMIT);
+    STATIC_REQUIRE(exactStreamingPlanSubmissionLimit(EXACT_STREAMING_EDITED_PRIORITY_LANE) +
+                       exactStreamingCubeSubmissionLimit(EXACT_STREAMING_EDITED_PRIORITY_LANE) <
+                   EXACT_GENERATION_WORKER_COUNT);
+
+    constexpr ChunkPos LIGHT_CENTER{200, 8, -300};
+    STATIC_REQUIRE(exactPublicationLightPriority(LIGHT_CENTER, LIGHT_CENTER) >
+                   exactPublicationLightPriority(
+                       {LIGHT_CENTER.x + 20, LIGHT_CENTER.y, LIGHT_CENTER.z}, LIGHT_CENTER));
+    STATIC_REQUIRE(exactPublicationLightPriority(
+                       {LIGHT_CENTER.x + 1, LIGHT_CENTER.y, LIGHT_CENTER.z}, LIGHT_CENTER) >
+                   exactPublicationLightPriority(
+                       {LIGHT_CENTER.x + 1, LIGHT_CENTER.y + 20, LIGHT_CENTER.z}, LIGHT_CENTER));
+}
+
+TEST_CASE("Airborne exact streaming prioritizes the surface below negative movement",
+          "[world][streaming][priority][collision][flight][regression]") {
+    STATIC_REQUIRE(exactStreamingSurfacePriorityLane(0, 0) == EXACT_STREAMING_CAMERA_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingPrimarySurfacePriorityLane(0, 0) ==
+                   EXACT_STREAMING_CAMERA_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingSurfacePriorityLane(-EXPLORATION_RADIUS_CHUNKS, 0) ==
+                   EXACT_STREAMING_EXPLORATION_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingSurfacePriorityLane(0, -EXPLORATION_RADIUS_CHUNKS) ==
+                   EXACT_STREAMING_EXPLORATION_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingSurfacePriorityLane(-EXPLORATION_RADIUS_CHUNKS, -1) ==
+                   EXACT_STREAMING_EDITED_PRIORITY_LANE);
+    STATIC_REQUIRE(
+        exactStreamingSurfacePriorityLane(EXACT_STREAMING_REQUIRED_SURFACE_PRIORITY_RADIUS_CHUNKS,
+                                          0) == EXACT_STREAMING_EDITED_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingSurfacePriorityLane(
+                       EXACT_STREAMING_REQUIRED_SURFACE_PRIORITY_RADIUS_CHUNKS + 1, 0) ==
+                   EXACT_STREAMING_SURFACE_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingPrimarySurfacePriorityLane(
+                       EXACT_STREAMING_REQUIRED_SURFACE_PRIORITY_RADIUS_CHUNKS + 1, 0) ==
+                   EXACT_STREAMING_PRIMARY_SURFACE_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingFloraPriorityLane(0, 0) == EXACT_STREAMING_CAMERA_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingFloraPriorityLane(EXPLORATION_RADIUS_CHUNKS, 0) ==
+                   EXACT_STREAMING_EXPLORATION_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingFloraPriorityLane(EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS,
+                                                   0) == EXACT_STREAMING_FLORA_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingFloraPriorityLane(EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS + 1,
+                                                   0) == EXACT_STREAMING_SURFACE_PRIORITY_LANE);
+
+    constexpr uint64_t EPOCH = 91;
+    constexpr uint64_t MAXIMUM_VERTICAL_DISTANCE_SQUARED =
+        static_cast<uint64_t>(WORLD_VERTICAL_CHUNKS) * WORLD_VERTICAL_CHUNKS;
+    const int64_t surfaceBelowCamera = exactStreamingTaskPriority(
+        EPOCH, exactStreamingSurfacePriorityLane(0, 0), MAXIMUM_VERTICAL_DISTANCE_SQUARED);
+    const int64_t optionalAirborneNeighbor =
+        exactStreamingTaskPriority(EPOCH, EXACT_STREAMING_EXPLORATION_PRIORITY_LANE, 0);
+    const int64_t explorationSurface = exactStreamingTaskPriority(
+        EPOCH, exactStreamingSurfacePriorityLane(-EXPLORATION_RADIUS_CHUNKS, 0),
+        MAXIMUM_VERTICAL_DISTANCE_SQUARED);
+    const int64_t broadPrimary =
+        exactStreamingTaskPriority(EPOCH, EXACT_STREAMING_PRIMARY_SURFACE_PRIORITY_LANE, 0);
+
+    REQUIRE(surfaceBelowCamera > optionalAirborneNeighbor);
+    REQUIRE(explorationSurface > broadPrimary);
+    REQUIRE(exactStreamingTaskPriority(
+                EPOCH,
+                exactStreamingFloraPriorityLane(EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS, 0),
+                EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS *
+                    EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS) >
+            exactStreamingTaskPriority(
+                EPOCH, EXACT_STREAMING_PRIMARY_SURFACE_PRIORITY_LANE,
+                (EXACT_STREAMING_REQUIRED_SURFACE_PRIORITY_RADIUS_CHUNKS + 1) *
+                    (EXACT_STREAMING_REQUIRED_SURFACE_PRIORITY_RADIUS_CHUNKS + 1)));
+    REQUIRE(
+        exactStreamingTaskPriority(EPOCH,
+                                   exactStreamingSurfacePriorityLane(
+                                       EXACT_STREAMING_REQUIRED_SURFACE_PRIORITY_RADIUS_CHUNKS, 0),
+                                   MAXIMUM_VERTICAL_DISTANCE_SQUARED) >
+        exactStreamingTaskPriority(
+            EPOCH, exactStreamingFloraPriorityLane(EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS, 0),
+            0));
+}
+
+TEST_CASE("Complete exact disk surfaces retain protected multi-section priority",
+          "[world][streaming][priority][surface][exact-disk][multi-section][regression]") {
+    constexpr uint64_t EPOCH = 117;
+    constexpr int EDGE_DX = EXACT_STREAMING_REQUIRED_SURFACE_PRIORITY_RADIUS_CHUNKS;
+    constexpr int OUTSIDE_DX = EXACT_STREAMING_REQUIRED_SURFACE_PRIORITY_RADIUS_CHUNKS + 1;
+    STATIC_REQUIRE(EDGE_DX == MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
+    STATIC_REQUIRE(exactStreamingSurfacePriorityLane(EDGE_DX, 0) ==
+                   EXACT_STREAMING_EDITED_PRIORITY_LANE);
+    STATIC_REQUIRE(exactStreamingPrimarySurfacePriorityLane(EDGE_DX, 0) ==
+                   exactStreamingSurfacePriorityLane(EDGE_DX, 0));
+    STATIC_REQUIRE(exactStreamingPrimarySurfacePriorityLane(OUTSIDE_DX, 0) ==
+                   EXACT_STREAMING_PRIMARY_SURFACE_PRIORITY_LANE);
+
+    const int64_t outsidePrimary = exactStreamingTaskPriority(
+        EPOCH, exactStreamingPrimarySurfacePriorityLane(OUTSIDE_DX, 0), 0);
+    constexpr std::array<int32_t, 4> EDGE_SURFACE_SECTIONS{-8, 0, 24, 87};
+    for (const int32_t section : EDGE_SURFACE_SECTIONS) {
+        const int64_t verticalDistance = static_cast<int64_t>(section) - 40;
+        const uint64_t distanceSquared =
+            static_cast<uint64_t>(EDGE_DX * EDGE_DX) +
+            static_cast<uint64_t>(verticalDistance * verticalDistance) * 2U;
+        CAPTURE(section, distanceSquared);
+        const int64_t required = exactStreamingTaskPriority(
+            EPOCH, exactStreamingSurfacePriorityLane(EDGE_DX, 0), distanceSquared);
+        REQUIRE(required > outsidePrimary);
+        REQUIRE(required ==
+                exactStreamingTaskPriority(
+                    EPOCH, exactStreamingPrimarySurfacePriorityLane(EDGE_DX, 0), distanceSquared));
+    }
+
+    constexpr ChunkPos CENTER{0, 40, 0};
+    constexpr ChunkPos NEAR_TALL{7, WORLD_MAX_CHUNK_Y, 0};
+    constexpr ChunkPos FAR_FLAT{EDGE_DX, CENTER.y, 0};
+    STATIC_REQUIRE(exactStreamingCubePriorityDistance(NEAR_TALL, CENTER) <
+                   exactStreamingCubePriorityDistance(FAR_FLAT, CENTER));
+    STATIC_REQUIRE(
+        exactStreamingTaskPriority(EPOCH,
+                                   exactStreamingSurfacePriorityLane(NEAR_TALL.x, NEAR_TALL.z),
+                                   exactStreamingCubePriorityDistance(NEAR_TALL, CENTER)) >
+        exactStreamingTaskPriority(EPOCH, exactStreamingSurfacePriorityLane(FAR_FLAT.x, FAR_FLAT.z),
+                                   exactStreamingCubePriorityDistance(FAR_FLAT, CENTER)));
 }
 
 TEST_CASE("Stale column plans requeue when a camera jump requires them again",
@@ -1492,6 +2396,25 @@ TEST_CASE("Stale column plans requeue when a camera jump requires them again",
     REQUIRE(columnPlanCompletionAction(false, false, true, true) == Action::DROP);
     REQUIRE(columnPlanCompletionAction(false, false, false, false) == Action::DROP);
     REQUIRE(columnPlanCompletionAction(false, true, true, false) == Action::DROP);
+}
+
+TEST_CASE("Deferred column plan retries wait for prior future reaping",
+          "[world][streaming][generator-v4][cold-start][regression]") {
+    using Action = ColumnPlanRetryPublicationAction;
+
+    // The worker may have recorded a retry and released its function body,
+    // but a concurrent preparation pump must retain the active reservation
+    // until the corresponding future itself reports ready.
+    REQUIRE(columnPlanRetryPublicationAction(false, true, true, false, false, true) ==
+            Action::HOLD);
+    REQUIRE(columnPlanRetryPublicationAction(true, true, true, false, false, true) ==
+            Action::REQUEUE);
+    REQUIRE(columnPlanRetryPublicationAction(true, true, false, false, false, true) ==
+            Action::DROP);
+    REQUIRE(columnPlanRetryPublicationAction(true, true, true, true, false, true) == Action::DROP);
+    REQUIRE(columnPlanRetryPublicationAction(true, true, true, false, true, true) == Action::DROP);
+    REQUIRE(columnPlanRetryPublicationAction(true, true, true, false, false, false) ==
+            Action::DROP);
 }
 
 TEST_CASE("World loads a saved cubic edit before generation", "[world][save]") {
@@ -1511,13 +2434,162 @@ TEST_CASE("World loads a saved cubic edit before generation", "[world][save]") {
 
 TEST_CASE("World streaming remains within the cubic loaded cap", "[world][async]") {
     World world(42, 1);
+    REQUIRE_FALSE(world.exactSpawnBandReady(0, SEA_LEVEL, 0, 0));
     world.updatePlayerPosition(0, SEA_LEVEL, 0);
-    for (int attempt = 0; attempt < 1000 && world.getPendingChunkCount() > 0; ++attempt) {
+    for (int attempt = 0; attempt < 2000 && !world.exactSpawnBandReady(0, SEA_LEVEL, 0, 0);
+         ++attempt) {
+        world.updatePlayerPosition(0, SEA_LEVEL, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     REQUIRE(world.getLoadedChunkCount() <= MAX_LOADED_CUBES);
     REQUIRE(world.getLoadedChunkCount() > 0);
     REQUIRE(world.getStreamingWorkStats().loadedCubeHighWater <= MAX_LOADED_CUBES);
+    REQUIRE(world.exactSpawnBandReady(0, SEA_LEVEL, 0, 0));
+    const std::optional<Vec3> safeSpawn = world.safeSpawnFromReadyPlans(0, 0, 0);
+    REQUIRE(safeSpawn);
+    const int64_t spawnX = static_cast<int64_t>(std::floor(safeSpawn->x));
+    const int32_t spawnY = static_cast<int32_t>(std::floor(safeSpawn->y));
+    const int64_t spawnZ = static_cast<int64_t>(std::floor(safeSpawn->z));
+    REQUIRE_FALSE(isSolid(world.getBlockIfLoaded(spawnX, spawnY, spawnZ)));
+    REQUIRE_FALSE(isSolid(world.getBlockIfLoaded(spawnX, spawnY + 1, spawnZ)));
+    REQUIRE(safeSpawn->y > WORLD_MIN_Y);
+    REQUIRE(safeSpawn->y < WORLD_MAX_Y);
+}
+
+TEST_CASE("Playable spawn waits for its complete closed-collision halo",
+          "[world][spawn][streaming][collision][regression]") {
+    World world(42, 1);
+    constexpr int64_t spawnX = -1;
+    constexpr int32_t spawnY = 200;
+    constexpr int64_t spawnZ = -1;
+    const ChunkPos center{Chunk::worldToChunk(spawnX), Chunk::worldToChunkY(spawnY),
+                          Chunk::worldToChunk(spawnZ)};
+    const ChunkPos finalNeighbor{center.x + PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS,
+                                 center.y + PLAYABLE_SPAWN_COLLISION_VERTICAL_HALO_CUBES,
+                                 center.z + PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS};
+
+    REQUIRE_FALSE(world.playableSpawnCollisionReady(spawnX, spawnY, spawnZ));
+    for (int offsetZ = -PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS;
+         offsetZ <= PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS; ++offsetZ) {
+        for (int offsetX = -PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS;
+             offsetX <= PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS; ++offsetX) {
+            for (int offsetY = -PLAYABLE_SPAWN_COLLISION_VERTICAL_HALO_CUBES;
+                 offsetY <= PLAYABLE_SPAWN_COLLISION_VERTICAL_HALO_CUBES; ++offsetY) {
+                const ChunkPos position{center.x + offsetX, center.y + offsetY, center.z + offsetZ};
+                if (position == finalNeighbor)
+                    continue;
+                REQUIRE(world.getChunk(position));
+            }
+        }
+    }
+
+    REQUIRE_FALSE(world.isChunkLoaded(finalNeighbor));
+    REQUIRE_FALSE(world.playableSpawnCollisionReady(spawnX, spawnY, spawnZ));
+    REQUIRE(world.getChunk(finalNeighbor));
+    REQUIRE(world.playableSpawnCollisionReady(spawnX, spawnY, spawnZ));
+}
+
+TEST_CASE("Cold radius-zero streaming generates the playable collision halo",
+          "[world][spawn][streaming][collision][cold-start][regression]") {
+    STATIC_REQUIRE(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS == 0);
+    STATIC_REQUIRE(exactStreamingActiveSetRadiusChunks(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS) ==
+                   1);
+
+    World world(42, 1);
+    REQUIRE_FALSE(world.generationContext());
+    world.setExactStreamingDistance(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+
+    constexpr int64_t spawnX = -1;
+    constexpr int32_t spawnY = 200;
+    constexpr int64_t spawnZ = -1;
+    const ChunkPos center{Chunk::worldToChunk(spawnX), Chunk::worldToChunkY(spawnY),
+                          Chunk::worldToChunk(spawnZ)};
+
+    world.updatePlayerPosition(spawnX, spawnY, spawnZ);
+    for (int attempt = 0;
+         attempt < 2'000 && !world.playableSpawnCollisionReady(spawnX, spawnY, spawnZ); ++attempt) {
+        world.updatePlayerPosition(spawnX, spawnY, spawnZ);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    REQUIRE(world.playableSpawnCollisionReady(spawnX, spawnY, spawnZ));
+    size_t residentHaloCubes = 0;
+    for (int offsetZ = -PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS;
+         offsetZ <= PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS; ++offsetZ) {
+        for (int offsetX = -PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS;
+             offsetX <= PLAYABLE_SPAWN_COLLISION_HORIZONTAL_HALO_CHUNKS; ++offsetX) {
+            for (int offsetY = -PLAYABLE_SPAWN_COLLISION_VERTICAL_HALO_CUBES;
+                 offsetY <= PLAYABLE_SPAWN_COLLISION_VERTICAL_HALO_CUBES; ++offsetY) {
+                const ChunkPos position{center.x + offsetX, center.y + offsetY, center.z + offsetZ};
+                CAPTURE(position.x, position.y, position.z);
+                REQUIRE(world.isChunkLoaded(position));
+                ++residentHaloCubes;
+            }
+        }
+    }
+    REQUIRE(residentHaloCubes == 27);
+}
+
+TEST_CASE("Safe spawn rejects lava in both breathing cells", "[world][spawn][lava][regression]") {
+    World world(42, 1);
+    world.updatePlayerPosition(0, SEA_LEVEL, 0);
+    for (int attempt = 0;
+         attempt < 2000 &&
+         !world.exactSpawnBandReady(0, SEA_LEVEL, 0, COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+         ++attempt) {
+        world.updatePlayerPosition(0, SEA_LEVEL, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    REQUIRE(world.exactSpawnBandReady(0, SEA_LEVEL, 0, COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS));
+    REQUIRE(world.safeSpawnFromReadyPlans(0, 0, 0));
+
+    const std::shared_ptr<const ColumnPlan> plan = world.generator().findColumnPlan({0, 0});
+    REQUIRE(plan);
+    struct SpawnCellPair {
+        std::shared_ptr<Chunk> chunk;
+        int64_t x = 0;
+        int32_t feetY = 0;
+        int64_t z = 0;
+        BlockType feet = BlockType::AIR;
+        BlockType head = BlockType::AIR;
+    };
+    std::vector<SpawnCellPair> cells;
+    cells.reserve(CHUNK_EDGE * CHUNK_EDGE);
+    for (int64_t z = 0; z < CHUNK_EDGE; ++z) {
+        for (int64_t x = 0; x < CHUNK_EDGE; ++x) {
+            const worldgen::SurfaceSample sample =
+                plan->sample(static_cast<int>(x), static_cast<int>(z));
+            const int32_t feetY = static_cast<int32_t>(std::ceil(sample.terrainHeight));
+            REQUIRE(feetY >= WORLD_MIN_Y + 1);
+            REQUIRE(feetY + 1 <= WORLD_MAX_Y);
+            const ChunkPos cubePosition{x / CHUNK_EDGE, Chunk::worldToChunkY(feetY),
+                                        z / CHUNK_EDGE};
+            REQUIRE(world.isChunkLoaded(cubePosition));
+            std::shared_ptr<Chunk> chunk = world.getChunk(cubePosition);
+            REQUIRE(chunk);
+            const std::optional<BlockType> feet = world.findBlockIfLoaded(x, feetY, z);
+            const std::optional<BlockType> head = world.findBlockIfLoaded(x, feetY + 1, z);
+            REQUIRE(feet);
+            REQUIRE(head);
+            cells.push_back({chunk, x, feetY, z, *feet, *head});
+        }
+    }
+
+    for (const SpawnCellPair& cell : cells) {
+        cell.chunk->setBlockWorld(cell.x, cell.feetY, cell.z, BlockType::LAVA);
+    }
+    REQUIRE_FALSE(world.safeSpawnFromReadyPlans(0, 0, 0));
+
+    for (const SpawnCellPair& cell : cells) {
+        cell.chunk->setBlockWorld(cell.x, cell.feetY, cell.z, cell.feet);
+        cell.chunk->setBlockWorld(cell.x, cell.feetY + 1, cell.z, BlockType::LAVA);
+    }
+    REQUIRE_FALSE(world.safeSpawnFromReadyPlans(0, 0, 0));
+
+    for (const SpawnCellPair& cell : cells) {
+        cell.chunk->setBlockWorld(cell.x, cell.feetY + 1, cell.z, cell.head);
+    }
+    REQUIRE(world.safeSpawnFromReadyPlans(0, 0, 0));
 }
 
 TEST_CASE("World rejects synchronous cube admission at its configured hard cap",
@@ -1548,6 +2620,29 @@ TEST_CASE("Exact priority metadata survives a cap too small for complete mesh ha
     REQUIRE_NOTHROW(world.generateAroundPlayer(0, SEA_LEVEL, 0));
     REQUIRE(world.getLoadedChunkCount() <= TINY_CAP);
     REQUIRE(world.getStreamingWorkStats().loadedCubeHighWater <= TINY_CAP);
+}
+
+TEST_CASE("World teardown drains queued plans and chunks across repeated worlds",
+          "[world][streaming][thread][shutdown][regression]") {
+    constexpr int WORLD_COUNT = 12;
+    constexpr int64_t WORLD_SPACING_CHUNKS = 16;
+    for (int index = 0; index < WORLD_COUNT; ++index) {
+        INFO("world iteration=" << index);
+        auto world = std::make_unique<World>(42 + static_cast<uint64_t>(index),
+                                             MIN_RENDER_DISTANCE_CHUNKS, 64);
+        const int64_t centerChunkX = static_cast<int64_t>(index) * WORLD_SPACING_CHUNKS;
+        const int64_t centerBlockX = centerChunkX * CHUNK_EDGE;
+
+        // A cached owning plan lets non-surface cubes enter the generation
+        // backlog immediately. The other worlds begin with plan work only, so
+        // repeated teardown covers both scheduler phases without test hooks.
+        if (index == 1) {
+            REQUIRE(world->generator().getColumnPlan({centerChunkX, 0}));
+        }
+        world->generateAroundPlayer(centerBlockX, SEA_LEVEL, 0);
+        REQUIRE(world->getPendingChunkCount() > 0);
+        REQUIRE_NOTHROW(world.reset());
+    }
 }
 
 TEST_CASE("Concurrent cube admission cannot race past the loaded hard cap",
@@ -1584,7 +2679,7 @@ TEST_CASE("Column plan completions wake only registered cube dependencies",
     world.updatePlayerPosition(0, SEA_LEVEL, 0);
 
     StreamingWorkStats work;
-    for (int attempt = 0; attempt < 2000; ++attempt) {
+    for (int attempt = 0; attempt < 3000; ++attempt) {
         work = world.getStreamingWorkStats();
         if (work.completedColumnPlans >= COLUMN_PLAN_REBUILD_BATCH)
             break;
@@ -1659,7 +2754,10 @@ TEST_CASE("Cubic streaming unload hysteresis does not add mesh candidates",
     World world(42, MIN_RENDER_DISTANCE_CHUNKS);
     constexpr int32_t INITIAL_BLOCK_Y = 400;
     constexpr int32_t initialY = INITIAL_BLOCK_Y / CHUNK_EDGE;
-    constexpr ChunkPos horizontalEdge{-EXPLORATION_RADIUS_CHUNKS - 1, initialY, 0};
+    constexpr int retainedHorizontalRadius =
+        exactStreamingActiveSetRadiusChunks(MIN_RENDER_DISTANCE_CHUNKS) +
+        EXACT_STREAMING_HORIZONTAL_MESH_HALO_CHUNKS;
+    constexpr ChunkPos horizontalEdge{-retainedHorizontalRadius, initialY, 0};
     constexpr ChunkPos verticalEdge{0, initialY + EXPLORATION_VERTICAL_RADIUS_CUBES + 1, 0};
 
     world.generateAroundPlayer(0, INITIAL_BLOCK_Y, 0);
@@ -1683,7 +2781,8 @@ TEST_CASE("Cubic streaming unload hysteresis does not add mesh candidates",
 
 TEST_CASE("The underground exploration band is a hard mesh and retention priority",
           "[world][streaming][priority]") {
-    World world(42, MIN_RENDER_DISTANCE_CHUNKS);
+    World world(42, EXPLORATION_RADIUS_CHUNKS, MAX_LOADED_CUBES,
+                GenerationSettings{.structures = false});
     constexpr int32_t centerY = SEA_LEVEL / CHUNK_EDGE;
     constexpr ChunkPos retainedEdge{EXPLORATION_RADIUS_CHUNKS, centerY, 0};
     REQUIRE(world.getChunk(retainedEdge));
@@ -1705,6 +2804,109 @@ TEST_CASE("The underground exploration band is a hard mesh and retention priorit
     }
 }
 
+TEST_CASE("Active streaming completes deep sky authority before the first underground mesh",
+          "[world][streaming][light][skylight][publication][regression]") {
+    // Clamp this scheduling fixture's visible horizon at the exploration
+    // boundary. The production release request below is still the full exact
+    // distance, while unrelated outer-disk surface work cannot dominate the
+    // bounded regression.
+    World world(42, EXPLORATION_RADIUS_CHUNKS);
+    world.setExactStreamingDistance(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+    const auto centerPlan = world.generator().getColumnPlan({0, 0});
+    REQUIRE(centerPlan);
+
+    const int32_t surfaceSection = Chunk::worldToChunkY(centerPlan->minimumSurfaceY());
+    const int32_t cameraSection = surfaceSection - EXPLORATION_VERTICAL_RADIUS_CUBES - 2;
+    REQUIRE(cameraSection >= WORLD_MIN_CHUNK_Y);
+    const int32_t cameraY = cameraSection * CHUNK_EDGE + CHUNK_EDGE / 2;
+    constexpr int64_t cameraX = CHUNK_EDGE / 2;
+    constexpr int64_t cameraZ = CHUNK_EDGE / 2;
+    const ChunkPos target{0, cameraSection, 0};
+
+    const auto streamingStart = std::chrono::steady_clock::now();
+    world.updatePlayerPosition(cameraX, cameraY, cameraZ);
+    MeshSnapshot firstVisible;
+    bool ready = false;
+    for (int attempt = 0; attempt < 20'000; ++attempt) {
+        world.updatePlayerPosition(cameraX, cameraY, cameraZ);
+        if (world.shouldMeshChunk(target) && world.snapshotForMeshing(target, firstVisible)) {
+            ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    INFO("loaded=" << world.getLoadedChunkCount() << " pending=" << world.getPendingChunkCount()
+                   << " publication="
+                   << world.getStreamingWorkStats().publicationLightDeferredQueue);
+    const double centerReadySeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - streamingStart).count();
+    const StreamingWorkStats centerStats = world.getStreamingWorkStats();
+    CAPTURE(centerReadySeconds, centerStats.loadedCubeHighWater,
+            centerStats.publicationLightDeferredQueue, world.getLoadedChunkCount(),
+            world.getPendingChunkCount());
+    REQUIRE(ready);
+    REQUIRE(firstVisible.derivedSkyLightValid);
+    REQUIRE(world.getLoadedChunkCount() < 2'048);
+    REQUIRE(world.getStreamingWorkStats().loadedCubeHighWater <= MAX_LOADED_CUBES);
+
+    const auto firstVisibleLight = firstVisible.packedLight;
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    MeshSnapshot settled;
+    REQUIRE(world.snapshotForMeshing(target, settled));
+    REQUIRE(settled.packedLight == firstVisibleLight);
+
+    // The active-set radius and priority-lane assertions keep the x=7 meshing
+    // halo ahead of broad surface work. Exercise publication there with
+    // bounded direct loads instead of timing it behind every nearer
+    // asynchronous exploration job.
+    const ChunkPos explorationEdge{EXPLORATION_RADIUS_CHUNKS, cameraSection, 0};
+    const ChunkPos explorationHalo{EXPLORATION_RADIUS_CHUNKS + 1, cameraSection, 0};
+    STATIC_REQUIRE(exactStreamingActiveSetRadiusChunks(EXPLORATION_RADIUS_CHUNKS) ==
+                   EXPLORATION_RADIUS_CHUNKS + 1);
+    STATIC_REQUIRE(exactStreamingTaskPriority(0, 6, 49) > exactStreamingTaskPriority(0, 4, 0));
+    REQUIRE(withinExactStreamingRadius(EXPLORATION_RADIUS_CHUNKS, 0, EXPLORATION_RADIUS_CHUNKS));
+    const auto edgeStart = std::chrono::steady_clock::now();
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const ColumnPos column{explorationEdge.x + offsetX, explorationEdge.z + offsetZ};
+            const auto plan = world.generator().getColumnPlan(column);
+            REQUIRE(plan);
+            REQUIRE(world.getChunk({column.x, cameraSection, column.z}));
+            for (const int32_t section : plan->exposedSections()) {
+                if (section >= cameraSection) {
+                    REQUIRE(world.getChunk({column.x, section, column.z}));
+                }
+            }
+        }
+    }
+
+    MeshSnapshot edgeFirstVisible;
+    REQUIRE(world.snapshotForMeshing(explorationEdge, edgeFirstVisible));
+    const double targetedEdgeSeconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - edgeStart).count();
+    const StreamingWorkStats edgeStats = world.getStreamingWorkStats();
+    CAPTURE(centerReadySeconds, targetedEdgeSeconds, edgeStats.completedColumnPlans,
+            edgeStats.activeSetRebuilds, edgeStats.activeSetRequests,
+            edgeStats.activeSetRequestsCoalesced, edgeStats.activeSetBuildsCanceled,
+            edgeStats.loadedCubeAdmissionsRejected, world.getLoadedChunkCount(),
+            world.getPendingChunkCount());
+    REQUIRE(world.getExactViewDistance() == COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+    REQUIRE_FALSE(world.generationFailure());
+    REQUIRE(edgeFirstVisible.derivedSkyLightValid);
+    REQUIRE(world.isChunkLoaded(explorationHalo));
+    REQUIRE(edgeStats.loadedCubeAdmissionsRejected == 0);
+    REQUIRE(edgeStats.loadedCubeHighWater <= MAX_LOADED_CUBES);
+
+    const auto edgeFirstVisibleLight = edgeFirstVisible.packedLight;
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    MeshSnapshot edgeSettled;
+    REQUIRE(world.snapshotForMeshing(explorationEdge, edgeSettled));
+    REQUIRE(edgeSettled.packedLight == edgeFirstVisibleLight);
+}
+
 TEST_CASE("Visible distance does not expand exact cubic simulation beyond 32 chunks",
           "[world][streaming][lod]") {
     World world(42, MAX_RENDER_DISTANCE_CHUNKS);
@@ -1722,6 +2924,139 @@ TEST_CASE("Visible distance does not expand exact cubic simulation beyond 32 chu
     world.setViewDistance(1);
     REQUIRE(world.getViewDistance() == MIN_RENDER_DISTANCE_CHUNKS);
     REQUIRE(world.getExactViewDistance() == MIN_RENDER_DISTANCE_CHUNKS);
+}
+
+TEST_CASE("Exact collision publication rejects stale coverage epochs",
+          "[world][streaming][collision][exact-ownership][epoch][regression]") {
+    World world(42, 4);
+    constexpr int64_t WORLD_X = 8;
+    constexpr int64_t WORLD_Z = 8;
+    constexpr ColumnPos COLUMN{0, 0};
+    const auto plan = world.generator().getColumnPlan(COLUMN);
+    REQUIRE(plan);
+    const int32_t surfaceY = plan->surfaceY(8, 8);
+    const ChunkPos surfaceSection{COLUMN.x, Chunk::worldToChunkY(surfaceY), COLUMN.z};
+    REQUIRE(world.getChunk(surfaceSection));
+    world.setBlock(WORLD_X, surfaceY, WORLD_Z, BlockType::AIR);
+    REQUIRE(world.findBlockIfLoaded(WORLD_X, surfaceY, WORLD_Z) == BlockType::AIR);
+
+    const auto coverage = world.getExactSurfaceCoverageSnapshot();
+    REQUIRE(coverage);
+    const uint64_t staleEpoch = coverage->epoch == std::numeric_limits<uint64_t>::max()
+                                    ? coverage->epoch - 1
+                                    : coverage->epoch + 1;
+    const std::array sections{surfaceSection};
+    REQUIRE_FALSE(world.publishExactCollisionOwnership(staleEpoch, sections));
+    REQUIRE(world.getExactCollisionOwnershipSnapshot()->sections.empty());
+
+    // Loaded exact air cannot open the canonical surface until the same
+    // coverage epoch publishes the exact section.
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, surfaceY, WORLD_Z) == BlockType::STONE);
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, surfaceY + 1, WORLD_Z) == BlockType::AIR);
+}
+
+TEST_CASE("Published exact collision sections use loaded blocks and close missing cubes",
+          "[world][streaming][collision][exact-ownership][publication][regression]") {
+    World world(42, 4);
+    constexpr int64_t WORLD_X = 8;
+    constexpr int64_t WORLD_Z = 8;
+    constexpr ColumnPos COLUMN{0, 0};
+    const auto plan = world.generator().getColumnPlan(COLUMN);
+    REQUIRE(plan);
+    const int32_t surfaceY = plan->surfaceY(8, 8);
+    const ChunkPos surfaceSection{COLUMN.x, Chunk::worldToChunkY(surfaceY), COLUMN.z};
+    REQUIRE(world.getChunk(surfaceSection));
+    world.setBlock(WORLD_X, surfaceY, WORLD_Z, BlockType::AIR);
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, surfaceY, WORLD_Z) == BlockType::STONE);
+
+    const int32_t missingSectionY = surfaceSection.y + 2;
+    REQUIRE(missingSectionY >= WORLD_MIN_CHUNK_Y);
+    REQUIRE(missingSectionY <= WORLD_MAX_CHUNK_Y);
+    const int32_t missingWorldY = missingSectionY * CHUNK_EDGE + CHUNK_EDGE / 2;
+    REQUIRE(missingWorldY > surfaceY);
+    REQUIRE_FALSE(world.isChunkLoaded({COLUMN.x, missingSectionY, COLUMN.z}));
+
+    const auto coverage = world.getExactSurfaceCoverageSnapshot();
+    REQUIRE(coverage);
+    const std::array sections{surfaceSection, ChunkPos{COLUMN.x, missingSectionY, COLUMN.z}};
+    REQUIRE(world.publishExactCollisionOwnership(coverage->epoch, sections));
+    const auto publication = world.getExactCollisionOwnershipSnapshot();
+    REQUIRE(publication->coverageEpoch == coverage->epoch);
+    REQUIRE(publication->owns(surfaceSection));
+    REQUIRE(publication->owns({COLUMN.x, missingSectionY, COLUMN.z}));
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, surfaceY, WORLD_Z) == BlockType::AIR);
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, missingWorldY, WORLD_Z) == BlockType::BEDROCK);
+}
+
+TEST_CASE("Cold v4 entry bounds exact streaming without shrinking the far horizon",
+          "[world][streaming][lod][generator-v4][startup]") {
+    World world(42, MAX_RENDER_DISTANCE_CHUNKS);
+    REQUIRE(world.getViewDistance() == MAX_RENDER_DISTANCE_CHUNKS);
+    REQUIRE(world.getExactViewDistance() == MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
+
+    world.setExactStreamingDistance(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+    REQUIRE(world.getViewDistance() == MAX_RENDER_DISTANCE_CHUNKS);
+    REQUIRE(world.getExactViewDistance() == COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+
+    world.setExactStreamingDistance(0);
+    REQUIRE(world.getExactViewDistance() == COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+
+    world.setExactStreamingDistance(MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
+    REQUIRE(world.getViewDistance() == MAX_RENDER_DISTANCE_CHUNKS);
+    REQUIRE(world.getExactViewDistance() == MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
+}
+
+TEST_CASE("Cold spawn readiness matches the circular entry footprint",
+          "[world][streaming][generator-v4][startup][spawn][regression]") {
+    REQUIRE(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS == 0);
+    REQUIRE(boundedColdStartExactRadiusChunks(-1) == 0);
+    REQUIRE(boundedColdStartExactRadiusChunks(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS) ==
+            COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+    REQUIRE(boundedColdStartExactRadiusChunks(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS + 1) ==
+            COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+    REQUIRE(withinExactStreamingRadius(0, 0, COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS));
+    REQUIRE_FALSE(withinExactStreamingRadius(1, 0, COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS));
+    REQUIRE(exactStreamingActiveSetRadiusChunks(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS) ==
+            COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS + 1);
+    REQUIRE(exactStreamingMeshRadiusChunks(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS) == 1);
+    REQUIRE(withinExactStreamingRadius(
+        1, 0, exactStreamingMeshRadiusChunks(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS)));
+    REQUIRE_FALSE(withinExactStreamingRadius(
+        1, 1, exactStreamingMeshRadiusChunks(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS)));
+    REQUIRE(exactStreamingPlanCoverageRadiusChunks(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS) ==
+            COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS + 1 +
+                EXACT_STREAMING_HORIZONTAL_MESH_HALO_CHUNKS +
+                EXACT_STREAMING_PLAN_DEPENDENCY_APRON_CHUNKS);
+    REQUIRE(exactStreamingActiveSetRadiusChunks(MAX_EXACT_CUBIC_DISTANCE_CHUNKS) ==
+            MAX_EXACT_CUBIC_DISTANCE_CHUNKS + 1);
+    REQUIRE(exactStreamingMeshRadiusChunks(MAX_EXACT_CUBIC_DISTANCE_CHUNKS) ==
+            MAX_EXACT_CUBIC_DISTANCE_CHUNKS + 1);
+    REQUIRE(exactStreamingActiveSetRadiusChunks(MAX_EXACT_CUBIC_DISTANCE_CHUNKS + 1) ==
+            MAX_EXACT_CUBIC_DISTANCE_CHUNKS + 1);
+    REQUIRE(exactStreamingActiveSetRadiusChunks(-1) == 1);
+}
+
+TEST_CASE("Cold v4 exact cap retains the mandatory one-chunk halo before entry",
+          "[world][streaming][lod][generator-v4][startup][regression]") {
+    // A tiny residency cap keeps this a scheduling test. The active-set
+    // snapshot is published before any asynchronous column-plan work can
+    // expand the mutable world, so it directly proves the v4 entry cap is
+    // applied to a 512-chunk render horizon.
+    World world(42, MAX_RENDER_DISTANCE_CHUNKS, 1);
+    world.setExactStreamingDistance(COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+    world.updatePlayerPosition(0, SEA_LEVEL, 0);
+
+    std::shared_ptr<const ExactSurfaceCoverageSnapshot> coverage;
+    for (int attempt = 0; attempt < 2'000; ++attempt) {
+        coverage = world.getExactSurfaceCoverageSnapshot();
+        if (coverage && coverage->nominalRadiusChunks == COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(coverage);
+    REQUIRE(coverage->nominalRadiusChunks == COLD_START_EXACT_CUBIC_DISTANCE_CHUNKS);
+    REQUIRE(world.getViewDistance() == MAX_RENDER_DISTANCE_CHUNKS);
 }
 
 TEST_CASE("Capped exact mesh selection keeps resident surfaces stable across small movement",
@@ -1743,15 +3078,17 @@ TEST_CASE("Capped exact mesh selection keeps resident surfaces stable across sma
         selectStableMeshCandidates(requirements, empty, {0, 4, 0}, MAX_MESH_RESIDENT_CUBES);
     REQUIRE(initial.size() == MAX_MESH_RESIDENT_CUBES);
 
-    // A rebuild within the same camera cube and a one-cube movement retain
-    // the complete prior intersection instead of selecting a new equal-rank
-    // subset from unordered iteration or tiny distance changes.
+    // A rebuild within the same camera cube retains the complete prior set.
+    // A one-cube diagonal movement may replace only the candidates whose
+    // distance advantage exceeds the bounded residency credit.
     const auto sameCube =
         selectStableMeshCandidates(requirements, initial, {0, 4, 0}, MAX_MESH_RESIDENT_CUBES);
     const auto adjacentCube =
         selectStableMeshCandidates(requirements, sameCube, {1, 4, -1}, MAX_MESH_RESIDENT_CUBES);
     REQUIRE(sameCube == initial);
-    REQUIRE(adjacentCube == initial);
+    REQUIRE(std::count_if(initial.begin(), initial.end(), [&](ChunkPos position) {
+                return adjacentCube.contains(position);
+            }) >= static_cast<std::ptrdiff_t>(MAX_MESH_RESIDENT_CUBES - 32));
 
     std::vector<ChunkPos> promoted;
     for (const auto& [position, priority] : requirements) {
@@ -1767,9 +3104,47 @@ TEST_CASE("Capped exact mesh selection keeps resident surfaces stable across sma
         selectStableMeshCandidates(requirements, adjacentCube, {1, 4, -1}, MAX_MESH_RESIDENT_CUBES);
     for (ChunkPos position : promoted)
         REQUIRE(withEdits.contains(position));
-    REQUIRE(std::count_if(initial.begin(), initial.end(), [&](ChunkPos position) {
+    const auto newlyPromoted =
+        std::count_if(promoted.begin(), promoted.end(),
+                      [&](ChunkPos position) { return !adjacentCube.contains(position); });
+    REQUIRE(std::count_if(adjacentCube.begin(), adjacentCube.end(), [&](ChunkPos position) {
                 return withEdits.contains(position);
-            }) == static_cast<std::ptrdiff_t>(MAX_MESH_RESIDENT_CUBES - promoted.size()));
+            }) == static_cast<std::ptrdiff_t>(MAX_MESH_RESIDENT_CUBES) - newlyPromoted);
+}
+
+TEST_CASE("Capped exact mesh selection replaces stale residency after a camera jump",
+          "[world][streaming][mesh-cap][residency][regression]") {
+    constexpr int64_t CLUSTER_EDGE = 128;
+    constexpr int64_t NEW_CLUSTER_X = 4'096;
+    constexpr uint8_t SURFACE_PRIORITY = 3;
+    static_assert(CLUSTER_EDGE * CLUSTER_EDGE == MAX_MESH_RESIDENT_CUBES);
+
+    std::unordered_map<ChunkPos, uint8_t> requirements;
+    std::unordered_set<ChunkPos> oldCluster;
+    std::unordered_set<ChunkPos> newCluster;
+    requirements.reserve(MAX_MESH_RESIDENT_CUBES * 2);
+    oldCluster.reserve(MAX_MESH_RESIDENT_CUBES);
+    newCluster.reserve(MAX_MESH_RESIDENT_CUBES);
+    for (int64_t z = 0; z < CLUSTER_EDGE; ++z) {
+        for (int64_t x = 0; x < CLUSTER_EDGE; ++x) {
+            const ChunkPos oldPosition{x, 4, z};
+            const ChunkPos newPosition{NEW_CLUSTER_X + x, 4, z};
+            requirements.emplace(oldPosition, SURFACE_PRIORITY);
+            requirements.emplace(newPosition, SURFACE_PRIORITY);
+            oldCluster.insert(oldPosition);
+            newCluster.insert(newPosition);
+        }
+    }
+
+    const std::unordered_set<ChunkPos> empty;
+    const auto beforeJump = selectStableMeshCandidates(
+        requirements, empty, {CLUSTER_EDGE / 2, 4, CLUSTER_EDGE / 2}, MAX_MESH_RESIDENT_CUBES);
+    REQUIRE(beforeJump == oldCluster);
+
+    const auto afterJump = selectStableMeshCandidates(
+        requirements, beforeJump, {NEW_CLUSTER_X + CLUSTER_EDGE / 2, 4, CLUSTER_EDGE / 2},
+        MAX_MESH_RESIDENT_CUBES);
+    REQUIRE(afterJump == newCluster);
 }
 
 TEST_CASE("Exact mesh selection preserves hard gameplay priority at capacity",
@@ -1786,6 +3161,27 @@ TEST_CASE("Exact mesh selection preserves hard gameplay priority at capacity",
     REQUIRE(selected.contains({1, 4, 0}));
     REQUIRE(selected.contains({2, 4, 0}));
     REQUIRE(selected.contains({3, 4, 0}));
+}
+
+TEST_CASE("Exact mesh capacity keeps complete nearer vertical surfaces before flatter distance",
+          "[world][streaming][mesh-cap][priority][surface][flight][regression]") {
+    constexpr uint8_t REQUIRED_SURFACE_PRIORITY = EXACT_STREAMING_EDITED_PRIORITY_LANE;
+    constexpr ChunkPos CAMERA{0, 40, 0};
+    constexpr ChunkPos NEAR_LOW{1, WORLD_MIN_CHUNK_Y, 0};
+    constexpr ChunkPos NEAR_HIGH{1, WORLD_MAX_CHUNK_Y, 0};
+    constexpr ChunkPos FAR_FLAT{2, CAMERA.y, 0};
+    const std::unordered_map<ChunkPos, uint8_t> requirements{
+        {NEAR_LOW, REQUIRED_SURFACE_PRIORITY},
+        {NEAR_HIGH, REQUIRED_SURFACE_PRIORITY},
+        {FAR_FLAT, REQUIRED_SURFACE_PRIORITY},
+    };
+
+    const auto selected = selectStableMeshCandidates(requirements, {}, CAMERA, /*capacity=*/2);
+
+    REQUIRE(selected.size() == 2);
+    REQUIRE(selected.contains(NEAR_LOW));
+    REQUIRE(selected.contains(NEAR_HIGH));
+    REQUIRE_FALSE(selected.contains(FAR_FLAT));
 }
 
 // ===========================================================================
@@ -1913,6 +3309,25 @@ TEST_CASE("Supported source water spreads at level one", "[fluid][rules]") {
     }
 }
 
+TEST_CASE("Source water cannot replace a floor torch",
+          "[fluid][rules][torch][replacement][regression]") {
+    FluidNeighborhood cells{
+        .center = loadedCell(BlockType::WATER),
+        .down = loadedCell(BlockType::STONE),
+        .up = loadedCell(),
+        .west = loadedCell(),
+        .east = loadedCell(BlockType::TORCH),
+        .north = loadedCell(),
+        .south = loadedCell(),
+    };
+    const FluidRuleResult result = evaluateWaterRules(cells);
+    REQUIRE(findMutation(result, FluidDirection::EAST, FluidMutationType::SET_WATER) == nullptr);
+    for (FluidDirection direction :
+         {FluidDirection::WEST, FluidDirection::NORTH, FluidDirection::SOUTH}) {
+        REQUIRE(findMutation(result, direction, FluidMutationType::SET_WATER) != nullptr);
+    }
+}
+
 TEST_CASE("Two adjacent sources form a source over support", "[fluid][rules]") {
     FluidNeighborhood cells{
         .center = loadedCell(BlockType::WATER, FluidState::flowing(4)),
@@ -1989,6 +3404,9 @@ TEST_CASE("World generation and loading do not enqueue fluid ticks", "[fluid][wo
     World world(42);
     REQUIRE(world.getPendingFluidCount() == 0);
     world.getChunk({0, WORLD_MAX_CHUNK_Y, 0});
+    REQUIRE(world.getPendingFluidCount() == 0);
+
+    world.setBlock(8, WORLD_MAX_Y - 1, 8, BlockType::AIR);
     REQUIRE(world.getPendingFluidCount() == 0);
 
     world.setBlock(8, WORLD_MAX_Y - 1, 8, BlockType::WATER);
@@ -2132,8 +3550,11 @@ TEST_CASE("Fluid frontier clear and restore preserve ordering caps and index sta
 // LightEngine: block-light propagation from lava
 // ===========================================================================
 
-TEST_CASE("Block properties: lava emits light, nothing else does", "[world][light]") {
+TEST_CASE("Block properties expose gameplay light emitters", "[world][light]") {
     REQUIRE(blockLightEmission(BlockType::LAVA) == 15);
+    REQUIRE(blockLightEmission(BlockType::TORCH) == 14);
+    REQUIRE(blockLightEmission(BlockType::FURNACE_LIT) == 13);
+    REQUIRE(blockLightEmission(BlockType::FURNACE) == 0);
     REQUIRE(blockLightEmission(BlockType::STONE) == 0);
     REQUIRE(blockLightEmission(BlockType::AIR) == 0);
     REQUIRE(isEmissive(BlockType::LAVA));
@@ -2306,12 +3727,23 @@ TEST_CASE("LightEngine: incomplete sky authority stays conservatively dark",
     REQUIRE(chunk.getSkyLight(8, 8, 8) == 15);
 }
 
-TEST_CASE("Skylight authority includes saved edited sections above generated terrain",
+TEST_CASE("Skylight authority requires sparse generated and saved occupancy sections",
           "[world][light][sky][streaming][save]") {
-    REQUIRE(skyAuthorityTopSection(4, 7, std::nullopt) == 7);
-    REQUIRE(skyAuthorityTopSection(9, 7, std::nullopt) == 9);
-    REQUIRE(skyAuthorityTopSection(4, 7, 12) == 12);
-    REQUIRE(skyAuthorityTopSection(-3, -2, -1) == -1);
+    VerticalSectionMask generated;
+    generated.set(4);
+    generated.set(7);
+    VerticalSectionMask saved;
+    saved.set(12);
+    generated.merge(saved);
+
+    VerticalSectionMask loaded;
+    loaded.set(4);
+    loaded.set(12);
+    REQUIRE_FALSE(loaded.containsAllSetSections(generated, 4));
+    loaded.set(7);
+    REQUIRE(loaded.containsAllSetSections(generated, 4));
+    REQUIRE(loaded.containsAllSetSections(generated, 8));
+    REQUIRE_FALSE(loaded.contains(6));
 }
 
 TEST_CASE("World publishes generated cubes with initial derived skylight", "[world][light][sky]") {
@@ -2320,6 +3752,313 @@ TEST_CASE("World publishes generated cubes with initial derived skylight", "[wor
     REQUIRE(chunk);
     REQUIRE(chunk->getBlock(8, 8, 8) == BlockType::AIR);
     REQUIRE(chunk->getSkyLight(8, 8, 8) == 15);
+}
+
+TEST_CASE("Generated tree cutoffs settle before their first mesh",
+          "[world][light][sky][streaming][publication][flora][regression]") {
+    // This seed has a birch rooted at (-27286, 75, -17100). The tree raises
+    // the real opaque cutoff above ColumnPlan's density surface, which used to
+    // become visible once with stale skylight and relight on a later tick.
+    constexpr BlockPos ROOT{-27'286, 75, -17'100};
+    World world(42, 4, 512);
+    const ChunkPos target{Chunk::worldToChunk(ROOT.x), Chunk::worldToChunkY(ROOT.y),
+                          Chunk::worldToChunk(ROOT.z)};
+
+    std::array<std::shared_ptr<const ColumnPlan>, 9> plans{};
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const size_t index = static_cast<size_t>((offsetZ + 1) * 3 + offsetX + 1);
+            plans[index] =
+                world.generator().getColumnPlan({target.x + offsetX, target.z + offsetZ});
+            REQUIRE(plans[index]);
+        }
+    }
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const size_t index = static_cast<size_t>((offsetZ + 1) * 3 + offsetX + 1);
+            for (const int32_t section : plans[index]->exposedSections()) {
+                if (section < target.y)
+                    continue;
+                REQUIRE(world.getChunk({target.x + offsetX, section, target.z + offsetZ}));
+            }
+        }
+    }
+
+    const std::shared_ptr<Chunk> rootCube = world.getChunk(target);
+    REQUIRE(rootCube);
+    REQUIRE(rootCube->getBlockWorld(ROOT.x, ROOT.y, ROOT.z) == BlockType::BIRCH_LOG);
+
+    MeshSnapshot firstVisible;
+    REQUIRE(world.snapshotForMeshing(target, firstVisible));
+    const int localX = Chunk::worldToLocal(ROOT.x);
+    const int localZ = Chunk::worldToLocal(ROOT.z);
+    REQUIRE(firstVisible.skyCutoffY[MeshSnapshot::skyIndex(localX, localZ)] >
+            firstVisible.generatedSurfaceCutoffY[MeshSnapshot::skyIndex(localX, localZ)]);
+
+    const std::vector<uint8_t> firstLight = rootCube->packedLightData();
+    world.markChunkMeshed(target);
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    REQUIRE(rootCube->packedLightData() == firstLight);
+    REQUIRE_FALSE(rootCube->needsMeshUpdate);
+}
+
+TEST_CASE("A newly published emitter settles resident boundary light before the first mesh",
+          "[world][light][streaming][publication][torch][regression]") {
+    TempDir directory("publication_boundary_light");
+    SaveManager saves(directory.path());
+    constexpr ChunkPos WEST{0, WORLD_MAX_CHUNK_Y, 0};
+    constexpr ChunkPos EAST{1, WORLD_MAX_CHUNK_Y, 0};
+
+    Chunk west(WEST);
+    west.fill(BlockType::AIR);
+    west.generated = true;
+    Chunk east(EAST);
+    east.fill(BlockType::AIR);
+    east.setBlock(0, 8, 8, BlockType::TORCH);
+    east.generated = true;
+    saves.saveChunk(west);
+    saves.saveChunk(east);
+    REQUIRE(saves.flush());
+
+    World world(42, 4);
+    world.setSaveManager(&saves);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            REQUIRE(world.generator().getColumnPlan({WEST.x + offsetX, WEST.z + offsetZ}));
+        }
+    }
+
+    const auto resident = world.getChunk(WEST);
+    REQUIRE(resident);
+    REQUIRE(resident->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 0);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const ColumnPos column{WEST.x + offsetX, WEST.z + offsetZ};
+            const auto plan = world.generator().getColumnPlan(column);
+            REQUIRE(plan);
+            int32_t topSection =
+                std::max(WEST.y, Chunk::worldToChunkY(std::clamp(plan->maximumSurfaceY(),
+                                                                 WORLD_MIN_Y, WORLD_MAX_Y)));
+            for (const int32_t exposed : plan->exposedSections()) {
+                topSection = std::max(topSection, exposed);
+            }
+            for (int32_t section = WEST.y; section <= topSection; ++section) {
+                const ChunkPos authority{column.x, section, column.z};
+                if (authority != EAST)
+                    REQUIRE(world.getChunk(authority));
+            }
+        }
+    }
+    world.markChunkMeshed(WEST);
+    const uint32_t versionBeforeArrival = resident->version.load(std::memory_order_relaxed);
+
+    const auto arriving = world.getChunk(EAST);
+    REQUIRE(arriving);
+    REQUIRE(arriving->getBlockLight(0, 8, 8) == 14);
+    REQUIRE(resident->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 13);
+    REQUIRE(resident->needsMeshUpdate);
+    REQUIRE(resident->version.load(std::memory_order_relaxed) > versionBeforeArrival);
+
+    MeshSnapshot firstVisible;
+    REQUIRE(world.snapshotForMeshing(WEST, firstVisible));
+    REQUIRE(firstVisible.blockLightAt(CHUNK_EDGE - 1, 8, 8) == 13);
+    REQUIRE(firstVisible.blockLightAt(CHUNK_EDGE, 8, 8) == 14);
+
+    const std::vector<uint8_t> settled = resident->packedLightData();
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    REQUIRE(resident->packedLightData() == settled);
+
+    World reverse(42, 4);
+    reverse.setSaveManager(&saves);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 2; ++offsetX) {
+            REQUIRE(reverse.generator().getColumnPlan({offsetX, offsetZ}));
+        }
+    }
+    const auto reverseEast = reverse.getChunk(EAST);
+    const auto reverseWest = reverse.getChunk(WEST);
+    REQUIRE(reverseEast);
+    REQUIRE(reverseWest);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const ColumnPos column{WEST.x + offsetX, WEST.z + offsetZ};
+            const auto plan = reverse.generator().getColumnPlan(column);
+            REQUIRE(plan);
+            int32_t topSection =
+                std::max(WEST.y, Chunk::worldToChunkY(std::clamp(plan->maximumSurfaceY(),
+                                                                 WORLD_MIN_Y, WORLD_MAX_Y)));
+            for (const int32_t exposed : plan->exposedSections()) {
+                topSection = std::max(topSection, exposed);
+            }
+            for (int32_t section = WEST.y; section <= topSection; ++section) {
+                REQUIRE(reverse.getChunk({column.x, section, column.z}));
+            }
+        }
+    }
+    REQUIRE(reverseEast->getBlockLight(0, 8, 8) == 14);
+    REQUIRE(reverseWest->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 13);
+    REQUIRE(reverseEast->packedLightData() == arriving->packedLightData());
+    REQUIRE(reverseWest->packedLightData() == resident->packedLightData());
+}
+
+TEST_CASE("A section crossing the vertical mask words publishes completed skylight synchronously",
+          "[world][light][sky][streaming][publication][vertical][v4][regression]") {
+    TempDir directory("publication_vertical_skylight");
+    SaveManager saves(directory.path());
+    constexpr int32_t LOWER_SECTION = WORLD_MIN_CHUNK_Y + 63;
+    constexpr int32_t BRIDGE_SECTION = LOWER_SECTION + 1;
+    constexpr int32_t UPPER_SECTION = BRIDGE_SECTION + 1;
+    STATIC_REQUIRE(LOWER_SECTION == 55);
+    STATIC_REQUIRE(BRIDGE_SECTION == 56);
+
+    for (int32_t section : {LOWER_SECTION, BRIDGE_SECTION, UPPER_SECTION}) {
+        Chunk saved(ChunkPos{0, section, 0});
+        saved.fill(BlockType::AIR);
+        saved.generated = true;
+        saves.saveChunk(saved);
+    }
+    REQUIRE(saves.flush());
+
+    World world(42, 4);
+    world.setSaveManager(&saves);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            REQUIRE(world.generator().getColumnPlan({offsetX, offsetZ}));
+            if (offsetX != 0 || offsetZ != 0) {
+                REQUIRE(world.getChunk({offsetX, LOWER_SECTION, offsetZ}));
+            }
+        }
+    }
+
+    const auto lower = world.getChunk({0, LOWER_SECTION, 0});
+    REQUIRE(lower);
+    REQUIRE(world.getChunk({0, UPPER_SECTION, 0}));
+    const uint8_t lightBeforeBridge = lower->getSkyLight(8, 8, 8);
+    REQUIRE(lightBeforeBridge < MAX_DERIVED_LIGHT_LEVEL);
+    world.markChunkMeshed({0, LOWER_SECTION, 0});
+    const uint32_t versionBeforeBridge = lower->version.load(std::memory_order_relaxed);
+
+    REQUIRE(world.getChunk({0, BRIDGE_SECTION, 0}));
+    REQUIRE(lower->getSkyLight(8, 8, 8) == 15);
+    REQUIRE(lower->needsMeshUpdate);
+    REQUIRE(lower->version.load(std::memory_order_relaxed) > versionBeforeBridge);
+
+    MeshSnapshot firstVisible;
+    REQUIRE(world.snapshotForMeshing({0, LOWER_SECTION, 0}, firstVisible));
+    REQUIRE(firstVisible.derivedSkyLightValid);
+    REQUIRE(firstVisible.skyLightAt(8, 8, 8) == 15);
+}
+
+TEST_CASE("Publication light reaches an available diagonal before its first mesh",
+          "[world][light][streaming][publication][torch][corner][regression]") {
+    TempDir directory("publication_corner_light");
+    SaveManager saves(directory.path());
+    constexpr ChunkPos SOURCE{1, WORLD_MAX_CHUNK_Y, 0};
+    constexpr ChunkPos FACE_X{0, WORLD_MAX_CHUNK_Y, 0};
+    constexpr ChunkPos FACE_Z{1, WORLD_MAX_CHUNK_Y, -1};
+    constexpr ChunkPos DIAGONAL{0, WORLD_MAX_CHUNK_Y, -1};
+
+    for (ChunkPos position : {SOURCE, FACE_X, FACE_Z, DIAGONAL}) {
+        Chunk saved(position);
+        saved.fill(BlockType::AIR);
+        if (position == SOURCE)
+            saved.setBlock(0, 8, 0, BlockType::TORCH);
+        saved.generated = true;
+        saves.saveChunk(saved);
+    }
+    REQUIRE(saves.flush());
+
+    World world(42, 4);
+    world.setSaveManager(&saves);
+    for (int64_t chunkZ = -2; chunkZ <= 1; ++chunkZ) {
+        for (int64_t chunkX = -1; chunkX <= 2; ++chunkX) {
+            REQUIRE(world.generator().getColumnPlan({chunkX, chunkZ}));
+        }
+    }
+    const auto faceX = world.getChunk(FACE_X);
+    const auto faceZ = world.getChunk(FACE_Z);
+    const auto diagonal = world.getChunk(DIAGONAL);
+    REQUIRE(faceX);
+    REQUIRE(faceZ);
+    REQUIRE(diagonal);
+    REQUIRE(diagonal->getBlockLight(CHUNK_EDGE - 1, 8, CHUNK_EDGE - 1) == 0);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const ChunkPos halo{DIAGONAL.x + offsetX, DIAGONAL.y, DIAGONAL.z + offsetZ};
+            if (halo != SOURCE)
+                REQUIRE(world.getChunk(halo));
+        }
+    }
+
+    const auto source = world.getChunk(SOURCE);
+    REQUIRE(source);
+    REQUIRE(source->getBlockLight(0, 8, 0) == 14);
+    REQUIRE(faceX->getBlockLight(CHUNK_EDGE - 1, 8, 0) == 13);
+    REQUIRE(faceZ->getBlockLight(0, 8, CHUNK_EDGE - 1) == 13);
+    REQUIRE(diagonal->getBlockLight(CHUNK_EDGE - 1, 8, CHUNK_EDGE - 1) == 12);
+
+    MeshSnapshot firstVisible;
+    REQUIRE(world.snapshotForMeshing(DIAGONAL, firstVisible));
+    REQUIRE(firstVisible.blockLightAt(CHUNK_EDGE - 1, 8, CHUNK_EDGE - 1) == 12);
+}
+
+TEST_CASE("Publication lighting defers a tall saved stack without publishing stale meshes",
+          "[world][light][streaming][publication][vertical][performance][regression]") {
+    TempDir directory("publication_tall_stack");
+    SaveManager saves(directory.path());
+    constexpr int32_t LOWER_SECTION = 20;
+    constexpr int32_t BRIDGE_SECTION = 52;
+    constexpr int32_t UPPER_SECTION = BRIDGE_SECTION + 1;
+    for (int32_t section = LOWER_SECTION; section <= UPPER_SECTION; ++section) {
+        Chunk saved(ChunkPos{0, section, 0});
+        saved.fill(BlockType::AIR);
+        saved.generated = true;
+        saves.saveChunk(saved);
+    }
+    REQUIRE(saves.flush());
+
+    World world(42, 4);
+    world.setSaveManager(&saves);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            REQUIRE(world.generator().getColumnPlan({offsetX, offsetZ}));
+            if (offsetX != 0 || offsetZ != 0) {
+                REQUIRE(world.getChunk({offsetX, BRIDGE_SECTION, offsetZ}));
+            }
+        }
+    }
+    for (int32_t section = LOWER_SECTION; section < BRIDGE_SECTION; ++section) {
+        REQUIRE(world.getChunk({0, section, 0}));
+    }
+    REQUIRE(world.getChunk({0, UPPER_SECTION, 0}));
+    const StreamingWorkStats beforeBridge = world.getStreamingWorkStats();
+    REQUIRE(world.getChunk({0, BRIDGE_SECTION, 0}));
+
+    MeshSnapshot snapshot;
+    REQUIRE_FALSE(world.snapshotForMeshing({0, BRIDGE_SECTION, 0}, snapshot));
+    const StreamingWorkStats deferred = world.getStreamingWorkStats();
+    REQUIRE(deferred.publicationLightDeferredCubes > 0);
+    REQUIRE(deferred.publicationLightMaxDeferredQueue > 0);
+    REQUIRE(deferred.publicationLightMaxSyncFloods <= 32);
+    REQUIRE(deferred.publicationLightSectionVisits - beforeBridge.publicationLightSectionVisits <=
+            static_cast<uint64_t>(WORLD_VERTICAL_CHUNKS));
+
+    bool ready = false;
+    for (int pass = 0; pass < 64 && !ready; ++pass) {
+        world.reconcileLight(16);
+        ready = world.snapshotForMeshing({0, BRIDGE_SECTION, 0}, snapshot);
+    }
+    REQUIRE(ready);
+    REQUIRE(snapshot.derivedSkyLightValid);
+    REQUIRE(snapshot.skyLightAt(8, 8, 8) == 15);
+    REQUIRE(world.getStreamingWorkStats().publicationLightMaxSyncFloods <= 32);
+    for (int pass = 0;
+         pass < 64 && world.getStreamingWorkStats().publicationLightDeferredQueue != 0; ++pass) {
+        world.reconcileLight(16);
+    }
+    REQUIRE(world.getStreamingWorkStats().publicationLightDeferredQueue == 0);
 }
 
 TEST_CASE("World reconciles skylight after opaque roof edits", "[world][light][sky][edit]") {
@@ -2496,6 +4235,439 @@ TEST_CASE("World removes a broken emitter's neighbor light synchronously", "[wor
     for (int pass = 0; pass < 4; ++pass)
         world.reconcileLight(64);
     REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 0);
+}
+
+TEST_CASE("Packed skylight crosses both vertical mask words at the world limits",
+          "[world][light][sky][vertical][v4]") {
+    VerticalSectionMask loaded;
+    for (int32_t section = WORLD_MIN_CHUNK_Y; section <= WORLD_MAX_CHUNK_Y; ++section) {
+        loaded.set(section);
+    }
+    REQUIRE(loaded.containsRange(WORLD_MIN_CHUNK_Y, WORLD_MAX_CHUNK_Y));
+    VerticalSectionMask required;
+    required.set(WORLD_MIN_CHUNK_Y);
+    required.set(WORLD_MAX_CHUNK_Y);
+    REQUIRE(loaded.containsAllSetSections(required, WORLD_MIN_CHUNK_Y));
+
+    Chunk bottom(ChunkPos{0, WORLD_MIN_CHUNK_Y, 0});
+    LightEngine::SkyLightSeedColumns bottomSeeds;
+    bottomSeeds.set(8, 8, WORLD_MIN_Y);
+    REQUIRE(LightEngine::floodChunk(bottom, {}, bottomSeeds));
+    REQUIRE(bottom.getSkyLight(8, 0, 8) == 15);
+
+    Chunk top(ChunkPos{0, WORLD_MAX_CHUNK_Y, 0});
+    LightEngine::SkyLightSeedColumns topSeeds;
+    topSeeds.set(8, 8, WORLD_MAX_CHUNK_Y * CHUNK_EDGE);
+    REQUIRE(LightEngine::floodChunk(top, {}, topSeeds));
+    REQUIRE(top.getSkyLight(8, CHUNK_EDGE - 1, 8) == 15);
+}
+
+TEST_CASE("World relights a torch across a cube face before setBlock returns",
+          "[world][light][edit][torch]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    auto west = world.getChunk(ChunkPos{-1, 4, 0});
+    REQUIRE(home);
+    REQUIRE(west);
+    home->fill(BlockType::AIR);
+    west->fill(BlockType::AIR);
+
+    const uint64_t revisionBefore = world.lightingRevision();
+    world.setBlock(1, 4 * CHUNK_EDGE + 8, 8, BlockType::TORCH);
+    REQUIRE(home->getBlockLight(1, 8, 8) == 14);
+    REQUIRE(home->getBlockLight(0, 8, 8) == 13);
+    REQUIRE(west->getBlockLight(CHUNK_EDGE - 1, 8, 8) == 12);
+    REQUIRE(world.lightingRevision() > revisionBefore);
+}
+
+TEST_CASE("World batches dynamic object light probes under resident authority",
+          "[world][light][entity][snapshot]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    REQUIRE(home);
+    home->fill(BlockType::AIR);
+    constexpr int32_t WORLD_Y = 4 * CHUNK_EDGE + 8;
+    world.setBlock(1, WORLD_Y, 8, BlockType::TORCH);
+
+    const std::array<BlockPos, 4> positions{
+        BlockPos{1, WORLD_Y, 8},
+        BlockPos{2, WORLD_Y, 8},
+        BlockPos{1'000'000, WORLD_Y, 1'000'000},
+        BlockPos{1, WORLD_MAX_Y + 1, 8},
+    };
+    std::array<uint8_t, 5> samples{0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    world.samplePackedLightsIfLoaded(positions, samples);
+
+    REQUIRE(samples[0] == home->getPackedLight(1, 8, 8));
+    REQUIRE(samples[1] == home->getPackedLight(2, 8, 8));
+    REQUIRE((samples[0] & 0x0F) == 14);
+    REQUIRE((samples[1] & 0x0F) == 13);
+    REQUIRE(samples[2] == 0);
+    REQUIRE(samples[3] == 0);
+    REQUIRE(samples[4] == 0);
+}
+
+TEST_CASE("World relights furnace state transitions synchronously",
+          "[world][light][edit][furnace]") {
+    World world(42);
+    auto chunk = world.getChunk(ChunkPos{0, 4, 0});
+    REQUIRE(chunk);
+    chunk->fill(BlockType::AIR);
+    constexpr int32_t WORLD_Y = 4 * CHUNK_EDGE + 8;
+
+    world.setBlock(8, WORLD_Y, 8, BlockType::FURNACE_LIT);
+    REQUIRE(chunk->getBlockLight(8, 8, 8) == 13);
+    REQUIRE(chunk->getBlockLight(9, 8, 8) == 12);
+
+    world.setBlock(8, WORLD_Y, 8, BlockType::FURNACE);
+    REQUIRE(chunk->getBlockLight(8, 8, 8) == 0);
+    REQUIRE(chunk->getBlockLight(9, 8, 8) == 0);
+}
+
+TEST_CASE("World normalizes an orphan saved furnace emitter before lighting",
+          "[world][light][save][torch][furnace]") {
+    TempDir directory("gameplay_light_reload");
+    SaveManager saves(directory.path());
+    Chunk saved(ChunkPos{0, 4, 0});
+    saved.fill(BlockType::AIR);
+    saved.setBlock(1, 8, 8, BlockType::TORCH);
+    saved.setBlock(8, 8, 8, BlockType::FURNACE_LIT);
+    saved.setBlock(15, 8, 8, BlockType::LAVA);
+    saved.generated = true;
+    saves.saveChunk(saved);
+    REQUIRE(saves.flush());
+
+    World world(42);
+    world.setSaveManager(&saves);
+    const uint64_t revisionBeforeLoad = world.lightingRevision();
+    auto loaded = world.getChunk(ChunkPos{0, 4, 0});
+    REQUIRE(loaded);
+    REQUIRE(loaded->getBlockLight(1, 8, 8) == 14);
+    REQUIRE(loaded->getBlock(8, 8, 8) == BlockType::FURNACE);
+    REQUIRE(loaded->getBlockLight(8, 8, 8) < 13);
+    REQUIRE(loaded->getBlockLight(15, 8, 8) == 15);
+    REQUIRE(world.lightingRevision() == revisionBeforeLoad);
+}
+
+TEST_CASE("Saved active furnaces publish their emissive block and derived light atomically",
+          "[world][light][save][furnace][publication][render][regression]") {
+    TempDir directory("active_furnace_first_publication");
+    SaveManager saves(directory.path());
+    constexpr ChunkPos CHUNK{0, WORLD_MAX_CHUNK_Y, 0};
+    constexpr BlockPos ACTIVE{8, WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8, 8};
+    constexpr BlockPos ORPHAN{12, WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8, 8};
+
+    Chunk saved(CHUNK);
+    saved.fill(BlockType::AIR);
+    saved.setBlock(8, 8, 8, BlockType::FURNACE_LIT);
+    saved.setBlock(12, 8, 8, BlockType::FURNACE_LIT);
+    saved.generated = true;
+    saves.saveChunk(saved);
+    REQUIRE(saves.flush());
+
+    FurnaceState burning;
+    burning.burnTicksRemaining = 400;
+    burning.burnTicksTotal = 800;
+    FurnaceMap furnaces{{ACTIVE, burning}};
+    auto visuals = std::make_shared<FurnaceVisualAuthority>();
+    visuals->replace(furnaces);
+
+    World world(42);
+    world.setSavedChunkProjection({
+        .apply = [visuals](Chunk& chunk) { return visuals->projectSavedChunk(chunk); },
+        .currentRevision = [visuals] { return visuals->revision(); },
+    });
+    world.setSaveManager(&saves);
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const auto plan = world.generator().getColumnPlan({offsetX, offsetZ});
+            REQUIRE(plan);
+            int32_t topSection =
+                std::max(CHUNK.y, Chunk::worldToChunkY(std::clamp(plan->maximumSurfaceY(),
+                                                                  WORLD_MIN_Y, WORLD_MAX_Y)));
+            for (const int32_t exposed : plan->exposedSections()) {
+                topSection = std::max(topSection, exposed);
+            }
+            for (int32_t section = CHUNK.y; section <= topSection; ++section) {
+                if (offsetX == 0 && offsetZ == 0 && section == CHUNK.y)
+                    continue;
+                REQUIRE(world.getChunk({offsetX, section, offsetZ}));
+            }
+        }
+    }
+    const uint64_t lightingRevision = world.lightingRevision();
+    const std::shared_ptr<Chunk> loaded = world.getChunk(CHUNK);
+    REQUIRE(loaded);
+
+    // The live sidecar-backed furnace is active in the first resident cube
+    // and its initial publication flood already contains the source. The
+    // orphan is sanitized in the same transform and never emits.
+    REQUIRE(loaded->getBlockWorld(ACTIVE.x, ACTIVE.y, ACTIVE.z) == BlockType::FURNACE_LIT);
+    REQUIRE(loaded->getBlockLight(8, 8, 8) == 13);
+    REQUIRE(loaded->getBlockLight(9, 8, 8) == 12);
+    REQUIRE(loaded->getBlockWorld(ORPHAN.x, ORPHAN.y, ORPHAN.z) == BlockType::FURNACE);
+    REQUIRE(world.lightingRevision() == lightingRevision);
+
+    MeshSnapshot firstSnapshot;
+    REQUIRE(world.snapshotForMeshing(CHUNK, firstSnapshot));
+    MeshScratch scratch;
+    const MeshOutput firstMesh = LODMesher::buildMesh(firstSnapshot, scratch);
+    bool foundActiveMouth = false;
+    for (const Vertex& vertex : firstMesh.vertices) {
+        if (unpackTextureLayer(vertex.faceAttr) != static_cast<uint8_t>(BlockType::FURNACE_LIT)) {
+            continue;
+        }
+        foundActiveMouth = true;
+        REQUIRE(unpackFace(vertex.faceAttr) == FaceNormal::MINUS_Z);
+        REQUIRE(unpackEmissive(vertex.faceAttr));
+        REQUIRE(unpackBlockLight(vertex.faceAttr) > 0);
+    }
+    REQUIRE(foundActiveMouth);
+}
+
+TEST_CASE("Saved chunk publication retries a stale visual projection before insertion",
+          "[world][save][furnace][publication][concurrency][regression]") {
+    TempDir directory("stale_furnace_projection");
+    SaveManager saves(directory.path());
+    constexpr ChunkPos CHUNK{-2, 4, 3};
+    constexpr BlockPos POSITION{-2 * CHUNK_EDGE + 5, 4 * CHUNK_EDGE + 6, 3 * CHUNK_EDGE + 7};
+
+    Chunk saved(CHUNK);
+    saved.fill(BlockType::AIR);
+    saved.setBlock(5, 6, 7, BlockType::FURNACE);
+    saved.generated = true;
+    saves.saveChunk(saved);
+    REQUIRE(saves.flush());
+
+    FurnaceMap furnaces{{POSITION, FurnaceState{}}};
+    auto visuals = std::make_shared<FurnaceVisualAuthority>();
+    visuals->replace(furnaces);
+    std::atomic<int> applications{0};
+
+    World world(42);
+    world.setSavedChunkProjection({
+        .apply =
+            [visuals, &applications, POSITION](Chunk& chunk) {
+                const uint64_t applied = visuals->projectSavedChunk(chunk);
+                if (applications.fetch_add(1, std::memory_order_relaxed) == 0) {
+                    visuals->set(POSITION, BlockType::FURNACE_LIT);
+                }
+                return applied;
+            },
+        .currentRevision = [visuals] { return visuals->revision(); },
+    });
+    world.setSaveManager(&saves);
+    const std::shared_ptr<Chunk> loaded = world.getChunk(CHUNK);
+    REQUIRE(loaded);
+    REQUIRE(applications.load(std::memory_order_relaxed) == 2);
+    REQUIRE(loaded->getBlock(5, 6, 7) == BlockType::FURNACE_LIT);
+    REQUIRE(loaded->getBlockLight(5, 6, 7) == 13);
+}
+
+TEST_CASE("Beds and chests synchronously update derived sky paths",
+          "[world][light][sky][edit][gameplay]") {
+    World world(42);
+    auto chunk = world.getChunk(ChunkPos{0, WORLD_MAX_CHUNK_Y, 0});
+    REQUIRE(chunk);
+    constexpr int32_t BLOCK_Y = WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8;
+
+    world.setBlock(8, BLOCK_Y, 8, BlockType::BED);
+    REQUIRE(chunk->getSkyLight(8, 8, 8) == 15);
+    REQUIRE(chunk->getSkyLight(8, 7, 8) == 15);
+    world.setBlock(8, BLOCK_Y, 8, BlockType::AIR);
+
+    world.setBlock(8, BLOCK_Y, 8, BlockType::CHEST);
+    REQUIRE(chunk->getSkyLight(8, 8, 8) == 0);
+    REQUIRE(chunk->getSkyLight(8, 7, 8) == 14);
+    world.setBlock(8, BLOCK_Y, 8, BlockType::AIR);
+    REQUIRE(chunk->getSkyLight(8, 7, 8) == 15);
+}
+
+TEST_CASE("Floor torches are supported decorations and resist fluid replacement",
+          "[world][torch][fluid][support][regression]") {
+    REQUIRE(isFloorTorch(BlockType::TORCH));
+    REQUIRE_FALSE(isFlora(BlockType::TORCH));
+    REQUIRE_FALSE(isWaterReplaceable(BlockType::TORCH));
+    REQUIRE(isWaterReplaceable(BlockType::TALL_GRASS));
+    REQUIRE(hasFullBlockCollision(BlockType::STONE));
+    REQUIRE(hasFullBlockCollision(BlockType::GLASS));
+    REQUIRE_FALSE(hasFullBlockCollision(BlockType::BED));
+}
+
+TEST_CASE("Torch support dependency crosses a vertical cube boundary",
+          "[world][torch][support][boundary][regression]") {
+    World world(42);
+    constexpr int32_t SUPPORT_Y = 4 * CHUNK_EDGE + CHUNK_EDGE - 1;
+    auto supportChunk = world.getChunk(ChunkPos{0, 4, 0});
+    auto torchChunk = world.getChunk(ChunkPos{0, 5, 0});
+    REQUIRE(supportChunk);
+    REQUIRE(torchChunk);
+    supportChunk->fill(BlockType::AIR);
+    torchChunk->fill(BlockType::AIR);
+
+    REQUIRE(world.trySetBlock(8, SUPPORT_Y, 8, BlockType::STONE));
+    REQUIRE(world.trySetBlock(8, SUPPORT_Y + 1, 8, BlockType::TORCH));
+    const std::optional<BlockType> decoration = world.findBlockIfLoaded(8, SUPPORT_Y + 1, 8);
+    REQUIRE(decoration == BlockType::TORCH);
+    REQUIRE(losesSupportWhenBlockBelowBreaks(*decoration));
+    REQUIRE(hasFullBlockCollision(*world.findBlockIfLoaded(8, SUPPORT_Y, 8)));
+
+    // Engine::breakBlock follows this shared predicate before dropping the
+    // decoration, and World resolves both resident cubes without truncating Y.
+    REQUIRE(world.trySetBlock(8, SUPPORT_Y, 8, BlockType::AIR));
+    REQUIRE(world.trySetBlock(8, SUPPORT_Y + 1, 8, BlockType::AIR));
+    REQUIRE(world.findBlockIfLoaded(8, SUPPORT_Y + 1, 8) == BlockType::AIR);
+}
+
+TEST_CASE("Static source water stays transparent without activating runtime fluid work",
+          "[world][light][water][fluid][regression]") {
+    REQUIRE_FALSE(blockEditResetsIndirectLighting(BlockType::AIR, BlockType::WATER));
+    REQUIRE_FALSE(blockEditResetsIndirectLighting(BlockType::WATER, BlockType::AIR));
+    REQUIRE_FALSE(blockEditResetsIndirectLighting(BlockType::WATER, BlockType::WATER));
+    REQUIRE(blockEditResetsIndirectLighting(BlockType::AIR, BlockType::STONE));
+    REQUIRE(blockEditResetsIndirectLighting(BlockType::STONE, BlockType::AIR));
+    REQUIRE(blockEditResetsIndirectLighting(BlockType::AIR, BlockType::TORCH));
+    REQUIRE(blockEditResetsIndirectLighting(BlockType::WATER, BlockType::LAVA));
+
+    World world(42);
+    auto loaded = world.getChunk(ChunkPos{0, WORLD_MAX_CHUNK_Y, 0});
+    REQUIRE(loaded);
+    // Model canonical water as an already-published implicit source. Replacing
+    // transparent air directly preserves its derived skylight, and the public
+    // no-op placement must not reinterpret it as mutable bucket water.
+    loaded->setBlock(8, 8, 8, BlockType::WATER);
+    loaded->setFluidState(8, 8, 8, FluidState::source());
+    REQUIRE(loaded->getSkyLight(8, 8, 8) == 15);
+    REQUIRE(world.getPendingFluidCount() == 0);
+
+    const uint64_t revisionBefore = world.lightingRevision();
+    REQUIRE_FALSE(world.trySetBlock(8, WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8, 8, BlockType::WATER));
+    REQUIRE(world.getPendingFluidCount() == 0);
+    REQUIRE(world.lightingRevision() == revisionBefore);
+
+    loaded->setFluidState(8, 8, 8, FluidState::flowing(4));
+    const uint64_t flowingRevision = world.lightingRevision();
+    REQUIRE(world.trySetBlock(8, WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8, 8, BlockType::WATER));
+    REQUIRE(world.readFluidCell({8, WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8, 8}).state ==
+            FluidState::source());
+    REQUIRE(world.getPendingFluidCount() > 0);
+    REQUIRE(world.lightingRevision() == flowingRevision);
+
+    const uint64_t sourceNoOpRevision = world.lightingRevision();
+    const size_t sourceNoOpPending = world.getPendingFluidCount();
+    REQUIRE_FALSE(world.trySetBlock(8, WORLD_MAX_CHUNK_Y * CHUNK_EDGE + 8, 8, BlockType::WATER));
+    REQUIRE(world.lightingRevision() == sourceNoOpRevision);
+    REQUIRE(world.getPendingFluidCount() == sourceNoOpPending);
+}
+
+TEST_CASE("Snapshot mesher decodes independent packed light channels",
+          "[world][light][mesher][smooth]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
+    snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8 + dz)] = 0xB5;
+        }
+    }
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    bool foundBoundary = false;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) != FaceNormal::PLUS_X ||
+            static_cast<float>(vertex.px) != 16.0F) {
+            continue;
+        }
+        REQUIRE(unpackSkyLight(vertex.faceAttr) == 11);
+        REQUIRE(unpackBlockLight(vertex.faceAttr) == 5);
+        foundBoundary = true;
+    }
+    REQUIRE(foundBoundary);
+}
+
+TEST_CASE("Snapshot mesher preserves a smooth per-vertex block-light gradient",
+          "[world][light][mesher][smooth]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.blocks[MeshSnapshot::index(15, 8, 8)] = BlockType::STONE;
+    for (int dy = -1; dy <= 1; ++dy) {
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 7)] = 0x00;
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 8)] = 0x08;
+        snapshot.packedLight[MeshSnapshot::index(16, 8 + dy, 9)] = 0x0F;
+    }
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    uint8_t low = 255;
+    uint8_t high = 0;
+    int faceVertices = 0;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) != FaceNormal::PLUS_X ||
+            static_cast<float>(vertex.px) != 16.0F) {
+            continue;
+        }
+        const uint8_t value = unpackBlockLight(vertex.faceAttr);
+        low = std::min(low, value);
+        high = std::max(high, value);
+        ++faceVertices;
+    }
+    REQUIRE(faceVertices == 4);
+    REQUIRE(low <= 5);
+    REQUIRE(high >= 10);
+    REQUIRE(low < high);
+}
+
+TEST_CASE("Snapshot mesher retains greedy merging under uniform packed light",
+          "[world][light][mesher][smooth][greedy]") {
+    MeshSnapshot snapshot;
+    snapshot.clear();
+    snapshot.derivedSkyLightValid = true;
+    for (int z = 6; z <= 8; ++z) {
+        for (int x = 6; x <= 8; ++x) {
+            snapshot.blocks[MeshSnapshot::index(x, 8, z)] = BlockType::STONE;
+        }
+    }
+    for (int z = 5; z <= 9; ++z) {
+        for (int x = 5; x <= 9; ++x) {
+            snapshot.packedLight[MeshSnapshot::index(x, 9, z)] = 0xF7;
+        }
+    }
+
+    MeshScratch scratch;
+    const MeshOutput output = LODMesher::buildMesh(snapshot, scratch);
+    int topVertices = 0;
+    for (const Vertex& vertex : output.vertices) {
+        if (unpackFace(vertex.faceAttr) != FaceNormal::PLUS_Y)
+            continue;
+        ++topVertices;
+        REQUIRE(unpackSkyLight(vertex.faceAttr) == 15);
+        REQUIRE(unpackBlockLight(vertex.faceAttr) == 7);
+    }
+    REQUIRE(topVertices == 4);
+}
+
+TEST_CASE("World removes a corner emitter's diagonal light synchronously",
+          "[world][light][edit][diagonal]") {
+    World world(42);
+    auto home = world.getChunk(ChunkPos{0, 4, 0});
+    auto east = world.getChunk(ChunkPos{1, 4, 0});
+    auto south = world.getChunk(ChunkPos{0, 4, 1});
+    auto diagonal = world.getChunk(ChunkPos{1, 4, 1});
+    REQUIRE(home);
+    REQUIRE(east);
+    REQUIRE(south);
+    REQUIRE(diagonal);
+    home->fill(BlockType::AIR);
+    east->fill(BlockType::AIR);
+    south->fill(BlockType::AIR);
+    diagonal->fill(BlockType::AIR);
+
+    world.setBlock(CHUNK_EDGE - 1, 4 * CHUNK_EDGE + 8, CHUNK_EDGE - 1, BlockType::LAVA);
+    REQUIRE(diagonal->getBlockLight(0, 8, 0) == 13);
+    world.setBlock(CHUNK_EDGE - 1, 4 * CHUNK_EDGE + 8, CHUNK_EDGE - 1, BlockType::AIR);
+    REQUIRE(diagonal->getBlockLight(0, 8, 0) == 0);
 }
 
 TEST_CASE("LightEngine: lava light falls off one level per block", "[world][light]") {

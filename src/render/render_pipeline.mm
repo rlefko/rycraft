@@ -189,11 +189,10 @@ void buildFarTerrainCanopyRefreshBatch(
             return;
         }
         const auto attachment = attachments.find(key);
-        const bool matchingAttachment =
-            attachment != attachments.end() &&
-            farCanopyMatchesSurface(attachment->second.authorityQuality,
-                                    attachment->second.groundingQuality,
-                                    resident->second.authorityQuality);
+        const bool matchingAttachment = attachment != attachments.end() &&
+                                        farCanopyMatchesSurface(attachment->second.authorityQuality,
+                                                                attachment->second.groundingQuality,
+                                                                resident->second.authorityQuality);
         if (matchingAttachment &&
             attachment->second.authorityQuality == FarTerrainAuthorityQuality::FINAL) {
             return;
@@ -1289,8 +1288,7 @@ void publishV4PreparationWorldSnapshot(World& world) {
     world.publishLoadedSnapshot();
 }
 
-void RenderPipeline::renderV4Preparation(id<MTLCommandQueue> queue,
-                                         id<CAMetalDrawable> drawable,
+void RenderPipeline::renderV4Preparation(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
                                          const UIFrameState& uiFrame, World& world,
                                          const Camera& camera) {
     if (!drawable || !queue)
@@ -2158,8 +2156,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         const bool explorationBand =
             dx * dx + dz * dz <= EXPLORATION_RADIUS_CHUNKS * EXPLORATION_RADIUS_CHUNKS;
         const ExactMeshCandidatePriority priority = exactMeshCandidatePriority(
-            dx, dy, dz, explorationBand,
-            _farTerrainExactCoverage.sectionRequired(position),
+            dx, dy, dz, explorationBand, _farTerrainExactCoverage.sectionRequired(position),
             _farTerrainExactFloraCoverage.sectionRequired(position));
         return MeshRequestPriority{priority.lane, priority.distanceSquared};
     });
@@ -2331,24 +2328,20 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // 1. Drain worker results and upload within the per-frame budget; the
     //    leftovers stay in _pendingResults for next frame.
     _meshScheduler->drainCompleted(_pendingResults);
-    std::stable_sort(_pendingResults.begin(), _pendingResults.end(),
-                     [&](const MeshResult& left, const MeshResult& right) {
-                         const bool leftSurfaceRequired =
-                             _farTerrainExactCoverage.sectionRequired(left.pos);
-                         const bool rightSurfaceRequired =
-                             _farTerrainExactCoverage.sectionRequired(right.pos);
-                         const bool leftFloraRequired =
-                             _farTerrainExactFloraCoverage.sectionRequired(left.pos);
-                         const bool rightFloraRequired =
-                             _farTerrainExactFloraCoverage.sectionRequired(right.pos);
-                         return exactMeshUploadRanksBefore(
-                             exactMeshUploadPriority(left.pos, uploadCamera,
-                                                     EXPLORATION_RADIUS_CHUNKS,
-                                                     leftSurfaceRequired, leftFloraRequired),
-                             exactMeshUploadPriority(right.pos, uploadCamera,
-                                                     EXPLORATION_RADIUS_CHUNKS,
-                                                     rightSurfaceRequired, rightFloraRequired));
-                     });
+    std::stable_sort(
+        _pendingResults.begin(), _pendingResults.end(),
+        [&](const MeshResult& left, const MeshResult& right) {
+            const bool leftSurfaceRequired = _farTerrainExactCoverage.sectionRequired(left.pos);
+            const bool rightSurfaceRequired = _farTerrainExactCoverage.sectionRequired(right.pos);
+            const bool leftFloraRequired = _farTerrainExactFloraCoverage.sectionRequired(left.pos);
+            const bool rightFloraRequired =
+                _farTerrainExactFloraCoverage.sectionRequired(right.pos);
+            return exactMeshUploadRanksBefore(
+                exactMeshUploadPriority(left.pos, uploadCamera, EXPLORATION_RADIUS_CHUNKS,
+                                        leftSurfaceRequired, leftFloraRequired),
+                exactMeshUploadPriority(right.pos, uploadCamera, EXPLORATION_RADIUS_CHUNKS,
+                                        rightSurfaceRequired, rightFloraRequired));
+        });
     constexpr size_t MAX_UPLOAD_BYTES_PER_FRAME = 32 * 1024 * 1024;
     // An edit synchronously relights its whole affected neighborhood (home cube
     // plus the face, edge, and corner cubes light can reach), so let the edit
@@ -2490,8 +2483,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         const bool explorationBand =
             dx * dx + dz * dz <= EXPLORATION_RADIUS_CHUNKS * EXPLORATION_RADIUS_CHUNKS;
         return exactMeshCandidatePriority(
-            dx, dy, dz, explorationBand,
-            _farTerrainExactCoverage.sectionRequired(chunk->pos()),
+            dx, dy, dz, explorationBand, _farTerrainExactCoverage.sectionRequired(chunk->pos()),
             _farTerrainExactFloraCoverage.sectionRequired(chunk->pos()));
     };
     _meshCandidates.clear();
@@ -2725,23 +2717,24 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         const ColumnPos chunkColumn{key.x, key.z};
         const bool sectionRequired = _farTerrainExactCoverage.sectionRequired(key);
         const bool floraSectionRequired = _farTerrainExactFloraCoverage.sectionRequired(key);
-        const bool floraSectionMayPublish = exactFloraSectionMayPublish(
-            sectionRequired, floraSectionRequired,
-            exactFloraDrawHandoff.columnFullyReady(chunkColumn));
+        const bool floraSectionMayPublish =
+            exactFloraSectionMayPublish(sectionRequired, floraSectionRequired,
+                                        exactFloraDrawHandoff.columnFullyReady(chunkColumn));
         const bool coverageParentDrawable = drawableCoverageParentFor(chunkColumn);
         const bool revisionReady = farTerrainExactSectionOwnsSurface(
             _exactOwnedSections.contains(key), meshState.builtVersion,
             chunk->version.load(std::memory_order_relaxed));
-        if (floraSectionMayPublish && farTerrainExactCollisionOwnsSection(
-                sectionRequired, exactDrawHandoff.columnFullyReady(chunkColumn),
-                coverageParentDrawable, revisionReady)) {
+        if (floraSectionMayPublish &&
+            farTerrainExactCollisionOwnsSection(sectionRequired,
+                                                exactDrawHandoff.columnFullyReady(chunkColumn),
+                                                coverageParentDrawable, revisionReady)) {
             // Empty exact meshes publish intentional air even though the
             // visual path below has no allocation to submit.
             _exactCollisionOwnedSections.push_back(key);
         }
         const FarTerrainExactVisualOwnership ownership = farTerrainExactVisualOwnership(
-            sectionRequired, exactDrawHandoff.columnFullyReady(chunkColumn),
-            coverageParentDrawable, meshState.uploaded);
+            sectionRequired, exactDrawHandoff.columnFullyReady(chunkColumn), coverageParentDrawable,
+            meshState.uploaded);
         if (!ownership.drawExact || !floraSectionMayPublish) {
             continue;
         }
@@ -2766,8 +2759,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                 origin.overlayColorAndStrength =
                     simd_make_float4(color[0], color[1], color[2], color[3]);
             } else {
-                origin.overlayColorAndStrength =
-                    simd_make_float4(0.10f, 0.95f, 0.28f, 0.78f);
+                origin.overlayColorAndStrength = simd_make_float4(0.10f, 0.95f, 0.28f, 0.78f);
             }
         } else if (_worldgenOverlayMode != WorldgenOverlayMode::NONE) {
             const int64_t centerX = chunk->chunkX * CHUNK_WIDTH + CHUNK_WIDTH / 2;
@@ -2806,7 +2798,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                             indexCount:meshState.opaqueIndexCount
                              indexType:MTLIndexTypeUInt32
                            indexBuffer:meshState.alloc.indexBuffer
-                            indexBufferOffset:meshState.alloc.indexOffset];
+                     indexBufferOffset:meshState.alloc.indexOffset];
     }
 
     // The loaded snapshot retains a stable order between membership changes,
@@ -2818,8 +2810,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         *_publishedExactCollisionCoverageEpoch != exactCoverageEpoch ||
         _publishedExactCollisionOwnedSections != _exactCollisionOwnedSections;
     if (collisionPublicationChanged &&
-        world.publishExactCollisionOwnership(exactCoverageEpoch,
-                                             _exactCollisionOwnedSections)) {
+        world.publishExactCollisionOwnership(exactCoverageEpoch, _exactCollisionOwnedSections)) {
         _publishedExactCollisionCoverageEpoch = exactCoverageEpoch;
         _publishedExactCollisionOwnedSections = _exactCollisionOwnedSections;
     }
@@ -3067,10 +3058,9 @@ void RenderPipeline::renderFarTerrain(
     const auto farPlannerStartedAt = std::chrono::steady_clock::now();
 
     const int exactChunks = world.getExactViewDistance();
-    const int configuredVisibleChunks = world.generationContext()
-                                            ? farTerrainEntryHorizonViewDistance(
-                                                  world.getViewDistance())
-                                            : world.getViewDistance();
+    const int configuredVisibleChunks =
+        world.generationContext() ? farTerrainEntryHorizonViewDistance(world.getViewDistance())
+                                  : world.getViewDistance();
     const int visibleChunks = selectedViewDistance < 0
                                   ? configuredVisibleChunks
                                   : std::clamp(selectedViewDistance, 0, configuredVisibleChunks);
@@ -3132,8 +3122,7 @@ void RenderPipeline::renderFarTerrain(
             const double movementZ = cameraPosition.z - previousSelectionCamera->second;
             constexpr double MOTION_SAMPLE_DISTANCE_SQUARED =
                 static_cast<double>(CHUNK_EDGE * CHUNK_EDGE);
-            if (movementX * movementX + movementZ * movementZ >=
-                MOTION_SAMPLE_DISTANCE_SQUARED) {
+            if (movementX * movementX + movementZ * movementZ >= MOTION_SAMPLE_DISTANCE_SQUARED) {
                 _farTerrainProtectedRecentMotionX = (movementX > 0.0) - (movementX < 0.0);
                 _farTerrainProtectedRecentMotionZ = (movementZ > 0.0) - (movementZ < 0.0);
             }
@@ -3145,8 +3134,7 @@ void RenderPipeline::renderFarTerrain(
         world_coord::floorDiv(cameraBlockX, static_cast<int64_t>(FAR_TERRAIN_TILE_EDGE)),
         world_coord::floorDiv(cameraBlockZ, static_cast<int64_t>(FAR_TERRAIN_TILE_EDGE)),
     };
-    const ColumnPos protectedAnchor =
-        farTerrainProtectedNearAnchor(cameraBlockX, cameraBlockZ);
+    const ColumnPos protectedAnchor = farTerrainProtectedNearAnchor(cameraBlockX, cameraBlockZ);
     const bool protectedHandoffChanged =
         finalStreamingWorkEnabled && _farTerrainProtectedNearHandoff.request(protectedAnchor);
     if (protectedHandoffChanged) {
@@ -3333,9 +3321,9 @@ void RenderPipeline::renderFarTerrain(
         // support copy, then every parent before intermediate bridges. Under
         // exceptional pressure, an adjacent core target can therefore never
         // lose admission to another coordinate's nonpublishable lineage.
-        buildFarTerrainTieredCriticalResidencyOrder(
-            _farTerrainCriticalResidencyTargets, _farTerrainPredictedNearPatchTargets,
-            _farTerrainCriticalResidencyKeys);
+        buildFarTerrainTieredCriticalResidencyOrder(_farTerrainCriticalResidencyTargets,
+                                                    _farTerrainPredictedNearPatchTargets,
+                                                    _farTerrainCriticalResidencyKeys);
     }
     if (residencyMembershipChanged) {
         buildFarTerrainResidencyOrder(_farTerrainCandidates, _farTerrainPriorityOrder,
@@ -3477,22 +3465,22 @@ void RenderPipeline::renderFarTerrain(
                                             _farTerrainConnectedNearPatchTargets);
         if (protectedHandoffChanged || selectionChanged ||
             _farTerrainProtectedFinalTerrainRegions.empty()) {
-            _farTerrainProtectedFinalTerrainRegions = farTerrainProtectedFinalTerrainRegions(
-                _farTerrainConnectedNearPatchTargets);
+            _farTerrainProtectedFinalTerrainRegions =
+                farTerrainProtectedFinalTerrainRegions(_farTerrainConnectedNearPatchTargets);
         }
         if (const auto generationContext = world.generationContext()) {
             const worldgen::learned::ProtectedHandoffEpoch epoch{protectedClosureEpoch};
             for (const worldgen::learned::NativeRect region :
                  _farTerrainProtectedFinalTerrainRegions) {
                 const auto prepared = generationContext->queryTransientFinalNativeGrid(
-                    region, worldgen::learned::AuthorityRequestPriority::PROTECTED_HANDOFF,
-                    epoch);
+                    region, worldgen::learned::AuthorityRequestPriority::PROTECTED_HANDOFF, epoch);
                 if (prepared.status() == worldgen::learned::AuthorityStatus::FAILED) {
                     generationContext->latchFailure(
                         prepared.failure()
                             ? *prepared.failure()
                             : worldgen::learned::GenerationFailure{
-                                  .code = worldgen::learned::GenerationFailureCode::INFERENCE_FAILED,
+                                  .code =
+                                      worldgen::learned::GenerationFailureCode::INFERENCE_FAILED,
                                   .message =
                                       "Protected FINAL terrain prewarm failed without a reason",
                                   .retriable = true});
@@ -3504,9 +3492,8 @@ void RenderPipeline::renderFarTerrain(
         _farTerrainProtectedFinalTerrainRegions.clear();
     }
     const auto predictedOnlyTarget = [&](FarTerrainKey key) {
-        const bool predicted =
-            std::ranges::find(_farTerrainPredictedNearPatchTargets, key) !=
-            _farTerrainPredictedNearPatchTargets.end();
+        const bool predicted = std::ranges::find(_farTerrainPredictedNearPatchTargets, key) !=
+                               _farTerrainPredictedNearPatchTargets.end();
         const bool current = std::ranges::find(_farTerrainConnectedNearPatchTargets, key) !=
                              _farTerrainConnectedNearPatchTargets.end();
         return predicted && !current;
@@ -3593,16 +3580,15 @@ void RenderPipeline::renderFarTerrain(
         if (fallback == _farCanopyLodFallbacks.end())
             return nullptr;
         const auto canopy = _farCanopyAttachments.find(fallback->second);
-        if (canopy == _farCanopyAttachments.end() ||
-            !canopyStateHasGeometry(&canopy->second) ||
+        if (canopy == _farCanopyAttachments.end() || !canopyStateHasGeometry(&canopy->second) ||
             !farCanopyMatchesSurface(canopy->second.authorityQuality,
                                      canopy->second.groundingQuality, surfaceQuality)) {
             return nullptr;
         }
         return &canopy->second;
     };
-    const auto retireCanopyFallback =
-        [&](ColumnPos coordinate, std::optional<FarTerrainKey> replacement) {
+    const auto retireCanopyFallback = [&](ColumnPos coordinate,
+                                          std::optional<FarTerrainKey> replacement) {
         const auto fallback = _farCanopyLodFallbacks.find(coordinate);
         if (fallback == _farCanopyLodFallbacks.end())
             return;
@@ -3637,8 +3623,7 @@ void RenderPipeline::renderFarTerrain(
         }
         const auto source = _farCanopyAttachments.find(sourceKey);
         const bool sourcePresent =
-            source != _farCanopyAttachments.end() &&
-            canopyStateHasGeometry(&source->second) &&
+            source != _farCanopyAttachments.end() && canopyStateHasGeometry(&source->second) &&
             farCanopyMatchesSurface(source->second.authorityQuality,
                                     source->second.groundingQuality, surfaceQuality);
         const auto target = _farCanopyAttachments.find(targetKey);
@@ -3684,10 +3669,10 @@ void RenderPipeline::renderFarTerrain(
         uint64_t indexBytes = 0;
     };
     const auto protectedClosureTarget = [&](FarTerrainKey key) {
-        return farTerrainProtectedNearTargetKey(
-                   _farTerrainProtectedNearHandoff.activeCenter(), key) ||
-               farTerrainProtectedNearTargetKey(
-                   _farTerrainProtectedNearHandoff.requestedCenter(), key);
+        return farTerrainProtectedNearTargetKey(_farTerrainProtectedNearHandoff.activeCenter(),
+                                                key) ||
+               farTerrainProtectedNearTargetKey(_farTerrainProtectedNearHandoff.requestedCenter(),
+                                                key);
     };
     const auto reclaimOptionalGpuResidencyForNear = [&](FarTerrainKey preserveKey,
                                                         uint64_t targetVertexBytes,
@@ -3762,13 +3747,12 @@ void RenderPipeline::renderFarTerrain(
                 }
                 const FarTerrainKey parent{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
                 const auto parentResident = _farTerrainMeshes.find(parent);
-                const bool parentReady =
-                    parentResident != _farTerrainMeshes.end() && parentResident->second.uploaded &&
-                    !_farTerrainAuthorityTransitions.contains(parent);
+                const bool parentReady = parentResident != _farTerrainMeshes.end() &&
+                                         parentResident->second.uploaded &&
+                                         !_farTerrainAuthorityTransitions.contains(parent);
                 demoteToParent = farTerrainDisplayedRefinementMayYieldToParentForNear(
-                    key.step, neighborSteps, parentReady, lodTransitionEndpoint,
-                    neighborTransition, authorityTransitionEndpoint, protectedClosure,
-                    exactFallback, nextCritical);
+                    key.step, neighborSteps, parentReady, lodTransitionEndpoint, neighborTransition,
+                    authorityTransitionEndpoint, protectedClosure, exactFallback, nextCritical);
             }
             if (!demoteToParent &&
                 !farTerrainGpuMayEvictForNear(false, isDisplayed, lodTransitionEndpoint,
@@ -3900,8 +3884,7 @@ void RenderPipeline::renderFarTerrain(
         const bool localUpload = coordinate == centerTile || protectedClosure || exactFallback ||
                                  distanceSquaredForKey(mesh->key) <= LOCAL_UPLOAD_RADIUS_SQUARED;
         const bool criticalRefinement = farTerrainCriticalProtectedRefinement(
-            _farTerrainProtectedNearHandoff.requestedCenter(), mesh->key,
-            mesh->authorityQuality);
+            _farTerrainProtectedNearHandoff.requestedCenter(), mesh->key, mesh->authorityQuality);
         const bool nearRefinement = !coverageCritical && !criticalRefinement && localUpload;
         const bool localCriticalCoverage = coverageCritical && localUpload;
         const auto displayedSurface = _farTerrainDisplayedByTile.find(coordinate);
@@ -4022,31 +4005,28 @@ void RenderPipeline::renderFarTerrain(
                 FAR_TERRAIN_NEAR_REFINEMENT_UPLOAD_RESERVE_BYTES, mayConsumeNearUploadReserve))
             return false;
         const FarTerrainGpuArenaClass arenaClass =
-            criticalRefinement    ? FarTerrainGpuArenaClass::CRITICAL_REFINEMENT
+            criticalRefinement      ? FarTerrainGpuArenaClass::CRITICAL_REFINEMENT
             : localCriticalCoverage ? FarTerrainGpuArenaClass::CRITICAL_COVERAGE
-            : coverageCritical    ? FarTerrainGpuArenaClass::COVERAGE
-            : nearRefinement ? FarTerrainGpuArenaClass::NEAR_REFINEMENT
-                             : FarTerrainGpuArenaClass::REFINEMENT;
+            : coverageCritical      ? FarTerrainGpuArenaClass::COVERAGE
+            : nearRefinement        ? FarTerrainGpuArenaClass::NEAR_REFINEMENT
+                                    : FarTerrainGpuArenaClass::REFINEMENT;
         if (!farTerrainGpuUploadFitsArena(
                 farArenaVertexUsed, farArenaIndexUsed, _farMegaBuffer->vertexCapacity(),
                 _farMegaBuffer->indexCapacity(), vertexBytes, indexBytes, arenaClass)) {
             ++_farTerrainArenaAdmissionDeniedCount;
             if (criticalRefinement || nearRefinement || localCriticalCoverage) {
                 const bool fullArenaAdmission = criticalRefinement || localCriticalCoverage;
-                const uint64_t vertexReserve =
-                    fullArenaAdmission ? uint64_t{0}
-                                       : FAR_TERRAIN_GPU_VERTEX_COVERAGE_RESERVE_BYTES;
+                const uint64_t vertexReserve = fullArenaAdmission
+                                                   ? uint64_t{0}
+                                                   : FAR_TERRAIN_GPU_VERTEX_COVERAGE_RESERVE_BYTES;
                 const uint64_t indexReserve =
-                    fullArenaAdmission ? uint64_t{0}
-                                       : FAR_TERRAIN_GPU_INDEX_COVERAGE_RESERVE_BYTES;
-                const uint64_t vertexLimit =
-                    _farMegaBuffer->vertexCapacity() > vertexReserve
-                        ? _farMegaBuffer->vertexCapacity() - vertexReserve
-                        : uint64_t{0};
-                const uint64_t indexLimit =
-                    _farMegaBuffer->indexCapacity() > indexReserve
-                        ? _farMegaBuffer->indexCapacity() - indexReserve
-                        : uint64_t{0};
+                    fullArenaAdmission ? uint64_t{0} : FAR_TERRAIN_GPU_INDEX_COVERAGE_RESERVE_BYTES;
+                const uint64_t vertexLimit = _farMegaBuffer->vertexCapacity() > vertexReserve
+                                                 ? _farMegaBuffer->vertexCapacity() - vertexReserve
+                                                 : uint64_t{0};
+                const uint64_t indexLimit = _farMegaBuffer->indexCapacity() > indexReserve
+                                                ? _farMegaBuffer->indexCapacity() - indexReserve
+                                                : uint64_t{0};
                 const uint64_t alignedVertexBytes = alignedArenaBytes(vertexBytes);
                 const uint64_t alignedIndexBytes = alignedArenaBytes(indexBytes);
                 const uint64_t availableVertexBytes =
@@ -4464,8 +4444,8 @@ void RenderPipeline::renderFarTerrain(
     // Treat the movement frame as local debt too, so a cached outer parent
     // cannot flash into view one frame before the nearer queue takes control.
     const bool ordinaryCoveragePublicationEnabled =
-        !selectionChanged && farTerrainOrdinaryCoverageWorkEnabled(
-                                 drawGeometry, exactStreamingBusy, _farTerrainLocalTerrainDebt);
+        !selectionChanged && farTerrainOrdinaryCoverageWorkEnabled(drawGeometry, exactStreamingBusy,
+                                                                   _farTerrainLocalTerrainDebt);
     const auto baseResultEligible = [&](const FarTerrainResult& result) {
         return !result.failed && farTerrainIsBaseStep(result.key.step) && result.mesh &&
                (result.mesh->authorityQuality != FarTerrainAuthorityQuality::FINAL ||
@@ -4723,10 +4703,9 @@ void RenderPipeline::renderFarTerrain(
                             missingFinalHandoffParents != 0;
     _farTerrainScheduler->setWorkerBudget(
         farTerrainWorkerBudget(exactStreamingBusy, localTerrainDebt));
-    _farTerrainScheduler->setCanopyWorkerBudget(
-        farTerrainCanopyWorkerBudget(drawGeometry, canopyConnectedPrefixReady,
-                                     localTerrainDebt || nearExactPublicationDebt,
-                                     exactStreamingBusy));
+    _farTerrainScheduler->setCanopyWorkerBudget(farTerrainCanopyWorkerBudget(
+        drawGeometry, canopyConnectedPrefixReady, localTerrainDebt || nearExactPublicationDebt,
+        exactStreamingBusy));
     _farTerrainUrgentRefinementRequests.clear();
     const bool ordinaryNearRefinementWorkEnabled = farTerrainOptionalStreamingWorkEnabled(
         drawGeometry, farTerrainConnectedRefinementLaneOpen(parentCoverage));
@@ -4793,14 +4772,13 @@ void RenderPipeline::renderFarTerrain(
     // small subset that intersects the exact fallback band.
     localTerrainDebt = localTerrainDebt || !_farTerrainUrgentRefinementRequests.empty();
     _farTerrainLocalTerrainDebt = localTerrainDebt;
-    _farTerrainScheduler->setNearFirstWorkEnabled(
-        drawGeometry && (exactStreamingBusy || localTerrainDebt));
+    _farTerrainScheduler->setNearFirstWorkEnabled(drawGeometry &&
+                                                  (exactStreamingBusy || localTerrainDebt));
     _farTerrainScheduler->setWorkerBudget(
         farTerrainWorkerBudget(exactStreamingBusy, localTerrainDebt));
-    _farTerrainScheduler->setCanopyWorkerBudget(
-        farTerrainCanopyWorkerBudget(drawGeometry, canopyConnectedPrefixReady,
-                                     localTerrainDebt || nearExactPublicationDebt,
-                                     exactStreamingBusy));
+    _farTerrainScheduler->setCanopyWorkerBudget(farTerrainCanopyWorkerBudget(
+        drawGeometry, canopyConnectedPrefixReady, localTerrainDebt || nearExactPublicationDebt,
+        exactStreamingBusy));
 
     // The pure ordering helper ranks the camera and protected handoff first,
     // followed by the connected neighbor wavefront and largest projected
@@ -4840,11 +4818,11 @@ void RenderPipeline::renderFarTerrain(
     _farTerrainCanopyRefreshKeys.clear();
     _farTerrainCachedCanopies.clear();
     if (drawGeometry) {
-        buildFarTerrainCanopyRefreshBatch(
-            _farTerrainDisplayedByTile, _farTerrainTransitions, _farTerrainMeshes,
-            _farCanopyAttachments, cameraPosition.x, cameraPosition.z,
-            FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET, _farTerrainCanopyRefreshRequests,
-            &exactFloraHandoff);
+        buildFarTerrainCanopyRefreshBatch(_farTerrainDisplayedByTile, _farTerrainTransitions,
+                                          _farTerrainMeshes, _farCanopyAttachments,
+                                          cameraPosition.x, cameraPosition.z,
+                                          FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET,
+                                          _farTerrainCanopyRefreshRequests, &exactFloraHandoff);
         for (const FarTerrainCanopyRefreshRequest& request : _farTerrainCanopyRefreshRequests)
             _farTerrainCanopyRefreshKeys.push_back(request.key);
         _farTerrainScheduler->findCachedCanopyBatch(_farTerrainCanopyRefreshKeys,
@@ -4919,8 +4897,7 @@ void RenderPipeline::renderFarTerrain(
             if (finalGroundingPrewarms >= FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET)
                 break;
             if (request.groundingQuality != FarTerrainAuthorityQuality::PREVIEW ||
-                exactFloraHandoff.tileFullyOwned(
-                    {request.key.tileX, request.key.tileZ}) ||
+                exactFloraHandoff.tileFullyOwned({request.key.tileX, request.key.tileZ}) ||
                 farTerrainProtectedNearRole(*protectedCenter,
                                             {request.key.tileX, request.key.tileZ}) ==
                     FarTerrainProtectedNearRole::NONE) {
@@ -5041,18 +5018,17 @@ void RenderPipeline::renderFarTerrain(
     size_t urgentRefinementSubmissions = 0;
     size_t baseSubmissions = 0;
     constexpr size_t MAX_BASE_SUBMISSIONS_PER_FRAME = 64;
-    const bool ordinaryCoverageWorkEnabled = farTerrainOrdinaryCoverageWorkEnabled(
-        drawGeometry, exactStreamingBusy, localTerrainDebt);
+    const bool ordinaryCoverageWorkEnabled =
+        farTerrainOrdinaryCoverageWorkEnabled(drawGeometry, exactStreamingBusy, localTerrainDebt);
     // A missing parent in the current protected closure is the player's only
     // continuous fallback. Promote or admit it through the critical coverage
     // lane before the ordinary horizon scan, including when that scan already
     // parked its previous request at the nonurgent cap.
     if (currentProtectedCenter) {
-        for (size_t index = 0;
-             index < _farTerrainConnectedNearPatchTargets.size() &&
-             urgentRefinementSubmissions <
-                 FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
-             _farTerrainScheduler->hasUrgentRefinementCapacity();
+        for (size_t index = 0; index < _farTerrainConnectedNearPatchTargets.size() &&
+                               urgentRefinementSubmissions <
+                                   FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
+                               _farTerrainScheduler->hasUrgentRefinementCapacity();
              ++index) {
             const FarTerrainKey target = _farTerrainConnectedNearPatchTargets[index];
             const FarTerrainKey parent{target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP};
@@ -5101,16 +5077,14 @@ void RenderPipeline::renderFarTerrain(
                                urgentRefinementSubmissions <
                                    FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
                                _farTerrainScheduler->hasUrgentRefinementCapacity();
-            ++index) {
+             ++index) {
             const FarTerrainKey target = _farTerrainConnectedNearPatchTargets[index];
             const FarTerrainKey parent{target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP};
             const auto displayed = _farTerrainDisplayedByTile.find({target.tileX, target.tileZ});
-            const bool provisionalBridgeDisplayed =
-                displayed != _farTerrainDisplayedByTile.end() &&
-                !farTerrainIsBaseStep(displayed->second.step);
+            const bool provisionalBridgeDisplayed = displayed != _farTerrainDisplayedByTile.end() &&
+                                                    !farTerrainIsBaseStep(displayed->second.step);
             if (!farTerrainProtectedFinalTargetMaySubmit(
-                    isFinalResident(target), provisionalBridgeDisplayed,
-                    isFinalResident(parent))) {
+                    isFinalResident(target), provisionalBridgeDisplayed, isFinalResident(parent))) {
                 // At least one provisional bridge becomes drawable before
                 // this coordinate spends capacity on its hidden FINAL target,
                 // unless a FINAL parent has already made that PREVIEW bridge
@@ -5126,8 +5100,7 @@ void RenderPipeline::renderFarTerrain(
     }
     const auto missingCurrentProtectedBridge = [&](FarTerrainKey bridge) {
         return bridge.step != FarTerrainStep::ONE && currentProtectedCenter &&
-               farTerrainProtectedNearRole(*currentProtectedCenter,
-                                           {bridge.tileX, bridge.tileZ}) !=
+               farTerrainProtectedNearRole(*currentProtectedCenter, {bridge.tileX, bridge.tileZ}) !=
                    FarTerrainProtectedNearRole::NONE &&
                !isResident(bridge);
     };
@@ -5186,9 +5159,8 @@ void RenderPipeline::renderFarTerrain(
     const auto predictedSubmissionPriority = [&](size_t index) {
         const size_t currentOffset =
             _farTerrainConnectedNearPatchTargets.size() * static_cast<size_t>(8);
-        return static_cast<uint32_t>(
-            std::min(currentOffset + index * static_cast<size_t>(8),
-                     static_cast<size_t>(UINT32_MAX)));
+        return static_cast<uint32_t>(std::min(currentOffset + index * static_cast<size_t>(8),
+                                              static_cast<size_t>(UINT32_MAX)));
     };
     for (size_t index = 0;
          index < _farTerrainPredictedNearPatchTargets.size() &&
@@ -5218,9 +5190,8 @@ void RenderPipeline::renderFarTerrain(
         const FarTerrainKey parent{target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP};
         const std::shared_ptr<const FarTerrainMesh> cachedParent =
             _farTerrainScheduler->findCached(parent);
-        if (!isFinalResident(parent) &&
-            (!cachedParent ||
-             cachedParent->authorityQuality != FarTerrainAuthorityQuality::FINAL)) {
+        if (!isFinalResident(parent) && (!cachedParent || cachedParent->authorityQuality !=
+                                                              FarTerrainAuthorityQuality::FINAL)) {
             continue;
         }
         if (_farTerrainScheduler->enqueueUrgentFinalRefinement(
@@ -5357,8 +5328,8 @@ void RenderPipeline::renderFarTerrain(
         }
     }
 
-    for (; ordinaryCoverageWorkEnabled &&
-           refinementOffset < _farTerrainPriorityOrder.size(); ++refinementOffset) {
+    for (; ordinaryCoverageWorkEnabled && refinementOffset < _farTerrainPriorityOrder.size();
+         ++refinementOffset) {
         if (!_farTerrainScheduler->hasSubmissionCapacity() ||
             baseSubmissions >= MAX_BASE_SUBMISSIONS_PER_FRAME)
             break;
@@ -5371,8 +5342,7 @@ void RenderPipeline::renderFarTerrain(
             continue;
         }
         if (!isResident(key)) {
-            if (_farTerrainScheduler->enqueue(key,
-                                              static_cast<uint32_t>(refinementOffset * 8))) {
+            if (_farTerrainScheduler->enqueue(key, static_cast<uint32_t>(refinementOffset * 8))) {
                 ++baseSubmissions;
             }
         }
@@ -5579,13 +5549,13 @@ void RenderPipeline::renderFarTerrain(
                 displayed != _farTerrainDisplayedByTile.end() &&
                 farTerrainRetainsProgressiveStep(it->first.step, displayed->second.step,
                                                  desired->second.step);
-            keep = protectedGpuResidency || farTerrainIsBaseStep(it->first.step) ||
-                   retainedStepOnePrefetch || progressiveBridge || authorityTransition ||
-                   (desired != _farTerrainDesiredByTile.end() && desired->second == it->first) ||
-                   (displayed != _farTerrainDisplayedByTile.end() &&
-                    displayed->second == it->first) ||
-                   (transition != _farTerrainTransitions.end() &&
-                    (transition->second.from == it->first || transition->second.to == it->first));
+            keep =
+                protectedGpuResidency || farTerrainIsBaseStep(it->first.step) ||
+                retainedStepOnePrefetch || progressiveBridge || authorityTransition ||
+                (desired != _farTerrainDesiredByTile.end() && desired->second == it->first) ||
+                (displayed != _farTerrainDisplayedByTile.end() && displayed->second == it->first) ||
+                (transition != _farTerrainTransitions.end() &&
+                 (transition->second.from == it->first || transition->second.to == it->first));
         }
         if (!keep) {
             const auto fallback = _farCanopyLodFallbacks.find(coordinate);
@@ -5772,20 +5742,18 @@ void RenderPipeline::renderFarTerrain(
                     // make this safe across geometric LOD keys.
                     targetCanopy = sourceCanopy;
                 }
-                plans[planCount++] = {
-                    transition->second.from,
-                    &_farTerrainMeshes.at(transition->second.from),
-                    sample.progress,
-                    transitionFlags,
-                    sourceOwnsConnectedGeometry,
-                    sourceCanopy};
-                plans[planCount++] = {
-                    transition->second.to,
-                    &_farTerrainMeshes.at(transition->second.to),
-                    sample.progress,
-                    transitionFlags | FAR_TERRAIN_LOD_TARGET_FLAG,
-                    targetOwnsConnectedGeometry,
-                    targetCanopy};
+                plans[planCount++] = {transition->second.from,
+                                      &_farTerrainMeshes.at(transition->second.from),
+                                      sample.progress,
+                                      transitionFlags,
+                                      sourceOwnsConnectedGeometry,
+                                      sourceCanopy};
+                plans[planCount++] = {transition->second.to,
+                                      &_farTerrainMeshes.at(transition->second.to),
+                                      sample.progress,
+                                      transitionFlags | FAR_TERRAIN_LOD_TARGET_FLAG,
+                                      targetOwnsConnectedGeometry,
+                                      targetCanopy};
             } else if (const std::optional<FarTerrainKey> displayed = displayedKeyFor(coordinate)) {
                 if (const auto promotion = _farTerrainAuthorityTransitions.find(*displayed);
                     promotion != _farTerrainAuthorityTransitions.end() &&

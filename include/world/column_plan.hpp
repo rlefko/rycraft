@@ -62,8 +62,7 @@ public:
     // volcanic support, or tall vertical walls.
     std::span<const int32_t> floraOwnershipSections() const {
         return std::span<const int32_t>(exposedSections_)
-            .subspan(floraOwnershipOffset_,
-                     surfaceOwnershipOffset_ - floraOwnershipOffset_);
+            .subspan(floraOwnershipOffset_, surfaceOwnershipOffset_ - floraOwnershipOffset_);
     }
     // Sections that contain the drawable terrain top, standing water, falls,
     // or required vertical surface walls. This is deliberately narrower than

@@ -847,18 +847,15 @@ const QuantizedTerrainSample* TerrainAuthorityPage::sample(size_t row,
     return std::addressof(samples[row * AUTHORITY_PAGE_NATIVE_EDGE + column]);
 }
 
-QuantizedTerrainSample
-quantizePhysicalTerrainSample(const PhysicalTerrainSample& sample) noexcept {
+QuantizedTerrainSample quantizePhysicalTerrainSample(const PhysicalTerrainSample& sample) noexcept {
     return QuantizedTerrainSample{
         .elevationMeters = clampedRound<int16_t>(sample.elevationMeters),
-        .meanTemperatureCentidegrees =
-            clampedRound<int16_t>(sample.meanTemperatureC * 100.0),
+        .meanTemperatureCentidegrees = clampedRound<int16_t>(sample.meanTemperatureC * 100.0),
         .temperatureVariabilityCentidegrees =
             clampedRound<uint16_t>(sample.temperatureVariabilityC * 100.0),
-        .annualPrecipitationMillimeters =
-            clampedRound<uint16_t>(sample.annualPrecipitationMm),
-        .precipitationCoefficientBasisPoints = clampedRound<uint16_t>(
-            sample.precipitationCoefficientOfVariation * 10'000.0),
+        .annualPrecipitationMillimeters = clampedRound<uint16_t>(sample.annualPrecipitationMm),
+        .precipitationCoefficientBasisPoints =
+            clampedRound<uint16_t>(sample.precipitationCoefficientOfVariation * 10'000.0),
         .lapseRateMicrodegreesPerMeter =
             clampedRound<int16_t>(sample.lapseRateCPerMeter * 1'000'000.0),
     };
@@ -1875,8 +1872,8 @@ public:
         return key.quality == AuthorityQuality::PREVIEW || isVisibleOrLowerRequest(priority);
     }
 
-    static AuthorityRequestPriority effectivePriority(
-        TerrainPageKey key, AuthorityRequestPriority priority) noexcept {
+    static AuthorityRequestPriority effectivePriority(TerrainPageKey key,
+                                                      AuthorityRequestPriority priority) noexcept {
         return key.quality == AuthorityQuality::PREVIEW
                    ? std::max(priority, AuthorityRequestPriority::COARSE_PREVIEW)
                    : priority;
@@ -1905,8 +1902,7 @@ public:
     }
 
     [[nodiscard]] bool requestBeforeLocked(AuthorityRequestPriority leftPriority,
-                                           ProtectedHandoffEpoch leftEpoch,
-                                           uint64_t leftSequence,
+                                           ProtectedHandoffEpoch leftEpoch, uint64_t leftSequence,
                                            AuthorityRequestPriority rightPriority,
                                            ProtectedHandoffEpoch rightEpoch,
                                            uint64_t rightSequence) const noexcept {
@@ -1936,10 +1932,10 @@ public:
         uint64_t sequence = 0;
     };
 
-    [[nodiscard]] bool preemptForPriorityLocked(
-        size_t requiredSlots, AuthorityRequestPriority incomingPriority,
-        ProtectedHandoffEpoch incomingEpoch = {},
-        std::span<const TerrainPageKey> excludedPageKeys = {}) {
+    [[nodiscard]] bool
+    preemptForPriorityLocked(size_t requiredSlots, AuthorityRequestPriority incomingPriority,
+                             ProtectedHandoffEpoch incomingEpoch = {},
+                             std::span<const TerrainPageKey> excludedPageKeys = {}) {
         if (requiredSlots == 0) return true;
         std::vector<PreemptionCandidate> candidates;
         candidates.reserve(outstandingRequestCountLocked());
@@ -1983,15 +1979,15 @@ public:
                                   .sequence = flight->sequence});
         }
         if (candidates.size() < requiredSlots) return false;
-        std::sort(candidates.begin(), candidates.end(), [](const PreemptionCandidate& left,
-                                                           const PreemptionCandidate& right) {
-            if (left.priority != right.priority) return left.priority > right.priority;
-            if (left.priority == AuthorityRequestPriority::PROTECTED_HANDOFF &&
-                left.handoffEpoch != right.handoffEpoch) {
-                return left.handoffEpoch.value < right.handoffEpoch.value;
-            }
-            return left.sequence > right.sequence;
-        });
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const PreemptionCandidate& left, const PreemptionCandidate& right) {
+                      if (left.priority != right.priority) return left.priority > right.priority;
+                      if (left.priority == AuthorityRequestPriority::PROTECTED_HANDOFF &&
+                          left.handoffEpoch != right.handoffEpoch) {
+                          return left.handoffEpoch.value < right.handoffEpoch.value;
+                      }
+                      return left.sequence > right.sequence;
+                  });
         candidates.resize(requiredSlots);
         for (const PreemptionCandidate& candidate : candidates) {
             switch (candidate.kind) {
@@ -2158,17 +2154,18 @@ public:
 
     bool evictTransientGridFor(AuthorityRequestPriority incomingPriority) {
         if (transientGridCache.empty()) return false;
-        const auto victim = std::max_element(
-            transientGridCache.begin(), transientGridCache.end(),
-            [incomingPriority](const auto& left, const auto& right) {
-                const bool leftEligible = left.second.priority >= incomingPriority;
-                const bool rightEligible = right.second.priority >= incomingPriority;
-                if (leftEligible != rightEligible) return !leftEligible;
-                if (!leftEligible) return false;
-                if (left.second.priority != right.second.priority)
-                    return left.second.priority < right.second.priority;
-                return left.second.recency > right.second.recency;
-            });
+        const auto victim =
+            std::max_element(transientGridCache.begin(), transientGridCache.end(),
+                             [incomingPriority](const auto& left, const auto& right) {
+                                 const bool leftEligible = left.second.priority >= incomingPriority;
+                                 const bool rightEligible =
+                                     right.second.priority >= incomingPriority;
+                                 if (leftEligible != rightEligible) return !leftEligible;
+                                 if (!leftEligible) return false;
+                                 if (left.second.priority != right.second.priority)
+                                     return left.second.priority < right.second.priority;
+                                 return left.second.recency > right.second.recency;
+                             });
         if (victim == transientGridCache.end() || victim->second.priority < incomingPriority)
             return false;
         transientGridCacheBytes -= victim->second.bytes;
@@ -2203,10 +2200,9 @@ public:
     smallestContainingTransientGridFlight(NativeRect region) {
         auto best = transientGridFlights.end();
         uint64_t bestArea = std::numeric_limits<uint64_t>::max();
-        for (auto candidate = transientGridFlights.begin();
-             candidate != transientGridFlights.end(); ++candidate) {
-            if (candidate->second->done || !nativeRectContains(candidate->first, region))
-                continue;
+        for (auto candidate = transientGridFlights.begin(); candidate != transientGridFlights.end();
+             ++candidate) {
+            if (candidate->second->done || !nativeRectContains(candidate->first, region)) continue;
             const uint64_t area = candidate->first.height() * candidate->first.width();
             if (best == transientGridFlights.end() || area < bestArea ||
                 (area == bestArea && candidate->first < best->first)) {
@@ -2346,9 +2342,9 @@ public:
     PageResult materializeFinalPageFromTransient(TerrainPageKey key,
                                                  AuthorityRequestPriority priority) {
         if (key.quality != AuthorityQuality::FINAL) {
-            return PageResult::deferred(makeFailure(
-                GenerationFailureCode::PAGE_NOT_FOUND,
-                "No cached transient terrain can materialize a preview page", true));
+            return PageResult::deferred(
+                makeFailure(GenerationFailureCode::PAGE_NOT_FOUND,
+                            "No cached transient terrain can materialize a preview page", true));
         }
         const std::optional<NativeRect> pageRegion = terrainPageNativeRect(key.coordinate);
         if (!pageRegion) {
@@ -2363,9 +2359,9 @@ public:
             std::lock_guard<std::mutex> lock(mutex);
             const auto containing = smallestContainingTransientGrid(*pageRegion);
             if (containing == transientGridCache.end()) {
-                return PageResult::deferred(makeFailure(
-                    GenerationFailureCode::PAGE_NOT_FOUND,
-                    "No cached transient terrain contains the authority page", true));
+                return PageResult::deferred(
+                    makeFailure(GenerationFailureCode::PAGE_NOT_FOUND,
+                                "No cached transient terrain contains the authority page", true));
             }
             containingGrid = containing->second.grid;
             containing->second.recency = ++transientGridRecency;
@@ -2389,12 +2385,11 @@ public:
         std::transform(crop->samples.begin(), crop->samples.end(), page.samples.begin(),
                        quantizePhysicalTerrainSample);
         if (!page.valid() || !page.matches(identity)) {
-            return PageResult::failed(makeFailure(
-                GenerationFailureCode::CORRUPT_PAGE,
-                "Transient terrain produced an invalid authority page", true));
+            return PageResult::failed(
+                makeFailure(GenerationFailureCode::CORRUPT_PAGE,
+                            "Transient terrain produced an invalid authority page", true));
         }
-        return PageResult::ready(
-            std::make_shared<const TerrainAuthorityPage>(std::move(page)));
+        return PageResult::ready(std::make_shared<const TerrainAuthorityPage>(std::move(page)));
     }
 
     std::vector<PageBuildResult> inferOrLoadBatch(std::span<const TerrainPageKey> keys,
@@ -2666,14 +2661,13 @@ public:
                 publicationCondition.wait(
                     lock, [this] { return publicationStopping || !publicationQueue.empty(); });
                 if (publicationQueue.empty() && publicationStopping) return;
-                const auto selected =
-                    std::min_element(publicationQueue.begin(), publicationQueue.end(),
-                                     [this](const PublicationTask& left,
-                                            const PublicationTask& right) {
-                                         return requestBeforeLocked(
-                                             left.priority, left.handoffEpoch, left.sequence,
-                                             right.priority, right.handoffEpoch, right.sequence);
-                                     });
+                const auto selected = std::min_element(
+                    publicationQueue.begin(), publicationQueue.end(),
+                    [this](const PublicationTask& left, const PublicationTask& right) {
+                        return requestBeforeLocked(left.priority, left.handoffEpoch, left.sequence,
+                                                   right.priority, right.handoffEpoch,
+                                                   right.sequence);
+                    });
                 task = std::move(*selected);
                 publicationQueue.erase(selected);
                 ++activePublications;
@@ -2766,85 +2760,73 @@ public:
                 const auto coarseSelected =
                     coarseSpawnQueue.empty()
                         ? coarseSpawnQueue.end()
-                        : std::min_element(coarseSpawnQueue.begin(), coarseSpawnQueue.end(),
-                                           [this](CoarseSpawnRegion left, CoarseSpawnRegion right) {
-                                               const auto leftFlight =
-                                                   coarseSpawnFlights.find(left);
-                                               const auto rightFlight =
-                                                   coarseSpawnFlights.find(right);
-                                               if (leftFlight == coarseSpawnFlights.end())
-                                                   return false;
-                                               if (rightFlight == coarseSpawnFlights.end())
-                                                   return true;
-                                               return requestBeforeLocked(
-                                                   leftFlight->second->priority,
-                                                   leftFlight->second->handoffEpoch,
-                                                   leftFlight->second->sequence,
-                                                   rightFlight->second->priority,
-                                                   rightFlight->second->handoffEpoch,
-                                                   rightFlight->second->sequence);
-                                           });
+                        : std::min_element(
+                              coarseSpawnQueue.begin(), coarseSpawnQueue.end(),
+                              [this](CoarseSpawnRegion left, CoarseSpawnRegion right) {
+                                  const auto leftFlight = coarseSpawnFlights.find(left);
+                                  const auto rightFlight = coarseSpawnFlights.find(right);
+                                  if (leftFlight == coarseSpawnFlights.end()) return false;
+                                  if (rightFlight == coarseSpawnFlights.end()) return true;
+                                  return requestBeforeLocked(leftFlight->second->priority,
+                                                             leftFlight->second->handoffEpoch,
+                                                             leftFlight->second->sequence,
+                                                             rightFlight->second->priority,
+                                                             rightFlight->second->handoffEpoch,
+                                                             rightFlight->second->sequence);
+                              });
                 const auto transientSelected =
                     transientGridQueue.empty()
                         ? transientGridQueue.end()
-                        : std::min_element(transientGridQueue.begin(), transientGridQueue.end(),
-                                           [this](NativeRect left, NativeRect right) {
-                                               const auto leftFlight =
-                                                   transientGridFlights.find(left);
-                                               const auto rightFlight =
-                                                   transientGridFlights.find(right);
-                                               if (leftFlight == transientGridFlights.end())
-                                                   return false;
-                                               if (rightFlight == transientGridFlights.end())
-                                                   return true;
-                                               return requestBeforeLocked(
-                                                   leftFlight->second->priority,
-                                                   leftFlight->second->handoffEpoch,
-                                                   leftFlight->second->sequence,
-                                                   rightFlight->second->priority,
-                                                   rightFlight->second->handoffEpoch,
-                                                   rightFlight->second->sequence);
-                                           });
+                        : std::min_element(
+                              transientGridQueue.begin(), transientGridQueue.end(),
+                              [this](NativeRect left, NativeRect right) {
+                                  const auto leftFlight = transientGridFlights.find(left);
+                                  const auto rightFlight = transientGridFlights.find(right);
+                                  if (leftFlight == transientGridFlights.end()) return false;
+                                  if (rightFlight == transientGridFlights.end()) return true;
+                                  return requestBeforeLocked(leftFlight->second->priority,
+                                                             leftFlight->second->handoffEpoch,
+                                                             leftFlight->second->sequence,
+                                                             rightFlight->second->priority,
+                                                             rightFlight->second->handoffEpoch,
+                                                             rightFlight->second->sequence);
+                              });
 
                 bool selected = false;
                 AuthorityRequestPriority selectedPriority =
                     AuthorityRequestPriority::SPECULATIVE_PREFETCH;
                 ProtectedHandoffEpoch selectedEpoch;
                 uint64_t selectedSequence = 0;
-                const auto consider = [&](WorkKind candidateKind,
-                                          AuthorityRequestPriority candidatePriority,
-                                          ProtectedHandoffEpoch candidateEpoch,
-                                          uint64_t candidateSequence) {
-                    if (!selected ||
-                        requestBeforeLocked(candidatePriority, candidateEpoch, candidateSequence,
-                                            selectedPriority, selectedEpoch, selectedSequence)) {
-                        selected = true;
-                        kind = candidateKind;
-                        selectedPriority = candidatePriority;
-                        selectedEpoch = candidateEpoch;
-                        selectedSequence = candidateSequence;
-                    }
-                };
+                const auto consider =
+                    [&](WorkKind candidateKind, AuthorityRequestPriority candidatePriority,
+                        ProtectedHandoffEpoch candidateEpoch, uint64_t candidateSequence) {
+                        if (!selected || requestBeforeLocked(candidatePriority, candidateEpoch,
+                                                             candidateSequence, selectedPriority,
+                                                             selectedEpoch, selectedSequence)) {
+                            selected = true;
+                            kind = candidateKind;
+                            selectedPriority = candidatePriority;
+                            selectedEpoch = candidateEpoch;
+                            selectedSequence = candidateSequence;
+                        }
+                    };
                 if (pageSelected != queue.end()) {
                     const auto flight = flights.find(*pageSelected);
                     if (flight != flights.end())
                         consider(WorkKind::Page, flight->second->priority,
-                                 flight->second->handoffEpoch,
-                                 flight->second->sequence);
+                                 flight->second->handoffEpoch, flight->second->sequence);
                 }
                 if (coarseSelected != coarseSpawnQueue.end()) {
                     const auto flight = coarseSpawnFlights.find(*coarseSelected);
                     if (flight != coarseSpawnFlights.end())
                         consider(WorkKind::CoarseSpawn, flight->second->priority,
-                                 flight->second->handoffEpoch,
-                                 flight->second->sequence);
+                                 flight->second->handoffEpoch, flight->second->sequence);
                 }
                 if (transientSelected != transientGridQueue.end()) {
                     const auto flight = transientGridFlights.find(*transientSelected);
                     if (flight != transientGridFlights.end())
                         consider(WorkKind::TransientGrid, flight->second->priority,
-                                 flight->second->handoffEpoch,
-                                 flight->second->sequence);
+                                 flight->second->handoffEpoch, flight->second->sequence);
                 }
                 if (!selected) continue;
 
@@ -2879,8 +2861,7 @@ public:
                     // group.
                     const AuthorityRequestPriority groupPriority =
                         pageWork.front().flight->priority;
-                    const ProtectedHandoffEpoch groupEpoch =
-                        pageWork.front().flight->handoffEpoch;
+                    const ProtectedHandoffEpoch groupEpoch = pageWork.front().flight->handoffEpoch;
                     const AuthorityQuality groupQuality = pageWork.front().key.quality;
                     while (pageWork.size() < MAXIMUM_COORDINATOR_PAGE_GROUP_PAGES) {
                         const auto nextPage =
@@ -2924,12 +2905,12 @@ public:
                         if (nextCoarse != coarseSpawnQueue.end()) {
                             const auto coarseFlight = coarseSpawnFlights.find(*nextCoarse);
                             if (coarseFlight != coarseSpawnFlights.end() &&
-                                requestBeforeLocked(
-                                    coarseFlight->second->priority,
-                                    coarseFlight->second->handoffEpoch,
-                                    coarseFlight->second->sequence, nextFlight->second->priority,
-                                    nextFlight->second->handoffEpoch,
-                                    nextFlight->second->sequence)) {
+                                requestBeforeLocked(coarseFlight->second->priority,
+                                                    coarseFlight->second->handoffEpoch,
+                                                    coarseFlight->second->sequence,
+                                                    nextFlight->second->priority,
+                                                    nextFlight->second->handoffEpoch,
+                                                    nextFlight->second->sequence)) {
                                 break;
                             }
                         }
@@ -2937,8 +2918,7 @@ public:
                             const auto gridFlight = transientGridFlights.find(*transientSelected);
                             if (gridFlight != transientGridFlights.end() &&
                                 requestBeforeLocked(
-                                    gridFlight->second->priority,
-                                    gridFlight->second->handoffEpoch,
+                                    gridFlight->second->priority, gridFlight->second->handoffEpoch,
                                     gridFlight->second->sequence, nextFlight->second->priority,
                                     nextFlight->second->handoffEpoch,
                                     nextFlight->second->sequence)) {
@@ -3171,10 +3151,10 @@ CachedTerrainAuthority::preparePage(TerrainPageKey key, AuthorityRequestPriority
         !Impl::validHandoffEpoch(key, priority, epoch)) {
         const std::string detail =
             "Terrain authority request is invalid: identity=" +
-            std::to_string(static_cast<unsigned>(impl_->identity.valid())) + " quality=" +
-            std::to_string(static_cast<unsigned>(key.quality)) + " priority=" +
-            std::to_string(static_cast<unsigned>(priority)) + " epoch=" +
-            std::to_string(epoch.value) + " row=" + std::to_string(key.coordinate.row) +
+            std::to_string(static_cast<unsigned>(impl_->identity.valid())) +
+            " quality=" + std::to_string(static_cast<unsigned>(key.quality)) +
+            " priority=" + std::to_string(static_cast<unsigned>(priority)) +
+            " epoch=" + std::to_string(epoch.value) + " row=" + std::to_string(key.coordinate.row) +
             " column=" + std::to_string(key.coordinate.column);
         return PageResult::failed(
             makeFailure(GenerationFailureCode::INVALID_REQUEST, detail, false));
@@ -3223,8 +3203,8 @@ CachedTerrainAuthority::preparePage(TerrainPageKey key, AuthorityRequestPriority
         if (!hasTotalCapacity) {
             const size_t occupied = impl_->outstandingRequestCountLocked();
             const size_t shortage = occupied + 1 - impl_->config.maximumOutstandingRequests;
-            if (impl_->preemptForPriorityLocked(
-                    shortage, Impl::effectivePriority(key, priority), epoch)) {
+            if (impl_->preemptForPriorityLocked(shortage, Impl::effectivePriority(key, priority),
+                                                epoch)) {
                 hasTotalCapacity = impl_->hasTotalCapacityLocked(1);
             }
         }
@@ -3275,11 +3255,10 @@ AuthorityResult<bool> CachedTerrainAuthority::preparePages(std::span<const Terra
     std::vector<TerrainPageKey> canonical(keys.begin(), keys.end());
     std::sort(canonical.begin(), canonical.end());
     if (std::adjacent_find(canonical.begin(), canonical.end()) != canonical.end() ||
-        std::any_of(canonical.begin(), canonical.end(),
-                    [epoch](TerrainPageKey key) {
-                        return !validQuality(key.quality) ||
-                               (epoch.valid() && key.quality != AuthorityQuality::FINAL);
-                    })) {
+        std::any_of(canonical.begin(), canonical.end(), [epoch](TerrainPageKey key) {
+            return !validQuality(key.quality) ||
+                   (epoch.valid() && key.quality != AuthorityQuality::FINAL);
+        })) {
         return AuthorityResult<bool>::failed(
             makeFailure(GenerationFailureCode::INVALID_REQUEST,
                         "Terrain authority page closure has invalid or duplicate keys", false));
@@ -3350,8 +3329,7 @@ AuthorityResult<bool> CachedTerrainAuthority::preparePages(std::span<const Terra
                 } else if (!wasLow && willBeLow) {
                     ++low;
                 }
-                const bool wasVisibleOrLower =
-                    Impl::isVisibleOrLowerRequest(key, flight->priority);
+                const bool wasVisibleOrLower = Impl::isVisibleOrLowerRequest(key, flight->priority);
                 const bool willBeVisibleOrLower = Impl::isVisibleOrLowerRequest(key, priority);
                 if (wasVisibleOrLower && !willBeVisibleOrLower) {
                     --visibleOrLower;
@@ -3372,8 +3350,8 @@ AuthorityResult<bool> CachedTerrainAuthority::preparePages(std::span<const Terra
         bool hasTotalCapacity = impl_->hasTotalCapacityLocked(missingKeys.size());
         if (!hasTotalCapacity) {
             const size_t occupied = impl_->outstandingRequestCountLocked();
-            const size_t shortage = occupied + missingKeys.size() -
-                                    impl_->config.maximumOutstandingRequests;
+            const size_t shortage =
+                occupied + missingKeys.size() - impl_->config.maximumOutstandingRequests;
             AuthorityRequestPriority incomingPriority = priority;
             for (const TerrainPageKey key : missingKeys) {
                 incomingPriority =
@@ -3697,9 +3675,9 @@ CachedTerrainAuthority::queryTransientFinalNativeGrid(NativeRect region,
         } else if (impl_->staleHandoffEpochLocked(epoch)) {
             ++impl_->metrics.deferredRequests;
             ++impl_->metrics.staleProtectedHandoffDeferrals;
-            return GridResult::deferred(makeFailure(
-                GenerationFailureCode::QUEUE_FULL,
-                "Transient protected handoff belongs to a stale camera epoch", true));
+            return GridResult::deferred(
+                makeFailure(GenerationFailureCode::QUEUE_FULL,
+                            "Transient protected handoff belongs to a stale camera epoch", true));
         }
     }
     if (containingGrid) {
@@ -3727,9 +3705,9 @@ CachedTerrainAuthority::queryTransientFinalNativeGrid(NativeRect region,
         if (impl_->staleHandoffEpochLocked(epoch)) {
             ++impl_->metrics.deferredRequests;
             ++impl_->metrics.staleProtectedHandoffDeferrals;
-            return GridResult::deferred(makeFailure(
-                GenerationFailureCode::QUEUE_FULL,
-                "Transient protected handoff belongs to a stale camera epoch", true));
+            return GridResult::deferred(
+                makeFailure(GenerationFailureCode::QUEUE_FULL,
+                            "Transient protected handoff belongs to a stale camera epoch", true));
         }
         const auto active = impl_->transientGridFlights.find(region);
         if (active != impl_->transientGridFlights.end()) {
@@ -3758,8 +3736,7 @@ CachedTerrainAuthority::queryTransientFinalNativeGrid(NativeRect region,
                     containingFlight->second->priority = priority;
                 if (containingFlight->second->priority ==
                         AuthorityRequestPriority::PROTECTED_HANDOFF &&
-                    epoch.valid() &&
-                    epoch.value > containingFlight->second->handoffEpoch.value) {
+                    epoch.valid() && epoch.value > containingFlight->second->handoffEpoch.value) {
                     containingFlight->second->handoffEpoch = epoch;
                 }
             }

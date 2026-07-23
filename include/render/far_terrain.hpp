@@ -46,8 +46,7 @@ inline constexpr int FAR_TERRAIN_PROTECTED_NEAR_STEP_SIXTEEN_DISTANCE_TILES = 4;
 // Directional preparation starts only in the half-tile overlap where both the
 // current and next 2x2 cores contain the camera. This is the maximum useful
 // lead and leaves the current canonical core's 128-block cushion unchanged.
-inline constexpr int FAR_TERRAIN_PROTECTED_NEAR_PREDICTION_LEAD_BLOCKS =
-    FAR_TERRAIN_TILE_EDGE / 2;
+inline constexpr int FAR_TERRAIN_PROTECTED_NEAR_PREDICTION_LEAD_BLOCKS = FAR_TERRAIN_TILE_EDGE / 2;
 inline constexpr size_t FAR_TERRAIN_MAX_PROTECTED_PREDICTION_SUBMISSIONS_PER_FRAME = 4;
 // A camera can occupy either core tile and either half of that tile. Six tile
 // widths conservatively cover the outer target's complete block extent. The
@@ -90,9 +89,9 @@ constexpr bool farTerrainHorizonRadiusValid(int chunkRadius) noexcept {
 }
 
 constexpr bool
-farTerrainCameraMovementRequiresRefresh(
-    std::optional<std::pair<double, double>> previousCamera, double cameraX, double cameraZ,
-    double refreshDistanceBlocks) noexcept {
+farTerrainCameraMovementRequiresRefresh(std::optional<std::pair<double, double>> previousCamera,
+                                        double cameraX, double cameraZ,
+                                        double refreshDistanceBlocks) noexcept {
     if (!previousCamera || refreshDistanceBlocks <= 0.0) return true;
     const double movementX = cameraX - previousCamera->first;
     const double movementZ = cameraZ - previousCamera->second;
@@ -531,10 +530,9 @@ constexpr bool farTerrainIsBaseStep(FarTerrainStep step) {
 // no transition, protected closure, exact fallback, or next critical key.
 constexpr bool farTerrainDisplayedRefinementMayYieldToParentForNear(
     FarTerrainStep displayedStep,
-    const std::array<std::optional<FarTerrainStep>, 4>& displayedNeighborSteps,
-    bool parentResident, bool lodTransitionEndpoint, bool neighborTransition,
-    bool authorityTransitionEndpoint, bool protectedClosure, bool exactFallback,
-    bool nextCriticalRefinement) noexcept {
+    const std::array<std::optional<FarTerrainStep>, 4>& displayedNeighborSteps, bool parentResident,
+    bool lodTransitionEndpoint, bool neighborTransition, bool authorityTransitionEndpoint,
+    bool protectedClosure, bool exactFallback, bool nextCriticalRefinement) noexcept {
     if (displayedStep != FarTerrainStep::SIXTEEN || !parentResident || lodTransitionEndpoint ||
         neighborTransition || authorityTransitionEndpoint || protectedClosure || exactFallback ||
         nextCriticalRefinement) {
@@ -543,8 +541,7 @@ constexpr bool farTerrainDisplayedRefinementMayYieldToParentForNear(
     for (const std::optional<FarTerrainStep> neighbor : displayedNeighborSteps) {
         if (!neighbor) continue;
         const int neighborSize = farTerrainStepSize(*neighbor);
-        if (farTerrainStepSize(FAR_TERRAIN_BASE_STEP) > neighborSize * 2)
-            return false;
+        if (farTerrainStepSize(FAR_TERRAIN_BASE_STEP) > neighborSize * 2) return false;
     }
     return true;
 }
@@ -853,7 +850,7 @@ constexpr ColumnPos farTerrainProtectedNearAnchor(int64_t cameraBlockX,
 // never changes the canonical handoff or weakens its spatial cushion.
 constexpr std::optional<ColumnPos>
 farTerrainPredictedProtectedNearAnchor(int64_t cameraBlockX, int64_t cameraBlockZ,
-                                      int recentMotionX, int recentMotionZ) noexcept {
+                                       int recentMotionX, int recentMotionZ) noexcept {
     if (recentMotionX == 0 && recentMotionZ == 0) return std::nullopt;
     const ColumnPos current = farTerrainProtectedNearAnchor(cameraBlockX, cameraBlockZ);
     const auto predictAxis = [](int64_t block, int motion, int64_t anchor) {
@@ -1039,9 +1036,9 @@ void buildFarTerrainCriticalResidencyOrder(std::span<const FarTerrainKey> target
 // Builds two complete critical classes without interleaving their lineages.
 // Current exact and protected ownership therefore ranks ahead of every
 // directional prediction, while overlapping immutable keys are retained once.
-void buildFarTerrainTieredCriticalResidencyOrder(
-    std::span<const FarTerrainKey> currentTargets,
-    std::span<const FarTerrainKey> predictedTargets, std::vector<FarTerrainKey>& output);
+void buildFarTerrainTieredCriticalResidencyOrder(std::span<const FarTerrainKey> currentTargets,
+                                                 std::span<const FarTerrainKey> predictedTargets,
+                                                 std::vector<FarTerrainKey>& output);
 
 // Checks the two-lane order without rebuilding it. Stable camera frames can
 // retain both the renderer's set and the scheduler's immutable wanted filter.
@@ -1823,8 +1820,8 @@ public:
     // This bounded lane prepares the PREVIEW parent at protected priority and
     // may replace a farther queued or authority-parked ordinary parent. It
     // never removes an already resident drawable parent.
-    bool enqueueUrgentCoverage(
-        FarTerrainKey key, uint32_t viewPriority = std::numeric_limits<uint32_t>::max());
+    bool enqueueUrgentCoverage(FarTerrainKey key,
+                               uint32_t viewPriority = std::numeric_limits<uint32_t>::max());
     // Replaces an already drawable preview step-32 payload with the same
     // geometric LOD sampled from final authority. The renderer performs the
     // GPU replacement atomically before it admits any final child tier.

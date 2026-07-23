@@ -647,11 +647,10 @@ MenuLayout buildV4WorldPreparationLayout(const V4WorldPreparationSnapshot& snaps
                                  snapshot.nearFinalRequired > 0;
     if (showsNearDetail) {
         const uint32_t ready = std::min(snapshot.nearFinalReady, snapshot.nearFinalRequired);
-        const std::string nearDetail =
-            ready == snapshot.nearFinalRequired
-                ? "NEAR DETAIL READY"
-                : "NEAR DETAIL " + std::to_string(ready) + "/" +
-                      std::to_string(snapshot.nearFinalRequired);
+        const std::string nearDetail = ready == snapshot.nearFinalRequired
+                                           ? "NEAR DETAIL READY"
+                                           : "NEAR DETAIL " + std::to_string(ready) + "/" +
+                                                 std::to_string(snapshot.nearFinalRequired);
         addCenteredText(layout, ctx, nearDetail, 0.5f + ctx.py(5.f), 1.0f,
                         ready == snapshot.nearFinalRequired ? 0.55f : 0.85f,
                         ready == snapshot.nearFinalRequired ? 1.0f : 0.85f, 0.75f);
@@ -661,17 +660,15 @@ MenuLayout buildV4WorldPreparationLayout(const V4WorldPreparationSnapshot& snaps
         const std::string extent =
             "ENTRY " + std::to_string(snapshot.entryHorizonRadiusChunks) + " CHUNKS / CONFIGURED " +
             std::to_string(snapshot.configuredHorizonRadiusChunks) + " CHUNKS";
-        addCenteredText(layout, ctx, extent,
-                        0.5f + ctx.py(showsNearDetail ? -15.f : 5.f), 1.0f,
+        addCenteredText(layout, ctx, extent, 0.5f + ctx.py(showsNearDetail ? -15.f : 5.f), 1.0f,
                         0.68f, 0.78f, 0.88f);
     }
 
     if (snapshot.finalSpawnTerrainReady && snapshot.safeSpawnReady &&
         snapshot.farBaseRequired > 0 && snapshot.entryHorizonRadiusChunks > 0) {
         layout.progressTrack =
-            UIRect{0.5f - ctx.px(230.f),
-                   0.5f - ctx.py(showsNearDetail ? 38.f : 18.f), ctx.px(460.f),
-                   ctx.py(20.f)};
+            UIRect{0.5f - ctx.px(230.f), 0.5f - ctx.py(showsNearDetail ? 38.f : 18.f),
+                   ctx.px(460.f), ctx.py(20.f)};
         const float horizonFraction =
             completeConfiguredHorizon
                 ? 1.0F
@@ -684,20 +681,16 @@ MenuLayout buildV4WorldPreparationLayout(const V4WorldPreparationSnapshot& snaps
                 std::clamp(0.20f * spawnFraction + 0.80f * horizonFraction, 0.0f, 1.0f);
         } else {
             const float nearFraction =
-                static_cast<float>(std::min(snapshot.nearFinalReady,
-                                            snapshot.nearFinalRequired)) /
+                static_cast<float>(std::min(snapshot.nearFinalReady, snapshot.nearFinalRequired)) /
                 static_cast<float>(snapshot.nearFinalRequired);
-            layout.progressFraction =
-                std::clamp(0.20f * spawnFraction + 0.40f * horizonFraction +
-                               0.40f * nearFraction,
-                           0.0f, 1.0f);
+            layout.progressFraction = std::clamp(
+                0.20f * spawnFraction + 0.40f * horizonFraction + 0.40f * nearFraction, 0.0f, 1.0f);
         }
     }
 
     char elapsed[48];
     std::snprintf(elapsed, sizeof(elapsed), "%.1f SECONDS", snapshot.elapsedSeconds);
-    addCenteredText(layout, ctx, elapsed,
-                    0.5f - ctx.py(showsNearDetail ? 70.f : 50.f), 1.25f, 0.8f,
+    addCenteredText(layout, ctx, elapsed, 0.5f - ctx.py(showsNearDetail ? 70.f : 50.f), 1.25f, 0.8f,
                     0.9f, 1.0f);
     addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, 0.5f - ctx.py(145.f), 320.f, 44.f);
     return layout;

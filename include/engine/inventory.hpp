@@ -40,6 +40,11 @@ public:
     // Remove items from the selected stack (placing, dropping, eating).
     void consumeSelected(int amount = 1);
 
+    // Consume one selected item and return its replacement to the selected
+    // slot or the remaining inventory. Any result that cannot fit is returned
+    // to the caller so a world interaction never destroys it.
+    ItemStack exchangeOneSelected(const ItemStack& replacement);
+
     // One point of tool wear; a tool at zero durability breaks and leaves the
     // slot empty. Non-tools never wear. Returns true when the tool broke.
     bool damageSelectedTool();

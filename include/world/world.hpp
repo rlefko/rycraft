@@ -88,12 +88,12 @@ enum class ColumnPlanRetryPublicationAction : uint8_t {
 // A completed worker has not left the ThreadPool task until its future is
 // ready. Retain its in-flight reservation through that interval so no second
 // task can collide with the still-published future and leak the reservation.
-constexpr ColumnPlanRetryPublicationAction columnPlanRetryPublicationAction(
-    bool futureReaped, bool retryRequested, bool requiredNow, bool alreadyQueued,
-    bool planAvailable, bool generationAvailable) noexcept {
+constexpr ColumnPlanRetryPublicationAction
+columnPlanRetryPublicationAction(bool futureReaped, bool retryRequested, bool requiredNow,
+                                 bool alreadyQueued, bool planAvailable,
+                                 bool generationAvailable) noexcept {
     if (!futureReaped) return ColumnPlanRetryPublicationAction::HOLD;
-    if (retryRequested && requiredNow && !alreadyQueued && !planAvailable &&
-        generationAvailable) {
+    if (retryRequested && requiredNow && !alreadyQueued && !planAvailable && generationAvailable) {
         return ColumnPlanRetryPublicationAction::REQUEUE;
     }
     return ColumnPlanRetryPublicationAction::DROP;
@@ -188,8 +188,7 @@ constexpr size_t exactStreamingPlanSubmissionLimit(uint8_t lane) noexcept {
 }
 
 constexpr size_t exactStreamingCubeSubmissionLimit(uint8_t lane) noexcept {
-    if (lane >= EXACT_STREAMING_CAMERA_PRIORITY_LANE)
-        return EXACT_GENERATION_SUBMISSION_LIMIT;
+    if (lane >= EXACT_STREAMING_CAMERA_PRIORITY_LANE) return EXACT_GENERATION_SUBMISSION_LIMIT;
     if (lane >= EXACT_STREAMING_EXPLORATION_PRIORITY_LANE) return 4;
     return 3;
 }
@@ -218,8 +217,7 @@ constexpr uint8_t exactStreamingPrimarySurfacePriorityLane(int dx, int dz) noexc
 constexpr uint8_t exactStreamingFloraPriorityLane(int dx, int dz) noexcept {
     const uint8_t surfaceLane = exactStreamingSurfacePriorityLane(dx, dz);
     if (surfaceLane >= EXACT_STREAMING_EXPLORATION_PRIORITY_LANE) return surfaceLane;
-    if (!withinExactStreamingRadius(dx, dz,
-                                    EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS)) {
+    if (!withinExactStreamingRadius(dx, dz, EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS)) {
         return EXACT_STREAMING_SURFACE_PRIORITY_LANE;
     }
     return EXACT_STREAMING_FLORA_PRIORITY_LANE;
@@ -254,14 +252,13 @@ inline constexpr int64_t exactStreamingTaskPriority(uint64_t epoch, uint8_t lane
 // section at the far edge of the exact disk merely because the camera is
 // airborne. The result remains inside the task priority's low 32 bits for
 // every retained exact and halo cube.
-constexpr uint64_t exactStreamingCubePriorityDistance(ChunkPos position,
-                                                      ChunkPos center) noexcept {
+constexpr uint64_t exactStreamingCubePriorityDistance(ChunkPos position, ChunkPos center) noexcept {
     constexpr uint64_t VERTICAL_SPAN =
         uint64_t{2} * WORLD_VERTICAL_CHUNKS * WORLD_VERTICAL_CHUNKS + 1U;
     constexpr uint64_t DISTANCE_MASK = (uint64_t{1} << 32U) - 1U;
     const auto boundedMagnitude = [](int64_t value) -> uint64_t {
-        const uint64_t magnitude = value < 0 ? static_cast<uint64_t>(-(value + 1)) + 1U
-                                             : static_cast<uint64_t>(value);
+        const uint64_t magnitude =
+            value < 0 ? static_cast<uint64_t>(-(value + 1)) + 1U : static_cast<uint64_t>(value);
         return std::min<uint64_t>(magnitude, 65'535U);
     };
     const uint64_t dx = boundedMagnitude(position.x - center.x);
@@ -290,8 +287,8 @@ constexpr int64_t exactPublicationLightPriority(ChunkPos position, ChunkPos cent
         lane = EXACT_STREAMING_EDITED_PRIORITY_LANE;
     }
     const auto boundedMagnitude = [](int64_t value) -> uint64_t {
-        const uint64_t magnitude = value < 0 ? static_cast<uint64_t>(-(value + 1)) + 1U
-                                             : static_cast<uint64_t>(value);
+        const uint64_t magnitude =
+            value < 0 ? static_cast<uint64_t>(-(value + 1)) + 1U : static_cast<uint64_t>(value);
         return std::min<uint64_t>(magnitude, 65'535U);
     };
     const uint64_t boundedX = boundedMagnitude(dx);
@@ -346,9 +343,7 @@ struct ExactCollisionOwnershipSnapshot {
     uint64_t coverageEpoch = 0;
     std::unordered_set<ChunkPos> sections;
 
-    [[nodiscard]] bool owns(ChunkPos section) const noexcept {
-        return sections.contains(section);
-    }
+    [[nodiscard]] bool owns(ChunkPos section) const noexcept { return sections.contains(section); }
 };
 inline constexpr size_t MAX_FLUID_RESUME_CUBES_PER_FRAME = 64;
 inline constexpr size_t MAX_FLUID_FRONTIER_RESUMES_PER_FRAME = 256;
@@ -454,9 +449,8 @@ public:
     // snapshot and rejects a stale coverage epoch without disturbing the last
     // valid publication. Public visibility also gives physics tests the exact
     // same handoff semantics as the renderer.
-    [[nodiscard]] bool
-    publishExactCollisionOwnership(uint64_t coverageEpoch,
-                                   std::span<const ChunkPos> sections) const;
+    [[nodiscard]] bool publishExactCollisionOwnership(uint64_t coverageEpoch,
+                                                      std::span<const ChunkPos> sections) const;
     void publishLoadedSnapshot();
     bool snapshotForMeshing(ChunkPos pos, MeshSnapshot& out) const;
     std::vector<std::shared_ptr<Chunk>> getDirtyChunks();
@@ -522,7 +516,7 @@ public:
     // retained local collision neighborhood so the closed missing-cube
     // fallback cannot become an invisible wall around the player.
     [[nodiscard]] bool playableSpawnCollisionReady(int64_t worldX, int32_t worldY,
-                                                    int64_t worldZ) const;
+                                                   int64_t worldZ) const;
     [[nodiscard]] std::optional<Vec3> safeSpawnFromReadyPlans(int64_t worldX, int64_t worldZ,
                                                               int radiusChunks = 1) const;
     std::optional<std::string> generationFailure() const;
@@ -549,8 +543,7 @@ private:
     std::shared_ptr<const std::unordered_set<ChunkPos>> meshCandidateSnapshot_;
     std::shared_ptr<const ExactSurfaceCoverageSnapshot> exactSurfaceCoverageSnapshot_;
     mutable std::mutex exactCollisionOwnershipPublicationMutex_;
-    mutable std::shared_ptr<const ExactCollisionOwnershipSnapshot>
-        exactCollisionOwnershipSnapshot_;
+    mutable std::shared_ptr<const ExactCollisionOwnershipSnapshot> exactCollisionOwnershipSnapshot_;
     std::atomic<bool> loadedSnapshotDirty_{true};
     std::atomic<size_t> loadedCubeCount_{0};
     const size_t loadedCubeLimit_;

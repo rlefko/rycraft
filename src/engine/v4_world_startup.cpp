@@ -639,12 +639,11 @@ std::optional<Vec3> inlandSpawnCandidate(const worldgen::learned::PhysicalTerrai
                     (sameAuthorityCost && score < best->score) ||
                     (sameAuthorityCost && score == best->score &&
                      std::pair{row, column} < std::pair{best->row, best->column})) {
-                    best =
-                        Candidate{.row = row,
-                                  .column = column,
-                                  .elevationMeters = center->elevationMeters,
-                                  .authorityCost = *authorityCost,
-                                  .score = score};
+                    best = Candidate{.row = row,
+                                     .column = column,
+                                     .elevationMeters = center->elevationMeters,
+                                     .authorityCost = *authorityCost,
+                                     .score = score};
                 }
             }
         }
@@ -678,8 +677,7 @@ v4SpawnPlacementAuthorityCost(int64_t worldX, int64_t worldZ) noexcept {
     if (!exactX || !exactZ) return std::nullopt;
 
     const ColumnPos protectedAnchor = farTerrainProtectedNearAnchor(worldX, worldZ);
-    constexpr int64_t OUTER_RING =
-        FAR_TERRAIN_PROTECTED_NEAR_STEP_SIXTEEN_DISTANCE_TILES;
+    constexpr int64_t OUTER_RING = FAR_TERRAIN_PROTECTED_NEAR_STEP_SIXTEEN_DISTANCE_TILES;
     constexpr int64_t CORE_EDGE = FAR_TERRAIN_PROTECTED_NEAR_CORE_EDGE_TILES;
     constexpr int64_t TILE_EDGE = FAR_TERRAIN_TILE_EDGE;
     constexpr int64_t PARENT_APRON = farTerrainStepSize(FAR_TERRAIN_BASE_STEP);
@@ -694,23 +692,19 @@ v4SpawnPlacementAuthorityCost(int64_t worldX, int64_t worldZ) noexcept {
     std::array<std::pair<int64_t, int64_t>, 9> protectedOwners{};
     size_t protectedOwnerCount = 0;
     size_t protectedExactOverlapCount = 0;
-    for (int64_t tileOffsetZ = -OUTER_RING; tileOffsetZ < CORE_EDGE + OUTER_RING;
-         ++tileOffsetZ) {
+    for (int64_t tileOffsetZ = -OUTER_RING; tileOffsetZ < CORE_EDGE + OUTER_RING; ++tileOffsetZ) {
         const int64_t distanceZ =
             tileOffsetZ < 0 ? -tileOffsetZ
                             : (tileOffsetZ >= CORE_EDGE ? tileOffsetZ - CORE_EDGE + 1 : 0);
         for (int64_t tileOffsetX = -OUTER_RING; tileOffsetX < CORE_EDGE + OUTER_RING;
              ++tileOffsetX) {
             const int64_t distanceX =
-                tileOffsetX < 0
-                    ? -tileOffsetX
-                    : (tileOffsetX >= CORE_EDGE ? tileOffsetX - CORE_EDGE + 1 : 0);
+                tileOffsetX < 0 ? -tileOffsetX
+                                : (tileOffsetX >= CORE_EDGE ? tileOffsetX - CORE_EDGE + 1 : 0);
             if (distanceX + distanceZ > OUTER_RING) continue;
 
-            const std::optional<int64_t> tileX =
-                checkedAdd(protectedAnchor.x, tileOffsetX);
-            const std::optional<int64_t> tileZ =
-                checkedAdd(protectedAnchor.z, tileOffsetZ);
+            const std::optional<int64_t> tileX = checkedAdd(protectedAnchor.x, tileOffsetX);
+            const std::optional<int64_t> tileZ = checkedAdd(protectedAnchor.z, tileOffsetZ);
             const std::optional<int64_t> originX =
                 tileX ? checkedMultiply(*tileX, TILE_EDGE) : std::nullopt;
             const std::optional<int64_t> originZ =
@@ -816,7 +810,7 @@ std::vector<V4SpawnExactFootprintRow> v4ColdSpawnExactFootprintRows() {
     }
 
     std::map<int64_t, std::vector<std::pair<int64_t, int64_t>>> intervalsByRow;
-    for (const auto [planX, planZ] : planCenters) {
+    for (const auto& [planX, planZ] : planCenters) {
         const int64_t planBaseX = planX * CHUNK_EDGE;
         const int64_t planBaseZ = planZ * CHUNK_EDGE;
         const int64_t minimumX = planBaseX - COLUMN_PLAN_HYDROLOGY_APRON_BLOCKS;
@@ -972,7 +966,7 @@ v4RankCertifiedDrySpawnCandidates(Vec3 requestedCandidate, int64_t originWorldX,
         constexpr long double MAXIMUM_TIER =
             static_cast<long double>(std::numeric_limits<uint64_t>::max());
         return tier >= MAXIMUM_TIER ? std::numeric_limits<uint64_t>::max()
-                                   : static_cast<uint64_t>(tier);
+                                    : static_cast<uint64_t>(tier);
     };
     std::map<std::pair<int64_t, int64_t>, RankedCandidate> bestByChunk;
     for (int z = static_cast<int>(BUFFER); z < sampleHeight - BUFFER; ++z) {

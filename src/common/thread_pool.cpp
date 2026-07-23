@@ -11,8 +11,7 @@ thread_local const void* activeThreadPoolState = nullptr;
 
 class ActiveThreadPoolStateScope {
 public:
-    explicit ActiveThreadPoolStateScope(const void* state)
-        : previous_(activeThreadPoolState) {
+    explicit ActiveThreadPoolStateScope(const void* state) : previous_(activeThreadPoolState) {
         activeThreadPoolState = state;
     }
 
