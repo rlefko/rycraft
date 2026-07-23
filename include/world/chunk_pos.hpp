@@ -77,6 +77,10 @@ constexpr int32_t floorDiv(int32_t value, int32_t divisor) {
     return quotient - ((remainder != 0 && ((remainder < 0) != (divisor < 0))) ? 1 : 0);
 }
 
+constexpr int64_t floorMultiple(int64_t value, int64_t divisor) {
+    return floorDiv(value, divisor) * divisor;
+}
+
 constexpr int32_t floorMod(int64_t value, int32_t divisor) {
     const int64_t remainder = value % divisor;
     return static_cast<int32_t>(remainder < 0 ? remainder + divisor : remainder);
