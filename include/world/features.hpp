@@ -23,6 +23,7 @@ inline constexpr int TREE_CELL_EDGE = 8;
 inline constexpr int TREE_MAXIMUM_HORIZONTAL_REACH = 6;
 inline constexpr int TREE_MINIMUM_VERTICAL_OFFSET = -2;
 inline constexpr int TREE_MAXIMUM_VERTICAL_OFFSET = 20;
+inline constexpr int GROUND_FLORA_MAXIMUM_VERTICAL_OFFSET = 4;
 
 // Density can expose a surface above or below its climate terrain sample.
 // Rejecting larger departures also prevents trees from growing on deep cave
@@ -61,6 +62,11 @@ TreeHabitatEvaluation evaluateTreeHabitat(TreeSpecies species,
                                           const worldgen::SurfaceSample& surface,
                                           int groundSurfaceY);
 double treeCoverDensity(const worldgen::SurfaceSample& surface);
+double farCanopyAggregateAcceptance(double exactCandidateAcceptance);
+// PREVIEW ecology is temporary coverage and cannot use flooded tree forms.
+// Every canonical surface-water type, including an explicit fall, excludes
+// both canopy and ground-flora roots until FINAL habitat authority replaces it.
+bool previewFarEcologyRejectsRoot(const worldgen::SurfaceSample& surface) noexcept;
 
 } // namespace feature_generation
 
@@ -105,6 +111,22 @@ struct FarCanopy {
     bool operator==(const FarCanopy&) const = default;
 };
 
+// Compact ground-flora authority for the optional far attachment. Candidates
+// are selected from a global lattice and retain the same world-space identity
+// at every LOD. The far mesher grounds the anchor against the displayed
+// terrain cell, so filtered terrain cannot leave plants floating while an
+// exact cube is still loading.
+struct FarFlora {
+    int64_t x = 0;
+    int64_t z = 0;
+    int32_t baseY = 0;
+    BlockType block = BlockType::AIR;
+    uint8_t height = 1;
+    uint64_t anchorId = 0;
+
+    bool operator==(const FarFlora&) const = default;
+};
+
 class FeaturePlacer {
 public:
     explicit FeaturePlacer(uint32_t worldSeed);
@@ -136,6 +158,13 @@ public:
     std::vector<FarCanopy> collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ,
                                                     int64_t maximumX, int64_t maximumZ, int lodStep,
                                                     const ChunkGenerator& gen) const;
+    // Returns a deterministic, half-open set of ground-flora aggregates.
+    // Every coarser tier is a strict subset of the preceding tier, and all
+    // habitat samples use the same physical climate and surface-material
+    // authority as exact flora without constructing ColumnPlans.
+    std::vector<FarFlora> collectFarFlora(int64_t minimumX, int64_t minimumZ, int64_t maximumX,
+                                          int64_t maximumZ, int lodStep,
+                                          const ChunkGenerator& gen) const;
 
 private:
     CounterRng random_;
