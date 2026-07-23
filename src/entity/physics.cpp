@@ -9,7 +9,7 @@
 // here while the mesher rendered it as a full block, so entities fell
 // through what looked like floor.
 // ---------------------------------------------------------------------------
-bool PhysicsEngine::isSolid(World& world, int x, int y, int z) {
+bool PhysicsEngine::isSolid(World& world, int64_t x, int32_t y, int64_t z) {
     return ::isSolid(world.getCollisionBlockIfLoaded(x, y, z));
 }
 
@@ -18,24 +18,24 @@ bool PhysicsEngine::isSolid(World& world, int x, int y, int z) {
 // swims like water; damage is out of scope)
 // ---------------------------------------------------------------------------
 bool PhysicsEngine::isInWater(World& world, const AABB& entityAABB) {
-    int minX = static_cast<int>(std::floor(entityAABB.min.x));
-    int minY = static_cast<int>(std::floor(entityAABB.min.y));
-    int minZ = static_cast<int>(std::floor(entityAABB.min.z));
-    int maxX = static_cast<int>(std::ceil(entityAABB.max.x));
-    int maxY = static_cast<int>(std::ceil(entityAABB.max.y));
-    int maxZ = static_cast<int>(std::ceil(entityAABB.max.z));
+    int64_t minX = static_cast<int64_t>(std::floor(entityAABB.min.x));
+    int32_t minY = static_cast<int32_t>(std::floor(entityAABB.min.y));
+    int64_t minZ = static_cast<int64_t>(std::floor(entityAABB.min.z));
+    int64_t maxX = static_cast<int64_t>(std::ceil(entityAABB.max.x));
+    int32_t maxY = static_cast<int32_t>(std::ceil(entityAABB.max.y));
+    int64_t maxZ = static_cast<int64_t>(std::ceil(entityAABB.max.z));
 
     // Exclusive upper bounds: cell k spans [k, k+1), so the last cell the box
     // reaches is ceil(max)-1. The old inclusive <= scanned a full block past
     // the AABB on +X/+Y/+Z, reporting "in water" while merely standing beside
     // a pond — which would flick sprint into swim mode along every shoreline.
-    for (int x = minX; x < maxX; ++x) {
-        for (int y = minY; y < maxY; ++y) {
-            for (int z = minZ; z < maxZ; ++z) {
-                BlockType block = world.getBlockIfLoaded(x, y, z);
+    for (int64_t x = minX; x < maxX; ++x) {
+        for (int32_t y = minY; y < maxY; ++y) {
+            for (int64_t z = minZ; z < maxZ; ++z) {
+                BlockType block = world.getCollisionBlockIfLoaded(x, y, z);
                 if (block == BlockType::WATER) {
                     const float surface =
-                        static_cast<float>(y) + world.getFluidHeightIfLoaded(x, y, z);
+                        static_cast<float>(y) + world.getCollisionFluidHeightIfLoaded(x, y, z);
                     if (entityAABB.min.y < surface && entityAABB.max.y > static_cast<float>(y)) {
                         return true;
                     }
@@ -54,12 +54,12 @@ bool PhysicsEngine::isInWater(World& world, const AABB& entityAABB) {
 std::vector<AABB> PhysicsEngine::collectObstacles(const AABB& expandedAABB, World& world) {
     std::vector<AABB> obstacles;
 
-    int minX = static_cast<int>(std::floor(expandedAABB.min.x));
-    int minY = static_cast<int>(std::floor(expandedAABB.min.y));
-    int minZ = static_cast<int>(std::floor(expandedAABB.min.z));
-    int maxX = static_cast<int>(std::ceil(expandedAABB.max.x));
-    int maxY = static_cast<int>(std::ceil(expandedAABB.max.y));
-    int maxZ = static_cast<int>(std::ceil(expandedAABB.max.z));
+    int64_t minX = static_cast<int64_t>(std::floor(expandedAABB.min.x));
+    int32_t minY = static_cast<int32_t>(std::floor(expandedAABB.min.y));
+    int64_t minZ = static_cast<int64_t>(std::floor(expandedAABB.min.z));
+    int64_t maxX = static_cast<int64_t>(std::ceil(expandedAABB.max.x));
+    int32_t maxY = static_cast<int32_t>(std::ceil(expandedAABB.max.y));
+    int64_t maxZ = static_cast<int64_t>(std::ceil(expandedAABB.max.z));
 
     // Expand by ±1 margin for edge cases
     minX -= 1;
@@ -69,15 +69,16 @@ std::vector<AABB> PhysicsEngine::collectObstacles(const AABB& expandedAABB, Worl
     maxY += 1;
     maxZ += 1;
 
-    for (int x = minX; x <= maxX; ++x) {
-        for (int y = minY; y <= maxY; ++y) {
-            for (int z = minZ; z <= maxZ; ++z) {
-                if (PhysicsEngine::isSolid(world, x, y, z)) {
-                    obstacles.emplace_back(
-                        Vec3{static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)},
-                        Vec3{static_cast<float>(x) + 1.f, static_cast<float>(y) + 1.f,
-                             static_cast<float>(z) + 1.f});
-                }
+    for (int64_t x = minX; x <= maxX; ++x) {
+        for (int32_t y = minY; y <= maxY; ++y) {
+            for (int64_t z = minZ; z <= maxZ; ++z) {
+                const BlockType block = world.getCollisionBlockIfLoaded(x, y, z);
+                const float height = blockCollisionHeight(block);
+                if (height <= 0.0F) continue;
+                obstacles.emplace_back(
+                    Vec3{static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)},
+                    Vec3{static_cast<float>(x) + 1.0F, static_cast<float>(y) + height,
+                         static_cast<float>(z) + 1.0F});
             }
         }
     }

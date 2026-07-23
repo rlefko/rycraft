@@ -40,6 +40,12 @@ struct BasinSample {
     double flowX = 1.0;
     double flowZ = 0.0;
     double surfaceElevation = 0.0;
+    // Dimensionless gradient of the canonical, pre-water terrain substrate.
+    // Native v4 routing derives this from the same four-block elevation
+    // authority as the bed and shoreline rather than from a legacy control
+    // lattice. Legacy BasinSolver callers retain the zero default and derive
+    // their historical slope independently.
+    double terrainSlope = 0.0;
     double waterSurface = 0.0;
     double discharge = 0.0;
     double sediment = 0.0;
@@ -63,6 +69,11 @@ struct BasinSample {
     double lakeLossMm = 0.0;
     double lakeOverflowMmSquareKilometers = 0.0;
     double lakeSpillSurface = 0.0;
+    double baseflow = 0.0;
+    double precipitationSeasonality = 0.0;
+    double groundwaterRechargeMm = 0.0;
+    double groundwaterHead = 0.0;
+    double hydroperiod = 0.0;
     double waterfallTop = 0.0;
     double waterfallBottom = 0.0;
     double waterfallWidth = 0.0;
@@ -88,7 +99,21 @@ struct BasinSample {
     bool waterfall = false;
     bool waterfallAnchor = false;
     bool delta = false;
+    bool estuary = false;
+    bool brackish = false;
+    bool perennial = false;
+    bool ephemeral = false;
+    bool wetland = false;
     bool valid = false;
+};
+
+struct BasinHydroclimateSample {
+    double meanTemperatureC = 15.0;
+    double temperatureVariabilityC = 10.0;
+    double annualPrecipitationMm = 0.0;
+    double precipitationCoefficientOfVariation = 0.25;
+    double lapseRateCPerMeter = -0.0065;
+    double potentialEvapotranspirationMm = 900.0;
 };
 
 struct BasinSamplePosition {
@@ -134,14 +159,16 @@ struct BasinCacheMetrics {
 // Builds immutable, bounded drainage solutions. Every callback must be
 // coordinate-pure because cached solutions can be constructed on any worker.
 // One solver instance also represents one immutable callback context: callers
-// must use the same elevation, rainfall, and resistance fields for its entire
-// lifetime because catchment cache keys contain only seed-space coordinates.
+// must use the same elevation, rainfall, resistance, PET, and hydroclimate
+// fields for its entire lifetime because catchment cache keys contain only
+// seed-space coordinates.
 class BasinSolver {
 public:
     using ElevationFunction = std::function<double(double, double)>;
     using RainfallFunction = std::function<double(double, double, double)>;
     using RockResistanceFunction = std::function<double(double, double)>;
     using PotentialEvapotranspirationFunction = std::function<double(double, double, double)>;
+    using HydroclimateFunction = std::function<BasinHydroclimateSample(double, double, double)>;
 
     explicit BasinSolver(uint64_t worldSeed, size_t cacheByteBudget = BASIN_CACHE_BYTE_BUDGET);
     ~BasinSolver();
@@ -151,27 +178,28 @@ public:
     BasinSolver(BasinSolver&&) noexcept;
     BasinSolver& operator=(BasinSolver&&) noexcept;
 
-    BasinSample
-    sample(double x, double z, const ElevationFunction& elevation, const RainfallFunction& rainfall,
-           const RockResistanceFunction& rockResistance,
-           const PotentialEvapotranspirationFunction& potentialEvapotranspiration = {}) const;
+    BasinSample sample(double x, double z, const ElevationFunction& elevation,
+                       const RainfallFunction& rainfall,
+                       const RockResistanceFunction& rockResistance,
+                       const PotentialEvapotranspirationFunction& potentialEvapotranspiration = {},
+                       const HydroclimateFunction& hydroclimate = {}) const;
     // Reconstructs a regular integer-coordinate grid while retaining every
     // immutable basin and only the contour nodes referenced by the batch.
     // This keeps dense mesh sampling from repeatedly traversing the global
     // LRU and does not alter any canonical ownership decision.
-    void
-    sampleGrid(int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth,
-               int sampleHeight, const ElevationFunction& elevation,
-               const RainfallFunction& rainfall, const RockResistanceFunction& rockResistance,
-               std::span<BasinSample> output,
-               const PotentialEvapotranspirationFunction& potentialEvapotranspiration = {}) const;
+    void sampleGrid(int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth,
+                    int sampleHeight, const ElevationFunction& elevation,
+                    const RainfallFunction& rainfall, const RockResistanceFunction& rockResistance,
+                    std::span<BasinSample> output,
+                    const PotentialEvapotranspirationFunction& potentialEvapotranspiration = {},
+                    const HydroclimateFunction& hydroclimate = {}) const;
     // Reconstructs arbitrary point coordinates while retaining the same
     // bounded basin and shoreline solutions across the whole batch.
-    void
-    samplePoints(std::span<const BasinSamplePosition> positions, const ElevationFunction& elevation,
-                 const RainfallFunction& rainfall, const RockResistanceFunction& rockResistance,
-                 std::span<BasinSample> output,
-                 const PotentialEvapotranspirationFunction& potentialEvapotranspiration = {}) const;
+    void samplePoints(std::span<const BasinSamplePosition> positions,
+                      const ElevationFunction& elevation, const RainfallFunction& rainfall,
+                      const RockResistanceFunction& rockResistance, std::span<BasinSample> output,
+                      const PotentialEvapotranspirationFunction& potentialEvapotranspiration = {},
+                      const HydroclimateFunction& hydroclimate = {}) const;
 
     BasinCacheMetrics cacheMetrics() const;
     void clear() const;

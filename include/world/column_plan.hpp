@@ -9,6 +9,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <span>
 #include <vector>
 
 inline constexpr int COLUMN_PLAN_LATTICE_SPACING = 8;
@@ -16,10 +17,10 @@ inline constexpr int COLUMN_PLAN_LATTICE_EDGE = CHUNK_EDGE / COLUMN_PLAN_LATTICE
 inline constexpr size_t COLUMN_PLAN_LATTICE_SAMPLES =
     COLUMN_PLAN_LATTICE_EDGE * COLUMN_PLAN_LATTICE_EDGE;
 inline constexpr size_t COLUMN_PLAN_CACHE_BYTE_BUDGET = 128 * 1024 * 1024;
-// A 32-chunk exact disk plus its two-column construction apron contains
-// roughly 4,000 plans. Retain two neighboring working sets so ordinary
-// movement does not evict plans that the active-set rebuild still needs.
-inline constexpr size_t DEFAULT_COLUMN_PLAN_CACHE_CAPACITY = 8112;
+// This value is set from the measured ColumnPlan size below. It retains the
+// largest radius-35 exact-plan disk while keeping the cache below its hard
+// 128 MiB budget.
+inline constexpr size_t DEFAULT_COLUMN_PLAN_CACHE_CAPACITY = 3'950;
 
 // Column plans deliberately depend on a bounded coordinate-pure callback
 // instead of one concrete macro sampler. The generator can therefore supply
@@ -37,7 +38,7 @@ using ColumnPlanGeologySampler =
     std::function<worldgen::GeologySample(int64_t worldX, int64_t worldZ)>;
 
 // Immutable macro data for one horizontal chunk column. A world-aligned 3 by
-// 3 lattice and a shared C2 control view retain continuous fields, while
+// 3 lattice and a compact macro control view retain continuous fields, while
 // compact 17 by 17 arrays retain block-exact hydrology and geology authority.
 // Remaining per-block values are reconstructed on demand.
 class ColumnPlan {
@@ -52,7 +53,27 @@ public:
     ColumnPos chunkColumn() const { return chunkColumn_; }
     worldgen::SurfaceSample sample(int localX, int localZ) const;
     int surfaceY(int localX, int localZ) const;
-    const std::vector<int32_t>& exposedSections() const { return exposedSections_; }
+    std::span<const int32_t> exposedSections() const {
+        return std::span<const int32_t>(exposedSections_).first(floraOwnershipOffset_);
+    }
+    // Sections that can contain exact tree geometry or ground flora. Keeping
+    // this span separate from broad generation support lets exact streaming
+    // finish visible vegetation without waiting for unrelated deep terrain,
+    // volcanic support, or tall vertical walls.
+    std::span<const int32_t> floraOwnershipSections() const {
+        return std::span<const int32_t>(exposedSections_)
+            .subspan(floraOwnershipOffset_,
+                     surfaceOwnershipOffset_ - floraOwnershipOffset_);
+    }
+    // Sections that contain the drawable terrain top, standing water, falls,
+    // or required vertical surface walls. This is deliberately narrower than
+    // exposedSections(), which also retains optional tree and generation
+    // support. Far terrain can retire once these sections own the surface;
+    // waiting for unrelated support cubes leaves coarse grass and water
+    // parents visibly intersecting an already rendered exact column.
+    std::span<const int32_t> surfaceOwnershipSections() const {
+        return std::span<const int32_t>(exposedSections_).subspan(surfaceOwnershipOffset_);
+    }
     bool exposesSection(int32_t chunkY) const;
     int minimumSurfaceY() const { return minimumSurfaceY_; }
     int maximumSurfaceY() const { return maximumSurfaceY_; }
@@ -64,12 +85,53 @@ private:
         float mixed = 0.0F;
     };
 
+    // Learned authority is sampled at every block while the plan is built.
+    // Retain routing fields that cannot be reconstructed from the eight-block
+    // lattice, so exact columns, far habitats, and water meshes all observe
+    // one canonical route. Flow components use the same signed 16-bit coding
+    // as canonical waterfalls; the remaining fields retain source float
+    // precision without growing a full HydrologySample for every cell.
+    struct CanonicalRoutingSample {
+        int16_t encodedFlowX = 0;
+        int16_t encodedFlowZ = 0;
+        float discharge = 0.0F;
+        float sediment = 0.0F;
+        float channelDistance = 0.0F;
+        float channelWidth = 0.0F;
+        float channelDepth = 0.0F;
+        float channelGradient = 0.0F;
+        float erosionDepth = 0.0F;
+        float baseflow = 0.0F;
+        float precipitationSeasonality = 0.0F;
+        float groundwaterRechargeMm = 0.0F;
+        float groundwaterHead = 0.0F;
+        float hydroperiod = 0.0F;
+        uint8_t streamOrder = 0;
+        uint8_t distributaryCount = 0;
+        uint8_t flags = 0;
+        uint8_t reserved = 0;
+    };
+    static_assert(sizeof(CanonicalRoutingSample) == 56);
+
     struct CanonicalLakeSample {
         float waterSurface = 0.0F;
         float surfaceElevation = 0.0F;
+        // This applies to dry cells as well. It is retained with the exact
+        // hydrology grid because learned slope is an authority field, not a
+        // value reconstructed from the plan's eight-block terrain lattice.
+        float terrainSlope = 0.0F;
         int16_t encodedShoreDistance = std::numeric_limits<int16_t>::min();
         uint8_t encodedBankInfluence = 0;
         uint8_t flags = 0;
+    };
+
+    // Wetlands carry a parent-owned surface stage in CanonicalLakeSample and
+    // waterBodyPalette_. Keep only their saturated-ground fields sparse so
+    // ordinary dry columns do not pay for two more block-resolution floats.
+    struct CanonicalWetlandSample {
+        uint16_t localIndex = 0;
+        float groundwaterHead = 0.0F;
+        uint8_t encodedHydroperiod = 0;
     };
 
     // Waterfalls occupy only a narrow analytical footprint, so retaining them
@@ -114,20 +176,28 @@ private:
     // the apron resident.
     std::array<TerrainDerivative, COLUMN_PLAN_LATTICE_SAMPLES> terrainDerivatives_{};
     ColumnPlanSurfaceGrid exactSurfaceY_{};
+    std::array<CanonicalRoutingSample, (CHUNK_EDGE + 1) * (CHUNK_EDGE + 1)> canonicalRouting_{};
     std::array<CanonicalLakeSample, (CHUNK_EDGE + 1) * (CHUNK_EDGE + 1)> canonicalLakes_{};
     std::array<uint8_t, (CHUNK_EDGE + 1) * (CHUNK_EDGE + 1)> generatedTopFluidStates_{};
     std::array<uint8_t, (CHUNK_EDGE + 1) * (CHUNK_EDGE + 1)> waterTopologyFlags_{};
     std::array<uint16_t, (CHUNK_EDGE + 1) * (CHUNK_EDGE + 1)> waterBodyIndices_{};
     std::vector<worldgen::WaterBodyId> waterBodyPalette_;
+    std::vector<CanonicalWetlandSample> canonicalWetlands_;
     std::vector<CanonicalWaterfallSample> canonicalWaterfalls_;
     std::vector<uint64_t> transitionOwnerPalette_;
     std::vector<CanonicalTransitionSample> canonicalTransitions_;
     std::array<CanonicalGeologySample, (CHUNK_EDGE + 1) * (CHUNK_EDGE + 1)> canonicalGeology_{};
+    // One allocation stores [all exposed sections][flora ownership
+    // sections][surface ownership sections]. The 16-bit split points retain
+    // the exact-plan cache's measured 128 MiB object budget.
     std::vector<int32_t> exposedSections_;
     float maximumWaterfallTop_ = 0.0F;
     int minimumSurfaceY_ = SEA_LEVEL;
     int maximumSurfaceY_ = SEA_LEVEL;
+    bool hasCanonicalRouting_ = false;
     bool hasCanonicalGeology_ = false;
+    uint16_t floraOwnershipOffset_ = 0;
+    uint16_t surfaceOwnershipOffset_ = 0;
 
     const worldgen::SurfaceSample& lattice(int x, int z) const;
     const TerrainDerivative& terrainDerivative(int x, int z) const;
@@ -136,6 +206,7 @@ private:
 
 static_assert((CHUNK_EDGE + 1) * (CHUNK_EDGE + 1) <=
               static_cast<size_t>(std::numeric_limits<uint16_t>::max()));
+static_assert(WORLD_VERTICAL_CHUNKS <= static_cast<int>(std::numeric_limits<uint16_t>::max()));
 
 static_assert(sizeof(ColumnPlan) * DEFAULT_COLUMN_PLAN_CACHE_CAPACITY <=
               COLUMN_PLAN_CACHE_BYTE_BUDGET);

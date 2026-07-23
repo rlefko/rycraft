@@ -1,6 +1,7 @@
 #include "entity/boat.hpp"
 
 #include "entity/physics.hpp"
+#include "world/world.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -37,7 +38,66 @@ float rayBoxEntry(const Vec3& origin, const Vec3& dir, const AABB& box, float ma
     return tMin;
 }
 
+bool boatHasBuoyantWater(World& world, const AABB& hull) {
+    const int64_t minX = static_cast<int64_t>(std::floor(hull.min.x));
+    const int32_t minY = static_cast<int32_t>(std::floor(hull.min.y));
+    const int64_t minZ = static_cast<int64_t>(std::floor(hull.min.z));
+    const int64_t maxX = static_cast<int64_t>(std::ceil(hull.max.x));
+    const int32_t maxY = static_cast<int32_t>(std::ceil(hull.max.y));
+    const int64_t maxZ = static_cast<int64_t>(std::ceil(hull.max.z));
+
+    for (int64_t x = minX; x < maxX; ++x) {
+        for (int32_t y = minY; y < maxY; ++y) {
+            for (int64_t z = minZ; z < maxZ; ++z) {
+                if (boatFluidCellProvidesBuoyancy(world.readFluidCell({x, y, z}), y, hull)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 } // namespace
+
+std::optional<float> boatPlacementSurfaceY(int64_t blockX, int32_t blockY, int64_t blockZ,
+                                           FluidCell waterCell, std::optional<BlockType> blockAbove,
+                                           const Vec3& rayOrigin, const Vec3& rayDirection,
+                                           float maxDistance) {
+    if (!waterCell.loaded || waterCell.block != BlockType::WATER || waterCell.state.isFalling() ||
+        !blockAbove || *blockAbove == BlockType::WATER || isSolid(*blockAbove) ||
+        isLiquid(*blockAbove) || maxDistance < 0.0F) {
+        return std::nullopt;
+    }
+
+    constexpr float DIRECTION_EPSILON = 1.0e-5F;
+    constexpr float SURFACE_EPSILON = 1.0e-4F;
+    const float directionLength = rayDirection.length();
+    if (directionLength <= DIRECTION_EPSILON) return std::nullopt;
+    const Vec3 direction = rayDirection * (1.0F / directionLength);
+    if (direction.y >= -DIRECTION_EPSILON) return std::nullopt;
+
+    const float surfaceY = static_cast<float>(blockY) + fluidSurfaceHeight(waterCell.state);
+    if (rayOrigin.y <= surfaceY + SURFACE_EPSILON) return std::nullopt;
+    const float distance = (surfaceY - rayOrigin.y) / direction.y;
+    if (distance < 0.0F || distance > maxDistance + SURFACE_EPSILON) return std::nullopt;
+
+    const Vec3 surfaceHit = rayOrigin + direction * distance;
+    if (static_cast<int64_t>(std::floor(surfaceHit.x)) != blockX ||
+        static_cast<int64_t>(std::floor(surfaceHit.z)) != blockZ) {
+        return std::nullopt;
+    }
+    return surfaceY;
+}
+
+bool boatFluidCellProvidesBuoyancy(FluidCell cell, int32_t blockY, const AABB& hull) {
+    if (!cell.loaded || cell.block != BlockType::WATER || cell.state.isFalling()) {
+        return false;
+    }
+    const float bottom = static_cast<float>(blockY);
+    const float surface = bottom + fluidSurfaceHeight(cell.state);
+    return hull.min.y < surface && hull.max.y > bottom;
+}
 
 AABB Boat::getAABB() const {
     const float halfW = WIDTH * 0.5f;
@@ -46,12 +106,14 @@ AABB Boat::getAABB() const {
                 Vec3{position.x + halfW, position.y + HEIGHT, position.z + halfL}};
 }
 
-size_t BoatManager::spawn(const Vec3& position, float yaw) {
+BoatSpawnResult BoatManager::spawn(const Vec3& position, float yaw) {
+    bool evictedOldest = false;
     if (boats_.size() >= MAX_BOATS) {
         boats_.erase(boats_.begin()); // evict the oldest at the cap
+        evictedOldest = true;
     }
     boats_.push_back(Boat{position, Vec3{0.f, 0.f, 0.f}, yaw, false});
-    return boats_.size() - 1;
+    return {.index = boats_.size() - 1, .evictedOldest = evictedOldest};
 }
 
 void BoatManager::remove(size_t index) {
@@ -71,7 +133,7 @@ void BoatManager::tick(World& world, const Vec3& playerPosition, int riddenIndex
         }
 
         const AABB box = boat.getAABB();
-        const bool inWater = PhysicsEngine::isInWater(world, box);
+        const bool inWater = boatHasBuoyantWater(world, box);
 
         // Vertical: buoyancy floats the hull toward the surface, otherwise it
         // sinks under gravity until it grounds.

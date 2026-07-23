@@ -1,6 +1,7 @@
 #pragma once
 
 #include <common/math.hpp>
+#include <world/block_properties.hpp>
 #include <world/chunk.hpp>
 
 #include <optional>
@@ -8,6 +9,17 @@
 
 // Forward declaration
 class World;
+
+// Rich ray result shared by block interaction and authored-shape highlights.
+// Bounds remain local to the selected voxel so the renderer can reuse them
+// without losing precision at large world coordinates.
+struct VoxelRayHit {
+    Vec3 blockPosition;
+    Vec3 normal;
+    BlockType block = BlockType::AIR;
+    BlockSelectionBounds localBounds;
+    float distance = 0.0F;
+};
 
 // ---------------------------------------------------------------------------
 // VoxelTraversal — DDA (Digital Differential Analyzer) ray marching
@@ -31,8 +43,18 @@ public:
                                                                    World& world,
                                                                    float maxDistance = 6.0f);
 
+    // Returns the authored shape, block type, and exact entry distance in
+    // addition to the compatibility position and face-normal fields above.
+    static std::optional<VoxelRayHit> traceRayDetailed(const Vec3& origin, const Vec3& direction,
+                                                       World& world, float maxDistance = 6.0f);
+
 private:
-    // A disengaged result means the cube is unavailable. Traversal stops at
-    // that boundary without generating or targeting a placeholder block.
-    static std::optional<bool> isBlockTargetableIfLoaded(World& world, int x, int y, int z);
+    struct ShapeIntersection {
+        float distance = 0.0F;
+        Vec3 normal;
+    };
+
+    static std::optional<ShapeIntersection>
+    intersectSelectionBounds(const Vec3& origin, const Vec3& direction, const Vec3& blockPosition,
+                             const BlockSelectionBounds& bounds, float maxDistance);
 };
