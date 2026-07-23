@@ -24,12 +24,15 @@ public:
     explicit BlockTextureArray(id<MTLDevice> device);
 
     id<MTLTexture> texture() const { return _texture; }
+    id<MTLTexture> emissionMask() const { return _emissionMask; }
     id<MTLSamplerState> sampler() const { return _sampler; }
 
 private:
     id<MTLTexture> _texture;
+    id<MTLTexture> _emissionMask;
     id<MTLSamplerState> _sampler;
 
     // Paint one layer's pixels procedurally, build its mip chain, and upload it.
     void generateLayer(uint8_t layer);
+    void generateEmissionMaskLayer(uint8_t layer);
 };

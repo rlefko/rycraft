@@ -29,6 +29,8 @@
 #include "world/weather.hpp"
 #include "world/world.hpp"
 
+static_assert(EXACT_SURFACE_MESH_PRIORITY_RADIUS_CHUNKS == MAX_EXACT_CUBIC_DISTANCE_CHUNKS);
+
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
@@ -38,6 +40,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <numbers>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -49,16 +52,27 @@
 // the particle instance array) sub-allocate from this ring slot; the particle
 // array dominates at 192 KB.
 static constexpr uint64_t FRAME_RING_SLOT_BYTES = 256 * 1024;
+static constexpr uint64_t EXACT_VERTEX_BUFFER_BYTES =
+    MAX_MESH_RESIDENT_CUBES * 128ull * 1024 * 13 / 10;
+static constexpr uint64_t EXACT_INDEX_BUFFER_BYTES = EXACT_VERTEX_BUFFER_BYTES / 2;
+static constexpr uint64_t EXACT_VERTEX_BUFFER_SLAB_BYTES = 256ull * 1024 * 1024;
+static constexpr uint64_t EXACT_INDEX_BUFFER_SLAB_BYTES = 128ull * 1024 * 1024;
+static_assert((EXACT_VERTEX_BUFFER_BYTES + EXACT_VERTEX_BUFFER_SLAB_BYTES - 1) /
+                  EXACT_VERTEX_BUFFER_SLAB_BYTES ==
+              (EXACT_INDEX_BUFFER_BYTES + EXACT_INDEX_BUFFER_SLAB_BYTES - 1) /
+                  EXACT_INDEX_BUFFER_SLAB_BYTES);
 static constexpr uint64_t FAR_VERTEX_BUFFER_BYTES = 2ull * 1024 * 1024 * 1024;
 static constexpr uint64_t FAR_INDEX_BUFFER_BYTES = 1ull * 1024 * 1024 * 1024;
 static constexpr uint64_t FAR_VERTEX_BUFFER_SLAB_BYTES = 256ull * 1024 * 1024;
 static constexpr uint64_t FAR_INDEX_BUFFER_SLAB_BYTES = 128ull * 1024 * 1024;
+static constexpr size_t FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET = 8;
 static_assert(FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR == 4);
 static_assert(FarTerrainExactHandoff::COLUMN_MASK_WORD_COUNT == FAR_TERRAIN_EXACT_MASK_WORD_COUNT);
 static_assert(FAR_TERRAIN_TILE_EDGE / CHUNK_EDGE == FAR_TERRAIN_EXACT_COLUMNS_PER_TILE);
 
 static FarTerrainOwnershipUniforms
-farTerrainOwnershipUniforms(ColumnPos centerTile, const FarTerrainExactHandoff& handoff) {
+farTerrainOwnershipUniforms(ColumnPos centerTile, const FarTerrainExactHandoff& surfaceHandoff,
+                            const FarTerrainExactHandoff& floraHandoff) {
     FarTerrainOwnershipUniforms ownership{};
     for (int64_t neighborZ = -FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS;
          neighborZ <= FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS; ++neighborZ) {
@@ -68,13 +82,20 @@ farTerrainOwnershipUniforms(ColumnPos centerTile, const FarTerrainExactHandoff& 
                 static_cast<size_t>((neighborZ + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS) *
                                         FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE +
                                     neighborX + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS);
-            const FarTerrainExactHandoff::ColumnMask mask =
-                handoff.readyColumnMask({centerTile.x + neighborX, centerTile.z + neighborZ});
-            for (size_t word = 0; word < mask.size(); ++word) {
+            const ColumnPos tile{centerTile.x + neighborX, centerTile.z + neighborZ};
+            const FarTerrainExactHandoff::ColumnMask surfaceMask =
+                surfaceHandoff.readyColumnMask(tile);
+            const FarTerrainExactHandoff::ColumnMask floraMask = floraHandoff.readyColumnMask(tile);
+            for (size_t word = 0; word < surfaceMask.size(); ++word) {
                 ownership.readyColumnMasks[tileIndex * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE +
                                            word / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR]
                                           [word % FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR] =
-                    mask[word];
+                    surfaceMask[word];
+                ownership
+                    .floraReadyColumnMasks[tileIndex * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE +
+                                           word / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR]
+                                          [word % FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR] =
+                    floraMask[word];
             }
         }
     }
@@ -116,6 +137,103 @@ farTerrainOccluderIntersectsExact(const FarTerrainBounds& patch, ColumnPos tile,
     return false;
 }
 
+void buildFarTerrainCanopyRefreshBatch(
+    const std::unordered_map<ColumnPos, FarTerrainKey>& displayed,
+    const std::unordered_map<ColumnPos, FarTerrainLodTransition>& transitions,
+    const std::unordered_map<FarTerrainKey, FarTerrainMeshState, FarTerrainKeyHash>& residents,
+    const std::unordered_map<FarTerrainKey, FarCanopyMeshState, FarTerrainKeyHash>& attachments,
+    double cameraX, double cameraZ, size_t requestBudget,
+    std::vector<FarTerrainCanopyRefreshRequest>& output,
+    const FarTerrainExactHandoff* exactFloraHandoff) {
+    output.clear();
+    if (requestBudget == 0)
+        return;
+
+    std::vector<FarTerrainCanopyRefreshRequest> missingAttachments;
+    std::vector<FarTerrainCanopyRefreshRequest> provisionalPromotions;
+    missingAttachments.reserve(requestBudget);
+    provisionalPromotions.reserve(requestBudget);
+    const auto before = [](const FarTerrainCanopyRefreshRequest& first,
+                           const FarTerrainCanopyRefreshRequest& second) {
+        if (first.distanceSquaredBlocks != second.distanceSquaredBlocks)
+            return first.distanceSquaredBlocks < second.distanceSquaredBlocks;
+        if (first.key.tileX != second.key.tileX)
+            return first.key.tileX < second.key.tileX;
+        if (first.key.tileZ != second.key.tileZ)
+            return first.key.tileZ < second.key.tileZ;
+        return farTerrainStepSize(first.key.step) < farTerrainStepSize(second.key.step);
+    };
+    const auto insertBounded = [&](std::vector<FarTerrainCanopyRefreshRequest>& requests,
+                                   const FarTerrainCanopyRefreshRequest& request) {
+        if (auto duplicate =
+                std::ranges::find(requests, request.key, &FarTerrainCanopyRefreshRequest::key);
+            duplicate != requests.end()) {
+            duplicate->transitionTarget = duplicate->transitionTarget || request.transitionTarget;
+            return;
+        }
+        if (requests.size() == requestBudget) {
+            if (!before(request, requests.back()))
+                return;
+            requests.pop_back();
+        }
+        const auto insertion = std::lower_bound(requests.begin(), requests.end(), request, before);
+        requests.insert(insertion, request);
+    };
+    const auto appendIfFinalResident = [&](FarTerrainKey key, bool transitionTarget) {
+        const ColumnPos coordinate{key.tileX, key.tileZ};
+        if (exactFloraHandoff && exactFloraHandoff->tileFullyOwned(coordinate)) {
+            return;
+        }
+        const auto resident = residents.find(key);
+        if (resident == residents.end() || !resident->second.uploaded) {
+            return;
+        }
+        const auto attachment = attachments.find(key);
+        const bool matchingAttachment =
+            attachment != attachments.end() &&
+            farCanopyMatchesSurface(attachment->second.authorityQuality,
+                                    attachment->second.groundingQuality,
+                                    resident->second.authorityQuality);
+        if (matchingAttachment &&
+            attachment->second.authorityQuality == FarTerrainAuthorityQuality::FINAL) {
+            return;
+        }
+        const double minimumX = static_cast<double>(key.tileX) * FAR_TERRAIN_TILE_EDGE;
+        const double maximumX = minimumX + FAR_TERRAIN_TILE_EDGE;
+        const double minimumZ = static_cast<double>(key.tileZ) * FAR_TERRAIN_TILE_EDGE;
+        const double maximumZ = minimumZ + FAR_TERRAIN_TILE_EDGE;
+        const double dx = cameraX < minimumX   ? minimumX - cameraX
+                          : cameraX > maximumX ? cameraX - maximumX
+                                               : 0.0;
+        const double dz = cameraZ < minimumZ   ? minimumZ - cameraZ
+                          : cameraZ > maximumZ ? cameraZ - maximumZ
+                                               : 0.0;
+        const double distanceSquared = dx * dx + dz * dz;
+        const uint32_t absolutePriority = static_cast<uint32_t>(std::min(
+            std::sqrt(distanceSquared), static_cast<double>(std::numeric_limits<uint32_t>::max())));
+        const FarTerrainCanopyRefreshRequest request{key, resident->second.authorityQuality,
+                                                     absolutePriority, transitionTarget,
+                                                     distanceSquared};
+        // PREVIEW attachments schedule their own FINAL successor when they
+        // complete. Keep them eligible for recovery, but do not let a handful
+        // of parked promotions occupy the entire bounded request batch while
+        // other drawable tiles still have no flora at all.
+        insertBounded(matchingAttachment ? provisionalPromotions : missingAttachments, request);
+    };
+    for (const auto& [_, key] : displayed)
+        appendIfFinalResident(key, false);
+    for (const auto& [_, transition] : transitions)
+        appendIfFinalResident(transition.to, true);
+
+    const size_t missingCount = std::min(requestBudget, missingAttachments.size());
+    output.insert(output.end(), missingAttachments.begin(),
+                  missingAttachments.begin() + static_cast<std::ptrdiff_t>(missingCount));
+    const size_t promotionCount =
+        std::min(requestBudget - output.size(), provisionalPromotions.size());
+    output.insert(output.end(), provisionalPromotions.begin(),
+                  provisionalPromotions.begin() + static_cast<std::ptrdiff_t>(promotionCount));
+}
+
 RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width,
                                uint32_t height, uint64_t worldSeed)
     : _device(device), _frameRing(device, FRAME_RING_SLOT_BYTES), _bloomIntensity(1.0f),
@@ -130,8 +248,13 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
             _worldgenOverlayMode = WorldgenOverlayMode::CLIMATE;
         } else if (name == "biome") {
             _worldgenOverlayMode = WorldgenOverlayMode::BIOME;
+        } else if (name == "lod") {
+            _worldgenOverlayMode = WorldgenOverlayMode::LOD;
+        } else if (name == "authority") {
+            _worldgenOverlayMode = WorldgenOverlayMode::AUTHORITY;
         } else if (!name.empty()) {
-            RY_LOG_ERROR("RYCRAFT_WORLDGEN_OVERLAY must be geology, hydrology, climate, or biome");
+            RY_LOG_ERROR("RYCRAFT_WORLDGEN_OVERLAY must be geology, hydrology, climate, biome, "
+                         "lod, or authority");
         }
     }
     // ---- Load main chunk shader functions ----
@@ -187,6 +310,38 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         RY_LOG_FATAL(msg.UTF8String);
     }
 
+    if (![_device supportsFamily:MTLGPUFamilyApple4] ||
+        ![_device supportsTextureSampleCount:PixelFormats::SCENE_SAMPLE_COUNT]) {
+        RY_LOG_FATAL("Coherent scene material resolve requires Apple GPU family 4 and 4x MSAA");
+    }
+    id<MTLFunction> coherentResolveFunction =
+        [shaderLibrary newFunctionWithName:@"coherentSceneResolveTileKernel"];
+    if (!coherentResolveFunction) {
+        RY_LOG_FATAL("Failed to load coherent scene material resolve tile function");
+    }
+    auto coherentResolveDesc = [[MTLTileRenderPipelineDescriptor alloc] init];
+    coherentResolveDesc.label = @"Coherent Nearest-Surface Resolve";
+    coherentResolveDesc.tileFunction = coherentResolveFunction;
+    coherentResolveDesc.threadgroupSizeMatchesTileSize = YES;
+    coherentResolveDesc.rasterSampleCount = PixelFormats::SCENE_SAMPLE_COUNT;
+    coherentResolveDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
+    coherentResolveDesc.colorAttachments[1].pixelFormat = PixelFormats::SURFACE;
+    coherentResolveDesc.colorAttachments[2].pixelFormat = PixelFormats::REACTIVE;
+    coherentResolveDesc.colorAttachments[3].pixelFormat = PixelFormats::RESOLVE_DEPTH_KEY;
+    _coherentResolvePipelineState =
+        [_device newRenderPipelineStateWithTileDescriptor:coherentResolveDesc
+                                                  options:MTLPipelineOptionNone
+                                               reflection:nil
+                                                    error:&error];
+    resetMetalObject(coherentResolveDesc);
+    resetMetalObject(coherentResolveFunction);
+    if (!_coherentResolvePipelineState) {
+        NSString* msg =
+            [NSString stringWithFormat:@"Failed to create coherent scene material resolve: %@",
+                                       error.localizedDescription];
+        RY_LOG_FATAL(msg.UTF8String);
+    }
+
     // ---- Depth stencil state (opaque) ----
     auto depthDesc = [[MTLDepthStencilDescriptor alloc] init];
     depthDesc.depthCompareFunction = MTLCompareFunctionLess;
@@ -221,10 +376,10 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     auto skyPipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
     skyPipelineDesc.vertexFunction = skyVertexFunc;
     skyPipelineDesc.fragmentFunction = skyFragmentFunc;
-    skyPipelineDesc.colorAttachments[0].pixelFormat = PixelFormats::SCENE_HDR;
-    skyPipelineDesc.colorAttachments[1].pixelFormat = PixelFormats::SURFACE;
-    skyPipelineDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
-    skyPipelineDesc.rasterSampleCount = 4;
+    PixelFormats::configureScenePassPipeline(skyPipelineDesc);
+    skyPipelineDesc.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
+    skyPipelineDesc.colorAttachments[2].writeMask = MTLColorWriteMaskNone;
+    skyPipelineDesc.colorAttachments[3].writeMask = MTLColorWriteMaskNone;
 
     _skyPipelineState = [_device newRenderPipelineStateWithDescriptor:skyPipelineDesc error:&error];
     resetMetalObject(skyPipelineDesc);
@@ -264,6 +419,11 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         MTLBlendFactorOneMinusSourceAlpha;
     highlightPipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
         MTLBlendFactorOneMinusSourceAlpha;
+    highlightPipelineDesc.colorAttachments[0].writeMask =
+        MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
+    highlightPipelineDesc.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
+    highlightPipelineDesc.colorAttachments[2].writeMask = MTLColorWriteMaskNone;
+    highlightPipelineDesc.colorAttachments[3].writeMask = MTLColorWriteMaskNone;
     _highlightPipelineState = [_device newRenderPipelineStateWithDescriptor:highlightPipelineDesc
                                                                       error:&error];
     resetMetalObject(highlightPipelineDesc);
@@ -391,8 +551,14 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         }
     }
 
-    // ---- MegaBuffer (centralized GPU memory for chunk meshes) ----
-    _megaBuffer = std::make_unique<MegaBuffer>(_device);
+    // ---- Lazy segmented arena for exact chunk meshes ----
+    // v4 expands its exact radius after safe-spawn qualification. A growable
+    // contiguous buffer would invalidate every published spawn allocation at
+    // that handoff, so reserve the final bounded capacity and allocate slabs
+    // only as exact meshes actually arrive.
+    _megaBuffer = std::make_unique<SegmentedMegaBuffer>(
+        _device, EXACT_VERTEX_BUFFER_BYTES, EXACT_INDEX_BUFFER_BYTES,
+        EXACT_VERTEX_BUFFER_SLAB_BYTES, EXACT_INDEX_BUFFER_SLAB_BYTES);
 
     // ---- Block textures (procedural, one array layer per face texture) ----
     _blockTextures = std::make_unique<BlockTextureArray>(_device);
@@ -445,9 +611,12 @@ RenderPipeline::RenderPipeline(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 void RenderPipeline::releaseSceneTargets() {
     resetMetalObject(_colorMSAA);
     resetMetalObject(_surfaceMSAA);
+    resetMetalObject(_reactiveMSAA);
+    resetMetalObject(_resolveDepthKeyMSAA);
     resetMetalObject(_depthMSAA);
     resetMetalObject(_colorResolve);
     resetMetalObject(_surfaceResolve);
+    resetMetalObject(_reactiveResolve);
     resetMetalObject(_depthResolve);
     resetMetalObject(_mediaDepthResolve);
     resetMetalObject(_sceneColorCopy);
@@ -460,7 +629,7 @@ void RenderPipeline::allocateSceneTargets() {
     colorMSAADesc.pixelFormat = PixelFormats::SCENE_HDR;
     colorMSAADesc.width = _displayWidth;
     colorMSAADesc.height = _displayHeight;
-    colorMSAADesc.sampleCount = 4;
+    colorMSAADesc.sampleCount = PixelFormats::SCENE_SAMPLE_COUNT;
     colorMSAADesc.usage = MTLTextureUsageRenderTarget;
     colorMSAADesc.storageMode = MTLStorageModeMemoryless;
     _colorMSAA = [_device newTextureWithDescriptor:colorMSAADesc];
@@ -471,10 +640,21 @@ void RenderPipeline::allocateSceneTargets() {
     MTLTextureDescriptor* surfaceMSAADesc = [colorMSAADesc copy];
     surfaceMSAADesc.pixelFormat = PixelFormats::SURFACE;
     _surfaceMSAA = [_device newTextureWithDescriptor:surfaceMSAADesc];
+    MTLTextureDescriptor* reactiveMSAADesc = [colorMSAADesc copy];
+    reactiveMSAADesc.pixelFormat = PixelFormats::REACTIVE;
+    _reactiveMSAA = [_device newTextureWithDescriptor:reactiveMSAADesc];
+    MTLTextureDescriptor* resolveDepthKeyMSAADesc = [colorMSAADesc copy];
+    resolveDepthKeyMSAADesc.pixelFormat = PixelFormats::RESOLVE_DEPTH_KEY;
+    _resolveDepthKeyMSAA = [_device newTextureWithDescriptor:resolveDepthKeyMSAADesc];
+    resetMetalObject(resolveDepthKeyMSAADesc);
+    resetMetalObject(reactiveMSAADesc);
     resetMetalObject(surfaceMSAADesc);
     resetMetalObject(colorMSAADesc);
     if (!_surfaceMSAA) {
         RY_LOG_FATAL("Failed to allocate MSAA surface-data texture");
+    }
+    if (!_reactiveMSAA || !_resolveDepthKeyMSAA) {
+        RY_LOG_FATAL("Failed to allocate coherent MSAA material targets");
     }
 
     auto depthMSAADesc = [[MTLTextureDescriptor alloc] init];
@@ -482,7 +662,7 @@ void RenderPipeline::allocateSceneTargets() {
     depthMSAADesc.pixelFormat = PixelFormats::SCENE_DEPTH;
     depthMSAADesc.width = _displayWidth;
     depthMSAADesc.height = _displayHeight;
-    depthMSAADesc.sampleCount = 4;
+    depthMSAADesc.sampleCount = PixelFormats::SCENE_SAMPLE_COUNT;
     depthMSAADesc.usage = MTLTextureUsageRenderTarget;
     depthMSAADesc.storageMode = MTLStorageModeMemoryless;
     _depthMSAA = [_device newTextureWithDescriptor:depthMSAADesc];
@@ -512,6 +692,18 @@ void RenderPipeline::allocateSceneTargets() {
     _surfaceResolve = [_device newTextureWithDescriptor:surfaceResolveDesc];
     if (!_surfaceResolve) {
         RY_LOG_FATAL("Failed to allocate surface-data resolve texture");
+    }
+
+    auto reactiveResolveDesc =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:PixelFormats::REACTIVE
+                                                           width:_displayWidth
+                                                          height:_displayHeight
+                                                       mipmapped:false];
+    reactiveResolveDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    reactiveResolveDesc.storageMode = MTLStorageModePrivate;
+    _reactiveResolve = [_device newTextureWithDescriptor:reactiveResolveDesc];
+    if (!_reactiveResolve) {
+        RY_LOG_FATAL("Failed to allocate reactive resolve texture");
     }
 
     // ---- Water pass inputs ----
@@ -558,7 +750,7 @@ void RenderPipeline::allocateSceneTargets() {
 void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawable,
                             const Mat4& viewMatrix, const Mat4& projectionMatrix,
                             const World& world, const Camera& camera, uint64_t worldTime,
-                            double deltaSeconds, std::optional<Vec3> highlightedBlock,
+                            double deltaSeconds, std::optional<BlockHighlight> highlightedBlock,
                             const UIFrameState& uiFrame,
                             const std::vector<std::shared_ptr<Entity>>* entities,
                             const std::vector<ItemEntity>* itemEntities,
@@ -567,6 +759,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
                             const std::vector<LightningEvent>* lightningEvents) {
     if (!drawable || !queue)
         return;
+
+    _clouds->beginWorld(world.instanceId(), world.getSeed());
+    _particles->beginWorld(world.instanceId(), world.getSeed());
 
     // Track the true drawable size (pixels, not view points, 2x on Retina)
     // so the scene targets always match the surface we resolve into.
@@ -625,6 +820,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     }
 
     const Vec3 cameraPosition = camera.getPosition();
+    const WorldPhysicalScale physicalScale =
+        worldPhysicalScale(world.generator().usesLearnedAuthority());
     WeatherSample localWeather{};
     if (weatherSnapshot) {
         localWeather = weatherSnapshot->sample(cameraPosition.x, cameraPosition.z, worldTime);
@@ -652,9 +849,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     // Slow atmosphere LUTs and the snapped cloud transmittance map precede
     // every geometry pass that samples them.
     const AtmosphereUniforms atmosphereUniforms = earthAtmosphereUniforms(
-        cameraPosition.y, skyUniforms.sunDirection, simd_make_float3(1.0F, 1.0F, 0.98F),
-        std::max(localWeather.aerosolDensity, 0.08F), localWeather.relativeHumidity,
-        static_cast<uint32_t>(_frameRing.frameIndex()));
+        cameraPosition.y, physicalScale, skyUniforms.sunDirection,
+        simd_make_float3(1.0F, 1.0F, 0.98F), std::max(localWeather.aerosolDensity, 0.08F),
+        localWeather.relativeHumidity, static_cast<uint32_t>(_frameRing.frameIndex()));
     _atmosphere->encode(commandBuffer, atmosphereUniforms, false, _gpuTimer.get());
     if (weatherSnapshot && _gfx.cloudQuality > 0 && shadowStrength > 0.0001F) {
         CloudShadowUniforms cloudShadow{};
@@ -683,6 +880,17 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderPassDesc.colorAttachments[1].storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.colorAttachments[1].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
+    renderPassDesc.colorAttachments[2].texture = _reactiveMSAA;
+    renderPassDesc.colorAttachments[2].resolveTexture = _reactiveResolve;
+    renderPassDesc.colorAttachments[2].loadAction = MTLLoadActionClear;
+    renderPassDesc.colorAttachments[2].storeAction = MTLStoreActionMultisampleResolve;
+    renderPassDesc.colorAttachments[2].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+
+    renderPassDesc.colorAttachments[3].texture = _resolveDepthKeyMSAA;
+    renderPassDesc.colorAttachments[3].loadAction = MTLLoadActionClear;
+    renderPassDesc.colorAttachments[3].storeAction = MTLStoreActionDontCare;
+    renderPassDesc.colorAttachments[3].clearColor = MTLClearColorMake(1.0, 0.0, 0.0, 0.0);
+
     // Depth resolves out of tile memory (min filter: nearest sample) so the
     // water pass can depth-test and reconstruct world positions.
     renderPassDesc.depthAttachment.texture = _depthMSAA;
@@ -691,6 +899,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     renderPassDesc.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
     renderPassDesc.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterMin;
     renderPassDesc.depthAttachment.clearDepth = 1.0;
+    renderPassDesc.tileWidth = 16;
+    renderPassDesc.tileHeight = 16;
     _gpuTimer->attachPass(renderPassDesc, "scene");
 
     // One immutable tick snapshot feeds shadows, exact terrain, and entities.
@@ -700,8 +910,8 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     const auto& loadedChunks = loadedSnapshot ? *loadedSnapshot : emptyChunks;
 
     // ---- Shadow cascades (depth-only passes before the scene pass) ----
-    renderShadows(commandBuffer, loadedChunks, entities, camera, sunDirection, shadowStrength,
-                  foliageWind);
+    renderShadows(commandBuffer, loadedChunks, camera, sunDirection, shadowStrength, foliageWind,
+                  entities, itemEntities, boats);
 
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:renderPassDesc];
@@ -757,18 +967,12 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     // never applied twice. Underwater absorption remains a separate medium.
     const float savedFogDensity = _fogDensity;
     _fogDensity = 0.0F;
-    renderChunks(encoder, world, loadedChunks, viewMatrix, projectionMatrix, camera.getPosition(),
-                 sunDirection, sunColor, ambientColor, fogColor, foliageWind);
+    renderChunks(encoder, world, loadedChunks, viewMatrix, projectionMatrix, camera, sunDirection,
+                 sunColor, ambientColor, fogColor, foliageWind);
 
     if (entities && _entityRenderer) {
-        _entityRenderer->render(
-            encoder, _frameUniforms.buffer, _frameUniforms.offset, *entities,
-            [this](const AABB& aabb) { return isChunkInFrustum(aabb); },
-            [&world](const Vec3& position) {
-                return world.getPackedLightIfLoaded(static_cast<int64_t>(std::floor(position.x)),
-                                                    static_cast<int32_t>(std::floor(position.y)),
-                                                    static_cast<int64_t>(std::floor(position.z)));
-            });
+        _entityRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset, *entities,
+                                [this](const AABB& aabb) { return isChunkInFrustum(aabb); });
     }
     if (itemEntities && _itemEntityRenderer) {
         _itemEntityRenderer->render(encoder, _frameUniforms.buffer, _frameUniforms.offset,
@@ -784,6 +988,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         renderBlockHighlight(encoder, highlightedBlock.value(), viewMatrix, projectionMatrix);
     }
 
+    [encoder setRenderPipelineState:_coherentResolvePipelineState];
+    [encoder dispatchThreadsPerTile:MTLSizeMake(16, 16, 1)];
+
     [encoder endEncoding];
     resetMetalObject(renderPassDesc);
 
@@ -792,6 +999,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     simd_float4x4 viewProjection{};
     std::memcpy(&projection, projectionMatrix.data.data(), sizeof(projection));
     std::memcpy(&viewProjection, vpMatrix.data.data(), sizeof(viewProjection));
+    if (indirectLightingTimeDiscontinuity(_hasPreviousWorldTime, _previousWorldTime, worldTime)) {
+        ++_indirectTimeDiscontinuityRevision;
+    }
     if (_hasPreviousWorldTime &&
         (worldTime < _previousWorldTime || worldTime > _previousWorldTime + 4U)) {
         ++_forcedStateRevision;
@@ -813,9 +1023,11 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     currentHistory.height = _displayHeight;
     currentHistory.cameraPosition = cameraPosition;
     currentHistory.fovDegrees = camera.FOV();
-    currentHistory.worldIdentity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&world)) ^
-                                   (static_cast<uint64_t>(world.getSeed()) << 32U);
+    currentHistory.worldIdentity = world.instanceId();
     currentHistory.forcedStateRevision = _forcedStateRevision;
+    currentHistory.lightEditRevision =
+        indirectLightingRevision(world.lightingRevision(), _exactMaterialPublicationRevision);
+    currentHistory.timeDiscontinuityRevision = _indirectTimeDiscontinuityRevision;
     currentHistory.quality = _gfx.indirectLightingQuality;
     currentHistory.directLightSource = _activeCelestialSource;
     // Ambient-only mode has no SSGI depth history to invalidate. Treat that
@@ -828,6 +1040,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     _screenSpaceLighting->setQuality(_gfx.indirectLightingQuality);
     if (historyReset != INDIRECT_HISTORY_STABLE) {
         _screenSpaceLighting->resetHistory();
+    }
+    const uint32_t atmosphereHistoryReset = atmosphericHistoryResetMask(historyReset);
+    if (atmosphereHistoryReset != INDIRECT_HISTORY_STABLE) {
         _clouds->resetHistory();
         _volumetrics->resetHistory();
     }
@@ -856,7 +1071,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
     indirect.ambientAndFrame = simd_make_float4(ambientColor[0], ambientColor[1], ambientColor[2],
                                                 static_cast<float>(_frameRing.frameIndex()));
     _screenSpaceLighting->encode(commandBuffer, _colorResolve, _depthResolve, _surfaceResolve,
-                                 indirect, _gpuTimer.get());
+                                 _reactiveResolve, indirect, _gpuTimer.get());
 
     // ---- Quarter-resolution physical volumetric clouds ----
     if (weatherSnapshot && _gfx.cloudQuality > 0) {
@@ -869,7 +1084,9 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         cloud.sunDirection = simd_make_float3(sunDirection[0], sunDirection[1], sunDirection[2]);
         cloud.sunRadiance = simd_make_float3(sunColor[0], sunColor[1], sunColor[2]);
         cloud.skyIrradiance = simd_make_float3(ambientColor[0], ambientColor[1], ambientColor[2]);
-        cloud.layerBounds = simd_make_float4(96.0F, 768.0F, 16.0F, CLOUD_HORIZON_VIEW_DEPTH);
+        const simd_float2 cloudLayerBounds = cloudSnapshotMarchLayerBounds(*weatherSnapshot);
+        cloud.layerBounds = simd_make_float4(cloudLayerBounds.x, cloudLayerBounds.y, 16.0F,
+                                             CLOUD_HORIZON_VIEW_DEPTH);
         cloud.densityParams = simd_make_float4(1.0F, 0.38F, 0.035F, 0.18F);
         cloud.phaseParams = simd_make_float4(0.78F, -0.20F, 0.82F, 0.0F);
         cloud.resolutionAndFrame.z = static_cast<float>(_frameRing.frameIndex());
@@ -919,8 +1136,12 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         froxel.weatherMap = _clouds->weatherMapForCamera(froxel.cameraPosition);
     }
     froxel.renderParams =
-        simd_make_float4(0.90F, historyReset == INDIRECT_HISTORY_STABLE ? 1.0F : 0.0F,
+        simd_make_float4(0.90F, atmosphereHistoryReset == INDIRECT_HISTORY_STABLE ? 1.0F : 0.0F,
                          shadowStrength, cameraUnderwater ? 1.0F : 0.0F);
+    froxel.physicalScale =
+        simd_make_float4(static_cast<float>(physicalScale.horizontalMetersPerBlock),
+                         static_cast<float>(physicalScale.positiveVerticalMetersPerBlock),
+                         static_cast<float>(physicalScale.altitudeDatumY), 0.0F);
     _volumetrics->encode(
         commandBuffer, _colorResolve, _mediaDepthResolve, _shadowMap->nearDepthTexture(),
         _shadowMap->farDepthTexture(), _shadowMap->horizonDepthTexture(),
@@ -948,7 +1169,7 @@ void RenderPipeline::render(id<MTLCommandQueue> queue, id<CAMetalDrawable> drawa
         if (weatherEncoder) {
             weatherEncoder.label = @"Atmospherically Attenuated Weather";
             _particles->render(weatherEncoder, _frameRing, viewMatrix, projectionMatrix,
-                               cameraPosition, localWeather, savedFogDensity);
+                               cameraPosition, localWeather, savedFogDensity, physicalScale);
             [weatherEncoder endEncoding];
         }
         resetMetalObject(weatherPass);
@@ -1064,6 +1285,61 @@ void RenderPipeline::renderMenuOnly(id<MTLCommandQueue> queue, id<CAMetalDrawabl
     [commandBuffer commit];
 }
 
+void publishV4PreparationWorldSnapshot(World& world) {
+    world.publishLoadedSnapshot();
+}
+
+void RenderPipeline::renderV4Preparation(id<MTLCommandQueue> queue,
+                                         id<CAMetalDrawable> drawable,
+                                         const UIFrameState& uiFrame, World& world,
+                                         const Camera& camera) {
+    if (!drawable || !queue)
+        return;
+
+    if (drawable.texture.width != _displayWidth || drawable.texture.height != _displayHeight) {
+        resize(static_cast<uint32_t>(drawable.texture.width),
+               static_cast<uint32_t>(drawable.texture.height));
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    if (!commandBuffer)
+        return;
+
+    _frameRing.waitAndBegin();
+    publishV4PreparationWorldSnapshot(world);
+    const auto loadedSnapshot = world.getLoadedSnapshot();
+    static const std::vector<std::shared_ptr<Chunk>> emptyChunks;
+    const auto& loadedChunks = loadedSnapshot ? *loadedSnapshot : emptyChunks;
+    constexpr float LIGHT_DIRECTION[3] = {0.0F, 1.0F, 0.0F};
+    constexpr float WHITE[3] = {1.0F, 1.0F, 1.0F};
+    constexpr float PREPARATION_FOG[3] = {0.53F, 0.81F, 0.92F};
+    const FoliageWindUniforms noWind{};
+    const Mat4 identity = Mat4::identity();
+    renderChunks(nil, world, loadedChunks, identity, identity, camera, LIGHT_DIRECTION, WHITE,
+                 WHITE, PREPARATION_FOG, noWind, false, true);
+
+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = drawable.texture;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.06, 0.07, 0.10, 1.0);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) {
+        _frameRing.cancelFrame();
+        return;
+    }
+    renderUIOverlay(encoder, uiFrame);
+    [encoder endEncoding];
+
+    if (!_capturePath.empty()) {
+        encodeFrameCapture(commandBuffer, drawable.texture);
+    }
+    _frameRing.signalOnCompletion(commandBuffer);
+    [commandBuffer presentDrawable:drawable];
+    [commandBuffer commit];
+}
+
 void RenderPipeline::endWorldSession() {
     if (_meshScheduler) {
         _meshScheduler->shutdown();
@@ -1079,15 +1355,19 @@ void RenderPipeline::endWorldSession() {
         }
     }
     _chunkMeshes.clear();
+    _pendingExactLightingPublications.clear();
+    _observedWorldLightingRevision = 0;
+    _exactMaterialPublicationRevision = 0;
+    _exactLightingPublicationBatchPending = false;
+    _exactLightingPublicationCompleted = false;
     _liveChunksByPosition.clear();
     clearExactSectionOwnership();
+    _exactShadowOwnedSections.clear();
     _waterDraws.clear();
 
-    // Far terrain: stop the eight workers and free the resident tiles now
-    // rather than pinning a full world's horizon arena and generation cache
-    // while sitting at the title. The next world's resetFarTerrain rebuilds
-    // the scheduler because it is null (which also forces a rebuild even for
-    // an identical seed, the World-identity guarantee).
+    // Stop both far-terrain lanes and release every World-keyed residency
+    // record. A later world with the same seed still receives a new scheduler
+    // and generation context because the instance identity is also cleared.
     if (_farTerrainScheduler) {
         _farTerrainScheduler->shutdown();
         _farTerrainScheduler.reset();
@@ -1099,9 +1379,133 @@ void RenderPipeline::endWorldSession() {
                 _farMegaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
             }
         }
+        for (auto& [key, state] : _farCanopyAttachments) {
+            (void)key;
+            if (state.alloc) {
+                _farMegaBuffer->deferFree(*state.alloc, _frameRing.frameIndex());
+            }
+        }
+        for (auto& [key, transition] : _farTerrainAuthorityTransitions) {
+            (void)key;
+            if (transition.source.uploaded) {
+                _farMegaBuffer->deferFree(transition.source.alloc, _frameRing.frameIndex());
+            }
+            if (transition.sourceCanopy && transition.sourceCanopy->alloc) {
+                _farMegaBuffer->deferFree(*transition.sourceCanopy->alloc, _frameRing.frameIndex());
+            }
+        }
     }
     _farTerrainMeshes.clear();
+    _farCanopyAttachments.clear();
     _farTerrainSeed.reset();
+    _farTerrainWorldInstanceId.reset();
+    _farTerrainCenterTile.reset();
+    _farTerrainWanted.clear();
+    _farTerrainPriorityOrder.clear();
+    _farTerrainActiveTiles.clear();
+    _farTerrainDesiredByTile.clear();
+    _farTerrainDisplayedByTile.clear();
+    _farTerrainTransitions.clear();
+    _farCanopyLodFallbacks.clear();
+    _farTerrainAuthorityTransitions.clear();
+    _farShadowDrawPlans.clear();
+    _farTerrainNearGraceStartedAt.clear();
+    _farTerrainResults.clear();
+    _farCanopyResults.clear();
+    _farTerrainSelectionCamera.reset();
+    _farTerrainDesiredMetricsCamera.reset();
+    _farTerrainSpeculativeCamera.reset();
+    _farTerrainSelectionViewDistance = -1;
+    _farTerrainProtectedNearHandoff.clear();
+    _farTerrainProtectedNearEpoch = 0;
+    _farTerrainLocalTerrainDebt = true;
+    _farTerrainProtectedRecentMotionX = 0;
+    _farTerrainProtectedRecentMotionZ = 0;
+    _farTerrainPredictedNearAnchor.reset();
+    _farTerrainProtectedNearClosureSnapshot.reset();
+    _farTerrainDesiredViewportHeight = 0;
+    _farTerrainDesiredVerticalFovRadians = 0.0;
+    _farTerrainDesiredDrawGeometry = false;
+    _farTerrainDesiredMetricsDirty = true;
+    _farTerrainViewEpoch = 0;
+    _farTerrainCandidates.clear();
+    _farTerrainCachedBaseRequests.clear();
+    _farTerrainMissingBaseRequests.clear();
+    _farTerrainDistantBaseRequests.clear();
+    _farTerrainFinalBaseRequests.clear();
+    _farTerrainPerceptualFinalRequests.clear();
+    _farTerrainFinalRefinementRequests.clear();
+    _farTerrainCanopyRefreshRequests.clear();
+    _farTerrainCanopyRefreshKeys.clear();
+    _farTerrainUrgentRefinementRequests.clear();
+    _farTerrainUrgentRefinementKeys.clear();
+    _farTerrainConnectedNearPatchTargets.clear();
+    _farTerrainProtectedFinalTerrainRegions.clear();
+    _farTerrainPredictedNearPatchTargets.clear();
+    _farTerrainPredictedCriticalResidencyKeys.clear();
+    _farTerrainCriticalResidencyCoordinates.clear();
+    _farTerrainCriticalResidencyTargets.clear();
+    _farTerrainCriticalResidencyCoordinateScratch.clear();
+    _farTerrainCriticalResidencyTargetScratch.clear();
+    _farTerrainCriticalResidencyKeys.clear();
+    _farTerrainRefinementSubmissionKeys.clear();
+    _farTerrainCachedMeshes.clear();
+    _farTerrainCachedCanopies.clear();
+    _farTerrainResidentWantedCount = 0;
+    _farTerrainResidentRefinementCount = 0;
+    _farTerrainPlannerTimings.clear();
+    _farTerrainSelectionTimings.clear();
+    _farTerrainPublicationTimings.clear();
+    _farTerrainResidencyTimings.clear();
+    _farTerrainArenaAdmissionDeniedCount = 0;
+    _farTerrainNearArenaReclaimCount = 0;
+    _farTerrainNearArenaReclaimedBytes = 0;
+    _farShadowDrawPlans.clear();
+    _chunkStats = {};
+    if (_screenSpaceLighting)
+        _screenSpaceLighting->resetHistory();
+    if (_clouds)
+        _clouds->endWorld();
+    if (_volumetrics)
+        _volumetrics->resetHistory();
+    if (_particles)
+        _particles->endWorld();
+    if (_postStack)
+        _postStack->resetHistory();
+    if (_indirectHistoryState)
+        *_indirectHistoryState = IndirectHistoryState{};
+    _previousViewProjection = matrix_identity_float4x4;
+    _previousWorldTime = 0;
+    _hasPreviousWorldTime = false;
+    _weatherSnapshotWasPresent = false;
+    _previousWeatherPreset = 0;
+    _animTime = 0.0F;
+    _animClock = 0.0;
+    ++_forcedStateRevision;
+    ++_indirectTimeDiscontinuityRevision;
+}
+
+void RenderPipeline::cancelV4Preparation() {
+    if (_farTerrainScheduler) {
+        _farTerrainScheduler->cancelViewPreparation();
+    }
+    _farTerrainSelectionCamera.reset();
+    _farTerrainDesiredMetricsCamera.reset();
+    _farTerrainSpeculativeCamera.reset();
+    _farTerrainSelectionViewDistance = -1;
+    _farTerrainCenterTile.reset();
+    _farTerrainProtectedNearHandoff.clear();
+    _farTerrainProtectedNearEpoch = 0;
+    _farTerrainProtectedRecentMotionX = 0;
+    _farTerrainProtectedRecentMotionZ = 0;
+    _farTerrainPredictedNearAnchor.reset();
+    _farTerrainPredictedNearPatchTargets.clear();
+    _farTerrainPredictedCriticalResidencyKeys.clear();
+    _farTerrainProtectedNearClosureSnapshot.reset();
+    _farTerrainDesiredMetricsDirty = true;
+    _farTerrainResults.clear();
+    _farCanopyResults.clear();
+    _chunkStats = {};
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,9 +1671,11 @@ void RenderPipeline::renderSky(id<MTLRenderCommandEncoder> encoder,
 // ---------------------------------------------------------------------------
 void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
                                    const std::vector<std::shared_ptr<Chunk>>& loadedChunks,
-                                   const std::vector<std::shared_ptr<Entity>>* entities,
                                    const Camera& camera, const float lightDirection[3],
-                                   float strength, const FoliageWindUniforms& foliageWind) {
+                                   float strength, const FoliageWindUniforms& foliageWind,
+                                   const std::vector<std::shared_ptr<Entity>>* entities,
+                                   const std::vector<ItemEntity>* itemEntities,
+                                   const std::vector<Boat>* boats) {
     _shadowCasterCounts.fill(0U);
     if (_gfx.shadowQuality == 0 || strength <= 0.001f) {
         _shadowRefreshMask = 0U;
@@ -1298,7 +1704,8 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
             continue;
         }
         const auto mesh = _chunkMeshes.find(chunk->pos());
-        if (mesh != _chunkMeshes.end() && mesh->second.uploaded) {
+        if (mesh != _chunkMeshes.end() && mesh->second.uploaded &&
+            _exactShadowOwnedSections.contains(chunk->pos())) {
             const ChunkPos position = chunk->pos();
             const uint64_t key = static_cast<uint64_t>(position.x) ^
                                  (static_cast<uint64_t>(static_cast<uint32_t>(position.y)) << 21U) ^
@@ -1308,17 +1715,26 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
         }
     }
     for (const FarShadowDrawPlan& plan : _farShadowDrawPlans) {
-        const auto resident = _farTerrainMeshes.find(plan.key);
-        if (resident != _farTerrainMeshes.end()) {
-            const FarTerrainBounds& bounds = resident->second.surfaceBounds;
+        if (plan.state.uploaded) {
+            const bool canopyCasts =
+                plan.canopy &&
+                farCanopyCastsShadow(true, plan.canopy->alloc.has_value(),
+                                     plan.canopy->alloc ? plan.canopy->alloc->indexCount : 0U);
+            const FarTerrainBounds bounds = farShadowCasterBounds(
+                plan.state.surfaceBounds,
+                canopyCasts ? std::optional<FarTerrainBounds>{plan.canopy->bounds} : std::nullopt);
             const AABB casterBounds{
                 {static_cast<float>(bounds.minX), bounds.minY, static_cast<float>(bounds.minZ)},
                 {static_cast<float>(bounds.maxX), bounds.maxY, static_cast<float>(bounds.maxZ)}};
-            const uint64_t revision = static_cast<uint64_t>(plan.coordinate.x) ^
-                                      (static_cast<uint64_t>(plan.coordinate.z) << 32U) ^
-                                      resident->second.deterministicHash ^
-                                      (static_cast<uint64_t>(plan.farMetadata.z) << 7U) ^
-                                      (static_cast<uint64_t>(plan.farMetadata.w) << 39U);
+            const uint64_t baseRevision = static_cast<uint64_t>(plan.coordinate.x) ^
+                                          (static_cast<uint64_t>(plan.coordinate.z) << 32U) ^
+                                          plan.state.deterministicHash ^
+                                          (static_cast<uint64_t>(plan.farMetadata.z) << 7U) ^
+                                          (static_cast<uint64_t>(plan.farMetadata.w) << 39U);
+            const uint64_t revision = farCanopyShadowRevision(
+                baseRevision, canopyCasts,
+                canopyCasts ? plan.canopy->authorityQuality : FarTerrainAuthorityQuality::FINAL,
+                canopyCasts ? plan.canopy->deterministicHash : 0U);
             addCasterRevision(revision, casterBounds);
         }
     }
@@ -1334,6 +1750,44 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
                 static_cast<uint64_t>(std::bit_cast<uint32_t>(entity->position.z)) << 43U;
             for (int cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
                 if (_shadowMap->entityCasterAffectsCascade(cascade, entity->aabb)) {
+                    ++_shadowCasterCounts[static_cast<size_t>(cascade)];
+                    casterRevisions[static_cast<size_t>(cascade)] ^= hash64(revision);
+                }
+            }
+        }
+    }
+    if (itemEntities) {
+        for (size_t index = 0; index < itemEntities->size(); ++index) {
+            const ItemEntity& item = (*itemEntities)[index];
+            if (item.stack.empty())
+                continue;
+            const uint64_t revision =
+                static_cast<uint64_t>(index) ^
+                (static_cast<uint64_t>(std::bit_cast<uint32_t>(item.position.x)) << 1U) ^
+                (static_cast<uint64_t>(std::bit_cast<uint32_t>(item.position.y)) << 22U) ^
+                (static_cast<uint64_t>(std::bit_cast<uint32_t>(item.position.z)) << 43U) ^
+                (static_cast<uint64_t>(item.ageTicks) << 7U);
+            const AABB bounds = item.getAABB();
+            for (int cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+                if (_shadowMap->entityCasterAffectsCascade(cascade, bounds)) {
+                    ++_shadowCasterCounts[static_cast<size_t>(cascade)];
+                    casterRevisions[static_cast<size_t>(cascade)] ^= hash64(revision);
+                }
+            }
+        }
+    }
+    if (boats) {
+        for (size_t index = 0; index < boats->size(); ++index) {
+            const Boat& boat = (*boats)[index];
+            const uint64_t revision =
+                static_cast<uint64_t>(index) ^
+                (static_cast<uint64_t>(std::bit_cast<uint32_t>(boat.position.x)) << 1U) ^
+                (static_cast<uint64_t>(std::bit_cast<uint32_t>(boat.position.y)) << 22U) ^
+                (static_cast<uint64_t>(std::bit_cast<uint32_t>(boat.position.z)) << 43U) ^
+                (static_cast<uint64_t>(std::bit_cast<uint32_t>(boat.yaw)) << 11U);
+            const AABB bounds = boat.getAABB();
+            for (int cascade = 0; cascade < SHADOW_CASCADE_COUNT; ++cascade) {
+                if (_shadowMap->entityCasterAffectsCascade(cascade, bounds)) {
                     ++_shadowCasterCounts[static_cast<size_t>(cascade)];
                     casterRevisions[static_cast<size_t>(cascade)] ^= hash64(revision);
                 }
@@ -1403,6 +1857,8 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
             if (!chunk || !chunk->generated)
                 continue;
             const ChunkPos key = chunk->pos();
+            if (!_exactShadowOwnedSections.contains(key))
+                continue;
             auto cached = _chunkMeshes.find(key);
             if (cached == _chunkMeshes.end() || !cached->second.uploaded)
                 continue;
@@ -1431,16 +1887,18 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
         // source and target topologies retain their monotonic flags and the
         // connected-coverage frontier, so hidden islands cannot cast and a
         // retiring canopy never leaves a stale shadow behind.
-        const FarTerrainExactHandoff& shadowHandoff =
-            _farTerrainExactCoverage.sample(camera.getPosition().x, camera.getPosition().z);
         for (const FarShadowDrawPlan& plan : _farShadowDrawPlans) {
-            const auto resident = _farTerrainMeshes.find(plan.key);
-            if (resident == _farTerrainMeshes.end() || !resident->second.uploaded ||
-                resident->second.opaqueIndexCount == 0) {
+            if (!plan.state.uploaded) {
                 continue;
             }
-            const FarTerrainMeshState& state = resident->second;
-            const FarTerrainBounds& bounds = state.surfaceBounds;
+            const FarTerrainMeshState& state = plan.state;
+            const bool canopyCasts =
+                plan.canopy &&
+                farCanopyCastsShadow(true, plan.canopy->alloc.has_value(),
+                                     plan.canopy->alloc ? plan.canopy->alloc->indexCount : 0U);
+            const FarTerrainBounds bounds = farShadowCasterBounds(
+                state.surfaceBounds,
+                canopyCasts ? std::optional<FarTerrainBounds>{plan.canopy->bounds} : std::nullopt);
             const AABB aabb{
                 {static_cast<float>(bounds.minX), bounds.minY, static_cast<float>(bounds.minZ)},
                 {static_cast<float>(bounds.maxX), bounds.maxY, static_cast<float>(bounds.maxZ)}};
@@ -1452,24 +1910,52 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
             origin.origin = simd_make_float4(static_cast<float>(state.bounds.minX), 0.0F,
                                              static_cast<float>(state.bounds.minZ), 0.0F);
             origin.farMetadata = plan.farMetadata;
-            const FarTerrainOwnershipUniforms ownership =
-                farTerrainOwnershipUniforms(plan.coordinate, shadowHandoff);
             [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
-            [encoder setFragmentBytes:&ownership length:sizeof(ownership) atIndex:5];
-            [encoder setVertexBuffer:state.alloc.vertexBuffer
-                              offset:state.alloc.vertexOffset
-                             atIndex:0];
-            [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                indexCount:state.opaqueIndexCount
-                                 indexType:MTLIndexTypeUInt32
-                               indexBuffer:state.alloc.indexBuffer
-                         indexBufferOffset:state.alloc.indexOffset];
+            [encoder setFragmentBytes:&plan.farOwnership
+                               length:sizeof(plan.farOwnership)
+                              atIndex:5];
+            if (state.opaqueIndexCount > 0) {
+                [encoder setVertexBuffer:state.alloc.vertexBuffer
+                                  offset:state.alloc.vertexOffset
+                                 atIndex:0];
+                [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                    indexCount:state.opaqueIndexCount
+                                     indexType:MTLIndexTypeUInt32
+                                   indexBuffer:state.alloc.indexBuffer
+                             indexBufferOffset:state.alloc.indexOffset];
+            }
+            if (canopyCasts) {
+                const MegaBuffer::ChunkAllocation& canopyAlloc = *plan.canopy->alloc;
+                [encoder setVertexBuffer:canopyAlloc.vertexBuffer
+                                  offset:canopyAlloc.vertexOffset
+                                 atIndex:0];
+                [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                    indexCount:canopyAlloc.indexCount
+                                     indexType:MTLIndexTypeUInt32
+                                   indexBuffer:canopyAlloc.indexBuffer
+                             indexBufferOffset:canopyAlloc.indexOffset];
+            }
         }
         if (entities && _entityRenderer) {
             _entityRenderer->renderShadows(
                 encoder, passUniforms, *entities, [this, cascade](const AABB& bounds) {
                     return _shadowMap->entityCasterAffectsCascade(cascade, bounds);
                 });
+        }
+        if ((itemEntities && _itemEntityRenderer) || (boats && _boatRenderer)) {
+            [encoder setRenderPipelineState:_shadowMap->entityPipeline()];
+            [encoder setVertexBytes:&passUniforms length:sizeof(passUniforms) atIndex:1];
+            [encoder setCullMode:MTLCullModeBack];
+            [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+            const auto affectsCascade = [this, cascade](const AABB& bounds) {
+                return _shadowMap->entityCasterAffectsCascade(cascade, bounds);
+            };
+            if (itemEntities && _itemEntityRenderer) {
+                _itemEntityRenderer->renderShadowCasters(encoder, *itemEntities, affectsCascade);
+            }
+            if (boats && _boatRenderer) {
+                _boatRenderer->renderShadowCasters(encoder, *boats, affectsCascade);
+            }
         }
         [encoder endEncoding];
         resetMetalObject(passDesc);
@@ -1482,9 +1968,11 @@ void RenderPipeline::renderShadows(id<MTLCommandBuffer> commandBuffer,
 void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const World& world,
                                   const std::vector<std::shared_ptr<Chunk>>& loadedChunks,
                                   const Mat4& viewMatrix, const Mat4& projectionMatrix,
-                                  const Vec3& cameraPosition, const float sunDirection[3],
+                                  const Camera& camera, const float sunDirection[3],
                                   const float sunColor[3], const float ambientColor[3],
-                                  const float fogColor[3], const FoliageWindUniforms& foliageWind) {
+                                  const float fogColor[3], const FoliageWindUniforms& foliageWind,
+                                  bool drawGeometry, bool prepareProtectedFinal) {
+    const Vec3 cameraPosition = camera.getPosition();
     // Bind pipeline state
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setDepthStencilState:_depthState];
@@ -1530,6 +2018,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     [encoder setVertexBuffer:_frameUniforms.buffer offset:_frameUniforms.offset atIndex:1];
     [encoder setFragmentBuffer:_frameUniforms.buffer offset:_frameUniforms.offset atIndex:1];
     [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
+    [encoder setFragmentTexture:_blockTextures->emissionMask() atIndex:5];
     [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
 
     // Shadow sampling: two detailed arrays, the horizon texture, one
@@ -1549,10 +2038,14 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
 
     // Reset seed-owned far state before exact ownership is accumulated. The
     // second call in renderFarTerrain is then an inexpensive no-op.
-    resetFarTerrain(world.getSeed(), world.getGenerationSettings());
+    resetFarTerrain(world);
 
     // Water draws recorded here render later, in the dedicated water pass
     _waterDraws.clear();
+    // renderShadows already consumed the prior frame's set. Rebuild the next
+    // replay from this frame's stable authority decisions before frustum
+    // culling, because an offscreen owner may still cast into a visible region.
+    _exactShadowOwnedSections.clear();
 
     // Builds only happen within the render radius: the generation radius is
     // one chunk wider, so every meshable chunk has generated neighbors for
@@ -1560,7 +2053,12 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     const int64_t camChunkX = Chunk::worldToChunk(static_cast<int64_t>(std::floor(camX)));
     const int32_t camChunkY = Chunk::worldToChunkY(static_cast<int32_t>(std::floor(camY)));
     const int64_t camChunkZ = Chunk::worldToChunk(static_cast<int64_t>(std::floor(camZ)));
-    const int renderRadius = world.getExactViewDistance();
+    // World publishes mesh ownership through its active radius, which is one
+    // column wider than the nominal exact distance. That ring supplies the
+    // cold spawn collision halo and the steady-state handoff boundary. Use
+    // the same radius here or a nominal distance of zero can mesh only the
+    // center of the five-column entry requirement and never become playable.
+    const int renderRadius = exactStreamingMeshRadiusChunks(world.getExactViewDistance());
     const auto meshCandidateSnapshot = world.getMeshCandidateSnapshot();
     const auto shouldMesh = [&](ChunkPos pos) {
         return meshCandidateSnapshot && meshCandidateSnapshot->contains(pos);
@@ -1585,6 +2083,7 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             if (it->second.uploaded) {
                 _megaBuffer->deferFree(it->second.alloc, _frameRing.frameIndex());
             }
+            _pendingExactLightingPublications.erase(it->first);
             it = _chunkMeshes.erase(it);
         } else {
             ++it;
@@ -1596,72 +2095,156 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         _meshScheduler = std::make_unique<MeshScheduler>(world, EXACT_MESH_WORKER_COUNT);
     }
 
-    // ---- MegaBuffer sized once for the selected exact radius ----
-    // Surface columns retain roughly 4.5 exposed vertical sections. Base the
-    // allocation on that stable target instead of the currently loaded count,
-    // which grows every frame during streaming and would repeatedly discard
-    // the whole registry. The 512-chunk horizon does not enter this estimate.
-    {
-        constexpr double PI = 3.14159265358979323846;
-        const double estimatedColumns =
-            PI * static_cast<double>((renderRadius + 2) * (renderRadius + 2));
-        const uint64_t visibleChunks = std::min<uint64_t>(
-            MAX_MESH_RESIDENT_CUBES, static_cast<uint64_t>(std::ceil(estimatedColumns * 4.5)));
-        uint64_t requiredVertexBytes =
-            std::max<uint64_t>(128ull * 1024 * 1024, visibleChunks * 128ull * 1024 * 13 / 10);
-        if (requiredVertexBytes > _megaBuffer->vertexCapacity()) {
-            RY_LOG_INFO((std::string("Growing mega-buffer for view distance ") +
-                         std::to_string(renderRadius) + ": " +
-                         std::to_string(requiredVertexBytes / (1024 * 1024)) + " MB vertices")
-                            .c_str());
-            _megaBuffer =
-                std::make_unique<MegaBuffer>(_device, requiredVertexBytes, requiredVertexBytes / 2);
-            _chunkMeshes.clear(); // allocations died with the old buffers
-            clearExactSectionOwnership();
+    // The active-set snapshot is the sole exact residency authority. A camera
+    // jump can replace it while the bounded mesh queue still contains work for
+    // the previous disk, so release those queued requests before draining or
+    // admitting this frame's nearest candidates. Running builds remain bounded
+    // and their ordinary stale-result path handles completion.
+    const auto clearCanceledMeshRequest = [&](const MeshCanceledRequest& canceled) {
+        const auto resident = _chunkMeshes.find(canceled.pos);
+        if (resident == _chunkMeshes.end())
+            return;
+        resident->second.requestedVersion = chunkMeshRequestAfterCompletion(
+            resident->second.requestedVersion, canceled.requestedVersion);
+    };
+    if (meshCandidateSnapshot) {
+        for (const MeshCanceledRequest& canceled :
+             _meshScheduler->cancelQueuedOutside(*meshCandidateSnapshot)) {
+            clearCanceledMeshRequest(canceled);
         }
+    }
+
+    // Read the current exact requirement epoch before draining worker
+    // completions. Upload ordering must follow the new camera immediately;
+    // rebuilding this cache after the drain lets an old completion wave spend
+    // the frame budget while nearer required surfaces wait another frame.
+    const std::shared_ptr<const ExactSurfaceCoverageSnapshot> exactCoverageForFrame =
+        world.getExactSurfaceCoverageSnapshot();
+    const int exactCoverageRadius = exactCoverageForFrame
+                                        ? std::clamp(exactCoverageForFrame->nominalRadiusChunks, 0,
+                                                     world.getExactViewDistance())
+                                        : 0;
+    const uint64_t exactCoverageEpoch = exactCoverageForFrame ? exactCoverageForFrame->epoch : 0;
+    if (!_farTerrainExactCoverage.matches(exactCoverageEpoch, exactCoverageRadius)) {
+        _farTerrainExactCoverage.rebuild(
+            exactCoverageEpoch, exactCoverageRadius,
+            exactCoverageForFrame
+                ? std::span<const ChunkPos>(exactCoverageForFrame->requiredSections)
+                : std::span<const ChunkPos>(),
+            exactCoverageForFrame
+                ? std::span<const ColumnPos>(exactCoverageForFrame->unresolvedColumns)
+                : std::span<const ColumnPos>(),
+            [&](ChunkPos position) { return _exactOwnedSections.contains(position); });
+    }
+    if (!_farTerrainExactFloraCoverage.matches(exactCoverageEpoch, exactCoverageRadius)) {
+        _farTerrainExactFloraCoverage.rebuild(
+            exactCoverageEpoch, exactCoverageRadius,
+            exactCoverageForFrame
+                ? std::span<const ChunkPos>(exactCoverageForFrame->floraRequiredSections)
+                : std::span<const ChunkPos>(),
+            exactCoverageForFrame
+                ? std::span<const ColumnPos>(exactCoverageForFrame->unresolvedColumns)
+                : std::span<const ColumnPos>(),
+            [&](ChunkPos position) { return _exactOwnedSections.contains(position); });
+    }
+    // Queued mesh requests can remain selected after a camera move. Refresh
+    // their lane and distance in place so a former disk-edge request that is
+    // now under the player moves to the front without waiting for, canceling,
+    // or duplicating its existing single-flight build.
+    _meshScheduler->reprioritizeQueued([&](ChunkPos position) {
+        const int64_t dx = position.x - camChunkX;
+        const int64_t dy = static_cast<int64_t>(position.y) - camChunkY;
+        const int64_t dz = position.z - camChunkZ;
+        const bool explorationBand =
+            dx * dx + dz * dz <= EXPLORATION_RADIUS_CHUNKS * EXPLORATION_RADIUS_CHUNKS;
+        const ExactMeshCandidatePriority priority = exactMeshCandidatePriority(
+            dx, dy, dz, explorationBand,
+            _farTerrainExactCoverage.sectionRequired(position),
+            _farTerrainExactFloraCoverage.sectionRequired(position));
+        return MeshRequestPriority{priority.lane, priority.distanceSquared};
+    });
+
+    // World lighting changes invalidate SSGI immediately. Track only stale,
+    // already-visible exact meshes at that revision so their delayed GPU
+    // publication triggers one final reset. Ordinary streaming and unrelated
+    // background remeshes never enter this batch.
+    const uint64_t worldLightingRevision = world.lightingRevision();
+    if (_observedWorldLightingRevision == 0) {
+        _observedWorldLightingRevision = worldLightingRevision;
+    } else if (_observedWorldLightingRevision != worldLightingRevision) {
+        for (const auto& chunk : loadedChunks) {
+            if (!chunk || !chunk->generated)
+                continue;
+            const auto resident = _chunkMeshes.find(chunk->pos());
+            if (resident == _chunkMeshes.end() || !resident->second.uploaded)
+                continue;
+            const uint32_t liveVersion = chunk->version.load(std::memory_order_relaxed);
+            if (resident->second.builtVersion != liveVersion) {
+                _pendingExactLightingPublications.insert_or_assign(chunk->pos(), liveVersion);
+            }
+        }
+        _exactLightingPublicationBatchPending =
+            _exactLightingPublicationBatchPending || !_pendingExactLightingPublications.empty();
+        _observedWorldLightingRevision = worldLightingRevision;
     }
 
     // Upload one finished mesh into the registry. Returns false on a
     // transient MegaBuffer-full failure (builtVersion stays 0, so the chunk
     // re-requests once space frees up).
+    constexpr int MAX_MESH_UPLOADS_PER_FRAME = 64;
     bool allocFailureLogged = false;
-    auto hasUnownedMeshVictim = [&] {
-        // Sweeps and resets clear ownership, and explicit eviction skips
-        // exact owners, so the ownership set remains a registry subset.
-        return _exactOwnedSections.size() < _chunkMeshes.size();
+    const ChunkPos uploadCamera{camChunkX, camChunkY, camChunkZ};
+    std::unordered_set<ChunkPos> committedExactMeshesThisDrain;
+    committedExactMeshesThisDrain.reserve(MAX_MESH_UPLOADS_PER_FRAME);
+    const auto protectCommittedMeshUntilColumnHandoff = [&](ChunkPos key) {
+        committedExactMeshesThisDrain.insert(key);
     };
-    auto canMakeMeshSlot = [&](ChunkPos key) {
-        return chunkMeshRegistryCanAdmit(
-            _chunkMeshes.size(), MAX_MESH_RESIDENT_CUBES, _chunkMeshes.contains(key),
-            _chunkMeshes.size() >= MAX_MESH_RESIDENT_CUBES && hasUnownedMeshVictim());
+    const auto meshPriorityFor = [&](ChunkPos key) {
+        return exactMeshUploadPriority(key, uploadCamera, EXPLORATION_RADIUS_CHUNKS,
+                                       _farTerrainExactCoverage.sectionRequired(key),
+                                       _farTerrainExactFloraCoverage.sectionRequired(key));
     };
-    auto makeMeshSlot = [&](ChunkPos key) -> ChunkMeshState* {
+    const auto meshVictimFor = [&](ExactMeshUploadPriority incoming) {
+        auto victim = _chunkMeshes.end();
+        std::optional<ExactMeshUploadPriority> victimPriority;
+        for (auto it = _chunkMeshes.begin(); it != _chunkMeshes.end(); ++it) {
+            if (!exactMeshRegistryVictimEligible(
+                    _exactOwnedSections.contains(it->first),
+                    committedExactMeshesThisDrain.contains(it->first))) {
+                continue;
+            }
+            const ExactMeshUploadPriority priority = meshPriorityFor(it->first);
+            if (!victimPriority || exactMeshEvictionRanksBefore(priority, *victimPriority)) {
+                victim = it;
+                victimPriority = priority;
+            }
+        }
+        if (victim == _chunkMeshes.end() || !victimPriority ||
+            !exactMeshRegistryMayReplace(incoming, *victimPriority)) {
+            return _chunkMeshes.end();
+        }
+        return victim;
+    };
+    auto canMakeMeshSlot = [&](ChunkPos key, ExactMeshUploadPriority incoming) {
+        if (_chunkMeshes.contains(key) || _chunkMeshes.size() < MAX_MESH_RESIDENT_CUBES)
+            return true;
+        return meshVictimFor(incoming) != _chunkMeshes.end();
+    };
+    auto makeMeshSlot = [&](ChunkPos key, ExactMeshUploadPriority incoming) -> ChunkMeshState* {
         auto existing = _chunkMeshes.find(key);
         if (existing != _chunkMeshes.end())
             return &existing->second;
         if (_chunkMeshes.size() >= MAX_MESH_RESIDENT_CUBES) {
-            auto victim = _chunkMeshes.end();
-            float farthestDistance = -1.0f;
-            for (auto it = _chunkMeshes.begin(); it != _chunkMeshes.end(); ++it) {
-                if (_exactOwnedSections.contains(it->first))
-                    continue;
-                const float dx =
-                    static_cast<float>(it->first.x * CHUNK_EDGE + CHUNK_EDGE / 2) - camX;
-                const float dy =
-                    static_cast<float>(it->first.y * CHUNK_EDGE + CHUNK_EDGE / 2) - camY;
-                const float dz =
-                    static_cast<float>(it->first.z * CHUNK_EDGE + CHUNK_EDGE / 2) - camZ;
-                const float distance = dx * dx + dy * dy + dz * dz;
-                if (distance > farthestDistance) {
-                    farthestDistance = distance;
-                    victim = it;
-                }
-            }
+            auto victim = meshVictimFor(incoming);
             if (victim == _chunkMeshes.end())
                 return nullptr;
+            if (const auto canceled = _meshScheduler->cancelQueued(victim->first)) {
+                clearCanceledMeshRequest(*canceled);
+            }
             // Reuse the victim node so insertion at the hard cap cannot fail
             // after discarding a live mesh.
             auto node = _chunkMeshes.extract(victim);
+            _pendingExactLightingPublications.erase(node.key());
             if (node.mapped().uploaded) {
                 _megaBuffer->deferFree(node.mapped().alloc, _frameRing.frameIndex());
             }
@@ -1673,14 +2256,27 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             return nullptr;
         return &_chunkMeshes.try_emplace(key).first->second;
     };
+    const auto completeTrackedLightingPublication = [&](ChunkPos key, uint32_t builtVersion,
+                                                        bool replacedUploadedMesh) {
+        const auto target = _pendingExactLightingPublications.find(key);
+        if (target == _pendingExactLightingPublications.end() ||
+            !exactMeshPublicationInvalidatesHistory(true, replacedUploadedMesh, builtVersion,
+                                                    target->second)) {
+            return;
+        }
+        _pendingExactLightingPublications.erase(target);
+        _exactLightingPublicationCompleted = true;
+    };
     auto applyMesh = [&](ChunkPos key, const MeshOutput& mesh, uint32_t builtVersion,
                          uint32_t completedRequestVersion) -> bool {
-        if (!canMakeMeshSlot(key))
+        const ExactMeshUploadPriority incoming = meshPriorityFor(key);
+        if (!canMakeMeshSlot(key, incoming))
             return false;
         if (mesh.vertices.empty()) {
-            ChunkMeshState* state = makeMeshSlot(key);
+            ChunkMeshState* state = makeMeshSlot(key, incoming);
             if (!state)
                 return false;
+            const bool replacedUploadedMesh = state->uploaded;
             state->requestedVersion =
                 chunkMeshRequestAfterCompletion(state->requestedVersion, completedRequestVersion);
             if (state->uploaded) {
@@ -1689,6 +2285,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             }
             state->opaqueIndexCount = 0;
             state->builtVersion = builtVersion; // all-air: nothing to draw
+            completeTrackedLightingPublication(key, builtVersion, replacedUploadedMesh);
+            protectCommittedMeshUntilColumnHandoff(key);
             return true;
         }
         std::optional<MegaBuffer::ChunkAllocation> replacement;
@@ -1696,16 +2294,17 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             replacement = _megaBuffer->allocate(static_cast<uint32_t>(mesh.vertices.size()),
                                                 static_cast<uint32_t>(mesh.indices.size()));
             _megaBuffer->uploadVertices(mesh.vertices.data(), mesh.vertices.size() * sizeof(Vertex),
-                                        replacement->vertexOffset);
+                                        *replacement);
             _megaBuffer->uploadIndices(mesh.indices.data(), mesh.indices.size() * sizeof(uint32_t),
-                                       replacement->indexOffset);
+                                       *replacement);
             // Do not evict a resident entry until allocation and upload have
             // succeeded. At the cap makeMeshSlot reuses the victim map node.
-            ChunkMeshState* state = makeMeshSlot(key);
+            ChunkMeshState* state = makeMeshSlot(key, incoming);
             if (!state) {
                 _megaBuffer->free(*replacement);
                 return false;
             }
+            const bool replacedUploadedMesh = state->uploaded;
             state->requestedVersion =
                 chunkMeshRequestAfterCompletion(state->requestedVersion, completedRequestVersion);
             if (state->uploaded) {
@@ -1715,6 +2314,8 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             state->opaqueIndexCount = mesh.opaqueIndexCount;
             state->uploaded = true;
             state->builtVersion = builtVersion;
+            completeTrackedLightingPublication(key, builtVersion, replacedUploadedMesh);
+            protectCommittedMeshUntilColumnHandoff(key);
             return true;
         } catch (const std::exception& e) {
             if (replacement)
@@ -1730,7 +2331,24 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     // 1. Drain worker results and upload within the per-frame budget; the
     //    leftovers stay in _pendingResults for next frame.
     _meshScheduler->drainCompleted(_pendingResults);
-    constexpr int MAX_MESH_UPLOADS_PER_FRAME = 64;
+    std::stable_sort(_pendingResults.begin(), _pendingResults.end(),
+                     [&](const MeshResult& left, const MeshResult& right) {
+                         const bool leftSurfaceRequired =
+                             _farTerrainExactCoverage.sectionRequired(left.pos);
+                         const bool rightSurfaceRequired =
+                             _farTerrainExactCoverage.sectionRequired(right.pos);
+                         const bool leftFloraRequired =
+                             _farTerrainExactFloraCoverage.sectionRequired(left.pos);
+                         const bool rightFloraRequired =
+                             _farTerrainExactFloraCoverage.sectionRequired(right.pos);
+                         return exactMeshUploadRanksBefore(
+                             exactMeshUploadPriority(left.pos, uploadCamera,
+                                                     EXPLORATION_RADIUS_CHUNKS,
+                                                     leftSurfaceRequired, leftFloraRequired),
+                             exactMeshUploadPriority(right.pos, uploadCamera,
+                                                     EXPLORATION_RADIUS_CHUNKS,
+                                                     rightSurfaceRequired, rightFloraRequired));
+                     });
     constexpr size_t MAX_UPLOAD_BYTES_PER_FRAME = 32 * 1024 * 1024;
     // An edit synchronously relights its whole affected neighborhood (home cube
     // plus the face, edge, and corner cubes light can reach), so let the edit
@@ -1786,6 +2404,18 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                              result.mesh.indices.size() * sizeof(uint32_t);
         if (uploadBytes + bytes > MAX_ASYNC_UPLOAD_BYTES_PER_FRAME)
             break;
+        if (!canMakeMeshSlot(key, meshPriorityFor(key))) {
+            // The placeholder yielded to a strictly more important surface
+            // while this worker was finishing. Drop the result so it cannot
+            // pin consumer capacity; it will be requested again if it later
+            // re-enters the admissible current-camera set.
+            if (resident != _chunkMeshes.end()) {
+                resident->second.requestedVersion = chunkMeshRequestAfterCompletion(
+                    resident->second.requestedVersion, result.requestedVersion);
+            }
+            ++resultsConsumed;
+            continue;
+        }
         if (!applyMesh(key, result.mesh, result.builtVersion, result.requestedVersion)) {
             break; // MegaBuffer full: retry this result next frame
         }
@@ -1795,6 +2425,16 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     }
     _pendingResults.erase(_pendingResults.begin(),
                           _pendingResults.begin() + static_cast<long>(resultsConsumed));
+    // Results that left the current exact candidate set after the drain do
+    // not get to occupy shared scheduler capacity until the next frame.
+    for (auto iterator = _pendingResults.begin(); iterator != _pendingResults.end();) {
+        if (_liveChunksByPosition.contains(iterator->pos) && shouldMesh(iterator->pos)) {
+            ++iterator;
+            continue;
+        }
+        clearCanceledMeshRequest({iterator->pos, iterator->requestedVersion});
+        iterator = _pendingResults.erase(iterator);
+    }
     _meshScheduler->acknowledgeConsumerPending(_pendingResults.size());
 
     // 2. Edit fast path: chunks right next to the camera re-mesh
@@ -1833,8 +2473,27 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         }
     }
 
+    if (_exactLightingPublicationBatchPending && _pendingExactLightingPublications.empty()) {
+        if (_exactLightingPublicationCompleted) {
+            ++_exactMaterialPublicationRevision;
+        }
+        _exactLightingPublicationBatchPending = false;
+        _exactLightingPublicationCompleted = false;
+    }
+
     // 3. Candidate scan: every generated chunk in the render radius whose
     //    mesh is missing or stale, nearest first, until the in-flight cap.
+    const auto candidatePriority = [&](const Chunk* chunk) {
+        const int64_t dx = chunk->chunkX - camChunkX;
+        const int64_t dy = static_cast<int64_t>(chunk->chunkY) - camChunkY;
+        const int64_t dz = chunk->chunkZ - camChunkZ;
+        const bool explorationBand =
+            dx * dx + dz * dz <= EXPLORATION_RADIUS_CHUNKS * EXPLORATION_RADIUS_CHUNKS;
+        return exactMeshCandidatePriority(
+            dx, dy, dz, explorationBand,
+            _farTerrainExactCoverage.sectionRequired(chunk->pos()),
+            _farTerrainExactFloraCoverage.sectionRequired(chunk->pos()));
+    };
     _meshCandidates.clear();
     for (auto& chunk : loadedChunks) {
         if (!chunk || !chunk->generated)
@@ -1851,50 +2510,124 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             (it->second.builtVersion == version || it->second.requestedVersion == version)) {
             continue; // up to date, or a build is already on its way
         }
-        float dx = static_cast<float>(chunk->chunkX * CHUNK_WIDTH + CHUNK_WIDTH / 2) - camX;
-        float dy = static_cast<float>(chunk->chunkY * CHUNK_HEIGHT + CHUNK_HEIGHT / 2) - camY;
-        float dz = static_cast<float>(chunk->chunkZ * CHUNK_DEPTH + CHUNK_DEPTH / 2) - camZ;
-        _meshCandidates.push_back({dx * dx + dy * dy + dz * dz, chunk.get()});
+        _meshCandidates.push_back({candidatePriority(chunk.get()), chunk.get()});
     }
-    const auto candidateLane = [&](const Chunk* chunk) {
-        const int64_t dx = chunk->chunkX - camChunkX;
-        const int64_t dz = chunk->chunkZ - camChunkZ;
-        if (dx == 0 && dz == 0)
-            return MeshPriorityLane::CAMERA_COLUMN;
-        return dx * dx + dz * dz <= EXPLORATION_RADIUS_CHUNKS * EXPLORATION_RADIUS_CHUNKS
-                   ? MeshPriorityLane::CAMERA_BAND
-                   : MeshPriorityLane::BROAD_SURFACE;
-    };
     std::sort(_meshCandidates.begin(), _meshCandidates.end(),
               [&](const auto& left, const auto& right) {
-                  const MeshPriorityLane leftLane = candidateLane(left.second);
-                  const MeshPriorityLane rightLane = candidateLane(right.second);
-                  if (leftLane != rightLane)
-                      return static_cast<uint8_t>(leftLane) > static_cast<uint8_t>(rightLane);
-                  return left.first < right.first;
+                  const ExactMeshCandidatePriority leftPriority = left.priority;
+                  const ExactMeshCandidatePriority rightPriority = right.priority;
+                  if (leftPriority != rightPriority)
+                      return exactMeshCandidateRanksBefore(leftPriority, rightPriority);
+                  const ChunkPos leftPosition = left.chunk->pos();
+                  const ChunkPos rightPosition = right.chunk->pos();
+                  if (leftPosition.x != rightPosition.x)
+                      return leftPosition.x < rightPosition.x;
+                  if (leftPosition.z != rightPosition.z)
+                      return leftPosition.z < rightPosition.z;
+                  return leftPosition.y < rightPosition.y;
               });
-    for (const auto& [distSq, chunkPtr] : _meshCandidates) {
+    const auto releaseLowerPriorityPendingResult = [&](ExactMeshUploadPriority incoming) {
+        for (size_t offset = _pendingResults.size(); offset > 0; --offset) {
+            const size_t index = offset - 1;
+            const MeshResult& pending = _pendingResults[index];
+            const ExactMeshUploadPriority pendingPriority = meshPriorityFor(pending.pos);
+            if (!exactMeshRegistryMayReplace(incoming, pendingPriority))
+                continue;
+            clearCanceledMeshRequest({pending.pos, pending.requestedVersion});
+            _pendingResults.erase(_pendingResults.begin() + static_cast<long>(index));
+            _meshScheduler->acknowledgeConsumerPending(_pendingResults.size());
+            return true;
+        }
+        return false;
+    };
+    for (const auto& candidate : _meshCandidates) {
+        const Chunk* chunkPtr = candidate.chunk;
         ChunkPos pos = chunkPtr->pos();
-        if (!canMakeMeshSlot(pos)) {
+        const ExactMeshUploadPriority incoming{candidate.priority, pos};
+        if (!canMakeMeshSlot(pos, incoming)) {
             break; // every resident mesh owns exact terrain; wait for a real eviction
         }
         const uint32_t requestedVersion = chunkPtr->version.load(std::memory_order_relaxed);
-        const int64_t chunkDx = pos.x - camChunkX;
-        const int64_t chunkDy = static_cast<int64_t>(pos.y) - camChunkY;
-        const int64_t chunkDz = pos.z - camChunkZ;
-        const MeshPriorityLane lane = candidateLane(chunkPtr);
-        const uint64_t schedulerDistance =
-            static_cast<uint64_t>(chunkDx * chunkDx + chunkDz * chunkDz + chunkDy * chunkDy * 2);
-        if (!_meshScheduler->enqueue(pos, requestedVersion, lane, schedulerDistance)) {
-            break; // in-flight cap reached, re-prioritized next frame
+        const ExactMeshCandidatePriority priority = candidate.priority;
+        std::optional<MeshCanceledRequest> displaced;
+        bool admitted = false;
+        for (;;) {
+            if (_meshScheduler->enqueue(pos, requestedVersion, priority.lane,
+                                        priority.distanceSquared, &displaced)) {
+                admitted = true;
+                break;
+            }
+            // Consumer-owned distant completions are part of the same hard
+            // 64-slot budget. Let a nearer missing surface reclaim one now,
+            // rather than waiting a frame while the player remains on coarse
+            // collision and visual authority.
+            if (!releaseLowerPriorityPendingResult(incoming))
+                break;
         }
-        ChunkMeshState* state = makeMeshSlot(pos);
+        if (!admitted)
+            break; // only equal-or-higher-priority work remains in flight
+        if (displaced)
+            clearCanceledMeshRequest(*displaced);
+        ChunkMeshState* state = makeMeshSlot(pos, incoming);
         if (!state) {
             break; // defensive: the registry never grows beyond the hard cap
         }
         state->requestedVersion = requestedVersion;
     }
 
+    // Publish every revision-ready ownership section before submitting any
+    // exact draw. A column handoff is atomic: while even one required surface
+    // section is missing, its resident far parent remains the sole visible
+    // surface instead of being layered over the exact sections that happened
+    // to finish first.
+    for (const auto& chunk : loadedChunks) {
+        if (!chunk || !chunk->generated)
+            continue;
+        const ChunkPos key = chunk->pos();
+        const auto cached = _chunkMeshes.find(key);
+        if (cached == _chunkMeshes.end())
+            continue;
+        if (farTerrainExactSectionOwnsSurface(_exactOwnedSections.contains(key),
+                                              cached->second.builtVersion,
+                                              chunk->version.load(std::memory_order_relaxed))) {
+            setExactSectionOwned(key, true);
+        }
+    }
+    const FarTerrainExactHandoff& exactDrawHandoff =
+        _farTerrainExactCoverage.sample(cameraPosition.x, cameraPosition.z);
+    const FarTerrainExactHandoff& exactFloraDrawHandoff =
+        _farTerrainExactFloraCoverage.sample(cameraPosition.x, cameraPosition.z);
+    const auto baseResident = [&](const FarTerrainKey& key) {
+        const auto resident = _farTerrainMeshes.find(key);
+        return resident != _farTerrainMeshes.end() && resident->second.uploaded;
+    };
+    const FarTerrainCoverageFrontier exactDrawCoverage =
+        farTerrainCoverageFrontier(_farTerrainCandidates, baseResident);
+    const auto drawableCoverageParentFor = [&](ColumnPos chunkColumn) {
+        constexpr int64_t COLUMNS_PER_TILE = FAR_TERRAIN_TILE_EDGE / CHUNK_EDGE;
+        const ColumnPos tile{
+            world_coord::floorDiv(chunkColumn.x, COLUMNS_PER_TILE),
+            world_coord::floorDiv(chunkColumn.z, COLUMNS_PER_TILE),
+        };
+        const FarTerrainKey parent{tile.x, tile.z, FAR_TERRAIN_BASE_STEP};
+        if (!baseResident(parent))
+            return false;
+        const double minimumX = static_cast<double>(tile.x) * FAR_TERRAIN_TILE_EDGE;
+        const double maximumX = minimumX + FAR_TERRAIN_TILE_EDGE;
+        const double minimumZ = static_cast<double>(tile.z) * FAR_TERRAIN_TILE_EDGE;
+        const double maximumZ = minimumZ + FAR_TERRAIN_TILE_EDGE;
+        const double dx = cameraPosition.x < minimumX   ? minimumX - cameraPosition.x
+                          : cameraPosition.x > maximumX ? cameraPosition.x - maximumX
+                                                        : 0.0;
+        const double dz = cameraPosition.z < minimumZ   ? minimumZ - cameraPosition.z
+                          : cameraPosition.z > maximumZ ? cameraPosition.z - maximumZ
+                                                        : 0.0;
+        return farTerrainCoverageDrawEligible(dx * dx + dz * dz, exactDrawCoverage);
+    };
+
+    // Collision publication is accumulated in the draw walk below so the
+    // render thread does not scan every loaded cube twice.
+    _exactCollisionOwnedSections.clear();
     auto overlayColor = [&](const worldgen::SurfaceSample& sample) {
         constexpr float biomeColors[][3] = {
             {0.02f, 0.08f, 0.30f}, {0.03f, 0.22f, 0.55f}, {0.42f, 0.72f, 0.24f},
@@ -1965,6 +2698,12 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                     std::lerp(biomeColors[primary][1], biomeColors[secondary][1], blend),
                     std::lerp(biomeColors[primary][2], biomeColors[secondary][2], blend), 0.72f);
             }
+            case WorldgenOverlayMode::LOD: {
+                const auto color = terrainLodOverlayColor(std::nullopt);
+                return simd_make_float4(color[0], color[1], color[2], color[3]);
+            }
+            case WorldgenOverlayMode::AUTHORITY:
+                return simd_make_float4(0.10f, 0.95f, 0.28f, 0.78f);
             case WorldgenOverlayMode::NONE:
                 break;
         }
@@ -1983,13 +2722,30 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
             continue;
 
         const auto& meshState = cached->second;
-        if (farTerrainExactSectionOwnsSurface(_exactOwnedSections.contains(key),
-                                              meshState.builtVersion,
-                                              chunk->version.load(std::memory_order_relaxed))) {
-            setExactSectionOwned(key, true);
+        const ColumnPos chunkColumn{key.x, key.z};
+        const bool sectionRequired = _farTerrainExactCoverage.sectionRequired(key);
+        const bool floraSectionRequired = _farTerrainExactFloraCoverage.sectionRequired(key);
+        const bool floraSectionMayPublish = exactFloraSectionMayPublish(
+            sectionRequired, floraSectionRequired,
+            exactFloraDrawHandoff.columnFullyReady(chunkColumn));
+        const bool coverageParentDrawable = drawableCoverageParentFor(chunkColumn);
+        const bool revisionReady = farTerrainExactSectionOwnsSurface(
+            _exactOwnedSections.contains(key), meshState.builtVersion,
+            chunk->version.load(std::memory_order_relaxed));
+        if (floraSectionMayPublish && farTerrainExactCollisionOwnsSection(
+                sectionRequired, exactDrawHandoff.columnFullyReady(chunkColumn),
+                coverageParentDrawable, revisionReady)) {
+            // Empty exact meshes publish intentional air even though the
+            // visual path below has no allocation to submit.
+            _exactCollisionOwnedSections.push_back(key);
         }
-        if (!meshState.uploaded)
+        const FarTerrainExactVisualOwnership ownership = farTerrainExactVisualOwnership(
+            sectionRequired, exactDrawHandoff.columnFullyReady(chunkColumn),
+            coverageParentDrawable, meshState.uploaded);
+        if (!ownership.drawExact || !floraSectionMayPublish) {
             continue;
+        }
+        _exactShadowOwnedSections.insert(key);
 
         // Readiness is independent of the current view direction, while draw
         // submission remains frustum culled.
@@ -2003,7 +2759,17 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
         origin.origin = simd_make_float4(static_cast<float>(chunk->chunkX * CHUNK_WIDTH),
                                          static_cast<float>(chunk->chunkY * CHUNK_HEIGHT),
                                          static_cast<float>(chunk->chunkZ * CHUNK_DEPTH), 0.0f);
-        if (_worldgenOverlayMode != WorldgenOverlayMode::NONE) {
+        if (_worldgenOverlayMode == WorldgenOverlayMode::LOD ||
+            _worldgenOverlayMode == WorldgenOverlayMode::AUTHORITY) {
+            if (_worldgenOverlayMode == WorldgenOverlayMode::LOD) {
+                const auto color = terrainLodOverlayColor(std::nullopt);
+                origin.overlayColorAndStrength =
+                    simd_make_float4(color[0], color[1], color[2], color[3]);
+            } else {
+                origin.overlayColorAndStrength =
+                    simd_make_float4(0.10f, 0.95f, 0.28f, 0.78f);
+            }
+        } else if (_worldgenOverlayMode != WorldgenOverlayMode::NONE) {
             const int64_t centerX = chunk->chunkX * CHUNK_WIDTH + CHUNK_WIDTH / 2;
             const int64_t centerZ = chunk->chunkZ * CHUNK_DEPTH + CHUNK_DEPTH / 2;
             if (const auto sample = world.findSurfaceSample(centerX, centerZ)) {
@@ -2040,14 +2806,30 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
                             indexCount:meshState.opaqueIndexCount
                              indexType:MTLIndexTypeUInt32
                            indexBuffer:meshState.alloc.indexBuffer
-                     indexBufferOffset:meshState.alloc.indexOffset];
+                            indexBufferOffset:meshState.alloc.indexOffset];
+    }
+
+    // The loaded snapshot retains a stable order between membership changes,
+    // so vector equality avoids allocating and copying a 16K-entry collision
+    // set every render frame. A stale epoch is rejected inside World and is
+    // retried next frame without changing the last successful publication.
+    const bool collisionPublicationChanged =
+        !_publishedExactCollisionCoverageEpoch ||
+        *_publishedExactCollisionCoverageEpoch != exactCoverageEpoch ||
+        _publishedExactCollisionOwnedSections != _exactCollisionOwnedSections;
+    if (collisionPublicationChanged &&
+        world.publishExactCollisionOwnership(exactCoverageEpoch,
+                                             _exactCollisionOwnedSections)) {
+        _publishedExactCollisionCoverageEpoch = exactCoverageEpoch;
+        _publishedExactCollisionOwnedSections = _exactCollisionOwnedSections;
     }
 
     // Fill the exact-to-horizon region after exact cubes. Each ready exact
-    // column suppresses its own far terrain, water, canopies, and skirts. An
+    // column suppresses its own far terrain, water, and canopies. An
     // unrelated loading gap therefore cannot reveal coarse geometry over a
     // revision-ready nearby column.
-    renderFarTerrain(encoder, world, cameraPosition, fogColor);
+    renderFarTerrain(encoder, world, camera, fogColor, drawGeometry, -1, exactCoverageForFrame,
+                     prepareProtectedFinal);
 
     // F3 HUD counters: uploads applied this frame + the workers' build EMA
     _chunkStats.meshBuildsLastFrame = static_cast<uint32_t>(uploads);
@@ -2067,9 +2849,15 @@ void RenderPipeline::renderChunks(id<MTLRenderCommandEncoder> encoder, const Wor
     _chunkStats.meshDroppedStaleCount = meshStats.droppedStale;
 }
 
-void RenderPipeline::resetFarTerrain(uint64_t worldSeed, GenerationSettings generation) {
-    if (_farTerrainSeed && *_farTerrainSeed == worldSeed && _farTerrainScheduler)
+void RenderPipeline::resetFarTerrain(const World& world) {
+    const uint64_t worldSeed = world.getSeed();
+    const uint64_t worldInstanceId = world.instanceId();
+    if (_farTerrainSeed && *_farTerrainSeed == worldSeed && _farTerrainWorldInstanceId &&
+        *_farTerrainWorldInstanceId == worldInstanceId && _farTerrainScheduler)
         return;
+
+    const std::shared_ptr<worldgen::learned::WorldGenerationContext> generationContext =
+        world.generationContext();
 
     if (_farTerrainScheduler)
         _farTerrainScheduler->shutdown();
@@ -2080,82 +2868,214 @@ void RenderPipeline::resetFarTerrain(uint64_t worldSeed, GenerationSettings gene
                 _farMegaBuffer->deferFree(state.alloc, _frameRing.frameIndex());
             }
         }
+        for (auto& [key, state] : _farCanopyAttachments) {
+            (void)key;
+            if (state.alloc)
+                _farMegaBuffer->deferFree(*state.alloc, _frameRing.frameIndex());
+        }
+        for (auto& [key, transition] : _farTerrainAuthorityTransitions) {
+            (void)key;
+            if (transition.source.uploaded) {
+                _farMegaBuffer->deferFree(transition.source.alloc, _frameRing.frameIndex());
+            }
+            if (transition.sourceCanopy && transition.sourceCanopy->alloc) {
+                _farMegaBuffer->deferFree(*transition.sourceCanopy->alloc, _frameRing.frameIndex());
+            }
+        }
     }
     _farTerrainMeshes.clear();
+    _farCanopyAttachments.clear();
     _farTerrainWanted.clear();
     _farTerrainPriorityOrder.clear();
     _farTerrainActiveTiles.clear();
     _farTerrainDesiredByTile.clear();
     _farTerrainDisplayedByTile.clear();
-    _farTerrainComplexityByTile.clear();
     _farTerrainTransitions.clear();
-    _farShadowDrawPlans.clear();
+    _farCanopyLodFallbacks.clear();
+    _farTerrainAuthorityTransitions.clear();
     _farTerrainNearGraceStartedAt.clear();
     _farTerrainResults.clear();
+    _farCanopyResults.clear();
+    _farTerrainSelectionCamera.reset();
+    _farTerrainDesiredMetricsCamera.reset();
+    _farTerrainSpeculativeCamera.reset();
+    _farTerrainSelectionViewDistance = -1;
+    _farTerrainProtectedNearHandoff.clear();
+    _farTerrainProtectedNearEpoch = 0;
+    _farTerrainProtectedRecentMotionX = 0;
+    _farTerrainProtectedRecentMotionZ = 0;
+    _farTerrainPredictedNearAnchor.reset();
+    _farTerrainProtectedNearClosureSnapshot.reset();
+    _farTerrainDesiredViewportHeight = 0;
+    _farTerrainDesiredVerticalFovRadians = 0.0;
+    _farTerrainDesiredDrawGeometry = false;
+    _farTerrainDesiredMetricsDirty = true;
+    _farTerrainViewEpoch = 0;
+    if (_farTerrainWorldEpoch == std::numeric_limits<uint64_t>::max()) {
+        _farTerrainWorldEpoch = 1;
+    } else {
+        ++_farTerrainWorldEpoch;
+    }
     _farTerrainCandidates.clear();
     _farTerrainCachedBaseRequests.clear();
+    _farTerrainMissingBaseRequests.clear();
+    _farTerrainDistantBaseRequests.clear();
+    _farTerrainFinalBaseRequests.clear();
+    _farTerrainPerceptualFinalRequests.clear();
+    _farTerrainFinalRefinementRequests.clear();
+    _farTerrainCanopyRefreshRequests.clear();
+    _farTerrainCanopyRefreshKeys.clear();
     _farTerrainUrgentRefinementRequests.clear();
     _farTerrainUrgentRefinementKeys.clear();
-    _farTerrainCachedRefinementRequests.clear();
+    _farTerrainPredictedNearPatchTargets.clear();
+    _farTerrainPredictedCriticalResidencyKeys.clear();
+    _farTerrainConnectedNearPatchTargets.clear();
+    _farTerrainProtectedFinalTerrainRegions.clear();
+    _farTerrainCriticalResidencyCoordinates.clear();
+    _farTerrainCriticalResidencyTargets.clear();
+    _farTerrainCriticalResidencyCoordinateScratch.clear();
+    _farTerrainCriticalResidencyTargetScratch.clear();
+    _farTerrainCriticalResidencyKeys.clear();
+    _farTerrainRefinementSubmissionKeys.clear();
     _farTerrainCachedMeshes.clear();
+    _farTerrainCachedCanopies.clear();
     _farTerrainCenterTile.reset();
     clearExactSectionOwnership();
+    _exactCollisionOwnedSections.clear();
+    _publishedExactCollisionOwnedSections.clear();
+    _publishedExactCollisionCoverageEpoch.reset();
     _farTerrainResidentWantedCount = 0;
     _farTerrainResidentRefinementCount = 0;
+    _farTerrainPlannerTimings.clear();
+    _farTerrainSelectionTimings.clear();
+    _farTerrainPublicationTimings.clear();
+    _farTerrainResidencyTimings.clear();
+    _farTerrainArenaAdmissionDeniedCount = 0;
+    _farTerrainNearArenaReclaimCount = 0;
+    _farTerrainNearArenaReclaimedBytes = 0;
 
     if (!_farMegaBuffer) {
         _farMegaBuffer = std::make_unique<SegmentedMegaBuffer>(
             _device, FAR_VERTEX_BUFFER_BYTES, FAR_INDEX_BUFFER_BYTES, FAR_VERTEX_BUFFER_SLAB_BYTES,
             FAR_INDEX_BUFFER_SLAB_BYTES);
     }
-    _farTerrainScheduler =
-        std::make_unique<FarTerrainScheduler>(worldSeed, FarTerrainSchedulerLimits{}, generation);
+    _farTerrainScheduler = std::make_unique<FarTerrainScheduler>(
+        worldSeed, std::move(generationContext), FarTerrainSchedulerLimits{},
+        world.getGenerationSettings());
     _farTerrainSeed = worldSeed;
+    _farTerrainWorldInstanceId = worldInstanceId;
     _farTerrainMeshes.reserve(8192);
-    _farTerrainWanted.reserve(8192);
-    _farTerrainPriorityOrder.reserve(8192);
+    _farCanopyAttachments.reserve(8192);
+    _farCanopyLodFallbacks.reserve(4096);
+    _farTerrainWanted.reserve(FAR_TERRAIN_MAX_RESIDENCY_KEYS);
+    _farTerrainPriorityOrder.reserve(FAR_TERRAIN_MAX_RESIDENCY_KEYS);
     _farTerrainActiveTiles.reserve(4096);
     _farTerrainDesiredByTile.reserve(4096);
     _farTerrainDisplayedByTile.reserve(4096);
-    _farTerrainComplexityByTile.reserve(4096);
     _farTerrainTransitions.reserve(64);
+    _farTerrainConnectedNearPatchTargets.reserve(128);
+    _farTerrainPredictedNearPatchTargets.reserve(FAR_TERRAIN_PROTECTED_NEAR_TARGET_COUNT);
+    _farTerrainPredictedCriticalResidencyKeys.reserve(512);
+    _farTerrainCriticalResidencyCoordinates.reserve(256);
+    _farTerrainCriticalResidencyTargets.reserve(256);
+    _farTerrainCriticalResidencyCoordinateScratch.reserve(256);
+    _farTerrainCriticalResidencyTargetScratch.reserve(256);
+    _farTerrainCriticalResidencyKeys.reserve(1024);
+    _farShadowDrawPlans.reserve(8192);
     _farTerrainNearGraceStartedAt.reserve(4096);
     _farTerrainCandidates.reserve(4096);
     _farTerrainCachedBaseRequests.reserve(4096);
-    _farTerrainUrgentRefinementRequests.reserve(256);
-    _farTerrainUrgentRefinementKeys.reserve(320);
-    _farTerrainCachedRefinementRequests.reserve(4096);
+    _farTerrainMissingBaseRequests.reserve(4096);
+    _farTerrainDistantBaseRequests.reserve(4096);
+    _farTerrainFinalBaseRequests.reserve(4096);
+    _farTerrainPerceptualFinalRequests.reserve(1024);
+    _farTerrainFinalRefinementRequests.reserve(8192);
+    _farTerrainCanopyRefreshRequests.reserve(FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET);
+    _farTerrainCanopyRefreshKeys.reserve(FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET);
+    _farTerrainUrgentRefinementRequests.reserve(4096);
+    _farTerrainUrgentRefinementKeys.reserve(FAR_TERRAIN_MAX_PROGRESSIVE_PLANNER_RESULTS);
+    _farTerrainRefinementSubmissionKeys.reserve(FAR_TERRAIN_MAX_PROGRESSIVE_PLANNER_RESULTS);
     _farTerrainCachedMeshes.reserve(FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME);
+    _farTerrainCachedCanopies.reserve(FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET);
     _exactOwnedSections.reserve(MAX_MESH_RESIDENT_CUBES);
+    _exactShadowOwnedSections.reserve(MAX_MESH_RESIDENT_CUBES);
+    _exactCollisionOwnedSections.reserve(MAX_MESH_RESIDENT_CUBES);
+    _publishedExactCollisionOwnedSections.reserve(MAX_MESH_RESIDENT_CUBES);
 }
 
 void RenderPipeline::setExactSectionOwned(ChunkPos position, bool owned) {
     if (owned) {
         if (_exactOwnedSections.insert(position).second) {
             _farTerrainExactCoverage.setSectionReady(position, true);
+            _farTerrainExactFloraCoverage.setSectionReady(position, true);
         }
         return;
     }
     if (_exactOwnedSections.erase(position) != 0) {
         _farTerrainExactCoverage.setSectionReady(position, false);
+        _farTerrainExactFloraCoverage.setSectionReady(position, false);
     }
 }
 
 void RenderPipeline::clearExactSectionOwnership() {
     _exactOwnedSections.clear();
     _farTerrainExactCoverage.clear();
+    _farTerrainExactFloraCoverage.clear();
 }
 
-void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const World& world,
-                                      const Vec3& cameraPosition, const float fogColor[3]) {
-    resetFarTerrain(world.getSeed(), world.getGenerationSettings());
+bool RenderPipeline::updateFarTerrainSelection(const Vec3& cameraPosition, int visibleChunks) {
+    const bool selectionChanged = farTerrainSelectionRequiresRefresh(
+        _farTerrainSelectionCamera, cameraPosition.x, cameraPosition.z,
+        _farTerrainSelectionViewDistance, visibleChunks);
+    if (!selectionChanged)
+        return false;
+    selectFarTerrainView(cameraPosition.x, cameraPosition.z, visibleChunks, _farTerrainCandidates);
+    _farTerrainSelectionCamera = std::pair{cameraPosition.x, cameraPosition.z};
+    _farTerrainSelectionViewDistance = visibleChunks;
+    ++_farTerrainViewEpoch;
+    return true;
+}
+
+void RenderPipeline::renderFarTerrain(
+    id<MTLRenderCommandEncoder> encoder, const World& world, const Camera& camera,
+    const float fogColor[3], bool drawGeometry, int selectedViewDistance,
+    std::shared_ptr<const ExactSurfaceCoverageSnapshot> exactCoverageOverride,
+    bool prepareProtectedFinal) {
+    const Vec3 cameraPosition = camera.getPosition();
+    resetFarTerrain(world);
+    const bool finalStreamingWorkEnabled =
+        farTerrainFinalStreamingWorkEnabled(drawGeometry, prepareProtectedFinal);
+    _farTerrainScheduler->setFinalStreamingWorkEnabled(finalStreamingWorkEnabled);
+    if (!finalStreamingWorkEnabled) {
+        // Preparation publishes only terrain and canonical water. Disable the
+        // optional and FINAL lanes before completed PREVIEW parents can enqueue
+        // follow-up work on their gameplay budgets.
+        _farTerrainScheduler->setCanopyWorkerBudget(0);
+        if (_farTerrainProtectedNearHandoff.statusCenter()) {
+            _farTerrainProtectedNearHandoff.clear();
+            _farTerrainDesiredMetricsDirty = true;
+        }
+        _farTerrainProtectedNearEpoch = 0;
+        _farTerrainProtectedRecentMotionX = 0;
+        _farTerrainProtectedRecentMotionZ = 0;
+        _farTerrainPredictedNearAnchor.reset();
+        _farTerrainPredictedNearPatchTargets.clear();
+        _farTerrainPredictedCriticalResidencyKeys.clear();
+        _farTerrainProtectedNearClosureSnapshot.reset();
+    }
     _farMegaBuffer->drainDeferredFrees(_frameRing.completedFrame());
-    _farTerrainActiveTiles.clear();
-    _farTerrainCandidates.clear();
+    const auto farPlannerStartedAt = std::chrono::steady_clock::now();
 
     const int exactChunks = world.getExactViewDistance();
-    const int visibleChunks = world.getViewDistance();
-    const auto exactCoverage = world.getExactSurfaceCoverageSnapshot();
+    const int configuredVisibleChunks = world.generationContext()
+                                            ? farTerrainEntryHorizonViewDistance(
+                                                  world.getViewDistance())
+                                            : world.getViewDistance();
+    const int visibleChunks = selectedViewDistance < 0
+                                  ? configuredVisibleChunks
+                                  : std::clamp(selectedViewDistance, 0, configuredVisibleChunks);
+    const auto exactCoverage = exactCoverageOverride ? std::move(exactCoverageOverride)
+                                                     : world.getExactSurfaceCoverageSnapshot();
     const int nominalExactChunks =
         exactCoverage ? std::clamp(exactCoverage->nominalRadiusChunks, 0, exactChunks) : 0;
     const float nominalExactBlocks = static_cast<float>(nominalExactChunks * CHUNK_EDGE);
@@ -2169,89 +3089,474 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
                           : std::span<const ColumnPos>(),
             [&](ChunkPos position) { return _exactOwnedSections.contains(position); });
     }
+    if (!_farTerrainExactFloraCoverage.matches(exactCoverageEpoch, nominalExactChunks)) {
+        _farTerrainExactFloraCoverage.rebuild(
+            exactCoverageEpoch, nominalExactChunks,
+            exactCoverage ? std::span<const ChunkPos>(exactCoverage->floraRequiredSections)
+                          : std::span<const ChunkPos>(),
+            exactCoverage ? std::span<const ColumnPos>(exactCoverage->unresolvedColumns)
+                          : std::span<const ColumnPos>(),
+            [&](ChunkPos position) { return _exactOwnedSections.contains(position); });
+    }
     const FarTerrainExactHandoff& exactHandoff =
         _farTerrainExactCoverage.sample(cameraPosition.x, cameraPosition.z);
-    const MeshSchedulerStats exactMeshStats = _meshScheduler->stats();
+    const FarTerrainExactHandoff& exactFloraHandoff =
+        _farTerrainExactFloraCoverage.sample(cameraPosition.x, cameraPosition.z);
+    const MeshSchedulerStats exactMeshStats =
+        _meshScheduler ? _meshScheduler->stats() : MeshSchedulerStats{};
     const bool exactStreamingBusy = farTerrainExactStreamingBusy(
         world.getPendingChunkCount(), exactMeshStats.schedulerOwned,
         std::max(exactMeshStats.consumerPending, _pendingResults.size()),
         exactHandoff.requiredSections, exactHandoff.readySections, exactHandoff.unresolvedColumns);
-    // Far construction runs at utility priority, while exact generation and
-    // meshing retain higher priorities on their separate pools. Keep all far
-    // workers available during cold exact streaming so horizon parents and
-    // nearby selected targets can converge together on the reference M4 Max.
-    _farTerrainScheduler->setWorkerBudget(FarTerrainScheduler::WORKER_COUNT);
+    // Exact generation and meshing share physical cores with far construction.
+    // Apply the exact-debt floor before this frame computes finer local debt;
+    // the completed planner policy below may reduce the budget further but can
+    // return to the full horizon pool only after both debts clear.
+    _farTerrainScheduler->setWorkerBudget(
+        farTerrainWorkerBudget(exactStreamingBusy, _farTerrainLocalTerrainDebt));
     const TerrainHorizonViewpoint viewpoint{cameraPosition.x, cameraPosition.y, cameraPosition.z};
-    selectFarTerrainView(cameraPosition.x, cameraPosition.z, visibleChunks, _farTerrainCandidates);
+    const int previousSelectionViewDistance = _farTerrainSelectionViewDistance;
+    const std::optional<std::pair<double, double>> previousSelectionCamera =
+        _farTerrainSelectionCamera;
+    const bool selectionChanged = updateFarTerrainSelection(cameraPosition, visibleChunks);
+    if (selectionChanged) {
+        _farTerrainActiveTiles.clear();
+        for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+            _farTerrainActiveTiles.insert({tile.key.tileX, tile.key.tileZ});
+        }
+        if (!previousSelectionCamera) {
+            _farTerrainProtectedRecentMotionX = 0;
+            _farTerrainProtectedRecentMotionZ = 0;
+        } else {
+            const double movementX = cameraPosition.x - previousSelectionCamera->first;
+            const double movementZ = cameraPosition.z - previousSelectionCamera->second;
+            constexpr double MOTION_SAMPLE_DISTANCE_SQUARED =
+                static_cast<double>(CHUNK_EDGE * CHUNK_EDGE);
+            if (movementX * movementX + movementZ * movementZ >=
+                MOTION_SAMPLE_DISTANCE_SQUARED) {
+                _farTerrainProtectedRecentMotionX = (movementX > 0.0) - (movementX < 0.0);
+                _farTerrainProtectedRecentMotionZ = (movementZ > 0.0) - (movementZ < 0.0);
+            }
+        }
+    }
     const int64_t cameraBlockX = static_cast<int64_t>(std::floor(cameraPosition.x));
     const int64_t cameraBlockZ = static_cast<int64_t>(std::floor(cameraPosition.z));
     const ColumnPos centerTile{
         world_coord::floorDiv(cameraBlockX, static_cast<int64_t>(FAR_TERRAIN_TILE_EDGE)),
         world_coord::floorDiv(cameraBlockZ, static_cast<int64_t>(FAR_TERRAIN_TILE_EDGE)),
     };
+    const ColumnPos protectedAnchor =
+        farTerrainProtectedNearAnchor(cameraBlockX, cameraBlockZ);
+    const bool protectedHandoffChanged =
+        finalStreamingWorkEnabled && _farTerrainProtectedNearHandoff.request(protectedAnchor);
+    if (protectedHandoffChanged) {
+        // The desired map owns scheduler residency. Recompute it immediately so
+        // a moving camera retains the published patch while also requesting the
+        // complete replacement patch and shell.
+        _farTerrainDesiredMetricsDirty = true;
+    }
+    std::optional<ColumnPos> predictedProtectedAnchor;
+    if (drawGeometry && finalStreamingWorkEnabled) {
+        predictedProtectedAnchor = farTerrainPredictedProtectedNearAnchor(
+            cameraBlockX, cameraBlockZ, _farTerrainProtectedRecentMotionX,
+            _farTerrainProtectedRecentMotionZ);
+    }
+    bool protectedPredictionChanged = false;
+    if (predictedProtectedAnchor != _farTerrainPredictedNearAnchor ||
+        (predictedProtectedAnchor && selectionChanged)) {
+        std::vector<FarTerrainKey> predictedProtectedTargets;
+        if (predictedProtectedAnchor) {
+            buildFarTerrainProtectedNearTargets(*predictedProtectedAnchor, _farTerrainCandidates,
+                                                predictedProtectedTargets);
+            if (predictedProtectedTargets.size() != FAR_TERRAIN_PROTECTED_NEAR_TARGET_COUNT) {
+                predictedProtectedAnchor.reset();
+                predictedProtectedTargets.clear();
+            }
+        }
+        protectedPredictionChanged =
+            predictedProtectedAnchor != _farTerrainPredictedNearAnchor ||
+            predictedProtectedTargets != _farTerrainPredictedNearPatchTargets;
+        if (protectedPredictionChanged) {
+            _farTerrainPredictedNearAnchor = predictedProtectedAnchor;
+            _farTerrainPredictedNearPatchTargets = std::move(predictedProtectedTargets);
+            buildFarTerrainCriticalResidencyOrder(_farTerrainPredictedNearPatchTargets,
+                                                  _farTerrainPredictedCriticalResidencyKeys);
+        }
+    }
     if (_farTerrainCenterTile && (std::abs(centerTile.x - _farTerrainCenterTile->x) > 2 ||
                                   std::abs(centerTile.z - _farTerrainCenterTile->z) > 2)) {
         _farTerrainScheduler->advanceEpoch();
     }
     _farTerrainCenterTile = centerTile;
+    const double farViewportHeightPixels = static_cast<double>(std::max(_displayHeight, 1U));
+    const double farVerticalFovRadians =
+        static_cast<double>(camera.FOV()) * std::numbers::pi / 180.0;
+    const double farProjectionScalePixels =
+        farViewportHeightPixels / (2.0 * std::tan(farVerticalFovRadians * 0.5));
+    const bool desiredMetricCameraChanged = farTerrainCameraMovementRequiresRefresh(
+        _farTerrainDesiredMetricsCamera, cameraPosition.x, cameraPosition.z,
+        FAR_TERRAIN_DESIRED_METRIC_REFRESH_BLOCKS);
+    const bool recomputeDesiredMetrics = farTerrainDesiredMetricsRequireRefresh(
+        selectionChanged || desiredMetricCameraChanged, _farTerrainDesiredMetricsDirty,
+        _farTerrainDesiredViewportHeight, _displayHeight, _farTerrainDesiredVerticalFovRadians,
+        farVerticalFovRadians, _farTerrainDesiredDrawGeometry, drawGeometry);
+    const auto screenMetricsForTile =
+        [&](const FarTerrainViewTile& tile) -> std::optional<FarTerrainScreenErrorMetrics> {
+        const auto parent =
+            _farTerrainMeshes.find({tile.key.tileX, tile.key.tileZ, FAR_TERRAIN_BASE_STEP});
+        if (parent == _farTerrainMeshes.end() || !parent->second.uploaded)
+            return std::nullopt;
+        const FarTerrainKey parentKey{tile.key.tileX, tile.key.tileZ, FAR_TERRAIN_BASE_STEP};
+        const auto promotion = _farTerrainAuthorityTransitions.find(parentKey);
+        const bool previewMayBeDisplayed =
+            parent->second.authorityQuality == FarTerrainAuthorityQuality::PREVIEW ||
+            (promotion != _farTerrainAuthorityTransitions.end() &&
+             promotion->second.source.authorityQuality == FarTerrainAuthorityQuality::PREVIEW);
+        const double relief =
+            std::max(0.0, static_cast<double>(parent->second.surfaceBounds.maxY) -
+                              static_cast<double>(parent->second.surfaceBounds.minY)) +
+            FAR_TERRAIN_STEP32_RELIEF_ENVELOPE * 2.0 +
+            (previewMayBeDisplayed ? FAR_TERRAIN_PREVIEW_RESIDUAL_MAX_BLOCKS * 2.0 : 0.0);
+        return FarTerrainScreenErrorMetrics{
+            // Absolute LOD bands start at the 32-chunk exact handoff, but a
+            // temporarily unresolved exact column can be much closer. Use
+            // its real nearest-point distance for projected error so the far
+            // fallback refines toward block scale instead of pretending it is
+            // half a kilometer away.
+            .distanceBlocks = std::max(1.0, std::sqrt(tile.distanceSquared)),
+            .viewportHeightPixels = farViewportHeightPixels,
+            .verticalFovRadians = farVerticalFovRadians,
+            .projectionScalePixels = farProjectionScalePixels,
+            .tileReliefBlocks = relief,
+        };
+    };
+    const auto currentTileDistanceSquared = [&](const FarTerrainBounds& bounds) {
+        const double dx = cameraPosition.x < static_cast<double>(bounds.minX)
+                              ? static_cast<double>(bounds.minX) - cameraPosition.x
+                          : cameraPosition.x > static_cast<double>(bounds.maxX)
+                              ? cameraPosition.x - static_cast<double>(bounds.maxX)
+                              : 0.0;
+        const double dz = cameraPosition.z < static_cast<double>(bounds.minZ)
+                              ? static_cast<double>(bounds.minZ) - cameraPosition.z
+                          : cameraPosition.z > static_cast<double>(bounds.maxZ)
+                              ? cameraPosition.z - static_cast<double>(bounds.maxZ)
+                              : 0.0;
+        return dx * dx + dz * dz;
+    };
+    bool desiredTierChanged = false;
     for (FarTerrainViewTile& tile : _farTerrainCandidates) {
         const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
-        _farTerrainActiveTiles.insert(coordinate);
+        tile.distanceSquared = currentTileDistanceSquared(tile.bounds);
+        tile.distanceChunks =
+            std::max(static_cast<double>(FAR_TERRAIN_NEAR_CHUNK_RADIUS),
+                     std::sqrt(tile.distanceSquared) / static_cast<double>(CHUNK_EDGE));
 
-        // Retain the maximum observed value while the coordinate is active.
-        // Different sample spacings can under-resolve a narrow ridge or river;
-        // allowing that observation to fall again would make two tiers chase
-        // each other despite the distance hysteresis.
-        float& complexity = _farTerrainComplexityByTile[coordinate];
-        for (FarTerrainStep step :
-             {FarTerrainStep::TWO, FarTerrainStep::FOUR, FarTerrainStep::EIGHT,
-              FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO}) {
-            const auto resident = _farTerrainMeshes.find({tile.key.tileX, tile.key.tileZ, step});
-            if (resident != _farTerrainMeshes.end()) {
-                complexity = std::max(complexity, resident->second.complexity);
+        if (recomputeDesiredMetrics) {
+            std::optional<FarTerrainStep> previousStep;
+            if (const auto previous = _farTerrainDesiredByTile.find(coordinate);
+                previous != _farTerrainDesiredByTile.end()) {
+                previousStep = previous->second.step;
             }
-        }
-        std::optional<FarTerrainStep> previousStep;
-        if (const auto previous = _farTerrainDesiredByTile.find(coordinate);
-            previous != _farTerrainDesiredByTile.end()) {
-            previousStep = previous->second.step;
-        }
-        if (const auto desired =
-                farTerrainStepForMetrics(tile.distanceChunks, complexity, previousStep)) {
-            tile.key.step = *desired;
-        }
-        _farTerrainDesiredByTile.insert_or_assign(coordinate, tile.key);
-    }
-    for (auto it = _farTerrainDesiredByTile.begin(); it != _farTerrainDesiredByTile.end();) {
-        if (!_farTerrainActiveTiles.contains(it->first)) {
-            it = _farTerrainDesiredByTile.erase(it);
-        } else {
-            ++it;
+            tile.screenErrorMetrics = drawGeometry ? screenMetricsForTile(tile) : std::nullopt;
+            std::optional<FarTerrainStep> desired =
+                tile.screenErrorMetrics
+                    ? farTerrainStepForScreenMetrics(tile.distanceChunks, *tile.screenErrorMetrics,
+                                                     previousStep)
+                    : farTerrainStepForMetrics(tile.distanceChunks, previousStep);
+            desired = farTerrainProtectedDesiredStep(
+                desired,
+                farTerrainProtectedNearRequiredStep(_farTerrainProtectedNearHandoff, coordinate));
+            if (desired) {
+                tile.key.step = *desired;
+            }
+            desiredTierChanged =
+                desiredTierChanged || !previousStep || *previousStep != tile.key.step;
+            _farTerrainDesiredByTile.insert_or_assign(coordinate, tile.key);
         }
     }
-    for (auto it = _farTerrainComplexityByTile.begin(); it != _farTerrainComplexityByTile.end();) {
-        if (!_farTerrainActiveTiles.contains(it->first)) {
-            it = _farTerrainComplexityByTile.erase(it);
-        } else {
-            ++it;
+    if (recomputeDesiredMetrics) {
+        _farTerrainDesiredMetricsCamera = std::pair{cameraPosition.x, cameraPosition.z};
+        _farTerrainDesiredViewportHeight = _displayHeight;
+        _farTerrainDesiredVerticalFovRadians = farVerticalFovRadians;
+        _farTerrainDesiredDrawGeometry = drawGeometry;
+        _farTerrainDesiredMetricsDirty = false;
+    }
+    if (selectionChanged) {
+        for (auto it = _farTerrainDesiredByTile.begin(); it != _farTerrainDesiredByTile.end();) {
+            if (!_farTerrainActiveTiles.contains(it->first)) {
+                it = _farTerrainDesiredByTile.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
     // Every visible coordinate owns a step-32 parent independently of its
-    // desired detail. Parents occupy the first priority lane in nearest-first
-    // order, followed by refinements in the same stable coordinate order.
+    // desired detail. Parents occupy the first priority lane. Camera,
+    // protected, and unresolved exact-fallback refinements form a second
+    // critical lane before the broad global bridge wavefront.
     const bool residencyMembershipChanged =
-        !farTerrainResidencyMembershipMatches(_farTerrainCandidates, _farTerrainWanted);
+        (selectionChanged || desiredTierChanged || protectedPredictionChanged) &&
+        !farTerrainResidencyMembershipMatches(_farTerrainCandidates, _farTerrainWanted,
+                                              _farTerrainPredictedCriticalResidencyKeys);
+    std::vector<ColumnPos>& criticalResidencyCoordinates =
+        _farTerrainCriticalResidencyCoordinateScratch;
+    std::vector<FarTerrainKey>& criticalResidencyTargets =
+        _farTerrainCriticalResidencyTargetScratch;
+    criticalResidencyCoordinates.clear();
+    criticalResidencyTargets.clear();
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+        const bool critical =
+            coordinate == centerTile ||
+            farTerrainProtectedNearRequiredStep(_farTerrainProtectedNearHandoff, coordinate)
+                .has_value() ||
+            farTerrainRequiresCoverageParent(cameraPosition.x, cameraPosition.z, coordinate,
+                                             nominalExactBlocks, exactHandoff);
+        if (critical) {
+            criticalResidencyCoordinates.push_back(coordinate);
+            criticalResidencyTargets.push_back(
+                {coordinate.x, coordinate.z, farTerrainResidencyTarget(tile)});
+        }
+    }
+    const bool criticalResidencyChanged =
+        criticalResidencyCoordinates != _farTerrainCriticalResidencyCoordinates ||
+        criticalResidencyTargets != _farTerrainCriticalResidencyTargets;
+    if (criticalResidencyChanged) {
+        _farTerrainCriticalResidencyCoordinates.swap(criticalResidencyCoordinates);
+        _farTerrainCriticalResidencyTargets.swap(criticalResidencyTargets);
+    }
+    const bool criticalPriorityChanged = criticalResidencyChanged || residencyMembershipChanged ||
+                                         protectedHandoffChanged || protectedPredictionChanged;
+    if (criticalPriorityChanged) {
+        // Critical cache rank is independent of the global base-first
+        // submission order. Preserve every required surface before any
+        // support copy, then every parent before intermediate bridges. Under
+        // exceptional pressure, an adjacent core target can therefore never
+        // lose admission to another coordinate's nonpublishable lineage.
+        buildFarTerrainTieredCriticalResidencyOrder(
+            _farTerrainCriticalResidencyTargets, _farTerrainPredictedNearPatchTargets,
+            _farTerrainCriticalResidencyKeys);
+    }
     if (residencyMembershipChanged) {
-        buildFarTerrainResidencyOrder(_farTerrainCandidates, _farTerrainPriorityOrder);
+        buildFarTerrainResidencyOrder(_farTerrainCandidates, _farTerrainPriorityOrder,
+                                      _farTerrainCriticalResidencyCoordinates);
         _farTerrainWanted.clear();
         _farTerrainWanted.insert(_farTerrainPriorityOrder.begin(), _farTerrainPriorityOrder.end());
-        _farTerrainScheduler->retainWanted(_farTerrainWanted, _farTerrainPriorityOrder);
+        for (const FarTerrainKey key : _farTerrainPredictedCriticalResidencyKeys) {
+            if (_farTerrainWanted.insert(key).second)
+                _farTerrainPriorityOrder.push_back(key);
+        }
+        _farTerrainScheduler->retainWanted(_farTerrainWanted, _farTerrainPriorityOrder,
+                                           _farTerrainCriticalResidencyKeys);
+        // Pause optional dispatch while wanted membership changes. The frame's
+        // local-debt policy below may re-admit one worker during gameplay only
+        // after the new protected and connected requirements are known.
+        _farTerrainScheduler->setCanopyWorkerBudget(0);
+    } else if (criticalPriorityChanged) {
+        _farTerrainScheduler->refreshCriticalPriorities(_farTerrainCriticalResidencyKeys);
+    }
+    if (protectedHandoffChanged) {
+        // Publish the new critical membership before advancing the movement
+        // epoch. The scheduler can then retag exact overlapping work instead
+        // of canceling and rebuilding it at every half-tile boundary.
+        _farTerrainProtectedNearEpoch = _farTerrainScheduler->advanceProtectedHandoffEpoch();
+    }
+    if (selectionChanged) {
+        std::vector<worldgen::learned::TerrainPageCoordinate> visibleAuthorityPages =
+            farTerrainCoarseAuthorityPages(_farTerrainCandidates, cameraPosition.x,
+                                           cameraPosition.z);
+        std::vector<worldgen::learned::TerrainPageCoordinate> speculativeAuthorityPages;
+        bool replaceSpeculativeAuthorityPages = false;
+        const bool viewDistanceChanged = previousSelectionViewDistance != visibleChunks;
+        if (viewDistanceChanged || !_farTerrainSpeculativeCamera) {
+            replaceSpeculativeAuthorityPages = true;
+            _farTerrainSpeculativeCamera = std::pair{cameraPosition.x, cameraPosition.z};
+        } else {
+            const double movementX = cameraPosition.x - _farTerrainSpeculativeCamera->first;
+            const double movementZ = cameraPosition.z - _farTerrainSpeculativeCamera->second;
+            constexpr double SPECULATIVE_UPDATE_DISTANCE_SQUARED =
+                static_cast<double>(CHUNK_EDGE * CHUNK_EDGE);
+            if (movementX * movementX + movementZ * movementZ >=
+                SPECULATIVE_UPDATE_DISTANCE_SQUARED) {
+                speculativeAuthorityPages = farTerrainSpeculativeAuthorityPages(
+                    visibleAuthorityPages, _farTerrainSpeculativeCamera->first,
+                    _farTerrainSpeculativeCamera->second, cameraPosition.x, cameraPosition.z);
+                replaceSpeculativeAuthorityPages = true;
+                _farTerrainSpeculativeCamera = std::pair{cameraPosition.x, cameraPosition.z};
+            }
+        }
+        _farTerrainScheduler->setCoarseAuthorityPrefetchPages(std::move(visibleAuthorityPages));
+        if (replaceSpeculativeAuthorityPages) {
+            _farTerrainScheduler->setSpeculativeAuthorityPrefetchPages(
+                std::move(speculativeAuthorityPages));
+        }
+    }
+    if (finalStreamingWorkEnabled)
+        _farTerrainScheduler->pumpFinalBaseAuthority();
+    // Preparation fills the bounded entry prefix. Once gameplay opens, exact
+    // publication and nearer desired LODs own authority before the remaining
+    // configured horizon can enqueue more preview pages.
+    if (!drawGeometry || (!exactStreamingBusy && !_farTerrainLocalTerrainDebt))
+        _farTerrainScheduler->pumpCoarseAuthorityPrefetch();
+    // Resuming a parked canopy only moves completed authority work back into
+    // its optional queue. Do this every gameplay frame so unrelated visible
+    // FINAL debt cannot strand nearby flora indefinitely.
+    if (drawGeometry)
+        _farTerrainScheduler->pumpCanopyAuthority();
+    // Current-frustum canonical replacements still enter the single-flight
+    // inference coordinator before speculative movement prediction.
+    if (drawGeometry && _farTerrainPerceptualFinalRequests.empty()) {
+        _farTerrainScheduler->pumpSpeculativeAuthorityPrefetch();
     }
 
     auto isResident = [&](const FarTerrainKey& key) {
         const auto found = _farTerrainMeshes.find(key);
         return found != _farTerrainMeshes.end() && found->second.uploaded;
     };
+    const auto isFinalResident = [&](const FarTerrainKey& key) {
+        const auto found = _farTerrainMeshes.find(key);
+        return found != _farTerrainMeshes.end() && found->second.uploaded &&
+               found->second.authorityQuality == FarTerrainAuthorityQuality::FINAL;
+    };
+    const auto isFinalBaseResident = [&](ColumnPos coordinate) {
+        return isFinalResident({coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP});
+    };
+    const auto displayedQualityFor = [&](ColumnPos coordinate, FarTerrainStep step) noexcept {
+        const FarTerrainKey key{coordinate.x, coordinate.z, step};
+        if (const auto promotion = _farTerrainAuthorityTransitions.find(key);
+            promotion != _farTerrainAuthorityTransitions.end()) {
+            return promotion->second.source.authorityQuality;
+        }
+        const auto resident = _farTerrainMeshes.find(key);
+        return resident == _farTerrainMeshes.end() ? FarTerrainAuthorityQuality::PREVIEW
+                                                   : resident->second.authorityQuality;
+    };
+    const auto parentAuthorityAllowsDisplayedStep =
+        [&](ColumnPos coordinate, FarTerrainAuthorityQuality child, FarTerrainStep step) noexcept {
+            const FarTerrainKey parentKey{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
+            const auto parent = _farTerrainMeshes.find(parentKey);
+            if (parent == _farTerrainMeshes.end() || !parent->second.uploaded)
+                return false;
+            std::optional<FarTerrainAuthorityQuality> sourceQuality;
+            if (const auto promotion = _farTerrainAuthorityTransitions.find(parentKey);
+                promotion != _farTerrainAuthorityTransitions.end()) {
+                sourceQuality = promotion->second.source.authorityQuality;
+            }
+            return farTerrainAuthorityAllowsDisplayedStepDuringParentPromotion(
+                parent->second.authorityQuality, sourceQuality, child, step);
+        };
+    const auto tileVisibleForScheduling = [&](ColumnPos coordinate) {
+        const auto parent =
+            _farTerrainMeshes.find({coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP});
+        if (parent == _farTerrainMeshes.end() || !parent->second.uploaded)
+            return false;
+        const FarTerrainBounds& bounds = parent->second.surfaceBounds;
+        const float previewVerticalExpansion =
+            displayedQualityFor(coordinate, FAR_TERRAIN_BASE_STEP) ==
+                    FarTerrainAuthorityQuality::PREVIEW
+                ? static_cast<float>(FAR_TERRAIN_PREVIEW_RESIDUAL_MAX_BLOCKS)
+                : 0.0F;
+        return isChunkInFrustum(
+            {{static_cast<float>(bounds.minX), bounds.minY - previewVerticalExpansion,
+              static_cast<float>(bounds.minZ)},
+             {static_cast<float>(bounds.maxX), bounds.maxY + previewVerticalExpansion,
+              static_cast<float>(bounds.maxZ)}});
+    };
+    // Capture the closure identity before evaluating any of its targets. The
+    // resulting anchor, counts, and epoch remain one logical snapshot even if
+    // the requested handoff commits later in this render pass.
+    const std::optional<ColumnPos> protectedClosureAnchor =
+        _farTerrainProtectedNearHandoff.statusCenter();
+    const uint64_t protectedClosureViewEpoch = protectedClosureAnchor ? _farTerrainViewEpoch : 0;
+    const uint64_t protectedClosureWorldEpoch = protectedClosureAnchor ? _farTerrainWorldEpoch : 0;
+    const uint64_t protectedClosureEpoch =
+        protectedClosureAnchor ? _farTerrainProtectedNearEpoch : 0;
+    _farTerrainConnectedNearPatchTargets.clear();
+    if (protectedClosureAnchor) {
+        buildFarTerrainProtectedNearTargets(*protectedClosureAnchor, _farTerrainCandidates,
+                                            _farTerrainConnectedNearPatchTargets);
+        if (protectedHandoffChanged || selectionChanged ||
+            _farTerrainProtectedFinalTerrainRegions.empty()) {
+            _farTerrainProtectedFinalTerrainRegions = farTerrainProtectedFinalTerrainRegions(
+                _farTerrainConnectedNearPatchTargets);
+        }
+        if (const auto generationContext = world.generationContext()) {
+            const worldgen::learned::ProtectedHandoffEpoch epoch{protectedClosureEpoch};
+            for (const worldgen::learned::NativeRect region :
+                 _farTerrainProtectedFinalTerrainRegions) {
+                const auto prepared = generationContext->queryTransientFinalNativeGrid(
+                    region, worldgen::learned::AuthorityRequestPriority::PROTECTED_HANDOFF,
+                    epoch);
+                if (prepared.status() == worldgen::learned::AuthorityStatus::FAILED) {
+                    generationContext->latchFailure(
+                        prepared.failure()
+                            ? *prepared.failure()
+                            : worldgen::learned::GenerationFailure{
+                                  .code = worldgen::learned::GenerationFailureCode::INFERENCE_FAILED,
+                                  .message =
+                                      "Protected FINAL terrain prewarm failed without a reason",
+                                  .retriable = true});
+                    break;
+                }
+            }
+        }
+    } else {
+        _farTerrainProtectedFinalTerrainRegions.clear();
+    }
+    const auto predictedOnlyTarget = [&](FarTerrainKey key) {
+        const bool predicted =
+            std::ranges::find(_farTerrainPredictedNearPatchTargets, key) !=
+            _farTerrainPredictedNearPatchTargets.end();
+        const bool current = std::ranges::find(_farTerrainConnectedNearPatchTargets, key) !=
+                             _farTerrainConnectedNearPatchTargets.end();
+        return predicted && !current;
+    };
+    _farTerrainPerceptualFinalRequests.clear();
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        if (!tile.screenErrorMetrics)
+            continue;
+        const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+        if (!tileVisibleForScheduling(coordinate))
+            continue;
+        if (const std::optional<ColumnPos> protectedCenter =
+                _farTerrainProtectedNearHandoff.statusCenter();
+            protectedCenter && farTerrainProtectedNearRole(*protectedCenter, coordinate) !=
+                                   FarTerrainProtectedNearRole::NONE) {
+            continue;
+        }
+        FarTerrainStep displayed = FAR_TERRAIN_BASE_STEP;
+        if (const auto found = _farTerrainDisplayedByTile.find(coordinate);
+            found != _farTerrainDisplayedByTile.end() && isResident(found->second)) {
+            displayed = found->second.step;
+        }
+        if (displayedQualityFor(coordinate, displayed) != FarTerrainAuthorityQuality::PREVIEW)
+            continue;
+        const double projectedError = farTerrainProjectedDisplayErrorPixels(
+            displayed, FarTerrainAuthorityQuality::PREVIEW, *tile.screenErrorMetrics);
+        if (projectedError <= FAR_TERRAIN_SCREEN_ERROR_TARGET_PIXELS)
+            continue;
+        _farTerrainPerceptualFinalRequests.push_back({
+            .coordinate = coordinate,
+            .displayed = displayed,
+            .desired = tile.key.step,
+            .cameraTile = coordinate == centerTile,
+            .visible = true,
+            .projectedErrorPixels = projectedError,
+            .distanceSquaredBlocks = tile.distanceSquared,
+        });
+    }
+    std::sort(_farTerrainPerceptualFinalRequests.begin(), _farTerrainPerceptualFinalRequests.end(),
+              [](const auto& first, const auto& second) {
+                  if (first.cameraTile != second.cameraTile)
+                      return first.cameraTile;
+                  if (first.projectedErrorPixels != second.projectedErrorPixels)
+                      return first.projectedErrorPixels > second.projectedErrorPixels;
+                  if (first.distanceSquaredBlocks != second.distanceSquaredBlocks)
+                      return first.distanceSquaredBlocks < second.distanceSquaredBlocks;
+                  if (first.coordinate.x != second.coordinate.x)
+                      return first.coordinate.x < second.coordinate.x;
+                  return first.coordinate.z < second.coordinate.z;
+              });
     if (residencyMembershipChanged) {
         _farTerrainResidentWantedCount = 0;
         _farTerrainResidentRefinementCount = 0;
@@ -2263,65 +3568,8 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
                 ++_farTerrainResidentRefinementCount;
         }
     }
+    const auto farPlannerSelectionCompletedAt = std::chrono::steady_clock::now();
 
-    size_t uploads = 0;
-    size_t baseUploads = 0;
-    size_t refinementUploads = 0;
-    size_t uploadBytes = 0;
-    bool uploadFailureLogged = false;
-    auto uploadMesh = [&](const std::shared_ptr<const FarTerrainMesh>& mesh) {
-        if (!mesh || _farTerrainWanted.count(mesh->key) == 0 ||
-            _farTerrainMeshes.count(mesh->key) != 0) {
-            return false;
-        }
-        const bool base = farTerrainIsBaseStep(mesh->key.step);
-        size_t& laneUploads = base ? baseUploads : refinementUploads;
-        const size_t laneLimit = exactStreamingBusy
-                                     ? (base ? FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME : size_t{4})
-                                     : (base ? FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME
-                                             : FAR_TERRAIN_MAX_REFINEMENT_UPLOADS_PER_FRAME);
-        if (laneUploads >= laneLimit)
-            return false;
-        const size_t bytes =
-            mesh->vertices.size() * sizeof(Vertex) + mesh->indices.size() * sizeof(uint32_t);
-        if (uploadBytes + bytes > FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
-            return false;
-        std::optional<MegaBuffer::ChunkAllocation> allocation;
-        try {
-            allocation = _farMegaBuffer->allocate(static_cast<uint32_t>(mesh->vertices.size()),
-                                                  static_cast<uint32_t>(mesh->indices.size()));
-            _farMegaBuffer->uploadVertices(mesh->vertices.data(),
-                                           mesh->vertices.size() * sizeof(Vertex), *allocation);
-            _farMegaBuffer->uploadIndices(mesh->indices.data(),
-                                          mesh->indices.size() * sizeof(uint32_t), *allocation);
-            const auto [_, inserted] = _farTerrainMeshes.emplace(
-                mesh->key, FarTerrainMeshState{*allocation, mesh->bounds, mesh->surfaceBounds,
-                                               mesh->occluderPatches, mesh->opaqueIndexCount,
-                                               mesh->complexity, mesh->deterministicHash, true});
-            if (!inserted) {
-                _farMegaBuffer->free(*allocation);
-                return false;
-            }
-            ++_farTerrainResidentWantedCount;
-            if (!base)
-                ++_farTerrainResidentRefinementCount;
-            ++uploads;
-            ++laneUploads;
-            uploadBytes += bytes;
-            return true;
-        } catch (const std::exception& error) {
-            if (allocation)
-                _farMegaBuffer->free(*allocation);
-            if (!uploadFailureLogged) {
-                RY_LOG_ERROR((std::string("Far-terrain upload failed: ") + error.what()).c_str());
-                uploadFailureLogged = true;
-            }
-            return false;
-        }
-    };
-
-    _farTerrainResults.clear();
-    _farTerrainScheduler->drainCompleted(_farTerrainResults);
     const auto distanceSquaredForKey = [&](const FarTerrainKey& key) {
         const double minimumX = static_cast<double>(key.tileX) * FAR_TERRAIN_TILE_EDGE;
         const double maximumX = minimumX + FAR_TERRAIN_TILE_EDGE;
@@ -2335,6 +3583,825 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
                                                         : 0.0;
         return dx * dx + dz * dz;
     };
+    const auto canopyStateHasGeometry = [](const FarCanopyMeshState* canopy) {
+        return canopy && canopy->alloc && canopy->alloc->indexCount != 0U;
+    };
+    const auto fallbackCanopyFor =
+        [&](ColumnPos coordinate,
+            FarTerrainAuthorityQuality surfaceQuality) -> const FarCanopyMeshState* {
+        const auto fallback = _farCanopyLodFallbacks.find(coordinate);
+        if (fallback == _farCanopyLodFallbacks.end())
+            return nullptr;
+        const auto canopy = _farCanopyAttachments.find(fallback->second);
+        if (canopy == _farCanopyAttachments.end() ||
+            !canopyStateHasGeometry(&canopy->second) ||
+            !farCanopyMatchesSurface(canopy->second.authorityQuality,
+                                     canopy->second.groundingQuality, surfaceQuality)) {
+            return nullptr;
+        }
+        return &canopy->second;
+    };
+    const auto retireCanopyFallback =
+        [&](ColumnPos coordinate, std::optional<FarTerrainKey> replacement) {
+        const auto fallback = _farCanopyLodFallbacks.find(coordinate);
+        if (fallback == _farCanopyLodFallbacks.end())
+            return;
+        const FarTerrainKey source = fallback->second;
+        _farCanopyLodFallbacks.erase(fallback);
+        if (replacement && source == *replacement)
+            return;
+        const auto canopy = _farCanopyAttachments.find(source);
+        if (canopy == _farCanopyAttachments.end())
+            return;
+        if (canopy->second.alloc) {
+            _farMegaBuffer->deferFree(*canopy->second.alloc, _frameRing.frameIndex());
+        }
+        _farCanopyAttachments.erase(canopy);
+    };
+    const auto clearCanopyFallbackReference = [&](FarTerrainKey key) {
+        const ColumnPos coordinate{key.tileX, key.tileZ};
+        const auto fallback = _farCanopyLodFallbacks.find(coordinate);
+        if (fallback != _farCanopyLodFallbacks.end() && fallback->second == key) {
+            _farCanopyLodFallbacks.erase(fallback);
+        }
+    };
+    const auto completeCanopyLodFallback = [&](ColumnPos coordinate, FarTerrainKey sourceKey,
+                                               FarTerrainKey targetKey) {
+        const auto targetSurface = _farTerrainMeshes.find(targetKey);
+        if (targetSurface == _farTerrainMeshes.end() || !targetSurface->second.uploaded)
+            return;
+        const FarTerrainAuthorityQuality surfaceQuality = targetSurface->second.authorityQuality;
+        if (_farCanopyLodFallbacks.contains(coordinate) &&
+            !fallbackCanopyFor(coordinate, surfaceQuality)) {
+            retireCanopyFallback(coordinate, std::nullopt);
+        }
+        const auto source = _farCanopyAttachments.find(sourceKey);
+        const bool sourcePresent =
+            source != _farCanopyAttachments.end() &&
+            canopyStateHasGeometry(&source->second) &&
+            farCanopyMatchesSurface(source->second.authorityQuality,
+                                    source->second.groundingQuality, surfaceQuality);
+        const auto target = _farCanopyAttachments.find(targetKey);
+        const bool targetPresent =
+            target != _farCanopyAttachments.end() &&
+            farCanopyMatchesSurface(target->second.authorityQuality,
+                                    target->second.groundingQuality, surfaceQuality);
+        const bool fallbackPresent = _farCanopyLodFallbacks.contains(coordinate);
+        switch (farCanopyLodCompletionAction(fallbackPresent, sourcePresent, targetPresent)) {
+            case FarCanopyLodCompletionAction::ADOPT_SOURCE:
+                _farCanopyLodFallbacks.insert_or_assign(coordinate, sourceKey);
+                break;
+            case FarCanopyLodCompletionAction::RETIRE_FALLBACK:
+                retireCanopyFallback(coordinate, targetKey);
+                break;
+            case FarCanopyLodCompletionAction::RETAIN_FALLBACK:
+            case FarCanopyLodCompletionAction::NONE:
+                break;
+        }
+    };
+    constexpr double LOCAL_UPLOAD_RADIUS_BLOCKS =
+        FAR_TERRAIN_CONNECTED_REFINEMENT_START_CHUNK_RADIUS * CHUNK_EDGE;
+    constexpr double LOCAL_UPLOAD_RADIUS_SQUARED =
+        LOCAL_UPLOAD_RADIUS_BLOCKS * LOCAL_UPLOAD_RADIUS_BLOCKS;
+    size_t uploads = 0;
+    size_t baseUploads = 0;
+    size_t refinementUploads = 0;
+    size_t canopyUploads = 0;
+    size_t uploadBytes = 0;
+    bool uploadFailureLogged = false;
+    uint64_t farArenaVertexUsed = _farMegaBuffer->vertexUsed();
+    uint64_t farArenaIndexUsed = _farMegaBuffer->indexUsed();
+    const auto alignedArenaBytes = [](uint64_t bytes) {
+        return (bytes + MegaBuffer::ALIGNMENT - 1) & ~(MegaBuffer::ALIGNMENT - 1);
+    };
+    struct FarTerrainGpuVictim {
+        FarTerrainKey key;
+        bool canopy = false;
+        bool demoteToParent = false;
+        uint8_t retirementClass = 0;
+        double distanceSquared = 0.0;
+        uint64_t vertexBytes = 0;
+        uint64_t indexBytes = 0;
+    };
+    const auto protectedClosureTarget = [&](FarTerrainKey key) {
+        return farTerrainProtectedNearTargetKey(
+                   _farTerrainProtectedNearHandoff.activeCenter(), key) ||
+               farTerrainProtectedNearTargetKey(
+                   _farTerrainProtectedNearHandoff.requestedCenter(), key);
+    };
+    const auto reclaimOptionalGpuResidencyForNear = [&](FarTerrainKey preserveKey,
+                                                        uint64_t targetVertexBytes,
+                                                        uint64_t targetIndexBytes) {
+        std::vector<FarTerrainGpuVictim> victims;
+        victims.reserve(_farCanopyAttachments.size() + _farTerrainMeshes.size() / 4);
+        for (const auto& [key, canopy] : _farCanopyAttachments) {
+            if (key == preserveKey || !canopy.alloc)
+                continue;
+            const ColumnPos coordinate{key.tileX, key.tileZ};
+            const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+            const bool current =
+                displayed != _farTerrainDisplayedByTile.end() && displayed->second == key;
+            const auto transition = _farTerrainTransitions.find(coordinate);
+            const bool transitionEndpoint =
+                transition != _farTerrainTransitions.end() &&
+                (transition->second.from == key || transition->second.to == key);
+            const double distanceSquared = distanceSquaredForKey(key);
+            if (transitionEndpoint || _farTerrainAuthorityTransitions.contains(key)) {
+                continue;
+            }
+            // Canopy is always optional relative to terrain and water. Retire
+            // distant attachments first, but allow even a current nearby
+            // attachment to yield when it is the last way to publish protected
+            // terrain. Its independent queue can rebuild it afterward.
+            victims.push_back({
+                .key = key,
+                .canopy = true,
+                .demoteToParent = false,
+                .retirementClass = static_cast<uint8_t>(current ? 1 : 0),
+                .distanceSquared = distanceSquared,
+                .vertexBytes = alignedArenaBytes(static_cast<uint64_t>(canopy.alloc->vertexCount) *
+                                                 sizeof(Vertex)),
+                .indexBytes = alignedArenaBytes(static_cast<uint64_t>(canopy.alloc->indexCount) *
+                                                sizeof(uint32_t)),
+            });
+        }
+        for (const auto& [key, state] : _farTerrainMeshes) {
+            if (key == preserveKey || !state.uploaded || farTerrainIsBaseStep(key.step))
+                continue;
+            const ColumnPos coordinate{key.tileX, key.tileZ};
+            const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+            const bool isDisplayed =
+                displayed != _farTerrainDisplayedByTile.end() && displayed->second == key;
+            const auto transition = _farTerrainTransitions.find(coordinate);
+            const bool lodTransitionEndpoint =
+                transition != _farTerrainTransitions.end() &&
+                (transition->second.from == key || transition->second.to == key);
+            const bool authorityTransitionEndpoint = _farTerrainAuthorityTransitions.contains(key);
+            const bool protectedClosure = protectedClosureTarget(key);
+            const bool exactFallback = farTerrainRequiresCoverageParent(
+                cameraPosition.x, cameraPosition.z, coordinate, nominalExactBlocks, exactHandoff);
+            const bool nextCritical = farTerrainProtectedNearTargetKey(
+                _farTerrainProtectedNearHandoff.requestedCenter(), key);
+            bool demoteToParent = false;
+            if (isDisplayed) {
+                constexpr std::array<ColumnPos, 4> NEIGHBOR_OFFSETS = {
+                    ColumnPos{1, 0}, ColumnPos{-1, 0}, ColumnPos{0, 1}, ColumnPos{0, -1}};
+                std::array<std::optional<FarTerrainStep>, 4> neighborSteps;
+                bool neighborTransition = false;
+                for (size_t edge = 0; edge < NEIGHBOR_OFFSETS.size(); ++edge) {
+                    const ColumnPos neighbor{coordinate.x + NEIGHBOR_OFFSETS[edge].x,
+                                             coordinate.z + NEIGHBOR_OFFSETS[edge].z};
+                    if (_farTerrainTransitions.contains(neighbor)) {
+                        neighborTransition = true;
+                        continue;
+                    }
+                    if (const auto neighborDisplayed = _farTerrainDisplayedByTile.find(neighbor);
+                        neighborDisplayed != _farTerrainDisplayedByTile.end()) {
+                        neighborSteps[edge] = neighborDisplayed->second.step;
+                    }
+                }
+                const FarTerrainKey parent{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
+                const auto parentResident = _farTerrainMeshes.find(parent);
+                const bool parentReady =
+                    parentResident != _farTerrainMeshes.end() && parentResident->second.uploaded &&
+                    !_farTerrainAuthorityTransitions.contains(parent);
+                demoteToParent = farTerrainDisplayedRefinementMayYieldToParentForNear(
+                    key.step, neighborSteps, parentReady, lodTransitionEndpoint,
+                    neighborTransition, authorityTransitionEndpoint, protectedClosure,
+                    exactFallback, nextCritical);
+            }
+            if (!demoteToParent &&
+                !farTerrainGpuMayEvictForNear(false, isDisplayed, lodTransitionEndpoint,
+                                              authorityTransitionEndpoint, protectedClosure,
+                                              exactFallback, nextCritical)) {
+                continue;
+            }
+            const auto desired = _farTerrainDesiredByTile.find(coordinate);
+            const bool desiredSurface =
+                desired != _farTerrainDesiredByTile.end() && desired->second == key;
+            const bool visible = tileVisibleForScheduling(coordinate);
+            if (desiredSurface && visible && !demoteToParent)
+                continue;
+            const bool wanted = _farTerrainWanted.contains(key);
+            const uint8_t retirementClass = !wanted           ? uint8_t{2}
+                                            : !desiredSurface ? uint8_t{3}
+                                                              : uint8_t{4};
+            victims.push_back({
+                .key = key,
+                .canopy = false,
+                .demoteToParent = demoteToParent,
+                .retirementClass =
+                    static_cast<uint8_t>(demoteToParent ? uint8_t{5} : retirementClass),
+                .distanceSquared = distanceSquaredForKey(key),
+                .vertexBytes = alignedArenaBytes(static_cast<uint64_t>(state.alloc.vertexCount) *
+                                                 sizeof(Vertex)),
+                .indexBytes = alignedArenaBytes(static_cast<uint64_t>(state.alloc.indexCount) *
+                                                sizeof(uint32_t)),
+            });
+        }
+        std::sort(victims.begin(), victims.end(), [](const auto& first, const auto& second) {
+            if (first.retirementClass != second.retirementClass)
+                return first.retirementClass < second.retirementClass;
+            if (first.distanceSquared != second.distanceSquared)
+                return first.distanceSquared > second.distanceSquared;
+            if (first.key.tileX != second.key.tileX)
+                return first.key.tileX < second.key.tileX;
+            if (first.key.tileZ != second.key.tileZ)
+                return first.key.tileZ < second.key.tileZ;
+            return farTerrainStepSize(first.key.step) > farTerrainStepSize(second.key.step);
+        });
+
+        uint64_t reclaimedVertexBytes = 0;
+        uint64_t reclaimedIndexBytes = 0;
+        size_t retired = 0;
+        for (const FarTerrainGpuVictim& victim : victims) {
+            if (reclaimedVertexBytes >= targetVertexBytes &&
+                reclaimedIndexBytes >= targetIndexBytes) {
+                break;
+            }
+            if (victim.canopy) {
+                const auto found = _farCanopyAttachments.find(victim.key);
+                if (found == _farCanopyAttachments.end() || !found->second.alloc)
+                    continue;
+                _farMegaBuffer->deferFree(*found->second.alloc, _frameRing.frameIndex());
+                _farCanopyAttachments.erase(found);
+                clearCanopyFallbackReference(victim.key);
+            } else {
+                const auto found = _farTerrainMeshes.find(victim.key);
+                if (found == _farTerrainMeshes.end() || !found->second.uploaded)
+                    continue;
+                if (victim.demoteToParent) {
+                    const ColumnPos coordinate{victim.key.tileX, victim.key.tileZ};
+                    const FarTerrainKey parent{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
+                    const auto parentResident = _farTerrainMeshes.find(parent);
+                    if (parentResident == _farTerrainMeshes.end() ||
+                        !parentResident->second.uploaded) {
+                        continue;
+                    }
+                    _farTerrainTransitions.erase(coordinate);
+                    _farTerrainDisplayedByTile.insert_or_assign(coordinate, parent);
+                }
+                if (const auto canopy = _farCanopyAttachments.find(victim.key);
+                    canopy != _farCanopyAttachments.end()) {
+                    if (canopy->second.alloc) {
+                        reclaimedVertexBytes += alignedArenaBytes(
+                            static_cast<uint64_t>(canopy->second.alloc->vertexCount) *
+                            sizeof(Vertex));
+                        reclaimedIndexBytes += alignedArenaBytes(
+                            static_cast<uint64_t>(canopy->second.alloc->indexCount) *
+                            sizeof(uint32_t));
+                        _farMegaBuffer->deferFree(*canopy->second.alloc, _frameRing.frameIndex());
+                    }
+                    _farCanopyAttachments.erase(canopy);
+                    clearCanopyFallbackReference(victim.key);
+                }
+                if (_farTerrainWanted.contains(victim.key)) {
+                    if (_farTerrainResidentWantedCount > 0)
+                        --_farTerrainResidentWantedCount;
+                    if (_farTerrainResidentRefinementCount > 0)
+                        --_farTerrainResidentRefinementCount;
+                }
+                _farMegaBuffer->deferFree(found->second.alloc, _frameRing.frameIndex());
+                _farTerrainMeshes.erase(found);
+            }
+            reclaimedVertexBytes += victim.vertexBytes;
+            reclaimedIndexBytes += victim.indexBytes;
+            ++retired;
+        }
+        if (retired != 0) {
+            ++_farTerrainNearArenaReclaimCount;
+            _farTerrainNearArenaReclaimedBytes += reclaimedVertexBytes + reclaimedIndexBytes;
+        }
+        return retired != 0;
+    };
+    auto uploadMesh = [&](const std::shared_ptr<const FarTerrainMesh>& mesh) {
+        if (!mesh || _farTerrainWanted.count(mesh->key) == 0) {
+            return false;
+        }
+        const bool base = farTerrainIsBaseStep(mesh->key.step);
+        auto resident = _farTerrainMeshes.find(mesh->key);
+        FarTerrainUploadAction uploadAction = farTerrainUploadAction(
+            resident == _farTerrainMeshes.end() ? std::nullopt
+                                                : std::optional{resident->second.authorityQuality},
+            mesh->authorityQuality);
+        if (uploadAction == FarTerrainUploadAction::REJECT)
+            return false;
+        const bool replacingPreviewParent =
+            uploadAction == FarTerrainUploadAction::REPLACE_AFTER_UPLOAD;
+        const bool coverageCritical = base && resident == _farTerrainMeshes.end();
+        const ColumnPos coordinate{mesh->key.tileX, mesh->key.tileZ};
+        const std::optional<ColumnPos> protectedCenter =
+            _farTerrainProtectedNearHandoff.statusCenter();
+        const bool protectedClosure =
+            protectedCenter && farTerrainProtectedNearRole(*protectedCenter, coordinate) !=
+                                   FarTerrainProtectedNearRole::NONE;
+        const bool exactFallback = farTerrainRequiresCoverageParent(
+            cameraPosition.x, cameraPosition.z, coordinate, nominalExactBlocks, exactHandoff);
+        const bool localUpload = coordinate == centerTile || protectedClosure || exactFallback ||
+                                 distanceSquaredForKey(mesh->key) <= LOCAL_UPLOAD_RADIUS_SQUARED;
+        const bool criticalRefinement = farTerrainCriticalProtectedRefinement(
+            _farTerrainProtectedNearHandoff.requestedCenter(), mesh->key,
+            mesh->authorityQuality);
+        const bool nearRefinement = !coverageCritical && !criticalRefinement && localUpload;
+        const bool localCriticalCoverage = coverageCritical && localUpload;
+        const auto displayedSurface = _farTerrainDisplayedByTile.find(coordinate);
+        const auto lodTransition = _farTerrainTransitions.find(coordinate);
+        const bool visiblePreviewChildDependsOnParent =
+            base && displayedSurface != _farTerrainDisplayedByTile.end() &&
+            displayedSurface->second != mesh->key &&
+            displayedQualityFor(coordinate, displayedSurface->second.step) ==
+                FarTerrainAuthorityQuality::PREVIEW;
+        const bool replacementIsVisible =
+            drawGeometry &&
+            ((displayedSurface != _farTerrainDisplayedByTile.end() &&
+              displayedSurface->second == mesh->key) ||
+             visiblePreviewChildDependsOnParent ||
+             (lodTransition != _farTerrainTransitions.end() &&
+              (lodTransition->second.from == mesh->key || lodTransition->second.to == mesh->key)));
+        auto previewCanopy = _farCanopyAttachments.end();
+        std::shared_ptr<const FarCanopyAttachment> finalPromotionCanopy;
+        size_t finalPromotionCanopyBytes = 0;
+        FarTerrainWaterPromotionAction waterPromotionAction =
+            FarTerrainWaterPromotionAction::MATCHED_TOPOLOGY_TRANSITION;
+        if (replacingPreviewParent) {
+            if (replacementIsVisible &&
+                (_farTerrainTransitions.contains(coordinate) ||
+                 _farTerrainAuthorityTransitions.contains(mesh->key) ||
+                 _farTerrainTransitions.size() + _farTerrainAuthorityTransitions.size() >=
+                     FAR_TERRAIN_MAX_SIMULTANEOUS_LOD_TRANSITIONS)) {
+                return false;
+            }
+            waterPromotionAction =
+                farTerrainWaterPromotionAction(resident->second.waterTopology, mesh->waterTopology);
+            previewCanopy = _farCanopyAttachments.find(mesh->key);
+            if (waterPromotionAction ==
+                    FarTerrainWaterPromotionAction::MATCHED_TOPOLOGY_TRANSITION &&
+                previewCanopy != _farCanopyAttachments.end() &&
+                farCanopyMatchesSurface(previewCanopy->second.authorityQuality,
+                                        previewCanopy->second.groundingQuality,
+                                        resident->second.authorityQuality)) {
+                // If flora is already visible on the preview surface, promote
+                // its final-grounded counterpart in the same GPU transaction
+                // when it is ready. A bounded optional-lane miss is retried,
+                // but it never delays FINAL terrain or canonical water.
+                finalPromotionCanopy = _farTerrainScheduler->findCachedCanopy(mesh->key);
+                if (!finalPromotionCanopy ||
+                    !farCanopyMatchesSurface(finalPromotionCanopy->authorityQuality,
+                                             finalPromotionCanopy->groundingQuality,
+                                             mesh->authorityQuality)) {
+                    // The completion-time enqueue is bounded and may have
+                    // lost a full-queue race. Retry every visible promotion
+                    // with deterministic highest priority until accepted.
+                    _farTerrainScheduler->enqueueCanopy(mesh->key, 0,
+                                                        FarTerrainAuthorityQuality::FINAL);
+                    finalPromotionCanopy.reset();
+                }
+                if (finalPromotionCanopy &&
+                    !farCanopyAnchorIdentityCompatible(previewCanopy->second.authorityQuality,
+                                                       previewCanopy->second.anchorIdentityHash,
+                                                       finalPromotionCanopy->authorityQuality,
+                                                       finalPromotionCanopy->anchorIdentityHash)) {
+                    const std::string message =
+                        "Far-canopy FINAL promotion changed stable ecology anchors at tile " +
+                        std::to_string(mesh->key.tileX) + "," + std::to_string(mesh->key.tileZ) +
+                        " step " + std::to_string(farTerrainStepSize(mesh->key.step));
+                    if (const auto context = world.generationContext()) {
+                        context->latchFailure({
+                            .code = worldgen::learned::GenerationFailureCode::INFERENCE_FAILED,
+                            .message = message,
+                            .retriable = false,
+                        });
+                    }
+                    if (!uploadFailureLogged) {
+                        RY_LOG_ERROR(message.c_str());
+                        uploadFailureLogged = true;
+                    }
+                    return false;
+                }
+                if (finalPromotionCanopy &&
+                    canopyUploads < FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET) {
+                    finalPromotionCanopyBytes =
+                        finalPromotionCanopy->vertices.size() * sizeof(Vertex) +
+                        finalPromotionCanopy->indices.size() * sizeof(uint32_t);
+                } else {
+                    finalPromotionCanopy.reset();
+                }
+            }
+        }
+        if (!base) {
+            if (!parentAuthorityAllowsDisplayedStep(coordinate, mesh->authorityQuality,
+                                                    mesh->key.step)) {
+                return false;
+            }
+        }
+        size_t& laneUploads = base ? baseUploads : refinementUploads;
+        const size_t laneLimit = exactStreamingBusy
+                                     ? (base ? FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME : size_t{4})
+                                     : (base ? FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME
+                                             : FAR_TERRAIN_MAX_REFINEMENT_UPLOADS_PER_FRAME);
+        if (laneUploads >= laneLimit)
+            return false;
+        const uint64_t vertexBytes = mesh->vertices.size() * sizeof(Vertex);
+        const uint64_t indexBytes = mesh->indices.size() * sizeof(uint32_t);
+        const size_t bytes = vertexBytes + indexBytes;
+        const bool mayConsumeNearUploadReserve = !drawGeometry || localUpload;
+        if (finalPromotionCanopy &&
+            !farTerrainUploadFitsPrioritizedFrameBudget(
+                uploadBytes, bytes + finalPromotionCanopyBytes,
+                FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME,
+                FAR_TERRAIN_NEAR_REFINEMENT_UPLOAD_RESERVE_BYTES, mayConsumeNearUploadReserve)) {
+            // Surface authority has priority over an opportunistic atomic
+            // canopy upload. The cached attachment remains available to the
+            // ordinary optional upload lane after the terrain commit.
+            finalPromotionCanopy.reset();
+            finalPromotionCanopyBytes = 0;
+        }
+        if (!farTerrainUploadFitsPrioritizedFrameBudget(
+                uploadBytes, bytes + finalPromotionCanopyBytes,
+                FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME,
+                FAR_TERRAIN_NEAR_REFINEMENT_UPLOAD_RESERVE_BYTES, mayConsumeNearUploadReserve))
+            return false;
+        const FarTerrainGpuArenaClass arenaClass =
+            criticalRefinement    ? FarTerrainGpuArenaClass::CRITICAL_REFINEMENT
+            : localCriticalCoverage ? FarTerrainGpuArenaClass::CRITICAL_COVERAGE
+            : coverageCritical    ? FarTerrainGpuArenaClass::COVERAGE
+            : nearRefinement ? FarTerrainGpuArenaClass::NEAR_REFINEMENT
+                             : FarTerrainGpuArenaClass::REFINEMENT;
+        if (!farTerrainGpuUploadFitsArena(
+                farArenaVertexUsed, farArenaIndexUsed, _farMegaBuffer->vertexCapacity(),
+                _farMegaBuffer->indexCapacity(), vertexBytes, indexBytes, arenaClass)) {
+            ++_farTerrainArenaAdmissionDeniedCount;
+            if (criticalRefinement || nearRefinement || localCriticalCoverage) {
+                const bool fullArenaAdmission = criticalRefinement || localCriticalCoverage;
+                const uint64_t vertexReserve =
+                    fullArenaAdmission ? uint64_t{0}
+                                       : FAR_TERRAIN_GPU_VERTEX_COVERAGE_RESERVE_BYTES;
+                const uint64_t indexReserve =
+                    fullArenaAdmission ? uint64_t{0}
+                                       : FAR_TERRAIN_GPU_INDEX_COVERAGE_RESERVE_BYTES;
+                const uint64_t vertexLimit =
+                    _farMegaBuffer->vertexCapacity() > vertexReserve
+                        ? _farMegaBuffer->vertexCapacity() - vertexReserve
+                        : uint64_t{0};
+                const uint64_t indexLimit =
+                    _farMegaBuffer->indexCapacity() > indexReserve
+                        ? _farMegaBuffer->indexCapacity() - indexReserve
+                        : uint64_t{0};
+                const uint64_t alignedVertexBytes = alignedArenaBytes(vertexBytes);
+                const uint64_t alignedIndexBytes = alignedArenaBytes(indexBytes);
+                const uint64_t availableVertexBytes =
+                    farArenaVertexUsed < vertexLimit ? vertexLimit - farArenaVertexUsed : 0;
+                const uint64_t availableIndexBytes =
+                    farArenaIndexUsed < indexLimit ? indexLimit - farArenaIndexUsed : 0;
+                const uint64_t requiredVertexBytes = alignedVertexBytes > availableVertexBytes
+                                                         ? alignedVertexBytes - availableVertexBytes
+                                                         : uint64_t{0};
+                const uint64_t requiredIndexBytes = alignedIndexBytes > availableIndexBytes
+                                                        ? alignedIndexBytes - availableIndexBytes
+                                                        : uint64_t{0};
+                reclaimOptionalGpuResidencyForNear(mesh->key, requiredVertexBytes,
+                                                   requiredIndexBytes);
+            }
+            return false;
+        }
+        uint64_t finalCanopyVertexBytes = 0;
+        uint64_t finalCanopyIndexBytes = 0;
+        if (finalPromotionCanopy) {
+            finalCanopyVertexBytes = finalPromotionCanopy->vertices.size() * sizeof(Vertex);
+            finalCanopyIndexBytes = finalPromotionCanopy->indices.size() * sizeof(uint32_t);
+            if (!farTerrainGpuUploadFitsArena(farArenaVertexUsed + alignedArenaBytes(vertexBytes),
+                                              farArenaIndexUsed + alignedArenaBytes(indexBytes),
+                                              _farMegaBuffer->vertexCapacity(),
+                                              _farMegaBuffer->indexCapacity(),
+                                              finalCanopyVertexBytes, finalCanopyIndexBytes,
+                                              FarTerrainGpuArenaClass::FLORA)) {
+                finalPromotionCanopy.reset();
+                finalPromotionCanopyBytes = 0;
+                finalCanopyVertexBytes = 0;
+                finalCanopyIndexBytes = 0;
+                ++_farTerrainArenaAdmissionDeniedCount;
+            }
+        }
+        std::optional<MegaBuffer::ChunkAllocation> allocation;
+        std::optional<MegaBuffer::ChunkAllocation> finalCanopyAllocation;
+        bool stagedAuthorityTransition = false;
+        try {
+            allocation = _farMegaBuffer->allocate(static_cast<uint32_t>(mesh->vertices.size()),
+                                                  static_cast<uint32_t>(mesh->indices.size()));
+            _farMegaBuffer->uploadVertices(mesh->vertices.data(),
+                                           mesh->vertices.size() * sizeof(Vertex), *allocation);
+            _farMegaBuffer->uploadIndices(mesh->indices.data(),
+                                          mesh->indices.size() * sizeof(uint32_t), *allocation);
+            if (finalPromotionCanopy && !finalPromotionCanopy->vertices.empty() &&
+                !finalPromotionCanopy->indices.empty()) {
+                try {
+                    finalCanopyAllocation = _farMegaBuffer->allocate(
+                        static_cast<uint32_t>(finalPromotionCanopy->vertices.size()),
+                        static_cast<uint32_t>(finalPromotionCanopy->indices.size()));
+                    _farMegaBuffer->uploadVertices(finalPromotionCanopy->vertices.data(),
+                                                   finalPromotionCanopy->vertices.size() *
+                                                       sizeof(Vertex),
+                                                   *finalCanopyAllocation);
+                    _farMegaBuffer->uploadIndices(finalPromotionCanopy->indices.data(),
+                                                  finalPromotionCanopy->indices.size() *
+                                                      sizeof(uint32_t),
+                                                  *finalCanopyAllocation);
+                } catch (...) {
+                    // Optional arena pressure cannot reject a valid terrain
+                    // promotion. Release a partial canopy allocation and let
+                    // the ordinary attachment lane retry independently.
+                    if (finalCanopyAllocation)
+                        _farMegaBuffer->free(*finalCanopyAllocation);
+                    finalCanopyAllocation.reset();
+                    finalPromotionCanopy.reset();
+                    finalPromotionCanopyBytes = 0;
+                }
+            }
+            if (!farTerrainUploadCommitAllowed(uploadAction, allocation.has_value()))
+                return false;
+            FarTerrainMeshState state{*allocation,
+                                      mesh->bounds,
+                                      mesh->surfaceBounds,
+                                      mesh->occluderPatches,
+                                      mesh->opaqueIndexCount,
+                                      mesh->complexity,
+                                      mesh->deterministicHash,
+                                      mesh->waterTopology,
+                                      mesh->authorityQuality,
+                                      true,
+                                      mesh->surfaceBoundary,
+                                      mesh->exactAuthorityCompatible};
+            if (replacingPreviewParent && replacementIsVisible) {
+                // Allocate the map node before moving any resident ownership.
+                // After this point the commit consists only of no-allocation
+                // state moves, so an unordered_map failure cannot leave a new
+                // allocation published while the catch path frees it.
+                const auto [transition, inserted] =
+                    _farTerrainAuthorityTransitions.try_emplace(mesh->key);
+                if (!inserted) {
+                    throw std::logic_error("far terrain authority transition already exists");
+                }
+                stagedAuthorityTransition = true;
+                FarTerrainMeshState previewSource = resident->second;
+                std::optional<FarCanopyMeshState> sourceCanopy;
+                if (previewCanopy != _farCanopyAttachments.end() &&
+                    farCanopyMatchesSurface(previewCanopy->second.authorityQuality,
+                                            previewCanopy->second.groundingQuality,
+                                            previewSource.authorityQuality)) {
+                    sourceCanopy.emplace(previewCanopy->second);
+                }
+                const bool hadSourceCanopy = sourceCanopy.has_value();
+                const auto requestedCenter = _farTerrainProtectedNearHandoff.requestedCenter();
+                const FarTerrainProtectedNearRole requestedRole =
+                    requestedCenter ? farTerrainProtectedNearRole(*requestedCenter, coordinate)
+                                    : FarTerrainProtectedNearRole::NONE;
+                const bool pendingProtectedPublication =
+                    requestedCenter && requestedRole != FarTerrainProtectedNearRole::NONE;
+                const double promotionStartedAt =
+                    pendingProtectedPublication ? 0.0 : CACurrentMediaTime();
+                FarTerrainAuthorityTransition promoted{mesh->key, std::move(previewSource),
+                                                       std::move(sourceCanopy), promotionStartedAt,
+                                                       !pendingProtectedPublication};
+                std::optional<FarCanopyMeshState> promotedCanopy;
+                if (finalPromotionCanopy) {
+                    promotedCanopy.emplace(
+                        FarCanopyMeshState{finalCanopyAllocation, finalPromotionCanopy->bounds,
+                                           finalPromotionCanopy->deterministicHash,
+                                           finalPromotionCanopy->anchorIdentityHash,
+                                           finalPromotionCanopy->authorityQuality,
+                                           finalPromotionCanopy->groundingQuality});
+                }
+                resident->second = std::move(state);
+                transition->second = std::move(promoted);
+                if (promotedCanopy) {
+                    previewCanopy->second = std::move(*promotedCanopy);
+                    ++uploads;
+                    ++canopyUploads;
+                    uploadBytes += finalPromotionCanopyBytes;
+                } else if (hadSourceCanopy) {
+                    _farCanopyAttachments.erase(previewCanopy);
+                }
+                stagedAuthorityTransition = false;
+            } else if (replacingPreviewParent) {
+                // A preparation pass or a hidden cached tier has never been
+                // submitted to a gameplay encoder. Replace it atomically
+                // instead of manufacturing a visible preview source whose
+                // later midpoint could cut FINAL exact columns into PREVIEW
+                // terrain on the first scene frame.
+                FarTerrainMeshState previewSource = resident->second;
+                resident->second = std::move(state);
+                if (previewSource.uploaded) {
+                    _farMegaBuffer->deferFree(previewSource.alloc, _frameRing.frameIndex());
+                }
+                if (previewCanopy != _farCanopyAttachments.end()) {
+                    if (previewCanopy->second.alloc) {
+                        _farMegaBuffer->deferFree(*previewCanopy->second.alloc,
+                                                  _frameRing.frameIndex());
+                    }
+                    if (finalPromotionCanopy) {
+                        previewCanopy->second =
+                            FarCanopyMeshState{finalCanopyAllocation,
+                                               finalPromotionCanopy->bounds,
+                                               finalPromotionCanopy->deterministicHash,
+                                               finalPromotionCanopy->anchorIdentityHash,
+                                               finalPromotionCanopy->authorityQuality,
+                                               finalPromotionCanopy->groundingQuality};
+                        ++uploads;
+                        ++canopyUploads;
+                        uploadBytes += finalPromotionCanopyBytes;
+                    } else {
+                        _farCanopyAttachments.erase(previewCanopy);
+                    }
+                }
+            } else {
+                const auto [_, inserted] = _farTerrainMeshes.emplace(mesh->key, std::move(state));
+                if (!inserted) {
+                    _farMegaBuffer->free(*allocation);
+                    return false;
+                }
+                ++_farTerrainResidentWantedCount;
+                if (!base)
+                    ++_farTerrainResidentRefinementCount;
+            }
+            ++uploads;
+            ++laneUploads;
+            uploadBytes += bytes;
+            farArenaVertexUsed += alignedArenaBytes(vertexBytes);
+            farArenaIndexUsed += alignedArenaBytes(indexBytes);
+            if (finalCanopyAllocation) {
+                farArenaVertexUsed += alignedArenaBytes(finalCanopyVertexBytes);
+                farArenaIndexUsed += alignedArenaBytes(finalCanopyIndexBytes);
+            }
+            if (base)
+                _farTerrainDesiredMetricsDirty = true;
+            return true;
+        } catch (const std::exception& error) {
+            if (stagedAuthorityTransition)
+                _farTerrainAuthorityTransitions.erase(mesh->key);
+            if (finalCanopyAllocation)
+                _farMegaBuffer->free(*finalCanopyAllocation);
+            if (allocation)
+                _farMegaBuffer->free(*allocation);
+            if ((criticalRefinement || nearRefinement || localCriticalCoverage) && !allocation) {
+                // Aggregate capacity can still hide per-slab fragmentation.
+                // Retire a candidate-sized optional set and retry only after
+                // the frame ring reports those source allocations complete.
+                reclaimOptionalGpuResidencyForNear(mesh->key, alignedArenaBytes(vertexBytes),
+                                                   alignedArenaBytes(indexBytes));
+            }
+            if (!uploadFailureLogged) {
+                RY_LOG_ERROR((std::string("Far-terrain upload failed: ") + error.what()).c_str());
+                uploadFailureLogged = true;
+            }
+            return false;
+        }
+    };
+
+    auto uploadCanopy = [&](const std::shared_ptr<const FarCanopyAttachment>& attachment) {
+        if (!attachment || _farTerrainWanted.count(attachment->key) == 0 ||
+            canopyUploads >= FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET) {
+            return false;
+        }
+        const auto base = _farTerrainMeshes.find(attachment->key);
+        if (base == _farTerrainMeshes.end() || !base->second.uploaded)
+            return false;
+        auto promotion = _farTerrainAuthorityTransitions.find(attachment->key);
+        const bool targetsSource =
+            promotion != _farTerrainAuthorityTransitions.end() && promotion->second.sourceCanopy &&
+            farCanopyMatchesSurface(attachment->authorityQuality, attachment->groundingQuality,
+                                    promotion->second.source.authorityQuality);
+        const bool targetsResident =
+            farCanopyMatchesSurface(attachment->authorityQuality, attachment->groundingQuality,
+                                    base->second.authorityQuality);
+        if (!targetsSource && !targetsResident)
+            return false;
+
+        auto resident = _farCanopyAttachments.find(attachment->key);
+        FarCanopyMeshState* destination = nullptr;
+        if (targetsSource) {
+            destination =
+                promotion->second.sourceCanopy ? &*promotion->second.sourceCanopy : nullptr;
+        } else if (resident != _farCanopyAttachments.end()) {
+            destination = &resident->second;
+        }
+        const FarCanopyMeshState* counterpart = nullptr;
+        if (targetsSource) {
+            if (resident != _farCanopyAttachments.end())
+                counterpart = &resident->second;
+        } else if (promotion != _farTerrainAuthorityTransitions.end() &&
+                   promotion->second.sourceCanopy) {
+            counterpart = &*promotion->second.sourceCanopy;
+        }
+        const auto compatibleAnchors = [&](const FarCanopyMeshState* candidate) {
+            return !candidate || farCanopyAnchorIdentityCompatible(
+                                     candidate->authorityQuality, candidate->anchorIdentityHash,
+                                     attachment->authorityQuality, attachment->anchorIdentityHash);
+        };
+        if (!compatibleAnchors(destination) || !compatibleAnchors(counterpart)) {
+            const std::string message =
+                "Far-canopy FINAL promotion changed stable ecology anchors at tile " +
+                std::to_string(attachment->key.tileX) + "," +
+                std::to_string(attachment->key.tileZ) + " step " +
+                std::to_string(farTerrainStepSize(attachment->key.step));
+            if (const auto context = world.generationContext()) {
+                context->latchFailure({
+                    .code = worldgen::learned::GenerationFailureCode::INFERENCE_FAILED,
+                    .message = message,
+                    .retriable = false,
+                });
+            }
+            if (!uploadFailureLogged) {
+                RY_LOG_ERROR(message.c_str());
+                uploadFailureLogged = true;
+            }
+            return false;
+        }
+        if (destination &&
+            (!farCanopyMayReplace(destination->authorityQuality, destination->groundingQuality,
+                                  attachment->authorityQuality, attachment->groundingQuality) ||
+             destination->deterministicHash == attachment->deterministicHash)) {
+            return false;
+        }
+        const size_t bytes = attachment->vertices.size() * sizeof(Vertex) +
+                             attachment->indices.size() * sizeof(uint32_t);
+        if (uploadBytes + bytes > FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
+            return false;
+        const uint64_t vertexBytes = attachment->vertices.size() * sizeof(Vertex);
+        const uint64_t indexBytes = attachment->indices.size() * sizeof(uint32_t);
+        if (!farTerrainGpuUploadFitsArena(farArenaVertexUsed, farArenaIndexUsed,
+                                          _farMegaBuffer->vertexCapacity(),
+                                          _farMegaBuffer->indexCapacity(), vertexBytes, indexBytes,
+                                          FarTerrainGpuArenaClass::FLORA)) {
+            ++_farTerrainArenaAdmissionDeniedCount;
+            return false;
+        }
+
+        std::optional<MegaBuffer::ChunkAllocation> allocation;
+        try {
+            if (!attachment->vertices.empty() && !attachment->indices.empty()) {
+                allocation =
+                    _farMegaBuffer->allocate(static_cast<uint32_t>(attachment->vertices.size()),
+                                             static_cast<uint32_t>(attachment->indices.size()));
+                _farMegaBuffer->uploadVertices(attachment->vertices.data(),
+                                               attachment->vertices.size() * sizeof(Vertex),
+                                               *allocation);
+                _farMegaBuffer->uploadIndices(attachment->indices.data(),
+                                              attachment->indices.size() * sizeof(uint32_t),
+                                              *allocation);
+            }
+            FarCanopyMeshState state{allocation,
+                                     attachment->bounds,
+                                     attachment->deterministicHash,
+                                     attachment->anchorIdentityHash,
+                                     attachment->authorityQuality,
+                                     attachment->groundingQuality};
+            if (targetsSource) {
+                if (promotion->second.sourceCanopy && promotion->second.sourceCanopy->alloc) {
+                    _farMegaBuffer->deferFree(*promotion->second.sourceCanopy->alloc,
+                                              _frameRing.frameIndex());
+                }
+                promotion->second.sourceCanopy = std::move(state);
+            } else if (resident != _farCanopyAttachments.end()) {
+                if (resident->second.alloc)
+                    _farMegaBuffer->deferFree(*resident->second.alloc, _frameRing.frameIndex());
+                resident->second = std::move(state);
+            } else {
+                _farCanopyAttachments.emplace(attachment->key, std::move(state));
+            }
+            const ColumnPos coordinate{attachment->key.tileX, attachment->key.tileZ};
+            const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+            if (!_farTerrainTransitions.contains(coordinate) &&
+                displayed != _farTerrainDisplayedByTile.end() &&
+                displayed->second == attachment->key) {
+                // The target is now both drawable and resident. Retire an
+                // older-tier fallback only after this upload has committed,
+                // making the exchange atomic even for an intentionally empty
+                // target attachment.
+                retireCanopyFallback(coordinate, attachment->key);
+            }
+            ++uploads;
+            ++canopyUploads;
+            uploadBytes += bytes;
+            if (allocation) {
+                farArenaVertexUsed += alignedArenaBytes(vertexBytes);
+                farArenaIndexUsed += alignedArenaBytes(indexBytes);
+            }
+            return true;
+        } catch (const std::exception& error) {
+            if (allocation)
+                _farMegaBuffer->free(*allocation);
+            if (!uploadFailureLogged) {
+                RY_LOG_ERROR((std::string("Far-canopy upload failed: ") + error.what()).c_str());
+                uploadFailureLogged = true;
+            }
+            return false;
+        }
+    };
+
+    _farTerrainResults.clear();
+    _farTerrainScheduler->drainCompleted(_farTerrainResults);
+    _farCanopyResults.clear();
+    _farTerrainScheduler->drainCanopyCompleted(_farCanopyResults);
     std::sort(_farTerrainResults.begin(), _farTerrainResults.end(),
               [&](const FarTerrainResult& first, const FarTerrainResult& second) {
                   const bool firstBase = farTerrainIsBaseStep(first.key.step);
@@ -2349,22 +4416,112 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
                       return first.key.tileX < second.key.tileX;
                   if (first.key.tileZ != second.key.tileZ)
                       return first.key.tileZ < second.key.tileZ;
+                  return first.key.step != second.key.step &&
+                         farTerrainStepSize(first.key.step) < farTerrainStepSize(second.key.step);
+              });
+    std::sort(_farCanopyResults.begin(), _farCanopyResults.end(),
+              [&](const FarCanopyResult& first, const FarCanopyResult& second) {
+                  const double firstDistance = distanceSquaredForKey(first.key);
+                  const double secondDistance = distanceSquaredForKey(second.key);
+                  if (firstDistance != secondDistance)
+                      return firstDistance < secondDistance;
+                  if (first.key.tileX != second.key.tileX)
+                      return first.key.tileX < second.key.tileX;
+                  if (first.key.tileZ != second.key.tileZ)
+                      return first.key.tileZ < second.key.tileZ;
                   return farTerrainStepSize(first.key.step) < farTerrainStepSize(second.key.step);
               });
 
-    // CPU completion order cannot bypass the parent lane. Upload every base
-    // result and cached base nearest-first before considering refinements.
+    const auto finalBaseUpgradeNeeded = [&](ColumnPos coordinate) {
+        if (!finalStreamingWorkEnabled)
+            return false;
+        if (farTerrainRequiresCoverageParent(cameraPosition.x, cameraPosition.z, coordinate,
+                                             nominalExactBlocks, exactHandoff)) {
+            return true;
+        }
+        if (std::ranges::any_of(_farTerrainPerceptualFinalRequests, [&](const auto& request) {
+                return request.coordinate == coordinate;
+            })) {
+            return true;
+        }
+        const std::optional<ColumnPos> protectedCenter =
+            _farTerrainProtectedNearHandoff.statusCenter();
+        if (!protectedCenter)
+            return false;
+        const FarTerrainProtectedNearRole role =
+            farTerrainProtectedNearRole(*protectedCenter, coordinate);
+        return role != FarTerrainProtectedNearRole::NONE;
+    };
+    constexpr double LOCAL_BASE_UPLOAD_RADIUS_BLOCKS =
+        FAR_TERRAIN_CONNECTED_REFINEMENT_START_CHUNK_RADIUS * CHUNK_EDGE;
+    constexpr double LOCAL_BASE_UPLOAD_RADIUS_SQUARED =
+        LOCAL_BASE_UPLOAD_RADIUS_BLOCKS * LOCAL_BASE_UPLOAD_RADIUS_BLOCKS;
+    const auto basePrecedesCanopy = [&](FarTerrainKey key) {
+        return !drawGeometry || distanceSquaredForKey(key) <= LOCAL_BASE_UPLOAD_RADIUS_SQUARED ||
+               finalBaseUpgradeNeeded({key.tileX, key.tileZ});
+    };
+    // Selection changes discover their desired-LOD debt later in this pass.
+    // Treat the movement frame as local debt too, so a cached outer parent
+    // cannot flash into view one frame before the nearer queue takes control.
+    const bool ordinaryCoveragePublicationEnabled =
+        !selectionChanged && farTerrainOrdinaryCoverageWorkEnabled(
+                                 drawGeometry, exactStreamingBusy, _farTerrainLocalTerrainDebt);
+    const auto baseResultEligible = [&](const FarTerrainResult& result) {
+        return !result.failed && farTerrainIsBaseStep(result.key.step) && result.mesh &&
+               (result.mesh->authorityQuality != FarTerrainAuthorityQuality::FINAL ||
+                finalBaseUpgradeNeeded({result.key.tileX, result.key.tileZ}));
+    };
+    // CPU completion order cannot bypass a camera-critical parent. During
+    // gameplay, ordinary horizon parents wait until protected FINAL children
+    // have consumed their reserved upload opportunity. Preparation still
+    // spends the complete lane on connected parent coverage.
     for (const FarTerrainResult& result : _farTerrainResults) {
-        if (!result.failed && farTerrainIsBaseStep(result.key.step))
+        if (baseResultEligible(result) &&
+            (!drawGeometry || finalBaseUpgradeNeeded({result.key.tileX, result.key.tileZ}))) {
             uploadMesh(result.mesh);
+        }
     }
+    // A completed final parent upgrades the same GPU key in place. Check
+    // these before missing preview parents so an upload-budget delay cannot
+    // leave a nearby final result hidden behind an older cached preview.
     _farTerrainCachedBaseRequests.clear();
+    _farTerrainMissingBaseRequests.clear();
+    _farTerrainDistantBaseRequests.clear();
     for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
         const FarTerrainKey base{tile.key.tileX, tile.key.tileZ, FAR_TERRAIN_BASE_STEP};
-        if (!isResident(base))
+        const auto resident = _farTerrainMeshes.find(base);
+        if (resident == _farTerrainMeshes.end() || !resident->second.uploaded) {
+            (basePrecedesCanopy(base) ? _farTerrainMissingBaseRequests
+                                      : _farTerrainDistantBaseRequests)
+                .push_back(base);
+        } else if (resident->second.authorityQuality != FarTerrainAuthorityQuality::FINAL &&
+                   finalBaseUpgradeNeeded({base.tileX, base.tileZ})) {
             _farTerrainCachedBaseRequests.push_back(base);
+        }
     }
-    _farTerrainScheduler->findCachedBatch(_farTerrainCachedBaseRequests,
+    _farTerrainScheduler->findCachedBatch(
+        _farTerrainCachedBaseRequests, FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME - baseUploads,
+        _farTerrainCachedMeshes, FarTerrainAuthorityQuality::FINAL);
+    for (const std::shared_ptr<const FarTerrainMesh>& mesh : _farTerrainCachedMeshes) {
+        if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
+            break;
+        uploadMesh(mesh);
+    }
+    // Pull protected FINAL payloads before ordinary missing parents. Their
+    // FINAL parents were handled above, and the near upload reserve exists so
+    // a ready camera surface cannot remain CPU-only behind broad coverage.
+    if (_farTerrainProtectedNearHandoff.statusCenter()) {
+        for (const FarTerrainKey target : _farTerrainConnectedNearPatchTargets) {
+            if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
+                break;
+            std::shared_ptr<const FarTerrainMesh> cached = _farTerrainScheduler->findCached(target);
+            if (cached && cached->authorityQuality != FarTerrainAuthorityQuality::FINAL)
+                cached.reset();
+            if (cached)
+                uploadMesh(cached);
+        }
+    }
+    _farTerrainScheduler->findCachedBatch(_farTerrainMissingBaseRequests,
                                           FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME - baseUploads,
                                           _farTerrainCachedMeshes);
     for (const std::shared_ptr<const FarTerrainMesh>& mesh : _farTerrainCachedMeshes) {
@@ -2372,18 +4529,22 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
             break;
         uploadMesh(mesh);
     }
-
+    _farTerrainFinalBaseRequests.clear();
+    const uint32_t missingFinalHandoffParents =
+        finalStreamingWorkEnabled
+            ? buildFarTerrainFinalParentUpgradeOrder(
+                  _farTerrainCandidates, cameraPosition.x, cameraPosition.z, nominalExactBlocks,
+                  exactHandoff, isFinalResident, _farTerrainFinalBaseRequests)
+            : 0;
     const double lodTimeSeconds = CACurrentMediaTime();
     const auto findNearGrace = [&](ColumnPos coordinate) {
-        return std::find_if(_farTerrainNearGraceStartedAt.begin(),
-                            _farTerrainNearGraceStartedAt.end(),
-                            [&](const auto& entry) { return entry.first == coordinate; });
+        return _farTerrainNearGraceStartedAt.find(coordinate);
     };
     const auto startNearGrace = [&](ColumnPos coordinate) {
         const auto found = findNearGrace(coordinate);
         if (found != _farTerrainNearGraceStartedAt.end())
             return found->second;
-        _farTerrainNearGraceStartedAt.emplace_back(coordinate, lodTimeSeconds);
+        _farTerrainNearGraceStartedAt.emplace(coordinate, lodTimeSeconds);
         return lodTimeSeconds;
     };
     const auto eraseNearGrace = [&](ColumnPos coordinate) {
@@ -2400,11 +4561,18 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
     };
     const auto residentStepMaskFor = [&](ColumnPos coordinate) {
         FarTerrainStepMask mask = 0;
+        if (!isResident({coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP}))
+            return mask;
         for (FarTerrainStep step :
-             {FarTerrainStep::TWO, FarTerrainStep::FOUR, FarTerrainStep::EIGHT,
+             {FarTerrainStep::ONE, FarTerrainStep::TWO, FarTerrainStep::FOUR, FarTerrainStep::EIGHT,
               FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO}) {
-            if (isResident({coordinate.x, coordinate.z, step}))
-                mask |= farTerrainStepMask(step);
+            const auto resident = _farTerrainMeshes.find({coordinate.x, coordinate.z, step});
+            if (resident == _farTerrainMeshes.end() || !resident->second.uploaded ||
+                !parentAuthorityAllowsDisplayedStep(coordinate, resident->second.authorityQuality,
+                                                    step)) {
+                continue;
+            }
+            mask |= farTerrainStepMask(step);
         }
         return mask;
     };
@@ -2419,66 +4587,168 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
                                                 EXPLORATION_BLOCKS, exactHandoff);
     };
     const auto coarsestFallbackFor = [&](ColumnPos coordinate) {
-        if (requiresBlockScaleFallback(coordinate))
-            return FarTerrainStep::TWO;
-        if (requiresFineFallback(coordinate))
-            return FarTerrainStep::EIGHT;
-        return FAR_TERRAIN_BASE_STEP;
+        const auto desired = _farTerrainDesiredByTile.find(coordinate);
+        const FarTerrainStep desiredStep = desired == _farTerrainDesiredByTile.end()
+                                               ? FarTerrainStep::EIGHT
+                                               : desired->second.step;
+        return farTerrainCoarsestDrawableFallback(desiredStep, requiresFineFallback(coordinate),
+                                                  requiresBlockScaleFallback(coordinate));
     };
-    const auto isDrawableCoverageResident = [&](FarTerrainKey base) {
-        if (!isResident(base))
-            return false;
-        const ColumnPos coordinate{base.tileX, base.tileZ};
-        const FarTerrainStep coarsestAllowed = coarsestFallbackFor(coordinate);
-        if (coarsestAllowed == FAR_TERRAIN_BASE_STEP)
-            return true;
-        if (coarsestAllowed == FarTerrainStep::TWO)
-            return isResident({coordinate.x, coordinate.z, FarTerrainStep::TWO});
-        return isResident({coordinate.x, coordinate.z, FarTerrainStep::TWO}) ||
-               isResident({coordinate.x, coordinate.z, FarTerrainStep::FOUR}) ||
-               isResident({coordinate.x, coordinate.z, FarTerrainStep::EIGHT});
+    constexpr std::array<ColumnPos, 4> FAR_TERRAIN_NEIGHBOR_OFFSETS = {
+        ColumnPos{1, 0}, ColumnPos{-1, 0}, ColumnPos{0, 1}, ColumnPos{0, -1}};
+    const auto stepCompatibleAt = [&](ColumnPos coordinate, FarTerrainStep candidate) {
+        std::array<std::optional<FarTerrainStep>, 4> neighborSteps;
+        for (size_t edge = 0; edge < FAR_TERRAIN_NEIGHBOR_OFFSETS.size(); ++edge) {
+            const ColumnPos neighbor{
+                coordinate.x + FAR_TERRAIN_NEIGHBOR_OFFSETS[edge].x,
+                coordinate.z + FAR_TERRAIN_NEIGHBOR_OFFSETS[edge].z,
+            };
+            const auto transition = _farTerrainTransitions.find(neighbor);
+            if (transition != _farTerrainTransitions.end()) {
+                if (!farTerrainStepCompatibleWithNeighbors(
+                        candidate, {transition->second.from.step, transition->second.to.step,
+                                    std::nullopt, std::nullopt})) {
+                    return false;
+                }
+                continue;
+            }
+            const auto displayed = _farTerrainDisplayedByTile.find(neighbor);
+            if (displayed != _farTerrainDisplayedByTile.end() && isResident(displayed->second)) {
+                neighborSteps[edge] = displayed->second.step;
+            }
+        }
+        return farTerrainStepCompatibleWithNeighbors(candidate, neighborSteps);
+    };
+    const auto compatibleInitialStepFor =
+        [&](ColumnPos coordinate, FarTerrainStep coarsestAllowed) -> std::optional<FarTerrainStep> {
+        if (!isResident({coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP}))
+            return std::nullopt;
+        const FarTerrainStepMask readySteps = residentStepMaskFor(coordinate);
+        constexpr std::array CANDIDATES = {
+            FarTerrainStep::ONE,   FarTerrainStep::TWO,     FarTerrainStep::FOUR,
+            FarTerrainStep::EIGHT, FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO,
+        };
+        for (const FarTerrainStep candidate : CANDIDATES) {
+            const auto& requested = _farTerrainProtectedNearHandoff.requestedCenter();
+            const bool protectedTarget =
+                requested && farTerrainProtectedNearRole(*requested, coordinate) !=
+                                 FarTerrainProtectedNearRole::NONE;
+            if (candidate != FAR_TERRAIN_BASE_STEP &&
+                !farTerrainProtectedIntermediateMayDisplay(
+                    protectedTarget, displayedQualityFor(coordinate, candidate))) {
+                // The complete protected FINAL closure remains atomic. A
+                // PREVIEW bridge may still improve the visible surface while
+                // those canonical children build behind it.
+                continue;
+            }
+            if (candidate == FarTerrainStep::ONE) {
+                const auto desired = _farTerrainDesiredByTile.find(coordinate);
+                if (desired == _farTerrainDesiredByTile.end() ||
+                    desired->second.step != FarTerrainStep::ONE) {
+                    continue;
+                }
+            }
+            // A cold step-32 parent is the explicit continuous-coverage
+            // fallback. Its exact-owned columns are clipped in the shader, so
+            // it must not disappear merely because a neighbor has already
+            // reached a finer far tier. Finer replacements still use the
+            // normal compatibility gate.
+            const bool compatible =
+                candidate == FAR_TERRAIN_BASE_STEP || stepCompatibleAt(coordinate, candidate);
+            const auto resident = _farTerrainMeshes.find({coordinate.x, coordinate.z, candidate});
+            if (!parentAuthorityAllowsDisplayedStep(coordinate,
+                                                    resident == _farTerrainMeshes.end()
+                                                        ? FarTerrainAuthorityQuality::FINAL
+                                                        : resident->second.authorityQuality,
+                                                    candidate)) {
+                continue;
+            }
+            if (!isResident({coordinate.x, coordinate.z, candidate}) || !compatible ||
+                !farTerrainDisplayedStepAllowed(candidate, coarsestAllowed, readySteps)) {
+                continue;
+            }
+            return candidate;
+        }
+        return std::nullopt;
     };
     FarTerrainCoverageFrontier parentCoverage =
         farTerrainCoverageFrontier(_farTerrainCandidates, isResident);
-    FarTerrainCoverageFrontier coverage =
-        farTerrainCoverageFrontier(_farTerrainCandidates, isDrawableCoverageResident);
-    // Every connected parent may request its distance-selected child before
-    // the complete 8 km parent disk arrives. The bounded worker lane advances
-    // the 16, 8, 4, and 2-block rings together instead of leaving an empty
-    // middle distance while thousands of horizon parents finish.
-    _farTerrainUrgentRefinementRequests.clear();
-    constexpr size_t MAX_PROGRESSIVE_REQUESTS_PER_TIER = 64;
-    std::array<size_t, 4> progressiveRequestsPerTier{};
-    const auto progressiveTierIndex = [](FarTerrainStep step) -> size_t {
-        switch (step) {
-            case FarTerrainStep::SIXTEEN:
-                return 0;
-            case FarTerrainStep::EIGHT:
-                return 1;
-            case FarTerrainStep::FOUR:
-                return 2;
-            case FarTerrainStep::TWO:
-                return 3;
-            case FarTerrainStep::ONE:
-            case FarTerrainStep::THIRTY_TWO:
-                return 4;
+    const auto protectedNearGeometryStatus = [&] {
+        std::vector<FarTerrainProtectedNearSurface> surfaces;
+        surfaces.reserve(_farTerrainConnectedNearPatchTargets.size());
+        for (const FarTerrainKey target : _farTerrainConnectedNearPatchTargets) {
+            const auto targetSurface = _farTerrainMeshes.find(target);
+            const auto parentSurface =
+                _farTerrainMeshes.find({target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP});
+            if (targetSurface == _farTerrainMeshes.end() || !targetSurface->second.uploaded ||
+                parentSurface == _farTerrainMeshes.end() || !parentSurface->second.uploaded) {
+                continue;
+            }
+            surfaces.push_back({
+                .key = target,
+                .authorityQuality = targetSurface->second.authorityQuality,
+                .parentAuthorityQuality = parentSurface->second.authorityQuality,
+                .exactAuthorityCompatible = targetSurface->second.exactAuthorityCompatible,
+                .surfaceBoundary = targetSurface->second.surfaceBoundary,
+            });
         }
-        return 4;
+        return protectedClosureAnchor
+                   ? farTerrainProtectedNearGeometryStatus(
+                         *protectedClosureAnchor, _farTerrainConnectedNearPatchTargets, surfaces)
+                   : FarTerrainProtectedNearGeometryStatus{};
     };
-    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+    const FarTerrainProtectedNearGeometryStatus protectedStatusBeforeUploads =
+        protectedNearGeometryStatus();
+    const bool protectedNearReadyBeforeUploads = protectedStatusBeforeUploads.ready();
+    const bool requiredProtectedNearWork = farTerrainConnectedRefinementLaneOpen(parentCoverage) &&
+                                           !_farTerrainConnectedNearPatchTargets.empty() &&
+                                           !protectedNearReadyBeforeUploads;
+    const bool missingProtectedCoverageParent =
+        std::ranges::any_of(_farTerrainConnectedNearPatchTargets, [&](FarTerrainKey target) {
+            return !isResident({target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP});
+        });
+    // Exact ownership clips only ready columns from a parent; the same parent
+    // remains the drawable coverage authority for every unresolved column.
+    FarTerrainCoverageFrontier coverage = parentCoverage;
+    // Optional flora stays behind terrain and water. Once the connected prefix
+    // exists, one renewable worker remains available even during exact or
+    // protected debt so a continuously busy terrain pipeline cannot leave
+    // every drawable non-exact surface barren. The second worker waits for
+    // stronger publication debt to clear.
+    const bool canopyConnectedPrefixReady = farTerrainConnectedRefinementLaneOpen(parentCoverage);
+    const bool nearExactPublicationDebt = farTerrainCanopyHasNearExactPublicationDebt(
+        exactStreamingBusy, exactHandoff.distanceBlocks, exactFloraHandoff.distanceBlocks,
+        EXACT_STREAMING_FLORA_PRIORITY_RADIUS_CHUNKS);
+    bool localTerrainDebt = requiredProtectedNearWork || missingProtectedCoverageParent ||
+                            missingFinalHandoffParents != 0;
+    _farTerrainScheduler->setWorkerBudget(
+        farTerrainWorkerBudget(exactStreamingBusy, localTerrainDebt));
+    _farTerrainScheduler->setCanopyWorkerBudget(
+        farTerrainCanopyWorkerBudget(drawGeometry, canopyConnectedPrefixReady,
+                                     localTerrainDebt || nearExactPublicationDebt,
+                                     exactStreamingBusy));
+    _farTerrainUrgentRefinementRequests.clear();
+    const bool ordinaryNearRefinementWorkEnabled = farTerrainOptionalStreamingWorkEnabled(
+        drawGeometry, farTerrainConnectedRefinementLaneOpen(parentCoverage));
+    const bool nearRefinementWorkEnabled =
+        ordinaryNearRefinementWorkEnabled || requiredProtectedNearWork;
+    const std::span<const FarTerrainViewTile> urgentCandidates =
+        nearRefinementWorkEnabled ? std::span<const FarTerrainViewTile>{_farTerrainCandidates}
+                                  : std::span<const FarTerrainViewTile>{};
+    for (const FarTerrainViewTile& tile : urgentCandidates) {
         const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+        const std::optional<FarTerrainStep> protectedStep =
+            farTerrainProtectedNearRequiredStep(_farTerrainProtectedNearHandoff, coordinate);
+        if (!ordinaryNearRefinementWorkEnabled && !protectedStep)
+            continue;
         const bool cameraTile = coordinate == centerTile;
+        const FarTerrainStep residencyTarget = farTerrainResidencyTarget(tile);
         const bool fineFallbackRequired = requiresFineFallback(coordinate);
         const bool blockScaleFallbackRequired = requiresBlockScaleFallback(coordinate);
         if (!cameraTile && !fineFallbackRequired &&
             !farTerrainCoverageDrawEligible(tile.distanceSquared, parentCoverage)) {
             // A same-distance protected tile may follow a ready exact tile in
             // coordinate order, so keep scanning the bounded candidate set.
-            continue;
-        }
-        const size_t tierIndex = progressiveTierIndex(tile.key.step);
-        if (tierIndex >= progressiveRequestsPerTier.size() ||
-            progressiveRequestsPerTier[tierIndex] >= MAX_PROGRESSIVE_REQUESTS_PER_TIER) {
             continue;
         }
         const FarTerrainKey base{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
@@ -2491,7 +4761,7 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
             continue;
         }
         const FarTerrainStep displayed = displayedStepFor(coordinate);
-        if (farTerrainStepSize(displayed) <= farTerrainStepSize(tile.key.step))
+        if (farTerrainStepSize(displayed) <= farTerrainStepSize(residencyTarget))
             continue;
         const bool transitionActive = _farTerrainTransitions.contains(coordinate);
         bool deferIntermediate = !baseResident;
@@ -2503,199 +4773,682 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
                                                          displayed, tile.key.step,
                                                          FarTerrainStep::EIGHT, parentAgeSeconds);
         }
+        const double projectedError =
+            tile.screenErrorMetrics
+                ? farTerrainProjectedDisplayErrorPixels(displayed,
+                                                        displayedQualityFor(coordinate, displayed),
+                                                        *tile.screenErrorMetrics)
+                : 0.0;
+        const FarTerrainStep nextBridge = farTerrainNextDisplayedStep(displayed, residencyTarget);
+        const bool displayableWavefront =
+            protectedStep.has_value() || stepCompatibleAt(coordinate, nextBridge);
         _farTerrainUrgentRefinementRequests.push_back(
-            {coordinate, displayed, tile.key.step, residentStepMaskFor(coordinate),
-             transitionActive, deferIntermediate, fineFallbackRequired,
-             blockScaleFallbackRequired});
-        ++progressiveRequestsPerTier[tierIndex];
+            {coordinate, displayed, residencyTarget, residentStepMaskFor(coordinate),
+             transitionActive, deferIntermediate, fineFallbackRequired, blockScaleFallbackRequired,
+             cameraTile, tileVisibleForScheduling(coordinate), displayableWavefront, projectedError,
+             tile.distanceSquared, protectedStep.has_value()});
     }
+    // Every connected desired-LOD miss is local debt. Finish these requests
+    // nearest-first before expanding the outer parent frontier, not only the
+    // small subset that intersects the exact fallback band.
+    localTerrainDebt = localTerrainDebt || !_farTerrainUrgentRefinementRequests.empty();
+    _farTerrainLocalTerrainDebt = localTerrainDebt;
+    _farTerrainScheduler->setNearFirstWorkEnabled(
+        drawGeometry && (exactStreamingBusy || localTerrainDebt));
+    _farTerrainScheduler->setWorkerBudget(
+        farTerrainWorkerBudget(exactStreamingBusy, localTerrainDebt));
+    _farTerrainScheduler->setCanopyWorkerBudget(
+        farTerrainCanopyWorkerBudget(drawGeometry, canopyConnectedPrefixReady,
+                                     localTerrainDebt || nearExactPublicationDebt,
+                                     exactStreamingBusy));
 
-    // Keep the camera target first, then seed one request from each remaining
-    // tier in coarse-to-fine order. Four refinement workers therefore build a
-    // spatial taper instead of all entering the much slower step-2 ring.
-    size_t promotedRequests = 0;
-    if (const auto camera = std::find_if(
-            _farTerrainUrgentRefinementRequests.begin(), _farTerrainUrgentRefinementRequests.end(),
-            [&](const auto& request) { return request.coordinate == centerTile; });
-        camera != _farTerrainUrgentRefinementRequests.end()) {
-        std::rotate(_farTerrainUrgentRefinementRequests.begin(), camera, std::next(camera));
-        promotedRequests = 1;
-    }
-    for (const FarTerrainStep tier : {FarTerrainStep::SIXTEEN, FarTerrainStep::EIGHT,
-                                      FarTerrainStep::FOUR, FarTerrainStep::TWO}) {
-        if (promotedRequests >= FAR_TERRAIN_MAX_URGENT_REFINEMENTS_IN_FLIGHT)
-            break;
-        const auto firstUnpromoted =
-            _farTerrainUrgentRefinementRequests.begin() +
-            static_cast<std::vector<FarTerrainRefinementCacheRequest>::difference_type>(
-                promotedRequests);
-        const auto tierRequest =
-            std::find_if(firstUnpromoted, _farTerrainUrgentRefinementRequests.end(),
-                         [&](const auto& request) { return request.desired == tier; });
-        if (tierRequest == _farTerrainUrgentRefinementRequests.end())
-            continue;
-        std::rotate(firstUnpromoted, tierRequest, std::next(tierRequest));
-        ++promotedRequests;
-    }
+    // The pure ordering helper ranks the camera and protected handoff first,
+    // followed by the connected neighbor wavefront and largest projected
+    // error. Every admitted request builds an adjacent bridge that can become
+    // displayable instead of seeding fine targets behind coarse neighbors.
+    const size_t sharedTransitionOccupancy =
+        std::min(FAR_TERRAIN_MAX_SIMULTANEOUS_LOD_TRANSITIONS,
+                 _farTerrainTransitions.size() + _farTerrainAuthorityTransitions.size());
     reserveFarTerrainIntermediateTransitionSlots(_farTerrainUrgentRefinementRequests,
-                                                 _farTerrainTransitions.size());
-    _farTerrainScheduler->findFinestCachedBatch(_farTerrainUrgentRefinementRequests,
-                                                FAR_TERRAIN_MAX_URGENT_REFINEMENT_UPLOADS_PER_FRAME,
-                                                _farTerrainCachedMeshes);
-    size_t uploadedProgressiveIntermediates = 0;
-    for (const std::shared_ptr<const FarTerrainMesh>& mesh : _farTerrainCachedMeshes) {
-        if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
-            break;
-        if (!uploadMesh(mesh))
-            continue;
-        const ColumnPos coordinate{mesh->key.tileX, mesh->key.tileZ};
-        const auto desired = _farTerrainDesiredByTile.find(coordinate);
-        if (desired != _farTerrainDesiredByTile.end() && desired->second.step != mesh->key.step) {
-            ++uploadedProgressiveIntermediates;
-        }
+                                                 sharedTransitionOccupancy);
+    buildFarTerrainProgressiveSubmissionOrder(_farTerrainUrgentRefinementRequests,
+                                              _farTerrainUrgentRefinementKeys,
+                                              FAR_TERRAIN_MAX_PROGRESSIVE_PLANNER_RESULTS);
+    _farTerrainRefinementSubmissionKeys.clear();
+    for (const FarTerrainKey key : _farTerrainUrgentRefinementKeys) {
+        if (!predictedOnlyTarget(key))
+            _farTerrainRefinementSubmissionKeys.push_back(key);
     }
-
-    // The broad optional lane begins after the complete visible parent disk is
-    // GPU resident. Connected targets and near fallbacks above already advance
-    // within the visible prefix. Once coverage completes, one cache lock
-    // selects the finest useful results for this broader upload lane. A fresh
-    // nearby parent gets 120 ms for its selected target to arrive, but a ready
-    // step-2 result bypasses that grace immediately.
-    const size_t refinementLaneLimit =
-        exactStreamingBusy ? size_t{4} : FAR_TERRAIN_MAX_REFINEMENT_UPLOADS_PER_FRAME;
-    _farTerrainCachedRefinementRequests.clear();
-    if (farTerrainRefinementLaneOpen(parentCoverage, true)) {
-        for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
-            const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
-            const FarTerrainStep displayed = displayedStepFor(coordinate);
-            const bool fineFallbackRequired = requiresFineFallback(coordinate);
-            const bool blockScaleFallbackRequired = requiresBlockScaleFallback(coordinate);
-            float parentAgeSeconds = std::numeric_limits<float>::infinity();
-            if (!fineFallbackRequired && displayed == FAR_TERRAIN_BASE_STEP &&
-                tile.key.step == FarTerrainStep::TWO &&
-                !_farTerrainTransitions.contains(coordinate)) {
-                parentAgeSeconds = static_cast<float>(lodTimeSeconds - startNearGrace(coordinate));
-            } else {
-                eraseNearGrace(coordinate);
-            }
-            const bool deferIntermediate = farTerrainDeferNearIntermediate(
-                displayed, tile.key.step, FarTerrainStep::EIGHT, parentAgeSeconds);
-            _farTerrainCachedRefinementRequests.push_back(
-                {coordinate, displayed, tile.key.step, residentStepMaskFor(coordinate),
-                 _farTerrainTransitions.contains(coordinate), deferIntermediate,
-                 fineFallbackRequired, blockScaleFallbackRequired});
-        }
-    }
-    std::erase_if(_farTerrainNearGraceStartedAt, [&](const auto& entry) {
-        return !_farTerrainActiveTiles.contains(entry.first) ||
-               !isResident({entry.first.x, entry.first.z, FAR_TERRAIN_BASE_STEP});
-    });
-    reserveFarTerrainIntermediateTransitionSlots(_farTerrainCachedRefinementRequests,
-                                                 _farTerrainTransitions.size() +
-                                                     uploadedProgressiveIntermediates);
-    _farTerrainScheduler->findFinestCachedBatch(_farTerrainCachedRefinementRequests,
-                                                refinementLaneLimit - refinementUploads,
-                                                _farTerrainCachedMeshes);
+    _farTerrainScheduler->findCachedBatch(_farTerrainRefinementSubmissionKeys,
+                                          FAR_TERRAIN_MAX_URGENT_REFINEMENT_UPLOADS_PER_FRAME,
+                                          _farTerrainCachedMeshes);
     for (const std::shared_ptr<const FarTerrainMesh>& mesh : _farTerrainCachedMeshes) {
         if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
             break;
         uploadMesh(mesh);
     }
 
-    parentCoverage = farTerrainCoverageFrontier(_farTerrainCandidates, isResident);
-    coverage = farTerrainCoverageFrontier(_farTerrainCandidates, isDrawableCoverageResident);
-
-    // Submission is nearest-first and bounded inside the scheduler. Seed the
-    // parent lane before urgent work so a frame-boundary queue drain cannot
-    // let every utility worker enter a long refinement. The scheduler keeps
-    // four workers on connected coverage and permits four progressive
-    // selected targets to advance at the same time.
-    size_t refinementOffset = 0;
-    size_t baseSubmissions = 0;
-    constexpr size_t MAX_BASE_SUBMISSIONS_PER_FRAME = 64;
-    for (; refinementOffset < _farTerrainPriorityOrder.size(); ++refinementOffset) {
-        const FarTerrainKey key = _farTerrainPriorityOrder[refinementOffset];
-        if (!farTerrainIsBaseStep(key.step))
-            break;
-        if (isResident(key))
-            continue;
-        if (_farTerrainScheduler->hasSubmissionCapacity()) {
-            _farTerrainScheduler->enqueue(key, static_cast<uint32_t>(refinementOffset * 8));
-            ++baseSubmissions;
+    // Build the optional lane from every drawable surface. PREVIEW ecology may
+    // publish immediately while the same parked job converges on FINAL. Its
+    // geometry grounds against the displayed PREVIEW or FINAL payload. A
+    // bounded nearest-first insertion keeps this pass linear in the displayed
+    // set, and the scheduler receives absolute block distance rather than a
+    // rotating batch-local rank. One ready attachment gets an upload
+    // opportunity after protected and urgent local terrain but before
+    // movement-edge bases and broad refinements.
+    _farTerrainCanopyRefreshRequests.clear();
+    _farTerrainCanopyRefreshKeys.clear();
+    _farTerrainCachedCanopies.clear();
+    if (drawGeometry) {
+        buildFarTerrainCanopyRefreshBatch(
+            _farTerrainDisplayedByTile, _farTerrainTransitions, _farTerrainMeshes,
+            _farCanopyAttachments, cameraPosition.x, cameraPosition.z,
+            FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET, _farTerrainCanopyRefreshRequests,
+            &exactFloraHandoff);
+        for (const FarTerrainCanopyRefreshRequest& request : _farTerrainCanopyRefreshRequests)
+            _farTerrainCanopyRefreshKeys.push_back(request.key);
+        _farTerrainScheduler->findCachedCanopyBatch(_farTerrainCanopyRefreshKeys,
+                                                    _farTerrainCanopyRefreshKeys.size(),
+                                                    _farTerrainCachedCanopies);
+    }
+    const auto readyCanopyFor = [&](FarTerrainKey key, FarTerrainAuthorityQuality groundingQuality)
+        -> std::shared_ptr<const FarCanopyAttachment> {
+        std::shared_ptr<const FarCanopyAttachment> best;
+        const auto prefer = [&](const std::shared_ptr<const FarCanopyAttachment>& candidate) {
+            if (!candidate || candidate->key != key ||
+                candidate->groundingQuality != groundingQuality)
+                return;
+            if (!best ||
+                farTerrainAuthoritySatisfies(candidate->authorityQuality, best->authorityQuality)) {
+                best = candidate;
+            }
+        };
+        for (const FarCanopyResult& result : _farCanopyResults) {
+            if (result.key == key && !result.failed && result.attachment)
+                prefer(result.attachment);
         }
-        ++refinementOffset;
-        break;
+        for (const std::shared_ptr<const FarCanopyAttachment>& attachment :
+             _farTerrainCachedCanopies) {
+            prefer(attachment);
+        }
+        return best;
+    };
+    std::optional<FarTerrainKey> earlyCanopyUpload;
+    for (const FarTerrainCanopyRefreshRequest& request : _farTerrainCanopyRefreshRequests) {
+        const std::shared_ptr<const FarCanopyAttachment> attachment =
+            readyCanopyFor(request.key, request.groundingQuality);
+        if (attachment && uploadCanopy(attachment)) {
+            earlyCanopyUpload = request.key;
+            break;
+        }
+    }
+    for (const FarTerrainCanopyRefreshRequest& request : _farTerrainCanopyRefreshRequests) {
+        _farTerrainScheduler->enqueueCanopy(request.key, request.viewPriority,
+                                            request.groundingQuality);
+    }
+    // Start the grounded successor before a requested surface promotion
+    // reaches the upload lane. The queued-job coalescer preserves the current
+    // PREVIEW-grounded publication first, then retargets its parked FINAL
+    // retry. This prewarm is optional, bounded, and cannot consume terrain or
+    // water scheduler capacity.
+    size_t finalGroundingPrewarms = 0;
+    for (const FarTerrainRefinementCacheRequest& finalRequest :
+         _farTerrainPerceptualFinalRequests) {
+        if (finalGroundingPrewarms >= FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET)
+            break;
+        const auto displayed = _farTerrainDisplayedByTile.find(finalRequest.coordinate);
+        if (displayed == _farTerrainDisplayedByTile.end())
+            continue;
+        if (exactFloraHandoff.tileFullyOwned(finalRequest.coordinate))
+            continue;
+        const auto resident = _farTerrainMeshes.find(displayed->second);
+        if (resident == _farTerrainMeshes.end() || !resident->second.uploaded ||
+            resident->second.authorityQuality != FarTerrainAuthorityQuality::PREVIEW) {
+            continue;
+        }
+        const uint32_t priority = static_cast<uint32_t>(
+            std::min(std::sqrt(finalRequest.distanceSquaredBlocks),
+                     static_cast<double>(std::numeric_limits<uint32_t>::max())));
+        _farTerrainScheduler->enqueueCanopy(displayed->second, priority,
+                                            FarTerrainAuthorityQuality::FINAL);
+        ++finalGroundingPrewarms;
+    }
+    if (const std::optional<ColumnPos> protectedCenter =
+            _farTerrainProtectedNearHandoff.statusCenter()) {
+        for (const FarTerrainCanopyRefreshRequest& request : _farTerrainCanopyRefreshRequests) {
+            if (finalGroundingPrewarms >= FAR_TERRAIN_CANOPY_REFRESH_REQUEST_BUDGET)
+                break;
+            if (request.groundingQuality != FarTerrainAuthorityQuality::PREVIEW ||
+                exactFloraHandoff.tileFullyOwned(
+                    {request.key.tileX, request.key.tileZ}) ||
+                farTerrainProtectedNearRole(*protectedCenter,
+                                            {request.key.tileX, request.key.tileZ}) ==
+                    FarTerrainProtectedNearRole::NONE) {
+                continue;
+            }
+            _farTerrainScheduler->enqueueCanopy(request.key, request.viewPriority,
+                                                FarTerrainAuthorityQuality::FINAL);
+            ++finalGroundingPrewarms;
+        }
     }
 
+    // Gameplay already owns a connected nearby surface. Movement-edge parent
+    // results remain coverage work, but they cannot consume the sole frame
+    // opportunity for a ready nearby attachment.
+    for (const FarTerrainResult& result : _farTerrainResults) {
+        if (ordinaryCoveragePublicationEnabled && baseResultEligible(result) &&
+            !basePrecedesCanopy(result.key)) {
+            if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
+                break;
+            uploadMesh(result.mesh);
+        }
+    }
+    _farTerrainScheduler->findCachedBatch(
+        ordinaryCoveragePublicationEnabled
+            ? std::span<const FarTerrainKey>{_farTerrainDistantBaseRequests}
+            : std::span<const FarTerrainKey>{},
+        FAR_TERRAIN_MAX_BASE_UPLOADS_PER_FRAME - baseUploads, _farTerrainCachedMeshes);
+    for (const std::shared_ptr<const FarTerrainMesh>& mesh : _farTerrainCachedMeshes) {
+        if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
+            break;
+        uploadMesh(mesh);
+    }
+
+    // The broad optional lane reuses the same bounded, ranked keys after the
+    // urgent upload pass. Rebuilding a second 3,336-request vector provided no
+    // additional scheduler capacity and dominated settled planner time.
+    const size_t refinementLaneLimit =
+        exactStreamingBusy ? size_t{4} : FAR_TERRAIN_MAX_REFINEMENT_UPLOADS_PER_FRAME;
+    std::erase_if(_farTerrainNearGraceStartedAt, [&](const auto& entry) {
+        return !_farTerrainActiveTiles.contains(entry.first) ||
+               !isResident({entry.first.x, entry.first.z, FAR_TERRAIN_BASE_STEP});
+    });
+    _farTerrainRefinementSubmissionKeys.clear();
+    if (drawGeometry && farTerrainRefinementLaneOpen(parentCoverage, true)) {
+        for (const FarTerrainKey key : _farTerrainUrgentRefinementKeys) {
+            if (!isResident(key) && !predictedOnlyTarget(key))
+                _farTerrainRefinementSubmissionKeys.push_back(key);
+        }
+    }
+    _farTerrainScheduler->findCachedBatch(_farTerrainRefinementSubmissionKeys,
+                                          refinementLaneLimit - refinementUploads,
+                                          _farTerrainCachedMeshes);
+    for (const std::shared_ptr<const FarTerrainMesh>& mesh : _farTerrainCachedMeshes) {
+        if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
+            break;
+        uploadMesh(mesh);
+    }
+
+    // A final refinement has the same geometric key as its preview payload,
+    // so it is not a new transition target. Apply cached upgrades only after
+    // all useful preview bridges have had first claim on this frame's upload
+    // lane, then swap the complete allocation atomically.
+    _farTerrainFinalRefinementRequests.clear();
+    if (drawGeometry) {
+        for (const FarTerrainRefinementCacheRequest& request : _farTerrainPerceptualFinalRequests) {
+            const ColumnPos coordinate = request.coordinate;
+            if (_farTerrainTransitions.contains(coordinate))
+                continue;
+            const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+            if (displayed == _farTerrainDisplayedByTile.end() ||
+                farTerrainIsBaseStep(displayed->second.step)) {
+                continue;
+            }
+            const FarTerrainKey key = displayed->second;
+            if (predictedOnlyTarget(key))
+                continue;
+            const auto resident = _farTerrainMeshes.find(key);
+            if (resident == _farTerrainMeshes.end() || !resident->second.uploaded ||
+                resident->second.authorityQuality != FarTerrainAuthorityQuality::PREVIEW ||
+                !isFinalBaseResident(coordinate)) {
+                continue;
+            }
+            _farTerrainFinalRefinementRequests.push_back(key);
+        }
+    }
+    _farTerrainScheduler->findCachedBatch(
+        _farTerrainFinalRefinementRequests, refinementLaneLimit - refinementUploads,
+        _farTerrainCachedMeshes, FarTerrainAuthorityQuality::FINAL);
+    for (const std::shared_ptr<const FarTerrainMesh>& mesh : _farTerrainCachedMeshes) {
+        if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
+            break;
+        uploadMesh(mesh);
+    }
+
+    // Additional ready attachments may consume capacity left after terrain and
+    // water. The early opportunity above is the only capacity ordering change;
+    // every other canopy remains strictly optional.
+    if (drawGeometry) {
+        for (const FarTerrainCanopyRefreshRequest& request : _farTerrainCanopyRefreshRequests) {
+            if (earlyCanopyUpload && request.key == *earlyCanopyUpload)
+                continue;
+            if (uploadBytes >= FAR_TERRAIN_MAX_UPLOAD_BYTES_PER_FRAME)
+                break;
+            if (const std::shared_ptr<const FarCanopyAttachment> attachment =
+                    readyCanopyFor(request.key, request.groundingQuality)) {
+                uploadCanopy(attachment);
+            }
+        }
+    }
+
+    const auto farPlannerPublicationCompletedAt = std::chrono::steady_clock::now();
+
+    // Submission is nearest-first and bounded inside the scheduler. During
+    // preparation, connected PREVIEW coverage and the protected FINAL closure
+    // share the hard-priority lane. Ordinary refinement remains gameplay-only.
+    const std::optional<ColumnPos> currentProtectedCenter =
+        _farTerrainProtectedNearHandoff.statusCenter();
     size_t urgentRefinementSubmissions = 0;
-    buildFarTerrainProgressiveSubmissionOrder(_farTerrainUrgentRefinementRequests,
-                                              _farTerrainUrgentRefinementKeys);
+    size_t baseSubmissions = 0;
+    constexpr size_t MAX_BASE_SUBMISSIONS_PER_FRAME = 64;
+    const bool ordinaryCoverageWorkEnabled = farTerrainOrdinaryCoverageWorkEnabled(
+        drawGeometry, exactStreamingBusy, localTerrainDebt);
+    // A missing parent in the current protected closure is the player's only
+    // continuous fallback. Promote or admit it through the critical coverage
+    // lane before the ordinary horizon scan, including when that scan already
+    // parked its previous request at the nonurgent cap.
+    if (currentProtectedCenter) {
+        for (size_t index = 0;
+             index < _farTerrainConnectedNearPatchTargets.size() &&
+             urgentRefinementSubmissions <
+                 FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
+             _farTerrainScheduler->hasUrgentRefinementCapacity();
+             ++index) {
+            const FarTerrainKey target = _farTerrainConnectedNearPatchTargets[index];
+            const FarTerrainKey parent{target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP};
+            if (isResident(parent))
+                continue;
+            if (_farTerrainScheduler->enqueueUrgentCoverage(
+                    parent, static_cast<uint32_t>(std::min<size_t>(index * 8, UINT32_MAX)))) {
+                ++urgentRefinementSubmissions;
+                ++baseSubmissions;
+            }
+        }
+    }
+
+    size_t refinementOffset = 0;
+    if (ordinaryCoverageWorkEnabled) {
+        for (; refinementOffset < _farTerrainPriorityOrder.size(); ++refinementOffset) {
+            const FarTerrainKey key = _farTerrainPriorityOrder[refinementOffset];
+            if (!farTerrainIsBaseStep(key.step))
+                break;
+            if (isResident(key))
+                continue;
+            if (currentProtectedCenter &&
+                farTerrainProtectedNearRole(*currentProtectedCenter, {key.tileX, key.tileZ}) !=
+                    FarTerrainProtectedNearRole::NONE) {
+                continue;
+            }
+            if (_farTerrainScheduler->hasSubmissionCapacity()) {
+                if (_farTerrainScheduler->enqueue(key,
+                                                  static_cast<uint32_t>(refinementOffset * 8))) {
+                    ++baseSubmissions;
+                }
+            }
+            ++refinementOffset;
+            break;
+        }
+    }
+
+    // The complete protected representation is one FINAL publication unit.
+    // Every one of its 60 parents remains drawable as PREVIEW until the
+    // corresponding FINAL parent and child are complete. Submit drawable
+    // FINAL children first because they directly retire near-player terrain
+    // debt. A child without a provisional bridge remains deferred until the
+    // bounded prerequisite lane below creates one.
+    if (finalStreamingWorkEnabled && _farTerrainProtectedNearHandoff.statusCenter()) {
+        for (size_t index = 0; index < _farTerrainConnectedNearPatchTargets.size() &&
+                               urgentRefinementSubmissions <
+                                   FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
+                               _farTerrainScheduler->hasUrgentRefinementCapacity();
+            ++index) {
+            const FarTerrainKey target = _farTerrainConnectedNearPatchTargets[index];
+            const FarTerrainKey parent{target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP};
+            const auto displayed = _farTerrainDisplayedByTile.find({target.tileX, target.tileZ});
+            const bool provisionalBridgeDisplayed =
+                displayed != _farTerrainDisplayedByTile.end() &&
+                !farTerrainIsBaseStep(displayed->second.step);
+            if (!farTerrainProtectedFinalTargetMaySubmit(
+                    isFinalResident(target), provisionalBridgeDisplayed,
+                    isFinalResident(parent))) {
+                // At least one provisional bridge becomes drawable before
+                // this coordinate spends capacity on its hidden FINAL target,
+                // unless a FINAL parent has already made that PREVIEW bridge
+                // authority-incompatible. In that state, build the FINAL child
+                // directly and retain atomic publication of the full closure.
+                continue;
+            }
+            const uint32_t priority =
+                static_cast<uint32_t>(std::min<size_t>(index * 8, UINT32_MAX));
+            if (_farTerrainScheduler->enqueueUrgentFinalRefinement(target, priority, true))
+                ++urgentRefinementSubmissions;
+        }
+    }
+    const auto missingCurrentProtectedBridge = [&](FarTerrainKey bridge) {
+        return bridge.step != FarTerrainStep::ONE && currentProtectedCenter &&
+               farTerrainProtectedNearRole(*currentProtectedCenter,
+                                           {bridge.tileX, bridge.tileZ}) !=
+                   FarTerrainProtectedNearRole::NONE &&
+               !isResident(bridge);
+    };
+    const bool protectedBridgePrerequisiteRequired =
+        std::ranges::any_of(_farTerrainUrgentRefinementKeys, missingCurrentProtectedBridge);
+    const size_t protectedFinalSubmissionFloor = farTerrainProtectedFinalSubmissionFloor(
+        FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME,
+        protectedBridgePrerequisiteRequired);
+    size_t protectedFinalParentScan = 0;
+    const auto submitCurrentFinalParentsUntil = [&](size_t submissionLimit) {
+        for (; finalStreamingWorkEnabled &&
+               protectedFinalParentScan < _farTerrainConnectedNearPatchTargets.size() &&
+               urgentRefinementSubmissions < submissionLimit &&
+               _farTerrainScheduler->hasUrgentRefinementCapacity();
+             ++protectedFinalParentScan) {
+            const size_t index = protectedFinalParentScan;
+            const FarTerrainKey target = _farTerrainConnectedNearPatchTargets[index];
+            const FarTerrainKey parent{target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP};
+            if (!isResident(parent) || isFinalResident(parent))
+                continue;
+            if (_farTerrainScheduler->enqueueFinalBase(
+                    parent, static_cast<uint32_t>(std::min<size_t>(index * 8, UINT32_MAX)), true)) {
+                ++urgentRefinementSubmissions;
+            }
+        }
+    };
+    // Reserve at most one third of a cold frame for the PREVIEW bridges that
+    // make later FINAL children displayable. Canonical FINAL work therefore
+    // always receives the first and largest share of current closure capacity.
+    submitCurrentFinalParentsUntil(protectedFinalSubmissionFloor);
+    size_t protectedBridgeSubmissions = 0;
     for (size_t index = 0;
          index < _farTerrainUrgentRefinementKeys.size() &&
+         protectedBridgeSubmissions < FAR_TERRAIN_MAX_PROTECTED_BRIDGE_SUBMISSIONS_PER_FRAME &&
          urgentRefinementSubmissions < FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
          _farTerrainScheduler->hasUrgentRefinementCapacity();
          ++index) {
-        const FarTerrainKey target = _farTerrainUrgentRefinementKeys[index];
-        if (isResident(target))
+        const FarTerrainKey bridge = _farTerrainUrgentRefinementKeys[index];
+        if (!missingCurrentProtectedBridge(bridge))
             continue;
         if (_farTerrainScheduler->enqueueUrgentRefinement(
-                target, static_cast<uint32_t>(std::min<size_t>(index * 8, UINT32_MAX)))) {
+                bridge, static_cast<uint32_t>(std::min<size_t>(index * 8, UINT32_MAX)), true)) {
+            ++protectedBridgeSubmissions;
             ++urgentRefinementSubmissions;
         }
     }
+    // If prerequisites were already queued or cached, return their unused
+    // reservation to current FINAL parents before any directional prediction.
+    submitCurrentFinalParentsUntil(FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME);
+    // Directional preparation uses only capacity left after the complete
+    // current closure has submitted its parents and children. Results remain
+    // in the CPU cache. They are intentionally absent from connected targets,
+    // upload lists, GPU residency, display state, and closure statistics until
+    // the canonical half-tile anchor actually advances.
+    size_t predictedProtectedSubmissions = 0;
+    const auto predictedSubmissionPriority = [&](size_t index) {
+        const size_t currentOffset =
+            _farTerrainConnectedNearPatchTargets.size() * static_cast<size_t>(8);
+        return static_cast<uint32_t>(
+            std::min(currentOffset + index * static_cast<size_t>(8),
+                     static_cast<size_t>(UINT32_MAX)));
+    };
+    for (size_t index = 0;
+         index < _farTerrainPredictedNearPatchTargets.size() &&
+         predictedProtectedSubmissions <
+             FAR_TERRAIN_MAX_PROTECTED_PREDICTION_SUBMISSIONS_PER_FRAME &&
+         urgentRefinementSubmissions < FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
+         _farTerrainScheduler->hasUrgentRefinementCapacity();
+         ++index) {
+        const FarTerrainKey target = _farTerrainPredictedNearPatchTargets[index];
+        const FarTerrainKey parent{target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP};
+        if (!isResident(parent) || isFinalResident(parent))
+            continue;
+        if (_farTerrainScheduler->enqueueFinalBase(parent, predictedSubmissionPriority(index),
+                                                   true)) {
+            ++predictedProtectedSubmissions;
+            ++urgentRefinementSubmissions;
+        }
+    }
+    for (size_t index = 0;
+         index < _farTerrainPredictedNearPatchTargets.size() &&
+         predictedProtectedSubmissions <
+             FAR_TERRAIN_MAX_PROTECTED_PREDICTION_SUBMISSIONS_PER_FRAME &&
+         urgentRefinementSubmissions < FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
+         _farTerrainScheduler->hasUrgentRefinementCapacity();
+         ++index) {
+        const FarTerrainKey target = _farTerrainPredictedNearPatchTargets[index];
+        const FarTerrainKey parent{target.tileX, target.tileZ, FAR_TERRAIN_BASE_STEP};
+        const std::shared_ptr<const FarTerrainMesh> cachedParent =
+            _farTerrainScheduler->findCached(parent);
+        if (!isFinalResident(parent) &&
+            (!cachedParent ||
+             cachedParent->authorityQuality != FarTerrainAuthorityQuality::FINAL)) {
+            continue;
+        }
+        if (_farTerrainScheduler->enqueueUrgentFinalRefinement(
+                target, predictedSubmissionPriority(index), true)) {
+            ++predictedProtectedSubmissions;
+            ++urgentRefinementSubmissions;
+        }
+    }
+    // Admit ready same-key FINAL children before adding another wave of proxy
+    // bridges. Four bounded slots let canonical learned detail advance even
+    // while four FINAL parents remain parked and the visible horizon still
+    // contains more proxy candidates than the queue can hold.
+    constexpr size_t MAX_VISIBLE_FINAL_CHILD_SUBMISSIONS_PER_FRAME = 4;
+    size_t visibleFinalChildSubmissions = 0;
+    for (size_t index = 0;
+         drawGeometry && index < _farTerrainFinalRefinementRequests.size() &&
+         visibleFinalChildSubmissions < MAX_VISIBLE_FINAL_CHILD_SUBMISSIONS_PER_FRAME &&
+         urgentRefinementSubmissions < FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME &&
+         _farTerrainScheduler->hasUrgentRefinementCapacity();
+         ++index) {
+        const FarTerrainKey target = _farTerrainFinalRefinementRequests[index];
+        const ColumnPos coordinate{target.tileX, target.tileZ};
+        const bool cameraNearCritical =
+            coordinate == centerTile || requiresFineFallback(coordinate);
+        const uint32_t priority = static_cast<uint32_t>(std::min<size_t>(index, UINT32_MAX));
+        const bool enqueued =
+            requiresFineFallback(coordinate)
+                ? _farTerrainScheduler->enqueueUrgentFinalRefinement(target, priority, true)
+                : _farTerrainScheduler->enqueueFinalRefinement(target, priority,
+                                                               cameraNearCritical);
+        if (enqueued) {
+            ++visibleFinalChildSubmissions;
+            ++urgentRefinementSubmissions;
+        }
+    }
+    constexpr size_t MAX_VISIBLE_FINAL_PARENT_SUBMISSIONS_PER_FRAME = 4;
+    size_t visibleFinalParentSubmissions = 0;
+    const size_t proxyBridgeSubmissionLimit =
+        FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME -
+        (_farTerrainPerceptualFinalRequests.empty()
+             ? size_t{0}
+             : MAX_VISIBLE_FINAL_PARENT_SUBMISSIONS_PER_FRAME);
+    for (size_t index = 0; index < _farTerrainUrgentRefinementKeys.size() &&
+                           urgentRefinementSubmissions < proxyBridgeSubmissionLimit &&
+                           _farTerrainScheduler->hasUrgentRefinementCapacity();
+         ++index) {
+        const FarTerrainKey target = _farTerrainUrgentRefinementKeys[index];
+        const ColumnPos coordinate{target.tileX, target.tileZ};
+        const std::optional<ColumnPos> protectedCenter =
+            _farTerrainProtectedNearHandoff.statusCenter();
+        const FarTerrainProtectedNearRole protectedRole =
+            protectedCenter ? farTerrainProtectedNearRole(*protectedCenter, coordinate)
+                            : FarTerrainProtectedNearRole::NONE;
+        const bool protectedNearTarget = protectedRole != FarTerrainProtectedNearRole::NONE;
+        const std::optional<FarTerrainStep> protectedStep =
+            farTerrainProtectedNearRequiredStep(_farTerrainProtectedNearHandoff, coordinate);
+        if (protectedNearTarget && protectedStep && target.step == *protectedStep &&
+            target.step == FarTerrainStep::ONE) {
+            continue;
+        }
+        const FarTerrainKey parentKey{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
+        const auto parent = _farTerrainMeshes.find(parentKey);
+        std::optional<FarTerrainAuthorityQuality> parentSourceQuality;
+        if (const auto promotion = _farTerrainAuthorityTransitions.find(parentKey);
+            promotion != _farTerrainAuthorityTransitions.end()) {
+            parentSourceQuality = promotion->second.source.authorityQuality;
+        }
+        const bool finalRequired = !protectedNearTarget && parent != _farTerrainMeshes.end() &&
+                                   farTerrainRefinementRequiresFinalAuthority(
+                                       parent->second.authorityQuality, parentSourceQuality,
+                                       requiresFineFallback(coordinate));
+        if ((finalRequired && isFinalResident(target)) || (!finalRequired && isResident(target))) {
+            continue;
+        }
+        const uint32_t priority = static_cast<uint32_t>(std::min<size_t>(index * 8, UINT32_MAX));
+        const bool cameraNearCritical =
+            protectedNearTarget || coordinate == centerTile || requiresFineFallback(coordinate);
+        const bool enqueued = finalRequired ? _farTerrainScheduler->enqueueUrgentFinalRefinement(
+                                                  target, priority, cameraNearCritical)
+                                            : _farTerrainScheduler->enqueueUrgentRefinement(
+                                                  target, priority, cameraNearCritical);
+        if (enqueued) {
+            ++urgentRefinementSubmissions;
+        }
+    }
+    // Preview bridges receive the first ordinary urgent slots because they
+    // remove large projected cells without another decoder call. Reserve the
+    // remaining slots for visible FINAL parents, which still outrank canopy
+    // and speculative work in the inference coordinator.
+    for (const FarTerrainRefinementCacheRequest& request : _farTerrainPerceptualFinalRequests) {
+        if (visibleFinalParentSubmissions >= MAX_VISIBLE_FINAL_PARENT_SUBMISSIONS_PER_FRAME ||
+            urgentRefinementSubmissions >=
+                FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME ||
+            !_farTerrainScheduler->hasUrgentRefinementCapacity()) {
+            break;
+        }
+        const FarTerrainKey parent{request.coordinate.x, request.coordinate.z,
+                                   FAR_TERRAIN_BASE_STEP};
+        if (!isResident(parent) || isFinalResident(parent))
+            continue;
+        const bool exactHandoffRequired = requiresFineFallback(request.coordinate);
+        if (_farTerrainScheduler->enqueueFinalBase(
+                parent,
+                static_cast<uint32_t>(std::min<size_t>(visibleFinalParentSubmissions, UINT32_MAX)),
+                exactHandoffRequired)) {
+            ++visibleFinalParentSubmissions;
+            ++urgentRefinementSubmissions;
+        }
+    }
+    // FINAL child tiers are the fastest way to remove a visibly coarse nearby
+    // tile. Spend remaining urgent slots on their FINAL parent replacements
+    // without allowing optional outer work to delay the protected handoff.
+    if (finalStreamingWorkEnabled && farTerrainConnectedRefinementLaneOpen(parentCoverage)) {
+        const size_t finalParentRequestCount = missingFinalHandoffParents;
+        for (size_t index = 0; index < finalParentRequestCount; ++index) {
+            if (urgentRefinementSubmissions >=
+                    FAR_TERRAIN_MAX_URGENT_REFINEMENT_SUBMISSIONS_PER_FRAME ||
+                !_farTerrainScheduler->hasUrgentRefinementCapacity()) {
+                break;
+            }
+            const FarTerrainKey base = _farTerrainFinalBaseRequests[index];
+            const ColumnPos coordinate{base.tileX, base.tileZ};
+            const bool exactHandoffRequired = index < missingFinalHandoffParents;
+            if (!isResident(base) || isFinalResident(base) ||
+                (coordinate != centerTile && !exactHandoffRequired &&
+                 !farTerrainCoverageDrawEligible(distanceSquaredForKey(base), parentCoverage))) {
+                continue;
+            }
+            if (_farTerrainScheduler->enqueueFinalBase(
+                    base, static_cast<uint32_t>(std::min<size_t>(index * 8, UINT32_MAX)),
+                    exactHandoffRequired)) {
+                ++urgentRefinementSubmissions;
+            }
+        }
+    }
 
-    for (; refinementOffset < _farTerrainPriorityOrder.size(); ++refinementOffset) {
+    for (; ordinaryCoverageWorkEnabled &&
+           refinementOffset < _farTerrainPriorityOrder.size(); ++refinementOffset) {
         if (!_farTerrainScheduler->hasSubmissionCapacity() ||
             baseSubmissions >= MAX_BASE_SUBMISSIONS_PER_FRAME)
             break;
         const FarTerrainKey key = _farTerrainPriorityOrder[refinementOffset];
         if (!farTerrainIsBaseStep(key.step))
             break;
+        if (currentProtectedCenter &&
+            farTerrainProtectedNearRole(*currentProtectedCenter, {key.tileX, key.tileZ}) !=
+                FarTerrainProtectedNearRole::NONE) {
+            continue;
+        }
         if (!isResident(key)) {
-            _farTerrainScheduler->enqueue(key, static_cast<uint32_t>(refinementOffset * 8));
-            ++baseSubmissions;
-        }
-    }
-    const bool parentSubmissionComplete = refinementOffset == _farTerrainCandidates.size();
-    for (size_t tileIndex = 0;
-         farTerrainRefinementLaneOpen(parentCoverage, parentSubmissionComplete) &&
-         tileIndex < _farTerrainCandidates.size();
-         ++tileIndex) {
-        if (!_farTerrainScheduler->hasSubmissionCapacity())
-            break;
-        const FarTerrainViewTile& tile = _farTerrainCandidates[tileIndex];
-        if (!isResident(tile.key)) {
-            _farTerrainScheduler->enqueue(tile.key, static_cast<uint32_t>(tileIndex * 8) + 1U);
-        }
-    }
-    for (size_t tileIndex = 0;
-         farTerrainRefinementLaneOpen(parentCoverage, parentSubmissionComplete) &&
-         tileIndex < _farTerrainCandidates.size();
-         ++tileIndex) {
-        const FarTerrainViewTile& tile = _farTerrainCandidates[tileIndex];
-        uint32_t stagePriority = 2;
-        const FarTerrainRefinementOrder refinement = farTerrainRefinementOrder(tile.key.step);
-        for (FarTerrainStep step : std::span(refinement.steps).first(refinement.count)) {
-            if (!_farTerrainScheduler->hasSubmissionCapacity())
-                break;
-            if (step == tile.key.step)
-                continue;
-            const FarTerrainKey key{tile.key.tileX, tile.key.tileZ, step};
-            if (!isResident(key)) {
-                _farTerrainScheduler->enqueue(key,
-                                              static_cast<uint32_t>(tileIndex * 8) + stagePriority);
+            if (_farTerrainScheduler->enqueue(key,
+                                              static_cast<uint32_t>(refinementOffset * 8))) {
+                ++baseSubmissions;
             }
-            ++stagePriority;
         }
+    }
+    const bool parentSubmissionComplete =
+        ordinaryCoverageWorkEnabled && refinementOffset == _farTerrainCandidates.size();
+    const std::span<const FarTerrainKey> broadRefinementSubmissions =
+        drawGeometry && farTerrainRefinementLaneOpen(parentCoverage, parentSubmissionComplete)
+            ? std::span<const FarTerrainKey>{_farTerrainRefinementSubmissionKeys}
+            : std::span<const FarTerrainKey>{};
+    for (size_t index = 0; index < broadRefinementSubmissions.size(); ++index) {
         if (!_farTerrainScheduler->hasSubmissionCapacity())
             break;
+        const FarTerrainKey key = broadRefinementSubmissions[index];
+        if (!isResident(key)) {
+            _farTerrainScheduler->enqueue(
+                key, static_cast<uint32_t>(std::min<size_t>(index, UINT32_MAX)));
+        }
+    }
+
+    const bool protectedNearReplacementReady =
+        _farTerrainProtectedNearHandoff.requestedCenter().has_value() &&
+        protectedStatusBeforeUploads.ready();
+    if (protectedStatusBeforeUploads.presentTargets ==
+            protectedStatusBeforeUploads.expectedTargets &&
+        protectedStatusBeforeUploads.finalTargets == protectedStatusBeforeUploads.expectedTargets &&
+        protectedStatusBeforeUploads.finalParents ==
+            protectedStatusBeforeUploads.expectedFinalParents &&
+        protectedStatusBeforeUploads.mismatchedSharedBoundaries != 0) {
+        if (const auto context = world.generationContext()) {
+            context->latchFailure({
+                .code = worldgen::learned::GenerationFailureCode::INFERENCE_FAILED,
+                .message = "Protected FINAL far-terrain patch has incompatible shared boundaries",
+                .retriable = true,
+            });
+        }
+    }
+    if (protectedNearReplacementReady) {
+        // Publish the requested near patch and shell as one enabled set.
+        // Same-key GPU replacements were staged with their
+        // old sources as sole draw owners; assign one clock before changing
+        // any display key so every temporal exchange starts together.
+        for (const FarTerrainKey target : _farTerrainConnectedNearPatchTargets) {
+            if (auto transition = _farTerrainAuthorityTransitions.find(target);
+                transition != _farTerrainAuthorityTransitions.end() &&
+                !transition->second.published) {
+                transition->second.startedAtSeconds = lodTimeSeconds;
+                transition->second.published = true;
+            }
+        }
+        // No encoder observes the display map between these updates, so a
+        // flying camera cannot reveal a partial FINAL island or proxy ring.
+        for (const FarTerrainKey target : _farTerrainConnectedNearPatchTargets) {
+            const ColumnPos coordinate{target.tileX, target.tileZ};
+            if (const auto transition = _farTerrainTransitions.find(coordinate);
+                transition != _farTerrainTransitions.end()) {
+                completeCanopyLodFallback(coordinate, transition->second.from, target);
+            }
+            _farTerrainTransitions.erase(coordinate);
+            _farTerrainDisplayedByTile.insert_or_assign(coordinate, target);
+            eraseNearGrace(coordinate);
+        }
+        if (_farTerrainProtectedNearHandoff.commitRequested(true)) {
+            // Old-only coordinates now return to the ordinary screen-error
+            // hierarchy. Recompute them next frame and coarsen through legal
+            // adjacent tiers while the newly published patch stays fixed.
+            _farTerrainDesiredMetricsDirty = true;
+        }
     }
 
     // Finish each monotonic replacement before reevaluating the desired tier.
     // Redirecting a transition mid-flight can make already revealed voxel
     // columns disappear and is perceived as flicker during ordinary travel.
     for (auto it = _farTerrainTransitions.begin(); it != _farTerrainTransitions.end();) {
-        if (!_farTerrainActiveTiles.contains(it->first)) {
+        if (!_farTerrainActiveTiles.contains(it->first) ||
+            !isResident({it->first.x, it->first.z, FAR_TERRAIN_BASE_STEP})) {
             it = _farTerrainTransitions.erase(it);
             continue;
         }
@@ -2706,8 +5459,9 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
             advanceFarTerrainLod(it->second.from.step, desiredStep, it->second.to.step,
                                  static_cast<float>(lodTimeSeconds - it->second.startedAtSeconds));
         if (advance.completedTransition) {
-            _farTerrainDisplayedByTile.insert_or_assign(
-                it->first, FarTerrainKey{it->first.x, it->first.z, advance.displayed});
+            const FarTerrainKey target{it->first.x, it->first.z, advance.displayed};
+            completeCanopyLodFallback(it->first, it->second.from, target);
+            _farTerrainDisplayedByTile.insert_or_assign(it->first, target);
             it = _farTerrainTransitions.erase(it);
         } else {
             ++it;
@@ -2716,25 +5470,21 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
     for (auto it = _farTerrainDisplayedByTile.begin(); it != _farTerrainDisplayedByTile.end();) {
         if (!_farTerrainActiveTiles.contains(it->first)) {
             it = _farTerrainDisplayedByTile.erase(it);
-        } else if (!farTerrainDisplayedStepAllowed(it->second.step,
-                                                   coarsestFallbackFor(it->first))) {
-            _farTerrainTransitions.erase(it->first);
-            it = _farTerrainDisplayedByTile.erase(it);
         } else {
             ++it;
         }
     }
 
-    // A coordinate cannot become visible before its parent is resident, but
-    // it initializes directly to the finest resident selected tier. Reentering
-    // a cached nearby tile must not briefly display step 32 and transition
-    // through a lower-detail canopy again.
+    // A coordinate cannot become visible before its parent is resident. It
+    // selects the closest resident tier that remains compatible with every
+    // displayed neighbor, including both sides of an active replacement.
     for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
         const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
         const FarTerrainKey base{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
         if (!isResident(base)) {
             _farTerrainDisplayedByTile.erase(coordinate);
             _farTerrainTransitions.erase(coordinate);
+            retireCanopyFallback(coordinate, std::nullopt);
             eraseNearGrace(coordinate);
             continue;
         }
@@ -2742,12 +5492,9 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
         if (displayed != _farTerrainDisplayedByTile.end() && isResident(displayed->second)) {
             continue;
         }
-        const auto desired = _farTerrainDesiredByTile.find(coordinate);
-        const FarTerrainStep desiredStep =
-            desired == _farTerrainDesiredByTile.end() ? tile.key.step : desired->second.step;
         const FarTerrainStep coarsestAllowed = coarsestFallbackFor(coordinate);
-        const std::optional<FarTerrainStep> initial = farTerrainInitialDisplayedStep(
-            desiredStep, residentStepMaskFor(coordinate), coarsestAllowed);
+        const std::optional<FarTerrainStep> initial =
+            compatibleInitialStepFor(coordinate, coarsestAllowed);
         if (initial) {
             _farTerrainDisplayedByTile.insert_or_assign(
                 coordinate, FarTerrainKey{coordinate.x, coordinate.z, *initial});
@@ -2755,7 +5502,8 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
     }
 
     for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
-        if (_farTerrainTransitions.size() >= FAR_TERRAIN_MAX_SIMULTANEOUS_LOD_TRANSITIONS)
+        if (_farTerrainTransitions.size() + _farTerrainAuthorityTransitions.size() >=
+            FAR_TERRAIN_MAX_SIMULTANEOUS_LOD_TRANSITIONS)
             break;
         const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
         if (_farTerrainTransitions.contains(coordinate))
@@ -2767,25 +5515,42 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
             !isResident(displayed->second)) {
             continue;
         }
+        if (_farTerrainAuthorityTransitions.contains(displayed->second))
+            continue;
+        const FarTerrainStepMask readySteps = residentStepMaskFor(coordinate);
         const std::optional<FarTerrainStep> readyTarget = farTerrainReadyTransitionTarget(
-            displayed->second.step, desired->second.step, residentStepMaskFor(coordinate), false);
+            displayed->second.step, desired->second.step, readySteps, false);
         if (!readyTarget)
             continue;
+        FarTerrainStep transitionTarget = *readyTarget;
+        if (const auto& requested = _farTerrainProtectedNearHandoff.requestedCenter();
+            requested && !farTerrainProtectedIntermediateMayDisplay(
+                             farTerrainProtectedNearRole(*requested, coordinate) !=
+                                 FarTerrainProtectedNearRole::NONE,
+                             displayedQualityFor(coordinate, transitionTarget))) {
+            continue;
+        }
+        if (!stepCompatibleAt(coordinate, transitionTarget)) {
+            const FarTerrainStep bridge =
+                farTerrainNextDisplayedStep(displayed->second.step, desired->second.step);
+            if (bridge == displayed->second.step ||
+                (readySteps & farTerrainStepMask(bridge)) == 0 ||
+                !stepCompatibleAt(coordinate, bridge)) {
+                continue;
+            }
+            transitionTarget = bridge;
+        }
         float parentAgeSeconds = std::numeric_limits<float>::infinity();
         if (const auto grace = findNearGrace(coordinate);
             grace != _farTerrainNearGraceStartedAt.end()) {
             parentAgeSeconds = static_cast<float>(lodTimeSeconds - grace->second);
         }
         if (farTerrainDeferNearIntermediate(displayed->second.step, desired->second.step,
-                                            *readyTarget, parentAgeSeconds)) {
+                                            transitionTarget, parentAgeSeconds)) {
             continue;
         }
-        const FarTerrainLodAdvance advance =
-            advanceFarTerrainLod(displayed->second.step, *readyTarget);
-        if (!advance.transitionTarget)
-            continue;
-        const FarTerrainKey next{coordinate.x, coordinate.z, *advance.transitionTarget};
-        if (!isResident(next))
+        const FarTerrainKey next{coordinate.x, coordinate.z, transitionTarget};
+        if (!isResident(next) || _farTerrainAuthorityTransitions.contains(next))
             continue;
         _farTerrainTransitions.emplace(
             coordinate, FarTerrainLodTransition{displayed->second, next, lodTimeSeconds});
@@ -2797,21 +5562,43 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
     // all other stale tiers retire through the frame-safe arena immediately.
     for (auto it = _farTerrainMeshes.begin(); it != _farTerrainMeshes.end();) {
         const ColumnPos coordinate{it->first.tileX, it->first.tileZ};
-        bool keep = _farTerrainActiveTiles.contains(coordinate);
-        if (keep) {
+        const bool protectedGpuResidency = farTerrainProtectedGpuResidencyRequired(
+            it->first, _farTerrainProtectedNearHandoff.activeCenter(),
+            _farTerrainProtectedNearHandoff.requestedCenter());
+        const bool activeTile = _farTerrainActiveTiles.contains(coordinate);
+        bool keep = protectedGpuResidency;
+        if (activeTile) {
             const auto desired = _farTerrainDesiredByTile.find(coordinate);
             const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
             const auto transition = _farTerrainTransitions.find(coordinate);
-            keep =
-                farTerrainIsBaseStep(it->first.step) ||
-                (coarsestFallbackFor(coordinate) != FAR_TERRAIN_BASE_STEP &&
-                 farTerrainDisplayedStepAllowed(it->first.step, coarsestFallbackFor(coordinate))) ||
-                (desired != _farTerrainDesiredByTile.end() && desired->second == it->first) ||
-                (displayed != _farTerrainDisplayedByTile.end() && displayed->second == it->first) ||
-                (transition != _farTerrainTransitions.end() &&
-                 (transition->second.from == it->first || transition->second.to == it->first));
+            const bool authorityTransition = _farTerrainAuthorityTransitions.contains(it->first);
+            const bool retainedStepOnePrefetch =
+                it->first.step == FarTerrainStep::ONE && _farTerrainWanted.contains(it->first);
+            const bool progressiveBridge =
+                desired != _farTerrainDesiredByTile.end() &&
+                displayed != _farTerrainDisplayedByTile.end() &&
+                farTerrainRetainsProgressiveStep(it->first.step, displayed->second.step,
+                                                 desired->second.step);
+            keep = protectedGpuResidency || farTerrainIsBaseStep(it->first.step) ||
+                   retainedStepOnePrefetch || progressiveBridge || authorityTransition ||
+                   (desired != _farTerrainDesiredByTile.end() && desired->second == it->first) ||
+                   (displayed != _farTerrainDisplayedByTile.end() &&
+                    displayed->second == it->first) ||
+                   (transition != _farTerrainTransitions.end() &&
+                    (transition->second.from == it->first || transition->second.to == it->first));
         }
         if (!keep) {
+            const auto fallback = _farCanopyLodFallbacks.find(coordinate);
+            const bool retainedCanopyFallback =
+                fallback != _farCanopyLodFallbacks.end() && fallback->second == it->first;
+            if (const auto canopy = _farCanopyAttachments.find(it->first);
+                canopy != _farCanopyAttachments.end() && !retainedCanopyFallback) {
+                if (canopy->second.alloc) {
+                    _farMegaBuffer->deferFree(*canopy->second.alloc, _frameRing.frameIndex());
+                }
+                _farCanopyAttachments.erase(canopy);
+                clearCanopyFallbackReference(it->first);
+            }
             if (it->second.uploaded) {
                 if (_farTerrainWanted.contains(it->first)) {
                     if (_farTerrainResidentWantedCount > 0)
@@ -2828,103 +5615,137 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
             ++it;
         }
     }
+    // Fallbacks are optional and live no longer than their active tile. This
+    // sweep also removes any reference retired by arena pressure, bounding the
+    // independent lifetime without retaining the source terrain mesh.
+    for (auto it = _farCanopyLodFallbacks.begin(); it != _farCanopyLodFallbacks.end();) {
+        const bool active = _farTerrainActiveTiles.contains(it->first);
+        const auto canopy = _farCanopyAttachments.find(it->second);
+        if (!active || canopy == _farCanopyAttachments.end() ||
+            !canopyStateHasGeometry(canopy == _farCanopyAttachments.end() ? nullptr
+                                                                          : &canopy->second)) {
+            if (!active && canopy != _farCanopyAttachments.end()) {
+                if (canopy->second.alloc) {
+                    _farMegaBuffer->deferFree(*canopy->second.alloc, _frameRing.frameIndex());
+                }
+                _farCanopyAttachments.erase(canopy);
+            }
+            it = _farCanopyLodFallbacks.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
-    const float exactHandoffBlocks = exactHandoff.distanceBlocks;
+    const auto farPlannerCompletedAt = std::chrono::steady_clock::now();
+    const auto elapsedMilliseconds = [](auto beginning, auto end) {
+        return static_cast<float>(
+            std::chrono::duration<double, std::milli>(end - beginning).count());
+    };
+    const float farPlannerSelectionMilliseconds =
+        elapsedMilliseconds(farPlannerStartedAt, farPlannerSelectionCompletedAt);
+    const float farPlannerPublicationMilliseconds =
+        elapsedMilliseconds(farPlannerSelectionCompletedAt, farPlannerPublicationCompletedAt);
+    const float farPlannerResidencyMilliseconds =
+        elapsedMilliseconds(farPlannerPublicationCompletedAt, farPlannerCompletedAt);
+    const float farPlannerMilliseconds =
+        elapsedMilliseconds(farPlannerStartedAt, farPlannerCompletedAt);
+    _farTerrainPlannerTimings.record(farPlannerMilliseconds);
+    _farTerrainSelectionTimings.record(farPlannerSelectionMilliseconds);
+    _farTerrainPublicationTimings.record(farPlannerPublicationMilliseconds);
+    _farTerrainResidencyTimings.record(farPlannerResidencyMilliseconds);
 
-    [encoder setRenderPipelineState:_pipelineState];
-    [encoder setDepthStencilState:_depthState];
-    [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
-    [encoder setCullMode:MTLCullModeBack];
-    // Exact terrain draws first. The shader clips each far fragment with its
-    // destination-column ownership bit; the depth bias remains only as a
-    // conservative fallback while an exact column is still cold.
-    [encoder setDepthBias:4.0f slopeScale:1.0f clamp:0.000002f];
-
-    TerrainHorizonCuller horizon(viewpoint);
     uint32_t drawn = 0;
     uint32_t baseDrawn = 0;
     uint32_t refinementDrawn = 0;
     uint32_t frustumCulled = 0;
     uint32_t occlusionCulled = 0;
-    _farShadowDrawPlans.clear();
-    auto displayedKeyFor = [&](ColumnPos coordinate) -> std::optional<FarTerrainKey> {
-        if (!_farTerrainActiveTiles.contains(coordinate))
-            return std::nullopt;
-        const FarTerrainKey base{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
-        if (!isResident(base))
-            return std::nullopt;
-        const FarTerrainStep coarsestAllowed = coarsestFallbackFor(coordinate);
-        const auto displayAllowed = [&](FarTerrainStep step) {
-            return farTerrainDisplayedStepAllowed(step, coarsestAllowed);
-        };
+    std::array<uint32_t, 6> farTierDrawn{};
+    const auto diagnosticTierIndex = [](FarTerrainStep step) -> std::optional<size_t> {
+        switch (step) {
+            case FarTerrainStep::ONE:
+                return 0;
+            case FarTerrainStep::TWO:
+                return 1;
+            case FarTerrainStep::FOUR:
+                return 2;
+            case FarTerrainStep::EIGHT:
+                return 3;
+            case FarTerrainStep::SIXTEEN:
+                return 4;
+            case FarTerrainStep::THIRTY_TWO:
+                return 5;
+        }
+        return std::nullopt;
+    };
+    const float exactHandoffBlocks = exactHandoff.distanceBlocks;
 
-        if (const auto transition = _farTerrainTransitions.find(coordinate);
-            transition != _farTerrainTransitions.end()) {
-            // Water remains source-owned until completion. Terrain and its
-            // skirts swap together under the narrow fog pulse.
-            if (isResident(transition->second.from) && displayAllowed(transition->second.from.step))
-                return transition->second.from;
-            if (isResident(transition->second.to) && displayAllowed(transition->second.to.step))
-                return transition->second.to;
-        }
-        if (const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
-            displayed != _farTerrainDisplayedByTile.end() && isResident(displayed->second) &&
-            displayAllowed(displayed->second.step)) {
-            return displayed->second;
-        }
-        const auto desired = _farTerrainDesiredByTile.find(coordinate);
-        const FarTerrainStep desiredStep =
-            desired == _farTerrainDesiredByTile.end() ? FarTerrainStep::TWO : desired->second.step;
-        const std::optional<FarTerrainStep> fallback = farTerrainInitialDisplayedStep(
-            desiredStep, residentStepMaskFor(coordinate), coarsestAllowed);
-        if (!fallback)
-            return std::nullopt;
-        return FarTerrainKey{coordinate.x, coordinate.z, *fallback};
-    };
-    auto visibleTerrainKeyFor = [&](ColumnPos coordinate) -> std::optional<FarTerrainKey> {
-        if (const auto transition = _farTerrainTransitions.find(coordinate);
-            transition != _farTerrainTransitions.end() && isResident(transition->second.from) &&
-            isResident(transition->second.to)) {
+    if (drawGeometry && encoder) {
+        _farShadowDrawPlans.clear();
+        [encoder setRenderPipelineState:_pipelineState];
+        [encoder setDepthStencilState:_depthState];
+        [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+        [encoder setCullMode:MTLCullModeBack];
+        // Exact terrain draws first. The shader clips each far fragment with its
+        // destination-column ownership bit; the depth bias remains only as a
+        // conservative fallback while an exact column is still cold.
+        [encoder setDepthBias:4.0f slopeScale:1.0f clamp:0.000002f];
+
+        TerrainHorizonCuller horizon(viewpoint);
+        auto displayedKeyFor = [&](ColumnPos coordinate) -> std::optional<FarTerrainKey> {
+            if (!_farTerrainActiveTiles.contains(coordinate))
+                return std::nullopt;
+            const FarTerrainKey base{coordinate.x, coordinate.z, FAR_TERRAIN_BASE_STEP};
+            if (!isResident(base))
+                return std::nullopt;
             const FarTerrainStep coarsestAllowed = coarsestFallbackFor(coordinate);
-            if (!farTerrainDisplayedStepAllowed(transition->second.from.step, coarsestAllowed)) {
-                if (farTerrainDisplayedStepAllowed(transition->second.to.step, coarsestAllowed))
+
+            if (const auto transition = _farTerrainTransitions.find(coordinate);
+                transition != _farTerrainTransitions.end()) {
+                // Water remains source-owned until completion. Complete terrain
+                // topologies swap together under the narrow fog pulse.
+                if (isResident(transition->second.from))
+                    return transition->second.from;
+                if (isResident(transition->second.to))
                     return transition->second.to;
-                return displayedKeyFor(coordinate);
             }
-            const FarTerrainTransitionSample sample = sampleFarTerrainTransition(
-                static_cast<float>(lodTimeSeconds - transition->second.startedAtSeconds));
-            uint32_t flags = FAR_TERRAIN_DRAW_FLAG | FAR_TERRAIN_LOD_TRANSITION_FLAG;
-            if (transition->second.from.step == FarTerrainStep::THIRTY_TWO &&
-                transition->second.to.step == FarTerrainStep::TWO) {
-                flags |= FAR_TERRAIN_LOD_EMERGENCY_FLAG;
+            if (const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+                displayed != _farTerrainDisplayedByTile.end() && isResident(displayed->second)) {
+                return displayed->second;
             }
-            if (farTerrainLodTerrainVisible(sample.progress, flags | FAR_TERRAIN_LOD_TARGET_FLAG)) {
-                return transition->second.to;
-            }
-            return transition->second.from;
-        }
-        return displayedKeyFor(coordinate);
-    };
-    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
-        if (!farTerrainCoverageDrawEligible(tile.distanceSquared, coverage))
-            continue;
-        const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
-        struct DrawPlan {
-            FarTerrainKey key;
-            float progress = 0.0F;
-            uint32_t flags = FAR_TERRAIN_DRAW_FLAG;
-            bool ownsConnectedGeometry = true;
+            const std::optional<FarTerrainStep> fallback =
+                compatibleInitialStepFor(coordinate, coarsestAllowed);
+            if (!fallback)
+                return std::nullopt;
+            return FarTerrainKey{coordinate.x, coordinate.z, *fallback};
         };
-        std::array<DrawPlan, 2> plans{};
-        size_t planCount = 0;
-        if (const auto transition = _farTerrainTransitions.find(coordinate);
-            transition != _farTerrainTransitions.end() && isResident(transition->second.from) &&
-            isResident(transition->second.to)) {
-            const FarTerrainStep coarsestAllowed = coarsestFallbackFor(coordinate);
-            if (!farTerrainDisplayedStepAllowed(transition->second.from.step, coarsestAllowed)) {
-                if (farTerrainDisplayedStepAllowed(transition->second.to.step, coarsestAllowed))
-                    plans[planCount++] = {transition->second.to};
-            } else {
+        for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+            if (!farTerrainCoverageDrawEligible(tile.distanceSquared, coverage))
+                continue;
+            const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+            struct DrawPlan {
+                FarTerrainKey key;
+                const FarTerrainMeshState* state = nullptr;
+                float progress = 0.0F;
+                uint32_t flags = FAR_TERRAIN_DRAW_FLAG;
+                bool ownsConnectedGeometry = true;
+                const FarCanopyMeshState* canopy = nullptr;
+            };
+            std::array<DrawPlan, 2> plans{};
+            size_t planCount = 0;
+            const auto matchingResidentCanopy =
+                [&](const FarTerrainKey& key,
+                    FarTerrainAuthorityQuality surfaceQuality) -> const FarCanopyMeshState* {
+                const auto canopy = _farCanopyAttachments.find(key);
+                if (canopy != _farCanopyAttachments.end() &&
+                    farCanopyMatchesSurface(canopy->second.authorityQuality,
+                                            canopy->second.groundingQuality, surfaceQuality)) {
+                    return &canopy->second;
+                }
+                return fallbackCanopyFor({key.tileX, key.tileZ}, surfaceQuality);
+            };
+            if (const auto transition = _farTerrainTransitions.find(coordinate);
+                transition != _farTerrainTransitions.end() && isResident(transition->second.from) &&
+                isResident(transition->second.to)) {
                 const FarTerrainTransitionSample sample = sampleFarTerrainTransition(
                     static_cast<float>(lodTimeSeconds - transition->second.startedAtSeconds));
                 const uint32_t transitionFlags =
@@ -2933,144 +5754,496 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
                              transition->second.to.step == FarTerrainStep::TWO
                          ? FAR_TERRAIN_LOD_EMERGENCY_FLAG
                          : 0U);
-                plans[planCount++] = {transition->second.from, sample.progress, transitionFlags,
-                                      true};
-                plans[planCount++] = {transition->second.to, sample.progress,
-                                      transitionFlags | FAR_TERRAIN_LOD_TARGET_FLAG, false};
+                const bool sourceOwnsConnectedGeometry =
+                    farTerrainLodConnectedGeometryVisible(sample.progress, transitionFlags);
+                const bool targetOwnsConnectedGeometry = farTerrainLodConnectedGeometryVisible(
+                    sample.progress, transitionFlags | FAR_TERRAIN_LOD_TARGET_FLAG);
+                const FarCanopyMeshState* sourceCanopy = matchingResidentCanopy(
+                    transition->second.from,
+                    _farTerrainMeshes.at(transition->second.from).authorityQuality);
+                const FarCanopyMeshState* targetCanopy = matchingResidentCanopy(
+                    transition->second.to,
+                    _farTerrainMeshes.at(transition->second.to).authorityQuality);
+                if (farCanopyLodTargetUsesSourceFallback(sourceCanopy != nullptr,
+                                                         targetCanopy != nullptr)) {
+                    // The same allocation fills the target half of the
+                    // monotonic dither until its independently built
+                    // attachment arrives. Matching tile-local coordinates
+                    // make this safe across geometric LOD keys.
+                    targetCanopy = sourceCanopy;
+                }
+                plans[planCount++] = {
+                    transition->second.from,
+                    &_farTerrainMeshes.at(transition->second.from),
+                    sample.progress,
+                    transitionFlags,
+                    sourceOwnsConnectedGeometry,
+                    sourceCanopy};
+                plans[planCount++] = {
+                    transition->second.to,
+                    &_farTerrainMeshes.at(transition->second.to),
+                    sample.progress,
+                    transitionFlags | FAR_TERRAIN_LOD_TARGET_FLAG,
+                    targetOwnsConnectedGeometry,
+                    targetCanopy};
+            } else if (const std::optional<FarTerrainKey> displayed = displayedKeyFor(coordinate)) {
+                if (const auto promotion = _farTerrainAuthorityTransitions.find(*displayed);
+                    promotion != _farTerrainAuthorityTransitions.end() &&
+                    isFinalResident(*displayed)) {
+                    const FarCanopyMeshState* sourceCanopy =
+                        promotion->second.sourceCanopy &&
+                                farCanopyMatchesSurface(
+                                    promotion->second.sourceCanopy->authorityQuality,
+                                    promotion->second.sourceCanopy->groundingQuality,
+                                    promotion->second.source.authorityQuality)
+                            ? &*promotion->second.sourceCanopy
+                            : nullptr;
+                    if (!promotion->second.published) {
+                        plans[planCount++] = {*displayed, &promotion->second.source,
+                                              0.0F,       FAR_TERRAIN_DRAW_FLAG,
+                                              true,       sourceCanopy};
+                    } else {
+                        const FarTerrainTransitionSample sample =
+                            sampleFarTerrainTransition(static_cast<float>(
+                                lodTimeSeconds - promotion->second.startedAtSeconds));
+                        const uint32_t flags =
+                            FAR_TERRAIN_DRAW_FLAG | FAR_TERRAIN_LOD_TRANSITION_FLAG;
+                        const bool sourceOwnsConnectedGeometry =
+                            farTerrainLodConnectedGeometryVisible(sample.progress, flags);
+                        const bool targetOwnsConnectedGeometry =
+                            farTerrainLodConnectedGeometryVisible(
+                                sample.progress, flags | FAR_TERRAIN_LOD_TARGET_FLAG);
+                        plans[planCount++] = {
+                            *displayed, &promotion->second.source,   sample.progress,
+                            flags,      sourceOwnsConnectedGeometry, sourceCanopy};
+                        plans[planCount++] = {
+                            *displayed,
+                            &_farTerrainMeshes.at(*displayed),
+                            sample.progress,
+                            flags | FAR_TERRAIN_LOD_TARGET_FLAG,
+                            targetOwnsConnectedGeometry,
+                            matchingResidentCanopy(
+                                *displayed, _farTerrainMeshes.at(*displayed).authorityQuality)};
+                    }
+                } else {
+                    const FarTerrainMeshState& state = _farTerrainMeshes.at(*displayed);
+                    plans[planCount++] = {
+                        *displayed, &state,
+                        0.0F,       FAR_TERRAIN_DRAW_FLAG,
+                        true,       matchingResidentCanopy(*displayed, state.authorityQuality)};
+                }
             }
-        } else if (const std::optional<FarTerrainKey> displayed = displayedKeyFor(coordinate)) {
-            plans[planCount++] = {*displayed};
-        }
-        if (planCount == 0)
-            continue;
+            if (planCount == 0)
+                continue;
 
-        FarTerrainBounds visibilityBounds = _farTerrainMeshes.at(plans.front().key).surfaceBounds;
-        for (size_t index = 1; index < planCount; ++index) {
-            const FarTerrainBounds& bounds = _farTerrainMeshes.at(plans[index].key).surfaceBounds;
-            visibilityBounds.minY = std::min(visibilityBounds.minY, bounds.minY);
-            visibilityBounds.maxY = std::max(visibilityBounds.maxY, bounds.maxY);
-        }
-        const AABB aabb{{static_cast<float>(visibilityBounds.minX), visibilityBounds.minY,
-                         static_cast<float>(visibilityBounds.minZ)},
-                        {static_cast<float>(visibilityBounds.maxX), visibilityBounds.maxY,
-                         static_cast<float>(visibilityBounds.maxZ)}};
-        if (!isChunkInFrustum(aabb)) {
-            ++frustumCulled;
-            continue;
-        }
-        // A replacement uses the union bounds and remains visible throughout
-        // its monotonic reveal. Culling either topology independently can
-        // punch a transient hole when the camera crosses a frustum or horizon
-        // threshold during those 650 milliseconds.
-        if (planCount == 1 && horizon.isOccluded(visibilityBounds)) {
-            ++occlusionCulled;
-            continue;
-        }
-        const float tileExactHandoffBlocks =
-            exactHandoff.distanceBlocksForTile(coordinate, nominalExactBlocks);
-        const FarTerrainExactHandoff::ColumnMask readyColumns =
-            exactHandoff.readyColumnMask(coordinate);
-        const FarTerrainOwnershipUniforms farOwnership =
-            farTerrainOwnershipUniforms(coordinate, exactHandoff);
-        const double fullyOpaqueFarRadius =
-            static_cast<double>(tileExactHandoffBlocks) + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
-        const double fullyOpaqueFarRadiusSquared = fullyOpaqueFarRadius * fullyOpaqueFarRadius;
-        const FarTerrainMeshState& occluderState = _farTerrainMeshes.at(plans.front().key);
-        for (const FarTerrainBounds& patch : occluderState.occluderPatches) {
-            // A clipped or dithered patch is not a conservative solid
-            // occluder. Boundary tiles are few, so omit those patches until
-            // their complete bounds are beyond the handoff band.
-            const bool fullyOpaque = farTerrainCoveragePatchMayOcclude(
-                patch, viewpoint, coverage, FAR_TERRAIN_COVERAGE_FADE_BLOCKS, planCount > 1);
-            if (fullyOpaque &&
-                !farTerrainOccluderIntersectsExact(patch, coordinate, readyColumns) &&
-                TerrainHorizonCuller::horizontalDistanceSquared(patch, viewpoint) >=
-                    fullyOpaqueFarRadiusSquared) {
-                horizon.addOccluder(patch);
+            FarTerrainBounds visibilityBounds = plans.front().state->surfaceBounds;
+            for (size_t index = 1; index < planCount; ++index) {
+                const FarTerrainBounds& bounds = plans[index].state->surfaceBounds;
+                visibilityBounds.minY = std::min(visibilityBounds.minY, bounds.minY);
+                visibilityBounds.maxY = std::max(visibilityBounds.maxY, bounds.maxY);
             }
-        }
+            for (const DrawPlan& plan : std::span(plans).first(planCount)) {
+                if (!plan.canopy)
+                    continue;
+                visibilityBounds.minX = std::min(visibilityBounds.minX, plan.canopy->bounds.minX);
+                visibilityBounds.maxX = std::max(visibilityBounds.maxX, plan.canopy->bounds.maxX);
+                visibilityBounds.minZ = std::min(visibilityBounds.minZ, plan.canopy->bounds.minZ);
+                visibilityBounds.maxZ = std::max(visibilityBounds.maxZ, plan.canopy->bounds.maxZ);
+                visibilityBounds.minY = std::min(visibilityBounds.minY, plan.canopy->bounds.minY);
+                visibilityBounds.maxY = std::max(visibilityBounds.maxY, plan.canopy->bounds.maxY);
+            }
+            const AABB aabb{{static_cast<float>(visibilityBounds.minX), visibilityBounds.minY,
+                             static_cast<float>(visibilityBounds.minZ)},
+                            {static_cast<float>(visibilityBounds.maxX), visibilityBounds.maxY,
+                             static_cast<float>(visibilityBounds.maxZ)}};
+            if (!isChunkInFrustum(aabb)) {
+                ++frustumCulled;
+                continue;
+            }
+            // A replacement uses the union bounds and remains visible throughout
+            // its monotonic reveal. Culling either topology independently can
+            // punch a transient hole when the camera crosses a frustum or horizon
+            // threshold during those 650 milliseconds.
+            if (planCount == 1 && horizon.isOccluded(visibilityBounds)) {
+                ++occlusionCulled;
+                continue;
+            }
+            const float tileExactHandoffBlocks =
+                exactHandoff.distanceBlocksForTile(coordinate, nominalExactBlocks);
+            const FarTerrainExactHandoff::ColumnMask readyColumns =
+                exactHandoff.readyColumnMask(coordinate);
+            FarTerrainOwnershipUniforms farOwnership =
+                farTerrainOwnershipUniforms(coordinate, exactHandoff, exactFloraHandoff);
+            const double fullyOpaqueFarRadius =
+                static_cast<double>(tileExactHandoffBlocks) + FAR_TERRAIN_HANDOFF_WIDTH_BLOCKS;
+            const double fullyOpaqueFarRadiusSquared = fullyOpaqueFarRadius * fullyOpaqueFarRadius;
+            const FarTerrainMeshState& occluderState = *plans.front().state;
+            for (const FarTerrainBounds& patch : occluderState.occluderPatches) {
+                // A clipped or dithered patch is not a conservative solid
+                // occluder. Boundary tiles are few, so omit those patches until
+                // their complete bounds are beyond the handoff band.
+                const bool fullyOpaque = farTerrainCoveragePatchMayOcclude(
+                    patch, viewpoint, coverage, FAR_TERRAIN_COVERAGE_FADE_BLOCKS, planCount > 1);
+                if (fullyOpaque &&
+                    !farTerrainOccluderIntersectsExact(patch, coordinate, readyColumns) &&
+                    TerrainHorizonCuller::horizontalDistanceSquared(patch, viewpoint) >=
+                        fullyOpaqueFarRadiusSquared) {
+                    horizon.addOccluder(patch);
+                }
+            }
 
-        std::array<std::optional<FarTerrainStep>, 4> displayedNeighborSteps;
-        const std::array<ColumnPos, 4> neighborCoordinates = {
-            ColumnPos{coordinate.x + 1, coordinate.z}, ColumnPos{coordinate.x - 1, coordinate.z},
-            ColumnPos{coordinate.x, coordinate.z + 1}, ColumnPos{coordinate.x, coordinate.z - 1}};
-        for (size_t edge = 0; edge < neighborCoordinates.size(); ++edge) {
-            if (const auto neighbor = visibleTerrainKeyFor(neighborCoordinates[edge])) {
-                displayedNeighborSteps[edge] = neighbor->step;
-            }
-        }
-        for (const DrawPlan& plan : std::span(plans).first(planCount)) {
-            // Target canopies overlap source canopies during their monotonic
-            // exchange. A slightly smaller target bias makes matching crowns
-            // stable without changing exact-cube ownership.
-            const bool transitionTarget = (plan.flags & FAR_TERRAIN_LOD_TARGET_FLAG) != 0U;
-            [encoder setDepthBias:(planCount > 1 && !transitionTarget ? 6.0f : 4.0f)
-                       slopeScale:1.0f
-                            clamp:0.000002f];
-            const FarTerrainMeshState& state = _farTerrainMeshes.at(plan.key);
-            ChunkOrigin origin{};
-            origin.origin = simd_make_float4(static_cast<float>(state.bounds.minX), 0.0f,
-                                             static_cast<float>(state.bounds.minZ), 0.0F);
-            origin.overlayColorAndStrength =
-                simd_make_float4(fogColor[0], fogColor[1], fogColor[2], 0.0F);
-            origin.farMetadata.x = farTerrainSkirtEdgeMask(plan.key.step, displayedNeighborSteps);
-            origin.farMetadata.y = std::bit_cast<uint32_t>(coverage.distanceBlocks);
-            origin.farMetadata.z = std::bit_cast<uint32_t>(plan.progress);
-            origin.farMetadata.w = plan.flags;
-            _farShadowDrawPlans.push_back({coordinate, plan.key, origin.farMetadata});
+            for (const DrawPlan& plan : std::span(plans).first(planCount)) {
+                // Target canopies overlap source canopies during their monotonic
+                // exchange. A slightly smaller target bias makes matching crowns
+                // stable without changing exact-cube ownership.
+                const bool transitionTarget = (plan.flags & FAR_TERRAIN_LOD_TARGET_FLAG) != 0U;
+                [encoder setDepthBias:(planCount > 1 && !transitionTarget ? 6.0f : 4.0f)
+                           slopeScale:1.0f
+                                clamp:0.000002f];
+                const FarTerrainMeshState& state = *plan.state;
+                ChunkOrigin origin{};
+                origin.origin = simd_make_float4(static_cast<float>(state.bounds.minX), 0.0f,
+                                                 static_cast<float>(state.bounds.minZ), 0.0F);
+                origin.overlayColorAndStrength =
+                    simd_make_float4(fogColor[0], fogColor[1], fogColor[2], 0.0F);
+                if (_worldgenOverlayMode == WorldgenOverlayMode::AUTHORITY) {
+                    origin.overlayColorAndStrength =
+                        state.authorityQuality == FarTerrainAuthorityQuality::FINAL
+                            ? simd_make_float4(0.10f, 0.95f, 0.28f, 0.78f)
+                            : simd_make_float4(0.96f, 0.10f, 0.72f, 0.78f);
+                } else if (_worldgenOverlayMode == WorldgenOverlayMode::LOD) {
+                    const auto color = terrainLodOverlayColor(plan.key.step);
+                    origin.overlayColorAndStrength =
+                        simd_make_float4(color[0], color[1], color[2], color[3]);
+                }
+                origin.farMetadata.x = 0;
+                origin.farMetadata.y = std::bit_cast<uint32_t>(coverage.distanceBlocks);
+                origin.farMetadata.z = std::bit_cast<uint32_t>(plan.progress);
+                origin.farMetadata.w = plan.flags;
 
-            // Canopies use a monotonic target-in, source-out exchange, so
-            // unrelated forest summaries never pass through an empty phase.
-            // Target water is not submitted at all, guaranteeing one
-            // refractive owner through the replacement.
-            const uint32_t waterIndexCount =
-                plan.ownsConnectedGeometry ? state.alloc.indexCount - state.opaqueIndexCount : 0;
-            if (waterIndexCount > 0) {
-                const double centerX =
-                    static_cast<double>(state.surfaceBounds.minX) +
-                    static_cast<double>(state.surfaceBounds.maxX - state.surfaceBounds.minX) * 0.5;
-                const double centerY =
-                    static_cast<double>(state.surfaceBounds.minY) +
-                    static_cast<double>(state.surfaceBounds.maxY - state.surfaceBounds.minY) * 0.5;
-                const double centerZ =
-                    static_cast<double>(state.surfaceBounds.minZ) +
-                    static_cast<double>(state.surfaceBounds.maxZ - state.surfaceBounds.minZ) * 0.5;
-                const double dx = centerX - cameraPosition.x;
-                const double dy = centerY - cameraPosition.y;
-                const double dz = centerZ - cameraPosition.z;
-                _waterDraws.push_back(WaterDraw{
-                    origin.origin, origin.overlayColorAndStrength, origin.farMetadata, farOwnership,
-                    state.alloc.vertexBuffer, state.alloc.indexBuffer, state.alloc.vertexOffset,
-                    state.alloc.indexOffset + state.opaqueIndexCount * sizeof(uint32_t),
-                    waterIndexCount, static_cast<float>(dx * dx + dy * dy + dz * dz)});
+                // Canopies use a monotonic target-in, source-out exchange, so
+                // unrelated forest summaries never pass through an empty phase.
+                // Submit only the terrain-matched connected-water owner on
+                // either side of the fog-covered topology swap.
+                const uint32_t waterIndexCount =
+                    plan.ownsConnectedGeometry ? state.alloc.indexCount - state.opaqueIndexCount
+                                               : 0;
+                if (waterIndexCount > 0) {
+                    const double centerX =
+                        static_cast<double>(state.surfaceBounds.minX) +
+                        static_cast<double>(state.surfaceBounds.maxX - state.surfaceBounds.minX) *
+                            0.5;
+                    const double centerY =
+                        static_cast<double>(state.surfaceBounds.minY) +
+                        static_cast<double>(state.surfaceBounds.maxY - state.surfaceBounds.minY) *
+                            0.5;
+                    const double centerZ =
+                        static_cast<double>(state.surfaceBounds.minZ) +
+                        static_cast<double>(state.surfaceBounds.maxZ - state.surfaceBounds.minZ) *
+                            0.5;
+                    const double dx = centerX - cameraPosition.x;
+                    const double dy = centerY - cameraPosition.y;
+                    const double dz = centerZ - cameraPosition.z;
+                    _waterDraws.push_back(WaterDraw{
+                        origin.origin, origin.overlayColorAndStrength, origin.farMetadata,
+                        farOwnership, state.alloc.vertexBuffer, state.alloc.indexBuffer,
+                        state.alloc.vertexOffset,
+                        state.alloc.indexOffset + state.opaqueIndexCount * sizeof(uint32_t),
+                        waterIndexCount, static_cast<float>(dx * dx + dy * dy + dz * dz)});
+                }
+                if (state.opaqueIndexCount > 0) {
+                    [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
+                    [encoder setFragmentBytes:&farOwnership length:sizeof(farOwnership) atIndex:5];
+                    [encoder setVertexBuffer:state.alloc.vertexBuffer
+                                      offset:state.alloc.vertexOffset
+                                     atIndex:0];
+                    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                        indexCount:state.opaqueIndexCount
+                                         indexType:MTLIndexTypeUInt32
+                                       indexBuffer:state.alloc.indexBuffer
+                                 indexBufferOffset:state.alloc.indexOffset];
+                }
+                const FarCanopyMeshState* canopy = plan.canopy;
+                const bool matchingCanopy =
+                    canopy &&
+                    farCanopyMatchesSurface(canopy->authorityQuality, canopy->groundingQuality,
+                                            state.authorityQuality);
+                const std::optional<FarCanopyMeshState> shadowCanopy =
+                    matchingCanopy && canopy->alloc && canopy->alloc->indexCount > 0
+                        ? std::optional<FarCanopyMeshState>{*canopy}
+                        : std::nullopt;
+                _farShadowDrawPlans.push_back(
+                    {coordinate, plan.key, state, origin.farMetadata, farOwnership, shadowCanopy});
+                if (matchingCanopy && canopy->alloc && canopy->alloc->indexCount > 0) {
+                    [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
+                    [encoder setFragmentBytes:&farOwnership length:sizeof(farOwnership) atIndex:5];
+                    [encoder setVertexBuffer:canopy->alloc->vertexBuffer
+                                      offset:canopy->alloc->vertexOffset
+                                     atIndex:0];
+                    [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                        indexCount:canopy->alloc->indexCount
+                                         indexType:MTLIndexTypeUInt32
+                                       indexBuffer:canopy->alloc->indexBuffer
+                                 indexBufferOffset:canopy->alloc->indexOffset];
+                }
             }
-            if (state.opaqueIndexCount > 0) {
-                [encoder setVertexBytes:&origin length:sizeof(origin) atIndex:2];
-                [encoder setFragmentBytes:&farOwnership length:sizeof(farOwnership) atIndex:5];
-                [encoder setVertexBuffer:state.alloc.vertexBuffer
-                                  offset:state.alloc.vertexOffset
-                                 atIndex:0];
-                [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                    indexCount:state.opaqueIndexCount
-                                     indexType:MTLIndexTypeUInt32
-                                   indexBuffer:state.alloc.indexBuffer
-                             indexBufferOffset:state.alloc.indexOffset];
+            if (farTerrainIsBaseStep(plans.front().key.step)) {
+                ++baseDrawn;
+            } else {
+                ++refinementDrawn;
             }
+            if (const std::optional<size_t> tier = diagnosticTierIndex(plans.front().key.step)) {
+                ++farTierDrawn[*tier];
+            }
+            ++drawn;
         }
-        if (farTerrainIsBaseStep(plans.front().key.step)) {
-            ++baseDrawn;
-        } else {
-            ++refinementDrawn;
-        }
-        ++drawn;
+        [encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
     }
-    [encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+
+    // Retire authority sources only after this frame has encoded both exact
+    // and far geometry. Processing completion earlier could let far clipping
+    // adopt FINAL ownership after the exact pass had already stayed hidden,
+    // creating a one-frame empty column at the handoff.
+    for (auto it = _farTerrainAuthorityTransitions.begin();
+         it != _farTerrainAuthorityTransitions.end();) {
+        const ColumnPos coordinate{it->first.tileX, it->first.tileZ};
+        const bool targetResident = isFinalResident(it->first);
+        const auto previewChildDependsOnParentSource = [&](const FarTerrainKey& candidate) {
+            const auto resident = _farTerrainMeshes.find(candidate);
+            return resident != _farTerrainMeshes.end() && resident->second.uploaded &&
+                   farTerrainPreviewChildDependsOnParentSource(
+                       it->first, candidate, displayedQualityFor(coordinate, candidate.step));
+        };
+        bool visiblePreviewDependency = false;
+        if (farTerrainIsBaseStep(it->first.step)) {
+            if (const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+                displayed != _farTerrainDisplayedByTile.end()) {
+                visiblePreviewDependency = previewChildDependsOnParentSource(displayed->second);
+            }
+            if (const auto lodTransition = _farTerrainTransitions.find(coordinate);
+                lodTransition != _farTerrainTransitions.end()) {
+                visiblePreviewDependency =
+                    visiblePreviewDependency ||
+                    previewChildDependsOnParentSource(lodTransition->second.from) ||
+                    previewChildDependsOnParentSource(lodTransition->second.to);
+            }
+        }
+        const bool completed =
+            it->second.published &&
+            lodTimeSeconds - it->second.startedAtSeconds >= FAR_TERRAIN_LOD_TRANSITION_SECONDS &&
+            !visiblePreviewDependency;
+        if (!_farTerrainActiveTiles.contains(coordinate) || !targetResident || completed) {
+            // The color pass records this source for the following frame's
+            // shadow pass. Keep its arena regions alive through that replay,
+            // even if the GPU has already completed the current color frame.
+            const uint64_t shadowReplayFrame = _frameRing.frameIndex() + 1;
+            if (it->second.source.uploaded) {
+                _farMegaBuffer->deferFree(it->second.source.alloc, shadowReplayFrame);
+            }
+            if (it->second.sourceCanopy && it->second.sourceCanopy->alloc) {
+                _farMegaBuffer->deferFree(*it->second.sourceCanopy->alloc, shadowReplayFrame);
+            }
+            it = _farTerrainAuthorityTransitions.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
     const FarTerrainSchedulerStats schedulerStats = _farTerrainScheduler->stats();
     const uint32_t baseWanted = static_cast<uint32_t>(_farTerrainCandidates.size());
+    const uint32_t protectedNearWanted =
+        static_cast<uint32_t>(_farTerrainConnectedNearPatchTargets.size());
+    std::array<uint32_t, 5> protectedNearTargetsByStep{};
+    for (const FarTerrainKey target : _farTerrainConnectedNearPatchTargets) {
+        switch (target.step) {
+            case FarTerrainStep::ONE:
+                ++protectedNearTargetsByStep[0];
+                break;
+            case FarTerrainStep::TWO:
+                ++protectedNearTargetsByStep[1];
+                break;
+            case FarTerrainStep::FOUR:
+                ++protectedNearTargetsByStep[2];
+                break;
+            case FarTerrainStep::EIGHT:
+                ++protectedNearTargetsByStep[3];
+                break;
+            case FarTerrainStep::SIXTEEN:
+                ++protectedNearTargetsByStep[4];
+                break;
+            case FarTerrainStep::THIRTY_TWO:
+                break;
+        }
+    }
+    // Entry and movement gates count publishable surfaces, not raw GPU
+    // residency. A PREVIEW payload or a FINAL payload with an incompatible
+    // shared boundary must never satisfy the protected-patch contract.
+    const size_t compatibleProtectedTargets = std::min(
+        {protectedStatusBeforeUploads.presentTargets, protectedStatusBeforeUploads.finalTargets,
+         protectedStatusBeforeUploads.exactCompatibleTargets});
+    const size_t missingProtectedParents =
+        protectedStatusBeforeUploads.expectedFinalParents -
+        std::min(protectedStatusBeforeUploads.finalParents,
+                 protectedStatusBeforeUploads.expectedFinalParents);
+    const size_t missingSharedBoundaries =
+        protectedStatusBeforeUploads.expectedSharedBoundaries >
+                protectedStatusBeforeUploads.matchingSharedBoundaries
+            ? protectedStatusBeforeUploads.expectedSharedBoundaries -
+                  protectedStatusBeforeUploads.matchingSharedBoundaries
+            : 0;
+    const uint32_t protectedNearAuthorityMismatch = static_cast<uint32_t>(std::min(
+        std::max(protectedStatusBeforeUploads.mismatchedSharedBoundaries, missingSharedBoundaries),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    uint32_t protectedNearResident =
+        static_cast<uint32_t>(std::min(compatibleProtectedTargets > missingProtectedParents
+                                           ? compatibleProtectedTargets - missingProtectedParents
+                                           : size_t{0},
+                                       static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    if ((protectedStatusBeforeUploads.incompatibleLodBoundaries != 0 ||
+         protectedNearAuthorityMismatch != 0) &&
+        protectedNearResident == protectedNearWanted && protectedNearResident != 0) {
+        --protectedNearResident;
+    }
     const uint32_t refinementWanted =
         static_cast<uint32_t>(_farTerrainWanted.size() - _farTerrainCandidates.size());
     const uint32_t refinementResident = static_cast<uint32_t>(_farTerrainResidentRefinementCount);
+    const uint32_t criticalWanted = static_cast<uint32_t>(std::min<size_t>(
+        _farTerrainCriticalResidencyTargets.size(), std::numeric_limits<uint32_t>::max()));
+    const uint32_t criticalResident = static_cast<uint32_t>(
+        std::min<size_t>(std::ranges::count_if(_farTerrainCriticalResidencyTargets,
+                                               [&](FarTerrainKey key) { return isResident(key); }),
+                         std::numeric_limits<uint32_t>::max()));
+    std::array<uint32_t, 6> farTierDesired{};
+    std::array<uint32_t, 6> farTierResident{};
+    std::array<uint32_t, 6> farTierDisplayed{};
+    std::array<uint32_t, 6> farTierResidentPreview{};
+    std::array<uint32_t, 6> farTierResidentFinal{};
+    std::array<uint32_t, 6> farTierDisplayedPreview{};
+    std::array<uint32_t, 6> farTierDisplayedFinal{};
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        if (const std::optional<size_t> tier = diagnosticTierIndex(tile.key.step)) {
+            ++farTierDesired[*tier];
+        }
+    }
+    for (const auto& [key, state] : _farTerrainMeshes) {
+        if (!state.uploaded || !_farTerrainActiveTiles.contains(ColumnPos{key.tileX, key.tileZ}))
+            continue;
+        if (const std::optional<size_t> tier = diagnosticTierIndex(key.step)) {
+            ++farTierResident[*tier];
+            if (state.authorityQuality == FarTerrainAuthorityQuality::PREVIEW) {
+                ++farTierResidentPreview[*tier];
+            } else {
+                ++farTierResidentFinal[*tier];
+            }
+        }
+    }
+    for (const auto& [coordinate, key] : _farTerrainDisplayedByTile) {
+        if (!_farTerrainActiveTiles.contains(coordinate) || !isResident(key))
+            continue;
+        if (const std::optional<size_t> tier = diagnosticTierIndex(key.step)) {
+            ++farTierDisplayed[*tier];
+            const FarTerrainMeshState* displayedState = nullptr;
+            if (const auto promotion = _farTerrainAuthorityTransitions.find(key);
+                promotion != _farTerrainAuthorityTransitions.end() &&
+                !promotion->second.published) {
+                displayedState = &promotion->second.source;
+            } else if (const auto resident = _farTerrainMeshes.find(key);
+                       resident != _farTerrainMeshes.end()) {
+                displayedState = &resident->second;
+            }
+            if (displayedState &&
+                displayedState->authorityQuality == FarTerrainAuthorityQuality::FINAL) {
+                ++farTierDisplayedFinal[*tier];
+            } else {
+                ++farTierDisplayedPreview[*tier];
+            }
+        }
+    }
+    float worstVisibleProjectedError = 0.0F;
+    ColumnPos worstVisibleCoordinate{};
+    FarTerrainStep worstVisibleDesired = FAR_TERRAIN_BASE_STEP;
+    FarTerrainStep worstVisibleDisplayed = FAR_TERRAIN_BASE_STEP;
+    FarTerrainAuthorityQuality worstVisibleQuality = FarTerrainAuthorityQuality::PREVIEW;
+    uint32_t worstVisiblePreviewResidentMask = 0;
+    uint32_t worstVisibleFinalResidentMask = 0;
+    uint32_t visibleProjectedErrorViolations = 0;
+    for (const FarTerrainViewTile& tile : _farTerrainCandidates) {
+        if (!tile.screenErrorMetrics)
+            continue;
+        const ColumnPos coordinate{tile.key.tileX, tile.key.tileZ};
+        if (!tileVisibleForScheduling(coordinate))
+            continue;
+        const auto displayed = _farTerrainDisplayedByTile.find(coordinate);
+        if (displayed == _farTerrainDisplayedByTile.end() || !isResident(displayed->second))
+            continue;
+        const FarTerrainAuthorityQuality quality =
+            displayedQualityFor(coordinate, displayed->second.step);
+        const double error = farTerrainProjectedDisplayErrorPixels(displayed->second.step, quality,
+                                                                   *tile.screenErrorMetrics);
+        if (error > FAR_TERRAIN_SCREEN_ERROR_TARGET_PIXELS &&
+            displayed->second.step != FarTerrainStep::ONE)
+            ++visibleProjectedErrorViolations;
+        if (error <= worstVisibleProjectedError)
+            continue;
+        worstVisibleProjectedError = static_cast<float>(error);
+        worstVisibleCoordinate = coordinate;
+        worstVisibleDesired = tile.key.step;
+        worstVisibleDisplayed = displayed->second.step;
+        worstVisibleQuality = quality;
+        worstVisiblePreviewResidentMask = 0;
+        worstVisibleFinalResidentMask = 0;
+        for (const FarTerrainStep step :
+             {FarTerrainStep::ONE, FarTerrainStep::TWO, FarTerrainStep::FOUR, FarTerrainStep::EIGHT,
+              FarTerrainStep::SIXTEEN, FarTerrainStep::THIRTY_TWO}) {
+            const auto resident = _farTerrainMeshes.find({coordinate.x, coordinate.z, step});
+            if (resident == _farTerrainMeshes.end() || !resident->second.uploaded)
+                continue;
+            uint32_t& mask = resident->second.authorityQuality == FarTerrainAuthorityQuality::FINAL
+                                 ? worstVisibleFinalResidentMask
+                                 : worstVisiblePreviewResidentMask;
+            mask |= static_cast<uint32_t>(farTerrainStepMask(step));
+        }
+    }
+    const auto saturatingUint32 = [](size_t value) {
+        return static_cast<uint32_t>(
+            std::min(value, static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    };
+    std::optional<FarTerrainProtectedNearClosureSnapshot> evaluatedProtectedClosure;
+    if (protectedClosureAnchor) {
+        evaluatedProtectedClosure = FarTerrainProtectedNearClosureSnapshot{
+            .wantedTileCount = protectedNearWanted,
+            .residentTileCount = protectedNearResident,
+            .missingTileCount = protectedNearWanted - protectedNearResident,
+            .boundaryMismatchCount =
+                saturatingUint32(protectedStatusBeforeUploads.mismatchedSharedBoundaries),
+            .targetCountsByStep = protectedNearTargetsByStep,
+            .finalParentCount = saturatingUint32(protectedStatusBeforeUploads.finalParents),
+            .finalTargetCount = saturatingUint32(protectedStatusBeforeUploads.finalTargets),
+            .exactCompatibleTargetCount =
+                saturatingUint32(protectedStatusBeforeUploads.exactCompatibleTargets),
+            .lodMismatchCount =
+                saturatingUint32(protectedStatusBeforeUploads.incompatibleLodBoundaries),
+            .authorityMismatchCount = protectedNearAuthorityMismatch,
+            .ready = protectedStatusBeforeUploads.ready(),
+            .anchor = *protectedClosureAnchor,
+            .viewEpoch = protectedClosureViewEpoch,
+            .worldEpoch = protectedClosureWorldEpoch,
+            .protectedEpoch = protectedClosureEpoch,
+        };
+    }
+    // A cached prior anchor can already be geometrically complete on the same
+    // frame that movement advances the requested scheduler epoch. Publish the
+    // retained snapshot for that frame, then retain this newly validated
+    // atomic snapshot. Startup observes the stale epoch once and can accept
+    // the revalidated closure on the following frame.
+    const std::optional<FarTerrainProtectedNearClosureSnapshot> publishedProtectedClosure =
+        protectedHandoffChanged && evaluatedProtectedClosure && evaluatedProtectedClosure->ready
+            ? _farTerrainProtectedNearClosureSnapshot
+            : evaluatedProtectedClosure;
+    _farTerrainProtectedNearClosureSnapshot = evaluatedProtectedClosure;
+    const FarTerrainProtectedNearClosureSnapshot protectedClosureStats =
+        publishedProtectedClosure.value_or(FarTerrainProtectedNearClosureSnapshot{});
+
     _chunkStats.exactSurfaceRequiredCount = static_cast<uint32_t>(
         std::min<size_t>(exactHandoff.requiredSections, std::numeric_limits<uint32_t>::max()));
     _chunkStats.exactSurfaceReadyCount = static_cast<uint32_t>(
@@ -3084,6 +6257,58 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
     _chunkStats.farBaseResidentTileCount = baseWanted - parentCoverage.missingBaseTiles;
     _chunkStats.farBaseDrawnTileCount = baseDrawn;
     _chunkStats.farBaseMissingTileCount = parentCoverage.missingBaseTiles;
+    _chunkStats.farProtectedNearWantedTileCount = protectedClosureStats.wantedTileCount;
+    _chunkStats.farProtectedNearResidentTileCount = protectedClosureStats.residentTileCount;
+    _chunkStats.farProtectedNearMissingTileCount = protectedClosureStats.missingTileCount;
+    _chunkStats.farProtectedNearBoundaryMismatchCount = protectedClosureStats.boundaryMismatchCount;
+    _chunkStats.farProtectedNearTargetCountsByStep = protectedClosureStats.targetCountsByStep;
+    _chunkStats.farProtectedNearFinalParentCount = protectedClosureStats.finalParentCount;
+    _chunkStats.farProtectedNearFinalTargetCount = protectedClosureStats.finalTargetCount;
+    _chunkStats.farProtectedNearExactCompatibleTargetCount =
+        protectedClosureStats.exactCompatibleTargetCount;
+    _chunkStats.farProtectedNearLodMismatchCount = protectedClosureStats.lodMismatchCount;
+    _chunkStats.farProtectedNearAuthorityMismatchCount =
+        protectedClosureStats.authorityMismatchCount;
+    _chunkStats.farProtectedNearReady = protectedClosureStats.ready;
+    _chunkStats.farProtectedNearAnchorTileX = protectedClosureStats.anchor.x;
+    _chunkStats.farProtectedNearAnchorTileZ = protectedClosureStats.anchor.z;
+    _chunkStats.farProtectedNearViewEpoch = protectedClosureStats.viewEpoch;
+    _chunkStats.farProtectedNearWorldEpoch = protectedClosureStats.worldEpoch;
+    _chunkStats.farProtectedNearCurrentEpoch = _farTerrainProtectedNearEpoch;
+    _chunkStats.farProtectedNearClosureEpoch = protectedClosureStats.protectedEpoch;
+    _chunkStats.exactSurfaceEpoch = exactCoverageEpoch;
+    _chunkStats.farCriticalWantedTileCount = criticalWanted;
+    _chunkStats.farCriticalResidentTileCount = criticalResident;
+    _chunkStats.farCriticalMissingTileCount = criticalWanted - criticalResident;
+    _chunkStats.farTierDesiredTileCounts = farTierDesired;
+    _chunkStats.farTierResidentMeshCounts = farTierResident;
+    _chunkStats.farTierDisplayedTileCounts = farTierDisplayed;
+    _chunkStats.farTierDrawnTileCounts = farTierDrawn;
+    _chunkStats.farTierResidentPreviewCounts = farTierResidentPreview;
+    _chunkStats.farTierResidentFinalCounts = farTierResidentFinal;
+    _chunkStats.farTierDisplayedPreviewCounts = farTierDisplayedPreview;
+    _chunkStats.farTierDisplayedFinalCounts = farTierDisplayedFinal;
+    _chunkStats.farWorstVisibleProjectedErrorPixels = worstVisibleProjectedError;
+    _chunkStats.farWorstVisibleTileX = worstVisibleCoordinate.x;
+    _chunkStats.farWorstVisibleTileZ = worstVisibleCoordinate.z;
+    _chunkStats.farWorstVisibleDesiredStep =
+        static_cast<uint8_t>(farTerrainStepSize(worstVisibleDesired));
+    _chunkStats.farWorstVisibleDisplayedStep =
+        static_cast<uint8_t>(farTerrainStepSize(worstVisibleDisplayed));
+    _chunkStats.farWorstVisibleDisplayedQuality = static_cast<uint8_t>(worstVisibleQuality);
+    _chunkStats.farWorstVisiblePreviewResidentMask = worstVisiblePreviewResidentMask;
+    _chunkStats.farWorstVisibleFinalResidentMask = worstVisibleFinalResidentMask;
+    _chunkStats.farVisibleProjectedErrorViolationCount = visibleProjectedErrorViolations;
+    _chunkStats.farVisiblePerceptualFinalRequestCount = static_cast<uint32_t>(std::min<size_t>(
+        _farTerrainPerceptualFinalRequests.size(), std::numeric_limits<uint32_t>::max()));
+    _chunkStats.farPendingAuthorityTransitionCount = static_cast<uint32_t>(std::min<size_t>(
+        _farTerrainAuthorityTransitions.size(), std::numeric_limits<uint32_t>::max()));
+    _chunkStats.farExactHandoffMissingFinalParentCount = missingFinalHandoffParents;
+    _chunkStats.farBaseViewDistanceChunks = visibleChunks;
+    _chunkStats.farBaseCenterTileX = centerTile.x;
+    _chunkStats.farBaseCenterTileZ = centerTile.z;
+    _chunkStats.farBaseWorldEpoch = _farTerrainWorldEpoch;
+    _chunkStats.farBaseViewEpoch = _farTerrainViewEpoch;
     _chunkStats.farRefinementWantedTileCount = refinementWanted;
     _chunkStats.farRefinementResidentTileCount = refinementResident;
     _chunkStats.farRefinementDrawnTileCount = refinementDrawn;
@@ -3101,13 +6326,41 @@ void RenderPipeline::renderFarTerrain(id<MTLRenderCommandEncoder> encoder, const
         static_cast<uint32_t>(schedulerStats.reservedBaseWorkers);
     _chunkStats.farActiveUrgentRefinementCount =
         static_cast<uint32_t>(schedulerStats.activeUrgentRefinement);
+    _chunkStats.farCriticalSchedulerDisplacementCount = schedulerStats.criticalDisplacements;
     _chunkStats.farWorkerBudget = static_cast<uint32_t>(schedulerStats.workerBudget);
+    _chunkStats.farStep32WaterGridCalls = schedulerStats.step32WaterGridCalls;
+    _chunkStats.farStep32WaterGridSamples = schedulerStats.step32WaterGridSamples;
+    _chunkStats.farStep32WaterPointSamples = schedulerStats.step32WaterPointSamples;
+    _chunkStats.farStep32WaterDenseGridCalls = schedulerStats.step32WaterDenseGridCalls;
     _chunkStats.farCachedBaseTileCount = static_cast<uint32_t>(schedulerStats.cacheBaseEntries);
+    _chunkStats.farCanopyInFlightCount = static_cast<uint32_t>(schedulerStats.canopyInFlight);
+    _chunkStats.farActiveCanopyWorkerCount =
+        static_cast<uint32_t>(schedulerStats.activeCanopyWorkers);
+    _chunkStats.farQueuedCanopyCount = static_cast<uint32_t>(schedulerStats.queuedCanopy);
+    _chunkStats.farParkedCanopyCount = static_cast<uint32_t>(schedulerStats.parkedCanopy);
+    _chunkStats.farCompletedCanopyCount = static_cast<uint32_t>(schedulerStats.completedCanopy);
+    _chunkStats.farCanopyCacheEntryCount = static_cast<uint32_t>(schedulerStats.canopyCacheEntries);
+    _chunkStats.farCanopyFailedCount = schedulerStats.canopyFailed;
+    _chunkStats.farCanopyDeferredCount = schedulerStats.canopyDeferred;
+    _chunkStats.farCanopyAuthorityCompletionResumeCount =
+        schedulerStats.canopyAuthorityCompletionResumes;
     _chunkStats.farCoverageFrontierBlocks = coverage.distanceBlocks;
     _chunkStats.farCacheMB = static_cast<float>(schedulerStats.cacheBytes) / (1024.0f * 1024.0f);
+    _chunkStats.farCanopyCacheMB =
+        static_cast<float>(schedulerStats.canopyCacheBytes) / (1024.0f * 1024.0f);
     _chunkStats.farMegaUsedMB =
         static_cast<float>(_farMegaBuffer->vertexUsed() + _farMegaBuffer->indexUsed()) /
         (1024.0f * 1024.0f);
+    _chunkStats.farPlannerMsLast = farPlannerMilliseconds;
+    _chunkStats.farPlannerMsP95 = _farTerrainPlannerTimings.percentile95Milliseconds();
+    _chunkStats.farPlannerMsMax = _farTerrainPlannerTimings.maximumMilliseconds();
+    _chunkStats.farPlannerSelectionMsP95 = _farTerrainSelectionTimings.percentile95Milliseconds();
+    _chunkStats.farPlannerPublicationMsP95 =
+        _farTerrainPublicationTimings.percentile95Milliseconds();
+    _chunkStats.farPlannerResidencyMsP95 = _farTerrainResidencyTimings.percentile95Milliseconds();
+    _chunkStats.farArenaAdmissionDeniedCount = _farTerrainArenaAdmissionDeniedCount;
+    _chunkStats.farNearArenaReclaimCount = _farTerrainNearArenaReclaimCount;
+    _chunkStats.farNearArenaReclaimedBytes = _farTerrainNearArenaReclaimedBytes;
 }
 
 void RenderPipeline::shutdownMeshWorkers() {
@@ -3134,21 +6387,26 @@ RenderPipeline::AtmosphericRenderStats RenderPipeline::atmosphericRenderStats() 
         }
     }
     stats.indirectHistoryResetMask = _indirectHistoryResetMask;
-    stats.indirectHistoryValid = _screenSpaceLighting && _screenSpaceLighting->historyValid();
-    stats.cloudHistoryValid = _clouds && _clouds->historyValid();
-    stats.froxelHistoryValid = _volumetrics && _volumetrics->historyValid();
-    stats.atmosphereSlowRefreshCount = _atmosphere ? _atmosphere->slowRefreshCount() : 0U;
-    stats.atmosphereSkyRefreshCount = _atmosphere ? _atmosphere->skyRefreshCount() : 0U;
+    stats.indirectHistoryValid = _gfx.indirectLightingQuality == 0 ||
+                                 (_screenSpaceLighting && _screenSpaceLighting->historyValid());
+    stats.cloudHistoryValid = _gfx.cloudQuality == 0 || (_clouds && _clouds->historyValid());
+    stats.froxelHistoryValid =
+        !_gfx.volumetricLight || (_volumetrics && _volumetrics->historyValid());
+    if (_atmosphere) {
+        stats.atmosphereSlowRefreshCount = _atmosphere->slowRefreshCount();
+        stats.atmosphereSkyRefreshCount = _atmosphere->skyRefreshCount();
+    }
     stats.indirectPersistentBytes =
         _screenSpaceLighting ? _screenSpaceLighting->persistentBytes() : 0U;
     stats.cloudPersistentBytes = _clouds ? _clouds->persistentBytes() : 0U;
     stats.froxelPersistentBytes = _volumetrics ? _volumetrics->persistentBytes() : 0U;
-    const uint64_t sceneTargetBytes =
-        atmosphericSceneTargetMemoryBytes(_displayWidth, _displayHeight);
-    const uint64_t shadowBytes = _shadowMap ? shadowMapMemoryBytes(_shadowMap->quality()) : 0U;
-    stats.integratedPersistentBytes = sceneTargetBytes + shadowBytes + atmosphereLutMemoryBytes() +
-                                      stats.indirectPersistentBytes + stats.cloudPersistentBytes +
-                                      stats.froxelPersistentBytes + LIGHTNING_RENDERER_MEMORY_BYTES;
+    stats.integratedPersistentBytes =
+        atmosphericSceneTargetMemoryBytes(_displayWidth, _displayHeight) +
+        (_shadowMap && _shadowMap->quality() != 0U ? shadowMapMemoryBytes(_shadowMap->quality())
+                                                   : 0U) +
+        stats.indirectPersistentBytes + (_atmosphere ? atmosphereLutMemoryBytes() : 0U) +
+        stats.cloudPersistentBytes + stats.froxelPersistentBytes +
+        (_lightning ? LIGHTNING_RENDERER_MEMORY_BYTES : 0U);
     stats.lightningEventId = _lastLightningEventId;
     stats.lunarPhaseEnergy = _lunarPhaseEnergy;
     stats.lunarPhaseCycle = _lunarPhaseCycle;
@@ -3310,16 +6568,24 @@ void RenderPipeline::renderWater(id<MTLCommandBuffer> commandBuffer, const Mat4&
 // ---------------------------------------------------------------------------
 // renderBlockHighlight (Task 6.9)
 // ---------------------------------------------------------------------------
-void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, const Vec3& blockPos,
-                                          const Mat4& viewMatrix, const Mat4& projectionMatrix) {
-    // Upload highlight-specific uniforms with translation to block position
+void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder,
+                                          const BlockHighlight& highlight, const Mat4& viewMatrix,
+                                          const Mat4& projectionMatrix) {
+    // Expand the authored bounds slightly on every side to prevent z-fighting.
+    // The unit wireframe is scaled before translation, so beds and torches no
+    // longer receive a floating full-voxel outline.
     Uniforms uniforms{};
-
-    // Translation matrix to move wireframe box to block position
-    // With slight offset (0.002) to prevent z-fighting
+    constexpr float HIGHLIGHT_OFFSET = 0.002F;
+    const Vec3 minimum = highlight.blockPosition + highlight.localBounds.min -
+                         Vec3{HIGHLIGHT_OFFSET, HIGHLIGHT_OFFSET, HIGHLIGHT_OFFSET};
+    const Vec3 extent =
+        highlight.localBounds.max - highlight.localBounds.min +
+        Vec3{2.0F * HIGHLIGHT_OFFSET, 2.0F * HIGHLIGHT_OFFSET, 2.0F * HIGHLIGHT_OFFSET};
     uniforms.modelMatrix = matrix_identity_float4x4;
-    uniforms.modelMatrix.columns[3] =
-        simd_make_float4(blockPos.x - 0.002f, blockPos.y - 0.002f, blockPos.z - 0.002f, 1.0f);
+    uniforms.modelMatrix.columns[0].x = extent.x;
+    uniforms.modelMatrix.columns[1].y = extent.y;
+    uniforms.modelMatrix.columns[2].z = extent.z;
+    uniforms.modelMatrix.columns[3] = simd_make_float4(minimum.x, minimum.y, minimum.z, 1.0F);
 
     std::memcpy(&uniforms.viewMatrix, viewMatrix.data.data(), sizeof(uniforms.viewMatrix));
     std::memcpy(&uniforms.projectionMatrix, projectionMatrix.data.data(),
@@ -3346,6 +6612,7 @@ void RenderPipeline::renderBlockHighlight(id<MTLRenderCommandEncoder> encoder, c
     // shadow cascade. Bind both (a disabled shadow block, strength 0, keeps
     // the yellow wireframe fully lit) so it never reads stale chunk-loop state.
     [encoder setFragmentTexture:_blockTextures->texture() atIndex:0];
+    [encoder setFragmentTexture:_blockTextures->emissionMask() atIndex:5];
     [encoder setFragmentSamplerState:_blockTextures->sampler() atIndex:0];
     ShadowUniforms noShadows{};
     FrameRing::Alloc noShadowAlloc = _frameRing.push(&noShadows, sizeof(ShadowUniforms));
@@ -3383,6 +6650,7 @@ void RenderPipeline::renderUIOverlay(id<MTLRenderCommandEncoder> encoder,
 RenderPipeline::~RenderPipeline() {
     releaseSceneTargets();
     resetMetalObject(_pipelineState);
+    resetMetalObject(_coherentResolvePipelineState);
     resetMetalObject(_depthState);
     resetMetalObject(_skyPipelineState);
     resetMetalObject(_skyDepthState);

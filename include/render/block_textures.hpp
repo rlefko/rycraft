@@ -27,7 +27,10 @@ inline constexpr uint8_t TEXTURE_LAYER_CACTUS_TOP = TEXTURE_LAYER_BIRCH_LOG_TOP 
 inline constexpr uint8_t TEXTURE_LAYER_SANDSTONE_TOP = TEXTURE_LAYER_CACTUS_TOP + 1;
 inline constexpr uint8_t TEXTURE_LAYER_CRAFTING_TABLE_TOP = TEXTURE_LAYER_SANDSTONE_TOP + 1;
 inline constexpr uint8_t TEXTURE_LAYER_FURNACE_TOP = TEXTURE_LAYER_CRAFTING_TABLE_TOP + 1;
-inline constexpr uint8_t TEXTURE_LAYER_COUNT = TEXTURE_LAYER_FURNACE_TOP + 1;
+inline constexpr uint8_t TEXTURE_LAYER_FURNACE_SIDE = TEXTURE_LAYER_FURNACE_TOP + 1;
+inline constexpr uint8_t TEXTURE_LAYER_CHEST_SIDE = TEXTURE_LAYER_FURNACE_SIDE + 1;
+inline constexpr uint8_t TEXTURE_LAYER_CHEST_TOP = TEXTURE_LAYER_CHEST_SIDE + 1;
+inline constexpr uint8_t TEXTURE_LAYER_COUNT = TEXTURE_LAYER_CHEST_TOP + 1;
 
 // UI item-icon layers append after every block-face layer. Only the overlay
 // samples them; faceAttr packing never sees these indices. The non-block
@@ -41,6 +44,21 @@ static_assert(TEXTURE_LAYER_TOTAL <= 255, "texture array layers must stay 8-bit 
 constexpr uint8_t itemIconLayer(ItemType type) {
     return static_cast<uint8_t>(TEXTURE_LAYER_ITEM_FIRST +
                                 (static_cast<uint16_t>(type) - ITEM_ID_BASE));
+}
+
+// Per-texel emission is intentionally narrower than the block-level emissive
+// bit carried by faceAttr. The bit remains a fast shader gate, while this mask
+// keeps a lit furnace's stone shell and a torch's wooden stick from glowing.
+constexpr uint8_t emissionMaskForTexel(uint8_t layer, uint8_t x, uint8_t y) {
+    if (x >= 16 || y >= 16) return 0;
+    if (layer == static_cast<uint8_t>(BlockType::LAVA)) return 255;
+    if (layer == static_cast<uint8_t>(BlockType::FURNACE_LIT)) {
+        return x >= 3 && x < 13 && y >= 6 && y < 13 ? 255 : 0;
+    }
+    if (layer == static_cast<uint8_t>(BlockType::TORCH)) {
+        return x >= 6 && x < 10 && y >= 1 && y < 5 ? 255 : 0;
+    }
+    return 0;
 }
 
 // Which array layer a given face of a block samples.
@@ -79,14 +97,32 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
             if (face == FaceNormal::PLUS_Y) return TEXTURE_LAYER_CRAFTING_TABLE_TOP;
             if (face == FaceNormal::MINUS_Y) return static_cast<uint8_t>(BlockType::PLANKS);
             return static_cast<uint8_t>(type);
-        case BlockType::FURNACE:     // the mouth is painted on every side face,
-        case BlockType::FURNACE_LIT: // the block format carries no facing bits
+        case BlockType::FURNACE:
+        case BlockType::FURNACE_LIT:
             if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
                 return TEXTURE_LAYER_FURNACE_TOP;
-            return static_cast<uint8_t>(type);
+            // Saves do not yet carry facing bits. The canonical fixed front
+            // faces world -Z, and only that face owns the furnace mouth.
+            return face == FaceNormal::MINUS_Z ? static_cast<uint8_t>(type)
+                                               : TEXTURE_LAYER_FURNACE_SIDE;
+        case BlockType::CHEST:
+            if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y)
+                return TEXTURE_LAYER_CHEST_TOP;
+            // Chests share the same fixed -Z front until facing is persisted.
+            return face == FaceNormal::MINUS_Z ? static_cast<uint8_t>(type)
+                                               : TEXTURE_LAYER_CHEST_SIDE;
         default:
             return static_cast<uint8_t>(type);
     }
+}
+
+// The isometric inventory icon may rotate a fixed-front block toward the
+// viewer without changing its world orientation. Other cubes retain the
+// ordinary +Z right face.
+constexpr FaceNormal itemIconRightFaceFor(BlockType type) {
+    return type == BlockType::FURNACE || type == BlockType::FURNACE_LIT || type == BlockType::CHEST
+               ? FaceNormal::MINUS_Z
+               : FaceNormal::PLUS_Z;
 }
 
 // Pack the per-vertex face attributes into the faceAttr field: face in bits
@@ -94,9 +130,9 @@ constexpr uint8_t textureLayerFor(BlockType type, FaceNormal face) {
 // block light in bits 17-20, emissive flag in bit 21, sway class in bits
 // 22-23. Sky light 15 = open sky; lower values darken faces under cover.
 // Corner AO 3 = fully open, 0 = a fully enclosed voxel corner. Block light
-// 0-15 is the lava glow reaching a face; emissive marks a self-lit block
-// (lava) that ignores sun/shadow/sky. Sway (see swayClass) picks the wind
-// animation the scene and shadow vertex stages both apply.
+// 0-15 is propagated emitter light reaching a face; emissive marks a source
+// surface that ignores sun, shadow, and sky. Sway (see swayClass) picks the
+// wind animation the scene and shadow vertex stages both apply.
 constexpr uint32_t packFaceAttr(FaceNormal face, uint8_t layer, uint8_t skyLight = 15,
                                 uint8_t cornerAO = 3, uint8_t blockLight = 0, bool emissive = false,
                                 uint8_t sway = 0) {

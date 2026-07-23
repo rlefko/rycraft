@@ -20,7 +20,6 @@
 #define FAR_TERRAIN_EXACT_COLUMN_EDGE_BLOCKS 16.0f
 #define FAR_TERRAIN_EXACT_COLUMNS_PER_TILE 16
 #define FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK (1u << 28u)
-#define FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK (1u << 29u)
 #define FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD 32
 #define FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR 4
 #define FAR_TERRAIN_EXACT_MASK_WORD_COUNT 8
@@ -46,20 +45,10 @@
 // outward face. Half-open X/Z lookup already selects that column for -X and
 // -Z faces, but a +X or +Z face lies exactly on the following column boundary.
 // Move only those terrain-riser samples inward by one binary-exact fraction.
-// Tops, water, canopies, and skirts keep destination-fragment ownership by
-// passing false for useEmittingColumn.
-static inline bool farTerrainOpaqueRiserUsesEmittingColumn(unsigned int face, bool canopy,
-                                                           bool skirt) {
-    return face <= FAR_TERRAIN_FACE_MINUS_Z && !canopy && !skirt;
-}
-
-// A skirt joins the edge column that emitted it to the neighboring receiving
-// column. It is valid only while both far-terrain owners remain visible.
-// Testing just the destination leaves an orphan wall when exact residency
-// reaches the emitting side of a tile boundary first.
-static inline bool farTerrainSkirtOwnersVisible(bool emittingColumnOwnedByExact,
-                                                bool receivingColumnOwnedByExact) {
-    return !emittingColumnOwnedByExact && !receivingColumnOwnedByExact;
+// Tops, water, and canopies keep destination-fragment ownership. Production
+// far terrain has no skirt vertex class.
+static inline bool farTerrainOpaqueRiserUsesEmittingColumn(unsigned int face, bool canopy) {
+    return face <= FAR_TERRAIN_FACE_MINUS_Z && !canopy;
 }
 
 static inline simd_float2 farTerrainExactOwnershipSamplePosition(simd_float2 localPosition,
@@ -71,19 +60,6 @@ static inline simd_float2 farTerrainExactOwnershipSamplePosition(simd_float2 loc
     if (face == FAR_TERRAIN_FACE_PLUS_X) {
         localPosition.x -= FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS;
     } else if (face == FAR_TERRAIN_FACE_PLUS_Z) {
-        localPosition.y -= FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS;
-    }
-    return localPosition;
-}
-
-// Positive faces already lie in the receiving half-open column. Negative
-// faces lie in the emitting column and need the corresponding outward inset
-// to reach their receiving neighbor.
-static inline simd_float2 farTerrainSkirtReceivingOwnershipSamplePosition(simd_float2 localPosition,
-                                                                          unsigned int face) {
-    if (face == FAR_TERRAIN_FACE_MINUS_X) {
-        localPosition.x -= FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS;
-    } else if (face == FAR_TERRAIN_FACE_MINUS_Z) {
         localPosition.y -= FAR_TERRAIN_OWNERSHIP_RISER_INSET_BLOCKS;
     }
     return localPosition;
@@ -168,15 +144,8 @@ static inline bool farTerrainLodTerrainVisible(float progress, unsigned int flag
     return target == swapped;
 }
 
-// Skirts belong to the currently visible terrain topology. Water keeps its
-// source topology until transition completion, but retaining a source skirt
-// after the source terrain swaps out creates a freestanding vertical panel.
-static inline bool farTerrainLodSkirtVisible(float progress, unsigned int flags) {
-    return farTerrainLodTerrainVisible(progress, flags);
-}
-
-// Hide the complete terrain swap behind a narrow terrain-only fog pulse. It is
-// intentionally independent of canopy, water, skirt, and coverage fog.
+// Hide the complete terrain and connected-water swap behind a narrow fog
+// pulse. Canopy keeps its independent monotonic exchange.
 static inline float farTerrainLodTerrainFog(float progress, unsigned int flags) {
     if ((flags & FAR_TERRAIN_LOD_TRANSITION_FLAG) == 0u) {
         return 0.0f;
@@ -218,10 +187,11 @@ static inline bool farTerrainLodCanopyVisible(float progress, float ditherThresh
     return ditherThreshold >= farTerrainLodTransitionAmount((progress - 0.5f) * 2.0f);
 }
 
-// Water remains source-owned for the complete transition, and the renderer
-// retires it atomically after the target topology becomes authoritative.
-static inline bool farTerrainLodConnectedGeometryVisible(unsigned int flags) {
-    return (flags & FAR_TERRAIN_LOD_TRANSITION_FLAG) == 0u || !farTerrainLodTransitionTarget(flags);
+// Terrain and its connected standing-water and falling-water topology must
+// come from one authority at a time. Sharing the terrain cut prevents a water
+// plane from floating above the other authority's surface.
+static inline bool farTerrainLodConnectedGeometryVisible(float progress, unsigned int flags) {
+    return farTerrainLodTerrainVisible(progress, flags);
 }
 
 // The canonical weather wind used by all foliage vertex passes. Direction is
@@ -641,10 +611,9 @@ struct Uniforms {
 // chunk-local so their fp16 coordinates stay exact; this restores world space.
 // origin.w is reserved and remains zero. overlayColorAndStrength remains
 // available for diagnostic overlays.
-// farMetadata.x contains the four displayed-neighbor skirt edge bits ordered
-// by FaceNormal values +X, -X, +Z, and -Z. farMetadata.y stores the float bits
-// of the temporary coverage frontier distance, or zero when coverage is
-// complete. farMetadata.z stores LOD transition progress as float bits.
+// farMetadata.x is reserved. farMetadata.y stores the float bits of the
+// temporary coverage frontier distance, or zero when coverage is complete.
+// farMetadata.z stores LOD transition progress as float bits.
 // farMetadata.w stores FAR_TERRAIN_* flags and is zero for exact cube draws.
 struct ChunkOrigin {
     simd_float4 origin;
@@ -653,19 +622,22 @@ struct ChunkOrigin {
 };
 
 // Fragment-only ownership for one far tile and its eight immediate neighbors.
-// Each tile contributes one 256-bit mask, with one bit per 16x16 exact chunk
-// column in row-major local X/Z order. The neighboring masks let a canopy or
-// waterfall owned by one tile cross a tile face without reappearing over a
-// revision-ready exact column. Exact cube draws bind an all-zero value.
+// Each tile contributes separate 256-bit surface and flora masks, with one bit
+// per 16x16 exact chunk column in row-major local X/Z order. Terrain, water,
+// and falls retire against the narrow surface mask. Far canopy retires only
+// after every possible exact tree section is ready. Exact cube draws bind an
+// all-zero value.
 struct FarTerrainOwnershipUniforms {
     simd_uint4 readyColumnMasks[FAR_TERRAIN_EXACT_MASK_NEIGHBOR_COUNT *
                                 FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE];
+    simd_uint4 floraReadyColumnMasks[FAR_TERRAIN_EXACT_MASK_NEIGHBOR_COUNT *
+                                     FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE];
 };
 
 #ifdef __METAL_VERSION__
 static inline bool
 farTerrainExactColumnOwnsFragment(simd_float2 localPosition, unsigned int face,
-                                  bool useEmittingColumn,
+                                  bool useEmittingColumn, bool floraOwnership,
                                   constant FarTerrainOwnershipUniforms& ownership) {
     localPosition = farTerrainExactOwnershipSamplePosition(localPosition, face, useEmittingColumn);
     const metal::int2 neighbor =
@@ -684,9 +656,11 @@ farTerrainExactColumnOwnsFragment(simd_float2 localPosition, unsigned int face,
     const unsigned int tileIndex = unsigned((neighbor.y + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS) *
                                                 FAR_TERRAIN_EXACT_MASK_NEIGHBOR_EDGE +
                                             neighbor.x + FAR_TERRAIN_EXACT_MASK_NEIGHBOR_RADIUS);
-    const simd_uint4 packed =
-        ownership.readyColumnMasks[tileIndex * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE +
-                                   word / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR];
+    const unsigned int vectorIndex =
+        tileIndex * FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE +
+        word / FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR;
+    const simd_uint4 packed = floraOwnership ? ownership.floraReadyColumnMasks[vectorIndex]
+                                             : ownership.readyColumnMasks[vectorIndex];
     return ((packed[word % FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR] >>
              (bit % FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD)) &
             1u) != 0u;
@@ -987,6 +961,47 @@ static inline simd_float3 atmosphereGroundRadiance(simd_float3 groundAlbedo,
 #define FROXEL_HEIGHT 104
 #define FROXEL_DEPTH 64
 
+// Intersects one ray-distance segment with the cloud slab sampled for that
+// local weather cell. The view march can therefore place a density sample
+// inside a thin lowland or summit layer even when the snapshot-wide vertical
+// envelope spans more than a thousand blocks.
+#ifdef __METAL_VERSION__
+static inline metal::float2 cloudRaySegmentLayerIntersection(float cameraY, float rayY,
+                                                             float segmentBegin, float segmentEnd,
+                                                             float layerBase, float layerTop) {
+    if (layerTop <= layerBase || segmentEnd <= segmentBegin) {
+        return metal::float2(segmentEnd, segmentBegin);
+    }
+    if (metal::abs(rayY) < 1.0e-5f) {
+        return cameraY >= layerBase && cameraY <= layerTop
+                   ? metal::float2(segmentBegin, segmentEnd)
+                   : metal::float2(segmentEnd, segmentBegin);
+    }
+    const float first = (layerBase - cameraY) / rayY;
+    const float second = (layerTop - cameraY) / rayY;
+    return metal::float2(metal::max(segmentBegin, metal::min(first, second)),
+                         metal::min(segmentEnd, metal::max(first, second)));
+}
+#else
+static inline simd_float2 cloudRaySegmentLayerIntersection(float cameraY, float rayY,
+                                                           float segmentBegin, float segmentEnd,
+                                                           float layerBase,
+                                                           float layerTop) noexcept {
+    if (layerTop <= layerBase || segmentEnd <= segmentBegin) {
+        return simd_make_float2(segmentEnd, segmentBegin);
+    }
+    if (std::abs(rayY) < 1.0e-5F) {
+        return cameraY >= layerBase && cameraY <= layerTop
+                   ? simd_make_float2(segmentBegin, segmentEnd)
+                   : simd_make_float2(segmentEnd, segmentBegin);
+    }
+    const float first = (layerBase - cameraY) / rayY;
+    const float second = (layerTop - cameraY) / rayY;
+    return simd_make_float2(std::max(segmentBegin, std::min(first, second)),
+                            std::min(segmentEnd, std::max(first, second)));
+}
+#endif
+
 // Camera-centered weather-map transform. Grid coordinates are reconstructed
 // from large-coordinate world X/Z on the CPU before these float values reach
 // Metal, keeping the shader sampling neighborhood close to zero.
@@ -1200,6 +1215,7 @@ struct ParticleUniforms {
     simd_float4x4 projectionMatrix;
     simd_float3 cameraPosition;
     float atmosphericExtinction;
+    float metersPerBlock; // optical path only; billboard geometry remains in blocks
 };
 
 // Bound at buffer(0) in the bloom extract/blur passes (via setFragmentBytes
@@ -1220,10 +1236,10 @@ struct BloomUniforms {
 // temporalParams carries (maxHistoryWeight, colorClampGamma, aoClampGamma,
 // fireflyMaxLuminance), and filterParams carries (giMaxDistance,
 // atrousLuminanceSigma, disocclusionAgeThreshold, dayNightSkyLevel). The last
-// term, 1 in daylight and ramping to 0 through twilight, scales the additive
-// bounce so the near-field one-bounce does not become an exposure-amplified
-// halo at night; the ambient/AO term is already scaled by the night ambient.
-#define SSGI_BOUNCE_NIGHT_FLOOR 0.05f
+// term, 1 in daylight and ramping to 0 through twilight, scales direct and
+// sky-lit bounce at its source. Emissive texels and surfaces reached by
+// propagated block light bypass that gate, so torch, furnace, and lava light
+// retain their indirect contribution at night.
 #define INDIRECT_HIGH_RAY_COUNT 4u
 #define INDIRECT_MEDIUM_RAY_COUNT 2u
 #define INDIRECT_HIGH_HIZ_ITERATION_CAP 24u
@@ -1245,6 +1261,50 @@ struct IndirectLightingUniforms {
     simd_float4 filterParams;
     simd_float4 ambientAndFrame;
 };
+
+// Surface alpha packs seven bits of ambient accessibility and one
+// night-persistent-light marker in the native RGBA8 attachment. The marker
+// covers both emissive texels and ordinary surfaces reached by propagated
+// block light, which are the dominant source of torch and furnace bounce.
+static inline bool screenSpaceNightPersistentSource(float emission, float blockLight) {
+    return emission > 0.001f || blockLight > 0.001f;
+}
+
+static inline float screenSpaceSurfaceDataAlpha(float ambientAccess, bool nightPersistentSource) {
+#ifdef __METAL_VERSION__
+    const float accessBits = metal::round(metal::clamp(ambientAccess, 0.0f, 1.0f) * 127.0f);
+#else
+    const float accessBits = std::round(std::clamp(ambientAccess, 0.0f, 1.0f) * 127.0f);
+#endif
+    return (accessBits + (nightPersistentSource ? 128.0f : 0.0f)) / 255.0f;
+}
+
+static inline bool screenSpaceSurfaceHasNightPersistentLight(float packedAlpha) {
+#ifdef __METAL_VERSION__
+    return metal::round(metal::clamp(packedAlpha, 0.0f, 1.0f) * 255.0f) >= 128.0f;
+#else
+    return std::round(std::clamp(packedAlpha, 0.0f, 1.0f) * 255.0f) >= 128.0f;
+#endif
+}
+
+static inline float screenSpaceSurfaceAmbientAccess(float packedAlpha) {
+#ifdef __METAL_VERSION__
+    const float bits = metal::round(metal::clamp(packedAlpha, 0.0f, 1.0f) * 255.0f);
+    return metal::fmod(bits, 128.0f) / 127.0f;
+#else
+    const float bits = std::round(std::clamp(packedAlpha, 0.0f, 1.0f) * 255.0f);
+    return std::fmod(bits, 128.0f) / 127.0f;
+#endif
+}
+
+static inline float screenSpaceBounceSourceScale(bool nightPersistentSource,
+                                                 float dayNightSkyLevel) {
+#ifdef __METAL_VERSION__
+    return nightPersistentSource ? 1.0f : metal::saturate(dayNightSkyLevel);
+#else
+    return nightPersistentSource ? 1.0f : std::clamp(dayNightSkyLevel, 0.0f, 1.0f);
+#endif
+}
 
 // Screen-space lighting advances its bounded rays in view space, then projects
 // each sample for hierarchical depth lookup. Keeping this math shared makes
@@ -1741,6 +1801,9 @@ struct FroxelUniforms {
     simd_float4 mediumParams;
     simd_float4 weatherParams;
     simd_float4 renderParams;
+    // Horizontal meters per block, positive vertical meters per block, and
+    // the world-space Y coordinate of the physical altitude datum.
+    simd_float4 physicalScale;
     WeatherMapUniforms weatherMap;
 };
 
@@ -1759,6 +1822,47 @@ static inline float beerLambertTransmittance(float extinction, float distance) {
     return metal::exp(-metal::max(extinction, 0.0f) * metal::max(distance, 0.0f));
 #else
     return std::exp(-std::max(extinction, 0.0f) * std::max(distance, 0.0f));
+#endif
+}
+
+static inline float particleOpticalDistanceMeters(float viewDistanceBlocks, float metersPerBlock) {
+#ifdef __METAL_VERSION__
+    return metal::max(viewDistanceBlocks, 0.0f) * metal::max(metersPerBlock, 0.0f);
+#else
+    return std::max(viewDistanceBlocks, 0.0f) * std::max(metersPerBlock, 0.0f);
+#endif
+}
+
+static inline float particleBillboardPointSize(float viewDistanceBlocks) {
+#ifdef __METAL_VERSION__
+    return metal::clamp(160.0f / metal::max(viewDistanceBlocks, 1.0f), 2.0f, 12.0f);
+#else
+    return std::clamp(160.0f / std::max(viewDistanceBlocks, 1.0f), 2.0f, 12.0f);
+#endif
+}
+
+static inline float froxelAltitudeMeters(float worldY, float verticalMetersPerBlock,
+                                         float altitudeDatumY) {
+#ifdef __METAL_VERSION__
+    return metal::max((worldY - altitudeDatumY) * metal::max(verticalMetersPerBlock, 0.0f), 0.0f);
+#else
+    return std::max((worldY - altitudeDatumY) * std::max(verticalMetersPerBlock, 0.0f), 0.0f);
+#endif
+}
+
+static inline float froxelPhysicalDistance(float blockDistance, float metersPerBlock) {
+#ifdef __METAL_VERSION__
+    return metal::max(blockDistance, 0.0f) * metal::max(metersPerBlock, 0.0f);
+#else
+    return std::max(blockDistance, 0.0f) * std::max(metersPerBlock, 0.0f);
+#endif
+}
+
+static inline float froxelHeightDensity(float altitudeMeters, float scaleHeightMeters) {
+#ifdef __METAL_VERSION__
+    return metal::exp(-metal::max(altitudeMeters, 0.0f) / metal::max(scaleHeightMeters, 1.0f));
+#else
+    return std::exp(-std::max(altitudeMeters, 0.0f) / std::max(scaleHeightMeters, 1.0f));
 #endif
 }
 
@@ -1921,8 +2025,9 @@ static_assert(offsetof(FoliageWindUniforms, strength) == 12);
 static_assert(sizeof(Uniforms) == 320);
 static_assert(sizeof(ChunkOrigin) == 48);
 static_assert(offsetof(ChunkOrigin, farMetadata) == 32);
-static_assert(sizeof(FarTerrainOwnershipUniforms) == 288);
+static_assert(sizeof(FarTerrainOwnershipUniforms) == 576);
 static_assert(offsetof(FarTerrainOwnershipUniforms, readyColumnMasks) == 0);
+static_assert(offsetof(FarTerrainOwnershipUniforms, floraReadyColumnMasks) == 288);
 static_assert(FAR_TERRAIN_EXACT_MASK_WORD_COUNT * FAR_TERRAIN_EXACT_MASK_BITS_PER_WORD ==
               FAR_TERRAIN_EXACT_COLUMNS_PER_TILE * FAR_TERRAIN_EXACT_COLUMNS_PER_TILE);
 static_assert(FAR_TERRAIN_EXACT_MASK_VECTORS_PER_TILE * FAR_TERRAIN_EXACT_MASK_WORDS_PER_VECTOR ==
@@ -1998,6 +2103,7 @@ static_assert(offsetof(EntityModel, lighting) == 64);
 static_assert(sizeof(ParticleUniforms) == 160);
 static_assert(offsetof(ParticleUniforms, cameraPosition) == 128);
 static_assert(offsetof(ParticleUniforms, atmosphericExtinction) == 144);
+static_assert(offsetof(ParticleUniforms, metersPerBlock) == 148);
 
 static_assert(sizeof(BloomUniforms) == 32);
 static_assert(offsetof(BloomUniforms, threshold) == 16);
@@ -2020,11 +2126,12 @@ static_assert(offsetof(UIIconVertex, uv) == 8);
 static_assert(offsetof(UIIconVertex, tint) == 16);
 static_assert(offsetof(UIIconVertex, layer) == 32);
 
-static_assert(sizeof(FroxelUniforms) == 368);
+static_assert(sizeof(FroxelUniforms) == 384);
 static_assert(offsetof(FroxelUniforms, cameraPosition) == 192);
 static_assert(offsetof(FroxelUniforms, volumeDimensions) == 256);
 static_assert(offsetof(FroxelUniforms, renderParams) == 320);
-static_assert(offsetof(FroxelUniforms, weatherMap) == 336);
+static_assert(offsetof(FroxelUniforms, physicalScale) == 336);
+static_assert(offsetof(FroxelUniforms, weatherMap) == 352);
 static_assert(sizeof(LightningUniforms) == 128);
 static_assert(offsetof(LightningUniforms, eventAndShape) == 112);
 

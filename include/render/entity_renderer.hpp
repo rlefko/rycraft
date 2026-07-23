@@ -16,18 +16,19 @@
 // Each EntityType's model (adult and baby variants) bakes into one small
 // static mesh at construction; per entity, only a model matrix changes.
 // Draws happen inside the main MSAA scene pass with the shared Uniforms
-// buffer, so entities receive the same sun/ambient/fog treatment as terrain.
+// buffer, so entities receive packed sky/block light, cascade shadows,
+// indirect lighting, and fog under the same material contract as terrain.
 // ---------------------------------------------------------------------------
 class EntityRenderer {
 public:
     EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrary);
+    ~EntityRenderer();
 
     // Draw every visible entity. `isVisible` is the caller's frustum test.
     // The uniforms live in the caller's frame ring, hence buffer + offset.
     void render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
                 uint64_t uniformsOffset, const std::vector<std::shared_ptr<Entity>>& entities,
-                const std::function<bool(const AABB&)>& isVisible,
-                const std::function<uint8_t(const Vec3&)>& packedLightAt);
+                const std::function<bool(const AABB&)>& isVisible);
 
     void renderShadows(id<MTLRenderCommandEncoder> encoder,
                        const ShadowPassUniforms& shadowUniforms,

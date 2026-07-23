@@ -9,7 +9,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <compare>
+#include <condition_variable>
+#include <limits>
+#include <mutex>
+#include <thread>
+#include <utility>
 #include <vector>
 
 static_assert(WeatherSnapshot::GRID_EDGE == WEATHER_MAP_EDGE);
@@ -19,6 +26,12 @@ namespace {
 
 constexpr double CLOUD_OFFSET_WRAP = static_cast<double>(CLOUD_MOTION_WRAP_BLOCKS);
 constexpr double TWO_PI = 6.28318530717958647692;
+constexpr uint32_t CLOUD_NOISE_MAXIMUM_AUTOMATIC_ATTEMPTS = 3;
+constexpr std::array CLOUD_NOISE_RETRY_DELAYS{
+    std::chrono::milliseconds{100},
+    std::chrono::milliseconds{500},
+};
+static_assert(CLOUD_NOISE_RETRY_DELAYS.size() + 1 == CLOUD_NOISE_MAXIMUM_AUTOMATIC_ATTEMPTS);
 
 float hashUnit(int x, int y, int z, int edge, uint64_t seed) {
     x = world_coord::floorMod(x, edge);
@@ -230,22 +243,29 @@ float cloudBaseNoise(int x, int y, int z, int edge, uint64_t seed) noexcept {
     return std::clamp(coarse * 0.50F + detail * 0.20F + worley * 0.30F, 0.0F, 1.0F);
 }
 
-std::vector<uint8_t> generateCloudBaseNoiseVolume(int edge, uint64_t seed,
-                                                  CloudNoiseGenerationStats* stats) {
+namespace {
+
+std::optional<std::vector<uint8_t>>
+generateCloudBaseNoiseVolumeInterruptibly(int edge, uint64_t seed, CloudNoiseGenerationStats* stats,
+                                          std::stop_token stopToken) {
     CloudNoiseGenerationStats measured{};
     if (edge <= 0) {
         if (stats) {
             *stats = measured;
         }
-        return {};
+        return std::vector<uint8_t>{};
     }
 
+    if (stopToken.stop_requested())
+        return std::nullopt;
     PeriodicValueLattice coarse(4, seed, &measured.hashEvaluations);
     PeriodicValueLattice detail(8, seed ^ 0xD1B54A32D192ED03ULL, &measured.hashEvaluations);
     PeriodicWorleyFeatures worley(8, seed ^ 0x94D049BB133111EBULL, &measured.hashEvaluations);
     const size_t voxelCount = static_cast<size_t>(edge) * edge * edge;
     std::vector<uint8_t> volume(voxelCount);
     for (int z = 0; z < edge; ++z) {
+        if (stopToken.stop_requested())
+            return std::nullopt;
         for (int y = 0; y < edge; ++y) {
             for (int x = 0; x < edge; ++x) {
                 const float broad = coarse.evaluate(static_cast<float>(x), static_cast<float>(y),
@@ -267,6 +287,341 @@ std::vector<uint8_t> generateCloudBaseNoiseVolume(int edge, uint64_t seed,
         *stats = measured;
     }
     return volume;
+}
+
+std::optional<CloudNoisePayload> buildCloudNoisePayload(uint64_t worldInstanceId, uint64_t seed,
+                                                        std::stop_token stopToken) {
+    const auto startedAt = std::chrono::steady_clock::now();
+    CloudNoisePayload payload{
+        .worldInstanceId = worldInstanceId,
+        .seed = seed,
+    };
+    std::optional<std::vector<uint8_t>> base =
+        generateCloudBaseNoiseVolumeInterruptibly(CLOUD_BASE_NOISE_EDGE, seed, nullptr, stopToken);
+    if (!base)
+        return std::nullopt;
+    payload.base = std::move(*base);
+
+    if (stopToken.stop_requested())
+        return std::nullopt;
+    const PeriodicWorleyFeatures erosionFeatures(8, seed ^ 0x6A09E667F3BCC909ULL);
+    payload.erosion.resize(static_cast<size_t>(CLOUD_EROSION_NOISE_EDGE) *
+                           CLOUD_EROSION_NOISE_EDGE * CLOUD_EROSION_NOISE_EDGE);
+    for (int z = 0; z < CLOUD_EROSION_NOISE_EDGE; ++z) {
+        if (stopToken.stop_requested())
+            return std::nullopt;
+        for (int y = 0; y < CLOUD_EROSION_NOISE_EDGE; ++y) {
+            for (int x = 0; x < CLOUD_EROSION_NOISE_EDGE; ++x) {
+                const size_t index = (static_cast<size_t>(z) * CLOUD_EROSION_NOISE_EDGE + y) *
+                                         CLOUD_EROSION_NOISE_EDGE +
+                                     x;
+                payload.erosion[index] = static_cast<uint8_t>(
+                    erosionFeatures.evaluate(static_cast<float>(x), static_cast<float>(y),
+                                             static_cast<float>(z), CLOUD_EROSION_NOISE_EDGE) *
+                        255.0F +
+                    0.5F);
+            }
+        }
+    }
+
+    constexpr int CURL_EDGE = 128;
+    if (stopToken.stop_requested())
+        return std::nullopt;
+    const PeriodicValueLattice curlLattice(8, seed);
+    payload.curl.resize(static_cast<size_t>(CURL_EDGE) * CURL_EDGE * 2);
+    for (int y = 0; y < CURL_EDGE; ++y) {
+        if (stopToken.stop_requested())
+            return std::nullopt;
+        for (int x = 0; x < CURL_EDGE; ++x) {
+            const float left = curlLattice.evaluate(static_cast<float>(x - 1),
+                                                    static_cast<float>(y), 0.0F, CURL_EDGE);
+            const float right = curlLattice.evaluate(static_cast<float>(x + 1),
+                                                     static_cast<float>(y), 0.0F, CURL_EDGE);
+            const float down = curlLattice.evaluate(static_cast<float>(x),
+                                                    static_cast<float>(y - 1), 0.0F, CURL_EDGE);
+            const float up = curlLattice.evaluate(static_cast<float>(x), static_cast<float>(y + 1),
+                                                  0.0F, CURL_EDGE);
+            const size_t index = (static_cast<size_t>(y) * CURL_EDGE + x) * 2;
+            payload.curl[index] =
+                static_cast<int8_t>(std::clamp((up - down) * 127.0F, -127.0F, 127.0F));
+            payload.curl[index + 1] =
+                static_cast<int8_t>(std::clamp((left - right) * 127.0F, -127.0F, 127.0F));
+        }
+    }
+    payload.generationMilliseconds =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startedAt)
+            .count();
+    return payload;
+}
+
+} // namespace
+
+std::vector<uint8_t> generateCloudBaseNoiseVolume(int edge, uint64_t seed,
+                                                  CloudNoiseGenerationStats* stats) {
+    std::optional<std::vector<uint8_t>> volume =
+        generateCloudBaseNoiseVolumeInterruptibly(edge, seed, stats, {});
+    return volume ? std::move(*volume) : std::vector<uint8_t>{};
+}
+
+class CloudNoisePublication::Impl {
+public:
+    explicit Impl(Builder builder)
+        : builder_(builder ? std::move(builder) : Builder{buildCloudNoisePayload}) {}
+
+    ~Impl() {
+        {
+            std::lock_guard lock(mutex_);
+            pending_.reset();
+            ready_.reset();
+            activeStop_.request_stop();
+        }
+        worker_.request_stop();
+        wake_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
+    }
+
+    void beginWorld(uint64_t worldInstanceId, uint64_t seed, bool generationRequired) {
+        std::lock_guard lock(mutex_);
+        const Request next{.worldInstanceId = worldInstanceId, .seed = seed};
+        const bool bindingChanged = !binding_ || *binding_ != next;
+        const bool explicitlyReenabled = !generationRequired_ && generationRequired;
+        binding_ = next;
+        generationRequired_ = generationRequired;
+        if (bindingChanged || !generationRequired_) {
+            pending_.reset();
+            ready_.reset();
+            activeStop_.request_stop();
+        }
+        if (bindingChanged || explicitlyReenabled)
+            resetRetryBudgetLocked();
+        requestBuildLocked();
+    }
+
+    void setGenerationRequired(bool generationRequired) {
+        std::lock_guard lock(mutex_);
+        const bool explicitlyReenabled = !generationRequired_ && generationRequired;
+        generationRequired_ = generationRequired;
+        if (!generationRequired_) {
+            pending_.reset();
+            ready_.reset();
+            activeStop_.request_stop();
+            return;
+        }
+        if (explicitlyReenabled)
+            resetRetryBudgetLocked();
+        requestBuildLocked();
+    }
+
+    void endWorld() {
+        std::lock_guard lock(mutex_);
+        binding_.reset();
+        generationRequired_ = false;
+        pending_.reset();
+        ready_.reset();
+        activeStop_.request_stop();
+    }
+
+    std::optional<CloudNoisePayload> takeReadyForDraw() {
+        std::lock_guard lock(mutex_);
+        if (!binding_ || !ready_ || ready_->worldInstanceId != binding_->worldInstanceId ||
+            ready_->seed != binding_->seed) {
+            return std::nullopt;
+        }
+        generationRequired_ = false;
+        return std::exchange(ready_, std::nullopt);
+    }
+
+    CloudNoisePublicationStats stats() const {
+        std::lock_guard lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        const bool retryExhausted =
+            generationRequired_ && consecutiveFailures_ >= CLOUD_NOISE_MAXIMUM_AUTOMATIC_ATTEMPTS;
+        const bool retryBackoffActive = generationRequired_ && !retryExhausted &&
+                                        consecutiveFailures_ != 0 && now < retryNotBefore_;
+        const auto retryDelay =
+            retryBackoffActive ? std::chrono::ceil<std::chrono::milliseconds>(retryNotBefore_ - now)
+                               : std::chrono::milliseconds{0};
+        const auto failureAge =
+            lastFailureAt_
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(now - *lastFailureAt_)
+                : std::chrono::milliseconds{0};
+        uint32_t attemptsRemaining = 0;
+        if (generationRequired_ && consecutiveFailures_ < CLOUD_NOISE_MAXIMUM_AUTOMATIC_ATTEMPTS) {
+            attemptsRemaining = CLOUD_NOISE_MAXIMUM_AUTOMATIC_ATTEMPTS - consecutiveFailures_;
+        }
+        return {
+            .workerStarted = workerStarted_,
+            .buildActive = active_.has_value(),
+            .requestPending = pending_.has_value(),
+            .retryBackoffActive = retryBackoffActive,
+            .retryExhausted = retryExhausted,
+            .buildsStarted = buildsStarted_,
+            .buildsFailed = buildsFailed_,
+            .buildsCanceled = buildsCanceled_,
+            .consecutiveFailures = consecutiveFailures_,
+            .automaticAttemptsRemaining = attemptsRemaining,
+            .retryDelayRemainingMilliseconds = static_cast<uint64_t>(retryDelay.count()),
+            .lastFailureAgeMilliseconds = static_cast<uint64_t>(failureAge.count()),
+            .lastFailureBuildMilliseconds = lastFailureBuildMilliseconds_,
+            .lastFailureMessage = lastFailureMessage_,
+            .retainedPayloadBytes = ready_ ? ready_->byteSize() : 0,
+        };
+    }
+
+private:
+    struct Request {
+        uint64_t worldInstanceId = 0;
+        uint64_t seed = 0;
+
+        auto operator<=>(const Request&) const = default;
+    };
+
+    void resetRetryBudgetLocked() {
+        consecutiveFailures_ = 0;
+        retryNotBefore_ = std::chrono::steady_clock::time_point{};
+    }
+
+    void requestBuildLocked() {
+        if (!generationRequired_ || !binding_)
+            return;
+        if (ready_ && ready_->worldInstanceId == binding_->worldInstanceId &&
+            ready_->seed == binding_->seed) {
+            return;
+        }
+        if ((active_ && *active_ == *binding_) || (pending_ && *pending_ == *binding_))
+            return;
+        if (consecutiveFailures_ >= CLOUD_NOISE_MAXIMUM_AUTOMATIC_ATTEMPTS)
+            return;
+        if (std::chrono::steady_clock::now() < retryNotBefore_)
+            return;
+        pending_ = binding_;
+        if (!worker_.joinable()) {
+            workerStarted_ = true;
+            worker_ = std::jthread([this](std::stop_token stopToken) { run(stopToken); });
+        }
+        wake_.notify_one();
+    }
+
+    void run(std::stop_token workerStop) {
+        while (!workerStop.stop_requested()) {
+            Request request;
+            std::stop_token buildStop;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock,
+                           [&] { return workerStop.stop_requested() || pending_.has_value(); });
+                if (workerStop.stop_requested())
+                    return;
+                request = *pending_;
+                pending_.reset();
+                active_ = request;
+                activeStop_ = std::stop_source{};
+                buildStop = activeStop_.get_token();
+                ++buildsStarted_;
+            }
+
+            const auto buildStartedAt = std::chrono::steady_clock::now();
+            std::optional<CloudNoisePayload> payload;
+            std::string failureMessage;
+            try {
+                payload = builder_(request.worldInstanceId, request.seed, buildStop);
+                if (!payload && !buildStop.stop_requested())
+                    failureMessage = "Cloud noise builder returned no payload";
+            } catch (const std::exception& exception) {
+                failureMessage = exception.what();
+            } catch (...) {
+                failureMessage = "Cloud noise builder threw an unknown exception";
+            }
+            const auto buildFinishedAt = std::chrono::steady_clock::now();
+            const double buildMilliseconds =
+                std::chrono::duration<double, std::milli>(buildFinishedAt - buildStartedAt).count();
+            const bool canceled = buildStop.stop_requested() || workerStop.stop_requested();
+            std::string failureLog;
+
+            {
+                std::lock_guard lock(mutex_);
+                active_.reset();
+                const bool stillCurrent = binding_ && *binding_ == request && generationRequired_ &&
+                                          !buildStop.stop_requested();
+                if (canceled) {
+                    ++buildsCanceled_;
+                } else if (payload && stillCurrent) {
+                    payload->worldInstanceId = request.worldInstanceId;
+                    payload->seed = request.seed;
+                    ready_ = std::move(payload);
+                    resetRetryBudgetLocked();
+                } else if (!payload && stillCurrent) {
+                    ++buildsFailed_;
+                    ++consecutiveFailures_;
+                    lastFailureAt_ = buildFinishedAt;
+                    lastFailureBuildMilliseconds_ = buildMilliseconds;
+                    lastFailureMessage_ = failureMessage.empty()
+                                              ? "Cloud noise builder failed without a diagnostic"
+                                              : std::move(failureMessage);
+                    failureLog = "Cloud noise build failed for world " +
+                                 std::to_string(request.worldInstanceId) + ": " +
+                                 lastFailureMessage_;
+                    if (consecutiveFailures_ < CLOUD_NOISE_MAXIMUM_AUTOMATIC_ATTEMPTS) {
+                        retryNotBefore_ =
+                            buildFinishedAt + CLOUD_NOISE_RETRY_DELAYS[consecutiveFailures_ - 1];
+                    }
+                }
+                // Render polling admits the next attempt only after the
+                // bounded delay. Three consecutive failures latch this binding
+                // until quality is re-enabled or a new world is bound.
+                requestBuildLocked();
+            }
+            if (!failureLog.empty())
+                RY_LOG_ERROR(failureLog);
+        }
+    }
+
+    Builder builder_;
+    mutable std::mutex mutex_;
+    std::condition_variable wake_;
+    std::jthread worker_;
+    std::stop_source activeStop_;
+    std::optional<Request> binding_;
+    std::optional<Request> pending_;
+    std::optional<Request> active_;
+    std::optional<CloudNoisePayload> ready_;
+    bool generationRequired_ = false;
+    bool workerStarted_ = false;
+    uint64_t buildsStarted_ = 0;
+    uint64_t buildsFailed_ = 0;
+    uint64_t buildsCanceled_ = 0;
+    uint32_t consecutiveFailures_ = 0;
+    std::chrono::steady_clock::time_point retryNotBefore_{};
+    std::optional<std::chrono::steady_clock::time_point> lastFailureAt_;
+    double lastFailureBuildMilliseconds_ = 0.0;
+    std::string lastFailureMessage_;
+};
+
+CloudNoisePublication::CloudNoisePublication(Builder builder)
+    : impl_(std::make_unique<Impl>(std::move(builder))) {}
+
+CloudNoisePublication::~CloudNoisePublication() = default;
+
+void CloudNoisePublication::beginWorld(uint64_t worldInstanceId, uint64_t seed,
+                                       bool generationRequired) {
+    impl_->beginWorld(worldInstanceId, seed, generationRequired);
+}
+
+void CloudNoisePublication::setGenerationRequired(bool generationRequired) {
+    impl_->setGenerationRequired(generationRequired);
+}
+
+void CloudNoisePublication::endWorld() {
+    impl_->endWorld();
+}
+
+std::optional<CloudNoisePayload> CloudNoisePublication::takeReadyForDraw() {
+    return impl_->takeReadyForDraw();
+}
+
+CloudNoisePublicationStats CloudNoisePublication::stats() const {
+    return impl_->stats();
 }
 
 double wrappedCloudOffset(double current, double velocityBlocksPerSecond,
@@ -307,6 +662,25 @@ simd_float2 cloudMotionDelta(simd_float2 current, simd_float2 previous) noexcept
     return delta;
 }
 
+simd_float2 cloudSnapshotMarchLayerBounds(const WeatherSnapshot& snapshot) noexcept {
+    float minimumY = std::numeric_limits<float>::infinity();
+    float maximumY = -std::numeric_limits<float>::infinity();
+    for (int slice = 0; slice < 2; ++slice) {
+        for (const WeatherSample& sample : snapshot.timeSlice(slice)) {
+            if (!std::isfinite(sample.cloudBaseY) || !std::isfinite(sample.cloudTopY) ||
+                sample.cloudTopY <= sample.cloudBaseY) {
+                continue;
+            }
+            minimumY = std::min(minimumY, sample.cloudBaseY);
+            maximumY = std::max(maximumY, sample.cloudTopY);
+        }
+    }
+    if (!std::isfinite(minimumY) || !std::isfinite(maximumY)) {
+        return simd_make_float2(96.0F, 768.0F);
+    }
+    return simd_make_float2(std::floor(minimumY) - 1.0F, std::ceil(maximumY) + 1.0F);
+}
+
 CloudRendererMemoryFootprint cloudRendererMemoryFootprint(uint32_t width, uint32_t height,
                                                           int quality) noexcept {
     constexpr uint32_t CURL_NOISE_EDGE = 128U;
@@ -315,11 +689,6 @@ CloudRendererMemoryFootprint cloudRendererMemoryFootprint(uint32_t width, uint32
     width = std::max(width, 1U);
     height = std::max(height, 1U);
     quality = std::clamp(quality, 0, 2);
-    footprint.noiseBytes = static_cast<uint64_t>(CLOUD_BASE_NOISE_EDGE) * CLOUD_BASE_NOISE_EDGE *
-                               CLOUD_BASE_NOISE_EDGE +
-                           static_cast<uint64_t>(CLOUD_EROSION_NOISE_EDGE) *
-                               CLOUD_EROSION_NOISE_EDGE * CLOUD_EROSION_NOISE_EDGE +
-                           static_cast<uint64_t>(CURL_NOISE_EDGE) * CURL_NOISE_EDGE * 2U;
     // Cloud and layer fields each use two time slices. Motion uses four so
     // low and high layers preserve independent circular phases.
     constexpr uint32_t WEATHER_SLICES_PER_SLOT = 2U + 2U + 4U;
@@ -330,6 +699,11 @@ CloudRendererMemoryFootprint cloudRendererMemoryFootprint(uint32_t width, uint32
         return footprint;
     }
 
+    footprint.noiseBytes = static_cast<uint64_t>(CLOUD_BASE_NOISE_EDGE) * CLOUD_BASE_NOISE_EDGE *
+                               CLOUD_BASE_NOISE_EDGE +
+                           static_cast<uint64_t>(CLOUD_EROSION_NOISE_EDGE) *
+                               CLOUD_EROSION_NOISE_EDGE * CLOUD_EROSION_NOISE_EDGE +
+                           static_cast<uint64_t>(CURL_NOISE_EDGE) * CURL_NOISE_EDGE * 2U;
     footprint.quarterWidth = std::max(width / 4U, 1U);
     footprint.quarterHeight = std::max(height / 4U, 1U);
     footprint.shadowEdge = quality >= 2 ? 2048U : 1024U;
@@ -372,7 +746,6 @@ CloudRenderer::CloudRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
         RY_LOG_FATAL("Failed to create cloud composite pipeline");
     }
 
-    allocateNoise(worldSeed);
     allocateWeatherTextures();
     auto neutralDescriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
@@ -395,9 +768,7 @@ CloudRenderer::CloudRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
 }
 
 CloudRenderer::~CloudRenderer() {
-    releaseTexture(_baseNoise);
-    releaseTexture(_erosionNoise);
-    releaseTexture(_curlNoise);
+    releaseNoise();
     for (uint32_t slot = 0; slot < WEATHER_TEXTURE_SLOTS; ++slot) {
         releaseTexture(_weatherCloud[slot]);
         releaseTexture(_weatherLayer[slot]);
@@ -428,7 +799,47 @@ void CloudRenderer::dispatch2D(id<MTLComputeCommandEncoder> encoder,
         threadsPerThreadgroup:MTLSizeMake(threadWidth, threadHeight, 1)];
 }
 
-void CloudRenderer::allocateNoise(uint64_t worldSeed) {
+void CloudRenderer::releaseNoise() {
+    releaseTexture(_baseNoise);
+    releaseTexture(_erosionNoise);
+    releaseTexture(_curlNoise);
+    _noiseTextureSeed.reset();
+}
+
+bool CloudRenderer::noiseReadyForCurrentWorld() const noexcept {
+    return _worldInstanceId.has_value() && _noiseTextureSeed == _worldSeed && _baseNoise != nil &&
+           _erosionNoise != nil && _curlNoise != nil;
+}
+
+bool CloudRenderer::publishReadyNoiseForCurrentWorld() {
+    if (_quality == 0 || !_worldInstanceId)
+        return false;
+    if (noiseReadyForCurrentWorld())
+        return true;
+    _noisePublication.beginWorld(*_worldInstanceId, _worldSeed, true);
+    std::optional<CloudNoisePayload> payload = _noisePublication.takeReadyForDraw();
+    if (!payload)
+        return false;
+    if (payload->worldInstanceId != *_worldInstanceId || payload->seed != _worldSeed)
+        return false;
+    publishNoise(std::move(*payload));
+    return noiseReadyForCurrentWorld();
+}
+
+void CloudRenderer::publishNoise(CloudNoisePayload payload) {
+    constexpr size_t BASE_BYTES =
+        static_cast<size_t>(CLOUD_BASE_NOISE_EDGE) * CLOUD_BASE_NOISE_EDGE * CLOUD_BASE_NOISE_EDGE;
+    constexpr size_t EROSION_BYTES = static_cast<size_t>(CLOUD_EROSION_NOISE_EDGE) *
+                                     CLOUD_EROSION_NOISE_EDGE * CLOUD_EROSION_NOISE_EDGE;
+    constexpr int CURL_EDGE = 128;
+    constexpr size_t CURL_BYTES = static_cast<size_t>(CURL_EDGE) * CURL_EDGE * 2;
+    if (!_worldInstanceId || payload.worldInstanceId != *_worldInstanceId ||
+        payload.seed != _worldSeed || payload.base.size() != BASE_BYTES ||
+        payload.erosion.size() != EROSION_BYTES || payload.curl.size() != CURL_BYTES) {
+        return;
+    }
+
+    releaseNoise();
     auto baseDescriptor = [[MTLTextureDescriptor alloc] init];
     baseDescriptor.textureType = MTLTextureType3D;
     baseDescriptor.pixelFormat = MTLPixelFormatR8Unorm;
@@ -439,13 +850,11 @@ void CloudRenderer::allocateNoise(uint64_t worldSeed) {
     baseDescriptor.usage = MTLTextureUsageShaderRead;
     _baseNoise = [_device newTextureWithDescriptor:baseDescriptor];
     _baseNoise.label = @"Perlin-Worley Cloud Base";
-    const std::vector<uint8_t> base =
-        generateCloudBaseNoiseVolume(CLOUD_BASE_NOISE_EDGE, worldSeed);
     [_baseNoise replaceRegion:MTLRegionMake3D(0, 0, 0, CLOUD_BASE_NOISE_EDGE, CLOUD_BASE_NOISE_EDGE,
                                               CLOUD_BASE_NOISE_EDGE)
                   mipmapLevel:0
                         slice:0
-                    withBytes:base.data()
+                    withBytes:payload.base.data()
                   bytesPerRow:CLOUD_BASE_NOISE_EDGE
                 bytesPerImage:CLOUD_BASE_NOISE_EDGE * CLOUD_BASE_NOISE_EDGE];
 
@@ -455,32 +864,14 @@ void CloudRenderer::allocateNoise(uint64_t worldSeed) {
     erosionDescriptor.depth = CLOUD_EROSION_NOISE_EDGE;
     _erosionNoise = [_device newTextureWithDescriptor:erosionDescriptor];
     _erosionNoise.label = @"Worley Cloud Erosion";
-    const PeriodicWorleyFeatures erosionFeatures(8, worldSeed ^ 0x6A09E667F3BCC909ULL);
-    std::vector<uint8_t> erosion(static_cast<size_t>(CLOUD_EROSION_NOISE_EDGE) *
-                                 CLOUD_EROSION_NOISE_EDGE * CLOUD_EROSION_NOISE_EDGE);
-    for (int z = 0; z < CLOUD_EROSION_NOISE_EDGE; ++z) {
-        for (int y = 0; y < CLOUD_EROSION_NOISE_EDGE; ++y) {
-            for (int x = 0; x < CLOUD_EROSION_NOISE_EDGE; ++x) {
-                const size_t index = (static_cast<size_t>(z) * CLOUD_EROSION_NOISE_EDGE + y) *
-                                         CLOUD_EROSION_NOISE_EDGE +
-                                     x;
-                erosion[index] = static_cast<uint8_t>(
-                    erosionFeatures.evaluate(static_cast<float>(x), static_cast<float>(y),
-                                             static_cast<float>(z), CLOUD_EROSION_NOISE_EDGE) *
-                        255.0F +
-                    0.5F);
-            }
-        }
-    }
     [_erosionNoise replaceRegion:MTLRegionMake3D(0, 0, 0, CLOUD_EROSION_NOISE_EDGE,
                                                  CLOUD_EROSION_NOISE_EDGE, CLOUD_EROSION_NOISE_EDGE)
                      mipmapLevel:0
                            slice:0
-                       withBytes:erosion.data()
+                       withBytes:payload.erosion.data()
                      bytesPerRow:CLOUD_EROSION_NOISE_EDGE
                    bytesPerImage:CLOUD_EROSION_NOISE_EDGE * CLOUD_EROSION_NOISE_EDGE];
 
-    constexpr int CURL_EDGE = 128;
     auto curlDescriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Snorm
                                                            width:CURL_EDGE
@@ -490,30 +881,15 @@ void CloudRenderer::allocateNoise(uint64_t worldSeed) {
     curlDescriptor.usage = MTLTextureUsageShaderRead;
     _curlNoise = [_device newTextureWithDescriptor:curlDescriptor];
     _curlNoise.label = @"Cloud Curl Noise";
-    const PeriodicValueLattice curlLattice(8, worldSeed);
-    std::vector<int8_t> curl(static_cast<size_t>(CURL_EDGE) * CURL_EDGE * 2);
-    for (int y = 0; y < CURL_EDGE; ++y) {
-        for (int x = 0; x < CURL_EDGE; ++x) {
-            const float left = curlLattice.evaluate(static_cast<float>(x - 1),
-                                                    static_cast<float>(y), 0.0F, CURL_EDGE);
-            const float right = curlLattice.evaluate(static_cast<float>(x + 1),
-                                                     static_cast<float>(y), 0.0F, CURL_EDGE);
-            const float down = curlLattice.evaluate(static_cast<float>(x),
-                                                    static_cast<float>(y - 1), 0.0F, CURL_EDGE);
-            const float up = curlLattice.evaluate(static_cast<float>(x), static_cast<float>(y + 1),
-                                                  0.0F, CURL_EDGE);
-            const size_t index = (static_cast<size_t>(y) * CURL_EDGE + x) * 2;
-            curl[index] = static_cast<int8_t>(std::clamp((up - down) * 127.0F, -127.0F, 127.0F));
-            curl[index + 1] =
-                static_cast<int8_t>(std::clamp((left - right) * 127.0F, -127.0F, 127.0F));
-        }
-    }
     [_curlNoise replaceRegion:MTLRegionMake2D(0, 0, CURL_EDGE, CURL_EDGE)
                   mipmapLevel:0
-                    withBytes:curl.data()
+                    withBytes:payload.curl.data()
                   bytesPerRow:CURL_EDGE * 2];
     resetMetalObject(erosionDescriptor);
     resetMetalObject(baseDescriptor);
+    _noiseTextureSeed = payload.seed;
+    ++_noiseGenerationCount;
+    _lastNoiseGenerationMilliseconds = payload.generationMilliseconds;
 }
 
 void CloudRenderer::allocateWeatherTextures() {
@@ -596,11 +972,61 @@ void CloudRenderer::setQuality(int quality) {
         return;
     }
     _quality = quality;
+    if (_quality == 0) {
+        _noisePublication.setGenerationRequired(false);
+        releaseNoise();
+    } else if (_worldInstanceId) {
+        _noisePublication.beginWorld(*_worldInstanceId, _worldSeed, !noiseReadyForCurrentWorld());
+    }
     allocateFrameTargets();
 }
 
 void CloudRenderer::resetHistory() {
     _historyValid = false;
+}
+
+void CloudRenderer::resetWorldState() {
+    resetHistory();
+    _weatherValid = false;
+    _weatherMap = {};
+    _previousWeatherMap = {};
+    _shadowUniforms = {};
+    _weatherSignatures.fill(0);
+    _weatherSlotValid.fill(false);
+    _weatherUploadSignature = 0;
+    _weatherUploadValid = false;
+    _currentWeatherSignature = 0;
+    _weatherOriginX = 0;
+    _weatherOriginZ = 0;
+    _previousWeatherOriginX = 0;
+    _previousWeatherOriginZ = 0;
+    _activeWeatherSlot = 0;
+    _previousWeatherSlot = 0;
+    _lastShadowFrame = 0;
+    _lastShadowLightDirection = simd_make_float3(0.0F, 1.0F, 0.0F);
+    _shadowValid = false;
+    _shadowDirty = true;
+}
+
+void CloudRenderer::beginWorld(uint64_t instanceId, uint64_t seed) {
+    if (!cloudWorldBindingChanged(_worldInstanceId.has_value(), _worldInstanceId.value_or(0),
+                                  _worldSeed, instanceId, seed)) {
+        return;
+    }
+    const bool reusableNoise = _quality > 0 && _noiseTextureSeed == seed && _baseNoise != nil &&
+                               _erosionNoise != nil && _curlNoise != nil;
+    if (!reusableNoise)
+        releaseNoise();
+    _worldSeed = seed;
+    _worldInstanceId = instanceId;
+    _noisePublication.beginWorld(instanceId, seed, _quality > 0 && !reusableNoise);
+    resetWorldState();
+}
+
+void CloudRenderer::endWorld() {
+    _noisePublication.endWorld();
+    _worldInstanceId.reset();
+    resetWorldState();
 }
 
 void CloudRenderer::updateWeather(const WeatherSnapshot& snapshot, uint64_t worldTick,
@@ -720,7 +1146,7 @@ WeatherMapUniforms CloudRenderer::weatherMapForCamera(const WeatherMapUniforms& 
 
 void CloudRenderer::encodeShadow(id<MTLCommandBuffer> commandBuffer, CloudShadowUniforms uniforms,
                                  GpuFrameTimer* timer) {
-    if (!commandBuffer || _quality == 0 || !_weatherValid) {
+    if (!commandBuffer || _quality == 0 || !_weatherValid || !publishReadyNoiseForCurrentWorld()) {
         return;
     }
     const uint64_t frameIndex = static_cast<uint64_t>(std::max(uniforms.footprintAndTexel.w, 0.0F));
@@ -764,7 +1190,8 @@ void CloudRenderer::encodeShadow(id<MTLCommandBuffer> commandBuffer, CloudShadow
 void CloudRenderer::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR,
                            id<MTLTexture> sceneDepth, CloudRenderUniforms uniforms,
                            GpuFrameTimer* timer) {
-    if (!commandBuffer || !sceneHDR || !sceneDepth || _quality == 0 || !_weatherValid) {
+    if (!commandBuffer || !sceneHDR || !sceneDepth || _quality == 0 || !_weatherValid ||
+        !publishReadyNoiseForCurrentWorld()) {
         return;
     }
     uniforms.renderParams.x =

@@ -19,7 +19,18 @@ enum IndirectHistoryReset : uint32_t {
     INDIRECT_HISTORY_FORCED_STATE = 1U << 5U,
     INDIRECT_HISTORY_INVALID_DEPTH = 1U << 6U,
     INDIRECT_HISTORY_LIGHT_SOURCE = 1U << 7U,
+    INDIRECT_HISTORY_LIGHT_EDIT = 1U << 8U,
+    INDIRECT_HISTORY_TIME_DISCONTINUITY = 1U << 9U,
 };
+
+inline constexpr uint32_t INDIRECT_HISTORY_ATMOSPHERIC_REASONS =
+    INDIRECT_HISTORY_RESIZE | INDIRECT_HISTORY_TELEPORT | INDIRECT_HISTORY_WORLD_CHANGE |
+    INDIRECT_HISTORY_FOV_CHANGE | INDIRECT_HISTORY_FORCED_STATE | INDIRECT_HISTORY_LIGHT_SOURCE |
+    INDIRECT_HISTORY_TIME_DISCONTINUITY;
+
+constexpr uint32_t atmosphericHistoryResetMask(uint32_t indirectReasons) noexcept {
+    return indirectReasons & INDIRECT_HISTORY_ATMOSPHERIC_REASONS;
+}
 
 struct IndirectHistoryState {
     uint32_t width = 0;
@@ -28,6 +39,8 @@ struct IndirectHistoryState {
     float fovDegrees = 0.0F;
     uint64_t worldIdentity = 0;
     uint64_t forcedStateRevision = 0;
+    uint64_t lightEditRevision = 0;
+    uint64_t timeDiscontinuityRevision = 0;
     int quality = 0;
     uint8_t directLightSource = 0;
     bool priorDepthValid = false;
@@ -55,10 +68,11 @@ struct ScreenSpaceLightingMemoryFootprint {
     // a-trous wavelet iterations without touching the temporal feedback.
     uint64_t momentsBytes = 0;
     uint64_t scratchBytes = 0;
+    uint64_t reactiveHistoryBytes = 0;
 
     uint64_t totalBytes() const noexcept {
         return neutralBytes + linearDepthPyramidBytes + normalBytes + traceBytes + historyBytes +
-               historyDepthBytes + momentsBytes + scratchBytes;
+               historyDepthBytes + momentsBytes + scratchBytes + reactiveHistoryBytes;
     }
 };
 
@@ -75,12 +89,13 @@ public:
     void setQuality(int quality);
     void resetHistory();
 
-    // The surface texture is resolved RGBA8: diffuse albedo in RGB and baked
-    // ambient accessibility in A. Direct, block, and emissive radiance remain
-    // in sceneHDR and are never multiplied by this pass.
+    // Surface and reactive data are selected from the nearest covered MSAA
+    // sample. The R8 mask rejects both current moving pixels and the pixels
+    // occupied by moving geometry in the previous frame.
     void encode(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR,
                 id<MTLTexture> depthResolve, id<MTLTexture> surfaceResolve,
-                const IndirectLightingUniforms& uniforms, GpuFrameTimer* timer = nullptr);
+                id<MTLTexture> reactiveResolve, const IndirectLightingUniforms& uniforms,
+                GpuFrameTimer* timer = nullptr);
 
     bool historyValid() const { return _historyValid; }
     uint64_t persistentBytes() const { return _persistentBytes; }
@@ -94,6 +109,7 @@ private:
     id<MTLComputePipelineState> _temporalPipeline;
     id<MTLComputePipelineState> _atrousPipeline;
     id<MTLComputePipelineState> _historyDepthPipeline;
+    id<MTLComputePipelineState> _reactiveHistoryPipeline;
     id<MTLRenderPipelineState> _applyPipeline;
     id<MTLTexture> _linearDepthPyramid{};
     id<MTLTexture> _normalTexture{};
@@ -101,6 +117,7 @@ private:
     id<MTLTexture> _history[2]{};
     id<MTLTexture> _historyDepth[2]{};
     id<MTLTexture> _momentsAge[2]{};
+    id<MTLTexture> _reactiveHistory[2]{};
     id<MTLTexture> _denoiseScratch{};
     id<MTLTexture> _neutralTexture;
     uint32_t _displayWidth;

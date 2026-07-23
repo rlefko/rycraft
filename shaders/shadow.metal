@@ -24,8 +24,6 @@ struct ShadowVertexOutput {
     uint vTextureLayer [[flat]];
     uint vFace [[flat]];
     uint vFarCanopy [[flat]];
-    uint vFarSkirt [[flat]];
-    uint vFarSkirtMask [[flat]];
     uint vFarTerrain [[flat]];
     float vLodTransitionProgress [[flat]];
 };
@@ -48,8 +46,6 @@ vertex ShadowVertexOutput shadowVertexMain(ShadowVertexInput in [[stage_in]],
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
     out.vFace = in.faceAttr & 7u;
     out.vFarCanopy = (in.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) != 0u;
-    out.vFarSkirt = (in.faceAttr & FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK) != 0u;
-    out.vFarSkirtMask = chunkOrigin.farMetadata.x;
     out.vFarTerrain = chunkOrigin.farMetadata.w;
     out.vLodTransitionProgress = as_type<float>(chunkOrigin.farMetadata.z);
     return out;
@@ -62,30 +58,15 @@ fragment void shadowCutoutFragment(ShadowVertexOutput in [[stage_in]],
                                    sampler blockSampler [[sampler(0)]],
                                    constant FarTerrainOwnershipUniforms& ownership [[buffer(5)]]) {
     if (in.vFarTerrain != 0u) {
-        const bool useEmittingColumn = farTerrainOpaqueRiserUsesEmittingColumn(
-            in.vFace, in.vFarCanopy != 0u, in.vFarSkirt != 0u);
-        bool exactOwns = farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace,
-                                                           useEmittingColumn, ownership);
-        if (in.vFarSkirt != 0u) {
-            const bool emittingOwns =
-                farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace, true, ownership);
-            const float2 receivingPosition =
-                farTerrainSkirtReceivingOwnershipSamplePosition(in.vFarLocalPosition, in.vFace);
-            const bool receivingOwns =
-                farTerrainExactColumnOwnsFragment(receivingPosition, in.vFace, false, ownership);
-            exactOwns = !farTerrainSkirtOwnersVisible(emittingOwns, receivingOwns);
-            if ((in.vFarSkirtMask & (1u << in.vFace)) == 0u) {
-                discard_fragment();
-            }
-        }
-        if (exactOwns) {
+        const bool useEmittingColumn =
+            farTerrainOpaqueRiserUsesEmittingColumn(in.vFace, in.vFarCanopy != 0u);
+        if (farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace, useEmittingColumn,
+                                              in.vFarCanopy != 0u, ownership)) {
             discard_fragment();
         }
         const float threshold = interleavedGradientNoise(floor(in.vLodWorldPosition));
         const bool visible =
-            in.vFarSkirt != 0u
-                ? farTerrainLodSkirtVisible(in.vLodTransitionProgress, in.vFarTerrain)
-            : in.vFarCanopy != 0u
+            in.vFarCanopy != 0u
                 ? farTerrainLodCanopyVisible(in.vLodTransitionProgress, threshold, in.vFarTerrain)
                 : farTerrainLodTerrainVisible(in.vLodTransitionProgress, in.vFarTerrain);
         if (!visible) {

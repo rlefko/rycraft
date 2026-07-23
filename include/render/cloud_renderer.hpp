@@ -7,6 +7,11 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <stop_token>
+#include <string>
 #include <vector>
 
 class GpuFrameTimer;
@@ -27,12 +32,91 @@ struct CloudNoiseGenerationStats {
 std::vector<uint8_t> generateCloudBaseNoiseVolume(int edge, uint64_t seed,
                                                   CloudNoiseGenerationStats* stats = nullptr);
 
+struct CloudNoisePayload {
+    uint64_t worldInstanceId = 0;
+    uint64_t seed = 0;
+    std::vector<uint8_t> base;
+    std::vector<uint8_t> erosion;
+    std::vector<int8_t> curl;
+    double generationMilliseconds = 0.0;
+
+    [[nodiscard]] uint64_t byteSize() const noexcept {
+        return static_cast<uint64_t>(base.size()) + static_cast<uint64_t>(erosion.size()) +
+               static_cast<uint64_t>(curl.size());
+    }
+};
+
+struct CloudNoisePublicationStats {
+    bool workerStarted = false;
+    bool buildActive = false;
+    bool requestPending = false;
+    bool retryBackoffActive = false;
+    bool retryExhausted = false;
+    uint64_t buildsStarted = 0;
+    uint64_t buildsFailed = 0;
+    uint64_t buildsCanceled = 0;
+    uint32_t consecutiveFailures = 0;
+    uint32_t automaticAttemptsRemaining = 0;
+    uint64_t retryDelayRemainingMilliseconds = 0;
+    uint64_t lastFailureAgeMilliseconds = 0;
+    double lastFailureBuildMilliseconds = 0.0;
+    std::string lastFailureMessage;
+    uint64_t retainedPayloadBytes = 0;
+};
+
+// Owns the single background CPU build lane for seeded cloud textures.
+// Publication is identity-checked when the render thread polls for its current
+// world, so a completed payload can never cross a world-session boundary.
+class CloudNoisePublication {
+public:
+    using Builder = std::function<std::optional<CloudNoisePayload>(
+        uint64_t worldInstanceId, uint64_t seed, std::stop_token stopToken)>;
+
+    explicit CloudNoisePublication(Builder builder = {});
+    ~CloudNoisePublication();
+
+    CloudNoisePublication(const CloudNoisePublication&) = delete;
+    CloudNoisePublication& operator=(const CloudNoisePublication&) = delete;
+
+    // `generationRequired` is false for disabled cloud quality and for a
+    // renderer that already owns textures for this exact seed. Repeating an
+    // enabled binding polls two delayed retries without resetting its failure
+    // budget; the third failure latches the binding. A false-to-true transition
+    // explicitly starts a fresh budget. Calls only update coordinator state and
+    // never perform generation.
+    void beginWorld(uint64_t worldInstanceId, uint64_t seed, bool generationRequired);
+    void setGenerationRequired(bool generationRequired);
+    void endWorld();
+    [[nodiscard]] std::optional<CloudNoisePayload> takeReadyForDraw();
+    [[nodiscard]] CloudNoisePublicationStats stats() const;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 double wrappedCloudOffset(double current, double velocityBlocksPerSecond,
                           double deltaSeconds) noexcept;
 simd_float4 encodeCloudMotionOffset(worldgen::Vector2d offset) noexcept;
 simd_float4 encodeCloudMotion(const WeatherSample& sample) noexcept;
 simd_float2 decodeCloudMotion(simd_float4 encoded) noexcept;
 simd_float2 cloudMotionDelta(simd_float2 current, simd_float2 previous) noexcept;
+
+constexpr bool cloudWorldBindingChanged(bool hasBinding, uint64_t currentInstance,
+                                        uint64_t currentSeed, uint64_t nextInstance,
+                                        uint64_t nextSeed) noexcept {
+    return !hasBinding || currentInstance != nextInstance || currentSeed != nextSeed;
+}
+
+constexpr bool cloudNoiseRegenerationRequired(bool noiseResident, uint64_t currentSeed,
+                                              uint64_t nextSeed) noexcept {
+    return !noiseResident || currentSeed != nextSeed;
+}
+
+// The weather snapshot owns physically scaled per-cell cloud heights. Using
+// their complete two-slice extent prevents the view march from clipping v4
+// layers above the former fixed 768-block ceiling.
+simd_float2 cloudSnapshotMarchLayerBounds(const WeatherSnapshot& snapshot) noexcept;
 
 // Texture payload retained by the cloud renderer. Driver page alignment is
 // device-specific and is intentionally outside this budget.
@@ -62,6 +146,8 @@ public:
 
     void resize(uint32_t width, uint32_t height);
     void setQuality(int quality);
+    void beginWorld(uint64_t instanceId, uint64_t seed);
+    void endWorld();
     void resetHistory();
     void updateWeather(const WeatherSnapshot& snapshot, uint64_t worldTick, uint32_t frameSlot);
 
@@ -76,7 +162,7 @@ public:
                 GpuFrameTimer* timer = nullptr);
 
     id<MTLTexture> shadowTexture() const {
-        return _quality > 0 && _weatherValid ? _cloudShadow : _neutralCloudShadow;
+        return _quality > 0 && _weatherValid && _shadowValid ? _cloudShadow : _neutralCloudShadow;
     }
     id<MTLTexture> weatherCloudTexture() const { return _weatherCloud[_activeWeatherSlot]; }
     id<MTLTexture> weatherLayerTexture() const { return _weatherLayer[_activeWeatherSlot]; }
@@ -91,6 +177,9 @@ public:
     const CloudShadowUniforms& shadowUniforms() const { return _shadowUniforms; }
     bool historyValid() const { return _historyValid; }
     uint64_t persistentBytes() const { return _persistentBytes; }
+    uint64_t noiseGenerationCount() const { return _noiseGenerationCount; }
+    double lastNoiseGenerationMilliseconds() const { return _lastNoiseGenerationMilliseconds; }
+    CloudNoisePublicationStats noisePublicationStats() const { return _noisePublication.stats(); }
 
 private:
     id<MTLDevice> _device;
@@ -101,6 +190,7 @@ private:
     id<MTLTexture> _baseNoise;
     id<MTLTexture> _erosionNoise;
     id<MTLTexture> _curlNoise;
+    CloudNoisePublication _noisePublication;
     static constexpr uint32_t WEATHER_TEXTURE_SLOTS = 3;
     id<MTLTexture> _weatherCloud[WEATHER_TEXTURE_SLOTS]{};
     id<MTLTexture> _weatherLayer[WEATHER_TEXTURE_SLOTS]{};
@@ -114,6 +204,8 @@ private:
     uint32_t _displayWidth;
     uint32_t _displayHeight;
     uint64_t _worldSeed = 0;
+    std::optional<uint64_t> _worldInstanceId;
+    std::optional<uint64_t> _noiseTextureSeed;
     uint32_t _quarterWidth = 1;
     uint32_t _quarterHeight = 1;
     int _quality = 0;
@@ -142,8 +234,14 @@ private:
     bool _shadowValid = false;
     bool _shadowDirty = true;
     uint64_t _persistentBytes = 0;
+    uint64_t _noiseGenerationCount = 0;
+    double _lastNoiseGenerationMilliseconds = 0.0;
 
-    void allocateNoise(uint64_t worldSeed);
+    [[nodiscard]] bool noiseReadyForCurrentWorld() const noexcept;
+    [[nodiscard]] bool publishReadyNoiseForCurrentWorld();
+    void publishNoise(CloudNoisePayload payload);
+    void releaseNoise();
+    void resetWorldState();
     void allocateFrameTargets();
     void allocateWeatherTextures();
     static WeatherMapUniforms weatherMapForCamera(const WeatherMapUniforms& weatherMap,

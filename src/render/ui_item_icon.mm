@@ -11,21 +11,27 @@ void drawItemIcon(UIOverlay& ui, const ItemStack& stack, float x, float y, float
         return;
 
     const BlockType block = isBlockItem(stack.type) ? blockFromItem(stack.type) : BlockType::AIR;
-    if (block != BlockType::AIR && rendersAsCube(block)) {
+    if (block != BlockType::AIR && (rendersAsCube(block) || rendersAsLowBox(block))) {
         const float cx = x + w * 0.5f;
-        const float topY = y + h;
-        const float midHighY = y + h * 0.75f;
-        const float centerY = y + h * 0.5f;
-        const float midLowY = y + h * 0.25f;
+        const float shapeScale = rendersAsLowBox(block) ? blockCollisionHeight(block) : 1.0F;
+        const float baseOffset = rendersAsLowBox(block) ? 0.15F : 0.0F;
+        const auto iconY = [=](float normalized) {
+            return y + h * (baseOffset + normalized * shapeScale);
+        };
+        const float topY = iconY(1.0F);
+        const float midHighY = iconY(0.75F);
+        const float centerY = iconY(0.5F);
+        const float midLowY = iconY(0.25F);
+        const float baseY = iconY(0.0F);
 
         const uint8_t topLayer = textureLayerFor(block, FaceNormal::PLUS_Y);
         const uint8_t leftLayer = textureLayerFor(block, FaceNormal::MINUS_X);
-        const uint8_t rightLayer = textureLayerFor(block, FaceNormal::PLUS_Z);
+        const uint8_t rightLayer = textureLayerFor(block, itemIconRightFaceFor(block));
 
         // Corners are bottom-left, bottom-right, top-left, top-right.
         const float top[8] = {x, midHighY, cx, centerY, cx, topY, x + w, midHighY};
-        const float left[8] = {x, y + h * 0.25f, cx, y, x, midHighY, cx, centerY};
-        const float right[8] = {cx, y, x + w, midLowY, cx, centerY, x + w, midHighY};
+        const float left[8] = {x, midLowY, cx, baseY, x, midHighY, cx, centerY};
+        const float right[8] = {cx, baseY, x + w, midLowY, cx, centerY, x + w, midHighY};
         ui.drawIconQuadCorners(top, topLayer, 1.0f, 1.0f);
         ui.drawIconQuadCorners(left, leftLayer, 0.8f, 1.0f);
         ui.drawIconQuadCorners(right, rightLayer, 0.6f, 1.0f);

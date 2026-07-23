@@ -232,6 +232,37 @@ void BlockTextureArray::generateLayer(uint8_t layer) {
                 fillTilePixel(&getTilePixel(x, y), 0.42, 0.42, 0.44, n, 0.12);
             }
         }
+    } else if (layer == TEXTURE_LAYER_FURNACE_SIDE) {
+        // Stone shell without a mouth. The lit front remains a separate block
+        // layer so the emission texture cannot leak onto these faces.
+        for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+            for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                const double n = noise.noise2D(x * 0.3, y * 0.3);
+                fillTilePixel(&getTilePixel(x, y), 0.40, 0.40, 0.42, n, 0.14);
+            }
+        }
+    } else if (layer == TEXTURE_LAYER_CHEST_SIDE) {
+        for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+            for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                const double n = noise.noise2D(x * 0.2, y * 0.2);
+                const bool seam = y == 5 || y == 6;
+                const bool frame = x == 0 || x == 15;
+                const double factor = seam ? 0.5 : (frame ? 0.75 : 1.0);
+                fillTilePixel(&getTilePixel(x, y), 0.62 * factor, 0.44 * factor, 0.22 * factor, n,
+                              0.06);
+            }
+        }
+    } else if (layer == TEXTURE_LAYER_CHEST_TOP) {
+        for (uint32_t y = 0; y < TILE_SIZE; ++y) {
+            for (uint32_t x = 0; x < TILE_SIZE; ++x) {
+                const double n = noise.noise2D(x * 0.2, y * 0.2);
+                const bool frame = x == 0 || x == 15 || y == 0 || y == 15;
+                const bool centerSeam = x == 7 || x == 8;
+                const double factor = centerSeam ? 0.58 : (frame ? 0.75 : 1.0);
+                fillTilePixel(&getTilePixel(x, y), 0.62 * factor, 0.44 * factor, 0.22 * factor, n,
+                              0.06);
+            }
+        }
     } else {
         switch (static_cast<BlockType>(layer)) {
             case BlockType::STONE: {
@@ -1167,6 +1198,19 @@ BlockTextureArray::BlockTextureArray(id<MTLDevice> device) {
         RY_LOG_FATAL("Failed to allocate block texture array");
     }
 
+    auto emissionDescriptor = [[MTLTextureDescriptor alloc] init];
+    emissionDescriptor.textureType = MTLTextureType2DArray;
+    emissionDescriptor.pixelFormat = MTLPixelFormatR8Unorm;
+    emissionDescriptor.width = TILE_SIZE;
+    emissionDescriptor.height = TILE_SIZE;
+    emissionDescriptor.arrayLength = TEXTURE_LAYER_TOTAL;
+    emissionDescriptor.mipmapLevelCount = MIP_LEVEL_COUNT;
+    emissionDescriptor.usage = MTLTextureUsageShaderRead;
+    _emissionMask = [device newTextureWithDescriptor:emissionDescriptor];
+    if (!_emissionMask) {
+        RY_LOG_FATAL("Failed to allocate block emission mask array");
+    }
+
     // Repeat addressing is what lets a single greedy quad tile its texture
     // across every block it covers.
     auto samplerDesc = [[MTLSamplerDescriptor alloc] init];
@@ -1183,5 +1227,41 @@ BlockTextureArray::BlockTextureArray(id<MTLDevice> device) {
 
     for (uint16_t layer = 0; layer < TEXTURE_LAYER_TOTAL; ++layer) {
         generateLayer(static_cast<uint8_t>(layer));
+        generateEmissionMaskLayer(static_cast<uint8_t>(layer));
+    }
+}
+
+void BlockTextureArray::generateEmissionMaskLayer(uint8_t layer) {
+    uint32_t edge = TILE_SIZE;
+    std::vector<uint8_t> pixels(static_cast<size_t>(edge) * edge);
+    for (uint32_t y = 0; y < edge; ++y) {
+        for (uint32_t x = 0; x < edge; ++x) {
+            pixels[static_cast<size_t>(y) * edge + x] =
+                emissionMaskForTexel(layer, static_cast<uint8_t>(x), static_cast<uint8_t>(y));
+        }
+    }
+
+    for (uint32_t mipLevel = 0; mipLevel < MIP_LEVEL_COUNT; ++mipLevel) {
+        [_emissionMask replaceRegion:MTLRegionMake2D(0, 0, edge, edge)
+                         mipmapLevel:mipLevel
+                               slice:layer
+                           withBytes:pixels.data()
+                         bytesPerRow:edge
+                       bytesPerImage:static_cast<NSUInteger>(edge) * edge];
+        if (edge == 1)
+            break;
+
+        const uint32_t nextEdge = edge / 2;
+        std::vector<uint8_t> next(static_cast<size_t>(nextEdge) * nextEdge);
+        for (uint32_t y = 0; y < nextEdge; ++y) {
+            for (uint32_t x = 0; x < nextEdge; ++x) {
+                const size_t source = static_cast<size_t>(y * 2) * edge + x * 2;
+                const uint32_t sum = static_cast<uint32_t>(pixels[source]) + pixels[source + 1] +
+                                     pixels[source + edge] + pixels[source + edge + 1];
+                next[static_cast<size_t>(y) * nextEdge + x] = static_cast<uint8_t>((sum + 2) / 4);
+            }
+        }
+        pixels = std::move(next);
+        edge = nextEdge;
     }
 }

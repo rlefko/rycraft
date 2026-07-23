@@ -310,6 +310,7 @@ public:
     id<MTLTexture> horizonDepthTexture() const { return _horizonDepthTexture; }
     id<MTLDepthStencilState> depthState() const { return _depthState; }
     id<MTLRenderPipelineState> chunkPipeline() const { return _chunkPipeline; }
+    id<MTLRenderPipelineState> entityPipeline() const { return _entityPipeline; }
     id<MTLSamplerState> comparisonSampler() const { return _comparisonSampler; }
 
     // A render pass descriptor targeting one cascade slice (depth-only clear).
@@ -330,6 +331,7 @@ private:
     id<MTLTexture> _horizonDepthTexture{}; // Depth32Float, one 2D texture
     id<MTLDepthStencilState> _depthState;
     id<MTLRenderPipelineState> _chunkPipeline;
+    id<MTLRenderPipelineState> _entityPipeline;
     id<MTLSamplerState> _comparisonSampler;
     uint32_t _quality = 1;
 

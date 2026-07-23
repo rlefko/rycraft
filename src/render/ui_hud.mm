@@ -177,6 +177,19 @@ void drawMenu(UIOverlay& ui, const UIFrameState& frame, uint32_t displayWidth,
                     0.14f, 0.92f);
     }
 
+    if (layout.progressFraction >= 0.f && layout.progressTrack.w > 0.f) {
+        const float borderX = 2.0f / w;
+        const float borderY = 2.0f / h;
+        ui.drawQuad(layout.progressTrack.x - borderX, layout.progressTrack.y - borderY,
+                    layout.progressTrack.w + 2.0f * borderX,
+                    layout.progressTrack.h + 2.0f * borderY, 0.02f, 0.02f, 0.03f, 0.95f);
+        ui.drawQuad(layout.progressTrack.x, layout.progressTrack.y, layout.progressTrack.w,
+                    layout.progressTrack.h, 0.16f, 0.16f, 0.2f, 0.95f);
+        ui.drawQuad(layout.progressTrack.x, layout.progressTrack.y,
+                    layout.progressTrack.w * std::clamp(layout.progressFraction, 0.0f, 1.0f),
+                    layout.progressTrack.h, 0.35f, 0.58f, 0.9f, 0.98f);
+    }
+
     for (size_t i = 0; i < layout.buttons.size(); ++i) {
         const MenuButton& button = layout.buttons[i];
         const bool hovered = static_cast<int>(i) == hoveredButton;

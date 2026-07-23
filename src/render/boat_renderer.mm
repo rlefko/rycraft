@@ -1,6 +1,8 @@
 #include "render/boat_renderer.hpp"
 
 #include "common/error.hpp"
+#include "render/dynamic_object_lighting.hpp"
+#include "render/metal_ownership.hpp"
 #include "render/pixel_formats.hpp"
 
 #include <cmath>
@@ -41,6 +43,19 @@ void appendBox(std::vector<EntityVertex>& vertices, std::vector<uint16_t>& indic
         indices.push_back(static_cast<uint16_t>(base + 2));
         indices.push_back(static_cast<uint16_t>(base + 3));
     }
+}
+
+EntityModel modelForBoat(const Boat& boat) {
+    const float c = std::cos(boat.yaw);
+    const float s = std::sin(boat.yaw);
+    EntityModel model{};
+    model.model = matrix_identity_float4x4;
+    model.model.columns[0] = simd_make_float4(c, 0, -s, 0);
+    model.model.columns[2] = simd_make_float4(s, 0, c, 0);
+    model.model.columns[3] =
+        simd_make_float4(boat.position.x, boat.position.y, boat.position.z, 1.0f);
+    model.lighting = dynamicObjectLighting(boat.renderPackedLight);
+    return model;
 }
 
 } // namespace
@@ -97,10 +112,19 @@ BoatRenderer::BoatRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) :
 
     NSError* error = nil;
     _pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    resetMetalObject(pipelineDesc);
+    resetMetalObject(vertexFunc);
+    resetMetalObject(fragmentFunc);
     if (!_pipelineState) {
         RY_LOG_FATAL("Failed to create boat pipeline state");
     }
     buildMesh();
+}
+
+BoatRenderer::~BoatRenderer() {
+    resetMetalObject(_vertexBuffer);
+    resetMetalObject(_indexBuffer);
+    resetMetalObject(_pipelineState);
 }
 
 void BoatRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
@@ -118,16 +142,28 @@ void BoatRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uni
         if (!isVisible(boat.getAABB()))
             continue;
 
-        const float c = std::cos(boat.yaw);
-        const float s = std::sin(boat.yaw);
-        EntityModel model;
-        model.model = matrix_identity_float4x4;
-        model.model.columns[0] = simd_make_float4(c, 0, -s, 0);
-        model.model.columns[2] = simd_make_float4(s, 0, c, 0);
-        model.model.columns[3] =
-            simd_make_float4(boat.position.x, boat.position.y, boat.position.z, 1.0f);
+        const EntityModel model = modelForBoat(boat);
         [encoder setVertexBytes:&model length:sizeof(model) atIndex:2];
 
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:_indexCount
+                             indexType:MTLIndexTypeUInt16
+                           indexBuffer:_indexBuffer
+                     indexBufferOffset:0];
+    }
+}
+
+void BoatRenderer::renderShadowCasters(id<MTLRenderCommandEncoder> encoder,
+                                       const std::vector<Boat>& boats,
+                                       const std::function<bool(const AABB&)>& isVisible) {
+    if (boats.empty())
+        return;
+    [encoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
+    for (const Boat& boat : boats) {
+        if (!isVisible(boat.getAABB()))
+            continue;
+        const EntityModel model = modelForBoat(boat);
+        [encoder setVertexBytes:&model length:sizeof(model) atIndex:2];
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                             indexCount:_indexCount
                              indexType:MTLIndexTypeUInt16

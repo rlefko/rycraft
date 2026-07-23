@@ -24,6 +24,7 @@
 class UIOverlay {
 public:
     UIOverlay(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_t width, uint32_t height);
+    ~UIOverlay();
 
     // Start a new frame's batch (drops any unflushed quads).
     void beginFrame();

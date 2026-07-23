@@ -33,7 +33,7 @@ LightEngine::FloodResult LightEngine::floodChunk(Chunk& chunk, const FaceNeighbo
             const int firstLocalY = std::max(0, cutoffY - cubeBaseY);
             for (int y = firstLocalY; y < CHUNK_HEIGHT; ++y) {
                 if (isTransparent(chunk.getBlock(x, y, z))) {
-                    raise(x, y, z, 15, true);
+                    raise(x, y, z, MAX_DERIVED_LIGHT_LEVEL, true);
                 }
             }
         }

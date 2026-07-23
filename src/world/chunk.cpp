@@ -13,6 +13,9 @@ Chunk::Chunk(const Chunk& other)
     , meshed(other.meshed)
     , generated(other.generated)
     , modifiedSinceSave(other.modifiedSinceSave)
+    , publicationLightPending(other.publicationLightPending)
+    , publicationLightQueued(other.publicationLightQueued)
+    , publicationLightQueueToken(other.publicationLightQueueToken)
     , version(other.version.load(std::memory_order_relaxed))
     , uniformBlock_(other.uniformBlock_)
     , blocks_(other.blocks_)
@@ -27,6 +30,9 @@ Chunk::Chunk(Chunk&& other) noexcept
     , meshed(other.meshed)
     , generated(other.generated)
     , modifiedSinceSave(other.modifiedSinceSave)
+    , publicationLightPending(other.publicationLightPending)
+    , publicationLightQueued(other.publicationLightQueued)
+    , publicationLightQueueToken(other.publicationLightQueueToken)
     , version(other.version.load(std::memory_order_relaxed))
     , uniformBlock_(other.uniformBlock_)
     , blocks_(std::move(other.blocks_))
@@ -42,6 +48,9 @@ Chunk& Chunk::operator=(const Chunk& other) {
     meshed = other.meshed;
     generated = other.generated;
     modifiedSinceSave = other.modifiedSinceSave;
+    publicationLightPending = other.publicationLightPending;
+    publicationLightQueued = other.publicationLightQueued;
+    publicationLightQueueToken = other.publicationLightQueueToken;
     version.store(other.version.load(std::memory_order_relaxed), std::memory_order_relaxed);
     uniformBlock_ = other.uniformBlock_;
     blocks_ = other.blocks_;
@@ -94,7 +103,7 @@ void Chunk::setSkyLight(int localX, int localY, int localZ, uint8_t level) {
         localZ >= CHUNK_EDGE) {
         return;
     }
-    level = std::min<uint8_t>(level, 15);
+    level = std::min(level, MAX_DERIVED_LIGHT_LEVEL);
     if (packedLight_.empty()) {
         if (level == 0) return;
         packedLight_.assign(CHUNK_VOLUME, 0);
@@ -108,7 +117,7 @@ void Chunk::setBlockLight(int localX, int localY, int localZ, uint8_t level) {
         localZ >= CHUNK_EDGE) {
         return;
     }
-    level = std::min<uint8_t>(level, 15);
+    level = std::min(level, MAX_DERIVED_LIGHT_LEVEL);
     if (packedLight_.empty()) {
         if (level == 0) return; // stay unallocated while fully dark
         packedLight_.assign(CHUNK_VOLUME, 0);

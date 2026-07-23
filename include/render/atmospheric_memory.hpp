@@ -40,9 +40,9 @@ constexpr uint64_t waterReflectionPyramidMemoryBytes(uint32_t width, uint32_t he
 
 constexpr uint64_t atmosphericSceneTargetMemoryBytes(uint32_t width, uint32_t height) noexcept {
     // HDR resolve is 8 B; the water refraction and SSR source is its complete
-    // 8 B-per-texel mip pyramid; surface data is 4 B; opaque and media depth
-    // are 4 B each.
-    return static_cast<uint64_t>(width) * height * (8U + 4U + 4U + 4U) +
+    // 8 B-per-texel mip pyramid; surface data is 4 B; the reactive mask is
+    // 1 B; opaque and media depth are 4 B each.
+    return static_cast<uint64_t>(width) * height * (8U + 4U + 1U + 4U + 4U) +
            waterReflectionPyramidMemoryBytes(width, height);
 }
 
