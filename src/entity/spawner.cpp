@@ -71,7 +71,7 @@ int64_t Spawner::floorDiv(int64_t value, int64_t divisor) {
     return world_coord::floorDiv(value, divisor);
 }
 
-uint64_t Spawner::territoryHash(uint32_t worldSeed, int64_t territoryX, int64_t territoryZ,
+uint64_t Spawner::territoryHash(uint64_t worldSeed, int64_t territoryX, int64_t territoryZ,
                                 uint64_t stream) {
     uint64_t xHash = hash64(static_cast<uint64_t>(territoryX));
     uint64_t zHash = hash64(static_cast<uint64_t>(territoryZ));
@@ -79,7 +79,7 @@ uint64_t Spawner::territoryHash(uint32_t worldSeed, int64_t territoryX, int64_t 
                   hash64(static_cast<uint64_t>(worldSeed)) ^ hash64(stream));
 }
 
-Vec2 Spawner::getTerritoryAnchor(uint32_t worldSeed, int64_t territoryX, int64_t territoryZ) {
+Vec2 Spawner::getTerritoryAnchor(uint64_t worldSeed, int64_t territoryX, int64_t territoryZ) {
     uint64_t hash = territoryHash(worldSeed, territoryX, territoryZ, 0x414E43484F52ULL);
     int offsetX = 8 + static_cast<int>(hash % 48ULL);
     int offsetZ = 8 + static_cast<int>((hash >> 16) % 48ULL);
@@ -87,7 +87,7 @@ Vec2 Spawner::getTerritoryAnchor(uint32_t worldSeed, int64_t territoryX, int64_t
             static_cast<float>(territoryZ * TERRITORY_SIZE + offsetZ)};
 }
 
-uint64_t Spawner::makeTerritoryEntityId(uint32_t worldSeed, int64_t territoryX, int64_t territoryZ,
+uint64_t Spawner::makeTerritoryEntityId(uint64_t worldSeed, int64_t territoryX, int64_t territoryZ,
                                         EntityType type, int memberIndex) {
     uint64_t stream = 0x57494C444C494645ULL;
     stream ^= static_cast<uint64_t>(static_cast<uint8_t>(type)) << 32;

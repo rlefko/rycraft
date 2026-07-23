@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "render/shader_types.hpp"
+#include "world/physical_scale.hpp"
 
 #include <cstdint>
 
@@ -11,9 +12,10 @@ class GpuFrameTimer;
 // Returns the Earth-like optical model used by captures and normal gameplay.
 // World Y is converted to kilometers only for atmospheric altitude response;
 // large world X/Z coordinates never enter the spherical LUT integration.
-AtmosphereUniforms earthAtmosphereUniforms(float cameraWorldY, simd_float3 sunDirection,
-                                           simd_float3 sunRadiance, float aerosolDensity,
-                                           float humidity, uint32_t frameIndex);
+AtmosphereUniforms earthAtmosphereUniforms(float cameraWorldY, WorldPhysicalScale physicalScale,
+                                           simd_float3 sunDirection, simd_float3 sunRadiance,
+                                           float aerosolDensity, float humidity,
+                                           uint32_t frameIndex);
 
 bool atmosphereUniformsFinite(const AtmosphereUniforms& uniforms);
 

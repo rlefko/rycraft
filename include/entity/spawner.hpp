@@ -119,8 +119,8 @@ public:
     // Pure ecology helpers exposed for deterministic tests and diagnostics.
     static float getHabitatScore(EntityType type, const HabitatSample& habitat);
     static int getCarryingCapacity(EntityType type, const HabitatSample& habitat);
-    static Vec2 getTerritoryAnchor(uint32_t worldSeed, int64_t territoryX, int64_t territoryZ);
-    static uint64_t makeTerritoryEntityId(uint32_t worldSeed, int64_t territoryX,
+    static Vec2 getTerritoryAnchor(uint64_t worldSeed, int64_t territoryX, int64_t territoryZ);
+    static uint64_t makeTerritoryEntityId(uint64_t worldSeed, int64_t territoryX,
                                           int64_t territoryZ, EntityType type, int memberIndex);
     static bool shouldDespawn(const Vec3& entityPosition, const Vec3& playerPosition);
 
@@ -155,7 +155,7 @@ private:
     bool hasPopulationCenter_ = false;
 
     static int64_t floorDiv(int64_t value, int64_t divisor);
-    static uint64_t territoryHash(uint32_t worldSeed, int64_t territoryX, int64_t territoryZ,
+    static uint64_t territoryHash(uint64_t worldSeed, int64_t territoryX, int64_t territoryZ,
                                   uint64_t stream);
 
     std::optional<EntityType> selectSpecies(const HabitatSample& habitat, uint64_t roll) const;

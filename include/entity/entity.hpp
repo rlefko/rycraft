@@ -109,6 +109,10 @@ public:
     // Animation
     int eatAnimationTimer = 0; // ticks remaining for eat bob animation
 
+    // Fixed-tick packed sky/block light sampled at the model center. The
+    // render thread consumes this cache without taking World locks.
+    uint8_t renderPackedLight = FULL_SKY_PACKED_LIGHT;
+
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------

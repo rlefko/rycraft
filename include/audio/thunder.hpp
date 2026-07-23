@@ -13,6 +13,7 @@ struct ScheduledThunder {
     double dueTimeSeconds = 0.0;
     float gain = 0.0F;
     float distanceBlocks = 0.0F;
+    float distanceMeters = 0.0F;
 };
 
 // A bounded main-thread timeline for delayed thunder. beginTimeline() is
@@ -24,7 +25,8 @@ public:
     static constexpr size_t MAX_PENDING = 16;
     static constexpr size_t MAX_REMEMBERED_IDS = 64;
 
-    void beginTimeline(uint64_t currentWorldTick);
+    void beginTimeline(uint64_t currentWorldTick,
+                       WorldPhysicalScale physicalScale = LEGACY_WORLD_PHYSICAL_SCALE);
     bool schedule(const LightningEvent& event, double listenerX, double listenerY, double listenerZ,
                   double nowSeconds);
     std::vector<ScheduledThunder> popDue(double nowSeconds);
@@ -40,4 +42,5 @@ private:
     bool timelineInitialized_ = false;
     std::vector<ScheduledThunder> pending_;
     std::deque<uint64_t> rememberedIds_;
+    WorldPhysicalScale physicalScale_ = LEGACY_WORLD_PHYSICAL_SCALE;
 };

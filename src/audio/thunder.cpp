@@ -10,8 +10,8 @@ bool hasHigherPlaybackPriority(const ScheduledThunder& left,
     if (left.dueTimeSeconds != right.dueTimeSeconds) {
         return left.dueTimeSeconds < right.dueTimeSeconds;
     }
-    if (left.distanceBlocks != right.distanceBlocks) {
-        return left.distanceBlocks < right.distanceBlocks;
+    if (left.distanceMeters != right.distanceMeters) {
+        return left.distanceMeters < right.distanceMeters;
     }
     if (left.eventTick != right.eventTick) {
         return left.eventTick > right.eventTick;
@@ -21,11 +21,12 @@ bool hasHigherPlaybackPriority(const ScheduledThunder& left,
 
 } // namespace
 
-void ThunderScheduler::beginTimeline(uint64_t currentWorldTick) {
+void ThunderScheduler::beginTimeline(uint64_t currentWorldTick, WorldPhysicalScale physicalScale) {
     timelineStartTick_ = currentWorldTick;
     timelineInitialized_ = true;
     pending_.clear();
     rememberedIds_.clear();
+    physicalScale_ = physicalScale.valid() ? physicalScale : LEGACY_WORLD_PHYSICAL_SCALE;
 }
 
 bool ThunderScheduler::remembers(uint64_t eventId) const noexcept {
@@ -53,20 +54,25 @@ bool ThunderScheduler::schedule(const LightningEvent& event, double listenerX, d
         return false;
     }
 
-    const double delay = thunderDelaySeconds(event, listenerX, listenerY, listenerZ);
+    const double delay =
+        thunderDelaySeconds(event, listenerX, listenerY, listenerZ, physicalScale_);
     if (!std::isfinite(delay)) {
         return false;
     }
     const double deltaX = event.x - listenerX;
     const double deltaY = static_cast<double>(event.y) - listenerY;
     const double deltaZ = event.z - listenerZ;
-    const float distance =
+    const float distanceBlocks =
         static_cast<float>(std::sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ));
-    const float distanceGain = 1.0F / std::sqrt(1.0F + distance / 384.0F);
-    const ScheduledThunder candidate{event.id, event.tick, nowSeconds + delay,
-                                     std::clamp(event.intensity, 0.0F, 1.25F) * distanceGain,
-                                     distance};
-    if (!std::isfinite(candidate.dueTimeSeconds) || !std::isfinite(candidate.distanceBlocks)) {
+    const float distanceMeters =
+        static_cast<float>(worldDistanceMeters(deltaX, deltaY, deltaZ, physicalScale_));
+    const float distanceGain = 1.0F / std::sqrt(1.0F + distanceMeters / 384.0F);
+    const ScheduledThunder candidate{
+        event.id,           event.tick,
+        nowSeconds + delay, std::clamp(event.intensity, 0.0F, 1.25F) * distanceGain,
+        distanceBlocks,     distanceMeters};
+    if (!std::isfinite(candidate.dueTimeSeconds) || !std::isfinite(candidate.distanceBlocks) ||
+        !std::isfinite(candidate.distanceMeters)) {
         return false;
     }
 
