@@ -1,0 +1,240 @@
+audit_root=<temporary-audit-root>
+profile_path=<temporary-audit-profile>
+model_pack=<verified-pinned-model-pack>
+command=RYCRAFT_TERRAIN_MODEL_PACK=<pinned-pack> RYCRAFT_TERRAIN_REAL_ENTRY_PROFILE=<empty-profile> RYCRAFT_TERRAIN_REAL_ENTRY_EXPECT_COLD=1 /usr/bin/time -l ./build-release/tests/test_rycraft Seed-42-real-model-entry-audit
+Filters: "Seed 42 real-model entry audit completes exact and far coverage"
+Randomness seeded to: 3182191298
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+test_rycraft is a Catch2 v3.14.0 host application.
+Run with -? for options
+
+-------------------------------------------------------------------------------
+Seed 42 real-model entry audit completes exact and far coverage
+-------------------------------------------------------------------------------
+../tests/test_terrain_runtime.mm:2545
+...............................................................................
+
+../tests/test_terrain_runtime.mm:2594: warning:
+  Real entry setup seconds=2.52546 failure=none
+
+../tests/test_terrain_runtime.mm:2610: warning:
+  setup model calls: coarse=1 base=1 decoder=1 total=3
+
+../tests/test_terrain_runtime.mm:2733: warning:
+  Real entry dry-spawn seconds=6.16639 ordinal=0 water_rejections=0 failure=
+  none
+
+../tests/test_terrain_runtime.mm:2743: warning:
+  Real entry dry-spawn phase calls: coarse=80 base=14 decoder=5
+
+../tests/test_terrain_runtime.mm:2628: warning:
+  dry-spawn model calls: coarse=80 base=14 decoder=5 total=99 queued=0
+  failures=0
+
+../tests/test_terrain_runtime.mm:2640: warning:
+  dry-spawn model seconds: coarse=2.61377 base=1.89528 decoder=1.27794
+
+../tests/test_terrain_runtime.mm:2661: warning:
+  dry-spawn authority: queries=1029 ready=313 deferred=716 builds=3 batches=0
+  hits=316 disk_loads=0 coordinator_queued=0 coordinator_active=0
+  coordinator_completed=3 coordinator_deferred=0
+
+../tests/test_terrain_runtime.mm:2669: warning:
+  dry-spawn hydrology: builds=1 hits=7 disk_loads=0 active=0 deferred=156
+  failures=0
+
+../tests/test_terrain_runtime.mm:2762: warning:
+  Real entry dry spawn x=3504.5 y=262.05 z=-5555.5
+
+../tests/test_terrain_runtime.mm:2839: warning:
+  Real entry exact progress seconds=0.000132834 loaded=0 pending=1
+  completed_plans=0
+
+../tests/test_terrain_runtime.mm:2839: warning:
+  Real entry exact progress seconds=0.0488424 loaded=53 pending=175
+  completed_plans=25
+
+../tests/test_terrain_runtime.mm:2846: warning:
+  Real entry exact-center seconds=0.0488737 loaded=54 pending=175
+  completed_plans=25 failure=none
+
+../tests/test_terrain_runtime.mm:2850: warning:
+  Real entry exact-center additional model calls=1
+
+../tests/test_terrain_runtime.mm:2628: warning:
+  exact-center model calls: coarse=0 base=0 decoder=0 total=1 queued=0
+  failures=0
+
+../tests/test_terrain_runtime.mm:2640: warning:
+  exact-center model seconds: coarse=0 base=0 decoder=0
+
+../tests/test_terrain_runtime.mm:2661: warning:
+  exact-center authority: queries=533 ready=517 deferred=16 builds=0 batches=0
+  hits=517 disk_loads=0 coordinator_queued=0 coordinator_active=1
+  coordinator_completed=0 coordinator_deferred=0
+
+../tests/test_terrain_runtime.mm:2669: warning:
+  exact-center hydrology: builds=0 hits=63 disk_loads=0 active=1 deferred=16
+  failures=0
+
+../tests/test_terrain_runtime.mm:2934: warning:
+  Real entry connected preview seconds=14.1604 radius_chunks=96 tiles=141
+  pages=60 meshes=141 submitted=10402 built=141 deferred=10261 failed=0
+  failure=none
+
+../tests/test_terrain_runtime.mm:2628: warning:
+  entry-preview-prefix model calls: coarse=0 base=82 decoder=12 total=93
+  queued=0 failures=0
+
+../tests/test_terrain_runtime.mm:2640: warning:
+  entry-preview-prefix model seconds: coarse=0 base=10.249 decoder=3.04996
+
+../tests/test_terrain_runtime.mm:2661: warning:
+  entry-preview-prefix authority: queries=34521 ready=30858 deferred=3663
+  builds=92 batches=22 hits=543005 disk_loads=0 coordinator_queued=0
+  coordinator_active=0 coordinator_completed=92 coordinator_deferred=3105
+
+../tests/test_terrain_runtime.mm:2669: warning:
+  entry-preview-prefix hydrology: builds=4 hits=42278 disk_loads=0 active=0
+  deferred=3663 failures=0
+
+../tests/test_terrain_runtime.mm:3057: warning:
+  Real entry protected FINAL closure seconds=7.17971 parents=60 children=60
+  matching_boundaries=100/100 submitted=10522 built=261 deferred=10261 failed=0
+  failure=none
+
+../tests/test_terrain_runtime.mm:2628: warning:
+  protected-final-closure model calls: coarse=0 base=0 decoder=17 total=17
+  queued=0 failures=0
+
+../tests/test_terrain_runtime.mm:2640: warning:
+  protected-final-closure model seconds: coarse=0 base=0 decoder=4.86746
+
+../tests/test_terrain_runtime.mm:2661: warning:
+  protected-final-closure authority: queries=2805 ready=2353 deferred=452
+  builds=7 batches=0 hits=13653 disk_loads=0 coordinator_queued=0
+  coordinator_active=0 coordinator_completed=7 coordinator_deferred=0
+
+../tests/test_terrain_runtime.mm:2669: warning:
+  protected-final-closure hydrology: builds=7 hits=13911 disk_loads=0 active=0
+  deferred=21 failures=0
+
+../tests/test_terrain_runtime.mm:3067: warning:
+  Real entry first-playable seconds=30.0823
+
+../tests/test_terrain_runtime.mm:3068: FAILED:
+  CHECK( Clock::now() <= setupStart + std::chrono::seconds(30) )
+with expansion:
+  584442776092458 ns since epoch
+  <=
+  584442693814708 ns since epoch
+with messages:
+  profilePath := "<temporary-audit-profile>"
+  step.failure.message := ""
+  setupSeconds := 2.52545924999999993
+  spawnFailure := {?}
+  spawnSeconds := 6.16639133299999997
+  drySpawnOrdinal := 0
+  waterRejections := 0
+  exactSeconds := 0.048873667
+  exactFailure := {?}
+  entryPreviewSeconds := 14.16037024999999971
+  ENTRY_HORIZON_CHUNKS := 96
+  previewMeshes.size() := 141
+  entryHorizonTiles.size() := 141
+  previewFailure := {?}
+  protectedSeconds := 7.17970537500000017
+  protectedParents.size() := 60
+  protectedChildren.size() := 60
+  protectedFailure := {?}
+  protectedStatus.mismatchedSharedBoundaries := 0
+  protectedStatus.incompatibleLodBoundaries := 0
+
+../tests/test_terrain_runtime.mm:3112: warning:
+  Real entry configured preview settlement seconds=42.4057 radius_chunks=512
+  tiles=3346 pages=360 meshes=3346 submitted=19402 built=3466 deferred=15936
+  failed=0 failure=none
+
+../tests/test_terrain_runtime.mm:2628: warning:
+  configured-preview-settlement model calls: coarse=0 base=212 decoder=0 total=
+  212 queued=0 failures=0
+
+../tests/test_terrain_runtime.mm:2640: warning:
+  configured-preview-settlement model seconds: coarse=0 base=28.4717 decoder=0
+
+../tests/test_terrain_runtime.mm:2661: warning:
+  configured-preview-settlement authority: queries=0 ready=0 deferred=0 builds=
+  316 batches=79 hits=544213 disk_loads=0 coordinator_queued=0
+  coordinator_active=0 coordinator_completed=316 coordinator_deferred=10712
+
+../tests/test_terrain_runtime.mm:2669: warning:
+  configured-preview-settlement hydrology: builds=0 hits=0 disk_loads=0 active=
+  0 deferred=0 failures=0
+
+../tests/test_terrain_runtime.mm:3135: warning:
+  Real entry post-entry exact-band seconds=3.875e-06 loaded=252 pending=1
+
+../tests/test_terrain_runtime.mm:2628: warning:
+  post-entry-exact-band model calls: coarse=0 base=0 decoder=0 total=0 queued=0
+  failures=0
+
+../tests/test_terrain_runtime.mm:2640: warning:
+  post-entry-exact-band model seconds: coarse=0 base=0 decoder=0
+
+../tests/test_terrain_runtime.mm:2661: warning:
+  post-entry-exact-band authority: queries=0 ready=0 deferred=0 builds=0
+  batches=0 hits=0 disk_loads=0 coordinator_queued=0 coordinator_active=0
+  coordinator_completed=0 coordinator_deferred=0
+
+../tests/test_terrain_runtime.mm:2669: warning:
+  post-entry-exact-band hydrology: builds=0 hits=0 disk_loads=0 active=0
+  deferred=0 failures=0
+
+../tests/test_terrain_runtime.mm:3211: warning:
+  Real entry FINAL parents seconds=2.08e-07 required=0 built=0
+  exact_required_sections=5 unresolved_columns=5 scheduler_submitted=0
+  scheduler_built=0 scheduler_deferred=0 scheduler_authority_resumes=0
+  scheduler_failed=0 failure=none
+
+../tests/test_terrain_runtime.mm:2628: warning:
+  final-handoff-parents model calls: coarse=0 base=0 decoder=0 total=0 queued=0
+  failures=0
+
+../tests/test_terrain_runtime.mm:2640: warning:
+  final-handoff-parents model seconds: coarse=0 base=0 decoder=0
+
+../tests/test_terrain_runtime.mm:2661: warning:
+  final-handoff-parents authority: queries=0 ready=0 deferred=0 builds=0
+  batches=0 hits=0 disk_loads=0 coordinator_queued=0 coordinator_active=0
+  coordinator_completed=0 coordinator_deferred=0
+
+../tests/test_terrain_runtime.mm:2669: warning:
+  final-handoff-parents hydrology: builds=0 hits=0 disk_loads=0 active=0
+  deferred=0 failures=0
+
+../tests/test_terrain_runtime.mm:3218: warning:
+  Real entry protected FINAL parents settled seconds=72.4903
+
+===============================================================================
+test cases:  1 |  0 passed | 1 failed
+assertions: 47 | 46 passed | 1 failed
+
+       72.59 real       690.40 user        23.63 sys
+          8639299584  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              884274  page reclaims
+                   7  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                1044  voluntary context switches
+             1843375  involuntary context switches
+       9611350105195  instructions retired
+       2137573444315  cycles elapsed
+          8636226952  peak memory footprint

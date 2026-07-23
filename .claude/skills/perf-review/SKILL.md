@@ -1,19 +1,22 @@
 ---
 name: perf-review
-description: Review a rycraft diff against frame and tick budgets, packed-light reconciliation, shadow refresh cadence, temporal SSGI, physical atmosphere, volumetric clouds, froxel volumes, deterministic weather and storms, sparse cubic active-set limits, adaptive far-terrain LOD, unified-memory limits, queue backpressure, and lock discipline. Use before committing changes to rendering, lighting, weather, simulation, world generation, streaming, meshing, persistence, fluids, entities, caches, worker pools, or mutexes. Reads docs/performance-conventions.md as the source of truth.
+description: Review a Rycraft diff against generator v4 learned-authority, bootstrap, cubic streaming, canonical water, far terrain, canopy staging, smooth lighting, physical atmosphere and weather, queue, cache, frame-time, and unified-memory budgets. Use before committing changes to generation, inference, hydrology, rendering, persistence, workers, queues, caches, or locks. Reads docs/performance-conventions.md as the source of truth.
 ---
 
 # Performance Review
 
-Review the requested change against rycraft's documented performance contract. Report concrete structural costs and violations. Do not accept an unmeasured timing claim or invent a violation outside the changed paths.
+Review the requested change against Rycraft's documented performance contract. Report structural costs and measured evidence separately. Never treat a queue cap or fake-backend test as proof of a real-model performance gate.
 
 ## 1. Read the source of truth
 
-Read `docs/performance-conventions.md` completely. Its current budgets and checklist override summaries in this skill.
+Read `docs/performance-conventions.md` completely. Read `docs/generator-v4-follow-up.md` when a
+change touches the deferred hierarchy, GPU construction, distant water, or distant flora. Also
+read the changed generator, runtime, hydrology, far-terrain, and persistence interfaces before
+interpreting the diff.
 
-## 2. Establish the review scope
+## 2. Establish scope
 
-Use the target named by the user. Otherwise inspect both committed and uncommitted work:
+Use the user's target. Otherwise inspect committed and uncommitted changes:
 
 ```bash
 git diff --stat origin/main...HEAD
@@ -21,192 +24,284 @@ git diff origin/main...HEAD
 git diff HEAD
 ```
 
-If the diff is empty, report that and stop. If no frame, tick, generation, streaming, mesh, fluid, entity, cache, persistence, or lock path changed, state that the performance checklist is not in scope and stop.
+If no frame, tick, inference, generation, hydrology, streaming, mesh, save, cache, queue, or lock path changed, state that performance review is not in scope.
 
-## 3. Map changed work to frequency and bounds
+## 3. Classify every cost
 
-For every changed path, record:
+For each changed path, record:
 
-- Thread: render, fixed tick, generation worker, mesh worker, save thread, or audio callback
-- Frequency: per frame, per tick, per cube boundary, per cold plan, per block, or one-time
-- Fanout: active cubes, halo cubes, far tiles, columns, lattice samples, fluid cells, entities, or draw calls
-- Bound: hard cap, eviction rule, fixed iteration count, radius, or queue budget
+- Thread: bootstrap, inference, generation, far worker, mesh worker, render, fixed tick, save, or audio
+- Frequency: startup, per model call, per page, per cube, per tile, per frame, per tick, or per block
+- Fanout: windows, tensors, pages, samples, hydrology cells, cubes, tiles, entities, or draws
+- Hard bound: queue cap, cache bytes, iteration count, radius, worker count, or upload budget
 
-Express cost as calls times frequency times fanout. A new operation once per block across 4,096 cells and thousands of cubes is not a constant-cost change.
+A page allocation once per cold inference is different from a vector allocation per block or per frame. Show the multiplication.
 
-## 4. Run the mechanical sweeps
-
-Inspect added allocation and lock sites:
+## 4. Run mechanical sweeps
 
 ```bash
-git diff origin/main...HEAD | rg '^\+.*(std::string|ostringstream|new |make_shared|make_unique|resize\(|reserve\()'
-git diff HEAD | rg '^\+.*(std::string|ostringstream|new |make_shared|make_unique|resize\(|reserve\()'
+git diff origin/main...HEAD | rg '^\+.*(new |make_shared|make_unique|resize\(|reserve\(|vector|unordered_)'
+git diff HEAD | rg '^\+.*(new |make_shared|make_unique|resize\(|reserve\(|vector|unordered_)'
 git diff origin/main...HEAD | rg '^\+.*(lock_guard|unique_lock|scoped_lock|\.wait\(|\.get\()'
 git diff HEAD | rg '^\+.*(lock_guard|unique_lock|scoped_lock|\.wait\(|\.get\()'
-git diff origin/main...HEAD | rg '^\+.*(for |while |unordered_map|unordered_set|queue|vector)'
-git diff HEAD | rg '^\+.*(for |while |unordered_map|unordered_set|queue|vector)'
+git diff origin/main...HEAD | rg '^\+.*(for |while |inference|queryNative|preparePage)'
+git diff HEAD | rg '^\+.*(for |while |inference|queryNative|preparePage)'
 ```
 
-Classify each hit by its execution path. An allocation during startup is not a hot-path finding. An allocation in density, fluid-neighbor, mesh-candidate, or per-frame code is.
+Classify every hit by execution path. Do not report startup-only allocation as frame-path allocation.
 
-## 5. Audit the cubic active set
+## 5. Audit bootstrap and inference
 
-Verify all of the following when streaming or rendering changes:
+Confirm:
 
-1. Exact simulation uses `min(viewDistance, 32)` and never follows the 512-chunk visible horizon.
-2. The radius-six and vertical-four exploration band, visible saved edits, one primary section per visible column, additional exposed and cliff sections, and the targeted halo are represented. Reservation follows that order before either global cap. Mesh snapshots carry an 18 by 18 by 18 block, fluid, and packed voxel-light halo plus separate 18 by 18 generated-surface and sky-cutoff authority.
-3. Loaded exact cubes cannot exceed 32,768. Obsolete cubes unload before replacement generation starts, and every insertion rechecks the cap while holding the chunk-map mutex.
-4. Exact mesh candidates and renderer mesh residency cannot exceed 16,384.
-5. Unload hysteresis retains existing cubes through two extra horizontal chunks and one extra vertical cube.
-6. Priority includes visibility, collision, edited state, and full three-dimensional distance.
-7. A view-distance scan does not multiply by the complete 40-section vertical range.
-8. Active-set reconstruction does not perform cold plan construction, hydrology solving, or file I/O on the render thread.
-9. Missing collision remains closed. Ray targeting and edits use non-loading lookups and stop at an unavailable cube instead of turning interaction into synchronous generation.
-10. A compact loaded-section mask proves vertical continuity before level-15 skylight seeds a column. A missing cardinal neighbor follows the generated terrain cutoff: air above it, opaque below it, a lit surface-material continuation when visible above ground, and a dark inward cap only for an underground opening. Packed light reconciles only changed faces, and halo residency changes invalidate affected meshes.
-11. One rebuild gathers unique horizontal columns and expands the fixed plan apron once. It does not repeat the complete apron query for every surface or halo cube.
-12. Pending plans use indexed active-set dependencies, and completion notifications coalesce before rebuild. A completed plan does not scan all retained cubes or schedule one rebuild per dependent.
-13. Saved edited sections for the unique visible-column list come from one bulk in-memory manifest query under a short lock, with no file I/O.
-14. Gameplay submits a latest-wins request rather than rebuilding on the fixed tick. A utility-priority planner checks for stale epochs between expensive phases and before publication. Plan completions batch at 128 results or backlog drain with a four-tick consumption cooldown.
-15. Request, coalescing, cancellation, and build-time metrics make planner churn visible in performance logs.
+1. Download, verification, extraction, compilation, and qualification occur before `SaveManager`, `World`, and worker construction.
+2. Model files and Core ML caches stay under `~/Library/Application Support/rycraft`, outside Git and workspaces.
+3. The model remains pinned to revision `ad2df557eca5645f588766101cf3bc3682455c3e`, Coarse remains scalar, Base and Decoder remain static batches of four, Decoder uses deterministic repeated-tail padding, the production window and batching contract remains compatible with the InfiniteDiffusion paper and pinned Minecraft reference commit `23d3f50e5108882bb88a03c3ab048aa63633a02f`, and ONNX Runtime remains pinned to 1.27.1 and loaded through `dlopen`.
+4. Core ML requires static shapes, ML Program, all compute units, model caching, and sequential execution.
+5. At most one model call is active. The coarse, base, and decoder sessions remain resident after compile, with no more than three residents. The provider identity uses `coreml-cache-v3-base4-decoder4x256` and qualification digest `6ccf5b56fc32d13df9e7a333a4e68f71c9a0f15191e57375a2e4785c463a41df`. Queue, failure, partition, CPU fallback, configured intra-op thread, and resident-session metrics remain observable.
+6. CPU fallback uses at most `min(hw.physicalcpu, 16)` intra-op threads, including the calling thread. It must not use inter-op graph parallelism to bypass the one-call rule.
+7. Render and fixed-tick threads neither execute nor wait on inference.
+8. The canonical qualification hash matches the pinned recorded digest, and any new runtime or provider configuration is requalified before a real-model result is called passing.
+9. The unsigned 64-bit seed and full identity reach every runtime, authority, and world constructor without narrowing.
+10. A normal launch and Retry reuse a verified installed pack without a network transfer. Repair alone may replace a failed asset, and a missing completion marker is restored locally after all assets verify.
+11. Preparation logs attribute coarse, Base, and decoder calls to qualification, dry-spawn search,
+    final-spawn certification, horizon preview, and protected FINAL handoff. A finalized warm profile
+    does not repeat dry-spawn calls or protected transient reconstruction.
+12. Spawn and protected transient FINAL rectangles use fingerprinted, checksummed atomic
+    persistence. Corrupt payloads repair through inference, while identity mismatches fail closed.
 
-State the worst-case counts found in code. A constant named `MAX_MESH_RESIDENT_CUBES` does not prove compliance if the renderer's cache can grow around it.
+## 6. Audit learned-authority bounds
 
-## 6. Audit the far-terrain horizon
+Confirm each cache and queue against the source of truth:
 
-When view distance, culling, LOD, far meshing, or draw submission changes, confirm:
+- At most 64 outstanding page requests
+- One page build at a time
+- At most 64 pages and 1,048,576 samples per query
+- At most 1,024 decoded entries and 512 MiB
+- At most 384 MiB if a tensor-window cache is present
+- Equal cold page requests share a single flight
+- Inference, compression, `fsync`, and file I/O occur outside the cache mutex
 
-1. Exact simulation has a nominal radius of 32, and immutable far-parent requests cover the complete visible disk through radius 512, including tiles wholly inside that nominal radius.
-2. Every selected 256 by 256-block coordinate requests a step-32 parent before optional refinement. Missing parents submit and upload nearest-first through a broad parent lane. Each connected coordinate gives its distance-selected step-16, step-8, step-4, or step-2 target one bounded urgent lane before the complete parent disk is resident. Optional broad intermediates remain behind complete coverage. Resident active parents stay pinned.
-3. Distance and immutable maximum slope and hydrology complexity select the desired refinement using bounded, tunable thresholds rather than rigid rings. Every far-owned fragment in the camera exploration band requires a block-scale step-2 fallback, while every other far-owned fragment in the exact overlap requires step 8 or finer. Protection includes a fully ready boundary tile whose published exact requirements cover only part of the tile. Its step-32 parent remains resident as a dependency but is never displayed. Protected fallback jobs bypass ordinary grace and topology-transition limits so these minimum tiers can publish as soon as they are ready.
-4. The previous tier supplies asymmetric refine and coarsen thresholds. Production fixtures prove that filtered voxel tiers are not a nested height pyramid, so a narrow terrain-only fog pulse hides one atomic complete-topology swap for ordinary replacements. Canopies retain the full 0.65-second target-in, source-out exchange. Transition and coverage decisions use unswayed world coordinates. Bit-29 skirts follow the complete terrain topology currently visible, while water remains source-owned until completion.
-5. At most 64 topology transitions are active. Exactly one complete terrain topology is visible outside the narrow fog pulse. The canopy exchange never passes through an empty phase, and generated water has exactly one owner throughout a transition.
-6. Parent residency and drawable coverage use separate connected frontiers. The parent frontier tracks missing step-32 dependencies. The drawable frontier additionally treats a protected tile with only its parent ready as missing, hides tiles at or beyond the nearest such gap, and fades the preceding 256 blocks. A protected step-2 or step-8 fallback advances that frontier only when it satisfies the tile's minimum display tier. Partially faded patches never enter the occluder horizon.
-7. One bounded canopy query runs per cold tile. Step 2 reuses accepted exact tree anchors, species, and dimensions without constructing ColumnPlans. Steps 4 through 32 use globally anchored 64-block aggregate cells with six fixed candidates and block-8 habitat and ground authority. The aggregate tiers form strict stable subsets, while the two-phase exchange safely handles the unrelated exact-anchor and aggregate representations. At step 32, block-resolution collector habitat and root-water authority wins over the coarse cell water bit, so unrelated water elsewhere in a 32 by 32 cell cannot suppress an accepted canopy. Its trunk grounds on the displayed voxel. Canopy work is cached with the tile and never runs per frame. Measure the current synchronous canopy stage separately: observed cold canopy work ranges from 250 to 1,165 milliseconds and delays terrain and water parent publication. Treat staged canopy attachment as follow-up debt.
-8. Published exact requirements and unresolved columns produce one 256-bit ownership mask for each far tile, with one bit per 16 by 16-block chunk column. Missing and unresolved requirements keep the column far-owned; empty completed meshes count as ready. Every far-owned exact-overlap fragment remains protected, including fragments in a fully ready partial boundary tile. Terrain, water, and canopies use the destination-column bit, and the eight neighboring tile masks cover fragments that cross tile faces. LOD skirts use displayed-neighbor state plus ownership samples on both sides of their joins. Any partially masked horizon patch is not an occluder. The nearest-gap distance remains a conservative parent-selection fallback and diagnostic. Separately verify the existing exact missing-halo closures: lit planned surface continuations aboveground, dark inward caps underground, and bedrock caps vertically. Halo arrival must invalidate the affected mesh.
-9. Four latency-sensitive and four utility far workers cap pending work at 64 and completed work at 32. While parents are queued, dispatch reserves four worker slots for base coverage and admits at most four urgent connected refinements. Already running base jobs finish without preemption. Exact streaming does not reduce this worker pool; it limits refinement uploads to four per frame while preserving up to 32 parent uploads. Otherwise up to 12 refinement uploads may advance. All far uploads share the 32 MiB frame cap. Record the combined active maximum across six exact-generation, four exact-mesh, and eight far workers because QoS assignment alone does not prove frame isolation on the 16-core reference machine.
-10. The CPU cache caps at 9,280 entries and 3 GiB. Active parents are pinned, the farthest refinement evicts first, and every key rebuilds deterministically, including canopy geometry. Residency changes never scan or destroy the cache on the render thread. Utility-worker maintenance scans at most 64 records and retires at most 32 MiB per pass, with one oversized record allowed alone for progress.
-11. One-, two-, four-, eight-, sixteen-, and thirty-two-block footprint sampling filters sub-Nyquist detail without changing hydrology, water, plate, or feature ownership. Step-32 coverage geometry uses conservative minima, and one weighted palette resolves per active LOD cell.
-12. Far uploads cap at 32 parents, 12 refinements, and 32 MiB per frame, with the busy-state refinement cap described above.
-13. The segmented far GPU arena grows lazily in paired 256 MiB vertex and 128 MiB index slabs, up to 2 GiB of vertex storage and 1 GiB of index storage.
-14. Frustum culling precedes conservative front-to-back 256-bin terrain-horizon culling.
-15. Sixteen 64 by 64-block patches per visible tile contribute lower horizons with fixed storage, and LOD replacement keeps the last resident tile until the staged replacement uploads.
-16. Opaque exact and far terrain uses outward counterclockwise winding and back-face culling.
-17. Submission uses bounded direct indexed draws. Do not credit HZB, a literal geometry clipmap, indirect command buffers, or GPU-driven submission unless the implementation actually adds them.
+Protected FINAL hydrology owners may be grouped lexicographically in sets of at most two by two,
+provided every combined half-open rectangle remains within the 1,048,576-sample query bound. Require
+each 517 by 517 owner crop to match an independent request exactly, including negative coordinates
+and shared aprons. A lower fake-executor call count is useful structural evidence, not real-model
+latency evidence.
 
-The current branch retains one performance violation: terrain, water, and canopy geometry share one synchronous far build and residency payload. Measured cold canopy work ranges from 250 to 1,165 milliseconds, so an otherwise ready parent cannot publish until canopy discovery finishes. Record staged canopy attachment as follow-up debt and do not report two-second cold-horizon residency as passing from queue policy or headless tests alone. Do not report exact-face closure as absent: missing exact halos already emit explicit lit, dark, or bedrock caps and rebuild when real halo data arrives.
+Identify whether the production backend actually implements coarse, latent, and decoder windows, fixed batch four, reconstruction, and cache reuse. The deterministic fake backend is correctness infrastructure, not production throughput evidence.
 
-State wanted, resident, drawn, frustum-culled, horizon-culled, pending, cache-byte, and far-arena maxima. A full circular resident set is intentional; an unbounded GPU registry is not.
+Confirm that v4 learned elevation and climate remain the sole macro authority. Legacy `BasinSolver` hydraulic erosion, alpine postprocessing, and the analytical crater-lake overlay are v3-only. V4 volcanic primitives enter physical elevation before native hydrology, and the separate post-routing dry residual stays within 1.5 blocks and is zero for water, channels, outlets, lake rims, coasts, divides, transition owners, and uncleared slopes. Treat any topology-changing residual or v4 call into legacy erosion as a correctness and performance violation.
 
-## 7. Audit caches and solvers
+The PR 1 ecology boundary remains the physical-climate adapter feeding existing biome, flora, canopy, and fauna consumers. Plant-functional-type equilibrium belongs to PR 2 and must not be described as a completed PR 1 performance path.
 
-For each changed macro, basin, plan, feature, or renderer cache, identify:
+## 7. Audit exact cubic work
 
-- Key and value size
-- Entry or byte cap
-- Eviction policy
-- Single-flight behavior for duplicate cold requests
-- Construction thread
-- Lock scope
-- Result behavior after eviction
+Confirm:
 
-For each solver, identify domain size, apron, input grid, numerical spacing, fixed pass count, concurrency limit, stale-result behavior, validation, and fallback. The implemented basin contract is a 2,048-block catchment, a 16-block raster with a two-cell apron, globally aligned 64-block callback inputs, a four-cell shared-boundary blend with exact portal reconstruction, Priority-Flood, angular two-neighbor D-infinity-inspired routing, eight erosion and relaxation passes, Strahler ordering, and validated lake, waterfall, outlet-fall, and distributary outputs. Lake-depth interpolation retains dry and different-body contributors at zero depth rather than renormalizing the wet weights. Distinct overlapping lake authorities retain both flat levels behind a bounded supported watershed, except where an outlet or channel corridor owned by either body must remain open. Incoming and outgoing channel halves follow monotonic quintic junction-to-portal water profiles, while explicit falling state is limited to tagged drops. Crater lakes use a warped absolute local profile, validate all 96 rim directions with one block of freeboard, support the complete dry bank, and are rejected when a safe wet radius cannot fit. Invalid basin construction falls back to un-eroded base terrain with deterministic outlet metadata. Streaming admits at most two cold column-plan jobs at once, while one process-wide permit separately caps cold basin constructions across exact and far generators at two. Do not credit the routing as a verbatim Tarboton triangular-facet implementation.
+1. Exact simulation reaches `min(viewDistance, 32)` after entry. A v4 cold start uses a zero
+   nominal exact radius with the mandatory one-chunk active halo and four-chunk plan-dependency
+   footprint. During preparation it advances exact mesh publication, connected coarse terrain and
+   canonical water through 96 chunks, and the protected FINAL closure. The protected lane begins
+   when the connected parent frontier reaches the near band. The configured horizon stays selected
+   and fills after entry without exposing a farther island.
+2. Loaded cubes stay at or below 32,768 and exact mesh residency at or below 16,384.
+3. Six generation workers submit no more than seven cube jobs at once.
+4. Every required surface section through the full 32-chunk exact disk stays ahead of optional flora
+   and broad primary work in generation submission, mesh admission, completed-result upload, and
+   deferred first-publication lighting. The camera column ranks first, the exploration band second,
+   and the remaining required disk third.
+5. The 96-section range does not become a full vertical scan for every visible column.
+6. `VerticalSectionMask` checks both words for sky and loaded-range queries.
+7. The 193 density levels are lazy and limited to the requested cube and surface neighborhood.
+8. Exact collision accepts loaded block and fluid authority only from a renderer-published section
+   whose epoch matches the active exact coverage. Unowned planned sections use canonical generated
+   terrain and fluid proxies, unresolved sections stay closed, and raycasts do not force-load.
+9. A learned failure freezes new generation instead of publishing an empty cube.
+10. World teardown stops admission and drains its uniquely owned generation pool before releasing futures; queued work may not retain pool ownership or make a worker join itself.
+11. AppKit termination completes persistence, then joins render, far, canopy, and world workers,
+    releases generation contexts, and finally destroys the inference runtime. A capture or
+    performance run that writes results and then exits by signal is a failed run.
 
-Treat one `BasinSolver` as one immutable callback context. Elevation, rainfall, and rock-resistance callbacks must be coordinate-pure and describe the same fields for the solver's entire lifetime because the catchment cache key does not contain callback identity. A changed field requires a new solver, not reuse after an ordinary cache clear. Scalar and grid sampling must retain shared ownership of every candidate basin solution until authority selection and shoreline reconstruction finish. Concurrent clear or LRU eviction must not invalidate a referenced neighbor, and work started under an older cache generation must not become a current fast hit after clear.
+State worst-case counts from code, not only constant names.
 
-Confirm each column plan retains nine full macro samples, a 256-column exact density surface grid, and compact 17 by 17 canonical water and lithology authority while making only 16 transient height-only perimeter queries. Water authority includes stable identity, level, depth, endorheic state, and ocean, river, lake, delta, waterfall, and supported-bank topology. Every standing column has a solid floor and a full-height source-water volume from the first wet voxel above that support through the top. Routed rapid and outlet stages carry their explicit flowing levels, and waterfall curtains carry falling state, without turning covered volume or receiving pools into flow. Ambiguous cells may use bounded exact hydrology or geology during cold construction, but ordinary cube and frame paths must reuse the retained authority. Confirm the 8,112-entry column-plan cache stays under its compile-time 128 MiB payload bound, the separate basin cache stays within its byte-accounted 64 MiB single-flight LRU bound, shoreline pages stay within their separate byte-accounted 64 MiB single-flight cache, the shared macro-control cache stays within 1,024 entries and 128 MiB, the far-climate cache stays within 1,024 entries and 8 MiB, and the far mesh cache stays within 9,280 entries and 3 GiB. Shoreline pages must be keyed by water body and global 256-block page, reconstruct broad controls at four-block spacing with shared aprons, and refine only their narrow contour band at two-block spacing. F3 reports exact readiness, the conservative nearest-gap distance, base and refinement residency, queue lanes, the drawable coverage frontier, and cache use. The inspector reports footprint, grid-artifact, material, hydrology, and cache metrics, including active, peak, and throttled cold-build counters. Cache payload bounds do not replace measurement of transient construction storage and allocator overhead.
+## 8. Audit canonical hydrology
 
-For tree generation, bound the global feature-cell fanout and local-priority comparisons. Habitat must remain coordinate-pure while consuming continuous biome suitability, temperature, precipitation, soil moisture and fertility, light, slope, emitted altitude, lithology, tectonic stress, hydrology, and ecotopes. Dense suitable forests may raise acceptance and tighten deterministic spacing, but dry, steep, barren, geothermal, and actively volcanic ground must suppress it. Ordinary species reject standing generated water. Only suitable mangroves through depth three and non-ocean willows through depth two may root while submerged, and their emitted trunks must replace intervening source water down to a rechecked solid floor without adding fluid work.
+For every changed solver, identify domain size, spacing, apron, fixed passes, queue behavior, cache key, single flight, construction thread, and edge reconciliation.
 
-Run or cite determinism tests that clear caches between equivalent requests. Eviction may change latency but never bytes, fluid states, plans, or feature anchors.
+Reject:
 
-Treat procedural field continuity as a separate acceptance concern from exact-to-far residency. The current categorical former-line check passes with a longest run of 9 blocks against the 24-block limit. The preserved continuous-field case is an explicitly deferred expected failure with 15 failing assertions: terrain derivative-energy ratios reach 0.105649 at 2,048 blocks and 0.076197 at 8,192 blocks, aggregate shoreline energy is 0.194688, shoreline structured orientation is 1.674842 against the 1.5 limit, and biome suitability fails multiple spacings. Run `./build-release/tests/test_rycraft "[.known-continuity-debt]"` when reviewing world fields. Report the result as deferred debt, never as a passing gate or a render-residency failure.
+- Whole-world or unbounded upstream walks
+- Query-rectangle-dependent water results
+- A dry-terrain raising pass
+- Wet-route deletion to resolve conflicts
+- Unbounded stage relaxation or flood queues
+- Scalar and batch paths that use different authority
 
-## 8. Audit queues and runtime fluids
+At 7.5 meters per block, one 2,048-block hydrology page is 15.36 kilometers wide and 235.9296 square kilometers. Use that scale for rainfall, runoff, and discharge calculations.
 
-For generation, mesh, save, fluid, and completion queues, verify producer cap, consumer budget, deduplication or coalescing, overflow behavior, and diagnostics.
+Preview and final routers must share one process-wide native-hydrology admission gate. Confirm the total is at most 16 concurrent page builds, additionally constrained by hardware concurrency and the one-GiB scratch reservation, rather than 16 builds per router.
 
-Six exact generation workers split into four latency-sensitive and two utility workers. Confirm the pump submits at most seven cube tasks, six running plus one look-ahead, beneath the 64-job hard ceiling while remaining active-set work stays in the prioritized backlog. At most two cold plans may run. A worker must skip a cube that is stale for current retention, and completion processing must requeue a still-required cube through its current plan dependencies. Confirm queued work retains active-set epoch, gameplay lane, and distance priority so the camera column and six-chunk exploration band cannot wait behind the broad exact disk or a previous camera position. Four exact mesh workers permit 64 total items across queued, building, completed, and renderer-pending states, with 32 slots reserved from broad admission for later camera-band work, coalescing by requested cube revision, and 64 uploads or 32 MiB per frame. Confirm a completion can publish only when its build revision matches the live cube and is newer than the resident mesh. Rejecting or failing a result must clear only its matching request, while coalescing must retain the completion for the newest request even when that snapshot failed. Confirm the observed exact-mesh queue high-water never exceeds 64. Far terrain uses four latency-sensitive and four utility workers and permits 64 pending jobs and 32 completed results. While parents are queued, confirm four slots remain reserved for base work and no more than four urgent connected refinements run. It uploads at most 32 parents, 12 refinements, or 32 MiB per frame, with the refinement count reduced to four while exact streaming is busy. Confirm stale far epochs are discarded rather than published after a large move.
+Treat `NativeHydrologyCacheMetrics::deferredBuilds` as a monotonic count of completed cache build
+attempts that returned typed `DEFERRED`. It is not a parked-work count, an active-build gauge, or a
+failure count. Interval logs subtract the preceding snapshot for `deferredBuilds` and report
+`activeBuilds` directly.
 
-The save queue permits at most 32,768 unique cubic positions. Repeated snapshots for one already queued position replace its pending snapshot with the newest revision and increment an observable coalescing count. A unique producer at the cap waits for backpressure. Bulk manifest reads lock the in-memory index once for the requested columns, while manifest serialization and file replacement use a separate writer lock outside the lookup lock.
+Connected wetland traversal must stop at 64 owner pages or 262,144 native cells, cache resolved and rejected native nodes, and avoid running for a cell without the persisted candidate flag. Estuary backwater must stop at 64 native cells and 64 owner pages, reject falls and steep channels, and cache its source result. Dense grid sampling may invoke either resolver only for matching candidate or channel cells; one low-gradient reach must not disable the direct immutable-page path for every dry point in the page.
 
-For water specifically, confirm:
+## 9. Audit far terrain and canopy staging
 
-- Five-tick delay on the 20 Hz clock
-- At most 1,024 processed cells per fluid tick
-- At most 65,536 pending updates and 65,536 deferred frontiers
-- At most eight catch-up ticks
-- Generation and ordinary loading enqueue zero work
-- Reads never force-load a cube
-- Missing boundaries create only activated frontiers
-- Deferred frontiers are indexed by unavailable destination cube, and a fixed resume budget touches only matching newly available buckets rather than scanning all 65,536 entries for each cube load
-- Restoring or loading a frontier does not activate unrelated generated water
-- Stable source and flowing cells emit planar top geometry only; the vertex path does not displace the source plane, analytic fragment shading supplies motion, and vertical sides belong only to explicit falling columns
-- Every generated standing body is a full-height implicit source-water volume from the first wet voxel above solid support through the surface, including across cube faces, without an explicit fluid array until runtime disturbance changes a cell
-- Routed rapid and outlet stages retain their explicit eighth-block flowing levels, and waterfall curtains retain falling state, while covered volume and receivers remain sources
-- Far partially wet cells use body-aware contour-clipped shorelines rather than rectangular sheets or joins between incompatible water authorities
-- Seed 42 at X=-557, Z=379 preserves direct, footprint, column-plan, solid-floor, and full implicit-source-volume agreement
-- A lake `OutletFall` retains independent top, bottom, width, flow, and receiver-anchor data; exact generation emits one short receiver-centered footprint and the owning half-open far tile emits one five-quad prism without raising the receiving water
-- Generated outlet falls enqueue zero fluid ticks, like every other generated water body
-- Far generated source water uses the exact implicit full-block source plane
+Confirm:
 
-Flag any pending-update or frontier drop count missing from F3. Confirm save and mesh coalescing remain observable through their statistics interfaces and regression coverage.
+1. Every selected coordinate requests a step-32 parent.
+2. A valid parent remains drawable until a connected replacement is resident.
+3. Sixteen terrain workers cap pending work at 64 and completed results at 32. After the connected
+   96-chunk prefix, exact publication through 32 chunks or any connected visible desired-LOD debt
+   pauses ordinary outer-parent submission and publication. Local far work admits 8 workers
+   alongside exact debt, 12 after exact debt clears, and all 16 only after exact and local debt
+   clear. Exact debt without a local far miss admits no ordinary far work. Canopy uses zero workers
+   during preparation and until the connected prefix is drawable. Gameplay then guarantees exactly
+   one low-priority canopy worker, including while stronger debt continues. No second gameplay
+   canopy lane opens. Missing PREVIEW attachments remain ahead of FINAL promotion.
+4. Missing base work reserves four admitted workers. No more than twelve urgent refinements run when
+   the complete 16-worker budget is available.
+5. Surface-stage terrain, standing water, and falls publish before vegetation enrichment.
+6. A blocked or canceled flora callback cannot consume the only in-flight slot indefinitely or invalidate resident surface geometry.
+7. Displayed PREVIEW and FINAL surfaces publish nearest-first PREVIEW ecology before any FINAL ecology promotion, grounded against their current surface authority.
+8. Camera movement refreshes every queued, parked, and follow-up flora priority, and near work can displace the least-important queued or parked request at capacity.
+9. Nearby flora gets one upload opportunity after protected and urgent local terrain, and broad refinements cannot consume its GPU residency floor.
+10. Step-32 dry corners do not suppress a cell with `waterTopologyPossible`.
+11. Production meshes have `skirtQuadCount == 0`.
+12. Displayed neighbors, including active replacement endpoints, remain within a 2:1 step ratio.
+13. Four canonical boundary strips add 516 samples per production tile, using four batched calls when available.
+14. Transition payload stays within the fixed 65,024-byte per-tile test bound before genuine interior terrain-discontinuity faces.
+15. Exact cubes own the first 32 chunks. Settled far bands are step 2 through 64 chunks, step 4 through 128, step 8 through 256, and step 16 through 512. These are maximum-coarseness limits. Gameplay retains finer tiers above the 0.55-pixel projected-error target, including FINAL step 1 when required, and coarsens outward below 0.45 pixels. Step 1 is the irreducible voxel-grid floor. Step 32 remains a coverage parent. Cold entry schedules only the required protected FINAL refinements; ordinary perceptual refinements remain closed.
+16. Except for the mandatory step-32 coverage parent, a displayed parent and child use matching authority quality or the child matches a retained parent source during promotion. Base-lineage PREVIEW steps 16, 8, 4, and 2 may reduce visible cell size while FINAL is cold, but their projected-error debt includes the measured revision-9 omitted residual. PREVIEW relief and vertical scheduling bounds include the measured 46-block maximum. Four urgent slots each serve ready FINAL children, proxy bridges, and visible FINAL parents, with unused child capacity loaned to proxies. Coarse preview leaves sixteen learned-authority admissions available for visible or protected FINAL work. Same-key promotion retains its preview source while a visible preview child depends on it. Exact ownership stays gated until stable FINAL authority. Matched water topology switches atomically. Treat a topology-changing per-tile promotion as unresolved until one complete hydrology owner can be perimeter-checked and published together.
+17. CPU terrain and canopy caches stay at or below 24,576 entries each, 3 GiB for terrain, and 512 MiB for canopy.
+18. GPU storage stays at or below 2 GiB of vertices and 1 GiB of indices, with the documented coverage and flora floors.
+19. During cold entry, preparation polling, base scheduling, result drains, and shared-buffer publication do not depend on a full exact-world scene draw.
+20. Entry uses the connected parent frontier, not the full configured parent count. At a 512-chunk view it requires the step-32 parent prefix through 96 chunks and the complete camera-aware protected FINAL closure. The closure begins during preparation when the connected frontier reaches the near band. It contains 4, 8, 12, 16, and 20 targets at steps 1, 2, 4, 8, and 16, for 60 total. Test all four camera-within-tile corners and reject any protected diagonal drawn beyond the missing-parent frontier.
+21. Authority requests preserve the production priority order: spawn, exploration exact,
+    protected exact handoff, visible final refinement, coarse preview, then speculative
+    movement prefetch. Final parents in the exact-handoff prefix use the protected lane. Current
+    protected FINAL children and parents receive urgent capacity before bounded PREVIEW bridge
+    prerequisites, unused bridge capacity returns to current FINAL, and directional prediction uses
+    only the remaining CPU-only capacity.
+22. Movement prefetch starts only after the current visible preview closure is ready, remains
+    outside that closure, and admits at most eight pages beyond the leading horizon.
+23. A standard or unknown exception from a critical far-base or final mesh latches a
+    retriable generation failure, exposes recovery through the existing bootstrap UI, and
+    leaves any valid resident parent drawable.
+24. Each refinement request advances one adjacent tier. Camera and protected work rank first,
+    followed by connected-wavefront eligibility. Within the nearby visible class, smaller
+    horizontal distance ranks before greater projected error. Screen-space error chooses desired
+    quality, but it cannot let a farther high-error tile delay closer missing detail. A finer cached
+    result cannot starve a missing bridge.
+25. Camera-near terrain is a capacity-protected class. At saturation an urgent protected PREVIEW
+    parent may displace the worst queued or parked ordinary coverage request, while a near bridge may
+    displace noncritical refinement work. An urgent camera-critical refinement bypasses the nominal
+    four-worker reservation for an unrelated distant parent, while ordinary urgent work observes
+    that reservation. Camera-critical work sheds protected status immediately after camera movement.
+    Distant work cannot evict either job or CPU cache entry.
+26. Every connected visible desired-LOD miss, not only a protected target, is local debt. It runs
+    nearest-first and may displace a queued or dependency-parked outer parent. It may not evict a
+    displayed parent, the connected 96-chunk prefix, a transition endpoint, exact fallback, active
+    protected lineage, or a requested critical key. While this debt or exact publication debt
+    remains, ordinary outer-parent submission and publication stay paused.
+27. A requested protected FINAL role-selected key may reclaim optional non-displayed distant
+    refinement or flora residency from both CPU and GPU storage, and it may use the complete GPU
+    arena. Alternate LODs at the same coordinate do not inherit that class. Never reclaim coverage,
+    a displayed surface, either transition endpoint, exact fallback, active protected lineage, or a
+    requested critical key. Distant work cannot evict the critical pending upload or allocation, and
+    the old drawable parent remains resident until commit.
+28. Broad and medium exact plan or cube submissions preserve physical capacity for a newer camera
+    epoch. At exact mesh saturation, a better near request displaces only the worst queued request,
+    and camera movement cancels queued meshes outside the new immutable candidate snapshot.
+29. Deferred first-publication lighting reranks in camera, exploration, required-surface, flora, and
+    broad order. One synchronous transaction performs no more than 32 floods, overflow remains in a
+    bounded queue, and no exact mesh publishes until its revision-matched transaction has settled.
 
-## 9. Audit locks and main-thread work
+Measure surface-stage and vegetation-enrichment time separately.
 
-Place every new mutex in the documented order. Inspect the complete critical section, including called functions, for generation, plan construction, solver work, I/O, compression, waits, or allocation-heavy operations. `SaveManager::manifestWriteMutex_` precedes the short-lived `manifestMutex_` in lock order. The inner lookup lock may copy or publish manifest state, but it must be released before file I/O while the outer writer lock serializes replacement. The process-wide cold-basin permit mutex is a nonnested leaf, and the basin-cache mutex must be released before a caller waits on that permit or an existing future.
+When the deferred paged hierarchy is in scope, also confirm:
 
-Confirm ordinary cube generation and mesh construction run on workers. The existing near-camera edit rebuild is limited to already-meshed cubes and two builds per frame. First-time streaming must not enter that synchronous path. The steady far render loop must reuse its reserved candidate, request, key, cache-result, upload, and 4,096-entry flat grace-record buffers plus fixed tier counters. Ordinary unprotected replacements may use the grace buffer, but protected exact-loading fallbacks must bypass grace and transition-cap admission. Flag a progressive scheduler change that allocates per tile or during ordinary command encoding, while distinguishing one-time renderer-reset capacity growth from recurring frame work.
+- The primary structure is a signed, surface-first page forest with sparse volumetric bricks only
+  for cubic exceptions. It is not a global pointer SVO or a dense voxel payload at every level.
+- Parent aggregates are deterministic products of canonical children and carry conservative
+  geometric, silhouette, water, flora, lighting, and emissive error summaries.
+- Selection projects canonical error into pixels, uses asymmetric refine and coarsen thresholds,
+  and retains the parent until the complete child terrain, transition, and water family is GPU
+  resident. Screen-space error chooses desired quality, while the nearby visible scheduler ranks
+  horizontal distance before projected error.
+- Water and flora retain separate semantic caches, queues, memory budgets, and residency. Generic
+  material or representative-voxel reduction cannot erase a wet route or distant canopy.
+- GPU traversal, request feedback, indirect commands, and eviction remain bounded and retain a CPU
+  reference path. Record hierarchy bytes, page faults, selected nodes, request overflow, command
+  count, and benefit-per-byte eviction decisions.
 
-## 9A. Audit lighting, atmosphere, and weather cost
+## 10. Audit persistence and locks
 
-For packed light, record the number of reconciled cubes, 4,096-cell flood bound, queue budget, changed-face fanout, changed mesh count, and materialized bytes. Confirm a stable cube does not requeue neighbors and that derived light is never serialized. Player edits may flood at most the home cube plus three border face neighbors synchronously under the block-write lock; fluid writes must stay on the deferred queue, and edit-queued propagation drains ahead of streaming reconciles.
+RYTA verification, compression, `fsync`, and rename stay off render and fixed-tick threads. Page corruption repair may reinfer only under the same fingerprint. A fingerprint mismatch cannot be repaired in place.
 
-For shadows, account for the two-slice near array, two-slice far array, and horizon texture at Medium and High. High resolutions are 4,096, 4,096, 2,048, 2,048, and 2,048. Medium resolutions are 2,048, 2,048, 1,024, 1,024, and 1,024. Confirm per-frame refresh intervals are bounded at one, one, two, four, and eight, with early refresh only for snapped projection, caster revision, or light direction. Record refreshed cascades and caster draw counts rather than treating every depth allocation as every-frame work.
+The inference mutex is a leaf. Authority-cache locks are released before model calls and I/O. The world chunk-map mutex may not contain generation, hydrology, inference, compression, or waits.
 
-For screen-space lighting, account for the full-resolution min-depth pyramid and normal guide, reduced trace and denoise-scratch targets, two color histories, two depth histories, and two moments-and-age histories. There is no radiance pyramid; bounce samples the scene source at hit texels. High is half resolution with four rays and a 24-iteration Hi-Z cap plus three a-trous iterations. Medium is quarter resolution with two rays, a 16-iteration cap, and two iterations. Off retains only ambient application. Verify target allocation occurs only on construction, resize, or quality change and every history reset is constant-time.
+For gameplay rendering, confirm that torch-flame and active-furnace-mouth emission reaches derived block light, emissive radiance in resolved HDR, bloom, and the Hi-Z indirect-light input without a per-block frame scan. The surface MRT supplies diffuse albedo and ambient accessibility, not emitted radiance. Confirm lava is fully emissive and that beds, inactive furnaces, furnace shells and tops, and torch sticks remain nonemissive.
 
-For weather, prove one utility worker, one running request, and at most one latest pending request. Each build has two fixed 81 by 81 slices. Recenter after 1,024 blocks, retain the old immutable snapshot, and never wait on the worker during ordinary gameplay. Record requests, coalescing, starts, publications, stale discards, pending count, and busy state. Lightning queries return no more than eight events. Thunder retains no more than 16 pending events and 64 remembered IDs.
+Measure `indirectPrepare`, `indirectTrace`, `indirectTemporal`, `indirectAtrous`, `indirectApply`, and `resolvedFog` separately. High quality must remain half resolution with four rays, a 24-iteration Hi-Z cap, and three a-trous passes. Medium must remain quarter resolution with two rays, a 16-iteration cap, and two a-trous passes. The retained compatibility Boolean must map false to off and true to high quality. Report persistent payload bytes for high, medium, and off. Confirm opaque fog runs after tracing without an extra persistent HDR target, and clouds and weather particles remain in the single-sample resolved post-indirect pass with no surface attachment.
 
-For atmosphere, count the fixed 256 by 64, 32 by 32, and 192 by 108 LUTs and separate slow versus sky-view refreshes. For clouds, count the 128-cubed base noise, 32-cubed erosion noise, curl map, two weather slices, quarter-resolution current and ping-pong histories, hit-depth histories, and 2,048 or 1,024-square cloud shadow. High march work is pixels times 48 view steps plus bounded 6-step light marches; Medium uses 24 plus 3. Wind update is constant work in physical blocks per second.
+Audit history invalidation as bounded state, not a publication counter. Authoritative resize, teleport, FOV, quality, world, session, direct-light source, prior-depth, resident-light-edit, and time discontinuities reset it. Far refinement, preview-to-final replacement, canopy attachment, and exact-to-far handoff preserve it.
 
-For froxels, account for the 160 by 104 by 64 volume, integration target, half-resolution current result, and ping-pong histories. Disabling volumetric light must skip froxel injection and integration and retain only LUT aerial perspective. Underwater gating cannot add a second air-medium march.
+## 11. Audit lighting, atmosphere, and weather cost
 
-Sum every new persistent High-tier Metal resource and require no more than 768 MiB. Keep the total credible unified-memory use below 64 GB without adding overlapping RSS and Metal counters. If the route misses frame target, reductions are permitted only in this order: clouds 48 to 40 to 32 view steps, froxels 160 by 104 by 64 to 144 by 94 by 48, horizon refresh rate and resolution, then High SSRT indirect lighting from four rays with a 24-iteration cap and three a-trous iterations to three rays with a 20-iteration cap and two iterations. Detailed shadow reach, first-two-cascade 4K resolution, lighting separation, and packed-light correctness are fixed.
+For packed light, record reconciled cubes, the 4,096-cell per-cube flood bound, queue budget, changed-face fanout, changed meshes, and materialized bytes. Confirm stable cubes do not requeue neighbors, derived light is never serialized, player-edit convergence stays inside its documented bounded neighborhood, and fluid writes remain on the deferred budget.
 
-## 10. Measure when the claim requires it
+For shadows, account for the two-slice near array, two-slice far array, and horizon texture. High resolutions are 4,096, 4,096, 2,048, 2,048, and 2,048. Medium resolutions are 2,048, 2,048, 1,024, 1,024, and 1,024. Refresh intervals remain bounded at one, one, two, four, and eight frames, with early refresh only for snapped projection, caster revision, or light direction. Record refreshed cascades and caster draw counts instead of treating every allocated target as every-frame work.
 
-Build and run the fixed-seed diagnostic or playtest route when the diff makes a speed, memory, queue, or frame-time claim. Record:
+For screen-space lighting, account for the full-resolution min-depth pyramid and normal guide, reduced trace and denoise targets, color and depth histories, and moments-and-age histories. There is no radiance pyramid. High remains half resolution with four rays, a 24-iteration Hi-Z cap, and three a-trous passes. Medium remains quarter resolution with two rays, a 16-iteration cap, and two passes. Off retains ambient application. Target allocation occurs only on construction, resize, or quality change, and every history reset is constant-time.
 
-- Build type and commit
-- Machine and macOS version
-- Seed, spawn, route, and view distance
-- Frame p50 and p95
-- Lowest sustained one-second frame rate
-- Warm cube p95
-- Cold macro or basin p95 when applicable
-- Peak process RSS and peak Metal allocated or resident memory
-- Queue settle time and maximum queue sizes
-- Loaded and mesh-resident maxima
-- Far wanted, resident, drawn, frustum-culled, horizon-culled, pending, cache, and arena maxima
+For weather, prove one utility worker, one running request, and at most one latest pending request. Each build has two fixed 81 by 81 slices, recentering starts only after 1,024 blocks, and readers retain the previous immutable snapshot without waiting. Record requests, coalescing, starts, publications, stale discards, pending count, and busy state. Lightning queries return no more than eight events. Thunder retains no more than 16 pending events and 64 remembered IDs.
 
-Acceptance evidence uses an optimized build on an identified Apple M4 Max at native 3456 by 2234 resolution, 4x MSAA, and `RYCRAFT_VIEW_DISTANCE=512`. Begin with seed 764891 at spawn `23029,225,-111726`, yaw 0, and pitch -17, then use the documented autopilot interval to exercise a repeatable moving route. After streaming settles, require the lowest sustained one-second rate to remain at or above 60 FPS with total unified-memory use at or below 64 GB, new persistent High-tier Metal allocations at or below 768 MiB, and every queue settled within five seconds after movement stops. Record the exact M4 Max configuration, macOS version, display resolution, seed, route, graphics qualities, cascade refresh counts, temporal reset counts, weather-worker counts, and per-pass GPU timings. Run Metal validation separately because validation overhead does not belong in the performance measurement.
+For dry-spawn screening, require at most one ranked proposal and one directly prepared 2,048-block owner per aligned hydrology owner. Check the requested chunk first, then use bounded globally aligned four-block native-raster batches across at most 16 workers. A canonically proven center must atomically install its complete 5 by 5 native safety certificate, or 25 dry samples at four-block spacing. A positive-elevation continental fallback may install no certificate and begin only radius-zero exact validation. Confirm that it does not start the far horizon, report dry land as located, or publish metadata before exact support, headroom, slope, water-absence, and nearby-dry validation pass. Record coarse selection, owner preparation, native samples, canonical proof calls, provisional fallbacks, exact rejections, and total dry-spawn latency. Reject any normal-entry path that prepares neighboring semantic topology owners or the wider exact band before world construction. A complete wide prequeue remains legal only for explicit repair or qualification.
 
-At the same settled camera, record playing and paused intervals and attribute fixed-tick CPU p50, p95, and maximum with a profiler or scoped measurement. Pausing may remove simulation work, but it must not conceal a material main-thread bottleneck or produce an unexplained frame-rate multiplication.
+For atmosphere, count the fixed 256 by 64, 32 by 32, and 192 by 108 LUTs and distinguish slow optical refreshes from sky-view refreshes. For clouds, count the 128-cubed base noise, 32-cubed erosion noise, curl map, weather slices, quarter-resolution histories, hit-depth histories, and 2,048 or 1,024-square cloud shadow. Confirm noise generation runs on its cancellable utility worker, that quality Off starts no worker or allocation, and that the render thread uploads only a completed payload for the current world instance and seed. Force deterministic noise failures and confirm that 100 and 500 millisecond backoff plus the third-failure latch prevent a per-frame worker storm while preserving one diagnostic record per attempt. High uses 48 view steps and 6 light steps; Medium uses 24 and 3. Wind updates remain constant work in physical blocks per second.
 
-Apple Silicon memory counters can overlap. Report process RSS, Metal allocation, and resident counters separately, then state the highest credible unified-memory total without adding overlapping counters. Hardware timings and memory are evidence, not portable CI gates. CI should enforce deterministic work limits, queue caps, cache bounds, and allocation invariants.
+For froxels, account for the 160 by 104 by 64 volume, integration target, half-resolution result, and ping-pong histories. Disabling volumetric lighting skips froxel injection and integration while retaining LUT aerial perspective. Underwater gating may not add another air-medium march.
 
-When texture sampling changed, confirm the single block-texture array eagerly owns all five 16-to-1 mip levels, alpha-aware downsampling preserves representable cutout coverage, and the sampler uses nearest magnification with linear minification, linear mip interpolation, repeat addressing, and 8x anisotropy. Account for the complete mip allocation once, not per tile or frame.
+Recalculate all persistent High-tier Metal resources for the tested drawable and require no more than 768 MiB. Keep credible unified-memory use below 64 GiB without adding overlapping RSS and Metal counters. If the route misses its frame target, follow the documented reduction order for cloud steps, froxel resolution, horizon-cascade work, then screen-space work. Do not reduce detailed shadow reach, the first two High shadow target resolutions, lighting-term separation, or packed-light correctness.
 
-When canopy LOD changed, measure the accepted exact-anchor count at step 2, globally anchored 64-block aggregate cell count at steps 4 through 32, six-candidate habitat fanout, impostor quad count, retained bytes, and build time. Confirm aggregate tiers are strict stable subsets, exact anchors retain their species and dimensions, cell ownership is deterministic across split queries, the exchange never exposes an empty forest, and all canopy work remains on far workers under the existing tile queue and cache bounds. At step 32, verify that the exact collector's habitat and root-water decision survives unrelated water elsewhere in the coarse cell and that the trunk grounds on displayed terrain. Measure terrain and water parent work separately from the synchronous 250-to-1,165-millisecond cold canopy stage. Treat staged canopy attachment as follow-up debt even when the combined mesh remains within its byte budget.
+## 12. Run portable evidence
 
-## 11. Report
+```bash
+meson setup build --buildtype=debugoptimized
+ninja -C build tests/test_rycraft
+ninja -C build test
+./build/tests/test_rycraft "[learned]"
+./build/tests/test_rycraft "[bootstrap]"
+./build/tests/test_rycraft "[reported-water-continuity]"
+./build/tests/test_rycraft "[render][indirect]"
+./build/tests/test_rycraft "[render][textures][emissive]"
+./build/tests/test_rycraft "[render][mesher][bed]"
+```
 
-Output in this order:
+Report exact commands and results. Ordinary CI must not download the model pack.
+
+## 13. Measure hardware gates when claimed
+
+Use a release build on the documented M4 Max, native resolution, 4x MSAA, view distance 512, seed 764891, spawn `23029,225,-111726`, yaw 0, and pitch -17.
+
+Record first entry, five-minute settlement, frame p50 and p95, lowest sustained one-second frame rate, movement recovery, authority lookup p95 and maximum on render and fixed-tick threads, inference queues, all streaming queues, the five indirect-light GPU timers, indirect persistent payload, RSS, Metal memory, and highest credible unified-memory total. Measure high, medium, and off separately without changing the acceptance resolution, MSAA, or view distance.
+
+Require at least 60 FPS, p95 at most 16.67 ms, no sustained generation interval above 20 ms, lookup p95 below 0.25 ms and maximum below 1 ms, and total unified memory at or below 64 GiB.
+
+Run Metal validation separately. Do not report an unrun or failed real-model gate as passing.
+
+## 14. Report
+
+Output:
 
 1. **Verdict:** clean, clean with notes, or violations found
-2. **Violations:** file and line, rule, structural cost, player impact, and compliant fix, ordered by impact
-3. **Risks worth a look:** uncertain or measurement-dependent items
-4. **Confirmed clean:** only checklist areas exercised by the diff
-5. **Evidence:** commands, deterministic route, measurements, and limits observed
+2. **Violations:** file and line, rule, structural cost, player impact, and fix
+3. **Measurement-required risks:** uncertain items and the exact needed evidence
+4. **Confirmed clean:** only areas exercised by the diff
+5. **Evidence:** commands, hashes, route, measurements, and observed bounds
 
-Keep findings actionable and do not restate the whole diff.
+Keep findings actionable and do not restate the diff.

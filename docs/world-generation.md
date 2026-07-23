@@ -1,326 +1,440 @@
 # World Generation and Persistence
 
-This document is the source of truth for cubic coordinates, procedural generation, runtime water, and world persistence. The implementation synthesizes a static world from bounded coordinate queries. It does not simulate a finite planet through geological time.
+This document is the source of truth for generator v4 coordinates, learned terrain identity, generated water, and persistence. It also records which parts require real-model or visual qualification before merge.
 
-## World coordinates and cubic chunks
+## Platform and model setup
 
-The horizontal world is procedurally unbounded. Renderer and entity positions still use floating-point values, so very long travel eventually reaches practical precision limits. The supported vertical range is finite.
+Generator v4 requires an Apple Silicon process on macOS 14 or newer. The in-app bootstrap installs assets below:
 
-| Constant | Value |
-|---|---:|
-| Cube edge | 16 blocks |
-| Cube volume | 4,096 blocks |
-| Minimum world Y | -128 |
-| Maximum world Y | 511 |
-| Vertical cube range | -8 through 31 |
-| Sea level | 64 |
-
-Coordinates use three canonical types from `include/world/chunk_pos.hpp`:
-
-```cpp
-struct ColumnPos { int64_t x; int64_t z; };
-struct ChunkPos  { int64_t x; int32_t y; int64_t z; };
-struct BlockPos  { int64_t x; int32_t y; int64_t z; };
+```text
+~/Library/Application Support/rycraft/terrain-models/
+  terrain-diffusion-30m-onnx/
+    ad2df557eca5645f588766101cf3bc3682455c3e/
 ```
 
-Each type has explicit equality and hashing. X and Z remain 64-bit throughout generation and persistence. `world_coord::floorDiv` and `floorMod` define all chunk and local-coordinate conversion, including negative boundaries. A block below Y=-128 reads as bedrock, a block above Y=511 reads as air, and edits outside the range are ignored.
+The installer downloads to a persistent revision-specific staging directory, reports byte progress, verifies exact size and SHA-256, writes a completion marker with the verified files' identity and change stamps, and atomically renames a fresh verified directory into place. A normal restart checks that local marker without rereading the 2.3 GB pack, then reuses the installed files. A changed, missing, or legacy marker triggers a full local SHA-256 audit and marker refresh, never another download. A short staged file continues with an HTTP range request after cancellation, failure, or restart. Repair verifies assets independently, replaces only missing or invalid files, and leaves the extracted runtime and Core ML caches in place. Models, the extracted runtime, and Core ML caches must never be committed or copied into a Conductor workspace.
 
-`Chunk` stores one 16 by 16 by 16 cube. A new cube is a uniform value without a 4,096-element block allocation. The first nonuniform edit materializes dense storage, and `compactStorage` returns a dense cube to uniform storage when possible. Fluid states are another optional 4,096-byte array. A generated source-water cube needs no fluid array unless a cell has an explicit runtime level or falling state.
+| Asset | Bytes | SHA-256 |
+|---|---:|---|
+| `base_model.onnx` | 2,029,994,361 | `543de788f73d0a4012685c908259f615601102aace4751aeccec64154ba145c0` |
+| `coarse_model.onnx` | 22,497,125 | `d6ca15b21b2e35d5e594a9ac7a4249a2376590c0ad2b5b49a1e6e2d033450008` |
+| `decoder_model.onnx` | 223,854,143 | `6473ae47ca6ec4d743d30fe4f5d381fe4158899714eff09b762005bdbdef68c1` |
+| `pipeline_data.json` | 12,226 | `e3132c3ef0c65d8613615f9278ffe23bbd9363ddcd87f1cc6f18456bcc9efe5c` |
+| `world_pipeline_config.json` | 774 | `c60f0b74d89317e64cfc623fbfdd828f1b5b2e50aa75020ac4001103381853bd` |
+| `onnxruntime-osx-arm64-1.27.1.tgz` | 31,959,937 | `e42b77a7281cc6e55141bf44fcfbac2c782b823a491bbb6ac33c781dd991f8a6` |
 
-All 65 `BlockType` values are append-only because saves persist raw bytes: ids are never reordered or reused, and the serializer validates every stored byte is below `BlockType::COUNT`, so growing the enum keeps every existing RYCH v4 cube valid with no chunk-version bump. A single compile-time `BlockDefinition` table exhaustively defines every block's render shape, collision solidity, opacity, targeting, liquid behavior, leaf behavior, sound, material, light emission, emissive state, wind-sway class, and the survival mining data (hardness, preferred tool class, minimum tool tier, interactability). `BlockType::COUNT` and compile-time assertions prevent a new block from omitting its traits. The crafting table, furnace, lit furnace, torch, chest, wool, and bed were appended this way; the byte-per-block format carries no facing metadata, so the furnace mouth is painted on all four side faces and the bed is a single cube (not the two-part Minecraft bed).
+All 65 `BlockType` values are append-only because saves persist raw bytes: ids are never reordered or reused, and the serializer validates every stored byte is below `BlockType::COUNT`, so growing the enum keeps every existing RYCH v4 cube valid with no chunk-version bump. A single compile-time `BlockDefinition` table exhaustively defines every block's render shape, collision solidity, opacity, targeting, liquid behavior, leaf behavior, sound, material, light emission, emissive state, wind-sway class, and the survival mining data (hardness, preferred tool class, minimum tool tier, interactability). `BlockType::COUNT` and compile-time assertions prevent a new block from omitting its traits. The crafting table, furnace, lit furnace, torch, chest, wool, and bed were appended this way. The byte-per-block format carries no facing metadata, so furnace and chest fronts use a documented fixed world -Z orientation until facing becomes persistent. A bed remains one block rather than a two-part Minecraft bed, but its rendered and collision volume stops at 9/16 height and it does not block skylight. A floor torch has a distinct support classification from flora: placement requires a full solid block below, breaking that support drops the torch, and water cannot replace it as vegetation. Targeting uses these authored occupied bounds as well: rays above a bed or beside a torch continue through the empty part of the voxel, while a hit carries matching bounds into the selection outline.
 
-| Trait | Meaning |
-|---|---|
-| `renderShape` | Cube, cross, flat, liquid, or none |
-| `solid` | Participates in collision |
-| `opaque` | Hides a neighboring solid face and blocks light |
-| `targetable` | Stops the block-edit raycast |
-| `liquid` | Participates in water or static-lava physics |
-| `sound` and `material` | Shared audio and material classification |
-| `lightEmission` and `emissive` | Derived block-light source and self-lit HDR surface |
-| `sway` | Static, root-bending flora, or whole-block leaves and reeds |
+The model revision is `ad2df557eca5645f588766101cf3bc3682455c3e`. The runtime is ONNX Runtime 1.27.1 loaded through its pinned C API header and `dlopen`. Its verified dylib remains mapped for the process lifetime because ONNX static operator registries can outlive a runtime environment. Sessions, the environment, and its global worker pool are still released on every retry and application teardown, while one process-local owner prevents duplicate runtime images. AppKit termination explicitly joins render and world generation before releasing generation contexts and the runtime; it never depends on shared-singleton destruction at `exit`. Ordinary CI does not link the downloaded dylib and never downloads the 2,308,318,566-byte pack.
 
-Cross flora is walk-through and targetable. Lily pads use flat geometry. Leaves and glass remain solid but nonopaque. Lava is non-solid, opaque, static, emissive, and the current level-15 block-light source.
+## Bootstrap and failure states
 
-Biome and surface metadata do not live in every vertical cube. An immutable `ColumnPlan` retains nine full `SurfaceSample` values on a world-aligned 3 by 3 lattice at eight-block spacing for one horizontal chunk column. It also stores the exact density surface Y for all 256 local X/Z columns and compact canonical water and lithology authority on the complete 17 by 17 world-coordinate grid. Each water entry records a stable `WaterBodyId`, level, depth, endorheic state, and ocean, river, lake, delta, waterfall, and supported-bank topology. Each geology entry records the primary and secondary facies, blend weight, contact distance, plate, crust, and boundary class at block resolution. Shared positive faces therefore receive the same water and lithology classification as the adjacent column. The plan records the vertical sections that may expose terrain, water, cliffs, vegetation, or waterfalls, including the maximum canonical waterfall reach. Construction makes 16 transient height-only perimeter queries to cover neighboring feature anchors, but those samples are not retained. `ColumnPlanCache` is a bounded 8,112-entry single-flight cache under a compile-time 128 MiB payload budget, so concurrent requests for one column share its construction.
+The title screen exposes these states before any world object exists:
 
-## Public generation contracts
+1. Model required
+2. Downloading
+3. Verifying
+4. Compiling Core ML partitions
+5. Loading and qualifying
+6. Ready
+7. Failed
 
-`ChunkGenerator` exposes three forms of procedural access:
+Cancellation and retry are explicit. Ordinary application startup performs no model or world work. Selecting or creating a v4 world starts local reuse and loading of an installed pack without another download action. The title screen states `LOCAL PACK REUSED - NO DOWNLOAD` whenever it has selected that path. Retry never replaces installed files. Repair is the only action that may replace an installed asset, and it downloads only assets that fail size and SHA-256 verification. The completion marker is recoverable state, not proof that the pack must be downloaded again: if it is missing or changed, bootstrap audits the installed files locally and restores the marker. A missing model, corrupt asset, unsupported platform, provider failure, or qualification mismatch is user-visible and fail-closed. It may not create a v4 world, publish an empty cube, or use the v3 generator.
 
-- `getColumnPlan(ColumnPos)` returns the immutable plan for a horizontal column.
-- `generateCube(Chunk&)` emits one cube and writes nowhere else.
-- `sampleSurface(x, z, footprint)`, `baseHeightAt(x, z)`, `surfaceYAt(x, z)`, and `biomeAt(x, z)` provide coordinate-pure queries. The two-coordinate surface wrapper requests the one-block footprint.
+The qualification query runs canonical input tensors through the coarse, base, and decoder graphs. Output values are quantized at a scale of 256 and hashed with SHA-256. Compilation retains one static session for each of those three graphs, so qualification and page inference never rebuild a session merely because the next call uses another graph. Coarse retains its qualified scalar batch. Base binds the model's symbolic `batch` dimension to the paper pipeline's fixed batch of four. Decoder binds batch four and the 256 by 256 spatial dimensions; a short lexicographic tail repeats its last real window and discards padded outputs. The runtime records Core ML, CPU fallback, and other provider partitions and nodes, the static Base and Decoder contracts, configured CPU fallback thread count, and resident-session count. The authority inspector also records final-page batch count and batched-page count, which must not imply more than one active model call. The pinned Core ML startup baseline is `6ccf5b56fc32d13df9e7a333a4e68f71c9a0f15191e57375a2e4785c463a41df`, and the provider-bound seed-42 final page containing block `(-4, -4)` has reference hash `d21220e869d92ad4c20201450bcaab05ae735b5657b26a502fd56a8b69c7896a`. These recorded values do not by themselves establish reverse-order determinism, full entry, visual, or performance qualification.
 
-`SurfaceFootprint` has one-, two-, four-, eight-, sixteen-, and thirty-two-block values. It describes the horizontal support represented by a sample, not a different world. Detail bands below that footprint's Nyquist limit fade out across one octave. Hydrology topology, `WaterBodyId`, water elevations, plate ownership, and feature anchors remain unchanged at every footprint. Far terrain consumes geometry, conservative footprint bounds, and a four-entry material palette through one sample contract, then resolves one palette entry per active LOD cell.
+Graph execution remains sequential and the inference coordinator admits one model call. CPU fallback sets ONNX Runtime's intra-op total to `min(hw.physicalcpu, 16)`, which is 16 on the documented M4 Max. That parallelizes work inside one CPU operator without permitting another graph or call to execute concurrently. Dry-spawn ranking retains at most one proposal per aligned 2,048-block hydrology owner. The canonical screen checks the requested chunk, then scans the owner's globally aligned four-block native raster in bounded batches across up to `min(hw.physicalcpu, 16)` workers. A proven center first tries the complete cold footprint and then the exact 113 by 113 radius-zero safety footprint. A bounded same-owner and same-learned-page relocation can install that stronger certificate without additional graph calls. If wider water prevents it, the screen retains the 25-sample five-by-five canonical dry certificate as its strict fallback. A positive-elevation continental fallback installs no certificate and may start only radius-zero exact validation. It cannot admit far-horizon work or metadata publication until that exact plan proves canonical water absence, support, headroom, slope, and the nearby dry neighborhood. Rejected candidates never prepare the wider exact band before world construction.
 
-Continuous geology, slope, climate, soil, and biome-suitability fields share immutable 64 by 64-block macro-control tiles. Each tile stores eight-block controls plus a one-control apron. Bounded tensor cubic B-splines reconstruct C2 fields across tile boundaries, then rotated Simplex bands restore only the detail supported by the requested footprint. The main single-flight cache holds at most 1,024 tiles and 128 MiB. Far footprints additionally reuse a 1,024-entry, 8 MiB climate cache whose 256-block tiles and 128-block controls avoid repeating the 4,096-block moisture integration at every coarse vertex. Plate IDs, water bodies, water elevations, and feature anchors remain direct coordinate authorities rather than interpolated categories.
+The opt-in runtime lifetime regression removes one staged model link, lets compilation load the verified dylib and then fail, proves that the failure releases its partial sessions and environment, restores the link, retries successfully, constructs a second runtime, and then exits the isolated test process. Run it against an external verified pack with `RYCRAFT_TERRAIN_REAL_LIFETIME=1 RYCRAFT_TERRAIN_MODEL_PACK=/absolute/model/pack ./build-release/tests/test_rycraft "[.real-runtime-lifetime]"`. A nonzero process exit is a failure even if every in-process assertion completed.
 
-The macro sampler returns the data shared by terrain and ecology:
+A qualifying cold-start measurement must cover the safe final spawn, revision-ready exact spawn meshes, the connected canonical terrain-and-water parent frontier through 96 chunks, and the atomic 60-target protected FINAL closure for the 30-second gameplay gate. The protected closure begins during preparation once the connected frontier reaches the near band. The configured 512-chunk horizon remains selected and must finish, with every other required queue, before the five-minute settlement deadline. Partial-radius diagnostics do not establish either result, even when their individual setup, spawn, or page timings are within budget.
 
-- `GeologySample`: plate, crust, resolved rock, `LithologyBlend`, plate velocity, boundary classification, uplift, rift, fault, hotspot, and volcanic values.
-- `HydrologySample`: `WaterBodyId`, flow direction, terrain and water elevations, discharge, sediment, analytical channel geometry, erosion, signed shoreline distance, lake depth, stream order, and water-body flags.
-- `ClimateFields`: wind, temperature, annual precipitation, potential evapotranspiration, aridity, and relative humidity.
-- `SoilSample`: moisture, fertility, drainage, and water table.
-- `BiomeBlend`: the two strongest biome suitability results and the secondary transition weight.
-- `Ecotope`: riverbank, floodplain, delta, lakeshore, coast, cliff, scree, canyon, geothermal, cave, and aquifer overlays.
+## Coordinates and physical scale
 
-These values are deterministic descriptors for world synthesis. Units such as annual precipitation and climate temperature are calibrated procedural values, not forecasts or a global climate simulation.
+| Contract | Value |
+|---|---:|
+| Cube edge | 16 blocks |
+| Minimum world Y | -128 |
+| Maximum world Y | 1407 |
+| Vertical section range | -8 through 87 |
+| Vertical section count | 96 |
+| Sea level | Y=64 |
+| Native model pixel | 30 meters |
+| Blocks per native pixel | 4 |
+| Horizontal block scale | 7.5 meters |
+| Positive-elevation block scale | 7.5 meters |
 
-## Generation pipeline
+World X maps to the model column and world Z maps to the model row. Native coordinates use floor division by four, including negative positions. Rectangles and page ownership are half-open.
 
-The pipeline is acyclic:
+The height conversion matches the scale-four reference with Rycraft sea level at Y=64:
 
-1. Geology and provisional relief
-2. Provisional precipitation for drainage discharge
-3. Bounded basin routing, erosion, channel incision, and water bodies
-4. Final climate over the incised elevation
-5. Soil and continuous biome suitability
-6. Cubic density, materials, water, ores, structures, and vegetation
+```text
+meters >= 0: trunc(meters / 7.5) + 64
+meters < 0:  trunc(-sqrt(abs(meters) + 10) + sqrt(10)) - 1 + 64
+```
 
-This order prevents a biome ID from feeding back into terrain shape. Biomes choose surface materials and ecology after height, water, and climate are established.
+`VerticalSectionMask` uses two words, so section 64 is not a shift boundary. Density interpolation has 193 possible Y levels for the full range, but cube generation evaluates only the interval required by the requested cube and surface neighborhood.
 
-### Geology and provisional relief
+## Generation identity
 
-`MacroGenerationSampler` places one jittered plate seed in every 8,192-block lattice cell after low-frequency domain warping. A bounded 3 by 3 search finds the two nearest sites. Each site has coordinate-counter-derived crust type, age, thickness, density, rock, and velocity.
+Every v4 world has one immutable `GenerationIdentity`. It includes generator version 4, the unsigned 64-bit seed, model-pack and runtime hashes, Core ML provider configuration including the scalar Coarse graph and static Base and Decoder batches, model scale, window geometry, RNG revision, quantization revision, hydrology revision, and postprocessing revision.
 
-Relative velocity is decomposed into normal and tangential motion near the nearest-site boundary:
+Hydrology revision 12 persists a frozen branch-specific fall partition and uses reach-scoped channel projection plus receiver-owned standing-water backwater. An immutable closed-depression outlet whose standing stage cannot grade into its routed receiver owns an explicit branch fall; spatial proximity and unresolved cross-page stages cannot synthesize one. Revision-11 RYHY pages therefore have a different generation fingerprint and cannot be mixed with newly routed pages.
 
-- Closing normal motion produces convergent uplift.
-- Opening normal motion produces divergent rift relief.
-- Dominant tangential motion produces transform fault strength.
-- Boundaries with little normal motion also receive a weaker transform classification.
+Postprocessing revision 9 reconstructs PREVIEW elevation from the FINAL latent low-frequency channel with the same cleanup operator, then derives its physical climate from that elevation. It retains the published Python and Java half-pixel, `align_corners=false` registration introduced by revision 8. Earlier PREVIEW pages remain rejected as incompatible, and profile metadata must select a separate identity namespace before current revision pages are generated. PREVIEW and FINAL RYTA pages, protected RYTG rectangles, and RYHY hydrology all remain fail-closed on seed or fingerprint mismatch.
 
-The result controls broad relief rather than replaying plate evolution. Pairwise candidate relationships are evaluated across the bounded 3 by 3 neighborhood, so convergent, divergent, and transform signals remain continuous through plate edges and triple points even though the diagnostic plate identifier changes discretely. Bounded mid-frequency domain warping bends contact geometry. `LithologyBlend` measures the two closest rock facies and their continuous contact distance, while an isotropic rank field resolves individual blocks without square ownership regions. Continental fraction blends oceanic and continental base elevations. Uplift, rifts, faults, ridged noise, and footprint-filtered rotated simplex bands form the provisional height.
+The identity's SHA-256 fingerprint is persisted in metadata and every terrain-authority page. A page, edit profile, or world path with a different identity cannot be combined with the current world. Cache eviction may affect latency only, never page bytes. A corrupt RYHY envelope is rebuilt and atomically replaced. An outer-valid RYHY native payload is replaced only after its exact bad bytes have been proved corrupt. Fingerprint, seed, quality, and other persistence failures remain fail-closed for both PREVIEW and FINAL authority.
 
-Relief is intentionally amplified for a fantastical game scale. Continental convergence can build broad folded massifs above Y=300, while oceanic convergence favors trenches and lower island arcs. Hotspots, faults, and rifts have distinct bounded relief responses. Smooth noise envelopes and unit-slope hyperbolic compression keep this exaggeration continuous instead of creating a height step, solitary wall, or flat clipped summit.
+`AuthorityQuality` is `PREVIEW` or `FINAL`. A typed authority result is `READY`, `DEFERRED`, or `FAILED`. `WorldGenerationContext` binds one identity, quality, and authority and latches the first production failure. The render and fixed-tick threads may read completed results or enqueue work, but they must not perform or wait on inference.
 
-Hotspot candidates occupy a 16,384-block lattice and have a 14 percent acceptance chance. An accepted hotspot emits four through seven volcanoes along the direction opposite the nearest plate velocity, which makes older relief trail away from the source. Separate 1,024-block candidates place arc-associated stratovolcano candidates near active convergent boundaries. Broad shield volcanoes and steeper stratovolcanoes lift oceanic islands, carve summit calderas or craters, optionally fill settled crater lakes, and emit basalt or ash fields. A crater lake uses an absolute local volcanic profile and a coordinate-warped radial distance, so its shoreline is irregular without inheriting an unrelated macro-height tilt. Generation samples the complete rim in 96 directions and accepts the lake only when every direction retains at least one full block of freeboard. It then emits a supported dry bank around the standing water and rejects the lake if a safe wet radius cannot fit inside the rim. These crater lakes are endorheic; ordinary routed lakes can instead retain the named outlets, rapids, and falls described below. The same global primitives reconstruct obsidian or lava-bearing conduits and three or four curving lava tubes inside every intersecting cube. These are static generated landforms; eruptions and propagating lava remain outside this version.
+The bounded coordinator treats priority as an admission contract. A SPAWN or EXPLORATION_EXACT request may displace unstarted visible, preview, or speculative work when all 64 request slots are occupied. A current protected handoff may also replace lower work and stale protected work from an older camera epoch. An active model call and an active atomic publication finish normally. Decoded page and transient-grid caches evict only entries from the same or a weaker lane, then use recency within that lane. Distant decoding therefore cannot remove a stronger current-player input merely because it arrived later.
 
-Provisional elevations are smoothly compressed and clamped to Y=-112 through Y=480. This leaves bedrock space below and headroom above generated terrain.
+`PREVIEW` pages are reserved for the coarse far horizon. They are decoder-free low-frequency reconstructions from the same latent lineage as FINAL terrain, not downsampled copies of FINAL output. Safe-spawn hydrology, exact cubes, and the native-hydrology topology and refinement closure use `FINAL` authority only. A coarse spawn selector may propose locations, but it never authorizes collision or water. The decoder residual may still refine local terrain and water topology, so the renderer replaces preview terrain and water together instead of pairing authority from different qualities.
 
-### Drainage, incision, lakes, and coastal deposition
+## InfiniteDiffusion authority contract
 
-`BasinSolver` keys one immutable solution to each 2,048-block catchment. A jittered site represents the catchment. Each non-ocean site chooses a lower cardinal neighbor under a stable elevation, random tie, and coordinate ordering. Adjacent catchments reconstruct the same boundary portal. Portal discharge combines exact provisional rainfall from four upstream site rings with a deterministic coarse contribution for more distant drainage.
+The locked window geometry is:
 
-Each catchment holds a 16-block raster plus a two-cell apron. Relief, rainfall, and rock-resistance callbacks are evaluated on a globally aligned 64-block input grid and interpolated onto the numerical raster. A four-cell boundary blend and exact reconstruction of the shared portal make terrain, water elevation, flow, discharge, and channel shape agree across catchment boundaries. Priority-Flood fills routing depressions, then an angular D-infinity-inspired routing step splits flow between the two downhill raster receivers around the local aspect, with a strict lower-neighbor fallback. Provisional rainfall and portal contributions accumulate through that acyclic routing.
+| Stage | Window | Stride | Solver steps | Batch |
+|---|---:|---:|---:|---:|
+| Coarse | 64 by 64 | 48 | 20 | 1 |
+| Latent | 64 by 64 | 32 | T=2 | 4 |
+| Decoder | 256 by 256 | 192 | T=1 | 4 |
 
-Eight fixed passes apply stream-power incision, sediment-capacity transport, deposition, and thermal hillslope relaxation while keeping the shared boundary locked. Priority-Flood and D-infinity run again over the eroded surface before Strahler order is assigned. Discharge, order, gradient, sediment, and rock resistance determine channel width, depth, floodplain reach, canyon incision, and gorge shape. Strahler channels reconstruct coordinate-pure curved guide segments whose shared endpoints and tangents return smoothly to canonical portals. Each incoming and outgoing half owns a deterministic junction water level and interpolates monotonically to the immutable portal level with a quintic profile. Confluences cross-fade by normalized centerline distance, so selecting a different guide cannot introduce a standing-water step. Bounded meanders fade near portals, confluences, deltas, and waterfalls. Analytical distance to those guides controls channel width and depth instead of exposing a raster-cell category. Nearly level guides remain undisplaced because a lateral cut there can manufacture an invalid spill basin. Ordinary descent remains a channel or rapid; only a tagged analytical drop emits falling-water geometry.
+The shared foundation implements global half-open window intersection, portable PCG64, Marsaglia Gaussian generation, coordinate-addressed noise patches, separable linear weights with epsilon 0.001, and insertion-order-independent accumulation. It also fixes model rows to world Z and columns to world X.
 
-Routed channel identity takes precedence over the below-sea fallback, so incision below sea level does not reclassify a river as ocean. A one-raster-cell support band raises the immediate dry channel bank to the routed water level, while named outlets remain open. A routed channel whose gradient is at least one eighth block per block quantizes its analytical stage to the nearest legal eighth-block plane and emits explicit flowing levels 1 through 7. This prevents a gradual stage from becoming a one-block source terrace while preserving downstream monotonicity. Tagged bounded analytical drops additionally emit explicit falling-water state. Outlet-fall lookup uses immutable local raster buckets, so sampling cost does not grow with the number of falls in a basin.
+`InfiniteDiffusionBackend` implements the production scalar coarse denoising loop, fixed four-window latent batches, lexicographically grouped four-window Decoder batches with deterministic repeated-tail padding, signed-square-root elevation encoding, Laplacian low-frequency and residual reconstruction, half-pixel bilinear interpolation corresponding to `align_corners=false`, low-frequency cleanup, climate reconstruction, and page quantization. PREVIEW and FINAL share the same latent accumulation; PREVIEW substitutes a zero decoder residual before the common cleanup and crop. Coarse climate sampling retains the same pixel-center formula at positive and negative coordinates. Compatibility ramp goldens lock that registration against the published Python and Java implementations. Acceptance still requires repeatable real-model hashes. Do not report paper-faithful generation as qualified from source inspection or fake-backend tests alone.
 
-Qualifying depression components become flat lakes at their spill surface; small or shallow depressions remain filled only for routing. Every retained body receives a stable 64-bit identity derived from its drainage root. Lake-body sampling groups contributors by identity, flat water level, and endorheic state. A dry or different-body contributor contributes zero lake depth and keeps its original interpolation weight instead of causing wet weights to be normalized back to full depth. Shoreline contours are keyed by water body and global 256 by 256-block page. Four-block controls with a shared apron reconstruct the broad signed-distance field, and only the narrow contour band refines to two-block controls. Bounded isotropic perturbation fades near outlets and shared portals. Adjacent pages therefore query the same apron authority, while a separate byte-accounted 64 MiB single-flight cache bounds retained contour work. Depth tapers to zero at a curved real shoreline rather than projecting a floating sheet beyond it. If distinct lake authorities overlap, the difference between their signed distances creates a bounded competitive watershed. The higher of their two levels controls a solid divider with dry freeboard, preserving both standing bodies instead of joining or discarding either one. An outlet or channel corridor owned by either body exempts that connector from the divider so valid drainage remains open. The solver reconstructs every retained lake floor from its flat level minus positive depth and removes negligible members. The `ColumnPlan` 17 by 17 authority carries stable identity, level, depth, and ocean, river, lake, delta, waterfall, and supported-bank topology into exact density and cube emission. Every generated standing-water voxel consequently occupies a canonical wet column with a solid block below its lowest water voxel and implicit source state at every voxel through the surface.
+## Learned fields and macro adaptation
 
-Routed basins continue toward an outlet, while terminal catchments receive bounded endorheic lakes. A high-discharge, steep channel over resistant rock can form an ordinary channel waterfall. A nonendorheic lake whose selected receiver is at least 2.5 blocks lower additionally records one immutable `OutletFall`. Its top and bottom surfaces, width, start-to-receiver flow direction, and receiver anchor are separate from the receiver's standing `waterSurface`. Exact generation overlays a short, narrow falling footprint centered on that receiver and marks its cells as explicit falling water from the lower surface through the upper lip. This connects the two bodies without extending a long water slab, discarding the elevated lake, or raising the lower receiving body. Sediment-rich, low-gradient rivers entering shallow ocean water build depositional fans with two through four distributaries.
+Each native sample carries:
 
-Channel, lake, waterfall, and delta geometry is carved directly into terrain before cubes are emitted. Ocean, river, lake, crater-lake, rapid, and outlet-fall cells receive finished block and fluid state during generation and enter no runtime fluid queue. Covered water below an exposed rapid top remains source-filled. Far water carries stable body identity and water kind plus the same quantized visible stage. When one coarse cell observes incompatible lake or receiving-water authorities, it refines against canonical samples rather than connecting their levels. The far renderer reconstructs each outlet fall as one receiver-centered five-quad prism, with four sides and one top. Exactly one half-open anchor tile owns the complete prism, even when it crosses a tile face. The prism extends into the lower body's top source voxel so it overlaps the visible surface, reaches the upper lip, and does not alter or cover the receiving body's standing surface. Basin solutions are stored in a byte-accounted 64 MiB single-flight LRU cache. Exact and far terrain share a process-wide permit gate that admits no more than two distinct cold basin constructions at once; cache hits and callers sharing an existing future do not consume another permit. One scalar or grid query retains shared ownership of every neighboring solution throughout lake selection and shoreline reconstruction, so concurrent clear or LRU eviction cannot free an authority still in use. A request records the cache generation before lookup or construction, preventing an overlapping clear from promoting stale work into the current fast-hit set. That budget accounts for retained immutable solution payloads; transient construction and allocator overhead are measured separately. Validation rejects nonfinite fields, invalid sinks or receivers, uphill channel water, lakes without positive depth, invalid lake outlets, and malformed outlet-fall extents. Construction failure falls back to un-eroded base terrain with deterministic outlet metadata instead of publishing an invalid solution.
+- Elevation in meters
+- Mean temperature in degrees Celsius
+- Temperature variability in degrees Celsius
+- Annual precipitation in millimeters
+- Precipitation coefficient of variation
+- Lapse rate in degrees Celsius per meter
 
-Each `BasinSolver` instance represents one immutable callback context. Its elevation, rainfall, and rock-resistance callbacks must be coordinate-pure and must describe the same fields for the solver's entire lifetime because the catchment cache key contains seed-space coordinates, not callback identity. Changing any field requires a new solver instance. Clearing the cache does not change the callback context.
+When a v4 `WorldGenerationContext` is present, learned elevation is the only macro elevation, and four learned climate variables plus the derived lapse-rate field are the only macro climate authority. Existing plate uplift and synthetic continental or climate fields do not modify those values. Temperature at a post-authority local height uses the derived lapse rate and the shared 7.5-meter scale.
 
-### Final climate and soil
+Geology, lithology, rock resistance, strata, caves, ores, aquifers, structures, and volcanic primitives remain bounded procedural systems. V4 adds deterministic shield, stratovolcano, and warped-caldera relief to the learned physical elevation in meters before native routing. A crater becomes wet only when the canonical depression hierarchy finds a supported stage and spill; the analytical crater-lake overlay remains v3-only and cannot override that result. After routing, v4 may add at most 1.5 blocks of footprint-filtered local relief to a dry slope. Channel, outlet, lake-rim, coast, divide, transition-owner, and every wet category gate the residual to zero, so it cannot delete water, create a retaining wall, or change body topology. The old 16-block `BasinSolver` hydraulic-erosion passes and alpine postprocessing remain v3-only. V4 uses the learned elevation, pre-routed volcanic adjustment, canonical bed correction, and bounded dry residual without allowing a legacy raster to overwrite the learned surface or imprint its storage phase on water. The code retains the existing biome, flora, canopy, and fauna consumers through a physical-climate adapter. Its soil moisture uses a bounded annual precipitation and potential-evapotranspiration balance, with precipitation variability increasing effective demand without inventing a monthly phase. The model itself supplies no biome IDs. The ecosystem follow-up begins with a golden native-grid crosswalk against the pinned mod's hand-written `BiomeClassifier`, then replaces the temporary adapter with continuous PFT capacity informed by canonical water and soils instead of copying fixed noise or vanilla sea rules. Equilibrium plant-functional-type fractions are deferred to PR 2.
 
-Climate uses rotated nonrepeating simplex bands rather than latitude bands or square value-noise cells. A pressure-field gradient plus a stable rotational term determines wind. Moisture evaluates 17 points connected by 16 upwind intervals of 256 blocks, for a bounded 4,096-block path. Each point samples the incised hydrology result. Oceans, lakes, and rivers recharge moisture with relative weights 1.0, 0.65, and 0.18. Rising terrain removes moisture as precipitation, descending terrain creates a lee-side drying response, and accumulated water exposure moderates temperature.
+The context-free `MacroGenerationSampler` remains the legacy synthetic generator for tests and `RYCRAFT_DIAGNOSTIC_V3=1`. It is not a fallback for a failed v4 query.
 
-Temperature begins with a synthetic insolation field. Elevation cooling uses a lapse rate of 6.5 C per 1,000 climate meters with eight climate meters per vertical block. Annual precipitation and temperature produce potential evapotranspiration and aridity. Rock type, soil noise, water proximity, drainage, and sediment context then produce soil moisture, fertility, and the water table.
+## Regional weather boundary
 
-The final climate uses the incised local terrain height and generated water along the bounded upwind profile. Discrete volcanic relief is applied after that macro integration. Its emitted-height lapse correction and any crater-water moderation are local corrections only; they do not rerun the 4,096-block atmospheric path.
+Static learned climate remains immutable world-generation authority. `WeatherSystem` samples only learned elevation and climate in bounded spatial batches. It does not route hydrology or construct geology, soil, biomes, or ecology for its horizon grid. Weather is a separate presentation system reconstructed from the generation identity, full-width coordinates, static climate, and saved world time. Its latest-wins utility worker builds an 81 by 81 camera-centered grid at 256-block spacing. Each immutable snapshot carries two deterministic slices 200 ticks, or ten real seconds, apart. Gameplay retains the prior valid snapshot while a replacement is built and recenters only after 1,024 blocks of movement. Deferred authority leaves the prior snapshot resident and retries from the fixed tick without terminating the worker.
 
-### Regional weather boundary
+Each sample derives pressure, relative humidity, wind in blocks per second, temperature, cloud coverage and type, precipitation intensity and kind, storm potential, fog extinction, aerosol density, terrain height, and cloud base and top. Coordinate-pure pressure, moisture, temperature, instability, and front fields are biased by the learned climate. Rain or snow follows temperature rather than a biome label. Surface wetness integrates precipitation and dries from temperature, wind, and sunlight. Foliage, clouds, fog, precipitation, lightning, and thunder consume the same immutable snapshot.
 
-Static climate remains immutable world-generation authority. `WeatherSystem` samples that authority in batches, but weather is a separate presentation system reconstructed from the world seed, full-width coordinates, static climate, and saved world time. Its latest-wins utility worker builds an 81 by 81 camera-centered grid at 256-block spacing. Each immutable snapshot carries two deterministic slices 200 ticks, or ten real seconds, apart. Ordinary gameplay retains the previous snapshot while a replacement is built and recenters only after 1,024 blocks of movement.
+Weather does not write blocks, fluids, terrain authority, column plans, or gameplay rules. Snow does not accumulate, rain does not create runoff or flooding, and lightning creates no fire or edits. Deterministic storm cells derive lightning IDs and positions from the seed, fixed time buckets, and cell coordinates. Thunder uses the same events with physical distance delay at 343 meters per second. Generator v4 converts horizontal and positive vertical distances at 7.5 meters per block. `RYCRAFT_WEATHER` provides stable `clear`, `overcast`, `rain`, `storm`, and `snow` capture authorities.
 
-Each sample derives pressure, relative humidity, wind in blocks per second, temperature, cloud coverage and type, precipitation intensity and kind, storm potential, fog extinction, aerosol density, terrain height, and cloud base and top. The live system advects coordinate-pure pressure, moisture, temperature, instability, and front fields, then biases them with the static climate. Rain or snow follows temperature, not a biome label. Surface wetness integrates precipitation and dries from temperature, wind, and sunlight. Foliage and particles consume the same physical wind vector.
+Continuity qualification compares each former storage line with eight nearby control lines. Its orientation histograms therefore use exposure-scaled Dirichlet pseudocounts. A control histogram with eight times as many samples receives eight times the prior mass, so mutually empty direction bins cannot create false grid evidence while an actual structured seam still exceeds the unchanged qualification threshold. Equal-exposure comparisons retain the original one-count-per-bin prior.
 
-Weather does not write blocks, fluids, terrain, column plans, save payloads, or gameplay rules. Snow does not accumulate, rain does not create runoff or flooding, and lightning creates no fire or edits. Deterministic storm cells derive lightning IDs and positions from the seed, fixed time buckets, and cell coordinates. Thunder uses the same events with distance delay at 343 blocks per second. `RYCRAFT_WEATHER` provides stable `clear`, `overcast`, `rain`, `storm`, and `snow` capture authorities.
+## Terrain-authority pages
 
-### Biomes and ecotopes
+One immutable page covers 256 by 256 native pixels, or 1,024 by 1,024 blocks. Preview and final pages are separate:
 
-All 33 persisted biome values are append-only. The original 14 values remain unchanged, the first climate expansion occupies values 14 through 26, and values 27 through 32 add montane grassland, flooded grassland, Mediterranean woodland, temperate conifer forest, tropical conifer forest, and tropical dry forest.
+```text
+terrain-authority-v1/
+  preview/p.<row>.<column>.ryta
+  final/p.<row>.<column>.ryta
+  transient-final-v1/g.<row-begin>.<column-begin>.<row-end>.<column-end>.rytg
+```
 
-The land-biome palette has at least one reachable representative for each of the 14 terrestrial biome classes used by the [One Earth Bioregions Framework](https://www.oneearth.org/bioregions-2023/) and the World Wildlife Fund's foundational [Terrestrial Ecoregions of the World](https://doi.org/10.1641/0006-3568%282001%29051%5B0933%3ATEOTWA%5D2.0.CO%3B2) classification. Desert, montane grassland, steppe, savanna, flooded grassland, mangrove, Mediterranean woodland, temperate broadleaf forest, temperate conifer forest, tropical conifer forest, tropical dry forest, tropical rainforest, taiga, and tundra provide that correspondence. Additional game biomes represent oceans, river and coast context, unusual geology, local floristic variation, ice, and glaciers. This is a procedural climate classification, not a claim to reproduce a specific real ecoregion.
+Each LZ4-compressed `RYTA` file records schema, quality, signed page coordinates, seed, full generation fingerprint, native dimensions, channel mask, payload lengths, payload CRC-32, and header CRC-32. The payload uses fixed 12-byte quantized samples. Publication uses a temporary file, `fsync`, rename, and directory synchronization.
 
-Continuous suitability scores combine temperature, precipitation, aridity, fertility, elevation, slope, geology, and water context. The score fields are evaluated continuously and `BiomeBlend` retains the strongest and second-strongest results with normalized influence. Surface materials consider the four strongest suitability scores so exchanging second and third place cannot create a categorical line. Rotated multiscale smooth ranks choose among weighted palettes for materials, tree candidates, and per-column flora. Each use has a stable subsystem stream, so broad transition zones form connected irregular patches without changing terrain shape, exposing 4-, 16-, 32-, or 64-block ownership squares, or depending on cube order.
+An `RYTG` file uses the same 12-byte quantization for one exact half-open FINAL rectangle. Only
+spawn and protected-handoff requests persist these rectangles. Restart loads validate the full
+identity, rectangle, sizes, header checksum, and payload checksum before exposing samples. A corrupt
+file is inferred again and atomically repaired. A fingerprint mismatch fails closed.
 
-Ecotopes describe local landforms without creating a combinatorial set of biome IDs. Riverbanks, floodplains, deltas, lakeshores, coasts, cliffs, scree, canyons, geothermal areas, caves, and aquifers can overlap a climate biome. Eight continuous elevation ecotopes add valleys, foothills, montane slopes, subalpine terrain, alpine zones, snowfields, glaciers, and exposed peaks. Their overlapping weights vary surface cover and ecology gradually across elevation rather than imposing one fixed snow line.
+The decoded authority cache defaults to at most 1,024 entries and 512 MiB. A query is limited to 64 pages and 1,048,576 samples. At most 64 page requests may be outstanding and one build runs at a time. Equal cold requests share one flight. The production backend separately caps retained coarse, latent, and decoder tensor windows at 384 MiB. The coordinator orders spawn, exploration exact, protected exact handoff, visible final refinement, coarse preview, and speculative movement prefetch. Production final-parent requests use the protected lane for the exact-handoff prefix. Movement hints use the speculative lane only after the current visible preview closure is ready and are capped at eight pages.
 
-Snow and ice are climate outputs. A surface freezes at or below -1 C when annual precipitation is at least 120 mm or when its primary biome is ice spikes, glacier, or frozen ocean. Tundra keeps its cold surface palette but does not independently force water to freeze. There is no fixed snow line.
+Protected FINAL targets sort directly intersected native hydrology owners lexicographically and
+group adjacent owners in sets of at most two by two. Every combined half-open FINAL rectangle stays
+within the 1,048,576-sample query bound. Cropping the grouped output back to one 517 by 517 owner
+produces exactly the same FINAL samples as preparing that owner separately, including negative
+coordinates and shared aprons. The grouping changes request count and reuse, not terrain authority
+or generation identity.
 
-### Cubic density and materials
+## Canonical generated water
 
-The solid test is `D(x, y, z) > 0`. Macro relief supplies the column height and detail amplitude. Existing three-dimensional density contributes anisotropic ledges and overhangs, cheese caverns, spaghetti tunnels, and deep noodle caves. Density is evaluated on a world-aligned 4 by 4 by 4 lattice, then interpolated with one fixed operation order. Neighboring cubes therefore sample the same density at the same world position.
+Generated water is complete static geometry and implicit source state. It does not use runtime ticks to settle.
 
-Water-covered columns seal caves near the surface. Dry high ground can expose cave entrances. Bedrock fills the bottom two layers and deterministically dithers part of the third. Aquifer ecotopes can emit bounded ellipsoidal water pockets below the water table. A clay or limestone shell seals each pocket, so aquifers do not flood an arbitrary connected cave. Static lava may occupy deep open cells at or below Y=-96. Lava does not flow.
+The governing invariants are:
 
-Geology, all biome suitability weights, elevation ecotopes, soil, water, and surface context produce a compact four-entry palette over stone, andesite, basalt, obsidian, limestone, sandstone, volcanic ash, mud, clay, silt, gravel, sand, dirt, grass, snow, and ice. Submerged sediment and active volcanic conduit rules remain hard physical exclusions. Exact terrain and every far LOD resolve the same coordinate-pure palette, and greedy far meshing merges only cells that resolve to the same material.
+- Hydrology may lower terrain to form a bed or open a route.
+- Hydrology may not raise dry terrain only to hold water.
+- A level conflict may not be resolved by deleting a wet cell.
+- A standing body has one stable identity and one flat stage.
+- A river stage is monotone along ordinary flow.
+- An ordinary exposed river top uses the nearest eighth-block static fluid state, while every
+  completely covered water voxel beneath it remains an implicit source.
+- An abrupt stage change must be owned by an explicit rapid or waterfall.
+- Every standing-water column has solid support and implicit source water through its surface.
+- Exact cubes and far tiles consume the same body, stage, bed, flow, and shoreline authority.
 
-`StrataField` is an implicit three-dimensional coordinate field rather than a plate- or chunk-local layer index. Regional dip, several rotated fold wavelengths, variable bed thickness, erosional unconformities, curved fault displacement, intrusions, and bounded lenses deform it continuously. Only tagged faults retain a sharp offset. Ordinary facies contacts use `LithologyBlend` plus an isotropic rank, so beds can curve through cube, chunk, macro, and plate boundaries without a vertical storage-aligned wall.
+The v4 path removes conflict-bank targets, categorical bank dilation, dry retaining-wall overrides, sealed artificial support columns, and shore-raising paths from its native hydrology and cube emission. The retained v3 `BasinSolver`, including its iterative hydraulic-erosion passes, is an explicit diagnostic compatibility path and is not used for v4 macro terrain. V4 derives a discharge-aware bed cut from learned elevation and canonical water stage rather than applying the legacy eroded raster. Conflicting connected stages reconcile by compatible stage relaxation, route opening, or explicit transition ownership rather than wall construction.
 
-All block identifiers are append-only because save payloads store raw bytes. `BlockType::COUNT` is 65. A compile-time `BlockDefinition` table defines render shape, collision solidity, opacity, targeting, liquid behavior, leaf behavior, and survival mining data for every value. Render shapes are cube, cross-quad, flat, liquid, or none. Lily pads use flat geometry. Non-block `ItemType` values (stick, ingots, foods, tools, buckets, shears, boat, and so on) append from `ITEM_ID_BASE` (256) in their own append-only range, mirroring the same raw-byte persistence rule.
+The implemented v4 route uses deterministic local native-page Priority-Flood and half-open shared-edge ownership. Its input is learned `elevationMeters`, not a converted block height: ocean classification uses values below 0 meters, Priority-Flood, lake components, and D-infinity retain those native meters, and gradients divide by the physical 30-meter raster spacing. The native lake-depth threshold is 0.9375 meters, while source stages, beds, raw terrain, and persisted sampling fields are emitted afterward in Rycraft block-height coordinates through the shared learned-elevation conversion. This preserves sub-block slopes in routing without changing the game-facing vertical contract. A one-component local lake retains its 256-block coarse anchor through ordinary preview and final refinement. If two disconnected local components collide in that anchor, each receives a separate exact local-component ID rather than sharing lake statistics or body ownership.
 
-### Ores, structures, and plants
+D-infinity keeps both physically significant receivers for runoff, but a receiver branch becomes visible geometry only when its target is a finished ocean, lake, river, or wetland cell with a canonical stage and body. A subthreshold branch therefore cannot terminate as a source-height puddle. Ordinary raster stages use a one-sixteenth-block-per-block upper grade so rounding exposed tops to eighth-block states cannot introduce a two-level step. Curved routes interpolate stage by sampled arc length, and overlap reconciliation is limited to one ordinary reach instead of borrowing a nearby body's stage. An abrupt descent is legal only on a frozen routed-fall branch or at an immutable closed-depression outlet whose standing stage cannot grade into its receiver. The latter owns the complete receiver edge as one half-open fall, while an edge-open depression waits for final cross-page spill authority and cannot emit a page-local curtain. River contacts lower smoothly into sea level, and a river entering a lower lake owns an explicit descent. When a small positive learned elevation quantizes to Y=64, the compatible downstream stage remains monotone and sampling cuts the supported bed below it instead of clamping the route to Y=63.875. These rules lower beds when required and never raise dry terrain or create a retaining wall.
 
-Every feature is anchored in global horizontal cells and clipped to the cube being generated. A generator never writes into a neighboring loaded cube.
+Each immutable page also persists local depression anchors, stages, half-open core mass, natural outlets, edge masks, and opposing-edge samples. Before returning any sample of an edge-connected lake, the router follows the component's tiled spill summaries in lexicographic order. It merges components only when both pages report lake water above the identical substrate at the same native edge sample. Stage reduction monotonically removes a portal if its substrate would become dry, then recomputes the source component to a fixed point. The merged component uses one flat compatible stage, its lexicographically rooted stable identity, core-owned area, volume, and runoff without apron double counting, and either the lowest compatible interior outlet or an explicit endorheic result. A dry edge on either side remains a barrier. This prevents request order, concurrency, cache state, and restart state from changing a page-edge stage, mass, outlet, or identity. Hydrology may lower the bed of a proven connected fringe when it lowers a conflicting stage, but it never raises dry terrain.
 
-- Ore random walks are re-evaluated from nearby source columns and clipped in X, Y, and Z. Bands now extend from Y=-120 through Y=160 depending on ore.
-- Ruins, wells, and houses are anchored once per 8 by 8 horizontal chunk region. The writer clips each structure to the current cube, so a vertical or horizontal boundary does not transfer ownership.
-- Trees place one counter-addressed candidate per 8 by 8 global feature cell. One continuous habitat evaluation consumes every biome suitability score and blend weight, temperature, annual precipitation, soil moisture and fertility, available light, slope, actual emitted altitude, lithology and contact stress, uplift, faults, volcanic stress, hydrology, and riverbank, lakeshore, floodplain, delta, coast, and geothermal ecotopes. Suitable rainforest, temperate rainforest, broadleaf, conifer, taiga, and mangrove climates raise cover and tighten deterministic local-priority spacing. Dry, steep, barren, geothermal, and actively volcanic terrain suppresses cover. A candidate is accepted only when its stable priority beats every candidate inside the larger of their species spacing radii, independent of cube request order.
-- The tree query expands six blocks beyond the target cube footprint, reconstructs every winning anchor, and clips output to that cube. The ten rooted forms are oak, branched large oak, birch, conical spruce, bent acacia, four-trunk jungle trees with buttress roots and branches, rooted mangroves, leaning palms, hanging willows, and alpine scrub. Fallen logs use the same anchored placement system as a separate form. Oak, birch, spruce, acacia, jungle, mangrove, palm, and willow retain distinct log and leaf blocks.
-- Per-column flora reads soil moisture, fertility, relative humidity, slope, ecotopes, water, and a counter-dithered primary or secondary biome. It emits tall grass, three flower colors, mushrooms, ferns, shrubs, cattails, reeds, cacti, dead bushes, succulents, and lily pads. Riparian plants use riverbank, lakeshore, floodplain, and mangrove context.
-- Tree and flora candidates also query the emitted substrate. Rock, scree, volcanic ash, deep snow, and standing water reject ordinary roots. Only mangroves in suitable water no more than three blocks deep and non-ocean willows in suitable water no more than two blocks deep may root while submerged. Their base uses the actual emitted solid surface plus one, support is rechecked, and adapted logs replace intervening generated source-water voxels so every trunk reaches the ground. Exact and far habitat decisions therefore agree on where vegetation can plausibly stand.
+The tiled spill traversal admits at most 64 connected owner pages and 256 component nodes, enough for a 131.072-kilometer one-page-wide chain. Reaching either limit fails closed instead of publishing a partial stage or identity, so no query performs a whole-world walk. Synthetic three-page and eight-page chains, including negative coordinates, qualify reverse order, concurrency, portal drying, aggregate mass, natural outlets, and endorheic closure.
 
-This is a locally evaluated priority distribution inspired by infinite Poisson-disk work. It does not precompute Poisson or Wang tiles. Global cells, counter randomness, radius competition, and clipped reconstruction provide the required order-independent spacing directly.
+Each page also persists physical native elevation, local runoff, and a four-bit receiving-edge hint derived from real escape paths across its core. When a locally wet component reaches an edge, or a locally dry page can receive a depression through one of those edges, the router combines the bounded owner rectangle and reruns the deterministic minimax flood on physical elevation. It expands only while the component can continue through an outer edge and fails closed at the same 64-page bound. The resulting immutable region owns its flat stage, mass, stable identity, and signed shoreline on both sides of the former page seam. Exact samples, dense grids, and compact far-topology cells share that region even when the first request arrives on the locally dry side or after a persisted restart. Exposure of a dry receiving page therefore cannot depend on query order, and a newly wet step-32 cell cannot disappear because its local page reduction was dry.
+
+Shallow, low-variability groundwater cells enter a connected wetland graph instead of a one-cell decoration pass. The graph follows both significant D-infinity receivers through other candidates until it reaches a finished ocean, lake, river, or wetland. It crosses half-open owner pages, visits at most 64 pages and 262,144 native cells, and fails closed instead of publishing a partial identity. Every resolved cell inherits one parent stage and body ID, promotes hydraulic head to that stage, and receives a one-eighth-block supported bed by lowering terrain only. Exact columns, implicit fluids, materials, and every far LOD consume that same authority. Candidate cells set both wet and dry compact-topology evidence, so a four-block fringe cannot disappear at step 32 before the connected solve runs.
+
+A low-gradient river that reaches the ocean becomes an estuary for up to 64 native cells of sea backwater. The category is explicitly brackish, cannot cross a waterfall, and follows receiver ownership across page boundaries. A qualifying mouth preserves its physical receiver and adds one deterministic secondary ocean receiver within four native cells. The stable seed chooses the branch side and a 0.32 through 0.42 secondary discharge fraction, the primary receives the remainder, and both ribbons retain the same junction identity. The secondary target is chosen for lateral separation, so the result is an actual visible distributary rather than two coincident labels on one raster edge. Schema-6 RYHY pages persist the receiver pair, weight, delta and estuary flags, and frozen two-bit fall-branch partition from which brackish and transition identity are derived. Exact and far sampling reconstruct the same splines, branch discharge, stage, and body ownership after cache clearing or restart.
+
+The no-raising correction, tiled lake reconciliation, connected wetlands, coastal distributaries, and estuaries are implemented and covered by deterministic fake-authority tests. The complete locked hydrology design still requires the real-model visual matrix, including cold-start and step-32 captures, before it can be declared qualified for merge.
+
+`NativeHydrologyCacheMetrics::deferredBuilds` counts completed cache build attempts that returned a
+typed `DEFERRED` result because learned authority was not ready. It is monotonic and does not mean
+currently parked pages, active builds, or failures. Phase logs subtract the preceding snapshot for
+an interval count and report `activeBuilds` directly.
+
+## Far terrain and water
+
+Every visible 256 by 256-block tile requests a step-32 parent and can refine through steps 16, 8, 4, and 2 as required. Cold entry publishes the connected step-32 terrain-and-water parent prefix through 96 chunks. Once that frontier reaches the near band, preparation begins the camera-aware protected FINAL closure while exact publication continues. The closure contains 4 targets at step 1, 8 at step 2, 12 at step 4, 16 at step 8, and 20 at step 16. All 60 publish atomically before gameplay. A parent remains drawable until an eligible connected replacement is resident. Exact cubes own the first 32 chunks. The maximum-coarseness bands are step 2 through 64 chunks, step 4 through 128, step 8 through 256, and step 16 through 512. Gameplay may retain finer geometry above the 0.55-pixel refinement threshold and coarsens outward one adjacent tier at a time only below 0.45 pixels. After the connected 96-chunk entry prefix is drawable, unfinished exact publication through 32 chunks or any connected visible desired-LOD miss pauses ordinary outer-parent submission and publication. Near jobs proceed nearest-first, rank horizontal distance before projected error within the nearby visible class, and may displace queued or dependency-parked outer parents. Displayed parents, the connected prefix, active transition endpoints, exact fallbacks, and protected lineage remain pinned.
+
+This is a hybrid hierarchy, not a literal sparse voxel octree. Mutable exact cubes remain sparse and hash-indexed for dense, write-heavy near simulation. Distant terrain and canonical water remain in the two-dimensional tile hierarchy because their visible authority is a single-valued surface. One frame-level coverage publication joins both systems while retaining parents until a connected child patch is ready.
+
+The renderer recomputes movement hints only after the camera travels one chunk. It selects at most eight authority pages just beyond the visible closure in that direction. Visible preview pages and protected final handoff parents always outrank these hints, so prediction cannot consume the queue capacity needed to draw the current view.
+
+`FarTerrainMesher::build` creates an immutable base mesh containing terrain, standing water, and falls without collecting vegetation anchors. `buildCanopyAttachment` produces a separate optional payload containing tree forms and deterministic ground-flora aggregates on the lower-priority flora lane. Ground flora uses globally anchored eight-block cells, the exact habitat and material rules, nested retention through steps 2, 4, 8, 16, and 32, and half-open tile ownership. Fine and middle tiers emit bounded clumps, while the two coarsest tiers widen repeated-texture billboards so projected plant cover does not collapse. Nearby displayed tiles publish PREVIEW ecology first, grounded against their displayed PREVIEW or FINAL terrain. Missing drawable attachments fill the bounded refresh batch before provisional FINAL promotions, then both classes remain nearest-first. The canopy budget is zero during preparation and until the connected 96-chunk prefix is drawable. Gameplay then guarantees exactly one low-priority canopy worker. Missing PREVIEW attachments remain ahead of FINAL ecology promotion on that worker. The provisional allocation remains drawable until its FINAL replacement is resident and exchanges atomically. Terrain and water publication therefore does not wait for vegetation discovery, and flora arrival never replaces or changes the base allocation or its deterministic hash. Presence of an attachment cache entry is the sole completion signal; an explicit empty attachment records that a tile has no flora geometry.
+
+Coarse water uses canonical geometry callbacks and `waterTopologyPossible`. If a step-32 cell can contain a narrow channel, body contour, or volcanic water feature despite dry corners, the mesher performs bounded interior probes and resolves a finer contour. A narrow route may become subpixel-thin, but it must not disappear merely because corners miss it. Step-32 preparation preserves topology-certified sparse sample masks even above half-page occupancy and decomposes each mask into lexicographically discovered rectangles for canonical grid evaluation. It requests a complete 66 by 66 water page only when every sample is required.
+
+For local real-model diagnosis, `rycraft_worldgen_inspect --v4-model MODEL_PACK SEED X Z preview --horizon-water-profile` reports the step-32 standing-water gate, topology-marked parent count, and native water-grid calls and samples. Add `--horizon-radius 64` only for a bounded diagnostic; without that option, the inspector measures the full 512-chunk production maximum. The JSON records the selected radius as `horizon.radius_chunks`. Before it requests authority, the inspector binds a deterministic temporary authority profile under the system temporary directory using the complete seed and fingerprint. It never opens or writes `rycraft_world_v4`. `--profile /absolute/external/directory` selects a durable external inspector profile instead; paths inside the configured user Application Support root are rejected. This opt-in mode instruments only the inspector's source callbacks; it does not add counters or synchronization to production far meshing.
+
+All production skirt quads are disabled. Each far tile's outer cell ring uses a shared transition topology on a canonical two-block boundary lattice, so adjacent tiers use identical edge heights and positive-area geometry remains half-open to one tile. Displayed neighbors are limited to a 2:1 step ratio, including both endpoints of an active replacement. Ordinary replacements proceed through adjacent tiers. Interior transition-marked vertical geometry is permitted only across a real source-column height discontinuity and may not lie on a tile face or bridge an LOD mismatch. Portable tests cover every edge and corner orientation, steps 2 through 32, negative coordinates, duplicate ownership, winding, area, and fixed mesh budgets. Visual qualification must still inspect all joins for cracks, panels, and ledges.
+
+Before entry, the preparation renderer advances exact mesh publication, far authority polling, base-mesh scheduling, result draining, and shared-buffer publication without rendering the full world scene. It completes a connected terrain-and-canonical-water step-32 prefix through 96 chunks. As soon as that connected frontier reaches the near band, the bounded protected FINAL near closure advances in the camera-critical lane. Entry requires the exact 4, 8, 12, 16, and 20 target distribution at steps 1, 2, 4, 8, and 16, all 60 matching FINAL parents and children, exact compatibility, legal shared boundaries, the 27-cube collision halo, and revision-ready exact spawn meshes. Its readiness identity cannot accept counters from a smaller or stale selection. Camera-critical jobs and CPU and GPU residency may evict optional distant work and cannot be evicted by it. Ordinary refinement and canopy work remain dormant until gameplay.
+
+## Near-field publication contract
+
+After entry, exact terrain owns a full 32-chunk radius. Every required surface section in that disk
+keeps generation, meshing, completed-result upload, and deferred-lighting priority over optional
+flora and broad work. The camera column is the highest lane, the six-chunk exploration band follows,
+and the remaining required disk follows that. Flora-bearing exact sections within 16 chunks run only
+after required terrain and before broad distant exact work. Far canopy workers remain at zero during
+entry preparation and until the connected 96-chunk far-terrain prefix is drawable. Gameplay then guarantees one
+low-priority canopy worker even while an unfinished exact surface or flora column remains inside the
+16-chunk flora radius or protected local terrain debt persists. Continuously replenished exact work
+therefore cannot leave every far attachment queued forever. Flora-only tree sections publish visual
+and collision ownership together only after their complete vertical flora column is ready. The
+canopy service remains capped at one gameplay worker after exact and local terrain debt drain. Canopy refresh skips
+fully exact-owned tiles so its bounded request batch advances immediately to the nearest far-owned
+vegetation gap.
+
+The far scheduler does not compete for all physical cores while the near world is incomplete. It
+pauses ordinary outer-parent submission and publication while exact publication or connected
+visible desired-LOD debt remains. Local far work admits 8 of its 16 workers alongside exact debt,
+12 after exact debt clears, and all 16 only after both debts clear. Nearby visible work ranks
+distance before projected screen error. Within the protected patch, a missing PREVIEW step-32 parent uses urgent
+coverage admission and may replace a lower-ranked queued or dependency-parked ordinary parent.
+Current protected FINAL children and parents run before required PREVIEW bridges. Unused bridge
+capacity returns to current FINAL work before at most one directional predicted anchor receives
+CPU-only staging.
+
+The requested protected FINAL key, and only that role-selected key, is a critical residency class.
+It may reclaim optional distant non-displayed refinement or canopy entries from the CPU cache and GPU
+arena, and it may use the complete GPU arena. Active coverage, displayed surfaces, transition
+endpoints, exact fallbacks, active protected lineage, and the requested critical keys remain pinned.
+The coarse parent stays drawable until the critical replacement commits.
+
+Exact collision follows the renderer's visual publication boundary. Each frame publishes the set of
+revision-ready exact sections with the matching exact-coverage epoch. A stale epoch is rejected.
+Owned sections use their loaded exact blocks and fluid cells, and a missing owned cube remains closed.
+Unowned sections use the immutable `ColumnPlan` terrain and canonical generated-fluid profile, while
+an unresolved plan stays closed. Physics therefore cannot switch early merely because one cube
+loaded before its visible column became authoritative.
+
+Cube insertion also starts one bounded first-publication lighting transaction. It settles the
+arriving cube, changed sky paths, and affected face neighbors under the world lock, with at most 32
+floods in one transaction. Remaining work enters a camera-ranked bounded queue. A pending cube cannot
+produce a mesh snapshot, so the first visible version already contains its settled packed light.
+
+## Dry-land spawn selection
+
+A new v4 world never finalizes an arbitrary requested coordinate as a spawn. Bootstrap samples the
+coarse model directly and does not write preview authority pages while it searches. A coarse cell
+is 256 native pixels, or 1,024 world blocks. At 7.5 meters per block it spans 7.68 kilometers.
+The selector queries one stable page-aligned 16-cell square. Its 61.44-kilometer half-edge is the
+largest representable bound below the 64-kilometer search contract. It ranks ocean-backed land
+first, then inland and remaining coastal land, and retains only the best proposal from each aligned
+two-by-two authority-page hydrology owner. At most 81 owners can intersect the odd-aligned search.
+Final authority, canonical water, and exact collision still decide whether a proposed cell is legal.
+
+For one proposal, the canonical screen directly prepares only its 2,048-block native hydrology
+owner. It checks the requested chunk first, then scans the strict owner interior on the globally
+aligned four-block native raster. Bounded batches use at most 16 workers. The nearest locally flat
+center with a dry five-by-five canonical safety buffer first attempts the complete cold streaming
+footprint. It next attempts the exact 113 by 113 radius-zero safety footprint, which is the union of
+the center column's five-by-five `ColumnPlan` dependency apron and every plan's 49 by 49 hydrology
+raster. If the original chunk cannot provide that proof, at most 64 deterministic candidates pass
+through the four-block owner mask before exact certification. Candidates must remain inside the
+already materialized learned page, so a successful relocation adds no terrain page or graph call.
+The scan neither opens a neighboring hydrology owner nor prepares the wider exact band. If a river,
+lake, wetland, or coast intersects either wider footprint, this optimization is rejected and the
+screen installs only the original 25-sample local certificate. This fallback preserves valid dry
+land near canonical water without weakening any water test.
+
+A positive-elevation continental owner may have no permanent-ocean terminal from which a
+conservative page-local dry proof can be derived. In that case the screen may offer one locally flat
+learned site as explicitly provisional and installs no dry certificate. World construction then
+starts only radius-zero exact generation. The UI continues reporting the land search, horizon work
+remains dormant, and metadata remains unwritten until the exact plan proves canonical water absence,
+solid support, two blocks of headroom, acceptable slope, and the nearby dry neighborhood. A
+rejection advances to the next deduplicated owner. After acceptance, world construction starts with
+a zero nominal exact radius. Its mandatory mesh halo keeps the camera column and four cardinal
+neighbors active, while the full 32-chunk exact disk waits until entry. A bounded all-ocean result
+is a visible failure and never falls back to an ocean coordinate.
+
+For local real-model qualification, run
+`rycraft_worldgen_inspect --v4-model MODEL_PACK SEED X Z final --dry-spawn`. The inspector invokes
+the same bounded coarse-to-final proposal path and canonical-water screen as world bootstrap. Each
+result comes from one directly prepared 2,048-block owner. The common path searches its globally
+aligned four-block native raster and prefers a complete cold or 113 by 113 exact-safety certificate
+before using the 25-sample local fallback. A continental provisional result is identified separately
+and has no certificate. The JSON emits
+the selected ordinal, coordinates, canonical-water rejection count, local relocation count,
+duration, and isolated `authority_profile`. It deliberately does not substitute for the exact-plan
+safety check, which still validates support, headroom, slope, and nearby dry columns before entry.
+
+V4 metadata records `playerPos` separately from `safeSpawnPos` and records
+`spawnSafetyRevision`. Normal saves update the resumable player location but never replace the
+verified safe spawn. A profile written before the current dry-land rule, before the separate
+safe-spawn field, or with an unknown safety revision is revalidated once. Its legacy `spawnPos` is
+treated only as the old player location. A legacy `safeSpawnPos` is a deterministic first recovery
+anchor, not unconditional proof of land. If its bounded search has no legal dry candidate, startup
+retries once from the requested fresh-world anchor. If the proposed location is ocean, lake, river,
+fall, wetland, delta, a water transition, too steep, unsupported, or lacks headroom, startup
+searches and verifies a replacement before allowing entry. An exhausted bounded search fails closed
+instead of placing the player into water.
+
+## Native hydrology build admission
+
+Preview and final native-hydrology routers retain independent immutable caches, but cold page construction shares one process-wide admission gate. The gate allows at most 16 page builds, further limited by reported hardware concurrency and the one-GiB aggregate scratch reservation. It prevents separate preview and final contexts from each oversubscribing the same CPU and unified-memory budget while allowing independent page builds to use available cores. Waiting requests are admitted by authority priority, and a duplicate exact request promotes the existing page flight. Active page solves are not interrupted. Native-page caches use the same priority-aware eviction rule as decoded learned authority, so distant hydrology cannot evict a stronger exact owner. Per-page single flight remains responsible for duplicate requests.
 
 ## Runtime water
 
-Generated water is settled geometry. Every standing generated wet voxel from the lowest one above solid support through the top water voxel is an implicit source, including when that vertical volume crosses cube boundaries. Steep routed tops, outlet approaches, and waterfall curtains materialize only their required level or falling bytes; covered volume and receiving pools remain sources. Generation and ordinary cube loading enqueue no water updates. Only a gameplay block edit activates the changed cell and its six face neighbors. The generated arrangement is validated as a fixed point, so activating an unchanged rapid or fall neighborhood does not reshape it.
+A gameplay edit activates one fluid cell and its six neighbors. The fixed 20 Hz scheduler applies downward-first source and level rules with a five-tick delay, loaded-only reads, bounded pending work, and indexed deferred frontiers. Generated standing water remains an implicit source until an edit changes a cell. A generated partial river top is an immutable render and collision state until a gameplay edit activates its neighborhood. Generation and ordinary loading enqueue no fluid work.
 
-`FluidState` occupies one byte:
+Generated and runtime stable water emits planar top geometry. Animated fragment normals provide motion without changing ownership or surface position. Vertical water sides are reserved for explicit falling columns.
 
-- Bits 0 through 2 hold source level 0 or flowing levels 1 through 7.
-- Bit 3 marks falling water.
-- Other bits are reserved.
-- `0xFF` inside an explicit cube array means the generated source state remains implicit.
+One fluid tick processes at most 1,024 deduplicated cells. Pending updates and deferred frontiers are each capped at 65,536, and catch-up is limited to eight ticks. A water update that reaches a missing cube records an activated frontier under that destination cube. Loading a cube makes only matching frontiers eligible for the bounded resume budget. Deferred frontiers persist through column manifests, while ordinary generated water without a frontier remains inactive on load.
 
-The scheduler advances at 20 Hz with a five-tick update delay. One fluid tick processes at most 1,024 deduplicated cells. Pending updates and deferred frontiers are each capped at 65,536, and catch-up is limited to eight ticks. Deferred frontiers are indexed by the unavailable destination cube, and each tick resumes only a bounded number whose destination has become loaded. Loading one cube therefore does not scan or activate the full frontier set. Water attempts downward flow before horizontal flow, increases horizontal distance levels, removes unsupported flow, and forms a source only from two horizontal sources over a solid block or source water.
+Mesh snapshots carry blocks, fluid bytes, and packed smooth skylight and block light through the complete 18 by 18 by 18 halo. Water uses eighth-block flowing heights, flow-direction bits, and a falling flag while retaining the shared 16-byte vertex layout. Stable sources fill a complete voxel and meet far source-water geometry on the same full-block plane. Buoyancy and head-submersion checks use exact fluid state only for a renderer-published exact section. Before that ownership handoff they use the same canonical generated-fluid proxy as collision, so physics cannot disagree with the visible parent.
 
-Fluid reads never load a cube. Missing collision cubes are closed, while a water update that reaches a missing cube records an activated frontier under the destination-cube index. Loading that cube makes only matching frontiers eligible for the bounded resume budget. Deferred frontiers are stored in column manifests and restored with the world. Static generated water without a frontier remains inactive on load. Pending-update and deferred-frontier overflow counts are surfaced in diagnostics instead of being silent.
+## Persistence profiles
 
-The mesh snapshot includes blocks, fluid bytes, and packed skylight and block light in an 18 by 18 by 18 halo, plus separate 18 by 18 generated-surface and sky-cutoff authority. Water uses eighth-block cell heights, corner averaging, flow-direction bits, and a falling flag while preserving the 16-byte vertex layout. Stable source and flowing cells emit planar top geometry only. The water vertex shader does not displace them; filtered analytic fragment normals and caustics supply motion without changing the source plane. Vertical sides are emitted exclusively for explicit falling columns, including the narrow `OutletFall` overlay, which prevents lake, river, and ocean edges from becoming walls. Buoyancy and head-submersion checks query the same runtime fluid height used by rendering.
-
-An implicit generated source fills its water voxel to a visible height of one block. Flowing levels 1 through 7 descend from 0.875 through 0.125 blocks. The far sampled representation quantizes its source-water top to the same full-block plane, so exact and far water do not meet at different heights.
-
-## Habitat-driven fauna
-
-Nine entity types are exhaustive through `EntityType::COUNT`: sheep, cow, pig, chicken, deer, goat, rabbit, frog, and fish.
-
-Wild populations use deterministic 64-block territories. Each territory has a stable seed-derived anchor and stable entity IDs. A habitat score chooses one species and a carrying capacity of up to four land animals or six fish. The hard cap is 64 living animals, including babies. Territories activate within 96 blocks and wild animals despawn beyond 112 blocks.
-
-Habitat reads `SurfaceSample` directly. Temperature, soil moisture, fertility, slope, precipitation, biome suitability, channel width, discharge, water-body geometry, and ecotopes produce food, cover, river size, and water depth. Loaded water can refine the procedural depth estimate. Deer favor cover, goats favor steep high ground, rabbits favor fertile open ground, frogs require warm wet ground near water, and fish require sufficiently deep generated water. Habitat suitability does not claim a global water-connectivity solve.
-
-Movement modes add climbing for goats, hopping for rabbits, amphibious hopping for frogs, and three-dimensional swimming for fish. Flocking supplies herd and schooling steering, fish physics confines fish to loaded water, and nearby wildlife flee when the player's actual horizontal displacement closes the distance to them.
-
-## Streaming and meshing
-
-The active cubic set is rebuilt when the player crosses a cube boundary or relevant cold column plans complete. Gameplay only submits a request; one utility-priority planner retains the latest camera position and cancels superseded work before publication, so entering a cold area cannot execute selection, sorting, apron expansion, or unload scans on the fixed-tick and render thread. One rebuild gathers the unique horizontal columns in the exact disk, expands that set through the fixed plan apron once, and requests each resulting plan no more than once. Pending plans register their dependent active-set columns in an index. A plan completion wakes only its indexed dependents instead of scanning every retained cube. Completion notifications batch after 128 plans or backlog drain, and the fixed tick consumes at most one every four ticks. Exact simulation uses `min(viewDistance, 32)`, even when the visible horizon is 512 chunks:
-
-- A radius-six exploration band extending four cubes above and below the camera
-- Every saved edited section listed by a visible column manifest
-- One primary surface section in every visible column, with a temporary sea-level fallback while a cold plan is still building
-- Additional `ColumnPlan::exposedSections` and cliff-wall sections in the exact-radius-plus-one disk
-- A complete one-cube, 26-neighbor halo needed by collision and 18 by 18 by 18 meshing
-
-The exact mesh-candidate set is capped at 16,384 cubes and the retained set at 32,768 cubes. Capacity is reserved in this order: exploration and collision, edited sections, one primary surface section per visible column, additional exposed and cliff sections, then halos. Distance resolves ties within a class. Before caps, the planner publishes `ExactSurfaceCoverageSnapshot` with its epoch, nominal radius, planned exposed and boundary sections, and unresolved columns. The renderer converts that snapshot and its currently published meshes into per-column exact-ownership masks. Empty completed meshes count as ready, while a missing or unresolved requirement keeps its column far-owned. Previously published exact meshes may retain ownership during an ordinary replacement. Unload hysteresis retains an existing cube through two extra horizontal chunks and one extra vertical cube beyond the current target. This hysteresis is distinct from the targeted one-cube mesh and collision halo. Four latency-sensitive and two utility-priority generation workers process column-plan and cube work carrying an active-set epoch, gameplay lane, and nearest-first distance. The camera column ranks above the six-chunk exploration band, which ranks above the broad radius-32 surface disk. At most two cold plans run. The pump submits no more than seven cube tasks, six running plus one look-ahead, beneath the 64-job hard ceiling while remaining demand stays in the prioritized backlog. A worker skips stale retained-set work, and completion processing requeues a still-required cube through its current plan dependencies. Four exact mesh workers use user-initiated priority and reserve half of their bounded queue for camera-band work. Completed cube insertion uses `try_emplace`, which preserves an already loaded edited cube if duplicate work finishes later. Performance logs report planner requests, coalesced replacements, canceled stale builds, and build-time EMA.
-
-Rendering reads a revision-cached immutable vector of loaded cube pointers. Four mesh workers admit at most 64 total items across queued, building, completed, and renderer-pending states and produce request- and build-versioned results from 18-cube-edge snapshots. Broad surface work can occupy at most half of those slots until camera-band work has had an opportunity to enter, and the queued camera band sorts ahead of broad surfaces. Coalescing retains the newest request completion, but the renderer rejects a result unless its build revision matches the live cube and is newer than the resident mesh. A failed or rejected completion clears only its matching request, leaving any newer request in flight. Snapshot construction copies loaded boundary block, fluid, and packed voxel-light data plus separate generated-surface and conservative sky-cutoff authority under the world mutex. An unavailable in-range halo follows its generated terrain silhouette. Cells above the cutoff remain air and cells below it remain opaque. A bounded transparent-cell flood distinguishes a sky-connected lateral continuation from an enclosed opening. The former receives a lit provisional surface-material face, the latter receives dark stone, and a missing vertical opening receives bedrock. Complete edited roof cutoffs govern the flood, while an incomplete vertical path uses generated authority for provisional aboveground classification and remains dark for propagated skylight. Loading or unloading a halo cube dirties all affected neighboring meshes. Mesh work then runs without the world lock. An edit dirties the touched cube and every face, edge, or corner neighbor whose one-block halo intersects the changed block. Exact upload work stops after 64 meshes or 32 MiB in one frame.
-
-Cube mesh origins, AABBs, candidate distance, frustum tests, and water sorting include Y. Missing collision cubes behave as bedrock and do not force generation. A generated skylight cutoff applies only when every vertical section through that cutoff is loaded; an incomplete path is fully occluded so sunlight cannot pass through an unloaded gap above an underground camera. Block raycasts stop at the first missing cube, and break or placement operations revalidate that their destination is loaded without generating it. The renderer retains a synchronous near-camera rebuild path for up to two already-meshed edited cubes per frame; initial meshes use workers.
-
-### Far visible terrain
-
-Every immutable 256 by 256-block tile intersecting the visible radius-512 disk is selected, including tiles wholly inside the nominal exact radius. The scheduler requests a step-32 parent for every selected coordinate through a broad nearest-first lane. Connected coordinates request their distance-selected step-16, step-8, step-4, or step-2 target before the complete parent disk is resident. While parents remain queued, dispatch reserves four far-worker slots for base work and admits at most four urgent refinements. Already running parents finish without preemption. Every far-owned fragment in the camera exploration band requires a block-scale step-2 fallback. Every other far-owned fragment in the exact overlap requires step 8 or finer. This includes fragments in a fully ready boundary tile whose exact requirements cover only part of the tile. These protected requests lead the urgent order and bypass ordinary grace and topology-transition admission. Their step-32 parents remain pinned as dependencies but cannot display. A refinement still requires its own parent to be resident. Under pressure, the farthest refinement is evicted before an active parent.
-
-Parent residency and drawable coverage use separate connected frontiers. The parent frontier tracks the nearest missing step-32 dependency. The drawable frontier also treats a protected tile with only its parent ready as missing. Farther resident tiles are suppressed, and the preceding 256 blocks fade into fog until the protected tile has its required step-2 or step-8 fallback. Exact ownership is independently derived from the exact snapshot and renderer residency. Every far tile receives a 256-bit mask for its 16 by 16 chunk columns. A bit is set only when all requirements currently published for that column are owned by exact meshes, and an empty completed mesh counts as ready. Fine-fallback protection applies to every fragment that remains far-owned in the overlap, even when all requirements on its partial boundary tile are ready. Each draw also binds the masks for the eight neighboring tiles so canopies and waterfalls crossing a tile face query their destination columns. Terrain, water, and canopies sample the destination fragment's column bit. The nearest unready distance remains a conservative parent-selection fallback and diagnostic rather than clipping a radial ownership ring.
-
-Exact opaque terrain draws first, and a small positive depth bias leaves overlapping far geometry behind it as lit fallback while exact meshes are cold. For every protected far-owned overlap fragment, that fallback must be step 2 in the camera exploration band and step 8 or finer elsewhere in the overlap. Step 32 remains hidden there. `FarSurfaceSample` carries filtered terrain and water, conservative footprint bounds, and the weighted material palette in one query. Step-32 coverage geometry uses conservative minima so it cannot protrude through exact terrain where it is displayable. Detail bands below each footprint's Nyquist limit fade across one octave without changing hydrology, water-body identity, water elevation, plate identity, or feature anchors. Distance plus immutable maximum sampled slope and hydrology complexity selects the desired refinement. The previous tier applies asymmetric refine and coarsen thresholds to stop ordinary boundary chatter. Production lake and caldera fixtures show that independently filtered voxel tiers can cross by one through five blocks. Depressing every coarse tier enough to force a min pyramid would visibly distort steady terrain, so ordinary replacements never mix partial source and target surfaces. A narrow terrain-only fog pulse hides one complete ordinary topology swap. Protected fallbacks publish directly when ready. Canopies keep the full 0.65-second target-in, source-out exchange whose two phases overlap rather than passing through an empty forest. Foliage sway cannot move transition or coverage ownership because both use unswayed world coordinates. Skirts follow the complete terrain topology currently visible, while water remains source-owned until completion, giving connected geometry exactly one owner.
-
-Far tiles are rendering only. They carry no caves, structures, per-block flora, fauna, collision, edits, persistence, runtime water, or exact biome transition detail. Step 2 reuses accepted exact tree anchors, species, and dimensions through a bounded anchor query. Steps 4 through 32 use globally anchored 64-block aggregate forest cells with six fixed candidates and block-8 habitat and ground authority. Their per-cell crown limits form strict subsets under one stable rank. At step 32, the block-resolution collector's habitat and root-water authority wins over the coarse water bit. Water elsewhere in the 32 by 32 cell does not erase an accepted canopy, and its trunk grounds on the displayed voxel. Half-open cells and tiles own complete impostors even when a canopy crosses a tile face. Bit 28 preserves the canopy classification in the shared vertex contract and diagnostics. Per-column ownership clips a canopy fragment only when exact geometry owns its destination column; neighboring masks preserve that decision across a tile face without affecting opaque fallback terrain. Because step 2 and the aggregate hierarchy are intentionally different representations, their target-in, source-out exchange is overlap-safe rather than assuming shared anchor IDs.
-
-Far shorelines carry stable body identity and kind. A coarse cell that observes incompatible standing-water authorities refines from canonical samples rather than joining their levels. Contour-clipped triangles prevent partially wet cells from creating rectangular ledges, and far water emits top geometry only at the same full-block source plane as exact generated water. Exact and far opaque terrain share depth, while water samples resolved opaque depth and hardware-tests and writes the nearest visible interface through media depth. Opaque terrain therefore uses depth-backed cold-residency fallback, and water and canopies use the same destination-column fragment masks. Per-draw edge metadata exposes a marked LOD skirt only where a resident finer tile borders a resident coarser tile. The shader evaluates exact ownership on both sides of that join, and the skirt follows whichever complete terrain topology is currently visible during a tier replacement. Water remains source-owned until the replacement completes. Any horizon patch intersecting a ready exact column is partially masked and cannot act as an occluder. Frustum culling, counterclockwise back-face culling, and a conservative 256-bin terrain-horizon test reduce the bounded direct draw list. This adaptive tiled LOD is inspired by geometry clipmaps and CDLOD, but it is not a literal geometry clipmap or hierarchical Z buffer.
-
-Eight far workers retain at most 64 pending jobs and 32 completed results. When parent work exists, four slots remain reserved for base coverage and up to four urgent slots construct connected refinements. Four latency-sensitive and four utility-priority construction workers remain available during exact streaming, while refinement uploads are limited to four per frame and up to 32 parent uploads are preserved. Otherwise, per-frame far uploads stop after 32 parents, 12 refinements, or 32 MiB. The CPU cache holds at most 9,280 meshes and 3 GiB. The far GPU arena grows lazily in paired 256 MiB vertex and 128 MiB index slabs, up to 2 GiB of vertices and 1 GiB of indices. The render loop reuses reserved scheduling buffers, a 4,096-entry flat grace-record buffer, and fixed tier counters. Far mesh construction and cache maintenance run on workers. All exact, far, post-processing, world, and transient allocations share a 64 GB unified-memory acceptance ceiling.
-
-### Remaining far-parent publication debt
-
-The parent-first scheduler and separate drawable coverage frontier prevent a resident far island from drawing beyond a missing dependency or a protected base-only tile. Exact missing-halo closure is already explicit: a bounded boundary scan emits lit planned continuations aboveground, dark inward caps underground, and bedrock caps vertically, then halo arrival invalidates every affected mesh. The seed-42 fixture near X=69.7936, Y=85.7918, Z=-1472.94 exercises those closures together with per-fragment exact ownership during cold streaming.
-
-The remaining performance debt is synchronous far payload construction. Terrain, water, and canopies publish together, and measured cold canopy work ranges from 250 to 1,165 milliseconds, delaying an otherwise ready parent. Staged canopy attachment is the follow-up so terrain and water can publish first. Existing LOD skirts remain a finer-to-coarser tile transition mechanism and are separate from exact closure caps. This version does not claim the two-second full-horizon residency target is resolved.
-
-## Determinism
-
-Discrete stochastic world-generation choices use `CounterRng`, a 10-round Philox-style counter generator keyed by the world seed, subsystem stream, full-width coordinates, and candidate index. This includes geology candidates, catchments, volcanoes, aquifers, materials, ores, structures, trees, and flora. Continuous Simplex fields instead use an immutable permutation derived from the world seed. Neither mechanism has mutable query-order state, so generation does not depend on worker order.
-
-The determinism contract is:
-
-- A cube writes only its own storage.
-- Coordinate conversion is identical for generation, streaming, meshing, physics, and saves.
-- Density interpolation has one operation order.
-- Cross-cube features reconstruct the same anchor from the same seed.
-- Generated water never runs a settling simulation.
-- Exact and far cache eviction may change cost, but not results.
-- Far tile construction depends only on its key, seed, coordinate-pure samples, and either accepted step-2 anchors or the aggregate canopy-cell subset selected for its coarser LOD.
-
-Skylight and block light are packed derived state, not saved world data. The high nibble stores skylight and the low nibble stores block light. Complete full-height column authority seeds skylight level 15 only where the path to the sky is unobstructed. `LightEngine` floods both channels through transparent cells with one level of attenuation per non-seeded step, pulls them across all six cube faces, and returns changed-state and changed-face masks. Missing cubes and incomplete vertical paths stay conservatively dark. Surface cutoffs remain direct-sky and provisional-boundary authority, not the final binary skylight value. The monotone flood over fixed blocks has one fixed point regardless of cube load and reconciliation order. Packed light is recomputed after generation, load, unload, or edits and is never serialized. Tests pin independent nibbles, cave-mouth falloff, opacity, all six faces, generation-order independence, unload closure, edits, and incomplete paths.
-
-Regression coverage checks negative coordinate boundaries, vertical limits, uniform and dense storage, full-width counter addresses, seed and request-order independence, surface query consistency, and exact column-plan surfaces. Canonical-water tests cover the complete 17 by 17 ocean, river, lake, delta, waterfall, and supported-bank authority, dry-to-wet taper, supported shore occupancy, negative column faces, flat interior depth, and the absence of floating water or artificial shoreline walls. The reported seed-42 probe at X=-557, Z=379 requires direct block-resolution sampling, every filtered footprint, and the column plan to agree, with a solid floor and implicit source water through the top. The seed-42 probe at X=-8235, Z=2976 is a shallow supported nonendorheic lake lip. Separate fixtures pin the incised river across the X=-12288 cube face at Z=2653 and Z=2654 and the canyon ecotope at X=-23904, Z=0. Another seed-42 fixture routes the elevated lake at X=-8272, Z=3056 through the receiver-centered outlet fall at X=-8256, Z=3072 into a lower standing river. It pins distinct top and bottom surfaces, bounded width and flow footprint, supported exact falling cells, the unchanged receiving-water level, five-quad far ownership at every LOD, and deterministic cache rebuilds.
-
-The fixed seed-764891 caldera fixture samples all 96 rim directions. It requires an irregular shoreline with at least six distinct radii spanning at least six blocks, no emitted terrain step above two blocks, a solid dry bank around the full endorheic perimeter, and a water surface at least one block below the validated rim. It also walks every generated water voxel from floor through surface at the center and across a cube face, requiring implicit source state without an explicit fluid array. Cache clearing and reverse traversal reproduce the same perimeter.
-
-Mesh tests exercise real and missing neighbors on all six faces, packed lighting through cave mouths and chunk boundaries, lit sky-connected silhouettes, dark enclosed caps, vertical bedrock caps, generated overhangs, isolated logs, broad roofs, sealed caves, raised and lowered edited roofs, the valid world-ceiling cutoff, the distinct incomplete-path sentinel, halo invalidation, and skylight blocking across unloaded vertical sections. Weather tests cover deterministic fronts, continuity, climate bias, physical wind units, precipitation type, stable overrides, latest-wins worker bounds, horizon coverage, cloud profiles, lightning event IDs, backlog suppression, and thunder delay. Exact-generation tests pin the four-latency-sensitive and two-utility worker split, seven-task submission limit, stale retained-set skip, and still-required work requeue. Exact-mesh concurrency tests reject old, duplicate, and future worker results against the live and resident revisions while preserving newer failed requests through coalescing. Streaming and entity tests pin the hard exploration-band priority, exact unload hysteresis, indexed plan completion, coalesced rebuilds, closed collision, and raycasts and edits that never cross a missing cube. Basin regressions also fix a multi-distributary delta sample, bound straight runs along high-gradient curved guides, pin monotonic junction-to-portal levels, preserve distinct lake levels behind competitive watersheds, exempt owned outlet and channel corridors, prove single-flight construction, retain candidate lifetimes through concurrent clear and eviction, limit cold construction to two producers across independent solver instances, enforce the immutable callback-context invariant and 64 MiB bound, and compare concurrent results with reverse-order cache rebuilds. Fixed volcano and aquifer samples verify conduits, the enclosed settled crater lake, sealed pockets, and volumetric implicit generated source water. Far tests compare all filtered topology tiers directly with exact emitted density heights and source-water planes throughout the radius-32 overlap. They also cover step-32 parent selection, desired-target priority, the protected step-2 and step-8 display floors for every far-owned overlap fragment, fully ready partial boundary tiles, protected-job grace and transition-cap bypass, separate parent and drawable frontiers, ordinary depth-backed opaque fallback, 16 by 16 per-column ownership-mask logic, 3 by 3 neighbor-mask crossings, non-occluding partial masks, conservative distance fallback, exact step-2 anchors, strict aggregate canopy subsets in coarser tiers, step-32 collector-authority preservation beside water, displayed-voxel trunk grounding, nonnested production height fixtures, ordinary atomic terrain swaps under narrow fog, two-phase canopy exchange, single-owner transition water, shader marker ownership, tunable distance thresholds, complexity-sensitive selection, asymmetric hysteresis, negative tile coordinates, deterministic hashes, same-LOD borders, resident finer-to-coarser skirt masks, paired skirt-ownership samples, body-aware contour-clipped shorelines, outward winding, scheduler bounds, near-work preemption, epoch cancellation, and conservative ridge occlusion. Synchronous canopy cost and terrain-and-water parent publication remain performance measurements, not an unimplemented exact-face closure contract. Tree regressions cover dense habitat, species climate fit, ordinary-water rejection, mangrove and willow depth limits, and grounded adapted trunks. Persistence tests cover checksums, bounded save coalescing, and bulk manifest reads. Runtime-fluid tests cover indexed and budgeted frontier resumption plus surfaced overflow counts. Deterministic territory IDs, runtime approach-triggered fleeing, fauna movement, and the global entity cap have focused coverage as well.
-
-The categorical former-control-line regression is active and passes with no observed run longer than 9 blocks against its 24-block limit. The more sensitive continuous-field matrix remains an explicitly deferred known failure with 15 failing assertions. Terrain derivative-energy ratios fall to 0.105649 at the former 2,048-block spacing and 0.076197 at 8,192 blocks. Aggregate shoreline derivative energy is 0.194688 relative to nearby lines, and its structured-orientation ratio is 1.674842 against the 1.5 limit. Biome suitability also fails at multiple spacings. The acceptance case remains runnable as `./build-release/tests/test_rycraft "[.known-continuity-debt]"`; its expected failure must not be reported as passing. This procedural field debt is separate from far-terrain residency and synchronous canopy-publication performance.
-
-For repeatable visual diagnostics, `RYCRAFT_WORLDGEN_OVERLAY` accepts exactly `geology`, `hydrology`, `climate`, or `biome`. The overlay is a rendering aid and does not alter generation. `RYCRAFT_WORLD_SEED`, `RYCRAFT_SPAWN`, `RYCRAFT_YAW`, `RYCRAFT_PITCH`, and `rycraft_worldgen_inspect [seed] [sample_x sample_z]` provide the corresponding deterministic setup and samples. F3 reports exact required and ready sections, unresolved columns, the conservative nearest-gap distance, base and refinement wanted, resident, drawn, missing, and queued counts, the drawable coverage frontier, cache and arena use, fluid work, and dropped work. The inspector reports footprint samples, former-grid artifact measurements, water IDs, shoreline distance, lithology, material palettes, far-parent counts, feature coordinates, cache metrics, and deterministic route timing.
-
-## Save format and migration
-
-Generator version three stores one LZ4-compressed RYCH v4 file per edited cube:
+Generator v4 uses:
 
 ```text
-rycraft_world/regions-v3/r.<regionX>.<regionZ>/c.<chunkX>.<chunkY>.<chunkZ>.dat
+~/Library/Application Support/rycraft/rycraft_world_v4/
+  metadata.json
+  regions-v4/
+  terrain-authority-v1/
+  hydrology-authority-v1/
 ```
 
-Region X and Z use floor division by 32. Writes use a temporary file followed by rename. The uncompressed payload begins with a packed 44-byte header:
+No v4 path is published before bootstrap qualification. Metadata records the unsigned 64-bit seed, 64-character generation fingerprint, and spawn-safety revision. The first explicit creation may use `rycraft_world_v4`; later creations reserve a collision-free identity-named sibling such as `rycraft_world_v4-seed-<16-hex-seed>-fingerprint-<64-hex-fingerprint>`, with a numeric suffix when needed. Opening a selected profile requires its exact metadata identity and never silently redirects to another path. After selection, the qualified terrain and hydrology authorities bind to that same profile's `terrain-authority-v1` and `hydrology-authority-v1` directories. Missing or corrupt metadata fails closed rather than being treated as a new world.
+
+The legacy profile remains separate:
 
 ```text
-uint32 magic              0x52594348, "RYCH"
-uint32 version            4
-int64  chunkX
-int32  chunkY
-uint32 flags              uniform blocks, explicit fluid states
-int64  chunkZ
-uint32 blockCount         1 or 4,096
-uint32 fluidStateCount    0 or 4,096
-uint32 payloadChecksum    IEEE CRC-32 over following uncompressed bytes
-uint8  blocks             one uniform value or 4,096 dense values
-uint8  fluidStates        optional 4,096 packed values
+rycraft_world/
+  metadata.json
+  regions-v3/
 ```
 
-Each saved horizontal column also has an atomically replaced manifest:
+Ordinary v4 startup never examines, migrates, or rewrites the legacy directory. The Worlds screen may explicitly use a legacy or incompatible profile as a successor source. That action creates a separate current-v4 profile with compatible metadata and leaves the source regions, manifests, edits, and fluid frontiers untouched. `RYCRAFT_DIAGNOSTIC_V3=1` constructs a no-save v3 world.
 
-```text
-rycraft_world/regions-v3/r.<regionX>.<regionZ>/m.<chunkX>.<chunkZ>.manifest
+Edited cubes remain LZ4-compressed RYCH files with CRC-32 validation and per-column manifests. Authority pages are not ordinary edit cubes and use their own `RYTA` schema and identity checks.
+
+## Tests and qualification
+
+Ordinary CI uses `DeterministicFakeTerrainBackend` and must remain network-free:
+
+```bash
+meson setup build --buildtype=debugoptimized
+ninja -C build tests/test_rycraft
+./build/tests/test_rycraft "[learned]"
+./build/tests/test_rycraft "[bootstrap]"
+./build/tests/test_rycraft "[generator-v4]"
+./build/tests/test_rycraft "[chunk][coords]"
+./build/tests/test_rycraft "[reported-water-continuity]"
 ```
 
-The manifest lists edited section Y values and activated fluid frontiers. `SaveManager` indexes manifests at startup. Active-set reconstruction submits its unique visible-column list to one bulk manifest query, which copies the requested edited-section vectors under one short manifest lock and performs no disk access there. Its pending map keeps a queued cube readable until the save thread finishes, so an unload followed by an immediate return cannot expose stale disk data.
+Tag names should be checked against the built test list before relying on a focused command. The complete suite remains `ninja -C build test`.
 
-Only modified cubes persist. Procedural cubes, far tiles, meshes, packed voxel light, regional weather, lunar phase, and lightning buckets regenerate from the seed, coordinates, current loaded neighborhood, static climate, and saved world time. The loader verifies the CRC-32 before deserializing block or fluid state. Unloading queues serialization and compression on the save thread. The queue is bounded to 32,768 cubic positions, and repeated snapshots for one queued position coalesce to its newest revision instead of growing the queue. Backpressure applies at the bound, while the quit path sweeps still-loaded modified cubes before flushing. Manifest serialization is ordered separately from the short in-memory manifest lock, so file I/O never holds the lookup lock. Metadata remains in `metadata.json` and records the seed, the fixed spawn anchor, the last player position and orientation, health, hunger, the selected hotbar slot, a 36-slot item-stack inventory as `[type, count, durability]` triples under `inventorySlots`, the display name, the game mode, the generation toggles, created and last-played timestamps, world time, chunk format version 4, and generator version 3.
+Only modified cubes persist. Procedural cubes, far tiles, meshes, packed smooth voxel light, regional weather, lunar phase, and lightning buckets regenerate from the generation identity, coordinates, current loaded neighborhood, learned climate, and saved world time. The loader verifies the CRC-32 before deserializing block or fluid state. Unloading queues serialization and compression on the save thread. The queue is bounded to 32,768 cubic positions, and repeated snapshots for one queued position coalesce to its newest revision instead of growing the queue. Backpressure applies at the bound, while the quit path sweeps still-loaded modified cubes before flushing. Manifest serialization is ordered separately from the short in-memory manifest lock, so file I/O never holds the lookup lock. Metadata remains in `metadata.json` and records the seed, the safe world-start anchor, the current respawn anchor and bed provenance, the last player position and orientation, health, hunger, the selected hotbar slot, a 36-slot item-stack inventory as `[type, count, durability]` triples under `inventorySlots`, the cursor plus nine crafting-input stacks under `carriedStacks`, the display name, the game mode, the generation toggles, created and last-played timestamps, world time, chunk format version 4, and generator version 4.
 
-Worlds live under a CWD-relative `saves/<name>` directory; the legacy `rycraft_world` directory is adopted in place and never migrated. World names are restricted at input to `[A-Za-z0-9 ._-]` (at most 24 characters) so the minimal JSON writer never escapes and the bitmap font always covers them; the directory is a sanitized, collision-suffixed form of the name. Metadata parsing is tolerant and forward compatible: the older `spawnPos`-only shape loads with a creative default and the classic starter hotbar, the legacy nine-number `inventory` array converts to count-one stacks, a missing `playerPos` falls back to the spawn, and item ids at or above `ItemType::COUNT` read as empty slots.
+V4 metadata extends the locked generation identity with the fixed safe-spawn anchor, current respawn anchor and bed provenance, resumable player position and orientation, health, hunger, selected hotbar slot, 36 inventory stacks, ten carried cursor and crafting stacks, display name, game mode, generation toggles, created and last-played timestamps, and world time. Metadata parsing remains tolerant of older gameplay fields, but it may not accept a mismatched v4 seed, generator fingerprint, or chunk format into the same profile.
 
 Furnaces and chests are the stateful blocks. They persist in a per-world plaintext sidecar `block_entities.dat` with a versioned `RYBE 1` magic: one `furnace <x> <y> <z> <burn> <burnTotal> <cook> <in...> <fuel...> <out...>` line per furnace and one `chest <x> <y> <z> <slot0...> ... <slot26...>` line per chest, written atomically alongside metadata and loaded once at world start into a `BlockEntities` struct. The read is forward tolerant: unknown leading record types are skipped, and one malformed line is dropped with a single logged error. This keeps block entities off the RYCH cube format and the RYCM manifest with no version bump. Dropped item entities and boats are never persisted; they despawn on quit and on a world switch.
 
-The previous generator's cube files and manifests remain beneath `regions`. Generator version three does not load, delete, or rewrite them. Seed, spawn, player transform, health, inventory, time, and settings remain compatible. The next successful metadata save advances `generatorVersion` to 3. Existing cube edits and fluid frontiers intentionally do not migrate. Corrupt or incompatible version-three cube data returns no cube, reports that cube's failure once, and falls back to deterministic generation.
+Real-model qualification must be explicit and local. Before reporting it as passing, record:
+
+- Model revision, all asset hashes, runtime hash, machine, and macOS version
+- Core ML and CPU fallback partition counts
+- Canonical qualification digest and generation fingerprint
+- Preview and final page hashes for fresh, reverse, concurrent, and cache-cleared requests
+- Exact and far mesh hashes at all six footprints
+- Queue and cache maxima
+- Cold startup, spawn readiness, horizon completion, and five-minute settlement times
+- Process RSS, Metal allocation or residency, and highest credible unified-memory total
+- Metal validation logs and opened captures
 
 Per-world generation toggles (structures, fauna, weather, day cycle) are stored in metadata and require no generator-version bump: the default toggle set produces byte-identical cubes to the settings-free path, verified by a serializer byte-comparison regression at seed 42. Only the structures toggle reaches the generator, where a disabled `StructurePlacer` deterministically reserves and emits nothing so trees fill former structure sites; fauna, weather, and the day cycle are engine-side gates. An old binary that opens a save containing a new block id rejects those cubes as incompatible and regenerates them, an unsupported downgrade path.
 
+Weather tests cover deterministic fronts, spatial and temporal continuity, climate bias, physical wind units, precipitation type, cloud profiles, stable presets, latest-wins worker bounds, lightning IDs, and thunder delay. Rendering tests separately qualify five-cascade selection and refresh, smooth packed-light propagation, Hi-Z screen-space lighting history, atmosphere LUT finiteness, clouds, fog, and weather integration. These headless checks do not replace opened Metal captures.
+
 The streaming active-set builder includes manifest `savedSections` for visible horizontal columns, so an off-surface build is rediscovered without generating every vertical section.
 
-## Research basis and implementation boundary
+The opt-in entry audit exercises one process from runtime qualification through canonical dry-spawn
+selection, the complete FINAL spawn authority closure, exact spawn readiness, the connected
+96-chunk preview entry prefix with the 512-chunk horizon still selected, and the camera-aware
+60-target protected FINAL closure. The closure begins during preparation when the connected
+frontier reaches the near band. The 30-second gameplay gate ends only after the safe FINAL spawn,
+revision-ready exact meshes, connected PREVIEW entry prefix, and atomic protected closure are ready.
+PREVIEW parents remain drawable while exact 32-chunk publication and nearest desired-LOD debt run
+first. Ordinary outer-horizon submission and publication resume only after those debts clear and
+still must finish within the five-minute settlement deadline.
+Point the audit at an existing empty external profile and
+run it only while the machine is otherwise idle:
 
-The generator uses the following work as design guidance:
+```bash
+RYCRAFT_TERRAIN_MODEL_PACK=/absolute/path/to/the/verified/model/pack \
+RYCRAFT_TERRAIN_REAL_ENTRY_PROFILE=/absolute/path/to/an/empty/external/profile \
+RYCRAFT_TERRAIN_REAL_ENTRY_EXPECT_COLD=1 \
+./build/tests/test_rycraft \
+  "Seed 42 real-model entry audit completes exact and far coverage"
+```
 
-- [Procedural Tectonic Planets](https://perso.liris.cnrs.fr/eric.galin/Articles/2019-planets.pdf) motivates crust attributes, plate motion, boundary-driven relief, subduction arcs, and volcanic chains. Rycraft uses a flat coordinate field and bounded volcano primitives rather than a simulated spherical crust.
-- [Large Scale Terrain Generation from Tectonic Uplift and Fluvial Erosion](https://www.cs.purdue.edu/cgvlab/www/resources/papers/Cordonnier-Computer_Graphics_Forum-2016-Large_Scale_Terrain_Generation_from_Tectonic_Uplift_and_Fluvial_.pdf) couples uplift, stream networks, fluvial incision, sediment, and hillslope response. Rycraft applies these relationships in eight fixed passes inside each bounded raster catchment.
-- [Terrain Generation Using Procedural Models Based on Hydrology](https://www.cs.purdue.edu/cgvlab/www/resources/papers/Genevaux-ACM_Trans_Graph-2013-Terrain_Generation_Using_Procedural_Models_Based_on_Hydrology.pdf) motivates hierarchical river features and terrain constructed around drainage. Rycraft combines catchment sites, shared portals, Strahler channels, lakes, waterfalls, and distributary fans.
-- [Priority-Flood](https://richard.science/sci/2014_barnes_depressions_published.pdf) supplies depression handling for each catchment raster. [D-infinity flow routing](https://digitalcommons.usu.edu/cee_facpub/2507/) motivates aspect-based flow split between adjacent downhill receivers. Rycraft runs Priority-Flood and an angular two-neighbor D-infinity-inspired routing step before erosion and again on the eroded surface; the routing step is not a verbatim triangular-facet implementation of Tarboton's method.
-- [Orographic Precipitation](https://earthweb.ess.washington.edu/roe/GerardWeb/Publications_files/MinderRoe_OrogPrecEncyc.pdf) motivates upwind moisture recharge, ascent precipitation, and lee drying. The implementation is a bounded procedural approximation, not a weather model.
-- [National Weather Service guidance on fronts, precipitation, and thunderstorms](https://www.weather.gov/lmk/basic-fronts) motivates the regional weather relationships among pressure, moisture, temperature, wind, precipitation, and instability. The implementation is a deterministic visual weather system, not a forecast model.
-- [AutoBiomes](https://cgvr.cs.uni-bremen.de/papers/cgi20/AutoBiomes.pdf) motivates climate-driven multi-biome suitability instead of discrete terrain switches.
-- [Geometry Clipmaps](https://hhoppe.com/geomclipmap.pdf) motivates nested coarse-parent residency and graceful degradation. Rycraft applies the parent invariant to immutable tiles rather than implementing a literal geometry clipmap.
-- [Wavelet Noise](https://graphics.pixar.com/people/derose/publications/WaveletNoise/paper.pdf) and [Improving Noise](https://dl.acm.org/doi/10.1145/566654.566636) motivate filtered multiresolution bands and smooth interpolation without visible lattice seams. Rycraft uses footprint-filtered rotated simplex bands and smooth counter fields rather than the papers' exact basis functions.
-- [LoopStructural](https://gmd.copernicus.org/articles/14/3915/2021/) motivates implicit geological fields for folded, faulted, and unconformable strata. Rycraft synthesizes bounded coordinate-pure deformation rather than fitting observations.
-- [Terrestrial Ecoregions of the World](https://doi.org/10.1641/0006-3568%282001%29051%5B0933%3ATEOTWA%5D2.0.CO%3B2), produced by World Wildlife Fund conservation scientists, supplies the 14 terrestrial biome classes also carried forward by One Earth. Rycraft maps reachable climate biomes to those broad classes without claiming to reproduce ecoregion boundaries.
-- [Random123](https://www.thesalmons.org/john/random123/papers/random123sc11.pdf) motivates stateless counter-addressed randomness. Discrete stochastic world-generation choices use a `CounterRng` Philox-style 4 by 32-bit, 10-round construction. Continuous Simplex fields use an immutable seed-derived permutation instead.
-- [A Procedural Object Distribution Function](https://graphics.cs.kuleuven.be/publications/LD05PODF/LD05PODF_paper.pdf) motivates locally evaluable infinite object distributions. Rycraft uses priority competition among global feature-cell candidates instead of precomputed Poisson-disk tiles.
+`RYCRAFT_TERRAIN_REAL_ENTRY_EXPECT_COLD=1` requires the fresh seed-42 spawn phases to use exactly 80
+coarse, 14 Base, and 5 decoder calls. Omit it when inspecting a warm or intentionally interrupted
+external profile; the audit still rejects any phase that exceeds those cold bounds.
 
-The bounded tradeoff is deliberate. Each basin is an immutable 2,048-block local solve with a fixed raster, apron, and pass count. Every other sample searches a fixed neighborhood or integrates a fixed number of steps. This keeps random access finite and generation order irrelevant without claiming to simulate a complete evolving planet.
+The audit has one five-minute deadline for the entire route. Its warnings report phase time,
+qualification, dry-spawn, final-spawn, horizon-preview, and protected-handoff model calls, authority
+and hydrology cache activity, exact-plan progress, and far
+scheduler progress. A run performed while another game, compiler, or benchmark is consuming the
+CPU is diagnostic evidence only and may not be cited as a performance qualification.
+
+The acceptance targets are a safe final spawn, revision-ready exact spawn meshes, connected coarse terrain and canonical water through 96 chunks, and the 60-target protected FINAL closure within 30 seconds; configured 512-chunk parent coverage and all remaining required queues within five minutes; at least 60 FPS at native resolution with 4x MSAA and view distance 512 on the documented M4 Max; and no more than 64 GiB total unified memory. These are hardware gates, not results established by fake-backend tests.
+
+## Research boundary
+
+Generator v4 follows [InfiniteDiffusion paper v4](https://arxiv.org/abs/2512.08309v4), pins the published [30-meter ONNX model at revision `ad2df557`](https://huggingface.co/xandergos/terrain-diffusion-30m-onnx/tree/ad2df557eca5645f588766101cf3bc3682455c3e), and uses the [Minecraft implementation at commit `23d3f50`](https://github.com/xandergos/terrain-diffusion-mc/tree/23d3f50e5108882bb88a03c3ab048aa63633a02f) as a compatibility reference. The implementation must remain independently testable through public model behavior, fixed random vectors, window geometry, and quantized outputs. Existing geology, hydrology, ecology, rendering, and persistence systems are Rycraft extensions.
+
+[National Weather Service guidance on fronts, precipitation, and thunderstorms](https://www.weather.gov/lmk/basic-fronts) informs the regional relationships among pressure, moisture, temperature, wind, precipitation, and instability. Rycraft implements a deterministic visual weather system, not a forecast model or terrain-changing climate simulation.
+
+PR 2 adds equilibrium plant-functional-type fields and connects them to flora, canopy, and fauna capacity. Succession, animated seasons, fire spread, migration, predators, and food webs remain out of scope.
