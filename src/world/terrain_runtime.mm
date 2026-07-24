@@ -2,6 +2,7 @@
 
 #include "world/terrain_runtime.hpp"
 
+#include "common/trace.hpp"
 #include "world/infinite_diffusion_backend.hpp"
 #include "world/onnxruntime_c_api_v27.hpp"
 #include "world/save_manager.hpp"
@@ -1045,6 +1046,14 @@ public:
                          runtimeMetrics.activeInferenceCalls);
             ++runtimeMetrics.inferenceCalls;
         }
+        // Observability only: a model-call duration span on the model-window
+        // track, tagged with its inference phase (see common/trace.hpp).
+        const trace::Name modelName =
+            model == TerrainRuntimeModel::Coarse    ? trace::Name::ModelCoarse
+            : model == TerrainRuntimeModel::Decoder ? trace::Name::ModelDecoder
+                                                    : trace::Name::ModelBase;
+        trace::Scope modelSpan(trace::Track::ModelWindow, modelName,
+                               {.priority = static_cast<uint8_t>(phase)});
         const auto inferenceStarted = std::chrono::steady_clock::now();
         TerrainRuntimeInferenceResult result = runLocked(model, inputs, cancellation);
         const uint64_t elapsedNanoseconds =
@@ -1115,6 +1124,7 @@ bootstrap::TerrainRuntimeStepResult ProductionTerrainRuntime::qualifyPlatform() 
 bootstrap::TerrainRuntimeStepResult
 ProductionTerrainRuntime::compile(const std::filesystem::path& installedPack,
                                   const bootstrap::TerrainBootstrapCancellation& cancellation) {
+    trace::Scope span(trace::Track::Bootstrap, trace::Name::BootstrapCompile);
     {
         std::lock_guard lock(contextMutex_);
         generationContext_.reset();
@@ -1183,6 +1193,7 @@ ProductionTerrainRuntime::compile(const std::filesystem::path& installedPack,
 bootstrap::TerrainRuntimeStepResult ProductionTerrainRuntime::loadAndQualify(
     const std::filesystem::path& installedPack,
     const bootstrap::TerrainBootstrapCancellation& cancellation) {
+    trace::Scope span(trace::Track::Bootstrap, trace::Name::BootstrapLoadQualify);
     if (installedPack != impl_->packPath || !impl_->compiled) {
         return bootstrap::TerrainRuntimeStepResult::failureResult(
             bootstrap::TerrainBootstrapFailureCode::RuntimeLoading,

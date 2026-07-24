@@ -1,5 +1,6 @@
 #include "world/native_hydrology.hpp"
 
+#include "common/trace.hpp"
 #include "world/chunk.hpp"
 #include "world/learned_terrain.hpp"
 
@@ -180,19 +181,39 @@ size_t nativeHydrologyBuildConcurrency() noexcept {
 // horizon page, leaving nearly all CPU cores idle while far tiles waited. This
 // admission gate bounds memory without imposing an artificial single-file
 // build order. Per-page flights still keep duplicate requests deterministic.
+// Admission classes shared with the learned-authority lanes so hydrology and
+// inference rank against the same camera closure. Reservations keep the
+// player's exact band from being starved by distant preview and speculative
+// work: a distant owner cannot occupy every build lane.
+enum class NativeHydrologyGateClass { Critical, Visible, Low };
+
+inline NativeHydrologyGateClass
+nativeHydrologyGateClass(learned::AuthorityRequestPriority priority) {
+    using P = learned::AuthorityRequestPriority;
+    if (priority == P::COARSE_PREVIEW || priority == P::SPECULATIVE_PREFETCH)
+        return NativeHydrologyGateClass::Low;
+    if (priority == P::VISIBLE_FINAL_REFINEMENT) return NativeHydrologyGateClass::Visible;
+    return NativeHydrologyGateClass::Critical; // SPAWN, EXPLORATION_EXACT, PROTECTED_HANDOFF
+}
+
 class NativeHydrologyBuildGate {
 public:
     class Lease {
     public:
         Lease() = default;
-        explicit Lease(NativeHydrologyBuildGate* gate) : gate_(gate) {}
+        Lease(NativeHydrologyBuildGate* gate, NativeHydrologyGateClass admissionClass)
+            : gate_(gate)
+            , class_(admissionClass) {}
         Lease(const Lease&) = delete;
         Lease& operator=(const Lease&) = delete;
-        Lease(Lease&& other) noexcept : gate_(std::exchange(other.gate_, nullptr)) {}
+        Lease(Lease&& other) noexcept
+            : gate_(std::exchange(other.gate_, nullptr))
+            , class_(other.class_) {}
         Lease& operator=(Lease&& other) noexcept {
             if (this != &other) {
                 release();
                 gate_ = std::exchange(other.gate_, nullptr);
+                class_ = other.class_;
             }
             return *this;
         }
@@ -201,38 +222,58 @@ public:
     private:
         void release() {
             if (gate_ == nullptr) return;
-            gate_->release();
+            gate_->release(class_);
             gate_ = nullptr;
         }
 
         NativeHydrologyBuildGate* gate_ = nullptr;
+        NativeHydrologyGateClass class_ = NativeHydrologyGateClass::Critical;
     };
 
     [[nodiscard]] Lease acquire(std::atomic<learned::AuthorityRequestPriority>& priority,
                                 bool& waited) {
         std::unique_lock lock(mutex_);
         waiters_.push_back(&priority);
-        const auto higherPriorityWaiting = [&] {
+        // Reserve lanes for stronger work exactly as the learned queue caps low
+        // and visible-or-lower requests at half and three quarters of capacity.
+        const size_t lowActiveCap = std::max<size_t>(1, limit_ / 2);
+        const size_t visibleOrLowerActiveCap = std::max<size_t>(1, (limit_ * 3) / 4);
+        const auto admissible = [&] {
+            if (active_ >= limit_) return false;
             const learned::AuthorityRequestPriority requested =
                 priority.load(std::memory_order_relaxed);
-            return std::ranges::any_of(waiters_, [&](const auto* candidate) {
+            const bool strongerWaiting = std::ranges::any_of(waiters_, [&](const auto* candidate) {
                 return candidate != &priority &&
                        candidate->load(std::memory_order_relaxed) < requested;
             });
+            if (strongerWaiting) return false;
+            const NativeHydrologyGateClass requestClass = nativeHydrologyGateClass(requested);
+            if (requestClass == NativeHydrologyGateClass::Low && activeLow_ >= lowActiveCap)
+                return false;
+            if (requestClass != NativeHydrologyGateClass::Critical &&
+                activeVisibleOrLower_ >= visibleOrLowerActiveCap)
+                return false;
+            return true;
         };
-        waited = active_ >= limit_ || higherPriorityWaiting();
-        ready_.wait(lock, [&] { return active_ < limit_ && !higherPriorityWaiting(); });
+        waited = !admissible();
+        ready_.wait(lock, admissible);
         std::erase(waiters_, &priority);
+        const NativeHydrologyGateClass admittedClass =
+            nativeHydrologyGateClass(priority.load(std::memory_order_relaxed));
         ++active_;
-        return Lease(this);
+        if (admittedClass == NativeHydrologyGateClass::Low) ++activeLow_;
+        if (admittedClass != NativeHydrologyGateClass::Critical) ++activeVisibleOrLower_;
+        return Lease(this, admittedClass);
     }
 
 private:
-    void release() {
+    void release(NativeHydrologyGateClass admissionClass) {
         {
             std::lock_guard lock(mutex_);
             if (active_ == 0) std::terminate();
             --active_;
+            if (admissionClass == NativeHydrologyGateClass::Low) --activeLow_;
+            if (admissionClass != NativeHydrologyGateClass::Critical) --activeVisibleOrLower_;
         }
         // A low-priority waiter may not be eligible while a later exact
         // waiter is. Wake the set so the strongest request always claims the
@@ -247,6 +288,8 @@ private:
     std::condition_variable ready_;
     std::vector<std::atomic<learned::AuthorityRequestPriority>*> waiters_;
     size_t active_ = 0;
+    size_t activeLow_ = 0;
+    size_t activeVisibleOrLower_ = 0;
 };
 
 // PREVIEW and FINAL contexts intentionally own separate immutable page
@@ -5898,6 +5941,9 @@ public:
                 recency.splice(recency.begin(), recency, found->second.recency);
                 found->second.priority = std::min(found->second.priority, priority);
                 ++metrics.hits;
+                trace::instant(trace::Track::Hydrology, trace::Name::HydrologyHit,
+                               {.spatialKey = trace::packCoord(key.x, key.z),
+                                .priority = static_cast<uint8_t>(priority)});
                 return found->second.page;
             }
             if (auto active = flights.find(key); active != flights.end()) {
@@ -5919,6 +5965,12 @@ public:
             }
         }
 
+        // Observability only: one span per owner build attempt on the builder
+        // path, carrying retained bytes and the typed disposition at the end
+        // (see common/trace.hpp).
+        trace::Scope hydroSpan(trace::Track::Hydrology, trace::Name::HydrologyBuild,
+                               {.spatialKey = trace::packCoord(key.x, key.z),
+                                .priority = static_cast<uint8_t>(priority)});
         std::shared_ptr<const NativePage> page;
         std::exception_ptr failure;
         size_t peakBuildBytes = 0;
@@ -6006,6 +6058,11 @@ public:
         } catch (...) {
             failure = std::current_exception();
         }
+
+        hydroSpan.setBytesRetained(peakBuildBytes);
+        hydroSpan.setCancellation(
+            failure ? (deferredBuild ? trace::Cancellation::Deferred : trace::Cancellation::Failed)
+                    : trace::Cancellation::Completed);
 
         {
             std::lock_guard lock(mutex);

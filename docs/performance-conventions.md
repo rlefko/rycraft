@@ -38,6 +38,8 @@ Every performance report records:
 
 Do not infer a passing cold horizon from queue caps. A canonical digest or one authority-page timing does not qualify the complete first-entry route.
 
+Attribution uses one machine-readable critical-path trace (`common/trace.hpp`, enabled with `RYCRAFT_TRACE`) and the checked-in `rycraft_trace_summary` tool for p50, p95, maximum, queue depth, cache reuse, cancellation, duplicate model windows, critical-path ownership, and omitted water or flora products. Disabled tracing performs no per-frame allocation and its overhead is a single relaxed atomic load per emit site. The trace is observability only and may never change a measured number.
+
 ## Startup and inference
 
 Download, initial SHA-256 verification, archive extraction, Core ML compilation, and canonical qualification run on the bootstrap thread before world construction. They do not run in a frame or fixed tick. Later launches check the installed pack's verified completion marker and current file stamps before reuse, so a normal launch does not reread the 2.3 GB pack or make a network request. A missing, legacy, or changed marker triggers a local full SHA-256 audit. Retry never redownloads a verified pack, and Repair is the only path that replaces an installed asset.
@@ -204,7 +206,7 @@ Hydrology pages are 2,048 blocks wide. At 7.5 meters per block, one page is 15.3
 
 The water solver remains a bounded tiled query. Every change identifies domain size, apron, native spacing, fixed passes, cache key, single flight, construction concurrency, and edge reconciliation. Whole-world walks and unbounded upstream traversal are prohibited.
 
-Preview and final native routers share one process-wide build gate. It permits at most 16 simultaneous page builds and also obeys hardware concurrency and a one-GiB aggregate scratch reservation. This is one total process budget, not 16 builds per context. Record active builds, peak concurrency, admission waits, and scratch use.
+Preview and final native routers share one process-wide build gate. It permits at most 16 simultaneous page builds and also obeys hardware concurrency and a one-GiB aggregate scratch reservation. This is one total process budget, not 16 builds per context. Record active builds, peak concurrency, admission waits, and scratch use. The gate ranks waiters by the shared `AuthorityRequestPriority` and reserves lanes for the exact band the way the learned queue does: distant `COARSE_PREVIEW` and `SPECULATIVE_PREFETCH` builds take at most half the lanes and visible-or-lower builds at most three quarters, so a distant owner cannot occupy every hydrology lane while the player's exact band is unresolved.
 
 No-raising reconciliation must not introduce an unbounded flood. Stage relaxation or dry-cell wetting needs a fixed rectangular extent, deterministic ordering, and scalar, reverse-order, and batched equality.
 

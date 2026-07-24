@@ -41,3 +41,13 @@ worldgen_inspect_exe = executable('rycraft_worldgen_inspect',
   dependencies : [appleframeworks, lz4_dep],
   build_by_default : true,
 )
+
+# Program 0 critical-path trace summarizer. It only parses a binary trace, so
+# it links libcommon alone and shares the record layout in common/trace.hpp.
+trace_summary_exe = executable('rycraft_trace_summary',
+  'trace_summary.cpp',
+  include_directories : inc,
+  link_with : [libcommon],
+  dependencies : [appleframeworks],
+  build_by_default : true,
+)

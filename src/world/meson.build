@@ -17,6 +17,7 @@ world_sources = files(
   'fluid.cpp',
   'serialization.cpp',
   'learned_terrain.cpp',
+  'learned_authority_graph.cpp',
   'hydrology_authority.cpp',
   'native_hydrology.cpp',
   'terrain_bootstrap.cpp',

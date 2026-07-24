@@ -2,6 +2,7 @@
 
 #include "common/error.hpp"
 #include "common/random.hpp"
+#include "common/trace.hpp"
 #include "render/atmosphere.hpp"
 #include "render/atmospheric_memory.hpp"
 #include "render/block_textures.hpp"
@@ -1439,6 +1440,9 @@ void RenderPipeline::endWorldSession() {
     _farTerrainUrgentRefinementKeys.clear();
     _farTerrainConnectedNearPatchTargets.clear();
     _farTerrainProtectedFinalTerrainRegions.clear();
+    // Release the pinned window closure while the backend is still alive; world
+    // teardown destroys the backend the deleter references immediately after.
+    _farTerrainProtectedWindowRetention.reset();
     _farTerrainPredictedNearPatchTargets.clear();
     _farTerrainPredictedCriticalResidencyKeys.clear();
     _farTerrainCriticalResidencyCoordinates.clear();
@@ -2922,6 +2926,7 @@ void RenderPipeline::resetFarTerrain(const World& world) {
     _farTerrainPredictedCriticalResidencyKeys.clear();
     _farTerrainConnectedNearPatchTargets.clear();
     _farTerrainProtectedFinalTerrainRegions.clear();
+    _farTerrainProtectedWindowRetention.reset();
     _farTerrainCriticalResidencyCoordinates.clear();
     _farTerrainCriticalResidencyTargets.clear();
     _farTerrainCriticalResidencyCoordinateScratch.clear();
@@ -3463,12 +3468,21 @@ void RenderPipeline::renderFarTerrain(
     if (protectedClosureAnchor) {
         buildFarTerrainProtectedNearTargets(*protectedClosureAnchor, _farTerrainCandidates,
                                             _farTerrainConnectedNearPatchTargets);
-        if (protectedHandoffChanged || selectionChanged ||
-            _farTerrainProtectedFinalTerrainRegions.empty()) {
+        const bool protectedRegionsChanged = protectedHandoffChanged || selectionChanged ||
+                                             _farTerrainProtectedFinalTerrainRegions.empty();
+        if (protectedRegionsChanged) {
             _farTerrainProtectedFinalTerrainRegions =
                 farTerrainProtectedFinalTerrainRegions(_farTerrainConnectedNearPatchTargets);
         }
         if (const auto generationContext = world.generationContext()) {
+            if (protectedRegionsChanged) {
+                // Pin the protected FINAL window closure so its coarse, Base,
+                // and decoder windows are computed once and never evicted while
+                // this closure is active (issue #16).
+                _farTerrainProtectedWindowRetention =
+                    generationContext->retainProtectedAuthorityWindows(
+                        _farTerrainProtectedFinalTerrainRegions);
+            }
             const worldgen::learned::ProtectedHandoffEpoch epoch{protectedClosureEpoch};
             for (const worldgen::learned::NativeRect region :
                  _farTerrainProtectedFinalTerrainRegions) {
@@ -3490,6 +3504,7 @@ void RenderPipeline::renderFarTerrain(
         }
     } else {
         _farTerrainProtectedFinalTerrainRegions.clear();
+        _farTerrainProtectedWindowRetention.reset();
     }
     const auto predictedOnlyTarget = [&](FarTerrainKey key) {
         const bool predicted = std::ranges::find(_farTerrainPredictedNearPatchTargets, key) !=
@@ -6286,6 +6301,31 @@ void RenderPipeline::renderFarTerrain(
     _chunkStats.farPendingTileCount =
         static_cast<uint32_t>(schedulerStats.inFlight + schedulerStats.completed);
     _chunkStats.farUploadsLastFrame = static_cast<uint32_t>(uploads);
+    // Observability only: the worst visible projected-error violation, far
+    // uploads, and GPU-resident tile count for the trace (common/trace.hpp).
+    if (trace::enabled()) {
+        if (worstVisibleProjectedError > 0.0F) {
+            trace::instant(
+                trace::Track::ScreenErrorDebt, trace::Name::ScreenErrorWorst,
+                {.spatialKey = trace::packCoord(
+                     worstVisibleCoordinate.x, worstVisibleCoordinate.z,
+                     static_cast<uint8_t>(farTerrainStepSize(worstVisibleDesired))),
+                 .bytesRetained = static_cast<uint64_t>(worstVisibleProjectedError * 256.0F),
+                 .priority = static_cast<uint8_t>(
+                     std::min<uint32_t>(visibleProjectedErrorViolations, 255))});
+        }
+        if (uploads > 0) {
+            trace::instant(trace::Track::Upload, trace::Name::FarMeshUpload,
+                           {.bytesRetained = static_cast<uint64_t>(uploads)});
+            trace::instant(trace::Track::GpuResidency, trace::Name::GpuResident,
+                           {.bytesRetained = static_cast<uint64_t>(drawn)});
+        }
+        const uint64_t omittedFlora = schedulerStats.queuedCanopy + schedulerStats.parkedCanopy;
+        if (omittedFlora > 0) {
+            trace::instant(trace::Track::ScreenErrorDebt, trace::Name::OmittedFlora,
+                           {.bytesRetained = omittedFlora});
+        }
+    }
     _chunkStats.farQueuedBaseTileCount = static_cast<uint32_t>(schedulerStats.queuedBase);
     _chunkStats.farQueuedRefinementTileCount =
         static_cast<uint32_t>(schedulerStats.queuedRefinement);

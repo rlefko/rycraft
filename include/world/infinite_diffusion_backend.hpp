@@ -12,9 +12,13 @@ namespace worldgen::runtime {
 // Builds the production page backend around the single-flight typed model
 // executor. The backend owns its deterministic window caches and keeps the
 // executor alive for every WorldGenerationContext that references it.
+// tensorWindowByteBudget of 0 keeps the production 384 MiB tensor-window cap.
+// A smaller value is a test-only knob for exercising retention under pressure;
+// it is not part of the generation identity.
 [[nodiscard]] std::shared_ptr<learned::TerrainInferenceBackend>
 makeInfiniteDiffusionTerrainBackend(uint64_t seed, std::filesystem::path modelPack,
-                                    std::shared_ptr<TerrainModelExecutor> executor);
+                                    std::shared_ptr<TerrainModelExecutor> executor,
+                                    size_t tensorWindowByteBudget = 0);
 
 // Exposes the provider-independent scheduler vector used by compatibility
 // tests and local model diagnostics.

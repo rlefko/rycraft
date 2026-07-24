@@ -153,11 +153,13 @@ file is inferred again and atomically repaired. A fingerprint mismatch fails clo
 The decoded authority cache defaults to at most 1,024 entries and 512 MiB. A query is limited to 64 pages and 1,048,576 samples. At most 64 page requests may be outstanding and one build runs at a time. Equal cold requests share one flight. The production backend separately caps retained coarse, latent, and decoder tensor windows at 384 MiB. The coordinator orders spawn, exploration exact, protected exact handoff, visible final refinement, coarse preview, and speculative movement prefetch. Production final-parent requests use the protected lane for the exact-handoff prefix. Movement hints use the speculative lane only after the current visible preview closure is ready and are capped at eight pages.
 
 Protected FINAL targets sort directly intersected native hydrology owners lexicographically and
-group adjacent owners in sets of at most two by two. Every combined half-open FINAL rectangle stays
-within the 1,048,576-sample query bound. Cropping the grouped output back to one 517 by 517 owner
-produces exactly the same FINAL samples as preparing that owner separately, including negative
-coordinates and shared aprons. The grouping changes request count and reuse, not terrain authority
-or generation identity.
+group adjacent owners in sets of at most two by two. A group is prepared as one rectangle only when
+that rectangle costs strictly fewer unique coarse, Base, and Decoder windows than preparing the
+owners independently, not by bounding box alone. Why: a bounding box that merely spans a gap pulls in
+decoder windows no owner needed. Every combined half-open FINAL rectangle stays within the 1,048,576-sample
+query bound. Cropping the grouped output back to one 517 by 517 owner produces exactly the same FINAL
+samples as preparing that owner separately, including negative coordinates and shared aprons. The
+grouping changes request count and reuse, not terrain authority or generation identity.
 
 ## Canonical generated water
 

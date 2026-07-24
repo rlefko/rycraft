@@ -1,5 +1,8 @@
 #include "world/infinite_diffusion_backend.hpp"
 
+#include "common/trace.hpp"
+#include "world/learned_authority_graph.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -702,10 +705,13 @@ private:
 class InfiniteDiffusionBackend final : public learned::TerrainInferenceBackend {
 public:
     InfiniteDiffusionBackend(uint64_t requestedSeed, std::filesystem::path modelPack,
-                             std::shared_ptr<TerrainModelExecutor> requestedExecutor)
+                             std::shared_ptr<TerrainModelExecutor> requestedExecutor,
+                             size_t requestedTensorWindowBudget = 0)
         : seed_(requestedSeed)
         , modelPack_(std::move(modelPack))
-        , executor_(std::move(requestedExecutor)) {
+        , executor_(std::move(requestedExecutor))
+        , tensorWindowByteBudget_(requestedTensorWindowBudget != 0 ? requestedTensorWindowBudget
+                                                                   : TENSOR_WINDOW_CACHE_BUDGET) {
         std::string error;
         pipelineData_ = loadPipelineData(modelPack_ / "pipeline_data.json", error);
         if (!pipelineData_) initializationError_ = std::move(error);
@@ -721,6 +727,36 @@ public:
             if (pipelineData_)
                 pipelineData_->noiseQuantiles[channel] = syntheticNoise_[channel]->noiseQuantiles();
         }
+    }
+
+    std::shared_ptr<void> retainWindowGraph(const learned::LearnedAuthorityGraph& graph) override {
+        auto keys = std::make_shared<std::vector<WindowKey>>();
+        keys->reserve(graph.retainedWindows().size());
+        for (const learned::LearnedWindowRef& ref : graph.retainedWindows()) {
+            keys->push_back({static_cast<WindowKey::Stage>(static_cast<uint8_t>(ref.stage)),
+                             ref.index.row, ref.index.column});
+        }
+        {
+            std::lock_guard lock(mutex_);
+            for (const WindowKey& key : *keys)
+                ++pinned_[key];
+        }
+        InfiniteDiffusionBackend* self = this;
+        // The deleter unpins exactly what it pinned. keys is captured so the
+        // vector outlives the handle; the managed pointer is never dereferenced.
+        return std::shared_ptr<void>(static_cast<void*>(keys.get()), [self, keys](void*) {
+            std::lock_guard lock(self->mutex_);
+            for (const WindowKey& key : *keys) {
+                auto found = self->pinned_.find(key);
+                if (found != self->pinned_.end() && --found->second == 0)
+                    self->pinned_.erase(found);
+            }
+        });
+    }
+
+    size_t tensorWindowCacheBytes() const override {
+        std::lock_guard lock(mutex_);
+        return cacheBytes_;
     }
 
     AuthorityResult<TerrainAuthorityPage> inferPage(const GenerationIdentity& identity,
@@ -1981,17 +2017,31 @@ private:
     const std::vector<float>& insertWindow(WindowKey key, std::vector<float> values) {
         auto existing = windows_.find(key);
         if (existing != windows_.end()) return existing->second.values;
+        // Observability only: one instant per actual window computation. A
+        // window that reappears here after eviction is a recompute, which the
+        // summarizer counts as a duplicate model window (see common/trace.hpp).
+        const trace::Name windowName =
+            key.stage == WindowKey::Stage::Coarse    ? trace::Name::ModelCoarse
+            : key.stage == WindowKey::Stage::Decoder ? trace::Name::ModelDecoder
+                                                     : trace::Name::ModelBase;
+        trace::instant(
+            trace::Track::ModelWindow, windowName,
+            {.spatialKey = trace::packCoord(key.row, key.column, static_cast<uint8_t>(key.stage))});
         cacheBytes_ += values.size() * sizeof(float);
         auto [inserted, didInsert] = windows_.emplace(
             key, CachedWindow{.values = std::move(values), .lastAccess = ++cacheClock_});
         (void)didInsert;
-        while (cacheBytes_ > TENSOR_WINDOW_CACHE_BUDGET && windows_.size() > 1) {
-            auto oldest = windows_.begin();
+        while (cacheBytes_ > tensorWindowByteBudget_ && windows_.size() > 1) {
+            auto oldest = windows_.end();
             for (auto candidate = windows_.begin(); candidate != windows_.end(); ++candidate) {
                 if (candidate == inserted) continue;
-                if (oldest == inserted || candidate->second.lastAccess < oldest->second.lastAccess)
+                // A window the active protected plan references is never evicted.
+                if (pinned_.find(candidate->first) != pinned_.end()) continue;
+                if (oldest == windows_.end() ||
+                    candidate->second.lastAccess < oldest->second.lastAccess)
                     oldest = candidate;
             }
+            if (oldest == windows_.end()) break; // every other window is pinned
             cacheBytes_ -= oldest->second.values.size() * sizeof(float);
             windows_.erase(oldest);
         }
@@ -2001,11 +2051,16 @@ private:
     uint64_t seed_;
     std::filesystem::path modelPack_;
     std::shared_ptr<TerrainModelExecutor> executor_;
+    size_t tensorWindowByteBudget_;
     std::optional<PipelineData> pipelineData_;
     std::string initializationError_;
     std::array<std::unique_ptr<FastPerlin>, 5> syntheticNoise_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::map<WindowKey, CachedWindow> windows_;
+    // Windows referenced by an active protected plan (issue #16). A pinned
+    // window is never evicted, so the plan's closure is computed once and stays
+    // resident until its retain handle is released.
+    std::map<WindowKey, uint32_t> pinned_;
     size_t cacheBytes_ = 0;
     uint64_t cacheClock_ = 0;
     TerrainRuntimeInferencePhase activePhase_ = TerrainRuntimeInferencePhase::Other;
@@ -2096,9 +2151,10 @@ runInfiniteDiffusionLaplacian(std::span<const float> residual, int residualHeigh
 
 std::shared_ptr<learned::TerrainInferenceBackend>
 makeInfiniteDiffusionTerrainBackend(uint64_t seed, std::filesystem::path modelPack,
-                                    std::shared_ptr<TerrainModelExecutor> executor) {
+                                    std::shared_ptr<TerrainModelExecutor> executor,
+                                    size_t tensorWindowByteBudget) {
     return std::make_shared<InfiniteDiffusionBackend>(seed, std::move(modelPack),
-                                                      std::move(executor));
+                                                      std::move(executor), tensorWindowByteBudget);
 }
 
 } // namespace worldgen::runtime

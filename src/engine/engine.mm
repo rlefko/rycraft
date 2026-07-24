@@ -9,6 +9,7 @@
 #include <common/error.hpp>
 #include <common/math.hpp>
 #include <common/random.hpp>
+#include <common/trace.hpp>
 #include <engine/application_termination.hpp>
 #include <engine/camera.hpp>
 #include <engine/game_state.hpp>
@@ -904,6 +905,8 @@ static EngineState* _engineGetState(Engine* engine) {
         _scrollAccumulator = 0;
         _savedWorld = NO;
         _terminationQuiescence.resetForWorldSession();
+        // Program 0 critical-path trace: disabled unless RYCRAFT_TRACE is set.
+        trace::enableFromEnvironment();
         _state = std::make_unique<EngineState>();
         _state->performance.requestedFrames =
             std::min<uint64_t>(unsignedEnvironmentValue("RYCRAFT_PERF_FRAMES", 0), 36'000);
@@ -3566,6 +3569,10 @@ static bool worldRequiresCurrentV4Successor(const WorldSummary& world) {
     // Belt and braces: the mouse association is global system state
     CGAssociateMouseAndMouseCursorPosition(true);
     static_cast<void>([self saveWorldState]);
+    // Write the critical-path trace at process quiesce, after workers stop.
+    if (trace::enabled()) {
+        trace::flush();
+    }
 }
 
 - (void)windowDidResignKey:(NSNotification*)notification {
@@ -5223,6 +5230,13 @@ static bool worldRequiresCurrentV4Successor(const WorldSummary& world) {
                               preparationNow - lastCapturePreparationEvidence >= 1.0)) {
             lastCapturePreparationEvidence = preparationNow;
             const auto stats = _renderPipeline->chunkRenderStats();
+            // Observability only: once-per-second visible screen-error debt as
+            // the missing base and protected-near tile counts (common/trace.hpp).
+            trace::instant(trace::Track::ScreenErrorDebt, trace::Name::ScreenErrorWorst,
+                           {.spatialKey = trace::packCoord(stats.farBaseMissingTileCount,
+                                                           stats.farProtectedNearMissingTileCount),
+                            .bytesRetained = static_cast<uint64_t>(stats.farBaseMissingTileCount) +
+                                             stats.farProtectedNearMissingTileCount});
             const int configuredHorizonChunks = stats.farBaseViewDistanceChunks;
             const int entryHorizonChunks =
                 v4RequiredEntryParentRadiusChunks(configuredHorizonChunks);
@@ -5705,6 +5719,10 @@ static bool worldRequiresCurrentV4Successor(const WorldSummary& world) {
                                  state->cachedChunkCount, state->autopilotStopFrame, *state->world,
                                  *_renderPipeline, _device, weatherSystemStats,
                                  state->thunder.pendingCount())) {
+        // Flush the trace before a bounded performance/capture run quits.
+        if (trace::enabled()) {
+            trace::flush();
+        }
         [self requestQuit];
     }
 }

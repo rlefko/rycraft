@@ -1106,6 +1106,10 @@ private:
     std::vector<FarTerrainKey> _farTerrainUrgentRefinementKeys;
     std::vector<FarTerrainKey> _farTerrainConnectedNearPatchTargets;
     std::vector<worldgen::learned::NativeRect> _farTerrainProtectedFinalTerrainRegions;
+    // Pins the protected FINAL window closure for the active epoch so its model
+    // windows are computed once and never evicted (issue #16). Released when the
+    // protected closure clears.
+    std::shared_ptr<void> _farTerrainProtectedWindowRetention;
     // Directional closure preparation remains CPU-only until its canonical
     // anchor is requested. These keys never enter desired, display, upload,
     // GPU-critical, or closure-stat state.

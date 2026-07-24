@@ -6,6 +6,7 @@ catch2_with_main_dep = catch2_proj.get_variable('catch2_with_main_dep')
 
 test_sources = files(
   'test_common.mm',
+  'test_trace.mm',
   'test_world.mm',
   'test_weather.mm',
   'test_worldgen_advanced.mm',
@@ -27,6 +28,7 @@ test_sources = files(
   'test_fluid_persistence.mm',
   'test_saves.mm',
   'test_learned_terrain.mm',
+  'test_learned_authority_graph.mm',
   'test_hydrology_authority.mm',
   'test_native_hydrology.mm',
   'test_terrain_bootstrap.mm',
