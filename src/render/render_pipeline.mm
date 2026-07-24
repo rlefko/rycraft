@@ -1440,6 +1440,9 @@ void RenderPipeline::endWorldSession() {
     _farTerrainUrgentRefinementKeys.clear();
     _farTerrainConnectedNearPatchTargets.clear();
     _farTerrainProtectedFinalTerrainRegions.clear();
+    // Release the pinned window closure while the backend is still alive; world
+    // teardown destroys the backend the deleter references immediately after.
+    _farTerrainProtectedWindowRetention.reset();
     _farTerrainPredictedNearPatchTargets.clear();
     _farTerrainPredictedCriticalResidencyKeys.clear();
     _farTerrainCriticalResidencyCoordinates.clear();
@@ -2923,6 +2926,7 @@ void RenderPipeline::resetFarTerrain(const World& world) {
     _farTerrainPredictedCriticalResidencyKeys.clear();
     _farTerrainConnectedNearPatchTargets.clear();
     _farTerrainProtectedFinalTerrainRegions.clear();
+    _farTerrainProtectedWindowRetention.reset();
     _farTerrainCriticalResidencyCoordinates.clear();
     _farTerrainCriticalResidencyTargets.clear();
     _farTerrainCriticalResidencyCoordinateScratch.clear();
