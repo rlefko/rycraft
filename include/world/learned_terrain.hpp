@@ -475,11 +475,24 @@ struct TerrainAuthorityPage {
     [[nodiscard]] const QuantizedTerrainSample* sample(size_t row, size_t column) const noexcept;
 };
 
+// The immutable learned-window plan (world/learned_authority_graph.hpp). Only
+// the pinning hook below needs its type here, so it stays a forward declaration.
+class LearnedAuthorityGraph;
+
 class TerrainInferenceBackend {
 public:
     virtual ~TerrainInferenceBackend() = default;
     virtual AuthorityResult<TerrainAuthorityPage> inferPage(const GenerationIdentity& identity,
                                                             TerrainPageKey key) = 0;
+    // Pin the plan's complete window closure so no window the active protected
+    // graph references is recomputed or evicted while the returned handle is
+    // held. The default no-op keeps fake and test backends unaffected. The
+    // handle unpins on destruction and must not outlive the backend.
+    virtual std::shared_ptr<void> retainWindowGraph(const LearnedAuthorityGraph&) {
+        return nullptr;
+    }
+    // Currently retained tensor-window bytes, for tests and diagnostics.
+    [[nodiscard]] virtual size_t tensorWindowCacheBytes() const { return 0; }
     virtual AuthorityResult<TerrainAuthorityPage>
     inferPageForRequest(const GenerationIdentity& identity, TerrainPageKey key,
                         AuthorityRequestPriority priority);
@@ -670,6 +683,12 @@ public:
         });
     }
     [[nodiscard]] virtual TerrainAuthorityCacheMetrics cacheMetrics() const = 0;
+    // Pin an immutable plan's window closure through the backend so no active
+    // protected window is recomputed or evicted while the handle is held. The
+    // default is a no-op for authorities without a window backend.
+    virtual std::shared_ptr<void> retainWindowGraph(const LearnedAuthorityGraph&) {
+        return nullptr;
+    }
 };
 
 class CachedTerrainAuthority final : public TerrainAuthority {
@@ -711,6 +730,7 @@ public:
         CoarseSpawnRegion region,
         AuthorityRequestPriority priority = AuthorityRequestPriority::SPAWN) override;
     [[nodiscard]] TerrainAuthorityCacheMetrics cacheMetrics() const override;
+    std::shared_ptr<void> retainWindowGraph(const LearnedAuthorityGraph& graph) override;
 
 private:
     class Impl;
@@ -807,6 +827,13 @@ public:
     AuthorityResult<bool>
     requestWorldPage(int64_t worldX, int64_t worldZ,
                      AuthorityRequestPriority priority = AuthorityRequestPriority::SPAWN) const;
+    // Plans one immutable window graph over the protected FINAL rectangles and
+    // pins its complete closure so no window it references is recomputed or
+    // evicted while the returned handle is held. Returns nullptr when the
+    // backend does not pin or the plan exceeds a configured bound; pinning is an
+    // optimization, never a correctness gate.
+    [[nodiscard]] std::shared_ptr<void>
+    retainProtectedAuthorityWindows(std::span<const NativeRect> finalRegions) const;
     AuthorityResult<PhysicalTerrainGrid>
     queryNative(NativeRect region,
                 std::optional<AuthorityRequestPriority> priority = std::nullopt) const;

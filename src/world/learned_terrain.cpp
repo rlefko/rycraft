@@ -2,6 +2,7 @@
 
 #include "common/trace.hpp"
 #include "world/chunk_pos.hpp"
+#include "world/learned_authority_graph.hpp"
 #include "world/native_hydrology.hpp"
 
 #include <algorithm>
@@ -3878,6 +3879,11 @@ TerrainAuthorityCacheMetrics CachedTerrainAuthority::cacheMetrics() const {
     return result;
 }
 
+std::shared_ptr<void>
+CachedTerrainAuthority::retainWindowGraph(const LearnedAuthorityGraph& graph) {
+    return impl_->backend ? impl_->backend->retainWindowGraph(graph) : nullptr;
+}
+
 GenerationFailureException::GenerationFailureException(AuthorityStatus status,
                                                        GenerationFailure failure)
     : std::runtime_error(failure.message.empty() ? "World generation authority failed"
@@ -4135,6 +4141,18 @@ bool WorldGenerationContext::nativeHydrologyOwnerPrepared(int64_t ownerPageX,
                                                           int64_t ownerPageZ) const {
     std::lock_guard lock(impl_->hydrologyPreparation->mutex);
     return impl_->hydrologyPreparation->preparedOwners.contains({ownerPageX, ownerPageZ});
+}
+
+std::shared_ptr<void> WorldGenerationContext::retainProtectedAuthorityWindows(
+    std::span<const NativeRect> finalRegions) const {
+    if (!impl_->authority || finalRegions.empty()) return nullptr;
+    std::vector<LearnedAuthorityRequest> requests;
+    requests.reserve(finalRegions.size());
+    for (const NativeRect region : finalRegions)
+        requests.push_back({.quality = AuthorityQuality::FINAL, .region = region});
+    const auto plan = LearnedAuthorityGraph::build(requests);
+    if (!plan.isReady()) return nullptr; // over a bound: skip pinning, never fatal
+    return impl_->authority->retainWindowGraph(**plan.value());
 }
 
 size_t WorldGenerationContext::preparedNativeHydrologyOwnerCount() const {
