@@ -1,10 +1,12 @@
 #include <catch2/catch_all.hpp>
 
+#include "common/trace.hpp"
 #include "engine/v4_world_startup.hpp"
 #include "render/far_terrain.hpp"
 #include "test_helpers.hpp"
 #include "world/artifact_analysis.hpp"
 #include "world/infinite_diffusion_backend.hpp"
+#include "world/learned_authority_graph.hpp"
 #include "world/native_hydrology.hpp"
 #include "world/save_manager.hpp"
 #include "world/terrain_runtime.hpp"
@@ -1332,6 +1334,99 @@ TEST_CASE("InfiniteDiffusion preview uses deterministic Base lineage without Dec
     REQUIRE(incompatible.failure());
     CHECK_FALSE(incompatible.failure()->retriable);
     CHECK(unusedExecutor->calls.load() == 0);
+}
+
+TEST_CASE("Authority graph enumerates exactly the windows the backend computes",
+          "[terrain-runtime][window-plan]") {
+    TempDir directory("terrain_runtime_window_plan");
+    const std::filesystem::path pack = directory.path();
+    std::filesystem::create_directories(pack);
+    writeFakePipelineData(pack / "pipeline_data.json");
+    writeFakeModelConfiguration(pack / "world_pipeline_config.json");
+    auto executor = std::make_shared<ZeroTerrainExecutor>();
+    constexpr uint64_t SEED = 0x1'0000'0001ULL;
+    auto backend = makeInfiniteDiffusionTerrainBackend(SEED, pack, executor);
+    const learned::GenerationIdentity identity = productionGenerationIdentity(SEED);
+
+    const learned::TerrainPageKey key{.quality = learned::AuthorityQuality::FINAL,
+                                      .coordinate = {.row = -1, .column = 2}};
+    const int64_t edge = learned::AUTHORITY_PAGE_NATIVE_EDGE;
+    const learned::NativeRect region{.rowBegin = key.coordinate.row * edge,
+                                     .columnBegin = key.coordinate.column * edge,
+                                     .rowEnd = key.coordinate.row * edge + edge,
+                                     .columnEnd = key.coordinate.column * edge + edge};
+
+    trace::enable("", 1u << 20, /*ring=*/false);
+    trace::reset();
+    auto page = backend->inferPage(identity, key);
+    REQUIRE(page.isReady());
+    std::vector<uint64_t> executed;
+    for (const trace::Event& e : trace::events()) {
+        if (e.track == trace::Track::ModelWindow && e.kind == trace::EventKind::Instant) {
+            executed.push_back(e.spatialKey);
+        }
+    }
+    trace::disable();
+    std::sort(executed.begin(), executed.end());
+    executed.erase(std::unique(executed.begin(), executed.end()), executed.end());
+
+    std::vector<uint64_t> planned;
+    for (const learned::LearnedWindowRef& ref :
+         learned::learnedWindowClosure({learned::LearnedAuthorityRequest{
+             .quality = learned::AuthorityQuality::FINAL, .region = region}})) {
+        planned.push_back(
+            trace::packCoord(ref.index.row, ref.index.column, static_cast<uint8_t>(ref.stage)));
+    }
+    std::sort(planned.begin(), planned.end());
+    planned.erase(std::unique(planned.begin(), planned.end()), planned.end());
+
+    CHECK_FALSE(planned.empty());
+    CHECK(executed == planned);
+}
+
+TEST_CASE("A retained window graph prevents eviction of its closure under a small budget",
+          "[terrain-runtime][window-plan]") {
+    TempDir directory("terrain_runtime_window_pin");
+    const std::filesystem::path pack = directory.path();
+    std::filesystem::create_directories(pack);
+    writeFakePipelineData(pack / "pipeline_data.json");
+    writeFakeModelConfiguration(pack / "world_pipeline_config.json");
+    constexpr uint64_t SEED = 0x1'0000'0001ULL;
+    const learned::GenerationIdentity identity = productionGenerationIdentity(SEED);
+    const learned::TerrainPageKey key{.quality = learned::AuthorityQuality::FINAL,
+                                      .coordinate = {.row = 0, .column = 0}};
+    const int64_t edge = learned::AUTHORITY_PAGE_NATIVE_EDGE;
+    const learned::NativeRect region{
+        .rowBegin = 0, .columnBegin = 0, .rowEnd = edge, .columnEnd = edge};
+
+    const std::vector<learned::LearnedAuthorityRequest> requests = {
+        {.quality = learned::AuthorityQuality::FINAL, .region = region}};
+    const auto plan = learned::LearnedAuthorityGraph::build(requests);
+    REQUIRE(plan.isReady());
+    const std::shared_ptr<const learned::LearnedAuthorityGraph> graph = *plan.value();
+    // A budget too small to hold the page's window closure.
+    const size_t tinyBudget = graph->retentionByteBound() / 4;
+    REQUIRE(tinyBudget > 0);
+
+    // Without pinning the build evicts its own required windows and fails.
+    auto executorA = std::make_shared<ZeroTerrainExecutor>();
+    auto backendA = makeInfiniteDiffusionTerrainBackend(SEED, pack, executorA, tinyBudget);
+    auto withoutPin = backendA->inferPage(identity, key);
+    CHECK_FALSE(withoutPin.isReady());
+
+    // Pinning the plan's closure keeps every window resident, so the same build
+    // succeeds and the whole closure stays in the cache.
+    auto executorB = std::make_shared<ZeroTerrainExecutor>();
+    auto backendB = makeInfiniteDiffusionTerrainBackend(SEED, pack, executorB, tinyBudget);
+    const std::shared_ptr<void> handle = backendB->retainWindowGraph(*graph);
+    auto withPin = backendB->inferPage(identity, key);
+    REQUIRE(withPin.isReady());
+    CHECK(backendB->tensorWindowCacheBytes() >= graph->retentionByteBound());
+    // A repeated build reuses the pinned closure without any new model calls.
+    const uint64_t callsAfterFirst = executorB->calls.load();
+    auto repeated = backendB->inferPage(identity, key);
+    REQUIRE(repeated.isReady());
+    CHECK(executorB->calls.load() == callsAfterFirst);
 }
 
 TEST_CASE("InfiniteDiffusion attributes inference to its authority phase",

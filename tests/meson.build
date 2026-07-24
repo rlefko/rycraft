@@ -28,6 +28,7 @@ test_sources = files(
   'test_fluid_persistence.mm',
   'test_saves.mm',
   'test_learned_terrain.mm',
+  'test_learned_authority_graph.mm',
   'test_hydrology_authority.mm',
   'test_native_hydrology.mm',
   'test_terrain_bootstrap.mm',
