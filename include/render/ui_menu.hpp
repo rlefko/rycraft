@@ -3,6 +3,7 @@
 #include "engine/game_state.hpp"
 #include "world/item.hpp"
 #include "world/macro_generation.hpp"
+#include "world/terrain_bootstrap.hpp"
 #include "world/view_distance.hpp"
 #include "world/world_config.hpp"
 
@@ -97,6 +98,27 @@ struct MenuLayout {
     std::vector<SlotWidget> slots;
     std::vector<MeterWidget> meters;
     float dimR = 0.f, dimG = 0.f, dimB = 0.f; // tint over the full-screen dim
+    UIRect progressTrack{};
+    float progressFraction = -1.f;
+};
+
+struct V4WorldPreparationSnapshot {
+    // FINAL terrain and canonical water have certified a dry candidate, or
+    // radius-zero exact validation has accepted a learned-only continental
+    // proposal. Exact support, headroom, persistence, and the bounded playable
+    // collision neighborhood are represented separately by safeSpawnReady.
+    bool drySpawnValidated = true;
+    // The selected owner's FINAL authority is ready for exact generation.
+    bool finalSpawnTerrainReady = true;
+    bool safeSpawnReady = false;
+    int configuredHorizonRadiusChunks = 0;
+    int entryHorizonRadiusChunks = 0;
+    float connectedParentRadiusChunks = 0.0F;
+    uint32_t farBaseReady = 0;
+    uint32_t farBaseRequired = 0;
+    uint32_t nearFinalReady = 0;
+    uint32_t nearFinalRequired = 0;
+    double elapsedSeconds = 0.0;
 };
 
 // Typed hit-testing across every widget kind. menuHitTest remains for
@@ -174,9 +196,26 @@ struct PerformanceStats {
     uint32_t farActiveUrgentRefinements = 0;
     uint32_t farWorkerBudget = 0;
     uint32_t farCachedBaseTiles = 0;
+    uint32_t farCanopyInFlight = 0;
+    uint32_t farActiveCanopyWorkers = 0;
+    uint32_t farQueuedCanopies = 0;
+    uint32_t farParkedCanopies = 0;
+    uint32_t farCompletedCanopies = 0;
+    uint32_t farCanopyCacheEntries = 0;
+    uint64_t farCanopyFailures = 0;
+    uint64_t farCanopyDeferrals = 0;
+    uint64_t farCanopyAuthorityResumes = 0;
     float farCoverageFrontierBlocks = 0.f;
     float farCacheMB = 0.f;
+    float farCanopyCacheMB = 0.f;
     float farMeshMB = 0.f;
+    float farPlannerMsLast = 0.f;
+    float farPlannerMsP95 = 0.f;
+    float farPlannerMsMax = 0.f;
+    uint64_t farArenaAdmissionDenials = 0;
+    uint32_t publicationLightDeferredQueue = 0;
+    uint64_t publicationLightDeferredCubes = 0;
+    uint32_t publicationLightMaxSyncFloods = 0;
     int64_t cubeX = 0;
     int32_t cubeY = 0;
     int64_t cubeZ = 0;
@@ -209,6 +248,8 @@ struct PerformanceStats {
     uint64_t weatherRequests = 0;
     uint64_t weatherCoalescedRequests = 0;
     uint64_t weatherBuildsStarted = 0;
+    uint64_t weatherBuildsDeferred = 0;
+    uint64_t weatherBuildsFailed = 0;
     uint64_t weatherSnapshotsPublished = 0;
     uint64_t weatherStaleBuildsDiscarded = 0;
     uint32_t weatherPendingRequests = 0;
@@ -284,7 +325,7 @@ struct WorldCreateState {
     bool dayCycle = true;
     bool creative = false;
     static constexpr size_t MAX_NAME_LENGTH = 24;
-    static constexpr size_t MAX_SEED_LENGTH = 10;
+    static constexpr size_t MAX_SEED_LENGTH = 20;
 };
 
 // Field charset enforcement in one place: the world-name charset comes from
@@ -315,8 +356,12 @@ struct MenuContext {
     std::vector<std::string> worldRows;    // display labels, cached on entry
     WorldSelectState worldSelect{};
     WorldCreateState worldCreate{};
+    bool selectedWorldRequiresV4Successor = false;
+    bool allowWorldCreation = true;
+    std::string worldCreationUnavailableReason;
     bool caretVisible = true;
     std::string deleteWorldName;
+    std::string successorWorldName;
     std::string deathMessage;
     ContainerView container{};
 };
@@ -333,6 +378,11 @@ MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHei
 // Build the layout for the current screen (Playing returns an empty layout).
 MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeight,
                            const SettingsValues& values, const GraphicsSettings& gfx);
+MenuLayout
+buildTerrainBootstrapLayout(const worldgen::bootstrap::TerrainBootstrapSnapshot& snapshot,
+                            float pixelWidth, float pixelHeight, bool allowWorldSelection = false);
+MenuLayout buildV4WorldPreparationLayout(const V4WorldPreparationSnapshot& snapshot,
+                                         float pixelWidth, float pixelHeight);
 
 // Index of the button under the (normalized) mouse position, or -1.
 int menuHitTest(const MenuLayout& layout, float mouseX, float mouseY);

@@ -252,6 +252,7 @@ void Entity::tick(World& world) {
     // 2. Resolve collision
     Vec3 movement = velocity;
     resolveCollision(world, movement);
+    const bool downwardMovementClipped = velocity.y < 0.0f && movement.y > velocity.y;
 
     // 3. Update position
     position.x += movement.x;
@@ -259,15 +260,14 @@ void Entity::tick(World& world) {
     position.z += movement.z;
 
     // 4. Step assist (only for negative Y movement)
+    onGround = false;
     if (movement.y < 0.f) {
         tryStepAssist(world, movement.y);
     }
 
-    // 5. Update onGround flag: check if block below feet is solid
-    int footX = static_cast<int>(std::floor(position.x));
-    int footY = static_cast<int>(std::floor(position.y)) - 1;
-    int footZ = static_cast<int>(std::floor(position.z));
-    onGround = PhysicsEngine::isSolid(world, footX, footY, footZ);
+    // 5. A clipped downward sweep proves the entity landed on the exact
+    // authored collision shape, including the 9/16-block top of a bed.
+    onGround = onGround || downwardMovementClipped;
 
     // Zero downward velocity while grounded so it does not saturate toward
     // terminal velocity between ticks — the same missing reset that made the

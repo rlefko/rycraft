@@ -1,10 +1,33 @@
 #include "render/item_entity_renderer.hpp"
 
 #include "common/error.hpp"
+#include "render/dynamic_object_lighting.hpp"
+#include "render/metal_ownership.hpp"
 #include "render/pixel_formats.hpp"
 
 #include <cmath>
 #include <vector>
+
+namespace {
+
+EntityModel modelForItem(const ItemEntity& item, size_t index) {
+    const float phase = static_cast<float>(item.ageTicks) * 0.08f + static_cast<float>(index);
+    const float bob = std::sin(static_cast<float>(item.ageTicks) * 0.12f + index) * 0.05f;
+    const float c = std::cos(phase);
+    const float s = std::sin(phase);
+
+    EntityModel model{};
+    model.model = matrix_identity_float4x4;
+    model.model.columns[0] = simd_make_float4(c, 0, -s, 0);
+    model.model.columns[2] = simd_make_float4(s, 0, c, 0);
+    model.model.columns[3] =
+        simd_make_float4(item.position.x, item.position.y + ItemEntity::SIZE * 0.5f + 0.1f + bob,
+                         item.position.z, 1.0f);
+    model.lighting = dynamicObjectLighting(item.renderPackedLight);
+    return model;
+}
+
+} // namespace
 
 const ItemEntityRenderer::Mesh& ItemEntityRenderer::meshFor(ItemType type) {
     const auto key = static_cast<uint16_t>(type);
@@ -83,9 +106,21 @@ ItemEntityRenderer::ItemEntityRenderer(id<MTLDevice> device, id<MTLLibrary> shad
 
     NSError* error = nil;
     _pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    resetMetalObject(pipelineDesc);
+    resetMetalObject(vertexFunc);
+    resetMetalObject(fragmentFunc);
     if (!_pipelineState) {
         RY_LOG_FATAL("Failed to create item entity pipeline state");
     }
+}
+
+ItemEntityRenderer::~ItemEntityRenderer() {
+    for (auto& [key, mesh] : _meshes) {
+        (void)key;
+        resetMetalObject(mesh.vertexBuffer);
+        resetMetalObject(mesh.indexBuffer);
+    }
+    resetMetalObject(_pipelineState);
 }
 
 void ItemEntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
@@ -107,22 +142,30 @@ void ItemEntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffe
 
         const Mesh& mesh = meshFor(item.stack.type);
 
-        // Spin about Y and bob gently; the phase is deterministic from age
-        // plus a per-item offset so a pile does not spin in lockstep.
-        const float phase = static_cast<float>(item.ageTicks) * 0.08f + static_cast<float>(index);
-        const float bob = std::sin(static_cast<float>(item.ageTicks) * 0.12f + index) * 0.05f;
-        const float c = std::cos(phase);
-        const float s = std::sin(phase);
-
-        EntityModel model;
-        model.model = matrix_identity_float4x4;
-        model.model.columns[0] = simd_make_float4(c, 0, -s, 0);
-        model.model.columns[2] = simd_make_float4(s, 0, c, 0);
-        model.model.columns[3] = simd_make_float4(
-            item.position.x, item.position.y + ItemEntity::SIZE * 0.5f + 0.1f + bob,
-            item.position.z, 1.0f);
+        // Spin and bob are shared with the shadow pass so the caster cannot
+        // detach from the visible item.
+        const EntityModel model = modelForItem(item, index);
         [encoder setVertexBytes:&model length:sizeof(model) atIndex:2];
 
+        [encoder setVertexBuffer:mesh.vertexBuffer offset:0 atIndex:0];
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:mesh.indexCount
+                             indexType:MTLIndexTypeUInt16
+                           indexBuffer:mesh.indexBuffer
+                     indexBufferOffset:0];
+    }
+}
+
+void ItemEntityRenderer::renderShadowCasters(id<MTLRenderCommandEncoder> encoder,
+                                             const std::vector<ItemEntity>& items,
+                                             const std::function<bool(const AABB&)>& isVisible) {
+    for (size_t index = 0; index < items.size(); ++index) {
+        const ItemEntity& item = items[index];
+        if (item.stack.empty() || !isVisible(item.getAABB()))
+            continue;
+        const Mesh& mesh = meshFor(item.stack.type);
+        const EntityModel model = modelForItem(item, index);
+        [encoder setVertexBytes:&model length:sizeof(model) atIndex:2];
         [encoder setVertexBuffer:mesh.vertexBuffer offset:0 atIndex:0];
         [encoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                             indexCount:mesh.indexCount

@@ -21,8 +21,18 @@ constexpr uint64_t TREE_CANDIDATE_STREAM = 0x5452454543414E44ULL;
 constexpr uint64_t TREE_PRIORITY_STREAM = 0x545245455052494FULL;
 constexpr uint64_t TREE_SHAPE_STREAM = 0x5452454553484150ULL;
 constexpr uint64_t FAR_CANOPY_CLUSTER_STREAM = 0x46415243414E4F50ULL;
+constexpr uint64_t FAR_FLORA_CANDIDATE_STREAM = 0x464152464C4F5241ULL;
+constexpr uint64_t FAR_FLORA_RETENTION_STREAM = 0x464C4F52414C4F44ULL;
 constexpr uint64_t FLORA_STREAM = 0x464C4F524143454CULL;
 constexpr uint64_t FLORA_BIOME_STREAM = 0x464C4F524142494FULL;
+constexpr int64_t FAR_CANOPY_CLUSTER_CELL_EDGE = 64;
+constexpr int FAR_CANOPY_CLUSTER_CANDIDATE_COUNT = 6;
+constexpr int64_t FAR_FLORA_CELL_EDGE = 8;
+constexpr int FAR_FLORA_CANDIDATE_COUNT = 4;
+constexpr double FAR_CANOPY_EXACT_OPPORTUNITIES_PER_CLUSTER_CANDIDATE =
+    static_cast<double>((FAR_CANOPY_CLUSTER_CELL_EDGE / feature_generation::TREE_CELL_EDGE) *
+                        (FAR_CANOPY_CLUSTER_CELL_EDGE / feature_generation::TREE_CELL_EDGE)) /
+    FAR_CANOPY_CLUSTER_CANDIDATE_COUNT;
 
 using TreeKind = feature_generation::TreeSpecies;
 
@@ -263,8 +273,9 @@ std::pair<BlockType, BlockType> canopyBlocks(TreeKind kind) {
         case TreeKind::BIRCH:
             return {BlockType::BIRCH_LOG, BlockType::BIRCH_LEAVES};
         case TreeKind::SPRUCE:
-        case TreeKind::ALPINE_SCRUB:
             return {BlockType::SPRUCE_LOG, BlockType::SPRUCE_LEAVES};
+        case TreeKind::ALPINE_SCRUB:
+            return {BlockType::AIR, BlockType::SHRUB};
         case TreeKind::ACACIA:
             return {BlockType::ACACIA_LOG, BlockType::ACACIA_LEAVES};
         case TreeKind::JUNGLE:
@@ -290,7 +301,13 @@ struct CoarseCanopyDimensions {
     uint8_t radius = 0;
 };
 
-CoarseCanopyDimensions coarseCanopyDimensions(BlockType leafBlock, int heightVariation) {
+CoarseCanopyDimensions coarseCanopyDimensions(TreeKind kind, BlockType leafBlock,
+                                              int heightVariation) {
+    if (kind == TreeKind::ALPINE_SCRUB) {
+        return {.topOffset = 1 + heightVariation,
+                .crownBottomOffset = 0,
+                .radius = static_cast<uint8_t>(1 + heightVariation)};
+    }
     switch (leafBlock) {
         case BlockType::SPRUCE_LEAVES:
             return {.topOffset = 10 + heightVariation, .crownBottomOffset = 2, .radius = 3};
@@ -343,7 +360,8 @@ double availableSurfaceLight(const worldgen::SurfaceSample& surface) {
 }
 
 int generatedWaterDepth(const worldgen::SurfaceSample& surface, int groundSurfaceY) {
-    if (!(surface.hydrology.ocean || surface.hydrology.river || surface.hydrology.lake) ||
+    if (!(surface.hydrology.ocean || surface.hydrology.river || surface.hydrology.lake ||
+          surface.hydrology.wetland) ||
         !std::isfinite(surface.waterSurface)) {
         return 0;
     }
@@ -378,7 +396,7 @@ double floodHabitatAffinity(TreeKind kind, const worldgen::SurfaceSample& surfac
 int habitatGroundSurfaceY(const worldgen::SurfaceSample& surface) {
     // Final block-footprint samples report the emitted top face. The rooting
     // block is the voxel immediately below that face for dry and wet terrain.
-    return static_cast<int>(std::ceil(surface.terrainHeight)) - 1;
+    return static_cast<int>(std::ceil(worldgen::geometryTerrainHeight(surface))) - 1;
 }
 
 feature_generation::TreeHabitatEvaluation
@@ -466,6 +484,17 @@ feature_generation::evaluateTreeHabitat(TreeSpecies species, const worldgen::Sur
                                           maximumBiomeSuitability(surface));
 }
 
+double feature_generation::farCanopyAggregateAcceptance(double exactCandidateAcceptance) {
+    const double bounded = std::clamp(exactCandidateAcceptance, 0.0, 1.0);
+    return 1.0 - std::pow(1.0 - bounded, FAR_CANOPY_EXACT_OPPORTUNITIES_PER_CLUSTER_CANDIDATE);
+}
+
+bool feature_generation::previewFarEcologyRejectsRoot(
+    const worldgen::SurfaceSample& surface) noexcept {
+    return surface.hydrology.ocean || surface.hydrology.river || surface.hydrology.lake ||
+           surface.hydrology.wetland || surface.hydrology.waterfall;
+}
+
 namespace {
 
 struct SelectedTreeKind {
@@ -475,7 +504,7 @@ struct SelectedTreeKind {
 
 std::optional<SelectedTreeKind> selectTreeKind(const worldgen::SurfaceSample& surface,
                                                int groundSurfaceY, double roll,
-                                               bool includeGroundForms = true) {
+                                               bool includeFallenLogs = true) {
     constexpr size_t SPECIES_COUNT = static_cast<size_t>(TreeKind::COUNT);
     std::array<double, SPECIES_COUNT> weights{};
     std::array<feature_generation::TreeHabitatEvaluation, SPECIES_COUNT> habitats{};
@@ -484,10 +513,7 @@ std::optional<SelectedTreeKind> selectTreeKind(const worldgen::SurfaceSample& su
     double total = 0.0;
     for (size_t index = 0; index < SPECIES_COUNT; ++index) {
         const TreeKind kind = static_cast<TreeKind>(index);
-        if (!includeGroundForms &&
-            (kind == TreeKind::FALLEN_LOG || kind == TreeKind::ALPINE_SCRUB)) {
-            continue;
-        }
+        if (!includeFallenLogs && kind == TreeKind::FALLEN_LOG) continue;
         const feature_generation::TreeHabitatEvaluation habitat = evaluateTreeHabitatWithContext(
             kind, surface, groundSurfaceY, cover, maximumSuitability);
         if (!habitat.allowed) continue;
@@ -1165,6 +1191,94 @@ struct FloraWriter {
     }
 };
 
+struct GroundFloraDescription {
+    BlockType block = BlockType::AIR;
+    uint8_t height = 1;
+};
+
+template <typename SupportFunction>
+std::optional<GroundFloraDescription>
+describeGroundFlora(const CounterRng& random, const worldgen::SurfaceSample& surface, int64_t x,
+                    int terrainY, int64_t z, SupportFunction&& supportsFlora) {
+    const double roll = random.uniform01(FLORA_STREAM, x, terrainY, z, 0);
+    const double kindRoll = random.uniform01(FLORA_STREAM, x, terrainY, z, 1);
+    const Biome biome = ditheredBiome(surface, random, FLORA_BIOME_STREAM, x, z);
+    const Biome substrateBiome = worldgen::surface_material::materialBiome(surface, random, x, z);
+    const double barrenWeight = worldgen::biomeBlendWeight(surface.biome, Biome::VOLCANIC_BARREN);
+    const double volcanicStress = std::max(
+        barrenWeight, std::clamp((surface.geology.volcanicActivity - 0.32) / 0.42, 0.0, 1.0));
+    const double growthFit = 1.0 - volcanicStress;
+    if (growthFit <= 0.01 || substrateBiome == Biome::VOLCANIC_BARREN ||
+        worldgen::hasEcotope(surface.ecotopes, worldgen::Ecotope::GEOTHERMAL)) {
+        return std::nullopt;
+    }
+
+    const double riparianInfluence = std::max(
+        {worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::RIVERBANK),
+         worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::LAKESHORE),
+         worldgen::MacroGenerationSampler::ecotopeInfluence(surface, worldgen::Ecotope::FLOODPLAIN),
+         worldgen::biomeBlendWeight(surface.biome, Biome::MANGROVE),
+         worldgen::biomeBlendWeight(surface.biome, Biome::FLOODED_GRASSLAND)});
+    if (surface.soil.moisture > 0.50 && roll < 0.22 * riparianInfluence * growthFit) {
+        if (!supportsFlora()) return std::nullopt;
+        const BlockType plant = kindRoll < 0.58 ? BlockType::CATTAIL : BlockType::REED;
+        const int height = plant == BlockType::REED ? 2 + static_cast<int>(kindRoll * 3.0) : 2;
+        return GroundFloraDescription{plant, static_cast<uint8_t>(height)};
+    }
+
+    if (biome == Biome::ALPINE || biome == Biome::MONTANE_GRASSLAND) {
+        const double slopeFit = std::clamp(1.0 - surface.slope / 1.65, 0.0, 1.0);
+        const double scrubSuitability =
+            std::clamp(surface.soil.moisture * 0.30 + surface.soil.fertility * 0.34 +
+                           slopeFit * 0.24 + availableSurfaceLight(surface) * 0.12,
+                       0.0, 1.0);
+        if (roll < scrubSuitability * 0.26 * growthFit && supportsFlora()) {
+            return GroundFloraDescription{BlockType::SHRUB, 1};
+        }
+        if (roll < scrubSuitability * 0.34 * growthFit && kindRoll > 0.55 && supportsFlora()) {
+            return GroundFloraDescription{BlockType::FERN, 1};
+        }
+        return std::nullopt;
+    }
+
+    if (biome == Biome::DESERT || biome == Biome::COLD_DESERT || biome == Biome::BADLANDS) {
+        if (roll < 0.018 * growthFit && supportsFlora()) {
+            return GroundFloraDescription{
+                BlockType::CACTUS, static_cast<uint8_t>(1 + static_cast<int>(kindRoll * 3.0))};
+        }
+        if (roll < 0.055 * growthFit && supportsFlora()) {
+            return GroundFloraDescription{
+                kindRoll < 0.45 ? BlockType::SUCCULENT : BlockType::DEAD_BUSH, 1};
+        }
+        return std::nullopt;
+    }
+
+    const double vegetation =
+        std::clamp(surface.soil.moisture * 0.45 + surface.soil.fertility * 0.45 +
+                       surface.climate.relativeHumidity * 0.10 - surface.slope * 0.12,
+                   0.0, 0.72) *
+        growthFit;
+    if (roll >= vegetation || !supportsFlora()) return std::nullopt;
+    BlockType plant = BlockType::TALL_GRASS;
+    if (biome == Biome::TROPICAL_RAINFOREST || biome == Biome::TEMPERATE_RAINFOREST ||
+        biome == Biome::TAIGA || biome == Biome::TEMPERATE_CONIFER_FOREST ||
+        biome == Biome::TROPICAL_CONIFER_FOREST) {
+        plant = kindRoll < 0.62 ? BlockType::FERN : BlockType::SHRUB;
+    } else if (biome == Biome::SHRUBLAND || biome == Biome::STEPPE || biome == Biome::SAVANNA ||
+               biome == Biome::MEDITERRANEAN_WOODLAND || biome == Biome::TROPICAL_DRY_FOREST) {
+        plant = kindRoll < 0.52 ? BlockType::SHRUB : BlockType::TALL_GRASS;
+    } else if (kindRoll > 0.87) {
+        plant = BlockType::FLOWER_BLUE;
+    } else if (kindRoll > 0.77) {
+        plant = BlockType::FLOWER_RED;
+    } else if (kindRoll > 0.67) {
+        plant = BlockType::FLOWER_YELLOW;
+    } else if (surface.climate.relativeHumidity > 0.78 && kindRoll < 0.08) {
+        plant = BlockType::MUSHROOM_BROWN;
+    }
+    return GroundFloraDescription{plant, 1};
+}
+
 } // namespace
 
 FeaturePlacer::FeaturePlacer(uint32_t worldSeed) : random_(worldSeed) {}
@@ -1307,8 +1421,8 @@ FeaturePlacer::collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ, int6
                                         const ChunkGenerator& generator) const {
     std::vector<FarCanopy> result;
     if (minimumX >= maximumX || minimumZ >= maximumZ) return result;
-    constexpr int64_t CELL_EDGE = 64;
-    constexpr int CANDIDATE_COUNT = 6;
+    constexpr int64_t CELL_EDGE = FAR_CANOPY_CLUSTER_CELL_EDGE;
+    constexpr int CANDIDATE_COUNT = FAR_CANOPY_CLUSTER_CANDIDATE_COUNT;
     const auto crownLimitForStep = [](int step) -> size_t {
         if (step <= 2) return 6;
         if (step <= 4) return 5;
@@ -1355,7 +1469,7 @@ FeaturePlacer::collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ, int6
         }
     }
     std::vector<worldgen::SurfaceSample> candidateSurfaces(candidatePositions.size());
-    generator.sampleFarHabitatPoints(candidatePositions, candidateSurfaces);
+    generator.sampleFarEcologyPoints(candidatePositions, lodStep, candidateSurfaces);
 
     for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
         for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
@@ -1372,6 +1486,10 @@ FeaturePlacer::collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ, int6
                 // crowns, and filtered terrain cannot introduce a tree that
                 // exact ecology rejects at a shoreline or material contact.
                 const worldgen::SurfaceSample& surface = candidateSurfaces[index];
+                if (generator.usesPreviewAuthority() &&
+                    feature_generation::previewFarEcologyRejectsRoot(surface)) {
+                    continue;
+                }
                 const Biome substrateBiome =
                     worldgen::surface_material::materialBiome(surface, random_, x, z);
                 const double density = feature_generation::treeCoverDensity(surface);
@@ -1388,10 +1506,13 @@ FeaturePlacer::collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ, int6
                 }
                 const TreeKind kind = selectedKind->kind;
                 const feature_generation::TreeHabitatEvaluation& habitat = selectedKind->habitat;
-                const double acceptance =
+                if (!habitat.allowed || habitat.submerged) continue;
+                const double exactCandidateAcceptance =
                     std::clamp(density * (0.70 + habitat.suitability * 0.52), 0.0, 1.0);
-                if (!habitat.allowed || random_.uniform01(FAR_CANOPY_CLUSTER_STREAM, cellX, slot,
-                                                          cellZ, 2) >= acceptance) {
+                const double acceptance =
+                    feature_generation::farCanopyAggregateAcceptance(exactCandidateAcceptance);
+                if (random_.uniform01(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 2) >=
+                    acceptance) {
                     continue;
                 }
 
@@ -1399,7 +1520,7 @@ FeaturePlacer::collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ, int6
                 const int heightVariation =
                     random_.uniformInt(FAR_CANOPY_CLUSTER_STREAM, cellX, slot, cellZ, 3, 0, 1);
                 const CoarseCanopyDimensions dimensions =
-                    coarseCanopyDimensions(leafBlock, heightVariation);
+                    coarseCanopyDimensions(kind, leafBlock, heightVariation);
                 const int baseY = groundSurfaceY + 1;
                 const int formX =
                     kind == TreeKind::ACACIA || kind == TreeKind::PALM
@@ -1465,6 +1586,104 @@ FeaturePlacer::collectFarCanopyClusters(int64_t minimumX, int64_t minimumZ, int6
     return result;
 }
 
+std::vector<FarFlora> FeaturePlacer::collectFarFlora(int64_t minimumX, int64_t minimumZ,
+                                                     int64_t maximumX, int64_t maximumZ,
+                                                     int lodStep,
+                                                     const ChunkGenerator& generator) const {
+    std::vector<FarFlora> result;
+    if (minimumX >= maximumX || minimumZ >= maximumZ) return result;
+
+    const int64_t minimumCellX = world_coord::floorDiv(minimumX, FAR_FLORA_CELL_EDGE);
+    const int64_t maximumCellX = world_coord::floorDiv(maximumX - 1, FAR_FLORA_CELL_EDGE);
+    const int64_t minimumCellZ = world_coord::floorDiv(minimumZ, FAR_FLORA_CELL_EDGE);
+    const int64_t maximumCellZ = world_coord::floorDiv(maximumZ - 1, FAR_FLORA_CELL_EDGE);
+    const uint8_t retentionSlots = lodStep <= 2    ? 8
+                                   : lodStep <= 4  ? 6
+                                   : lodStep <= 8  ? 4
+                                   : lodStep <= 16 ? 2
+                                                   : 1;
+
+    struct Candidate {
+        ColumnPos position;
+        int64_t cellX = 0;
+        int64_t cellZ = 0;
+        int slot = 0;
+    };
+    std::vector<Candidate> candidates;
+    const auto appendCoordinate = [](int64_t cell, int offset) -> std::optional<int64_t> {
+        const __int128 coordinate = static_cast<__int128>(cell) * FAR_FLORA_CELL_EDGE + offset;
+        if (coordinate < std::numeric_limits<int64_t>::min() ||
+            coordinate > std::numeric_limits<int64_t>::max()) {
+            return std::nullopt;
+        }
+        return static_cast<int64_t>(coordinate);
+    };
+    for (int64_t cellZ = minimumCellZ; cellZ <= maximumCellZ; ++cellZ) {
+        for (int64_t cellX = minimumCellX; cellX <= maximumCellX; ++cellX) {
+            for (int slot = 0; slot < FAR_FLORA_CANDIDATE_COUNT; ++slot) {
+                const uint64_t retentionRank =
+                    random_.u64(FAR_FLORA_RETENTION_STREAM, cellX, slot, cellZ, 0);
+                if ((retentionRank & 7U) >= retentionSlots) continue;
+                const int quadrantX = (slot & 1) * 4;
+                const int quadrantZ = (slot >> 1) * 4;
+                const int offsetX = quadrantX + random_.uniformInt(FAR_FLORA_CANDIDATE_STREAM,
+                                                                   cellX, slot, cellZ, 0, 0, 3);
+                const int offsetZ = quadrantZ + random_.uniformInt(FAR_FLORA_CANDIDATE_STREAM,
+                                                                   cellX, slot, cellZ, 1, 0, 3);
+                const std::optional<int64_t> x = appendCoordinate(cellX, offsetX);
+                const std::optional<int64_t> z = appendCoordinate(cellZ, offsetZ);
+                if (!x.has_value() || !z.has_value() || *x < minimumX || *x >= maximumX ||
+                    *z < minimumZ || *z >= maximumZ) {
+                    continue;
+                }
+                candidates.push_back(
+                    {.position = {*x, *z}, .cellX = cellX, .cellZ = cellZ, .slot = slot});
+            }
+        }
+    }
+    if (candidates.empty()) return result;
+
+    std::vector<ColumnPos> positions;
+    positions.reserve(candidates.size());
+    for (const Candidate& candidate : candidates)
+        positions.push_back(candidate.position);
+    std::vector<worldgen::SurfaceSample> surfaces(positions.size());
+    generator.sampleFarEcologyPoints(positions, lodStep, surfaces);
+    result.reserve(candidates.size() / 2);
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const Candidate& candidate = candidates[index];
+        const worldgen::SurfaceSample& surface = surfaces[index];
+        const int terrainY = habitatGroundSurfaceY(surface);
+        // Exact flora emission cannot replace a generated water block. Keep
+        // that same rule in the aggregate authority so submerged grass never
+        // protrudes through a lake while the exact cube is loading.
+        if ((generator.usesPreviewAuthority() &&
+             feature_generation::previewFarEcologyRejectsRoot(surface)) ||
+            generatedWaterDepth(surface, terrainY) > 0 || surface.hydrology.waterfall) {
+            continue;
+        }
+        std::optional<bool> supportsFlora;
+        const auto description = describeGroundFlora(
+            random_, surface, candidate.position.x, terrainY, candidate.position.z, [&] {
+                if (!supportsFlora.has_value()) {
+                    supportsFlora = worldgen::surface_material::supportsSurfaceFlora(
+                        generator.farSurfaceMaterialAt(candidate.position.x, candidate.position.z,
+                                                       surface));
+                }
+                return *supportsFlora;
+            });
+        if (!description.has_value() || !rendersAsCross(description->block)) continue;
+        result.push_back({.x = candidate.position.x,
+                          .z = candidate.position.z,
+                          .baseY = terrainY + 1,
+                          .block = description->block,
+                          .height = description->height,
+                          .anchorId = random_.u64(FAR_FLORA_CANDIDATE_STREAM, candidate.cellX,
+                                                  candidate.slot, candidate.cellZ, 2)});
+    }
+    return result;
+}
+
 void FeaturePlacer::placeFlora(Chunk& chunk, const ChunkGenerator& generator,
                                GenScratch& scratch) const {
     const int64_t baseX = chunk.chunkX * CHUNK_EDGE;
@@ -1479,7 +1698,6 @@ void FeaturePlacer::placeFlora(Chunk& chunk, const ChunkGenerator& generator,
             const worldgen::SurfaceSample surface = generator.sampleSurface(x, z);
             const int terrainY = generator.surfaceYAt(x, z, scratch);
             const double roll = random_.uniform01(FLORA_STREAM, x, terrainY, z, 0);
-            const double kindRoll = random_.uniform01(FLORA_STREAM, x, terrainY, z, 1);
             const Biome biome = ditheredBiome(surface, random_, FLORA_BIOME_STREAM, x, z);
             const Biome substrateBiome =
                 worldgen::surface_material::materialBiome(surface, random_, x, z);
@@ -1509,81 +1727,12 @@ void FeaturePlacer::placeFlora(Chunk& chunk, const ChunkGenerator& generator,
                     writer.setIfAir(x, waterTop + 1, z, BlockType::LILY_PAD);
                 }
             }
-
-            const double riparianInfluence = std::max(
-                {worldgen::MacroGenerationSampler::ecotopeInfluence(surface,
-                                                                    worldgen::Ecotope::RIVERBANK),
-                 worldgen::MacroGenerationSampler::ecotopeInfluence(surface,
-                                                                    worldgen::Ecotope::LAKESHORE),
-                 worldgen::MacroGenerationSampler::ecotopeInfluence(surface,
-                                                                    worldgen::Ecotope::FLOODPLAIN),
-                 worldgen::biomeBlendWeight(surface.biome, Biome::MANGROVE),
-                 worldgen::biomeBlendWeight(surface.biome, Biome::FLOODED_GRASSLAND)});
-            if (surface.soil.moisture > 0.50 && roll < 0.22 * riparianInfluence * growthFit) {
-                if (!supportsFlora()) continue;
-                const BlockType plant = kindRoll < 0.58 ? BlockType::CATTAIL : BlockType::REED;
-                const int height =
-                    plant == BlockType::REED ? 2 + static_cast<int>(kindRoll * 3.0) : 2;
-                for (int offset = 1; offset <= height; ++offset) {
-                    if (!writer.setIfAir(x, terrainY + offset, z, plant)) break;
-                }
-                continue;
+            const std::optional<GroundFloraDescription> description =
+                describeGroundFlora(random_, surface, x, terrainY, z, supportsFlora);
+            if (!description.has_value()) continue;
+            for (int offset = 1; offset <= description->height; ++offset) {
+                if (!writer.setIfAir(x, terrainY + offset, z, description->block)) break;
             }
-
-            if (biome == Biome::ALPINE || biome == Biome::MONTANE_GRASSLAND) {
-                const double slopeFit = std::clamp(1.0 - surface.slope / 1.65, 0.0, 1.0);
-                const double scrubSuitability =
-                    std::clamp(surface.soil.moisture * 0.30 + surface.soil.fertility * 0.34 +
-                                   slopeFit * 0.24 + availableSurfaceLight(surface) * 0.12,
-                               0.0, 1.0);
-                if (roll < scrubSuitability * 0.26 * growthFit && supportsFlora()) {
-                    writer.setIfAir(x, terrainY + 1, z, BlockType::SHRUB);
-                } else if (roll < scrubSuitability * 0.34 * growthFit && kindRoll > 0.55 &&
-                           supportsFlora()) {
-                    writer.setIfAir(x, terrainY + 1, z, BlockType::FERN);
-                }
-                continue;
-            }
-
-            if (biome == Biome::DESERT || biome == Biome::COLD_DESERT || biome == Biome::BADLANDS) {
-                if (roll < 0.018 * growthFit && supportsFlora()) {
-                    const int height = 1 + static_cast<int>(kindRoll * 3.0);
-                    for (int offset = 1; offset <= height; ++offset) {
-                        if (!writer.setIfAir(x, terrainY + offset, z, BlockType::CACTUS)) break;
-                    }
-                } else if (roll < 0.055 * growthFit && supportsFlora()) {
-                    writer.setIfAir(x, terrainY + 1, z,
-                                    kindRoll < 0.45 ? BlockType::SUCCULENT : BlockType::DEAD_BUSH);
-                }
-                continue;
-            }
-
-            const double vegetation =
-                std::clamp(surface.soil.moisture * 0.45 + surface.soil.fertility * 0.45 +
-                               surface.climate.relativeHumidity * 0.10 - surface.slope * 0.12,
-                           0.0, 0.72) *
-                growthFit;
-            if (roll >= vegetation) continue;
-            if (!supportsFlora()) continue;
-            BlockType plant = BlockType::TALL_GRASS;
-            if (biome == Biome::TROPICAL_RAINFOREST || biome == Biome::TEMPERATE_RAINFOREST ||
-                biome == Biome::TAIGA || biome == Biome::TEMPERATE_CONIFER_FOREST ||
-                biome == Biome::TROPICAL_CONIFER_FOREST) {
-                plant = kindRoll < 0.62 ? BlockType::FERN : BlockType::SHRUB;
-            } else if (biome == Biome::SHRUBLAND || biome == Biome::STEPPE ||
-                       biome == Biome::SAVANNA || biome == Biome::MEDITERRANEAN_WOODLAND ||
-                       biome == Biome::TROPICAL_DRY_FOREST) {
-                plant = kindRoll < 0.52 ? BlockType::SHRUB : BlockType::TALL_GRASS;
-            } else if (kindRoll > 0.87) {
-                plant = BlockType::FLOWER_BLUE;
-            } else if (kindRoll > 0.77) {
-                plant = BlockType::FLOWER_RED;
-            } else if (kindRoll > 0.67) {
-                plant = BlockType::FLOWER_YELLOW;
-            } else if (surface.climate.relativeHumidity > 0.78 && kindRoll < 0.08) {
-                plant = BlockType::MUSHROOM_BROWN;
-            }
-            writer.setIfAir(x, terrainY + 1, z, plant);
         }
     }
 }

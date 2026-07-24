@@ -47,6 +47,20 @@ ShadowMap::ShadowMap(id<MTLDevice> device, id<MTLLibrary> shaderLibrary,
         RY_LOG_FATAL("Failed to create shadow chunk pipeline state");
     }
 
+    id<MTLFunction> entityVertex = [shaderLibrary newFunctionWithName:@"entityShadowVertexMain"];
+    if (!entityVertex) {
+        RY_LOG_FATAL("Failed to load dynamic-object shadow vertex function");
+    }
+    auto entityDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    entityDesc.vertexFunction = entityVertex;
+    entityDesc.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
+    _entityPipeline = [_device newRenderPipelineStateWithDescriptor:entityDesc error:&error];
+    resetMetalObject(entityDesc);
+    resetMetalObject(entityVertex);
+    if (!_entityPipeline) {
+        RY_LOG_FATAL("Failed to create dynamic-object shadow pipeline state");
+    }
+
     // Shadow casters write depth, standard less-than test.
     auto depthDesc = [[MTLDepthStencilDescriptor alloc] init];
     depthDesc.depthCompareFunction = MTLCompareFunctionLess;
@@ -74,6 +88,7 @@ ShadowMap::~ShadowMap() {
     resetMetalObject(_horizonDepthTexture);
     resetMetalObject(_depthState);
     resetMetalObject(_chunkPipeline);
+    resetMetalObject(_entityPipeline);
     resetMetalObject(_comparisonSampler);
 }
 

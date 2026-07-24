@@ -31,8 +31,8 @@ struct VertexOutput {
     float vLight;
     float vSkyLight;          // propagated skylight 0-1 (ambient access)
     float vAO;                // baked corner AO 0.5-1 (per-vertex crease shading)
-    float vBlockLight;        // lava block light 0-1 (warm cave glow)
-    float vEmissive;          // 1 = self-lit block (lava), 0 = normally lit
+    float vBlockLight;        // propagated block light 0-1 (warm local glow)
+    float vEmissive;          // 1 = emissive source texels, 0 = normally lit
     float vFoliage;           // shading class: 0 solid, 1 = cross-quad flora
                               // (two-sided facing + SSS), 2 = leaf cube (SSS only)
     float3 vWorldPosition;    // Displayed world-space position for fog and light
@@ -41,8 +41,6 @@ struct VertexOutput {
     uint vTextureLayer [[flat]];
     uint vFace [[flat]];
     uint vFarCanopy [[flat]];
-    uint vFarSkirt [[flat]];
-    uint vFarSkirtMask [[flat]];
     uint vFarTerrain [[flat]];
     float vLodTransitionProgress [[flat]];
     float vCoverageFrontier [[flat]];
@@ -136,14 +134,12 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
     out.vTextureLayer = (in.faceAttr >> 3) & 0xFFu;
     out.vFace = normalIdx;
     out.vFarCanopy = (in.faceAttr & FAR_TERRAIN_CANOPY_ATTRIBUTE_MASK) != 0u;
-    out.vFarSkirt = (in.faceAttr & FAR_TERRAIN_SKIRT_ATTRIBUTE_MASK) != 0u;
-    out.vFarSkirtMask = chunkOrigin.farMetadata.x;
     out.vFarTerrain = chunkOrigin.farMetadata.w;
     out.vLodTransitionProgress = as_type<float>(chunkOrigin.farMetadata.z);
     out.vCoverageFrontier = as_type<float>(chunkOrigin.farMetadata.y);
     out.vSkyLight = float((in.faceAttr >> 11) & 15u) / 15.0f;
     out.vAO = 0.5f + float((in.faceAttr >> 15) & 3u) * (1.0f / 6.0f);
-    // Block light (bits 17-20) and the emissive flag (bit 21), the lava glow.
+    // Block light (bits 17-20) and the emissive-source gate (bit 21).
     out.vBlockLight = float((in.faceAttr >> 17) & 15u) / 15.0f;
     out.vEmissive = float((in.faceAttr >> 21) & 1u);
     // Shading class: every cross quad (grass, flowers, reeds, mushrooms)
@@ -173,13 +169,52 @@ vertex VertexOutput vertexMain(VertexInput in [[stage_in]],
 struct SurfaceFragmentOutput {
     float4 scene [[color(0)]];
     float4 surface [[color(1)]];
+    float reactive [[color(2)]];
+    float depthKey [[color(3)]];
 };
+
+struct SceneTileData {
+    half4 scene [[color(0)]];
+    half4 surface [[color(1)]];
+    half reactive [[color(2)]];
+    float depthKey [[color(3)]];
+};
+
+kernel void
+coherentSceneResolveTileKernel(imageblock<SceneTileData, imageblock_layout_implicit> sceneBlock,
+                               ushort2 tid [[thread_position_in_threadgroup]]) {
+    const ushort colorCount = sceneBlock.get_num_colors(tid);
+    const ushort sampleCount = sceneBlock.get_num_samples();
+    half3 accumulatedHDR = half3(0.0h);
+    SceneTileData nearest = sceneBlock.read(tid, 0, imageblock_data_rate::color);
+    float nearestDepth = nearest.depthKey;
+
+    for (ushort colorIndex = 0; colorIndex < colorCount; ++colorIndex) {
+        const SceneTileData candidate =
+            sceneBlock.read(tid, colorIndex, imageblock_data_rate::color);
+        const ushort coverage = popcount(sceneBlock.get_color_coverage_mask(tid, colorIndex));
+        accumulatedHDR += candidate.scene.rgb * half(coverage);
+        if (candidate.depthKey < nearestDepth) {
+            nearest = candidate;
+            nearestDepth = candidate.depthKey;
+        }
+    }
+
+    SceneTileData resolved;
+    resolved.scene = half4(accumulatedHDR / half(max(sampleCount, ushort(1))), 1.0h);
+    resolved.surface = nearest.surface;
+    resolved.reactive = nearest.reactive;
+    resolved.depthKey = nearestDepth;
+    const ushort outputMask = ushort((1u << sampleCount) - 1u);
+    sceneBlock.write(resolved, tid, outputMask);
+}
 
 fragment SurfaceFragmentOutput fragmentMain(
     VertexOutput in [[stage_in]], texture2d_array<float> blockTextures [[texture(0)]],
     sampler blockSampler [[sampler(0)]], depth2d_array<float> nearShadow [[texture(1)]],
     depth2d_array<float> farShadow [[texture(2)]], depth2d<float> horizonShadow [[texture(3)]],
-    texture2d<float> cloudShadow [[texture(4)]], sampler shadowSampler [[sampler(1)]],
+    texture2d<float> cloudShadow [[texture(4)]],
+    texture2d_array<float> emissionMasks [[texture(5)]], sampler shadowSampler [[sampler(1)]],
     constant Uniforms& uniforms [[buffer(1)]], constant ShadowUniforms& shadow [[buffer(4)]],
     constant FarTerrainOwnershipUniforms& ownership [[buffer(5)]],
     constant CloudShadowUniforms& cloudShadowUniforms [[buffer(6)]]) {
@@ -188,28 +223,16 @@ fragment SurfaceFragmentOutput fragmentMain(
         discard_fragment();
     }
     const bool useEmittingColumn =
-        farTerrainOpaqueRiserUsesEmittingColumn(in.vFace, in.vFarCanopy != 0u, in.vFarSkirt != 0u);
+        farTerrainOpaqueRiserUsesEmittingColumn(in.vFace, in.vFarCanopy != 0u);
     if (in.vFarTerrain != 0u) {
-        bool exactOwnsFragment = farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace,
-                                                                   useEmittingColumn, ownership);
-        if (in.vFarSkirt != 0u) {
-            const bool emittingColumnOwnedByExact =
-                farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace, true, ownership);
-            const float2 receivingPosition =
-                farTerrainSkirtReceivingOwnershipSamplePosition(in.vFarLocalPosition, in.vFace);
-            const bool receivingColumnOwnedByExact =
-                farTerrainExactColumnOwnsFragment(receivingPosition, in.vFace, false, ownership);
-            exactOwnsFragment = !farTerrainSkirtOwnersVisible(emittingColumnOwnedByExact,
-                                                              receivingColumnOwnedByExact);
-        }
-        if (exactOwnsFragment) {
+        if (farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace, useEmittingColumn,
+                                              in.vFarCanopy != 0u, ownership)) {
             discard_fragment();
         }
     }
     const float lodThreshold = interleavedGradientNoise(floor(in.vLodWorldPosition));
     const bool lodVisible =
-        in.vFarSkirt != 0u ? farTerrainLodSkirtVisible(in.vLodTransitionProgress, in.vFarTerrain)
-        : in.vFarCanopy != 0u
+        in.vFarCanopy != 0u
             ? farTerrainLodCanopyVisible(in.vLodTransitionProgress, lodThreshold, in.vFarTerrain)
             : farTerrainLodTerrainVisible(in.vLodTransitionProgress, in.vFarTerrain);
     if (!lodVisible) {
@@ -217,15 +240,8 @@ fragment SurfaceFragmentOutput fragmentMain(
     }
     const float coverageFog = farTerrainCoverageFog(horizontalDistance, in.vCoverageFrontier);
     const float lodTerrainFog =
-        in.vFarCanopy == 0u && in.vFarSkirt == 0u
-            ? farTerrainLodTerrainFog(in.vLodTransitionProgress, in.vFarTerrain)
-            : 0.0f;
-    if (in.vFarSkirt != 0u) {
-        const uint edgeBit = 1u << in.vFace;
-        if ((in.vFarSkirtMask & edgeBit) == 0u) {
-            discard_fragment();
-        }
-    }
+        in.vFarCanopy == 0u ? farTerrainLodTerrainFog(in.vLodTransitionProgress, in.vFarTerrain)
+                            : 0.0f;
     // The bound sampler repeats each tile, keeps nearest magnification, and
     // applies trilinear anisotropic filtering during minification. UVs span the
     // quad extent in blocks, so each block gets one full texture tile.
@@ -237,21 +253,13 @@ fragment SurfaceFragmentOutput fragmentMain(
         discard_fragment();
     }
 
-    // Emissive blocks (lava) glow at a fixed HDR level, ignoring sun, shadow,
-    // and skylight, the >1.0 output exceeds the bloom threshold naturally and
-    // makes lava the light source the block-light term below spreads from.
-    // Kept modest so the molten orange survives tonemapping instead of
-    // clipping to white when auto-exposure lifts a dark scene.
+    // The block-level bit is a fast gate. The filtered R8 mask limits emission
+    // to lava, the lit furnace mouth, and the torch flame, so their surrounding
+    // stone and wood still receive ordinary direct and indirect light.
     constexpr float EMISSIVE_BOOST = 3.0f;
+    float emission = 0.0f;
     if (in.vEmissive > 0.5f) {
-        float3 glow = texColor.rgb * EMISSIVE_BOOST;
-        glow = applyFog(glow, in.vWorldPosition, uniforms.cameraPosition, uniforms.fogDensity,
-                        uniforms.fogColor);
-        glow = mix(glow, in.vOverlayColor.rgb, max(saturate(in.vOverlayColor.a), coverageFog));
-        SurfaceFragmentOutput result;
-        result.scene = float4(glow, 1.0f);
-        result.surface = float4(texColor.rgb, 0.0f);
-        return result;
+        emission = emissionMasks.sample(blockSampler, in.vUV, in.vTextureLayer).r;
     }
 
     // Rain-soaked surfaces darken (water fills the surface pores), scaled
@@ -294,9 +302,9 @@ fragment SurfaceFragmentOutput fragmentMain(
         direct *= mix(facing, 1.0f, 0.7f * saturate(uniforms.sunDirection.y));
     }
 
-    // Warm block light from lava: a squared falloff so it reads as a punchy
-    // pool of orange near the source that fades quickly, added on top of the
-    // sun/sky (it is emitted, so the cascade shadow does not gate it).
+    // Warm propagated block light uses a squared response so local emitters
+    // read as a punchy pool of orange that fades quickly. It is added on top
+    // of sun and sky, so the cascade shadow does not gate it.
     constexpr float3 BLOCK_LIGHT_TINT = float3(1.0f, 0.55f, 0.22f);
     constexpr float BLOCK_LIGHT_STRENGTH = 1.5f;
     float3 blockLight = BLOCK_LIGHT_TINT * (in.vBlockLight * in.vBlockLight) * BLOCK_LIGHT_STRENGTH;
@@ -322,13 +330,23 @@ fragment SurfaceFragmentOutput fragmentMain(
         litColor += texColor.rgb * uniforms.sunColor * (sss * 0.55f * lit);
     }
 
+    litColor = mix(litColor, texColor.rgb * EMISSIVE_BOOST, emission);
+
     float3 finalColor = applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                  uniforms.fogDensity, uniforms.fogColor);
     finalColor = mix(finalColor, in.vOverlayColor.rgb,
                      max(max(saturate(in.vOverlayColor.a), coverageFog), lodTerrainFog));
     SurfaceFragmentOutput result;
     result.scene = float4(finalColor, 1.0f);
-    result.surface = float4(texColor.rgb, ambientAccess);
+    result.surface =
+        float4(texColor.rgb,
+               screenSpaceSurfaceDataAlpha(
+                   ambientAccess, screenSpaceNightPersistentSource(emission, in.vBlockLight)));
+    const bool animatedFoliage = in.vFoliage > 0.5f;
+    const bool changingLod = in.vFarTerrain != 0u && in.vLodTransitionProgress > 0.0f &&
+                             in.vLodTransitionProgress < 1.0f;
+    result.reactive = animatedFoliage || changingLod ? 1.0f : 0.0f;
+    result.depthKey = in.clipPosition.z;
     return result;
 }
 
@@ -650,14 +668,17 @@ fragment float4 waterFragmentMain(
     constant CloudShadowUniforms& cloudShadowUniforms [[buffer(6)]]) {
     const float horizontalDistance = distance(in.vWorldPosition.xz, water.cameraPosition.xz);
     if ((in.vFarTerrain != 0u &&
-         farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace, false, ownership)) ||
+         farTerrainExactColumnOwnsFragment(in.vFarLocalPosition, in.vFace, false, false,
+                                           ownership)) ||
         !farTerrainCoverageVisible(horizontalDistance, in.vCoverageFrontier)) {
         discard_fragment();
     }
-    if (!farTerrainLodConnectedGeometryVisible(in.vFarTerrain)) {
+    if (!farTerrainLodConnectedGeometryVisible(in.vLodTransitionProgress, in.vFarTerrain)) {
         discard_fragment();
     }
     const float coverageFog = farTerrainCoverageFog(horizontalDistance, in.vCoverageFrontier);
+    const float lodTerrainFog =
+        farTerrainLodTerrainFog(in.vLodTransitionProgress, in.vFarTerrain);
     constexpr sampler depthPoint(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);
     constexpr sampler colorLinear(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
     float2 screenUV = in.clipPosition.xy / water.resolution;
@@ -922,7 +943,8 @@ fragment float4 waterFragmentMain(
                     saturate(foam) * 0.45f * exteriorSkyVisibility);
     }
 
-    color = mix(color, in.vOverlayColor.rgb, max(saturate(in.vOverlayColor.a), coverageFog));
+    color = mix(color, in.vOverlayColor.rgb,
+                max(max(saturate(in.vOverlayColor.a), coverageFog), lodTerrainFog));
     return float4(color, 1.0f);
 }
 
@@ -1077,6 +1099,7 @@ struct EntityVertexOutput {
     float3 vWorldPosition;
     float vSkyLight;
     float vBlockLight;
+    float vReactive [[flat]];
 };
 
 vertex EntityVertexOutput entityVertexMain(device const EntityVertex* vertices [[buffer(0)]],
@@ -1093,6 +1116,7 @@ vertex EntityVertexOutput entityVertexMain(device const EntityVertex* vertices [
     out.vColor = v.color;
     out.vSkyLight = saturate(entityModel.lighting.x);
     out.vBlockLight = saturate(entityModel.lighting.y);
+    out.vReactive = saturate(entityModel.lighting.z);
     return out;
 }
 
@@ -1118,6 +1142,10 @@ fragment SurfaceFragmentOutput entityFragmentMain(
     result.scene = float4(applyFog(litColor, in.vWorldPosition, uniforms.cameraPosition,
                                    uniforms.fogDensity, uniforms.fogColor),
                           1.0f);
-    result.surface = float4(in.vColor, in.vSkyLight);
+    result.surface = float4(
+        in.vColor, screenSpaceSurfaceDataAlpha(
+                       in.vSkyLight, screenSpaceNightPersistentSource(0.0f, in.vBlockLight)));
+    result.reactive = in.vReactive;
+    result.depthKey = in.clipPosition.z;
     return result;
 }

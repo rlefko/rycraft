@@ -75,6 +75,22 @@ void Inventory::consumeSelected(int amount) {
     }
 }
 
+ItemStack Inventory::exchangeOneSelected(const ItemStack& replacement) {
+    ItemStack& selected = slots_[static_cast<size_t>(selectedIndex_)];
+    if (selected.empty() || replacement.empty()) return replacement;
+    if (selected.count == 1) {
+        selected = replacement;
+        return {};
+    }
+
+    --selected.count;
+    const int absorbed = add(replacement);
+    if (absorbed == replacement.count) return {};
+    ItemStack remainder = replacement;
+    remainder.count = static_cast<uint8_t>(replacement.count - absorbed);
+    return remainder;
+}
+
 bool Inventory::damageSelectedTool() {
     ItemStack& stack = slots_[static_cast<size_t>(selectedIndex_)];
     if (stack.empty() || !isTool(stack.type)) return false;

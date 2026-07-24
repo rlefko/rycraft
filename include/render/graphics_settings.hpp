@@ -61,4 +61,6 @@ struct LoadedSettings {
 bool saveSettings(const std::string& path, const SettingsValues& values,
                   const GraphicsSettings& gfx);
 LoadedSettings loadSettings(const std::string& path);
+// RYCRAFT_SETTINGS_PATH may select an isolated playtest file without changing
+// HOME or reading the user's normal preferences.
 std::string settingsPath(); // ~/Library/Preferences/rycraft/settings.json

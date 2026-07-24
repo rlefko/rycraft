@@ -8,8 +8,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 class World;
@@ -43,12 +46,24 @@ struct MeshSchedulerStats {
     size_t highWater = 0;
     uint64_t coalesced = 0;
     uint64_t droppedStale = 0;
+    uint64_t displaced = 0;
+    uint64_t canceledQueued = 0;
+};
+
+struct MeshCanceledRequest {
+    ChunkPos pos;
+    uint32_t requestedVersion = 0;
 };
 
 enum class MeshPriorityLane : uint8_t {
     BROAD_SURFACE = 0,
     CAMERA_BAND = 1,
     CAMERA_COLUMN = 2,
+};
+
+struct MeshRequestPriority {
+    MeshPriorityLane lane = MeshPriorityLane::BROAD_SURFACE;
+    uint64_t distanceSquared = 0;
 };
 
 inline constexpr size_t EXACT_MESH_CAMERA_RESERVED_SLOTS = 32;
@@ -103,7 +118,25 @@ public:
     // the scheduler is stopping.
     bool enqueue(ChunkPos pos, uint32_t requestedVersion = 0,
                  MeshPriorityLane lane = MeshPriorityLane::BROAD_SURFACE,
-                 uint64_t distanceSquared = 0);
+                 uint64_t distanceSquared = 0,
+                 std::optional<MeshCanceledRequest>* displaced = nullptr);
+
+    // Camera movement replaces the world's immutable candidate snapshot. Drop
+    // requests that have not started and no longer belong to it so an old
+    // exact disk cannot occupy the bounded queue in front of the new camera.
+    // Running jobs remain bounded and finish normally.
+    std::vector<MeshCanceledRequest>
+    cancelQueuedOutside(const std::unordered_set<ChunkPos>& candidates);
+
+    // Cancel one unstarted request whose registry placeholder must yield to a
+    // more important current-camera section. Running work remains untouched.
+    std::optional<MeshCanceledRequest> cancelQueued(ChunkPos position);
+
+    // A queued request can remain inside two consecutive exact disks while
+    // moving from their distant edge into the camera band. Refresh every
+    // unstarted request in place so it immediately follows the current camera
+    // instead of retaining the lane captured by an older frame.
+    size_t reprioritizeQueued(const std::function<MeshRequestPriority(ChunkPos)>& priorityFor);
 
     // Move finished results into the consumer's bounded pending vector. The
     // consumer calls this once per frame, including when no new result is
@@ -148,6 +181,8 @@ private:
     std::atomic<size_t> highWater_{0};
     std::atomic<uint64_t> coalesced_{0};
     std::atomic<uint64_t> droppedStale_{0};
+    std::atomic<uint64_t> displaced_{0};
+    std::atomic<uint64_t> canceledQueued_{0};
     AtomicEmaMs meshMs_;
 
     bool reserveSlot(MeshPriorityLane lane);

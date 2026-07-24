@@ -100,6 +100,7 @@ screenSpaceLightingMemoryFootprint(uint32_t width, uint32_t height, int quality)
     footprint.historyDepthBytes = workPixels * 4U * 2U;
     footprint.momentsBytes = workPixels * 8U * 2U;
     footprint.scratchBytes = workPixels * 8U;
+    footprint.reactiveHistoryBytes = workPixels * 2U;
     return footprint;
 }
 
@@ -127,6 +128,12 @@ uint32_t indirectHistoryResetMask(const IndirectHistoryState& previous,
     if (previous.directLightSource != current.directLightSource) {
         reasons |= INDIRECT_HISTORY_LIGHT_SOURCE;
     }
+    if (previous.lightEditRevision != current.lightEditRevision) {
+        reasons |= INDIRECT_HISTORY_LIGHT_EDIT;
+    }
+    if (previous.timeDiscontinuityRevision != current.timeDiscontinuityRevision) {
+        reasons |= INDIRECT_HISTORY_TIME_DISCONTINUITY;
+    }
     if (!current.priorDepthValid) {
         reasons |= INDIRECT_HISTORY_INVALID_DEPTH;
     }
@@ -146,6 +153,8 @@ ScreenSpaceLighting::ScreenSpaceLighting(id<MTLDevice> device, id<MTLLibrary> sh
     _atrousPipeline = makeComputePipeline(device, shaderLibrary, @"screenSpaceAtrousKernel");
     _historyDepthPipeline =
         makeComputePipeline(device, shaderLibrary, @"screenSpaceHistoryDepthKernel");
+    _reactiveHistoryPipeline =
+        makeComputePipeline(device, shaderLibrary, @"screenSpaceReactiveHistoryKernel");
 
     id<MTLFunction> vertex = [shaderLibrary newFunctionWithName:@"screenSpaceApplyVertex"];
     id<MTLFunction> fragment = [shaderLibrary newFunctionWithName:@"screenSpaceApplyFragment"];
@@ -197,6 +206,7 @@ ScreenSpaceLighting::~ScreenSpaceLighting() {
         releaseTexture(_history[index]);
         releaseTexture(_historyDepth[index]);
         releaseTexture(_momentsAge[index]);
+        releaseTexture(_reactiveHistory[index]);
     }
     releaseTexture(_neutralTexture);
     resetMetalObject(_linearDepthPipeline);
@@ -206,6 +216,7 @@ ScreenSpaceLighting::~ScreenSpaceLighting() {
     resetMetalObject(_temporalPipeline);
     resetMetalObject(_atrousPipeline);
     resetMetalObject(_historyDepthPipeline);
+    resetMetalObject(_reactiveHistoryPipeline);
     resetMetalObject(_applyPipeline);
 }
 
@@ -234,6 +245,7 @@ void ScreenSpaceLighting::allocateTargets() {
         releaseTexture(_history[index]);
         releaseTexture(_historyDepth[index]);
         releaseTexture(_momentsAge[index]);
+        releaseTexture(_reactiveHistory[index]);
     }
     _historyIndex = 0;
     _historyValid = false;
@@ -258,6 +270,9 @@ void ScreenSpaceLighting::allocateTargets() {
         _momentsAge[index] =
             makeTexture2D(_device, MTLPixelFormatRGBA16Float, _workWidth, _workHeight, false,
                           index == 0 ? @"SSL Moments A" : @"SSL Moments B");
+        _reactiveHistory[index] =
+            makeTexture2D(_device, MTLPixelFormatR8Unorm, _workWidth, _workHeight, false,
+                          index == 0 ? @"SSL Reactive A" : @"SSL Reactive B");
     }
 }
 
@@ -289,8 +304,9 @@ void ScreenSpaceLighting::resetHistory() {
 
 void ScreenSpaceLighting::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sceneHDR,
                                  id<MTLTexture> depthResolve, id<MTLTexture> surfaceResolve,
+                                 id<MTLTexture> reactiveResolve,
                                  const IndirectLightingUniforms& uniforms, GpuFrameTimer* timer) {
-    if (!commandBuffer || !sceneHDR || !depthResolve || !surfaceResolve) {
+    if (!commandBuffer || !sceneHDR || !depthResolve || !surfaceResolve || !reactiveResolve) {
         return;
     }
 
@@ -349,6 +365,7 @@ void ScreenSpaceLighting::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTextu
         [compute setTexture:sceneHDR atIndex:1];
         [compute setTexture:_normalTexture atIndex:2];
         [compute setTexture:_traceTexture atIndex:3];
+        [compute setTexture:surfaceResolve atIndex:4];
         [compute setBytes:&frameUniforms length:sizeof(frameUniforms) atIndex:0];
         dispatch2D(compute, _tracePipeline, _workWidth, _workHeight);
         if (timer) {
@@ -360,6 +377,12 @@ void ScreenSpaceLighting::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTextu
         compute.label = @"Screen-Space Temporal Filter";
         computeTimerToken =
             timer ? timer->beginComputePass(compute, "indirectTemporal") : UINT32_MAX;
+        [compute setComputePipelineState:_reactiveHistoryPipeline];
+        [compute setTexture:reactiveResolve atIndex:0];
+        [compute setTexture:_reactiveHistory[writeIndex] atIndex:1];
+        dispatch2D(compute, _reactiveHistoryPipeline, _workWidth, _workHeight);
+        [compute memoryBarrierWithScope:MTLBarrierScopeTextures];
+
         [compute setComputePipelineState:_temporalPipeline];
         [compute setTexture:_traceTexture atIndex:0];
         [compute setTexture:_linearDepthPyramid atIndex:1];
@@ -370,6 +393,8 @@ void ScreenSpaceLighting::encode(id<MTLCommandBuffer> commandBuffer, id<MTLTextu
         [compute setTexture:_normalTexture atIndex:6];
         [compute setTexture:_momentsAge[_historyIndex] atIndex:7];
         [compute setTexture:_momentsAge[writeIndex] atIndex:8];
+        [compute setTexture:_reactiveHistory[writeIndex] atIndex:9];
+        [compute setTexture:_reactiveHistory[_historyIndex] atIndex:10];
         [compute setBytes:&frameUniforms length:sizeof(frameUniforms) atIndex:0];
         dispatch2D(compute, _temporalPipeline, _workWidth, _workHeight);
 

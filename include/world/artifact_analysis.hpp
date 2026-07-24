@@ -183,18 +183,38 @@ inline void add(OrientationHistogram& destination, const OrientationHistogram& s
 inline std::array<double, 8> orientationBias(const OrientationBins& formerLine,
                                              const OrientationBins& nearby) {
     constexpr double PRIOR = 1.0;
-    double formerTotal = PRIOR * 8.0;
-    double nearbyTotal = PRIOR * 8.0;
+    double formerObserved = 0.0;
+    double nearbyObserved = 0.0;
     for (size_t index = 0; index < formerLine.size(); ++index) {
-        formerTotal += static_cast<double>(formerLine[index]);
-        nearbyTotal += static_cast<double>(nearby[index]);
+        formerObserved += static_cast<double>(formerLine[index]);
+        nearbyObserved += static_cast<double>(nearby[index]);
     }
+
+    // The nearby control samples eight offset lines for each former line, so
+    // paired histograms ordinarily have different exposure. Scale the
+    // Dirichlet pseudocount with that exposure: proportional observations
+    // then remain proportional even when both histograms have empty bins.
+    // Equal-exposure histograms retain the original one-count prior exactly.
+    double referenceExposure = 0.0;
+    if (formerObserved > 0.0 && nearbyObserved > 0.0)
+        referenceExposure = std::min(formerObserved, nearbyObserved);
+    else
+        referenceExposure = std::max(formerObserved, nearbyObserved);
+    const double formerPrior = referenceExposure > 0.0 && formerObserved > 0.0
+                                   ? PRIOR * formerObserved / referenceExposure
+                                   : PRIOR;
+    const double nearbyPrior = referenceExposure > 0.0 && nearbyObserved > 0.0
+                                   ? PRIOR * nearbyObserved / referenceExposure
+                                   : PRIOR;
+    const double formerTotal = formerObserved + formerPrior * 8.0;
+    const double nearbyTotal = nearbyObserved + nearbyPrior * 8.0;
 
     std::array<double, 8> result{};
     for (size_t index = 0; index < result.size(); ++index) {
         const double formerFraction =
-            (static_cast<double>(formerLine[index]) + PRIOR) / formerTotal;
-        const double nearbyFraction = (static_cast<double>(nearby[index]) + PRIOR) / nearbyTotal;
+            (static_cast<double>(formerLine[index]) + formerPrior) / formerTotal;
+        const double nearbyFraction =
+            (static_cast<double>(nearby[index]) + nearbyPrior) / nearbyTotal;
         result[index] = formerFraction / nearbyFraction;
     }
     return result;

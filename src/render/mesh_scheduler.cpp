@@ -70,15 +70,39 @@ bool MeshScheduler::reserveSlot(MeshPriorityLane lane) {
 }
 
 bool MeshScheduler::enqueue(ChunkPos pos, uint32_t requestedVersion, MeshPriorityLane lane,
-                            uint64_t distanceSquared) {
-    if (!running_.load(std::memory_order_relaxed) || !reserveSlot(lane)) return false;
+                            uint64_t distanceSquared,
+                            std::optional<MeshCanceledRequest>* displaced) {
+    if (displaced) displaced->reset();
+    if (!running_.load(std::memory_order_relaxed)) return false;
+
+    bool ownsNewSlot = reserveSlot(lane);
     {
         std::lock_guard<std::mutex> lock(jobMutex_);
         if (!running_.load(std::memory_order_relaxed)) {
-            inFlight_.fetch_sub(1, std::memory_order_relaxed);
+            if (ownsNewSlot) inFlight_.fetch_sub(1, std::memory_order_relaxed);
             return false;
         }
-        const MeshJob job{pos, requestedVersion, lane, distanceSquared, nextSequence_++};
+
+        MeshJob job{pos, requestedVersion, lane, distanceSquared, nextSequence_};
+        if (!ownsNewSlot) {
+            // At the shared cap, transfer the worst queued slot to a request
+            // that ranks ahead of it. This is a true displacement: completed
+            // and running work remain untouched, and the bounded ownership
+            // count does not change.
+            if (jobs_.empty()) return false;
+            const MeshJob& worst = jobs_.back();
+            if (!meshJobRanksBefore(job.lane, job.distanceSquared, job.sequence, worst.lane,
+                                    worst.distanceSquared, worst.sequence)) {
+                return false;
+            }
+            if (displaced) {
+                *displaced = MeshCanceledRequest{worst.pos, worst.requestedVersion};
+            }
+            jobs_.pop_back();
+            displaced_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        ++nextSequence_;
         const auto insertion = std::find_if(jobs_.begin(), jobs_.end(), [&](const MeshJob& queued) {
             return meshJobRanksBefore(job.lane, job.distanceSquared, job.sequence, queued.lane,
                                       queued.distanceSquared, queued.sequence);
@@ -87,6 +111,67 @@ bool MeshScheduler::enqueue(ChunkPos pos, uint32_t requestedVersion, MeshPriorit
     }
     jobCv_.notify_one();
     return true;
+}
+
+std::vector<MeshCanceledRequest>
+MeshScheduler::cancelQueuedOutside(const std::unordered_set<ChunkPos>& candidates) {
+    std::vector<MeshCanceledRequest> canceled;
+    {
+        std::lock_guard<std::mutex> lock(jobMutex_);
+        for (auto iterator = jobs_.begin(); iterator != jobs_.end();) {
+            if (candidates.contains(iterator->pos)) {
+                ++iterator;
+                continue;
+            }
+            canceled.push_back({iterator->pos, iterator->requestedVersion});
+            iterator = jobs_.erase(iterator);
+        }
+        if (!canceled.empty()) {
+            inFlight_.fetch_sub(canceled.size(), std::memory_order_relaxed);
+            canceledQueued_.fetch_add(canceled.size(), std::memory_order_relaxed);
+        }
+    }
+    if (!canceled.empty()) jobCv_.notify_all();
+    return canceled;
+}
+
+std::optional<MeshCanceledRequest> MeshScheduler::cancelQueued(ChunkPos position) {
+    std::optional<MeshCanceledRequest> canceled;
+    {
+        std::lock_guard<std::mutex> lock(jobMutex_);
+        const auto iterator = std::find_if(jobs_.begin(), jobs_.end(),
+                                           [&](const MeshJob& job) { return job.pos == position; });
+        if (iterator == jobs_.end()) return std::nullopt;
+        canceled = MeshCanceledRequest{iterator->pos, iterator->requestedVersion};
+        jobs_.erase(iterator);
+        inFlight_.fetch_sub(1, std::memory_order_relaxed);
+        canceledQueued_.fetch_add(1, std::memory_order_relaxed);
+    }
+    jobCv_.notify_all();
+    return canceled;
+}
+
+size_t
+MeshScheduler::reprioritizeQueued(const std::function<MeshRequestPriority(ChunkPos)>& priorityFor) {
+    if (!priorityFor) return 0;
+    size_t changed = 0;
+    {
+        std::lock_guard<std::mutex> lock(jobMutex_);
+        for (MeshJob& job : jobs_) {
+            const MeshRequestPriority priority = priorityFor(job.pos);
+            if (job.lane == priority.lane && job.distanceSquared == priority.distanceSquared)
+                continue;
+            job.lane = priority.lane;
+            job.distanceSquared = priority.distanceSquared;
+            ++changed;
+        }
+        std::stable_sort(jobs_.begin(), jobs_.end(), [](const MeshJob& left, const MeshJob& right) {
+            return meshJobRanksBefore(left.lane, left.distanceSquared, left.sequence, right.lane,
+                                      right.distanceSquared, right.sequence);
+        });
+    }
+    if (changed != 0) jobCv_.notify_all();
+    return changed;
 }
 
 void MeshScheduler::drainCompleted(std::vector<MeshResult>& out) {
@@ -194,6 +279,8 @@ MeshSchedulerStats MeshScheduler::stats() const {
     result.highWater = highWater_.load(std::memory_order_relaxed);
     result.coalesced = coalesced_.load(std::memory_order_relaxed);
     result.droppedStale = droppedStale_.load(std::memory_order_relaxed);
+    result.displaced = displaced_.load(std::memory_order_relaxed);
+    result.canceledQueued = canceledQueued_.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(completedMutex_);
         result.completed = completed_.size();

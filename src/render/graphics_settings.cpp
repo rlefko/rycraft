@@ -208,6 +208,9 @@ LoadedSettings loadSettings(const std::string& path) {
 }
 
 std::string settingsPath() {
+    if (const char* overridePath = getenv("RYCRAFT_SETTINGS_PATH")) {
+        if (*overridePath) return overridePath;
+    }
     const char* home = getenv("HOME");
     if (!home) {
         return "/tmp/rycraft_settings.json";

@@ -17,9 +17,17 @@
 
 class OrePlacer {
 public:
+    // V3 preserves its established stone-only replacement. V4 strata use the
+    // natural-rock policy so selecting a bounded geological host does not
+    // remove ores from an otherwise valid cubic volume.
+    enum class HostPolicy : uint8_t {
+        LEGACY_STONE_ONLY,
+        NATURAL_ROCK,
+    };
+
     explicit OrePlacer(uint32_t worldSeed);
 
-    void place(Chunk& chunk) const;
+    void place(Chunk& chunk, HostPolicy hostPolicy = HostPolicy::LEGACY_STONE_ONLY) const;
 
 private:
     CounterRng random_;

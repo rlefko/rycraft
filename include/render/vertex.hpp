@@ -33,6 +33,7 @@ using float16_t = __fp16;
 //
 // Face normal indices:
 //   0 = +X, 1 = -X, 2 = +Z, 3 = -Z, 4 = +Y, 5 = -Y
+//   6 = flora cross, 7 = floor-torch cross
 
 struct alignas(16) Vertex {
     // Packed face normal + texture layer — offset 0
@@ -53,8 +54,9 @@ static_assert(alignof(Vertex) == 16, "Vertex must be 16-byte aligned");
 
 // Face normal index constants. CROSS marks flora cross-quads: the vertex
 // shader gives them a fixed up-facing light instead of face shading (so the
-// two diagonal quads of one plant never shade differently), and rendering
-// them double-sided relies on the scene pass keeping cull mode None.
+// two diagonal quads of one plant never shade differently). TORCH_CROSS keeps
+// the same double-sided geometry without applying plant-facing or subsurface
+// lighting to the authored flame and stick.
 enum class FaceNormal : uint8_t {
     PLUS_X = 0,
     MINUS_X = 1,
@@ -63,4 +65,5 @@ enum class FaceNormal : uint8_t {
     PLUS_Y = 4,
     MINUS_Y = 5,
     CROSS = 6,
+    TORCH_CROSS = 7,
 };

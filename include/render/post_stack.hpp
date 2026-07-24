@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 
 #include "render/graphics_settings.hpp"
+#include "render/shader_types.hpp"
 #include <simd/simd.h>
 
 // ---------------------------------------------------------------------------
@@ -20,6 +21,11 @@ class PostStack {
 public:
     PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary);
     ~PostStack();
+
+    // Replaces the persistent GPU buffers with canonical seed values. Metal
+    // command buffers retain any prior buffers they reference, so session
+    // teardown never races an in-flight exposure or flare pass.
+    void resetHistory();
 
     // Measure scene luminance and ease the persistent exposure toward it
     // (eye adaptation). Run after the scene + water are composited, before
@@ -53,3 +59,11 @@ private:
     id<MTLTexture> _whiteFallback{}; // neutral cloud transmittance
     id<MTLSamplerState> _linearSampler{};
 };
+
+constexpr ExposureState canonicalExposureHistory() noexcept {
+    return {.smoothedLogLum = 0.0F, .exposure = 1.0F};
+}
+
+constexpr FlareState canonicalFlareHistory() noexcept {
+    return {.visibility = 0.0F};
+}

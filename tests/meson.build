@@ -15,6 +15,7 @@ test_sources = files(
   'test_macro_control.mm',
   'test_final_field_artifacts.mm',
   'test_reported_water_continuity.mm',
+  'test_v4_water_antipatterns.mm',
   'test_relief.mm',
   'test_alpine_morphology.mm',
   'test_tree_geometry.mm',
@@ -25,6 +26,11 @@ test_sources = files(
   'test_fauna_habitat.mm',
   'test_fluid_persistence.mm',
   'test_saves.mm',
+  'test_learned_terrain.mm',
+  'test_hydrology_authority.mm',
+  'test_native_hydrology.mm',
+  'test_terrain_bootstrap.mm',
+  'test_terrain_runtime.mm',
   'test_render_concurrency.mm',
   'test_engine.mm',
   'test_audio.mm',
@@ -36,6 +42,7 @@ test_exe = executable('test_rycraft',
   include_directories : inc,
   link_with : [libcommon, libworld, librender, libentity, libengine, libaudio],
   dependencies : [catch2_with_main_dep, lz4_dep],
+  objcpp_args : ['-DRYCRAFT_SOURCE_ROOT="' + meson.project_source_root() + '"'],
 )
 
 # The deterministic worldgen, full-disk coverage, and hydrology matrices
@@ -45,10 +52,13 @@ test_exe = executable('test_rycraft',
 # sum, with no loss of coverage. Each shard finishes well inside its timeout.
 # Eight shards with a wide per-shard timeout: the merged suite carries both
 # the gameplay and the lighting-weather matrices, and the slowest worldgen
-# fixtures exceeded the old budget on loaded CI runners.
+# fixtures exceeded the old budget on loaded CI runners. Catch2 randomizes test
+# order by default, so every shard must use the same seed or their partitions
+# overlap and leave other cases uncovered.
 test_shard_count = '8'
 foreach shard : ['0', '1', '2', '3', '4', '5', '6', '7']
   test('rycraft tests ' + shard, test_exe,
-       args : ['--shard-count', test_shard_count, '--shard-index', shard],
+       args : ['--order', 'rand', '--rng-seed', '764891',
+               '--shard-count', test_shard_count, '--shard-index', shard],
        timeout : 1800)
 endforeach

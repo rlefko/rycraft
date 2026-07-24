@@ -84,8 +84,15 @@ void requireExactSurface(const worldgen::SurfaceSample& actual,
     REQUIRE(actual.hydrology.flowDirection.x == expected.hydrology.flowDirection.x);
     REQUIRE(actual.hydrology.flowDirection.z == expected.hydrology.flowDirection.z);
     REQUIRE(actual.hydrology.surfaceElevation == expected.hydrology.surfaceElevation);
+    REQUIRE(actual.hydrology.terrainSlope == expected.hydrology.terrainSlope);
     REQUIRE(actual.hydrology.waterSurface == expected.hydrology.waterSurface);
     REQUIRE(actual.hydrology.discharge == expected.hydrology.discharge);
+    REQUIRE(actual.hydrology.baseflow == expected.hydrology.baseflow);
+    REQUIRE(actual.hydrology.precipitationSeasonality ==
+            expected.hydrology.precipitationSeasonality);
+    REQUIRE(actual.hydrology.groundwaterRechargeMm == expected.hydrology.groundwaterRechargeMm);
+    REQUIRE(actual.hydrology.groundwaterHead == expected.hydrology.groundwaterHead);
+    REQUIRE(actual.hydrology.hydroperiod == expected.hydrology.hydroperiod);
     REQUIRE(actual.hydrology.sediment == expected.hydrology.sediment);
     REQUIRE(actual.hydrology.channelDistance == expected.hydrology.channelDistance);
     REQUIRE(actual.hydrology.channelWidth == expected.hydrology.channelWidth);
@@ -114,6 +121,11 @@ void requireExactSurface(const worldgen::SurfaceSample& actual,
     REQUIRE(actual.hydrology.waterfall == expected.hydrology.waterfall);
     REQUIRE(actual.hydrology.waterfallAnchor == expected.hydrology.waterfallAnchor);
     REQUIRE(actual.hydrology.delta == expected.hydrology.delta);
+    REQUIRE(actual.hydrology.estuary == expected.hydrology.estuary);
+    REQUIRE(actual.hydrology.brackish == expected.hydrology.brackish);
+    REQUIRE(actual.hydrology.perennial == expected.hydrology.perennial);
+    REQUIRE(actual.hydrology.ephemeral == expected.hydrology.ephemeral);
+    REQUIRE(actual.hydrology.wetland == expected.hydrology.wetland);
 
     REQUIRE(actual.climate.wind.x == expected.climate.wind.x);
     REQUIRE(actual.climate.wind.z == expected.climate.wind.z);
@@ -303,8 +315,14 @@ void requireBasinSamplesEqual(const worldgen::BasinSample& actual,
     REQUIRE(actual.flowX == expected.flowX);
     REQUIRE(actual.flowZ == expected.flowZ);
     REQUIRE(actual.surfaceElevation == expected.surfaceElevation);
+    REQUIRE(actual.terrainSlope == expected.terrainSlope);
     REQUIRE(actual.waterSurface == expected.waterSurface);
     REQUIRE(actual.discharge == expected.discharge);
+    REQUIRE(actual.baseflow == expected.baseflow);
+    REQUIRE(actual.precipitationSeasonality == expected.precipitationSeasonality);
+    REQUIRE(actual.groundwaterRechargeMm == expected.groundwaterRechargeMm);
+    REQUIRE(actual.groundwaterHead == expected.groundwaterHead);
+    REQUIRE(actual.hydroperiod == expected.hydroperiod);
     REQUIRE(actual.sediment == expected.sediment);
     REQUIRE(actual.channelDistance == expected.channelDistance);
     REQUIRE(actual.channelWidth == expected.channelWidth);
@@ -342,6 +360,11 @@ void requireBasinSamplesEqual(const worldgen::BasinSample& actual,
     REQUIRE(actual.waterfall == expected.waterfall);
     REQUIRE(actual.waterfallAnchor == expected.waterfallAnchor);
     REQUIRE(actual.delta == expected.delta);
+    REQUIRE(actual.estuary == expected.estuary);
+    REQUIRE(actual.brackish == expected.brackish);
+    REQUIRE(actual.perennial == expected.perennial);
+    REQUIRE(actual.ephemeral == expected.ephemeral);
+    REQUIRE(actual.wetland == expected.wetland);
     REQUIRE(actual.valid == expected.valid);
 }
 
@@ -363,7 +386,11 @@ bool basinSamplesExactlyEqual(const worldgen::BasinSample& actual,
     return actual.flowX == expected.flowX && actual.flowZ == expected.flowZ &&
            actual.surfaceElevation == expected.surfaceElevation &&
            actual.waterSurface == expected.waterSurface && actual.discharge == expected.discharge &&
-           actual.sediment == expected.sediment &&
+           actual.baseflow == expected.baseflow &&
+           actual.precipitationSeasonality == expected.precipitationSeasonality &&
+           actual.groundwaterRechargeMm == expected.groundwaterRechargeMm &&
+           actual.groundwaterHead == expected.groundwaterHead &&
+           actual.hydroperiod == expected.hydroperiod && actual.sediment == expected.sediment &&
            actual.channelDistance == expected.channelDistance &&
            actual.channelWidth == expected.channelWidth &&
            actual.channelDepth == expected.channelDepth &&
@@ -394,7 +421,9 @@ bool basinSamplesExactlyEqual(const worldgen::BasinSample& actual,
            actual.lakeBank == expected.lakeBank && actual.endorheic == expected.endorheic &&
            actual.waterfall == expected.waterfall &&
            actual.waterfallAnchor == expected.waterfallAnchor && actual.delta == expected.delta &&
-           actual.valid == expected.valid;
+           actual.estuary == expected.estuary && actual.brackish == expected.brackish &&
+           actual.perennial == expected.perennial && actual.ephemeral == expected.ephemeral &&
+           actual.wetland == expected.wetland && actual.valid == expected.valid;
 }
 
 struct WaterContinuityAudit {
@@ -747,6 +776,57 @@ TEST_CASE("Lake bathymetry preserves the solved water balance after shoreline sh
                         basinFixtureResistance, rebuilt);
     requireBasinSamplesEqual(rebuilt[0], lake);
     requireBasinSamplesEqual(rebuilt[1], center);
+}
+
+TEST_CASE("Learned hydroclimate controls runoff baseflow and groundwater authority",
+          "[worldgen][advanced][hydrology][climate][groundwater]") {
+    constexpr double SAMPLE_X = worldgen::BASIN_CATCHMENT_EDGE * 3.0 + 773.0;
+    constexpr double SAMPLE_Z = worldgen::BASIN_CATCHMENT_EDGE * 2.0 + 911.0;
+    const auto humidClimate = [](double, double, double) {
+        return worldgen::BasinHydroclimateSample{
+            .meanTemperatureC = 16.0,
+            .temperatureVariabilityC = 4.0,
+            .annualPrecipitationMm = 1'600.0,
+            .precipitationCoefficientOfVariation = 0.12,
+            .lapseRateCPerMeter = -0.0065,
+            .potentialEvapotranspirationMm = 550.0,
+        };
+    };
+    const auto aridClimate = [](double, double, double) {
+        return worldgen::BasinHydroclimateSample{
+            .meanTemperatureC = 28.0,
+            .temperatureVariabilityC = 18.0,
+            .annualPrecipitationMm = 220.0,
+            .precipitationCoefficientOfVariation = 1.10,
+            .lapseRateCPerMeter = -0.0045,
+            .potentialEvapotranspirationMm = 1'900.0,
+        };
+    };
+
+    worldgen::BasinSolver humidSolver(42);
+    worldgen::BasinSolver aridSolver(42);
+    const worldgen::BasinSample humid =
+        humidSolver.sample(SAMPLE_X, SAMPLE_Z, basinFixtureElevation, basinFixtureRainfall,
+                           basinFixtureResistance, {}, humidClimate);
+    const worldgen::BasinSample arid =
+        aridSolver.sample(SAMPLE_X, SAMPLE_Z, basinFixtureElevation, basinFixtureRainfall,
+                          basinFixtureResistance, {}, aridClimate);
+
+    REQUIRE(humid.valid);
+    REQUIRE(arid.valid);
+    REQUIRE(humid.discharge > arid.discharge);
+    REQUIRE(humid.baseflow > arid.baseflow);
+    REQUIRE(humid.groundwaterRechargeMm > arid.groundwaterRechargeMm);
+    REQUIRE(humid.precipitationSeasonality < arid.precipitationSeasonality);
+    for (const worldgen::BasinSample* sample : {&humid, &arid}) {
+        REQUIRE(sample->baseflow >= 0.0);
+        REQUIRE(sample->baseflow <= sample->discharge);
+        REQUIRE(sample->precipitationSeasonality >= 0.0);
+        REQUIRE(sample->precipitationSeasonality <= 1.0);
+        REQUIRE(sample->hydroperiod >= 0.0);
+        REQUIRE(sample->hydroperiod <= 1.0);
+        REQUIRE(std::isfinite(sample->groundwaterHead));
+    }
 }
 
 TEST_CASE("Pinned open water windows retain continuous supported levels",
@@ -1168,7 +1248,9 @@ TEST_CASE("Pinned steep channels emit stable partial-height rapid water",
             ++rapidColumns;
         }
     }
-    REQUIRE(rapidColumns >= 50);
+    // Invalid partial states now become source anchors before publication, so
+    // this fixture retains only the subset with a complete predecessor chain.
+    REQUIRE(rapidColumns >= 32);
     REQUIRE(sourceAnchors > 0);
     REQUIRE(validPredecessors == rapidColumns - sourceAnchors);
     for (uint8_t level = 1; level <= 7; ++level) {
@@ -1235,7 +1317,7 @@ TEST_CASE("Pinned steep channels emit stable partial-height rapid water",
     }
     CAPTURE(maximumCardinalVisibleStep, downstreamComparisons);
     REQUIRE(maximumCardinalVisibleStep <= 0.250001);
-    REQUIRE(downstreamComparisons >= 35);
+    REQUIRE(downstreamComparisons >= 24);
 
     World world(SEED, 4);
     const int64_t minimumChunkX = Chunk::worldToChunk(MINIMUM_X) - 1;
@@ -3208,7 +3290,7 @@ TEST_CASE("Cold column plans batch every basin construction sample",
                     static_cast<int16_t>(plan.surfaceY(localX, localZ));
             }
         }
-        result.exposedSections = plan.exposedSections();
+        result.exposedSections.assign(plan.exposedSections().begin(), plan.exposedSections().end());
         result.minimumSurfaceY = plan.minimumSurfaceY();
         result.maximumSurfaceY = plan.maximumSurfaceY();
         return result;
@@ -3250,6 +3332,8 @@ TEST_CASE("Cold column plans batch every basin construction sample",
             REQUIRE(sample.hydrology.waterfall == reference.hydrology.waterfall);
             REQUIRE(sample.hydrology.waterfallAnchor == reference.hydrology.waterfallAnchor);
             REQUIRE(sample.hydrology.delta == reference.hydrology.delta);
+            REQUIRE(sample.hydrology.estuary == reference.hydrology.estuary);
+            REQUIRE(sample.hydrology.brackish == reference.hydrology.brackish);
             REQUIRE(sample.hydrology.waterfallTop == reference.hydrology.waterfallTop);
             REQUIRE(sample.hydrology.waterfallBottom == reference.hydrology.waterfallBottom);
             REQUIRE(sample.hydrology.waterfallWidth == reference.hydrology.waterfallWidth);
@@ -3776,6 +3860,32 @@ TEST_CASE("Near anchors and distant forest cover are deterministic and globally 
             REQUIRE(ids.insert(canopy.anchorId).second);
         }
 
+        if (lodStep == 4) {
+            std::vector<ColumnPos> positions;
+            positions.reserve(first.size());
+            for (const FarCanopy& canopy : first)
+                positions.push_back({canopy.x, canopy.z});
+            std::vector<worldgen::SurfaceSample> habitats(positions.size());
+            generator.sampleFarHabitatPoints(positions, habitats);
+            for (size_t index = 0; index < first.size(); ++index) {
+                const FarCanopy& canopy = first[index];
+                const worldgen::SurfaceSample& habitatSurface = habitats[index];
+                const int groundY =
+                    static_cast<int>(std::ceil(worldgen::geometryTerrainHeight(habitatSurface))) -
+                    1;
+                const BlockType substrate =
+                    generator.farSurfaceMaterialAt(canopy.x, canopy.z, habitatSurface);
+                const auto habitat = feature_generation::evaluateTreeHabitat(
+                    canopy.species, habitatSurface, groundY);
+                CAPTURE(canopy.x, canopy.z, static_cast<int>(canopy.species), groundY,
+                        static_cast<int>(substrate));
+                REQUIRE_FALSE(worldgen::surface_material::submerged(habitatSurface));
+                REQUIRE_FALSE(habitat.submerged);
+                REQUIRE(habitat.allowed);
+                REQUIRE(worldgen::surface_material::supportsTreeRooting(substrate));
+            }
+        }
+
         const int64_t splitX = MINIMUM_X + 128;
         const std::vector<FarCanopy> west =
             generator.collectFarCanopiesForLod(MINIMUM_X, MINIMUM_Z, splitX, MAXIMUM_Z, lodStep);
@@ -3792,6 +3902,8 @@ TEST_CASE("Near anchors and distant forest cover are deterministic and globally 
 
     // Step two is the exact accepted-anchor distribution. Aggregated step-four
     // and more distant tiers form their own stable, nested hierarchy.
+    REQUIRE(tiers[1].size() <= tiers[0].size());
+    REQUIRE(tiers[1].size() * 5 >= tiers[0].size());
     for (size_t tierIndex = 2; tierIndex < tiers.size(); ++tierIndex) {
         REQUIRE(tiers[tierIndex].size() <= tiers[tierIndex - 1].size());
         for (const FarCanopy& farther : tiers[tierIndex]) {
@@ -3802,6 +3914,21 @@ TEST_CASE("Near anchors and distant forest cover are deterministic and globally 
             REQUIRE(*nearer == farther);
         }
     }
+}
+
+TEST_CASE("Far canopy aggregation represents exact candidate opportunities",
+          "[worldgen][advanced][flora][far-canopy][density][regression]") {
+    constexpr double EXACT_ACCEPTANCE = 0.055;
+    constexpr double REPRESENTED_EXACT_OPPORTUNITIES = 64.0 / 6.0;
+    const double expected = 1.0 - std::pow(1.0 - EXACT_ACCEPTANCE, REPRESENTED_EXACT_OPPORTUNITIES);
+    const double actual = feature_generation::farCanopyAggregateAcceptance(EXACT_ACCEPTANCE);
+
+    REQUIRE(feature_generation::farCanopyAggregateAcceptance(0.0) == 0.0);
+    REQUIRE(feature_generation::farCanopyAggregateAcceptance(1.0) == 1.0);
+    REQUIRE(actual == Catch::Approx(expected));
+    REQUIRE(actual > 0.44);
+    REQUIRE(actual < 0.46);
+    REQUIRE(feature_generation::farCanopyAggregateAcceptance(0.10) > actual);
 }
 
 TEST_CASE("Every far canopy corresponds to emitted tree material",

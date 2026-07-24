@@ -86,6 +86,26 @@ TEST_CASE("Thunder scheduling uses sound travel time and suppresses replays",
     REQUIRE_FALSE(scheduler.schedule(liveEvent, 0.0, 0.0, 0.0, 7.0));
 }
 
+TEST_CASE("Generator v4 thunder scheduling converts block distance to physical meters",
+          "[audio][thunder][scheduler][v4]") {
+    ThunderScheduler scheduler;
+    scheduler.beginTimeline(0, GENERATOR_V4_PHYSICAL_SCALE);
+    LightningEvent event;
+    event.id = 44;
+    event.tick = 1;
+    event.x = 343.0 / GENERATOR_V4_PHYSICAL_SCALE.horizontalMetersPerBlock;
+    event.y = static_cast<float>(GENERATOR_V4_PHYSICAL_SCALE.altitudeDatumY);
+    event.intensity = 1.0F;
+    REQUIRE(scheduler.schedule(event, 0.0, GENERATOR_V4_PHYSICAL_SCALE.altitudeDatumY, 0.0, 2.0));
+    REQUIRE(scheduler.popDue(2.999).empty());
+    const std::vector<ScheduledThunder> due = scheduler.popDue(3.0);
+    REQUIRE(due.size() == 1);
+    REQUIRE(due.front().distanceMeters == Catch::Approx(343.0F));
+    REQUIRE(due.front().distanceBlocks ==
+            Catch::Approx(
+                343.0F / static_cast<float>(GENERATOR_V4_PHYSICAL_SCALE.horizontalMetersPerBlock)));
+}
+
 TEST_CASE("Thunder scheduling remains bounded during a dense storm",
           "[audio][thunder][scheduler][bounds]") {
     ThunderScheduler scheduler;

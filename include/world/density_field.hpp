@@ -28,7 +28,11 @@ struct GeologySample;
 // Lattice spacing must stay a power of two: latticeFloor masks with
 // (LATTICE_XZ - 1) to floor negative coordinates.
 inline constexpr int LATTICE_XZ = 4;
-inline constexpr int LATTICE_Y = 4;
+inline constexpr int LEGACY_DENSITY_LATTICE_Y = 4;
+inline constexpr int LEARNED_DENSITY_LATTICE_Y = 8;
+// Preserve the established name and spacing for v3 callers. ChunkGenerator
+// selects LEARNED_DENSITY_LATTICE_Y only when it owns v4 learned authority.
+inline constexpr int LATTICE_Y = LEGACY_DENSITY_LATTICE_Y;
 inline constexpr double DENSITY_CAP = 32.0;
 
 // One fixed operation order for density interpolation: bilinear in xz at the

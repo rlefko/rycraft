@@ -3,6 +3,7 @@
 #include <common/math.hpp>
 #include <world/chunk.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <vector>
 
@@ -24,12 +25,14 @@ public:
     Vec3 sweepCollision(const AABB& entityAABB, const Vec3& movement, World& world);
 
     // Collect all solid blocks that intersect an AABB.
-    // Each returned AABB represents a 1×1×1 block at integer coordinates.
+    // Full cubes return a 1×1×1 AABB. Authored partial blocks retain their
+    // exact collision height.
     static std::vector<AABB> collectObstacles(const AABB& expandedAABB, World& world);
 
     // Check if a block at world coordinates is solid.
-    // Returns true for all BlockTypes except AIR, WATER, and GLASS.
-    static bool isSolid(World& world, int x, int y, int z);
+    // Returns the shared gameplay solidity classification. Shape-aware callers
+    // use collectObstacles for the exact collision volume.
+    static bool isSolid(World& world, int64_t x, int32_t y, int64_t z);
 
     // Check if entity AABB overlaps any water block.
     static bool isInWater(World& world, const AABB& entityAABB);

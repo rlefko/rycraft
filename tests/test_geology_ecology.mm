@@ -552,6 +552,8 @@ TEST_CASE("Column plans retain block-resolution water authority and source suppo
         REQUIRE(planned.hydrology.river == direct.hydrology.river);
         REQUIRE(planned.hydrology.lake == direct.hydrology.lake);
         REQUIRE(planned.hydrology.delta == direct.hydrology.delta);
+        REQUIRE(planned.hydrology.estuary == direct.hydrology.estuary);
+        REQUIRE(planned.hydrology.brackish == direct.hydrology.brackish);
         REQUIRE(planned.hydrology.waterfall == direct.hydrology.waterfall);
         REQUIRE(planned.hydrology.waterBodyId == direct.hydrology.waterBodyId);
         REQUIRE(planned.waterSurface == Catch::Approx(direct.waterSurface).margin(1.0e-4));
@@ -560,6 +562,8 @@ TEST_CASE("Column plans retain block-resolution water authority and source suppo
         REQUIRE(exact.hydrology.ocean == direct.hydrology.ocean);
         REQUIRE(exact.hydrology.river == direct.hydrology.river);
         REQUIRE(exact.hydrology.lake == direct.hydrology.lake);
+        REQUIRE(exact.hydrology.estuary == direct.hydrology.estuary);
+        REQUIRE(exact.hydrology.brackish == direct.hydrology.brackish);
         REQUIRE(exact.waterSurface == Catch::Approx(direct.waterSurface).margin(1.0e-6));
 
         const int surfaceY = generator.surfaceYAt(fixture.x, fixture.z);
@@ -778,6 +782,39 @@ TEST_CASE("Former-line orientation analysis detects an aligned synthetic seam",
         artifact::orientationHistogram(alignedField, line, 32);
     REQUIRE(artifact::structuredOrientationRatio(histogram) >
             artifact::STRUCTURED_ORIENTATION_LIMIT);
+}
+
+TEST_CASE("Orientation bias scales sparse priors with sample exposure",
+          "[worldgen][continuity][artifact][unit]") {
+    const artifact::OrientationBins former = {15, 11, 0, 0, 0, 0, 0, 7};
+    const artifact::OrientationBins nearby = {120, 88, 0, 0, 0, 0, 0, 56};
+
+    const std::array<double, 8> bias = artifact::orientationBias(former, nearby);
+    for (const double value : bias)
+        CHECK(value == Catch::Approx(1.0).margin(1.0e-12));
+    CHECK(artifact::structuredOrientationRatio(bias) == Catch::Approx(1.0).margin(1.0e-12));
+}
+
+TEST_CASE("Orientation bias retains structured seam detection with scaled priors",
+          "[worldgen][continuity][artifact][unit][negative-control]") {
+    const artifact::OrientationBins former = {64, 0, 0, 0, 0, 0, 0, 0};
+    const artifact::OrientationBins nearby = {8, 8, 8, 8, 8, 8, 8, 8};
+
+    CHECK(artifact::structuredOrientationRatio(artifact::orientationBias(former, nearby)) >
+          artifact::STRUCTURED_ORIENTATION_LIMIT);
+}
+
+TEST_CASE("Orientation bias preserves the equal-exposure prior",
+          "[worldgen][continuity][artifact][unit]") {
+    const artifact::OrientationBins former = {8, 4, 0, 0, 0, 0, 4, 0};
+    const artifact::OrientationBins nearby = {4, 8, 0, 0, 0, 0, 0, 4};
+    const std::array<double, 8> bias = artifact::orientationBias(former, nearby);
+
+    for (size_t index = 0; index < bias.size(); ++index) {
+        const double originalBias =
+            (static_cast<double>(former[index]) + 1.0) / (static_cast<double>(nearby[index]) + 1.0);
+        CHECK(bias[index] == Catch::Approx(originalBias).margin(1.0e-12));
+    }
 }
 
 TEST_CASE("Former storage lines do not own untagged categorical boundaries",

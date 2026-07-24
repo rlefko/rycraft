@@ -4,6 +4,7 @@
 #include "world/item.hpp"
 
 #include <array>
+#include <optional>
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------
@@ -27,3 +28,9 @@ struct ChestState {
 };
 
 using ChestMap = std::unordered_map<BlockPos, ChestState>;
+
+// Missing means the cube is not resident and cannot invalidate persistence.
+// A resident non-chest cell proves the sidecar is stale.
+constexpr bool chestSidecarMatchesLoadedBlock(std::optional<BlockType> loadedBlock) noexcept {
+    return !loadedBlock || *loadedBlock == BlockType::CHEST;
+}

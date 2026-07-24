@@ -93,16 +93,6 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
     }
     // Seed the persistent state so the very first frames aren't black while
     // the EMA converges (mid-grey log-luminance, exposure 1).
-    ExposureState seed{};
-    seed.smoothedLogLum = 0.0f;
-    seed.exposure = 1.0f;
-    _exposureBuffer = [_device newBufferWithBytes:&seed
-                                           length:sizeof(ExposureState)
-                                          options:MTLResourceStorageModeShared];
-    if (!_exposureBuffer) {
-        RY_LOG_FATAL("Failed to allocate exposure state buffer");
-    }
-
     // ---- Lens-flare occlusion probe + persistent visibility ----
     id<MTLFunction> flareFunc = [shaderLibrary newFunctionWithName:@"flareProbe"];
     if (!flareFunc) {
@@ -113,13 +103,7 @@ PostStack::PostStack(id<MTLDevice> device, id<MTLLibrary> shaderLibrary) : _devi
     if (!_flarePipelineState) {
         RY_LOG_FATAL("Failed to create flare probe pipeline state");
     }
-    FlareState flareSeed{};
-    _flareBuffer = [_device newBufferWithBytes:&flareSeed
-                                        length:sizeof(FlareState)
-                                       options:MTLResourceStorageModeShared];
-    if (!_flareBuffer) {
-        RY_LOG_FATAL("Failed to allocate flare state buffer");
-    }
+    resetHistory();
 }
 
 PostStack::~PostStack() {
@@ -131,6 +115,26 @@ PostStack::~PostStack() {
     resetMetalObject(_blackFallback);
     resetMetalObject(_whiteFallback);
     resetMetalObject(_linearSampler);
+}
+
+void PostStack::resetHistory() {
+    const ExposureState exposureSeed = canonicalExposureHistory();
+    const FlareState flareSeed = canonicalFlareHistory();
+    id<MTLBuffer> exposure = [_device newBufferWithBytes:&exposureSeed
+                                                  length:sizeof(exposureSeed)
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> flare = [_device newBufferWithBytes:&flareSeed
+                                               length:sizeof(flareSeed)
+                                              options:MTLResourceStorageModeShared];
+    if (!exposure || !flare) {
+        resetMetalObject(exposure);
+        resetMetalObject(flare);
+        RY_LOG_FATAL("Failed to reset post-stack temporal state");
+    }
+    resetMetalObject(_exposureBuffer);
+    resetMetalObject(_flareBuffer);
+    _exposureBuffer = exposure;
+    _flareBuffer = flare;
 }
 
 // ---------------------------------------------------------------------------

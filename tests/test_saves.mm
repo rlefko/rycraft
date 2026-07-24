@@ -7,6 +7,8 @@
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <sstream>
 
 namespace {
 
@@ -29,6 +31,7 @@ TEST_CASE("World metadata v2 round-trips every field", "[saves][metadata]") {
     SaveManager::WorldMetadata written;
     written.seed = 777;
     written.spawnPos = Vec3{8.f, 96.f, -12.f};
+    written.bedSpawnSet = true;
     written.playerPos = Vec3{100.f, 64.f, 250.f};
     written.worldTime = 13500;
     written.name = "Frontier Valley 2";
@@ -40,12 +43,15 @@ TEST_CASE("World metadata v2 round-trips every field", "[saves][metadata]") {
     written.player.inventory.fill(ItemStack{});
     written.player.inventory[3] = ItemStack{ItemType::COOKED_MUTTON, 7, 0};
     written.player.inventory[20] = ItemStack{ItemType::STONE_AXE, 1, 44};
+    written.player.carriedStacks[0] = ItemStack{ItemType::DIAMOND, 17, 0};
+    written.player.carriedStacks[9] = ItemStack{ItemType::IRON_PICKAXE, 1, 203};
     REQUIRE(saves.saveMetadata(written));
 
     const auto loaded = saves.loadMetadata();
     REQUIRE(loaded.has_value());
     REQUIRE(loaded->seed == 777);
     REQUIRE(loaded->spawnPos == written.spawnPos);
+    REQUIRE(loaded->bedSpawnSet);
     REQUIRE(loaded->playerPos == written.playerPos);
     REQUIRE(loaded->worldTime == 13500);
     REQUIRE(loaded->name == "Frontier Valley 2");
@@ -58,6 +64,8 @@ TEST_CASE("World metadata v2 round-trips every field", "[saves][metadata]") {
     REQUIRE(loaded->player.inventory[3] == ItemStack{ItemType::COOKED_MUTTON, 7, 0});
     REQUIRE(loaded->player.inventory[20] == ItemStack{ItemType::STONE_AXE, 1, 44});
     REQUIRE(loaded->player.inventory[0].empty());
+    REQUIRE(loaded->player.carriedStacks[0] == ItemStack{ItemType::DIAMOND, 17, 0});
+    REQUIRE(loaded->player.carriedStacks[9] == ItemStack{ItemType::IRON_PICKAXE, 1, 203});
 }
 
 TEST_CASE("Legacy metadata shapes load with creative defaults", "[saves][metadata]") {
@@ -76,11 +84,14 @@ TEST_CASE("Legacy metadata shapes load with creative defaults", "[saves][metadat
     REQUIRE(oldest->gameMode == GameMode::CREATIVE);
     REQUIRE(oldest->generation == GenerationSettings{});
     REQUIRE(oldest->name.empty());
+    REQUIRE_FALSE(oldest->bedSpawnSet);
     // Missing playerPos falls back to the spawn.
     REQUIRE(oldest->playerPos == oldest->spawnPos);
     // Missing player section keeps the classic starter hotbar.
     REQUIRE(oldest->player.inventory[0] == ItemStack{itemFromBlock(BlockType::STONE), 1, 0});
     REQUIRE(oldest->player.hunger == 20);
+    for (const ItemStack& stack : oldest->player.carriedStacks)
+        REQUIRE(stack.empty());
 
     // The nine-number hotbar shape converts to count-one stacks.
     writeTextFile(directory.path() + "/metadata.json",
@@ -101,6 +112,203 @@ TEST_CASE("Legacy metadata shapes load with creative defaults", "[saves][metadat
         REQUIRE(legacy->player.inventory[slot].empty());
     }
     REQUIRE(legacy->player.health == 18);
+}
+
+TEST_CASE("Carried stacks validate ids and counts with inventory rules", "[saves][metadata]") {
+    TempDir directory("metadata_carried_stack_validation");
+    writeTextFile(directory.path() + "/metadata.json",
+                  "{\n"
+                  "  \"seed\": 1,\n"
+                  "  \"spawnPos\": { \"x\": 0, \"y\": 64, \"z\": 0 },\n"
+                  "  \"worldTime\": 0,\n"
+                  "  \"player\": {\n"
+                  "    \"carriedStacks\": [[65536, 5, 0], [257, 200, 0], [256, 3, 7]"
+                  ", [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]"
+                  ", [0, 0, 0], [280, 1, 245]]\n"
+                  "  }\n"
+                  "}\n");
+    const auto loaded = SaveManager::readMetadataFile(directory.path() + "/metadata.json");
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->player.carriedStacks[0].empty());
+    CHECK(loaded->player.carriedStacks[1] == ItemStack{ItemType::COAL, 64, 0});
+    CHECK(loaded->player.carriedStacks[2] == ItemStack{ItemType::STICK, 3, 7});
+    CHECK(loaded->player.carriedStacks[9] == ItemStack{ItemType::IRON_PICKAXE, 1, 245});
+
+    SaveManager saves(directory.path());
+    SaveManager::WorldMetadata metadata;
+    metadata.seed = 2;
+    metadata.spawnPos = Vec3{0.5F, 64.0F, 0.5F};
+    metadata.playerPos = metadata.spawnPos;
+    metadata.player.carriedStacks[0] = ItemStack{ItemType::COAL, 65, 0};
+    CHECK_FALSE(saves.saveMetadata(metadata));
+    metadata.player.carriedStacks[0] = ItemStack{static_cast<ItemType>(100), 1, 0};
+    CHECK_FALSE(saves.saveMetadata(metadata));
+    metadata.player.carriedStacks[0] = ItemStack{ItemType::NONE, 0, 1};
+    CHECK_FALSE(saves.saveMetadata(metadata));
+}
+
+TEST_CASE("Older generator v4 metadata defaults new player provenance fields",
+          "[saves][metadata][generator-v4][migration]") {
+    TempDir directory("metadata_v4_player_provenance_defaults");
+    writeTextFile(directory.path() + "/metadata.json",
+                  "{\n"
+                  "  \"seed\": 3,\n"
+                  "  \"generationFingerprint\": "
+                  "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\n"
+                  "  \"spawnFinalized\": true,\n"
+                  "  \"spawnSafetyRevision\": 4,\n"
+                  "  \"safeSpawnPos\": { \"x\": 1.5, \"y\": 70, \"z\": -1.5 },\n"
+                  "  \"spawnPos\": { \"x\": 1.5, \"y\": 70, \"z\": -1.5 },\n"
+                  "  \"playerPos\": { \"x\": 4.5, \"y\": 71, \"z\": -6.5 },\n"
+                  "  \"worldTime\": 7,\n"
+                  "  \"generatorVersion\": 4\n"
+                  "}\n");
+    const auto loaded = SaveManager::readMetadataFile(directory.path() + "/metadata.json");
+    REQUIRE(loaded.has_value());
+    CHECK_FALSE(loaded->bedSpawnSet);
+    for (const ItemStack& stack : loaded->player.carriedStacks)
+        CHECK(stack.empty());
+}
+
+TEST_CASE("Metadata writes reject positions unsafe for world conversion", "[saves][metadata]") {
+    TempDir directory("metadata_position_write_bounds");
+    SaveManager saves(directory.path());
+
+    SaveManager::WorldMetadata metadata;
+    metadata.seed = 91;
+    metadata.spawnPos = Vec3{0.5F, static_cast<float>(WORLD_MIN_Y), -0.5F};
+    metadata.playerPos = Vec3{-12.5F, static_cast<float>(WORLD_MAX_Y), 18.5F};
+    REQUIRE(saves.saveMetadata(metadata));
+
+    metadata.playerPos.y = static_cast<float>(WORLD_MAX_Y) + 1.0F;
+    CHECK_FALSE(saves.saveMetadata(metadata));
+    metadata.playerPos.y = static_cast<float>(WORLD_MIN_Y) - 1.0F;
+    CHECK_FALSE(saves.saveMetadata(metadata));
+    metadata.playerPos = Vec3{1.0e30F, 64.0F, 0.0F};
+    CHECK_FALSE(saves.saveMetadata(metadata));
+    metadata.playerPos = Vec3{0.0F, 64.0F, -1.0e30F};
+    CHECK_FALSE(saves.saveMetadata(metadata));
+    metadata.playerPos = Vec3{0.0F, std::numeric_limits<float>::quiet_NaN(), 0.0F};
+    CHECK_FALSE(saves.saveMetadata(metadata));
+    metadata.playerPos = Vec3{0.0F, 64.0F, 0.0F};
+    metadata.safeSpawnPos = Vec3{0.0F, static_cast<float>(WORLD_MAX_Y) + 1.0F, 0.0F};
+    CHECK_FALSE(saves.saveMetadata(metadata));
+}
+
+TEST_CASE("Generator v4 repairs unsafe positions before startup can cast them",
+          "[saves][metadata][generator-v4][corruption]") {
+    TempDir directory("metadata_v4_position_repair");
+    constexpr std::string_view fingerprint{
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"};
+    std::ostringstream json;
+    json << "{\n"
+         << "  \"seed\": 123,\n"
+         << "  \"generationFingerprint\": \"" << fingerprint << "\",\n"
+         << "  \"spawnFinalized\": true,\n"
+         << "  \"spawnSafetyRevision\": " << SaveManager::GENERATOR_V4_SPAWN_SAFETY_REVISION
+         << ",\n"
+         << "  \"safeSpawnPos\": { \"x\": 24.5, \"y\": 81, \"z\": -8.5 },\n"
+         << "  \"spawnPos\": { \"x\": 2, \"y\": " << WORLD_MAX_Y + 1 << ", \"z\": 3 },\n"
+         << "  \"bedSpawnSet\": true,\n"
+         << "  \"playerPos\": { \"x\": 1e30, \"y\": 64, \"z\": 0 },\n"
+         << "  \"worldTime\": 4,\n"
+         << "  \"generatorVersion\": " << SaveManager::GENERATOR_V4_VERSION << "\n"
+         << "}\n";
+    writeTextFile(directory.path() + "/metadata.json", json.str());
+
+    const auto repaired = SaveManager::readMetadataFile(directory.path() + "/metadata.json");
+    REQUIRE(repaired.has_value());
+    REQUIRE(repaired->safeSpawnPos.has_value());
+    CHECK(repaired->spawnPos == *repaired->safeSpawnPos);
+    CHECK(repaired->playerPos == *repaired->safeSpawnPos);
+    CHECK_FALSE(repaired->bedSpawnSet);
+    CHECK(repaired->spawnFinalized);
+}
+
+TEST_CASE("Generator v4 invalidates an unsafe safe spawn and repairs remaining fields",
+          "[saves][metadata][generator-v4][corruption]") {
+    TempDir directory("metadata_v4_safe_spawn_repair");
+    constexpr std::string_view fingerprint{
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"};
+    std::ostringstream json;
+    json << "{\n"
+         << "  \"seed\": 456,\n"
+         << "  \"generationFingerprint\": \"" << fingerprint << "\",\n"
+         << "  \"spawnFinalized\": true,\n"
+         << "  \"spawnSafetyRevision\": " << SaveManager::GENERATOR_V4_SPAWN_SAFETY_REVISION
+         << ",\n"
+         << "  \"safeSpawnPos\": { \"x\": 0, \"y\": " << WORLD_MIN_Y - 1 << ", \"z\": 0 },\n"
+         << "  \"spawnPos\": { \"x\": 1e30, \"y\": 64, \"z\": 0 },\n"
+         << "  \"bedSpawnSet\": true,\n"
+         << "  \"playerPos\": { \"x\": -10.5, \"y\": 72, \"z\": 31.5 },\n"
+         << "  \"worldTime\": 5,\n"
+         << "  \"generatorVersion\": " << SaveManager::GENERATOR_V4_VERSION << "\n"
+         << "}\n";
+    writeTextFile(directory.path() + "/metadata.json", json.str());
+
+    const auto repaired = SaveManager::readMetadataFile(directory.path() + "/metadata.json");
+    REQUIRE(repaired.has_value());
+    CHECK_FALSE(repaired->safeSpawnPos.has_value());
+    CHECK_FALSE(repaired->spawnFinalized);
+    CHECK(repaired->spawnSafetyRevision == 0);
+    CHECK(repaired->spawnPos == repaired->playerPos);
+    CHECK_FALSE(repaired->bedSpawnSet);
+}
+
+TEST_CASE("Generator v4 refuses metadata with no safe position to repair from",
+          "[saves][metadata][generator-v4][corruption]") {
+    TempDir directory("metadata_v4_unrepairable_positions");
+    writeTextFile(directory.path() + "/metadata.json",
+                  "{\n"
+                  "  \"seed\": 789,\n"
+                  "  \"generationFingerprint\": "
+                  "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\n"
+                  "  \"spawnFinalized\": false,\n"
+                  "  \"spawnSafetyRevision\": 0,\n"
+                  "  \"safeSpawnPos\": null,\n"
+                  "  \"spawnPos\": { \"x\": 0, \"y\": 99999, \"z\": 0 },\n"
+                  "  \"playerPos\": { \"x\": 1e30, \"y\": 64, \"z\": 0 },\n"
+                  "  \"worldTime\": 6,\n"
+                  "  \"generatorVersion\": 4\n"
+                  "}\n");
+    CHECK_FALSE(SaveManager::readMetadataFile(directory.path() + "/metadata.json").has_value());
+}
+
+TEST_CASE("Generator v4 locks structures but permits runtime generation toggles",
+          "[saves][metadata][generator-v4]") {
+    TempDir directory("metadata_v4_structures_identity");
+    SaveManager saves(directory.path(), SaveManager::Profile::GeneratorV4);
+    SaveManager::WorldMetadata metadata;
+    metadata.seed = 0x1234'5678'9ABC'DEF0ULL;
+    metadata.generationFingerprint =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    metadata.spawnFinalized = false;
+    metadata.spawnSafetyRevision = 0;
+    metadata.spawnPos = Vec3{0.5F, 80.0F, -0.5F};
+    metadata.bedSpawnSet = true;
+    metadata.playerPos = metadata.spawnPos;
+    metadata.generatorVersion = SaveManager::GENERATOR_V4_VERSION;
+    metadata.generation = GenerationSettings{true, true, true, true};
+    metadata.player.carriedStacks[0] = ItemStack{ItemType::DIAMOND, 4, 0};
+    metadata.player.carriedStacks[8] = ItemStack{ItemType::STONE_AXE, 1, 12};
+    REQUIRE(saves.saveMetadata(metadata));
+
+    metadata.generation.fauna = false;
+    metadata.generation.weather = false;
+    metadata.generation.dayCycle = false;
+    REQUIRE(saves.saveMetadata(metadata));
+    metadata.generation.structures = false;
+    CHECK_FALSE(saves.saveMetadata(metadata));
+
+    const auto loaded = saves.loadMetadata();
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->generation.structures);
+    CHECK(loaded->bedSpawnSet);
+    CHECK_FALSE(loaded->generation.fauna);
+    CHECK_FALSE(loaded->generation.weather);
+    CHECK_FALSE(loaded->generation.dayCycle);
+    CHECK(loaded->player.carriedStacks[0] == ItemStack{ItemType::DIAMOND, 4, 0});
+    CHECK(loaded->player.carriedStacks[8] == ItemStack{ItemType::STONE_AXE, 1, 12});
 }
 
 TEST_CASE("Inventory slots tolerate out-of-range items and oversized counts", "[saves][metadata]") {

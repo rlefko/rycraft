@@ -1,4 +1,5 @@
 #include "world/chunk_generator.hpp"
+#include "world/learned_terrain.hpp"
 #include "world/surface_material.hpp"
 
 #include <algorithm>
@@ -8,12 +9,12 @@
 #include <limits>
 #include <numbers>
 #include <optional>
+#include <queue>
 #include <utility>
 
 namespace {
 
 constexpr int LAVA_LEVEL = -96;
-constexpr int LATTICE_LEVELS = (WORLD_MAX_Y - WORLD_MIN_Y + 1) / LATTICE_Y + 1;
 constexpr int HOTSPOT_QUERY_RADIUS = 1;
 constexpr int64_t VOLCANIC_ARC_CELL_EDGE = 1024;
 constexpr int64_t AQUIFER_CELL_EDGE = 64;
@@ -24,13 +25,31 @@ constexpr size_t ARC_PRIMITIVE_CACHE_CAPACITY = 2048;
 constexpr int COLUMN_PLAN_CONSTRUCTION_APRON_EDGE = COLUMN_PLAN_LATTICE_EDGE + 2;
 constexpr size_t COLUMN_PLAN_CONSTRUCTION_APRON_SAMPLES =
     COLUMN_PLAN_CONSTRUCTION_APRON_EDGE * COLUMN_PLAN_CONSTRUCTION_APRON_EDGE;
-constexpr int COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE = CHUNK_EDGE + 1;
+constexpr int COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE = COLUMN_PLAN_HYDROLOGY_SAMPLE_EDGE;
 constexpr size_t COLUMN_PLAN_CONSTRUCTION_AUTHORITY_SAMPLES =
     COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE * COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE;
+constexpr int LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE = CHUNK_EDGE + 1;
+constexpr size_t LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_SAMPLES =
+    LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE * LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE;
+constexpr int COLUMN_PLAN_CONSTRUCTION_GEOLOGY_EDGE = CHUNK_EDGE + 1;
+constexpr size_t COLUMN_PLAN_CONSTRUCTION_GEOLOGY_SAMPLES =
+    COLUMN_PLAN_CONSTRUCTION_GEOLOGY_EDGE * COLUMN_PLAN_CONSTRUCTION_GEOLOGY_EDGE;
 constexpr size_t COLUMN_PLAN_CONSTRUCTION_PERIMETER_SAMPLES =
     COLUMN_PLAN_CONSTRUCTION_APRON_SAMPLES - COLUMN_PLAN_LATTICE_SAMPLES;
 static_assert(COLUMN_PLAN_CONSTRUCTION_PERIMETER_SAMPLES == 16);
 static_assert(feature_generation::TREE_MAXIMUM_HORIZONTAL_REACH <= COLUMN_PLAN_LATTICE_SPACING);
+
+int densityLatticeLevelCountForSpacing(int verticalSpacing) {
+    return (WORLD_MAX_Y - WORLD_MIN_Y + 1) / verticalSpacing + 1;
+}
+
+int maximumEvaluatedDensityLevel(double yCap, int verticalSpacing) {
+    const int latticeLevels = densityLatticeLevelCountForSpacing(verticalSpacing);
+    const int maximumLatticeY = WORLD_MIN_Y + (latticeLevels - 1) * verticalSpacing;
+    if (std::isnan(yCap) || yCap < WORLD_MIN_Y) return -1;
+    if (yCap >= maximumLatticeY) return latticeLevels - 1;
+    return static_cast<int>((yCap - WORLD_MIN_Y) / verticalSpacing);
+}
 
 constexpr uint64_t HOTSPOT_PROPERTIES_STREAM = 0x1202;
 constexpr uint64_t VOLCANIC_ARC_STREAM = 0x564F4C4341524331ULL;
@@ -42,8 +61,10 @@ using ColumnPlanConstructionSurfaceApron =
     std::array<worldgen::SurfaceSample, COLUMN_PLAN_CONSTRUCTION_APRON_SAMPLES>;
 using ColumnPlanConstructionHydrology =
     std::array<worldgen::HydrologySample, COLUMN_PLAN_CONSTRUCTION_AUTHORITY_SAMPLES>;
+using LegacyColumnPlanConstructionHydrology =
+    std::array<worldgen::HydrologySample, LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_SAMPLES>;
 using ColumnPlanConstructionGeology =
-    std::array<worldgen::GeologySample, COLUMN_PLAN_CONSTRUCTION_AUTHORITY_SAMPLES>;
+    std::array<worldgen::GeologySample, COLUMN_PLAN_CONSTRUCTION_GEOLOGY_SAMPLES>;
 using ColumnPlanConstructionPerimeter = std::array<double, COLUMN_PLAN_CONSTRUCTION_APRON_SAMPLES>;
 
 // The cache consumes its callbacks synchronously and retains only the finished
@@ -70,6 +91,12 @@ struct ThreadVolcanoPrimitiveCache {
     std::unordered_map<ColumnPos, std::vector<VolcanoPrimitive>> arcCells;
 };
 
+struct ThreadWaterContactCache {
+    const void* owner = nullptr;
+    uint64_t ownerToken = 0;
+    std::unordered_map<ColumnPos, worldgen::SurfaceSample> surfaces;
+};
+
 ThreadVolcanoPrimitiveCache& threadVolcanoPrimitiveCache(const void* owner, uint64_t ownerToken) {
     thread_local ThreadVolcanoPrimitiveCache cache;
     if (cache.owner != owner || cache.ownerToken != ownerToken) {
@@ -81,12 +108,37 @@ ThreadVolcanoPrimitiveCache& threadVolcanoPrimitiveCache(const void* owner, uint
     return cache;
 }
 
+ThreadWaterContactCache& threadWaterContactCache(const void* owner, uint64_t ownerToken) {
+    thread_local ThreadWaterContactCache cache;
+    if (cache.owner != owner || cache.ownerToken != ownerToken || cache.surfaces.size() > 16'384) {
+        cache.owner = owner;
+        cache.ownerToken = ownerToken;
+        cache.surfaces.clear();
+    }
+    return cache;
+}
+
 int64_t latticeFloor(int64_t value) {
     return world_coord::floorDiv(value, static_cast<int64_t>(LATTICE_XZ)) * LATTICE_XZ;
 }
 
 bool hasSurfaceWater(const worldgen::HydrologySample& hydrology) {
-    return hydrology.ocean || hydrology.river || hydrology.lake;
+    return hydrology.ocean || hydrology.river || hydrology.lake || hydrology.wetland;
+}
+
+bool requiresLegacyExactShoreSupport(const worldgen::HydrologySample& hydrology) {
+    constexpr double SHORE_SUPPORT_REACH = 56.0;
+    return !hasSurfaceWater(hydrology) && !hydrology.channelBank && !hydrology.lakeBank &&
+           hydrology.shoreWaterSurface > SEA_LEVEL && hydrology.lakeShoreDistance <= 0.0 &&
+           hydrology.lakeShoreDistance > -SHORE_SUPPORT_REACH &&
+           hydrology.surfaceElevation + 2.5 >= hydrology.shoreWaterSurface;
+}
+
+bool hasCanonicalWaterFeature(const worldgen::HydrologySample& hydrology) {
+    return hasSurfaceWater(hydrology) || hydrology.wetland || hydrology.delta ||
+           hydrology.waterfall ||
+           hydrology.transitionOwnerKind != worldgen::WaterTransitionKind::NONE ||
+           hydrology.transitionOwnerId != 0;
 }
 
 double canonicalColumnPlanContactDistance(double distance) {
@@ -273,10 +325,13 @@ void clearSurfaceWater(worldgen::HydrologySample& hydrology) {
     hydrology.ocean = false;
     hydrology.river = false;
     hydrology.lake = false;
+    hydrology.wetland = false;
     hydrology.endorheic = false;
     hydrology.waterfall = false;
     hydrology.waterfallAnchor = false;
     hydrology.delta = false;
+    hydrology.estuary = false;
+    hydrology.brackish = false;
     hydrology.waterSurface = 0.0;
     hydrology.waterfallTop = 0.0;
     hydrology.waterfallBottom = 0.0;
@@ -301,7 +356,55 @@ void clearSurfaceWater(worldgen::HydrologySample& hydrology) {
     hydrology.transitionOwnerId = 0;
 }
 
-void applyEmittedSurfaceTopology(worldgen::SurfaceSample& surface, double emittedTop) {
+void carveSolvedWaterBed(worldgen::HydrologySample& hydrology, int& surfaceY) {
+    for (int iteration = 0; iteration < 4; ++iteration) {
+        if (!hasSurfaceWater(hydrology)) return;
+        const int waterTopY = std::clamp(static_cast<int>(std::ceil(hydrology.waterSurface)) - 1,
+                                         WORLD_MIN_Y, WORLD_MAX_Y);
+        const int plannedFloorY = std::clamp(
+            static_cast<int>(std::ceil(hydrology.surfaceElevation)) - 1, WORLD_MIN_Y, WORLD_MAX_Y);
+        const int carved =
+            std::min(surfaceY, std::min(plannedFloorY, std::max(WORLD_MIN_Y, waterTopY - 1)));
+        if (carved == surfaceY) return;
+        surfaceY = carved;
+    }
+}
+
+void reconcileEmittedSurfaceY(worldgen::HydrologySample& hydrology, int& surfaceY,
+                              bool learnedAuthority) {
+    if (learnedAuthority) {
+        carveSolvedWaterBed(hydrology, surfaceY);
+    } else if (hasSurfaceWater(hydrology)) {
+        const int waterTopY = std::clamp(static_cast<int>(std::ceil(hydrology.waterSurface)) - 1,
+                                         WORLD_MIN_Y, WORLD_MAX_Y);
+        const int plannedFloorY = std::clamp(
+            static_cast<int>(std::ceil(hydrology.surfaceElevation)) - 1, WORLD_MIN_Y, WORLD_MAX_Y);
+        surfaceY = std::min(plannedFloorY, std::max(WORLD_MIN_Y, waterTopY - 1));
+    } else if (hydrology.channelBank || hydrology.lakeBank) {
+        const int plannedBankY = std::clamp(
+            static_cast<int>(std::ceil(hydrology.surfaceElevation)) - 1, WORLD_MIN_Y, WORLD_MAX_Y);
+        surfaceY = std::max(surfaceY, plannedBankY);
+    } else if (hydrology.surfaceElevation >= SEA_LEVEL && surfaceY < SEA_LEVEL - 1) {
+        surfaceY = SEA_LEVEL - 1;
+    }
+
+    if (!learnedAuthority && hydrology.waterfall &&
+        hydrology.waterfallTop >= hydrology.waterfallBottom + 0.5) {
+        const int receivingWaterY = std::clamp(
+            static_cast<int>(std::ceil(hydrology.waterfallBottom)) - 1, WORLD_MIN_Y, WORLD_MAX_Y);
+        surfaceY = std::min(surfaceY, std::max(WORLD_MIN_Y, receivingWaterY - 1));
+    }
+}
+
+void applyEmittedSurfaceTopology(worldgen::SurfaceSample& surface, double emittedTop,
+                                 bool learnedAuthority) {
+    surface.emittedTerrainHeight = static_cast<float>(emittedTop);
+    if (learnedAuthority) {
+        // Learned v4 keeps its continuous terrain and routed hydrology as the
+        // canonical physical authority. Voxel emission is a separate mesh,
+        // collision, and fluid contact concern, not an ecology input.
+        return;
+    }
     surface.terrainHeight = emittedTop;
     surface.hydrology.surfaceElevation = emittedTop;
     if (surface.hydrology.channelBank) {
@@ -321,16 +424,136 @@ void applyEmittedSurfaceTopology(worldgen::SurfaceSample& surface, double emitte
     surface.waterSurface = surface.hydrology.waterSurface;
 }
 
-bool requiresExactShoreSupport(const worldgen::HydrologySample& hydrology) {
-    constexpr double SHORE_SUPPORT_REACH = 56.0;
-    return !hasSurfaceWater(hydrology) && !hydrology.channelBank && !hydrology.lakeBank &&
-           hydrology.shoreWaterSurface > SEA_LEVEL && hydrology.lakeShoreDistance <= 0.0 &&
-           hydrology.lakeShoreDistance > -SHORE_SUPPORT_REACH &&
-           hydrology.surfaceElevation + 2.5 >= hydrology.shoreWaterSurface;
+bool legalExplicitFall(const worldgen::SurfaceSample& surface) {
+    return surface.hydrology.waterfall &&
+           surface.hydrology.transitionOwnerKind == worldgen::WaterTransitionKind::EXPLICIT_FALL &&
+           surface.hydrology.transitionOwnerId != 0 &&
+           surface.hydrology.waterfallTop >= surface.hydrology.waterfallBottom + 0.5;
+}
+
+void ensureExplicitFallOwnership(worldgen::SurfaceSample& surface, int64_t x, int64_t z) {
+    if (!surface.hydrology.waterfall ||
+        surface.hydrology.waterfallTop < surface.hydrology.waterfallBottom + 0.5 ||
+        legalExplicitFall(surface)) {
+        return;
+    }
+    uint64_t owner = hash64(0x4E41'5449'5645'464CULL ^ static_cast<uint64_t>(x));
+    owner = hash64(owner ^ static_cast<uint64_t>(z));
+    owner = hash64(owner ^ surface.hydrology.waterBodyId);
+    if (owner == 0) owner = 1;
+    surface.hydrology.transitionOwnerKind = worldgen::WaterTransitionKind::EXPLICIT_FALL;
+    surface.hydrology.transitionOwnerId = owner;
+}
+
+void applyExplicitWetContact(worldgen::SurfaceSample& surface, int64_t x, int64_t z,
+                             const worldgen::SurfaceSample& receiver, int offsetX, int offsetZ) {
+    const worldgen::GeneratedFluidColumn sourceFluid = worldgen::generatedFluidColumn(surface);
+    const worldgen::GeneratedFluidColumn receiverFluid = worldgen::generatedFluidColumn(receiver);
+    if (!sourceFluid.wet || !receiverFluid.wet || legalExplicitFall(surface) ||
+        legalExplicitFall(receiver) ||
+        sourceFluid.visibleSurface <= receiverFluid.visibleSurface + 0.125001) {
+        return;
+    }
+
+    uint64_t owner = hash64(0x5745545F434F4E54ULL ^ static_cast<uint64_t>(x));
+    owner = hash64(owner ^ static_cast<uint64_t>(z));
+    owner = hash64(owner ^ static_cast<uint64_t>(static_cast<int64_t>(offsetX)));
+    owner = hash64(owner ^ static_cast<uint64_t>(static_cast<int64_t>(offsetZ)));
+    if (owner == 0) owner = 1;
+
+    const int fallingTopY = static_cast<int>(std::ceil(sourceFluid.visibleSurface)) - 1;
+    surface.waterSurface = static_cast<double>(fallingTopY) + 0.125;
+    surface.terrainHeight = std::min(surface.terrainHeight, receiverFluid.visibleSurface - 0.125);
+    surface.emittedTerrainHeight = static_cast<float>(surface.terrainHeight);
+    surface.hydrology.surfaceElevation = surface.terrainHeight;
+    surface.hydrology.channelDepth =
+        std::max(surface.hydrology.channelDepth, surface.waterSurface - surface.terrainHeight);
+    surface.hydrology.channelGradient =
+        std::max(surface.hydrology.channelGradient,
+                 sourceFluid.visibleSurface - receiverFluid.visibleSurface);
+    surface.hydrology.ocean = false;
+    surface.hydrology.river = true;
+    surface.hydrology.lake = false;
+    surface.hydrology.lakeBank = false;
+    surface.hydrology.channelBank = false;
+    surface.hydrology.endorheic = false;
+    surface.hydrology.waterfall = true;
+    surface.hydrology.waterfallAnchor = true;
+    surface.hydrology.lakeDepth = 0.0;
+    surface.hydrology.lakeAreaSquareKilometers = 0.0;
+    surface.hydrology.lakeVolumeCubicMeters = 0.0;
+    surface.hydrology.lakeRunoffMmSquareKilometers = 0.0;
+    surface.hydrology.lakeLossMm = 0.0;
+    surface.hydrology.lakeOverflowMmSquareKilometers = 0.0;
+    surface.hydrology.lakeSpillSurface = 0.0;
+    surface.hydrology.waterBodyId = worldgen::NO_WATER_BODY;
+    surface.hydrology.generatedFluidLevel = 7;
+    surface.hydrology.transitionOwnerKind = worldgen::WaterTransitionKind::EXPLICIT_FALL;
+    surface.hydrology.transitionOwnerId = owner;
+    surface.hydrology.waterfallTop = sourceFluid.visibleSurface;
+    surface.hydrology.waterfallBottom = receiverFluid.visibleSurface;
+    surface.hydrology.waterfallWidth = 1.0;
+    surface.hydrology.waterSurface = surface.waterSurface;
+}
+
+template <typename SampleUnfinalized>
+worldgen::SurfaceSample finalizeCoordinateWetContact(int64_t x, int64_t z,
+                                                     worldgen::SurfaceSample result,
+                                                     SampleUnfinalized&& sampleUnfinalized,
+                                                     bool repairStandingRiver = false) {
+    constexpr std::array<std::pair<int, int>, 4> CARDINAL = {std::pair{-1, 0}, std::pair{1, 0},
+                                                             std::pair{0, -1}, std::pair{0, 1}};
+    ensureExplicitFallOwnership(result, x, z);
+
+    const worldgen::GeneratedFluidColumn repairedFluid = worldgen::generatedFluidColumn(result);
+    if (!repairedFluid.wet) return result;
+    if (legalExplicitFall(result)) return result;
+    const bool partialRiver = result.hydrology.river && result.hydrology.generatedFluidLevel > 0;
+    const bool mayExposeWetContact = result.hydrology.lake || result.hydrology.waterfall ||
+                                     partialRiver ||
+                                     (repairStandingRiver && result.hydrology.river);
+    if (!mayExposeWetContact) return result;
+
+    struct Receiver {
+        worldgen::SurfaceSample sample;
+        int offsetX = 0;
+        int offsetZ = 0;
+        double visibleSurface = 0.0;
+        bool found = false;
+    };
+    Receiver receiver;
+    const double sourceVisibleSurface = worldgen::generatedFluidColumn(result).visibleSurface;
+    constexpr double MAXIMUM_UNTAGGED_VISIBLE_STEP = 0.125001;
+    for (const auto [offsetX, offsetZ] : CARDINAL) {
+        worldgen::SurfaceSample neighbor = sampleUnfinalized(x + offsetX, z + offsetZ);
+        ensureExplicitFallOwnership(neighbor, x + offsetX, z + offsetZ);
+        const worldgen::GeneratedFluidColumn neighborFluid =
+            worldgen::generatedFluidColumn(neighbor);
+        if (!neighborFluid.wet || legalExplicitFall(neighbor) ||
+            sourceVisibleSurface <= neighborFluid.visibleSurface + MAXIMUM_UNTAGGED_VISIBLE_STEP) {
+            continue;
+        }
+        const auto candidateRank = std::tuple{neighborFluid.visibleSurface, offsetX, offsetZ};
+        const auto retainedRank =
+            std::tuple{receiver.visibleSurface, receiver.offsetX, receiver.offsetZ};
+        if (!receiver.found || candidateRank < retainedRank) {
+            receiver = {
+                .sample = std::move(neighbor),
+                .offsetX = offsetX,
+                .offsetZ = offsetZ,
+                .visibleSurface = neighborFluid.visibleSurface,
+                .found = true,
+            };
+        }
+    }
+    if (receiver.found) {
+        applyExplicitWetContact(result, x, z, receiver.sample, receiver.offsetX, receiver.offsetZ);
+    }
+    return result;
 }
 
 bool applyCraterLake(worldgen::SurfaceSample& surface, const VolcanicColumnSample& volcanism,
-                     bool applyOuterProfile) {
+                     bool applyOuterProfile, bool learnedAuthority) {
     if (!volcanism.craterLake || volcanism.craterLakeRadius <= 0.0 ||
         volcanism.craterRimElevation <= volcanism.craterLakeSurface) {
         return false;
@@ -342,7 +565,9 @@ bool applyCraterLake(worldgen::SurfaceSample& surface, const VolcanicColumnSampl
         surface.terrainHeight += (volcanism.craterTerrainTarget - surface.terrainHeight) *
                                  volcanism.craterProfileInfluence;
     }
-    surface.terrainHeight = std::clamp(surface.terrainHeight, -112.0, 480.0);
+    const double minimumTerrain = learnedAuthority ? static_cast<double>(WORLD_MIN_Y) : -112.0;
+    const double maximumTerrain = learnedAuthority ? static_cast<double>(WORLD_MAX_Y) : 480.0;
+    surface.terrainHeight = std::clamp(surface.terrainHeight, minimumTerrain, maximumTerrain);
     surface.hydrology.surfaceElevation = surface.terrainHeight;
 
     const double shoreDistance = volcanism.craterLakeRadius - volcanism.craterProfileDistance;
@@ -380,7 +605,7 @@ bool applyCraterLake(worldgen::SurfaceSample& surface, const VolcanicColumnSampl
 }
 
 double emittedVolcanicHeight(const worldgen::SurfaceSample& macroSurface,
-                             const VolcanicColumnSample& volcanism) {
+                             const VolcanicColumnSample& volcanism, bool learnedAuthority) {
     double heightAdjustment = volcanism.heightAdjustment;
     if (macroSurface.geology.crust == worldgen::CrustType::OCEANIC &&
         macroSurface.hydrology.ocean && volcanism.strongestProfile > 0.38) {
@@ -389,8 +614,10 @@ double emittedVolcanicHeight(const worldgen::SurfaceSample& macroSurface,
             volcanism.strongestProfile;
         heightAdjustment = std::max(heightAdjustment, std::min(18.0, islandLift));
     }
+    const double minimumTerrain = learnedAuthority ? static_cast<double>(WORLD_MIN_Y) : -112.0;
+    const double maximumTerrain = learnedAuthority ? static_cast<double>(WORLD_MAX_Y) : 480.0;
     return std::clamp(macroSurface.terrainHeight + std::clamp(heightAdjustment, -18.0, 18.0),
-                      -112.0, 480.0);
+                      minimumTerrain, maximumTerrain);
 }
 
 Biome ditheredBiome(const worldgen::SurfaceSample& surface, const CounterRng& random, int64_t x,
@@ -764,8 +991,24 @@ double surfaceDetailAmplitude(const worldgen::SurfaceSample& surface, double slo
                       1.5, 14.0);
 }
 
-ColumnShape shapeFromSurface(const worldgen::SurfaceSample& surface,
-                             const ColumnShape& legacyShape) {
+int boundedLearnedSurfaceY(const worldgen::SurfaceSample& surface, int surfaceY,
+                           bool learnedAuthority) {
+    if (!learnedAuthority) return surfaceY;
+    const double amplitude = surfaceDetailAmplitude(surface);
+    int minimum = static_cast<int>(std::floor(surface.terrainHeight - amplitude));
+    if (!hasSurfaceWater(surface.hydrology) &&
+        surface.terrainHeight <= SEA_LEVEL + amplitude + 1.0) {
+        // Post-hydrology detail may texture a learned coast, but it cannot
+        // move a final dry column below the sea plane and create a depression
+        // that the neighboring ocean must later fill or wall off.
+        minimum = std::max(minimum, SEA_LEVEL - 1);
+    }
+    const int maximum = static_cast<int>(std::ceil(surface.terrainHeight + amplitude));
+    return std::clamp(surfaceY, std::max(WORLD_MIN_Y, minimum), std::min(WORLD_MAX_Y, maximum));
+}
+
+ColumnShape shapeFromSurface(const worldgen::SurfaceSample& surface, double caveEntrance,
+                             bool learnedAuthority) {
     ColumnShape result;
     result.climate.continentalness = surface.geology.continentalFraction * 2.0 - 1.0;
     result.climate.erosion =
@@ -777,30 +1020,112 @@ ColumnShape shapeFromSurface(const worldgen::SurfaceSample& surface,
         std::clamp(surface.climate.annualPrecipitationMm / 1600.0 - 1.0, -1.0, 1.0);
     result.height = surface.terrainHeight;
     const bool waterCovered = hasSurfaceWater(surface.hydrology);
-    result.detailAmp = surfaceDetailAmplitude(surface);
-    result.entrance = waterCovered ? -1.0 : legacyShape.entrance;
+    // V4's slope-gated residual is already part of this final macro surface.
+    // Reapplying the legacy density detail here would displace a coast, divide,
+    // or water bed after its clearance gates were checked. Caves remain
+    // bounded below the surface by the density field's near-surface sealing.
+    result.detailAmp = learnedAuthority ? 0.0 : surfaceDetailAmplitude(surface);
+    result.entrance = waterCovered ? -1.0 : caveEntrance;
     result.riverCut = surface.hydrology.erosionDepth;
     result.ravineEdge = 0.0;
     result.ravineFloor = waterCovered ? SEA_LEVEL - 1.0 : result.height;
     return result;
 }
 
+uint32_t boundedSubsystemSeed(uint64_t worldSeed) {
+    return static_cast<uint32_t>(worldSeed) ^ static_cast<uint32_t>(worldSeed >> 32U);
+}
+
+template <typename Sample, typename GridSampler>
+void sampleStageFreePointRuns(std::span<const ColumnPos> positions, std::span<Sample> output,
+                              GridSampler&& sampleGrid) {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("coarse point sample output has the wrong size");
+    }
+    if (positions.empty()) return;
+
+    std::vector<size_t> order(positions.size());
+    for (size_t index = 0; index < order.size(); ++index)
+        order[index] = index;
+    std::ranges::sort(order, [&](size_t first, size_t second) {
+        const ColumnPos a = positions[first];
+        const ColumnPos b = positions[second];
+        if (a.z != b.z) return a.z < b.z;
+        if (a.x != b.x) return a.x < b.x;
+        return first < second;
+    });
+
+    struct UniquePoint {
+        ColumnPos position;
+        std::vector<size_t> destinations;
+    };
+    std::vector<UniquePoint> unique;
+    unique.reserve(positions.size());
+    for (const size_t index : order) {
+        if (unique.empty() || unique.back().position != positions[index]) {
+            unique.push_back({positions[index], {index}});
+        } else {
+            unique.back().destinations.push_back(index);
+        }
+    }
+
+    size_t first = 0;
+    while (first < unique.size()) {
+        const int64_t row = unique[first].position.z;
+        size_t last = first + 1;
+        int64_t spacing = 2;
+        if (last < unique.size() && unique[last].position.z == row) {
+            const __int128 candidate =
+                static_cast<__int128>(unique[last].position.x) - unique[first].position.x;
+            if (candidate <= std::numeric_limits<int>::max()) {
+                spacing = static_cast<int64_t>(candidate);
+                ++last;
+                while (last < unique.size() && unique[last].position.z == row &&
+                       static_cast<__int128>(unique[last].position.x) -
+                               unique[last - 1].position.x ==
+                           spacing) {
+                    ++last;
+                }
+            }
+        }
+        const size_t count = last - first;
+        std::vector<Sample> run(count);
+        sampleGrid(unique[first].position.x, row, static_cast<int>(spacing), 2,
+                   static_cast<int>(count), 1, run);
+        for (size_t offset = 0; offset < count; ++offset) {
+            for (const size_t destination : unique[first + offset].destinations)
+                output[destination] = run[offset];
+        }
+        first = last;
+    }
+}
+
 } // namespace
 
-ChunkGenerator::ChunkGenerator(uint32_t worldSeed, GenerationSettings generation)
+ChunkGenerator::ChunkGenerator(uint64_t worldSeed, GenerationSettings generation)
+    : ChunkGenerator(worldSeed, nullptr, generation) {}
+
+ChunkGenerator::ChunkGenerator(
+    uint64_t worldSeed,
+    std::shared_ptr<worldgen::learned::WorldGenerationContext> generationContext,
+    GenerationSettings generation)
     : seed_(worldSeed)
     , scratchToken_(nextGeneratorInstanceToken())
     , random_(worldSeed)
-    , macroSampler_(worldSeed)
+    , learnedAuthority_(generationContext != nullptr)
+    , previewAuthority_(generationContext && generationContext->quality() ==
+                                                 worldgen::learned::AuthorityQuality::PREVIEW)
+    , macroSampler_(worldSeed, std::move(generationContext))
     , columnPlanCache_()
-    , climate_(worldSeed)
-    , density_(worldSeed)
-    , ores_(worldSeed)
-    , structures_(worldSeed, generation.structures)
-    , features_(worldSeed) {}
+    , climate_(boundedSubsystemSeed(worldSeed))
+    , density_(boundedSubsystemSeed(worldSeed))
+    , ores_(boundedSubsystemSeed(worldSeed))
+    , structures_(boundedSubsystemSeed(worldSeed), generation.structures)
+    , features_(boundedSubsystemSeed(worldSeed)) {}
 
 void ChunkGenerator::clearMacroCaches() const {
     columnPlanCache_.clear();
+    farWaterPlanCache_.clear();
     macroSampler_.clearBasinCache();
     macroSampler_.clearMacroControlCache();
     scratchToken_.store(nextGeneratorInstanceToken(), std::memory_order_relaxed);
@@ -811,9 +1136,9 @@ const ColumnShape& ChunkGenerator::latticeShape(int64_t lx, int64_t lz, GenScrat
     auto it = scratch.shapes.find(key);
     if (it != scratch.shapes.end()) return it->second;
     const worldgen::SurfaceSample surface = surfaceSampleAt(lx, lz, scratch);
-    const ColumnShape legacy =
-        climate_.shapeColumn(static_cast<double>(lx), static_cast<double>(lz));
-    ColumnShape shape = shapeFromSurface(surface, legacy);
+    const double caveEntrance =
+        climate_.caveEntrance(static_cast<double>(lx), static_cast<double>(lz));
+    ColumnShape shape = shapeFromSurface(surface, caveEntrance, learnedAuthority_);
     return scratch.shapes.emplace(key, shape).first->second;
 }
 
@@ -821,8 +1146,10 @@ std::shared_ptr<const ColumnPlan> ChunkGenerator::getColumnPlan(ColumnPos chunkC
     return constructColumnPlan(chunkColumn, true);
 }
 
-std::shared_ptr<const ColumnPlan> ChunkGenerator::constructColumnPlan(ColumnPos chunkColumn,
-                                                                      bool retainInCache) const {
+std::shared_ptr<const ColumnPlan>
+ChunkGenerator::constructColumnPlan(ColumnPos chunkColumn, bool retainInCache,
+                                    ColumnPlanCache* alternateCache) const {
+    columnPlanConstructionRequestCount_.fetch_add(1, std::memory_order_relaxed);
     const int64_t baseX = chunkColumn.x * CHUNK_EDGE;
     const int64_t baseZ = chunkColumn.z * CHUNK_EDGE;
     const int64_t apronOriginX = baseX - COLUMN_PLAN_LATTICE_SPACING;
@@ -856,17 +1183,12 @@ std::shared_ptr<const ColumnPlan> ChunkGenerator::constructColumnPlan(ColumnPos 
     const auto canonicalHydrology = [&]() -> const ColumnPlanConstructionHydrology& {
         if (!construction.hydrology) {
             auto samples = std::make_unique<ColumnPlanConstructionHydrology>();
-            sampleGeneratedWaterAuthorityGrid(baseX, baseZ, 1,
-                                              COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE, *samples);
-            for (int localZ = 0; localZ < COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE; ++localZ) {
-                for (int localX = 0; localX < COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE; ++localX) {
-                    const int64_t worldX = baseX + localX;
-                    const int64_t worldZ = baseZ + localZ;
-                    worldgen::HydrologySample& hydrology = (*samples)[static_cast<size_t>(
-                        localZ * COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE + localX)];
-                    if (requiresExactShoreSupport(hydrology)) {
-                        hydrology.channelBank = true;
-                    }
+            if (!learnedAuthority_) {
+                // The v3 plan remains byte-compatible with its original
+                // 17-by-17 hydrology query. Only learned pages require an
+                // apron to resolve canonical contacts across page edges.
+                const auto applyLegacyTerrainDetail = [&](worldgen::HydrologySample& hydrology,
+                                                          int64_t worldX, int64_t worldZ) {
                     if (hydrology.ocean) {
                         hydrology.surfaceElevation = std::min(
                             hydrology.surfaceElevation +
@@ -886,7 +1208,33 @@ std::shared_ptr<const ColumnPlan> ChunkGenerator::constructColumnPlan(ColumnPos 
                             smoothstep(0.0, 32.0, channelClearance) *
                             worldgen::DRY_RELIEF_DETAIL_SCALE;
                     }
+                };
+                LegacyColumnPlanConstructionHydrology legacySamples{};
+                macroSampler_.sampleHydrologyGrid(
+                    baseX, baseZ, 1, 1, LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE,
+                    LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE, legacySamples);
+                for (int localZ = 0; localZ < LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE;
+                     ++localZ) {
+                    for (int localX = 0; localX < LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE;
+                         ++localX) {
+                        worldgen::HydrologySample& hydrology = (*samples)[static_cast<size_t>(
+                            (localZ + COLUMN_PLAN_HYDROLOGY_APRON_BLOCKS) *
+                                COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE +
+                            localX + COLUMN_PLAN_HYDROLOGY_APRON_BLOCKS)];
+                        hydrology = legacySamples[static_cast<size_t>(
+                            localZ * LEGACY_COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE + localX)];
+                        if (requiresLegacyExactShoreSupport(hydrology)) {
+                            hydrology.channelBank = true;
+                        }
+                        applyLegacyTerrainDetail(hydrology, baseX + localX, baseZ + localZ);
+                    }
                 }
+            } else {
+                macroSampler_.sampleHydrologyGrid(baseX - COLUMN_PLAN_HYDROLOGY_APRON_BLOCKS,
+                                                  baseZ - COLUMN_PLAN_HYDROLOGY_APRON_BLOCKS, 1, 1,
+                                                  COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE,
+                                                  COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE,
+                                                  *samples);
             }
             construction.hydrology = std::move(samples);
         }
@@ -896,10 +1244,10 @@ std::shared_ptr<const ColumnPlan> ChunkGenerator::constructColumnPlan(ColumnPos 
     const auto canonicalGeology = [&]() -> const ColumnPlanConstructionGeology& {
         if (!construction.geology) {
             auto samples = std::make_unique<ColumnPlanConstructionGeology>();
-            for (int localZ = 0; localZ < COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE; ++localZ) {
-                for (int localX = 0; localX < COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE; ++localX) {
-                    (*samples)[static_cast<size_t>(
-                        localZ * COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE + localX)] =
+            for (int localZ = 0; localZ < COLUMN_PLAN_CONSTRUCTION_GEOLOGY_EDGE; ++localZ) {
+                for (int localX = 0; localX < COLUMN_PLAN_CONSTRUCTION_GEOLOGY_EDGE; ++localX) {
+                    (*samples)[static_cast<size_t>(localZ * COLUMN_PLAN_CONSTRUCTION_GEOLOGY_EDGE +
+                                                   localX)] =
                         macroSampler_.sampleGeology(static_cast<double>(baseX + localX),
                                                     static_cast<double>(baseZ + localZ));
                 }
@@ -934,7 +1282,7 @@ std::shared_ptr<const ColumnPlan> ChunkGenerator::constructColumnPlan(ColumnPos 
 
             std::array<worldgen::HydrologySample, COLUMN_PLAN_CONSTRUCTION_PERIMETER_SAMPLES>
                 hydrology{};
-            sampleGeneratedWaterAuthorityPoints(positions, hydrology);
+            macroSampler_.sampleHydrologyPoints(positions, hydrology);
             GenScratch& scratch = threadScratch();
             for (size_t index = 0; index < positions.size(); ++index) {
                 const ColumnPos position = positions[index];
@@ -971,23 +1319,25 @@ std::shared_ptr<const ColumnPlan> ChunkGenerator::constructColumnPlan(ColumnPos 
         const int localX = static_cast<int>(x - baseX);
         const int localZ = static_cast<int>(z - baseZ);
         return canonicalHydrology()[static_cast<size_t>(
-            localZ * COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE + localX)];
+            (localZ + COLUMN_PLAN_HYDROLOGY_APRON_BLOCKS) *
+                COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE +
+            localX + COLUMN_PLAN_HYDROLOGY_APRON_BLOCKS)];
     };
     const ColumnPlanGeologySampler sampleGeology = [&](int64_t x, int64_t z) {
         const int localX = static_cast<int>(x - baseX);
         const int localZ = static_cast<int>(z - baseZ);
         return canonicalGeology()[static_cast<size_t>(
-            localZ * COLUMN_PLAN_CONSTRUCTION_AUTHORITY_EDGE + localX)];
+            localZ * COLUMN_PLAN_CONSTRUCTION_GEOLOGY_EDGE + localX)];
     };
     worldgen::MacroControlView controls = macroSampler_.controlView(chunkColumn);
-    if (!retainInCache) {
+    if (!retainInCache && alternateCache == nullptr) {
         return std::make_shared<ColumnPlan>(chunkColumn, sampleSurface, sampleHeight,
                                             sampleExactSurface, sampleHydrology, sampleGeology,
                                             std::move(controls));
     }
-    return columnPlanCache_.getOrCreate(chunkColumn, sampleSurface, sampleHeight,
-                                        sampleExactSurface, sampleHydrology, sampleGeology,
-                                        std::move(controls));
+    ColumnPlanCache& targetCache = alternateCache != nullptr ? *alternateCache : columnPlanCache_;
+    return targetCache.getOrCreate(chunkColumn, sampleSurface, sampleHeight, sampleExactSurface,
+                                   sampleHydrology, sampleGeology, std::move(controls));
 }
 
 std::shared_ptr<const ColumnPlan> ChunkGenerator::findColumnPlan(ColumnPos chunkColumn) const {
@@ -999,7 +1349,48 @@ worldgen::SurfaceSample ChunkGenerator::surfaceSampleFromPlan(int64_t x, int64_t
                                                               GenScratch& scratch) const {
     const int localX = static_cast<int>(x - plan.chunkColumn().x * CHUNK_EDGE);
     const int localZ = static_cast<int>(z - plan.chunkColumn().z * CHUNK_EDGE);
-    worldgen::SurfaceSample result = applyVolcanism(x, z, plan.sample(localX, localZ), scratch);
+    worldgen::SurfaceSample result = plan.sample(localX, localZ);
+    if (learnedAuthority_) {
+        // ColumnPlan keeps exact categorical geology compact, while its
+        // retained eight-block lattice supplies the legacy continuous fields.
+        // The latter must not leak into v4 ecology or density decisions: the
+        // learned authority has no control-grid geology phase. Restore the
+        // coordinate-pure full geology sample before any downstream consumer
+        // observes the exact column.
+        result.geology =
+            macroSampler_.sampleGeology(static_cast<double>(x), static_cast<double>(z));
+        // ColumnPlan restores the canonical block-resolution hydrology floor
+        // after reconstructing its compact lattice. Apply the bounded dry
+        // residual at the final coordinate as well, rather than interpolating
+        // it through that lattice or silently omitting it from exact terrain.
+        const double previousTerrainHeight = result.terrainHeight;
+        macroSampler_.applyV4SurfaceDetail(static_cast<double>(x), static_cast<double>(z),
+                                           worldgen::SurfaceFootprint::BLOCK_1, result);
+        const double terrainHeightDelta = result.terrainHeight - previousTerrainHeight;
+        if (std::abs(terrainHeightDelta) > 1.0e-12) {
+            // The compact plan reconstructed learned climate at the canonical
+            // routing floor. Bring its derived values to the same final dry
+            // elevation used by direct and far samples without issuing one
+            // scalar learned-authority lookup per generated column.
+            result.climate.temperatureC += terrainHeightDelta *
+                                           worldgen::learned::WORLD_METERS_PER_BLOCK *
+                                           result.climate.lapseRateCPerMeter;
+            result.climate.potentialEvapotranspirationMm =
+                std::clamp(300.0 + std::max(-8.0, result.climate.temperatureC) * 31.0 +
+                               result.climate.temperatureVariabilityC * 8.0,
+                           120.0, 1'800.0);
+            result.climate.relativeHumidity = std::clamp(
+                result.climate.annualPrecipitationMm /
+                    std::max(1.0,
+                             result.climate.annualPrecipitationMm +
+                                 result.climate.potentialEvapotranspirationMm *
+                                     (0.75 + result.climate.precipitationCoefficientOfVariation)),
+                0.0, 1.0);
+            result.climate.aridity = result.climate.potentialEvapotranspirationMm /
+                                     std::max(1.0, result.climate.annualPrecipitationMm);
+        }
+    }
+    result = applyVolcanism(x, z, std::move(result), scratch);
     // Suitability is nonlinear in final terrain, hydrology, and climate.
     // Recompute it after block-resolution terrain and volcanic deformation
     // instead of preserving the control lattice's interpolated ranking.
@@ -1009,18 +1400,26 @@ worldgen::SurfaceSample ChunkGenerator::surfaceSampleFromPlan(int64_t x, int64_t
 
 worldgen::SurfaceSample ChunkGenerator::surfaceSampleAt(int64_t x, int64_t z,
                                                         GenScratch& scratch) const {
-    const ColumnPos chunkColumn{
-        world_coord::floorDiv(x, static_cast<int64_t>(CHUNK_EDGE)),
-        world_coord::floorDiv(z, static_cast<int64_t>(CHUNK_EDGE)),
+    const auto sampleUnfinalized = [&](int64_t sampleX, int64_t sampleZ) {
+        const ColumnPos chunkColumn{
+            world_coord::floorDiv(sampleX, static_cast<int64_t>(CHUNK_EDGE)),
+            world_coord::floorDiv(sampleZ, static_cast<int64_t>(CHUNK_EDGE)),
+        };
+        auto found = scratch.columnPlans.find(chunkColumn);
+        if (found == scratch.columnPlans.end()) {
+            found = scratch.columnPlans.emplace(chunkColumn, getColumnPlan(chunkColumn)).first;
+        }
+        worldgen::SurfaceSample sample =
+            surfaceSampleFromPlan(sampleX, sampleZ, *found->second, scratch);
+        applyEmittedSurfaceTopology(
+            sample,
+            static_cast<double>(found->second->surfaceY(Chunk::worldToLocal(sampleX),
+                                                        Chunk::worldToLocal(sampleZ)) +
+                                1),
+            learnedAuthority_);
+        return sample;
     };
-    auto found = scratch.columnPlans.find(chunkColumn);
-    if (found == scratch.columnPlans.end()) {
-        found = scratch.columnPlans.emplace(chunkColumn, getColumnPlan(chunkColumn)).first;
-    }
-    worldgen::SurfaceSample result = surfaceSampleFromPlan(x, z, *found->second, scratch);
-    applyEmittedSurfaceTopology(
-        result, static_cast<double>(
-                    found->second->surfaceY(Chunk::worldToLocal(x), Chunk::worldToLocal(z)) + 1));
+    worldgen::SurfaceSample result = sampleUnfinalized(x, z);
     const VolcanicColumnSample& volcanism = volcanismAt(x, z, result.geology, scratch);
     return refreshDependentSurface(x, z, std::move(result), volcanism);
 }
@@ -1042,20 +1441,22 @@ worldgen::SurfaceSample ChunkGenerator::sampleFarGeometrySurface(int64_t x, int6
 worldgen::SurfaceSample
 ChunkGenerator::sampleFarGeometrySurface(int64_t x, int64_t z,
                                          worldgen::SurfaceFootprint footprint) const {
+    if (footprint == worldgen::SurfaceFootprint::BLOCK_1) {
+        const std::array<ColumnPos, 1> positions = {ColumnPos{x, z}};
+        std::array<worldgen::SurfaceSample, 1> output{};
+        macroSampler_.sampleGeometryPoints(positions, footprint, output);
+        GenScratch& scratch = threadScratch();
+        const VolcanicColumnSample& volcanism = volcanismAt(x, z, output.front().geology, scratch);
+        applyVolcanicGeometry(output.front(), volcanism);
+        return output.front();
+    }
     worldgen::SurfaceSample result;
     result.geology = macroSampler_.sampleGeology(static_cast<double>(x), static_cast<double>(z));
-    if (footprint == worldgen::SurfaceFootprint::BLOCK_1) {
-        result.hydrology =
-            macroSampler_.sampleHydrology(static_cast<double>(x), static_cast<double>(z));
-        result.terrainHeight = result.hydrology.surfaceElevation;
-        result.waterSurface = result.hydrology.waterSurface;
-    } else {
-        const worldgen::SurfaceSample filtered =
-            macroSampler_.sampleSurface(static_cast<double>(x), static_cast<double>(z), footprint);
-        result.hydrology = filtered.hydrology;
-        result.terrainHeight = filtered.terrainHeight;
-        result.waterSurface = filtered.waterSurface;
-    }
+    const worldgen::SurfaceSample filtered =
+        macroSampler_.sampleSurface(static_cast<double>(x), static_cast<double>(z), footprint);
+    result.hydrology = filtered.hydrology;
+    result.terrainHeight = filtered.terrainHeight;
+    result.waterSurface = filtered.waterSurface;
     GenScratch& scratch = threadScratch();
     const VolcanicColumnSample& volcanism = volcanismAt(x, z, result.geology, scratch);
     applyVolcanicGeometry(result, volcanism);
@@ -1079,6 +1480,30 @@ void ChunkGenerator::sampleFarGeometryGrid(int64_t originX, int64_t originZ, int
             applyVolcanicGeometry(output[index], volcanism);
         }
     }
+    if (!learnedAuthority_ && footprint == worldgen::SurfaceFootprint::BLOCK_1 && spacingX == 1 &&
+        spacingZ == 1) {
+        // Legacy macro raster routes can terminate at the global ocean after
+        // a multi-block stage drop. Preserve both wet bodies and represent
+        // the discontinuity as an explicit fall, rather than publishing an
+        // untagged vertical water face in the geometry-only far grid.
+        const std::vector<worldgen::SurfaceSample> unfinalized(output.begin(), output.end());
+        const auto sampleUnfinalized = [&](int64_t x, int64_t z) {
+            const int64_t localX = x - originX;
+            const int64_t localZ = z - originZ;
+            if (localX < 0 || localZ < 0 || localX >= sampleWidth || localZ >= sampleHeight) {
+                return worldgen::SurfaceSample{};
+            }
+            return unfinalized[static_cast<size_t>(localZ * sampleWidth + localX)];
+        };
+        for (int sampleZ = 0; sampleZ < sampleHeight; ++sampleZ) {
+            for (int sampleX = 0; sampleX < sampleWidth; ++sampleX) {
+                const size_t index = static_cast<size_t>(sampleZ * sampleWidth + sampleX);
+                output[index] =
+                    finalizeCoordinateWetContact(originX + sampleX, originZ + sampleZ,
+                                                 std::move(output[index]), sampleUnfinalized, true);
+            }
+        }
+    }
 }
 
 void ChunkGenerator::sampleFarGeometryPoints(std::span<const ColumnPos> positions,
@@ -1091,6 +1516,256 @@ void ChunkGenerator::sampleFarGeometryPoints(std::span<const ColumnPos> position
             volcanismAt(positions[index].x, positions[index].z, output[index].geology, scratch);
         applyVolcanicGeometry(output[index], volcanism);
     }
+}
+
+void ChunkGenerator::sampleNativeHydrologyGeometryGrid(
+    int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth, int sampleHeight,
+    std::span<worldgen::SurfaceSample> output) const {
+    if (spacingX <= 0 || spacingZ <= 0 || sampleWidth <= 0 || sampleHeight <= 0 ||
+        output.size() != static_cast<size_t>(sampleWidth * sampleHeight)) {
+        throw std::invalid_argument("invalid native hydrology geometry grid");
+    }
+    std::vector<worldgen::HydrologySample> hydrology(output.size());
+    macroSampler_.sampleHydrologyGrid(originX, originZ, spacingX, spacingZ, sampleWidth,
+                                      sampleHeight, hydrology);
+    GenScratch& scratch = threadScratch();
+    for (int sampleZ = 0; sampleZ < sampleHeight; ++sampleZ) {
+        for (int sampleX = 0; sampleX < sampleWidth; ++sampleX) {
+            const size_t index = static_cast<size_t>(sampleZ * sampleWidth + sampleX);
+            const int64_t worldX = originX + static_cast<int64_t>(sampleX) * spacingX;
+            const int64_t worldZ = originZ + static_cast<int64_t>(sampleZ) * spacingZ;
+            worldgen::SurfaceSample surface;
+            surface.geology = macroSampler_.sampleGeology(static_cast<double>(worldX),
+                                                          static_cast<double>(worldZ));
+            surface.hydrology = hydrology[index];
+            surface.terrainHeight = surface.hydrology.surfaceElevation;
+            surface.waterSurface = surface.hydrology.waterSurface;
+            applyVolcanicGeometry(surface, volcanismAt(worldX, worldZ, surface.geology, scratch));
+            output[index] = std::move(surface);
+        }
+    }
+}
+
+void ChunkGenerator::sampleNativeHydrologyGeometryPoints(
+    std::span<const ColumnPos> positions, std::span<worldgen::SurfaceSample> output) const {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("invalid native hydrology geometry points");
+    }
+    if (positions.empty()) return;
+    std::vector<worldgen::HydrologySample> hydrology(output.size());
+    macroSampler_.sampleHydrologyPoints(positions, hydrology);
+    GenScratch& scratch = threadScratch();
+    for (size_t index = 0; index < positions.size(); ++index) {
+        const ColumnPos position = positions[index];
+        worldgen::SurfaceSample surface;
+        surface.geology = macroSampler_.sampleGeology(static_cast<double>(position.x),
+                                                      static_cast<double>(position.z));
+        surface.hydrology = hydrology[index];
+        surface.terrainHeight = surface.hydrology.surfaceElevation;
+        surface.waterSurface = surface.hydrology.waterSurface;
+        applyVolcanicGeometry(surface,
+                              volcanismAt(position.x, position.z, surface.geology, scratch));
+        output[index] = std::move(surface);
+    }
+}
+
+void ChunkGenerator::sampleNativeHydrologyAuthorityGrid(
+    int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth, int sampleHeight,
+    std::span<worldgen::HydrologySample> output) const {
+    if (spacingX <= 0 || spacingZ <= 0 || sampleWidth <= 0 || sampleHeight <= 0 ||
+        output.size() != static_cast<size_t>(sampleWidth * sampleHeight)) {
+        throw std::invalid_argument("invalid native hydrology authority grid");
+    }
+    macroSampler_.sampleHydrologyGrid(originX, originZ, spacingX, spacingZ, sampleWidth,
+                                      sampleHeight, output);
+}
+
+void ChunkGenerator::sampleNativeHydrologyAuthorityPoints(
+    std::span<const ColumnPos> positions, std::span<worldgen::HydrologySample> output) const {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("invalid native hydrology authority points");
+    }
+    macroSampler_.sampleHydrologyPoints(positions, output);
+}
+
+void ChunkGenerator::sampleCoarseNativeHydrologyAuthorityGrid(
+    int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth, int sampleHeight,
+    std::span<worldgen::HydrologySample> output) const {
+    if (spacingX <= 0 || spacingZ <= 0 || sampleWidth <= 0 || sampleHeight <= 0 ||
+        output.size() != static_cast<size_t>(sampleWidth * sampleHeight)) {
+        throw std::invalid_argument("invalid coarse native hydrology authority grid");
+    }
+    if (spacingX == 1 && spacingZ == 1) {
+        // Preserve every requested block coordinate while keeping each router
+        // call on a two-block lattice. Four parity grids exactly partition the
+        // original rectangle, including negative origins and odd dimensions.
+        for (int parityZ = 0; parityZ < 2; ++parityZ) {
+            const int height = (sampleHeight - parityZ + 1) / 2;
+            if (height <= 0) continue;
+            for (int parityX = 0; parityX < 2; ++parityX) {
+                const int width = (sampleWidth - parityX + 1) / 2;
+                if (width <= 0) continue;
+                std::vector<worldgen::HydrologySample> parity(static_cast<size_t>(width * height));
+                macroSampler_.sampleHydrologyGrid(originX + parityX, originZ + parityZ, 2, 2, width,
+                                                  height, parity);
+                for (int z = 0; z < height; ++z) {
+                    for (int x = 0; x < width; ++x) {
+                        output[static_cast<size_t>((z * 2 + parityZ) * sampleWidth + x * 2 +
+                                                   parityX)] =
+                            parity[static_cast<size_t>(z * width + x)];
+                    }
+                }
+            }
+        }
+        return;
+    }
+    macroSampler_.sampleHydrologyGrid(originX, originZ, spacingX, spacingZ, sampleWidth,
+                                      sampleHeight, output);
+}
+
+void ChunkGenerator::sampleCoarseNativeHydrologyAuthorityPoints(
+    std::span<const ColumnPos> positions, std::span<worldgen::HydrologySample> output) const {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("invalid coarse native hydrology authority points");
+    }
+    macroSampler_.sampleCoarseHydrologyPoints(positions, output);
+}
+
+void ChunkGenerator::sampleCoarseNativeHydrologyGeometryGrid(
+    int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth, int sampleHeight,
+    std::span<worldgen::SurfaceSample> output) const {
+    if (spacingX <= 0 || spacingZ <= 0 || sampleWidth <= 0 || sampleHeight <= 0 ||
+        output.size() != static_cast<size_t>(sampleWidth * sampleHeight)) {
+        throw std::invalid_argument("invalid coarse native hydrology geometry grid");
+    }
+    std::vector<worldgen::HydrologySample> hydrology(output.size());
+    sampleCoarseNativeHydrologyAuthorityGrid(originX, originZ, spacingX, spacingZ, sampleWidth,
+                                             sampleHeight, hydrology);
+    GenScratch& scratch = threadScratch();
+    for (int sampleZ = 0; sampleZ < sampleHeight; ++sampleZ) {
+        for (int sampleX = 0; sampleX < sampleWidth; ++sampleX) {
+            const size_t index = static_cast<size_t>(sampleZ * sampleWidth + sampleX);
+            const int64_t worldX = originX + static_cast<int64_t>(sampleX) * spacingX;
+            const int64_t worldZ = originZ + static_cast<int64_t>(sampleZ) * spacingZ;
+            worldgen::SurfaceSample surface;
+            surface.geology = macroSampler_.sampleGeology(static_cast<double>(worldX),
+                                                          static_cast<double>(worldZ));
+            surface.hydrology = hydrology[index];
+            surface.terrainHeight = surface.hydrology.surfaceElevation;
+            surface.waterSurface = surface.hydrology.waterSurface;
+            applyVolcanicGeometry(surface, volcanismAt(worldX, worldZ, surface.geology, scratch));
+            output[index] = std::move(surface);
+        }
+    }
+}
+
+void ChunkGenerator::sampleCoarseNativeHydrologyGeometryPoints(
+    std::span<const ColumnPos> positions, std::span<worldgen::SurfaceSample> output) const {
+    sampleStageFreePointRuns<worldgen::SurfaceSample>(
+        positions, output,
+        [this](int64_t originX, int64_t originZ, int spacingX, int spacingZ, int width, int height,
+               std::span<worldgen::SurfaceSample> destination) {
+            sampleCoarseNativeHydrologyGeometryGrid(originX, originZ, spacingX, spacingZ, width,
+                                                    height, destination);
+        });
+}
+
+void ChunkGenerator::sampleNativeHydrologyTopologyGrid(
+    int64_t originX, int64_t originZ, int cellWidth, int cellHeight,
+    std::span<worldgen::NativeHydrologyTopologyCell> output) const {
+    if (cellWidth <= 0 || cellHeight <= 0 ||
+        output.size() != static_cast<size_t>(cellWidth) * static_cast<size_t>(cellHeight)) {
+        throw std::invalid_argument("invalid native hydrology topology grid");
+    }
+    macroSampler_.sampleNativeHydrologyTopologyGrid(originX, originZ, cellWidth, cellHeight,
+                                                    output);
+}
+
+void ChunkGenerator::markVolcanicWaterCandidates(int64_t originX, int64_t originZ, int step,
+                                                 int cellWidth, int cellHeight,
+                                                 std::span<uint8_t> output) const {
+    if (step <= 0 || cellWidth <= 0 || cellHeight <= 0 ||
+        output.size() != static_cast<size_t>(cellWidth) * static_cast<size_t>(cellHeight)) {
+        throw std::invalid_argument("invalid volcanic far-water candidate grid");
+    }
+    std::fill(output.begin(), output.end(), uint8_t{0});
+
+    // V4 volcanic relief is already part of the model-native elevation passed
+    // into the canonical router. Its compact topology grid therefore sees a
+    // caldera lake even when every step-32 display sample misses it. Running
+    // the legacy analytical crater search here would duplicate that proof,
+    // request unrelated crater datums, and promote cells to an exact callback
+    // that cannot change v4 terrain or water.
+    if (learnedAuthority_) return;
+
+    const auto coordinateAt = [](int64_t origin, int index, int spacing) {
+        const __int128 value =
+            static_cast<__int128>(origin) + static_cast<__int128>(index) * spacing;
+        if (value < std::numeric_limits<int64_t>::min() ||
+            value > std::numeric_limits<int64_t>::max()) {
+            throw std::out_of_range("volcanic far-water candidate coordinate exceeds int64 range");
+        }
+        return static_cast<int64_t>(value);
+    };
+    const int64_t maximumX = coordinateAt(originX, cellWidth, step);
+    const int64_t maximumZ = coordinateAt(originZ, cellHeight, step);
+    const auto circleTouches = [](const VolcanoPrimitive& volcano, double radius, int64_t minimumX,
+                                  int64_t minimumZ, int64_t maximumXExclusive,
+                                  int64_t maximumZExclusive) {
+        // Volcanic columns sample at block centers and crater warping can
+        // stretch the radial shore by 12 percent. Expand the half-open cell
+        // slightly so this conservative filter cannot omit a legal lake cell.
+        const double closestX = std::clamp(volcano.centerX, static_cast<double>(minimumX) - 1.0,
+                                           static_cast<double>(maximumXExclusive) + 1.0);
+        const double closestZ = std::clamp(volcano.centerZ, static_cast<double>(minimumZ) - 1.0,
+                                           static_cast<double>(maximumZExclusive) + 1.0);
+        return std::hypot(volcano.centerX - closestX, volcano.centerZ - closestZ) <= radius;
+    };
+
+    GenScratch& scratch = threadScratch();
+    const auto markPrimitive = [&](const VolcanoPrimitive& primitive) {
+        if (!primitive.craterLake || primitive.craterRadius <= 2.0 ||
+            !circleTouches(primitive, primitive.craterRadius * 1.12 + 1.0, originX, originZ,
+                           maximumX, maximumZ)) {
+            return;
+        }
+        const VolcanoPrimitive& volcano = resolvedVolcano(primitive, scratch);
+        if (!volcano.craterLake || volcano.craterLakeRadius <= 2.0) return;
+        const double wetRadius = volcano.craterLakeRadius * 1.12 + 1.0;
+        for (int cellZ = 0; cellZ < cellHeight; ++cellZ) {
+            const int64_t minimumCellZ = coordinateAt(originZ, cellZ, step);
+            const int64_t maximumCellZ = coordinateAt(originZ, cellZ + 1, step);
+            for (int cellX = 0; cellX < cellWidth; ++cellX) {
+                const int64_t minimumCellX = coordinateAt(originX, cellX, step);
+                const int64_t maximumCellX = coordinateAt(originX, cellX + 1, step);
+                if (!circleTouches(volcano, wetRadius, minimumCellX, minimumCellZ, maximumCellX,
+                                   maximumCellZ)) {
+                    continue;
+                }
+                output[static_cast<size_t>(cellZ) * static_cast<size_t>(cellWidth) +
+                       static_cast<size_t>(cellX)] = 1;
+            }
+        }
+    };
+    const auto visitPrimitiveCells = [&](int64_t cellEdge, auto&& visitor) {
+        const int64_t firstX = world_coord::floorDiv(originX, cellEdge);
+        const int64_t lastX = world_coord::floorDiv(maximumX - 1, cellEdge);
+        const int64_t firstZ = world_coord::floorDiv(originZ, cellEdge);
+        const int64_t lastZ = world_coord::floorDiv(maximumZ - 1, cellEdge);
+        for (int64_t cellZ = firstZ - 1; cellZ <= lastZ + 1; ++cellZ) {
+            for (int64_t cellX = firstX - 1; cellX <= lastX + 1; ++cellX) {
+                visitor(cellX, cellZ);
+            }
+        }
+    };
+    visitPrimitiveCells(worldgen::HOTSPOT_LATTICE_EDGE, [&](int64_t cellX, int64_t cellZ) {
+        for (const VolcanoPrimitive& primitive : volcanoesForCell(cellX, cellZ, scratch))
+            markPrimitive(primitive);
+    });
+    visitPrimitiveCells(VOLCANIC_ARC_CELL_EDGE, [&](int64_t cellX, int64_t cellZ) {
+        for (const VolcanoPrimitive& primitive : volcanicArcForCell(cellX, cellZ, scratch))
+            markPrimitive(primitive);
+    });
 }
 
 worldgen::SurfaceSample ChunkGenerator::sampleExactGeometrySurface(int64_t x, int64_t z) const {
@@ -1113,31 +1788,191 @@ void ChunkGenerator::sampleExactSurfaceGrid(int64_t originX, int64_t originZ, in
         output.size() != static_cast<size_t>(sampleEdge * sampleEdge)) {
         throw std::invalid_argument("invalid exact surface grid");
     }
+    if (learnedAuthority_ && spacing == 1) {
+        samplePlanFreeExactSurfaceGrid(originX, originZ, sampleEdge, output);
+        return;
+    }
     GenScratch& scratch = threadScratch();
-    std::unordered_map<ColumnPos, std::shared_ptr<const ColumnPlan>> retainedPlans;
-    const int64_t gridWidth = static_cast<int64_t>(sampleEdge - 1) * spacing;
-    const size_t planSpan = static_cast<size_t>(gridWidth / CHUNK_EDGE + 2);
-    retainedPlans.reserve(planSpan * planSpan);
     for (int sampleZ = 0; sampleZ < sampleEdge; ++sampleZ) {
         for (int sampleX = 0; sampleX < sampleEdge; ++sampleX) {
             const int64_t worldX = originX + static_cast<int64_t>(sampleX) * spacing;
             const int64_t worldZ = originZ + static_cast<int64_t>(sampleZ) * spacing;
-            const ColumnPos column{
-                world_coord::floorDiv(worldX, static_cast<int64_t>(CHUNK_EDGE)),
-                world_coord::floorDiv(worldZ, static_cast<int64_t>(CHUNK_EDGE)),
-            };
-            auto [plan, inserted] = retainedPlans.try_emplace(column);
-            if (inserted) plan->second = getColumnPlan(column);
-            worldgen::SurfaceSample result =
-                surfaceSampleFromPlan(worldX, worldZ, *plan->second, scratch);
-            const int emittedTop =
-                plan->second->surfaceY(Chunk::worldToLocal(worldX), Chunk::worldToLocal(worldZ)) +
-                1;
-            applyEmittedSurfaceTopology(result, static_cast<double>(emittedTop));
-            const VolcanicColumnSample& volcanism =
-                volcanismAt(worldX, worldZ, result.geology, scratch);
             output[static_cast<size_t>(sampleZ * sampleEdge + sampleX)] =
-                refreshDependentSurface(worldX, worldZ, std::move(result), volcanism);
+                surfaceSampleAt(worldX, worldZ, scratch);
+        }
+    }
+}
+
+void ChunkGenerator::samplePlanFreeExactSurfaceGrid(
+    int64_t originX, int64_t originZ, int sampleEdge,
+    std::span<worldgen::SurfaceSample> output) const {
+    if (!learnedAuthority_ || sampleEdge <= 0 ||
+        output.size() != static_cast<size_t>(sampleEdge * sampleEdge)) {
+        throw std::invalid_argument("invalid plan-free exact surface grid");
+    }
+
+    // One regular macro and hydrology batch supplies every requested column.
+    // The density field then retains only the globally aligned lattice columns
+    // that bound this square. This is the dense counterpart to the sparse
+    // habitat evaluator and avoids both per-column hash tables and 16-block
+    // ColumnPlan construction.
+    macroSampler_.sampleSurfaceGrid(originX, originZ, 1, sampleEdge,
+                                    worldgen::SurfaceFootprint::BLOCK_1, output);
+    GenScratch& scratch = threadScratch();
+    for (int z = 0; z < sampleEdge; ++z) {
+        for (int x = 0; x < sampleEdge; ++x) {
+            const size_t index = static_cast<size_t>(z * sampleEdge + x);
+            output[index] =
+                applyVolcanism(originX + x, originZ + z, std::move(output[index]), scratch);
+        }
+    }
+
+    const auto checkedLastCoordinate = [sampleEdge](int64_t origin) {
+        const __int128 last = static_cast<__int128>(origin) + sampleEdge - 1;
+        if (last > std::numeric_limits<int64_t>::max()) {
+            throw std::out_of_range("plan-free exact grid exceeds int64 coordinates");
+        }
+        return static_cast<int64_t>(last);
+    };
+    const int64_t lastX = checkedLastCoordinate(originX);
+    const int64_t lastZ = checkedLastCoordinate(originZ);
+    const int64_t latticeOriginX = latticeFloor(originX);
+    const int64_t latticeOriginZ = latticeFloor(originZ);
+    const int64_t latticeLastX = latticeFloor(lastX) + LATTICE_XZ;
+    const int64_t latticeLastZ = latticeFloor(lastZ) + LATTICE_XZ;
+    const int latticeWidth = static_cast<int>((latticeLastX - latticeOriginX) / LATTICE_XZ + 1);
+    const int latticeHeight = static_cast<int>((latticeLastZ - latticeOriginZ) / LATTICE_XZ + 1);
+
+    std::vector<ColumnPos> latticePositions;
+    latticePositions.reserve(static_cast<size_t>(latticeWidth * latticeHeight));
+    for (int z = 0; z < latticeHeight; ++z) {
+        for (int x = 0; x < latticeWidth; ++x) {
+            latticePositions.push_back({latticeOriginX + static_cast<int64_t>(x) * LATTICE_XZ,
+                                        latticeOriginZ + static_cast<int64_t>(z) * LATTICE_XZ});
+        }
+    }
+    std::vector<worldgen::SurfaceSample> latticeSurfaces(latticePositions.size());
+    macroSampler_.sampleSurfacePoints(latticePositions, worldgen::SurfaceFootprint::BLOCK_1,
+                                      latticeSurfaces);
+    for (size_t index = 0; index < latticeSurfaces.size(); ++index) {
+        latticeSurfaces[index] =
+            applyVolcanism(latticePositions[index].x, latticePositions[index].z,
+                           std::move(latticeSurfaces[index]), scratch);
+    }
+
+    struct DensityColumn {
+        ColumnShape shape;
+        DensityColumnContext context;
+        std::vector<double> values;
+    };
+    const int verticalSpacing = densityLatticeVerticalSpacing();
+    const int levelCount = densityLatticeLevelCount();
+    std::vector<DensityColumn> densityColumns;
+    densityColumns.reserve(latticeSurfaces.size());
+    for (size_t index = 0; index < latticeSurfaces.size(); ++index) {
+        const ColumnPos position = latticePositions[index];
+        const worldgen::SurfaceSample& surface = latticeSurfaces[index];
+        ColumnShape shape = shapeFromSurface(
+            surface,
+            climate_.caveEntrance(static_cast<double>(position.x), static_cast<double>(position.z)),
+            learnedAuthority_);
+        const int maximumLevel =
+            maximumEvaluatedDensityLevel(shape.height + shape.detailAmp + 5.0, verticalSpacing);
+        densityColumns.push_back({
+            .shape = std::move(shape),
+            .context = density_.columnContext(static_cast<double>(position.x),
+                                              static_cast<double>(position.z), surface.geology),
+            .values = std::vector<double>(static_cast<size_t>(std::max(0, maximumLevel + 1)),
+                                          std::numeric_limits<double>::quiet_NaN()),
+        });
+    }
+    const auto latticeIndex = [&](int64_t x, int64_t z) {
+        const size_t localX = static_cast<size_t>((x - latticeOriginX) / LATTICE_XZ);
+        const size_t localZ = static_cast<size_t>((z - latticeOriginZ) / LATTICE_XZ);
+        return localZ * static_cast<size_t>(latticeWidth) + localX;
+    };
+    const auto densityValue = [&](size_t index, int level) {
+        DensityColumn& column = densityColumns[index];
+        const size_t bounded = static_cast<size_t>(std::clamp(level, 0, levelCount - 1));
+        if (bounded >= column.values.size()) return -DENSITY_CAP;
+        double& value = column.values[bounded];
+        if (std::isnan(value)) {
+            const ColumnPos position = latticePositions[index];
+            const double y =
+                static_cast<double>(WORLD_MIN_Y + static_cast<int>(bounded) * verticalSpacing);
+            value = evaluateDensity(static_cast<double>(position.x), y,
+                                    static_cast<double>(position.z), column.shape, column.context);
+        }
+        return value;
+    };
+
+    for (int z = 0; z < sampleEdge; ++z) {
+        for (int x = 0; x < sampleEdge; ++x) {
+            const size_t outputIndex = static_cast<size_t>(z * sampleEdge + x);
+            const int64_t worldX = originX + x;
+            const int64_t worldZ = originZ + z;
+            worldgen::SurfaceSample& surface = output[outputIndex];
+            const ColumnShape rootShape = shapeFromSurface(
+                surface,
+                climate_.caveEntrance(static_cast<double>(worldX), static_cast<double>(worldZ)),
+                learnedAuthority_);
+            const int start = std::clamp(
+                static_cast<int>(std::ceil(rootShape.height + rootShape.detailAmp + 8.0)),
+                WORLD_MIN_Y + 2, WORLD_MAX_Y);
+            const int64_t latticeX = latticeFloor(worldX);
+            const int64_t latticeZ = latticeFloor(worldZ);
+            const double fx = static_cast<double>(worldX - latticeX) / LATTICE_XZ;
+            const double fz = static_cast<double>(worldZ - latticeZ) / LATTICE_XZ;
+            const std::array<size_t, 4> corners{
+                latticeIndex(latticeX, latticeZ),
+                latticeIndex(latticeX + LATTICE_XZ, latticeZ),
+                latticeIndex(latticeX, latticeZ + LATTICE_XZ),
+                latticeIndex(latticeX + LATTICE_XZ, latticeZ + LATTICE_XZ),
+            };
+            int surfaceY = WORLD_MIN_Y + 1;
+            const int startLevel = (start - WORLD_MIN_Y) / verticalSpacing;
+            for (int level = startLevel; level >= 0; --level) {
+                const int baseY = WORLD_MIN_Y + level * verticalSpacing;
+                const int minimumY = std::max(WORLD_MIN_Y + 2, baseY);
+                const int maximumY = std::min(start, baseY + verticalSpacing - 1);
+                if (minimumY > maximumY) continue;
+                const double below = bilerpDensity(
+                    densityValue(corners[0], level), densityValue(corners[1], level),
+                    densityValue(corners[2], level), densityValue(corners[3], level), fx, fz);
+                const double above = bilerpDensity(densityValue(corners[0], level + 1),
+                                                   densityValue(corners[1], level + 1),
+                                                   densityValue(corners[2], level + 1),
+                                                   densityValue(corners[3], level + 1), fx, fz);
+                const auto interpolated = [&](int y) {
+                    return lerpDensity(below, above,
+                                       static_cast<double>(y - baseY) / verticalSpacing);
+                };
+                if (interpolated(maximumY) > 0.0) {
+                    surfaceY = maximumY;
+                    break;
+                }
+                if (maximumY == minimumY || interpolated(minimumY) <= 0.0) continue;
+                for (int y = maximumY - 1; y >= minimumY; --y) {
+                    if (interpolated(y) > 0.0) {
+                        surfaceY = y;
+                        break;
+                    }
+                }
+                if (surfaceY >= minimumY) break;
+            }
+
+            const VolcanicColumnSample& volcanism =
+                volcanismAt(worldX, worldZ, surface.geology, scratch);
+            surfaceY = boundedLearnedSurfaceY(surface, surfaceY, learnedAuthority_);
+            if (!learnedAuthority_ && !hasCanonicalWaterFeature(surface.hydrology) &&
+                volcanism.craterLake && volcanism.craterProfileInfluence > 1.0e-4) {
+                surfaceY = std::clamp(static_cast<int>(std::ceil(surface.terrainHeight)) - 1,
+                                      WORLD_MIN_Y, WORLD_MAX_Y);
+            }
+            reconcileEmittedSurfaceY(surface.hydrology, surfaceY, learnedAuthority_);
+            applyEmittedSurfaceTopology(surface, static_cast<double>(surfaceY + 1),
+                                        learnedAuthority_);
+            surface = refreshDependentSurface(worldX, worldZ, std::move(surface), volcanism);
         }
     }
 }
@@ -1149,27 +1984,261 @@ worldgen::SurfaceSample ChunkGenerator::sampleFarSurface(int64_t x, int64_t z) c
 worldgen::SurfaceSample
 ChunkGenerator::sampleFarSurface(int64_t x, int64_t z, worldgen::SurfaceFootprint footprint) const {
     if (footprint == worldgen::SurfaceFootprint::BLOCK_1) return sampleSurface(x, z);
-    return applyVolcanism(
+    worldgen::SurfaceSample result = applyVolcanism(
         x, z,
         macroSampler_.sampleSurface(static_cast<double>(x), static_cast<double>(z), footprint),
         threadScratch());
+
+    // v3's filtered macro sample remains its own geometry and water contract.
+    // Only v4 has a separately persisted canonical water authority that must
+    // override every coarse terrain footprint. Applying that override to v3
+    // paired a block-resolution lake stage with a filtered lake bed and left
+    // stale depth metadata at far LODs.
+    if (!learnedAuthority_) return result;
+
+    const worldgen::SurfaceSample exact = sampleExactSurface(x, z);
+    result.hydrology = exact.hydrology;
+    result.waterSurface = exact.waterSurface;
+    if (hasSurfaceWater(exact.hydrology)) {
+        result.terrainHeight = std::min(result.terrainHeight, exact.terrainHeight);
+        result.hydrology.surfaceElevation = result.terrainHeight;
+    }
+    if (result.hydrology.lake) {
+        result.hydrology.lakeDepth =
+            std::max(0.0, result.hydrology.waterSurface - result.terrainHeight);
+    }
+    return result;
+}
+
+void ChunkGenerator::sampleCanonicalWaterSurfacePoints(
+    std::span<const ColumnPos> positions, std::span<worldgen::SurfaceSample> output) const {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("canonical water point output has the wrong size");
+    }
+    // Far water needs the same emitted terrain contact as exact cubes, but a
+    // tile-wide query must not construct and retain hundreds of complete
+    // 16-by-16 column plans. The sparse evaluator computes only the density
+    // levels crossed by each requested coordinate and finalizes the same
+    // canonical water authority in one deterministic batch.
+    if (positions.empty()) return;
+
+    // V4's native router already owns every legal waterfall transition. It
+    // therefore needs only requested positions here, rather than the four
+    // synthetic wet-contact probes formerly used to invent a local fall.
+    if (learnedAuthority_) {
+        sampleFarHabitatPoints(positions, output);
+        return;
+    }
+
+    // Keep the legacy v3 batch geometry unchanged. Its retained neighbor set
+    // is part of the existing sampling behavior even though v4 no longer uses
+    // it to synthesize water transitions.
+    std::unordered_map<ColumnPos, size_t> sampleIndices;
+    sampleIndices.reserve(positions.size() * 5);
+    std::vector<ColumnPos> samplePositions;
+    samplePositions.reserve(positions.size() * 5);
+    const auto retain = [&](ColumnPos position) {
+        const auto [found, inserted] = sampleIndices.emplace(position, samplePositions.size());
+        if (inserted) samplePositions.push_back(position);
+        return found->second;
+    };
+    constexpr std::array<std::pair<int, int>, 4> CARDINAL = {std::pair{-1, 0}, std::pair{1, 0},
+                                                             std::pair{0, -1}, std::pair{0, 1}};
+    for (const ColumnPos position : positions) {
+        retain(position);
+        for (const auto [offsetX, offsetZ] : CARDINAL)
+            retain({position.x + offsetX, position.z + offsetZ});
+    }
+
+    std::vector<worldgen::SurfaceSample> samples(samplePositions.size());
+    sampleFarHabitatPoints(samplePositions, samples);
+    for (size_t index = 0; index < positions.size(); ++index)
+        output[index] = samples[sampleIndices.at(positions[index])];
 }
 
 worldgen::HydrologySample ChunkGenerator::sampleGeneratedWaterAuthority(int64_t x,
                                                                         int64_t z) const {
-    return macroSampler_.sampleHydrology(static_cast<double>(x), static_cast<double>(z));
+    if (!learnedAuthority_)
+        return macroSampler_.sampleHydrology(static_cast<double>(x), static_cast<double>(z));
+    return sampleExactSurface(x, z).hydrology;
 }
 
 void ChunkGenerator::sampleGeneratedWaterAuthorityGrid(
     int64_t originX, int64_t originZ, int spacing, int sampleEdge,
     std::span<worldgen::HydrologySample> output) const {
-    macroSampler_.sampleHydrologyGrid(originX, originZ, spacing, spacing, sampleEdge, sampleEdge,
-                                      output);
+    if (spacing <= 0 || sampleEdge <= 0 ||
+        output.size() != static_cast<size_t>(sampleEdge * sampleEdge)) {
+        throw std::invalid_argument("invalid generated water authority grid");
+    }
+    if (!learnedAuthority_) {
+        macroSampler_.sampleHydrologyGrid(originX, originZ, spacing, spacing, sampleEdge,
+                                          sampleEdge, output);
+        return;
+    }
+    std::vector<ColumnPos> positions;
+    positions.reserve(output.size());
+    for (int sampleZ = 0; sampleZ < sampleEdge; ++sampleZ) {
+        for (int sampleX = 0; sampleX < sampleEdge; ++sampleX) {
+            positions.push_back({originX + static_cast<int64_t>(sampleX) * spacing,
+                                 originZ + static_cast<int64_t>(sampleZ) * spacing});
+        }
+    }
+    sampleGeneratedWaterAuthorityPoints(positions, output);
 }
 
 void ChunkGenerator::sampleGeneratedWaterAuthorityPoints(
     std::span<const ColumnPos> positions, std::span<worldgen::HydrologySample> output) const {
-    macroSampler_.sampleHydrologyPoints(positions, output);
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("generated water authority point output has the wrong size");
+    }
+    if (positions.empty()) return;
+    if (!learnedAuthority_) {
+        macroSampler_.sampleHydrologyPoints(positions, output);
+        return;
+    }
+
+    std::unordered_map<ColumnPos, size_t> sampleIndices;
+    sampleIndices.reserve(positions.size() * 13);
+    std::vector<ColumnPos> samplePositions;
+    samplePositions.reserve(positions.size() * 13);
+    const auto retain = [&](ColumnPos position) {
+        const auto [found, inserted] = sampleIndices.emplace(position, samplePositions.size());
+        if (inserted) samplePositions.push_back(position);
+        return found->second;
+    };
+    constexpr std::array<std::pair<int, int>, 4> CARDINAL = {std::pair{-1, 0}, std::pair{1, 0},
+                                                             std::pair{0, -1}, std::pair{0, 1}};
+    std::vector<size_t> requestedIndices;
+    requestedIndices.reserve(positions.size());
+    for (const ColumnPos position : positions) {
+        requestedIndices.push_back(retain(position));
+        for (const auto [offsetX, offsetZ] : CARDINAL) {
+            const ColumnPos neighbor{position.x + offsetX, position.z + offsetZ};
+            retain(neighbor);
+            for (const auto [secondOffsetX, secondOffsetZ] : CARDINAL) {
+                retain({neighbor.x + secondOffsetX, neighbor.z + secondOffsetZ});
+            }
+        }
+    }
+
+    // Most far-grid points are dry macro terrain and cannot change water
+    // ownership after voxel emission. Sample the complete coordinate-pure
+    // authority first, then pay the lazy density cost for every requested wet
+    // column, its banks, and dry columns close enough to open below the sea
+    // plane. A standing or routed water cell must expose the same emitted bed
+    // elevation as exact terrain, even when its current depth is greater than
+    // one block. Otherwise a distant mesh can retain a correct stage above a
+    // stale, fractional bed.
+    std::vector<worldgen::SurfaceSample> samples(samplePositions.size());
+    std::vector<worldgen::HydrologySample> macroHydrology(samplePositions.size());
+    macroSampler_.sampleHydrologyPoints(samplePositions, macroHydrology);
+    GenScratch& scratch = threadScratch();
+    for (size_t index = 0; index < samples.size(); ++index) {
+        const ColumnPos position = samplePositions[index];
+        worldgen::SurfaceSample& sample = samples[index];
+        sample.geology = macroSampler_.sampleGeology(static_cast<double>(position.x),
+                                                     static_cast<double>(position.z));
+        sample.hydrology = macroHydrology[index];
+        sample.terrainHeight = sample.hydrology.surfaceElevation;
+        sample.waterSurface = sample.hydrology.waterSurface;
+        applyVolcanicGeometry(sample, volcanismAt(position.x, position.z, sample.geology, scratch));
+    }
+    constexpr double MAXIMUM_DRY_SURFACE_DETAIL = 14.0;
+    std::vector<bool> exactMask(samplePositions.size(), false);
+    for (size_t requestIndex = 0; requestIndex < positions.size(); ++requestIndex) {
+        const size_t index = requestedIndices[requestIndex];
+        const ColumnPos position = positions[requestIndex];
+        const worldgen::SurfaceSample& sample = samples[index];
+        const bool wet = hasSurfaceWater(sample.hydrology);
+        bool breachedLakeBoundary = false;
+        if (sample.hydrology.lake) {
+            for (const auto [offsetX, offsetZ] : CARDINAL) {
+                const worldgen::SurfaceSample& neighbor =
+                    samples[sampleIndices.at({position.x + offsetX, position.z + offsetZ})];
+                const bool differentBody =
+                    !neighbor.hydrology.lake ||
+                    neighbor.hydrology.waterBodyId != sample.hydrology.waterBodyId;
+                if (differentBody && sample.waterSurface > neighbor.terrainHeight + 1.000001) {
+                    breachedLakeBoundary = true;
+                    break;
+                }
+            }
+        }
+        bool partialDropContact = false;
+        if (wet && sample.hydrology.river && sample.hydrology.generatedFluidLevel > 0) {
+            const double visibleSurface = worldgen::generatedFluidColumn(sample).visibleSurface;
+            for (const auto [offsetX, offsetZ] : CARDINAL) {
+                const worldgen::SurfaceSample& neighbor =
+                    samples[sampleIndices.at({position.x + offsetX, position.z + offsetZ})];
+                const worldgen::GeneratedFluidColumn neighborFluid =
+                    worldgen::generatedFluidColumn(neighbor);
+                if (neighborFluid.wet && !legalExplicitFall(neighbor) &&
+                    visibleSurface > neighborFluid.visibleSurface + 1.000001) {
+                    partialDropContact = true;
+                    break;
+                }
+            }
+        }
+        const bool drySeaContact =
+            !wet && sample.terrainHeight <= SEA_LEVEL + MAXIMUM_DRY_SURFACE_DETAIL + 1.0;
+        const bool topologySensitive =
+            wet || sample.hydrology.channelBank || sample.hydrology.lakeBank || drySeaContact;
+        if (!topologySensitive) continue;
+        exactMask[index] = true;
+        if (breachedLakeBoundary || partialDropContact) {
+            for (const auto [offsetX, offsetZ] : CARDINAL)
+                exactMask[sampleIndices.at({position.x + offsetX, position.z + offsetZ})] = true;
+        } else if (drySeaContact) {
+            for (const auto [offsetX, offsetZ] : CARDINAL) {
+                const size_t neighborIndex =
+                    sampleIndices.at({position.x + offsetX, position.z + offsetZ});
+                const worldgen::SurfaceSample& neighbor = samples[neighborIndex];
+                const worldgen::GeneratedFluidColumn neighborFluid =
+                    worldgen::generatedFluidColumn(neighbor);
+                const double normalFlow = offsetX != 0
+                                              ? std::abs(neighbor.hydrology.flowDirection.x)
+                                              : std::abs(neighbor.hydrology.flowDirection.z);
+                const double tangentialFlow = offsetX != 0
+                                                  ? std::abs(neighbor.hydrology.flowDirection.z)
+                                                  : std::abs(neighbor.hydrology.flowDirection.x);
+                if (neighborFluid.wet && neighbor.hydrology.river &&
+                    normalFlow + 1.0e-6 < tangentialFlow &&
+                    neighborFluid.visibleSurface > sample.terrainHeight + 1.000001) {
+                    exactMask[neighborIndex] = true;
+                }
+            }
+        }
+    }
+
+    ThreadWaterContactCache& contactCache = threadWaterContactCache(this, scratch.ownerToken);
+    std::vector<ColumnPos> missingExactPositions;
+    std::vector<size_t> missingExactIndices;
+    missingExactPositions.reserve(samplePositions.size() / 4);
+    missingExactIndices.reserve(samplePositions.size() / 4);
+    for (size_t index = 0; index < exactMask.size(); ++index) {
+        if (!exactMask[index]) continue;
+        const auto cached = contactCache.surfaces.find(samplePositions[index]);
+        if (cached != contactCache.surfaces.end()) {
+            samples[index] = cached->second;
+            continue;
+        }
+        missingExactPositions.push_back(samplePositions[index]);
+        missingExactIndices.push_back(index);
+    }
+    if (!missingExactPositions.empty()) {
+        std::vector<worldgen::SurfaceSample> exactSamples(missingExactPositions.size());
+        sampleFarHabitatPoints(missingExactPositions, exactSamples);
+        for (size_t index = 0; index < exactSamples.size(); ++index)
+            samples[missingExactIndices[index]] = exactSamples[index];
+        for (size_t index = 0; index < exactSamples.size(); ++index)
+            contactCache.surfaces.insert_or_assign(missingExactPositions[index],
+                                                   std::move(exactSamples[index]));
+    }
+
+    for (size_t index = 0; index < output.size(); ++index) {
+        const ColumnPos position = positions[index];
+        output[index] = samples[sampleIndices.at(position)].hydrology;
+    }
 }
 
 void ChunkGenerator::sampleGeneratedWaterGeometryGrid(
@@ -1179,25 +2248,15 @@ void ChunkGenerator::sampleGeneratedWaterGeometryGrid(
         output.size() != static_cast<size_t>(sampleWidth * sampleHeight)) {
         throw std::invalid_argument("invalid generated water geometry grid");
     }
-    std::vector<worldgen::HydrologySample> hydrology(output.size());
-    macroSampler_.sampleHydrologyGrid(originX, originZ, spacingX, spacingZ, sampleWidth,
-                                      sampleHeight, hydrology);
-    GenScratch& scratch = threadScratch();
+    std::vector<ColumnPos> positions;
+    positions.reserve(output.size());
     for (int sampleZ = 0; sampleZ < sampleHeight; ++sampleZ) {
         for (int sampleX = 0; sampleX < sampleWidth; ++sampleX) {
-            const size_t index = static_cast<size_t>(sampleZ * sampleWidth + sampleX);
-            const int64_t worldX = originX + static_cast<int64_t>(sampleX) * spacingX;
-            const int64_t worldZ = originZ + static_cast<int64_t>(sampleZ) * spacingZ;
-            worldgen::SurfaceSample& surface = output[index];
-            surface = {};
-            surface.geology = macroSampler_.sampleGeology(static_cast<double>(worldX),
-                                                          static_cast<double>(worldZ));
-            surface.hydrology = hydrology[index];
-            surface.terrainHeight = surface.hydrology.surfaceElevation;
-            surface.waterSurface = surface.hydrology.waterSurface;
-            applyVolcanicGeometry(surface, volcanismAt(worldX, worldZ, surface.geology, scratch));
+            positions.push_back({originX + static_cast<int64_t>(sampleX) * spacingX,
+                                 originZ + static_cast<int64_t>(sampleZ) * spacingZ});
         }
     }
+    sampleCanonicalWaterSurfacePoints(positions, output);
 }
 
 void ChunkGenerator::sampleGeneratedWaterGeometryPoints(
@@ -1205,21 +2264,7 @@ void ChunkGenerator::sampleGeneratedWaterGeometryPoints(
     if (positions.size() != output.size()) {
         throw std::invalid_argument("generated water geometry point output has the wrong size");
     }
-    std::vector<worldgen::HydrologySample> hydrology(output.size());
-    macroSampler_.sampleHydrologyPoints(positions, hydrology);
-    GenScratch& scratch = threadScratch();
-    for (size_t index = 0; index < positions.size(); ++index) {
-        const ColumnPos position = positions[index];
-        worldgen::SurfaceSample& surface = output[index];
-        surface = {};
-        surface.geology = macroSampler_.sampleGeology(static_cast<double>(position.x),
-                                                      static_cast<double>(position.z));
-        surface.hydrology = hydrology[index];
-        surface.terrainHeight = surface.hydrology.surfaceElevation;
-        surface.waterSurface = surface.hydrology.waterSurface;
-        applyVolcanicGeometry(surface,
-                              volcanismAt(position.x, position.z, surface.geology, scratch));
-    }
+    sampleCanonicalWaterSurfacePoints(positions, output);
 }
 
 void ChunkGenerator::sampleFarSurfacePoints(std::span<const ColumnPos> positions,
@@ -1230,21 +2275,23 @@ void ChunkGenerator::sampleFarSurfacePoints(std::span<const ColumnPos> positions
             throw std::invalid_argument("surface point sample output has the wrong size");
         }
         std::unordered_map<ColumnPos, std::shared_ptr<const ColumnPlan>> retainedPlans;
-        retainedPlans.reserve(positions.size());
+        retainedPlans.reserve(positions.size() * 2);
         GenScratch& scratch = threadScratch();
-        for (size_t index = 0; index < positions.size(); ++index) {
-            const ColumnPos position = positions[index];
-            const ColumnPos column{Chunk::worldToChunk(position.x),
-                                   Chunk::worldToChunk(position.z)};
+        const auto sampleUnfinalized = [&](int64_t x, int64_t z) {
+            const ColumnPos column{Chunk::worldToChunk(x), Chunk::worldToChunk(z)};
             auto [plan, inserted] = retainedPlans.try_emplace(column);
             if (inserted) plan->second = constructColumnPlan(column, false);
-            worldgen::SurfaceSample result =
-                surfaceSampleFromPlan(position.x, position.z, *plan->second, scratch);
+            worldgen::SurfaceSample result = surfaceSampleFromPlan(x, z, *plan->second, scratch);
             applyEmittedSurfaceTopology(
                 result,
-                static_cast<double>(plan->second->surfaceY(Chunk::worldToLocal(position.x),
-                                                           Chunk::worldToLocal(position.z)) +
-                                    1));
+                static_cast<double>(
+                    plan->second->surfaceY(Chunk::worldToLocal(x), Chunk::worldToLocal(z)) + 1),
+                learnedAuthority_);
+            return result;
+        };
+        for (size_t index = 0; index < positions.size(); ++index) {
+            const ColumnPos position = positions[index];
+            worldgen::SurfaceSample result = sampleUnfinalized(position.x, position.z);
             const VolcanicColumnSample& volcanism =
                 volcanismAt(position.x, position.z, result.geology, scratch);
             output[index] =
@@ -1260,12 +2307,57 @@ void ChunkGenerator::sampleFarSurfacePoints(std::span<const ColumnPos> positions
     }
 }
 
+void ChunkGenerator::sampleFarEcologyPoints(std::span<const ColumnPos> positions, int lodStep,
+                                            std::span<worldgen::SurfaceSample> output) const {
+    if (positions.size() != output.size()) {
+        throw std::invalid_argument("far ecology point output has the wrong size");
+    }
+    if (!previewAuthority_ || lodStep < 4) {
+        sampleFarHabitatPoints(positions, output);
+        return;
+    }
+    if (positions.empty()) return;
+
+    const worldgen::SurfaceFootprint footprint =
+        lodStep <= 4    ? worldgen::SurfaceFootprint::BLOCK_4
+        : lodStep <= 8  ? worldgen::SurfaceFootprint::BLOCK_8
+        : lodStep <= 16 ? worldgen::SurfaceFootprint::BLOCK_16
+                        : worldgen::SurfaceFootprint::BLOCK_32;
+    macroSampler_.samplePreviewEcologyPoints(positions, footprint, output);
+
+    // Every candidate shares one stage-free point batch. The router retains
+    // immutable native pages across the complete call, preserving exact root
+    // wet/dry classification without per-row passes or ordinary-stage tiles.
+    std::vector<worldgen::HydrologySample> coarseHydrology(positions.size());
+    sampleCoarseNativeHydrologyAuthorityPoints(positions, coarseHydrology);
+
+    GenScratch& scratch = threadScratch();
+    for (size_t index = 0; index < positions.size(); ++index) {
+        const ColumnPos position = positions[index];
+        worldgen::SurfaceSample& surface = output[index];
+        surface.hydrology = coarseHydrology[index];
+        surface.waterSurface = surface.hydrology.waterSurface;
+        surface.slope = std::max(0.0, surface.hydrology.terrainSlope);
+        if (hasCanonicalWaterFeature(surface.hydrology)) {
+            surface.terrainHeight =
+                std::min(surface.terrainHeight, surface.hydrology.surfaceElevation);
+        }
+        surface.hydrology.surfaceElevation = surface.terrainHeight;
+        const VolcanicColumnSample& volcanism =
+            volcanismAt(position.x, position.z, surface.geology, scratch);
+        surface = applyVolcanism(position.x, position.z, std::move(surface), scratch);
+        surface = refreshDependentSurface(position.x, position.z, std::move(surface), volcanism);
+    }
+}
+
 void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions,
                                             std::span<worldgen::SurfaceSample> output) const {
     if (positions.size() != output.size()) {
         throw std::invalid_argument("habitat point sample output has the wrong size");
     }
     if (positions.empty()) return;
+    const int verticalDensitySpacing = densityLatticeVerticalSpacing();
+    const int densityLatticeLevels = densityLatticeLevelCount();
 
     // Sparse tree roots need the emitted block top, but constructing a full
     // 16 by 16 ColumnPlan for every occupied candidate column stalls coarse
@@ -1344,11 +2436,11 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
         const ColumnPos position = samplePositions[index];
         worldgen::SurfaceSample& surface = samples[index];
         surface.hydrology = canonicalHydrology[hydrologyIndices.at(position)];
-        if (requiresExactShoreSupport(surface.hydrology)) {
+        if (!learnedAuthority_ && requiresLegacyExactShoreSupport(surface.hydrology)) {
             surface.hydrology.channelBank = true;
         }
         surface.terrainHeight = surface.hydrology.surfaceElevation;
-        if (surface.hydrology.ocean) {
+        if (!learnedAuthority_ && surface.hydrology.ocean) {
             surface.terrainHeight =
                 std::min(surface.terrainHeight +
                              macroSampler_.reliefDetail(static_cast<double>(position.x),
@@ -1356,8 +2448,8 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
                                                         worldgen::SurfaceFootprint::BLOCK_1) *
                                  worldgen::OCEAN_FLOOR_DETAIL_SCALE,
                          static_cast<double>(SEA_LEVEL) - 0.5);
-        } else if (!hasSurfaceWater(surface.hydrology) && !surface.hydrology.channelBank &&
-                   !surface.hydrology.lakeBank) {
+        } else if (!learnedAuthority_ && !hasSurfaceWater(surface.hydrology) &&
+                   !surface.hydrology.channelBank && !surface.hydrology.lakeBank) {
             const double channelClearance =
                 surface.hydrology.channelDistance - surface.hydrology.channelWidth * 2.5;
             surface.terrainHeight +=
@@ -1368,6 +2460,16 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
         }
         surface.hydrology.surfaceElevation = surface.terrainHeight;
         surface.waterSurface = surface.hydrology.waterSurface;
+        if (learnedAuthority_) {
+            // Sparse habitat density must use the same coordinate-pure dry
+            // residual as exact columns and far geometry. Resetting to the
+            // canonical routing floor above is required for authoritative
+            // water, but omitting this post-routing step moved dry roots and
+            // left their retained climate adapted to a different elevation.
+            macroSampler_.applyV4SurfaceDetail(static_cast<double>(position.x),
+                                               static_cast<double>(position.z),
+                                               worldgen::SurfaceFootprint::BLOCK_1, surface);
+        }
         surface = applyVolcanism(position.x, position.z, std::move(surface), scratch);
     }
 
@@ -1385,8 +2487,7 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
     struct DensityLatticeColumn {
         ColumnShape shape;
         DensityColumnContext context;
-        std::array<double, LATTICE_LEVELS> values{};
-        std::array<bool, LATTICE_LEVELS> evaluated{};
+        std::vector<double> values;
     };
     std::vector<std::optional<DensityLatticeColumn>> densityColumns(samples.size());
     const auto densityValue = [&](size_t sampleIndex, int level) {
@@ -1396,24 +2497,29 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
             const worldgen::SurfaceSample& surface = samples[sampleIndex];
             retained.emplace();
             retained->shape =
-                shapeFromSurface(surface, climate_.shapeColumn(static_cast<double>(position.x),
-                                                               static_cast<double>(position.z)));
+                shapeFromSurface(surface,
+                                 climate_.caveEntrance(static_cast<double>(position.x),
+                                                       static_cast<double>(position.z)),
+                                 learnedAuthority_);
             retained->context = density_.columnContext(
                 static_cast<double>(position.x), static_cast<double>(position.z), surface.geology);
+            const double yCap = retained->shape.height + retained->shape.detailAmp + 5.0;
+            const int maximumEvaluatedLevel =
+                maximumEvaluatedDensityLevel(yCap, verticalDensitySpacing);
+            retained->values.assign(static_cast<size_t>(maximumEvaluatedLevel + 1),
+                                    std::numeric_limits<double>::quiet_NaN());
         }
         DensityLatticeColumn& column = *retained;
-        const size_t boundedLevel = static_cast<size_t>(std::clamp(level, 0, LATTICE_LEVELS - 1));
-        if (!column.evaluated[boundedLevel]) {
+        const size_t boundedLevel =
+            static_cast<size_t>(std::clamp(level, 0, densityLatticeLevels - 1));
+        if (boundedLevel >= column.values.size()) return -DENSITY_CAP;
+        if (std::isnan(column.values[boundedLevel])) {
             const ColumnPos position = samplePositions[sampleIndex];
-            const double y =
-                static_cast<double>(WORLD_MIN_Y + static_cast<int>(boundedLevel) * LATTICE_Y);
-            const double yCap = column.shape.height + column.shape.detailAmp + 5.0;
-            column.values[boundedLevel] = y > yCap
-                                              ? -DENSITY_CAP
-                                              : density_.density(static_cast<double>(position.x), y,
-                                                                 static_cast<double>(position.z),
-                                                                 column.shape, column.context);
-            column.evaluated[boundedLevel] = true;
+            const double y = static_cast<double>(WORLD_MIN_Y + static_cast<int>(boundedLevel) *
+                                                                   verticalDensitySpacing);
+            column.values[boundedLevel] =
+                evaluateDensity(static_cast<double>(position.x), y, static_cast<double>(position.z),
+                                column.shape, column.context);
         }
         return column.values[boundedLevel];
     };
@@ -1432,39 +2538,47 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
         const int nearestX = fx <= 0.5 ? 0 : 1;
         const int nearestZ = fz <= 0.5 ? 0 : 1;
         const size_t nearest = root.hydrologyLattice[static_cast<size_t>(nearestZ * 2 + nearestX)];
-        worldgen::HydrologySample hydrology = canonicalHydrology[nearest];
-        const auto interpolate = [&](auto getter) {
-            return bilerpDensity(getter(canonicalHydrology[root.hydrologyLattice[0]]),
-                                 getter(canonicalHydrology[root.hydrologyLattice[1]]),
-                                 getter(canonicalHydrology[root.hydrologyLattice[2]]),
-                                 getter(canonicalHydrology[root.hydrologyLattice[3]]), smoothFx,
-                                 smoothFz);
-        };
-        hydrology.flowDirection = {
-            interpolate([](const auto& value) { return value.flowDirection.x; }),
-            interpolate([](const auto& value) { return value.flowDirection.z; }),
-        };
-        const double flowMagnitude =
-            std::hypot(hydrology.flowDirection.x, hydrology.flowDirection.z);
-        if (flowMagnitude < 1.0e-12) {
-            hydrology.flowDirection = {1.0, 0.0};
-        } else {
-            hydrology.flowDirection.x /= flowMagnitude;
-            hydrology.flowDirection.z /= flowMagnitude;
+        worldgen::HydrologySample hydrology;
+        if (!learnedAuthority_) {
+            hydrology = canonicalHydrology[nearest];
+            const auto interpolate = [&](auto getter) {
+                return bilerpDensity(getter(canonicalHydrology[root.hydrologyLattice[0]]),
+                                     getter(canonicalHydrology[root.hydrologyLattice[1]]),
+                                     getter(canonicalHydrology[root.hydrologyLattice[2]]),
+                                     getter(canonicalHydrology[root.hydrologyLattice[3]]), smoothFx,
+                                     smoothFz);
+            };
+            hydrology.flowDirection = {
+                interpolate([](const auto& value) { return value.flowDirection.x; }),
+                interpolate([](const auto& value) { return value.flowDirection.z; }),
+            };
+            const double flowMagnitude =
+                std::hypot(hydrology.flowDirection.x, hydrology.flowDirection.z);
+            if (flowMagnitude < 1.0e-12) {
+                hydrology.flowDirection = {1.0, 0.0};
+            } else {
+                hydrology.flowDirection.x /= flowMagnitude;
+                hydrology.flowDirection.z /= flowMagnitude;
+            }
+            hydrology.discharge = interpolate([](const auto& value) { return value.discharge; });
+            hydrology.sediment = interpolate([](const auto& value) { return value.sediment; });
+            hydrology.channelDistance =
+                interpolate([](const auto& value) { return value.channelDistance; });
+            hydrology.channelWidth =
+                interpolate([](const auto& value) { return value.channelWidth; });
+            hydrology.channelDepth =
+                interpolate([](const auto& value) { return value.channelDepth; });
+            hydrology.channelGradient =
+                interpolate([](const auto& value) { return value.channelGradient; });
+            hydrology.erosionDepth =
+                interpolate([](const auto& value) { return value.erosionDepth; });
         }
-        hydrology.discharge = interpolate([](const auto& value) { return value.discharge; });
-        hydrology.sediment = interpolate([](const auto& value) { return value.sediment; });
-        hydrology.channelDistance =
-            interpolate([](const auto& value) { return value.channelDistance; });
-        hydrology.channelWidth = interpolate([](const auto& value) { return value.channelWidth; });
-        hydrology.channelDepth = interpolate([](const auto& value) { return value.channelDepth; });
-        hydrology.channelGradient =
-            interpolate([](const auto& value) { return value.channelGradient; });
-        hydrology.erosionDepth = interpolate([](const auto& value) { return value.erosionDepth; });
 
         worldgen::HydrologySample canonical = canonicalHydrology[hydrologyIndices.at(position)];
-        if (requiresExactShoreSupport(canonical)) canonical.channelBank = true;
-        if (canonical.ocean) {
+        if (!learnedAuthority_ && requiresLegacyExactShoreSupport(canonical)) {
+            canonical.channelBank = true;
+        }
+        if (!learnedAuthority_ && canonical.ocean) {
             canonical.surfaceElevation =
                 std::min(canonical.surfaceElevation +
                              macroSampler_.reliefDetail(static_cast<double>(position.x),
@@ -1472,7 +2586,8 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
                                                         worldgen::SurfaceFootprint::BLOCK_1) *
                                  worldgen::OCEAN_FLOOR_DETAIL_SCALE,
                          static_cast<double>(SEA_LEVEL) - 0.5);
-        } else if (!hasSurfaceWater(canonical) && !canonical.channelBank && !canonical.lakeBank) {
+        } else if (!learnedAuthority_ && !hasSurfaceWater(canonical) && !canonical.channelBank &&
+                   !canonical.lakeBank) {
             const double channelClearance =
                 canonical.channelDistance - canonical.channelWidth * 2.5;
             canonical.surfaceElevation +=
@@ -1481,40 +2596,93 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
                                            worldgen::SurfaceFootprint::BLOCK_1) *
                 smoothstep(0.0, 32.0, channelClearance) * worldgen::DRY_RELIEF_DETAIL_SCALE;
         }
+        const worldgen::Vector2d directFlow = canonical.flowDirection;
         canonicalizeColumnPlanHydrology(canonical);
-        hydrology.generatedFluidLevel = canonical.generatedFluidLevel;
-        hydrology.transitionOwnerKind = canonical.transitionOwnerKind;
-        hydrology.transitionOwnerId = canonical.transitionOwnerId;
-        hydrology.waterBodyId = canonical.waterBodyId;
-        hydrology.lakeShoreDistance = canonical.lakeShoreDistance;
-        hydrology.shoreWaterSurface = canonical.waterSurface;
-        hydrology.ocean = canonical.ocean;
-        hydrology.channelBank = canonical.channelBank;
-        hydrology.lakeBank = canonical.lakeBank;
-        hydrology.lakeBankInfluence = canonical.lakeBankInfluence;
-        hydrology.lake = !canonical.ocean && canonical.lake &&
-                         canonical.waterSurface > canonical.surfaceElevation + 0.05;
-        hydrology.river = !hydrology.ocean && !hydrology.lake && canonical.river;
-        hydrology.endorheic = hydrology.lake && canonical.endorheic;
-        hydrology.waterfall = canonical.waterfall;
-        hydrology.waterfallAnchor = canonical.waterfallAnchor;
-        hydrology.waterfallTop = canonical.waterfallTop;
-        hydrology.waterfallBottom = canonical.waterfallBottom;
-        hydrology.waterfallWidth = canonical.waterfallWidth;
-        if (hydrology.waterfall) hydrology.flowDirection = canonical.flowDirection;
-        hydrology.delta = canonical.delta;
-        if (hydrology.river || hydrology.delta) {
-            for (size_t sampleIndex : root.hydrologyLattice) {
-                hydrology.streamOrder =
-                    std::max(hydrology.streamOrder, canonicalHydrology[sampleIndex].streamOrder);
-                hydrology.distributaryCount = std::max(
-                    hydrology.distributaryCount, canonicalHydrology[sampleIndex].distributaryCount);
+        if (learnedAuthority_) {
+            // The block-exact v4 hydrology batch already contains every
+            // routing field. Do not reintroduce the retired eight-block
+            // interpolation while preparing sparse canopy habitat.
+            hydrology = canonical;
+            const double directFlowMagnitude = std::hypot(directFlow.x, directFlow.z);
+            if (directFlowMagnitude < 1.0e-12) {
+                hydrology.flowDirection = {};
+            } else {
+                hydrology.flowDirection = canonicalColumnPlanFlow(directFlow);
+                const double canonicalFlowMagnitude =
+                    std::hypot(hydrology.flowDirection.x, hydrology.flowDirection.z);
+                hydrology.flowDirection.x /= canonicalFlowMagnitude;
+                hydrology.flowDirection.z /= canonicalFlowMagnitude;
             }
+            hydrology.discharge = static_cast<float>(hydrology.discharge);
+            hydrology.sediment = static_cast<float>(hydrology.sediment);
+            hydrology.channelDistance = static_cast<float>(hydrology.channelDistance);
+            hydrology.channelWidth = static_cast<float>(hydrology.channelWidth);
+            hydrology.channelDepth = static_cast<float>(hydrology.channelDepth);
+            hydrology.channelGradient = static_cast<float>(hydrology.channelGradient);
+            hydrology.erosionDepth = static_cast<float>(hydrology.erosionDepth);
+            hydrology.baseflow = static_cast<float>(hydrology.baseflow);
+            hydrology.precipitationSeasonality =
+                static_cast<float>(hydrology.precipitationSeasonality);
+            hydrology.groundwaterRechargeMm = static_cast<float>(hydrology.groundwaterRechargeMm);
+            hydrology.groundwaterHead = static_cast<float>(hydrology.groundwaterHead);
+            hydrology.hydroperiod = static_cast<float>(hydrology.hydroperiod);
+            hydrology.terrainSlope = static_cast<float>(hydrology.terrainSlope);
+            hydrology.shoreWaterSurface = canonical.waterSurface;
+            hydrology.lake = !canonical.ocean && canonical.lake &&
+                             canonical.waterSurface > canonical.surfaceElevation + 0.05;
+            hydrology.river = !hydrology.ocean && !hydrology.lake && canonical.river;
+            hydrology.wetland = !hydrology.ocean && !hydrology.lake && !hydrology.river &&
+                                canonical.wetland &&
+                                canonical.waterSurface > canonical.surfaceElevation + 0.01;
+            hydrology.endorheic = hydrology.lake && canonical.endorheic;
         } else {
-            hydrology.streamOrder = 0;
-            hydrology.distributaryCount = 0;
+            hydrology.generatedFluidLevel = canonical.generatedFluidLevel;
+            hydrology.transitionOwnerKind = canonical.transitionOwnerKind;
+            hydrology.transitionOwnerId = canonical.transitionOwnerId;
+            hydrology.waterBodyId = canonical.waterBodyId;
+            hydrology.lakeShoreDistance = canonical.lakeShoreDistance;
+            hydrology.shoreWaterSurface = canonical.waterSurface;
+            hydrology.ocean = canonical.ocean;
+            hydrology.lake = !canonical.ocean && canonical.lake &&
+                             canonical.waterSurface > canonical.surfaceElevation + 0.05;
+            hydrology.river = !hydrology.ocean && !hydrology.lake && canonical.river;
+            // The legacy macro sampler can retain a wetland classification after
+            // local relief has lifted the final bank above its water stage. Match
+            // ColumnPlan's block-resolution ownership predicate so far flora
+            // never accepts a wetland habitat that exact cube generation resolves
+            // as dry terrain.
+            hydrology.wetland = !hydrology.ocean && !hydrology.lake && !hydrology.river &&
+                                canonical.wetland &&
+                                canonical.waterSurface > canonical.surfaceElevation + 0.01;
+            hydrology.channelBank = canonical.channelBank;
+            hydrology.lakeBank = canonical.lakeBank;
+            hydrology.lakeBankInfluence = canonical.lakeBankInfluence;
+            hydrology.endorheic = hydrology.lake && canonical.endorheic;
+            hydrology.waterfall = canonical.waterfall;
+            hydrology.waterfallAnchor = canonical.waterfallAnchor;
+            hydrology.waterfallTop = canonical.waterfallTop;
+            hydrology.waterfallBottom = canonical.waterfallBottom;
+            hydrology.waterfallWidth = canonical.waterfallWidth;
+            if (hydrology.waterfall) hydrology.flowDirection = canonical.flowDirection;
+            hydrology.delta = canonical.delta;
+            if (hydrology.river || hydrology.delta) {
+                for (size_t sampleIndex : root.hydrologyLattice) {
+                    hydrology.streamOrder = std::max(hydrology.streamOrder,
+                                                     canonicalHydrology[sampleIndex].streamOrder);
+                    hydrology.distributaryCount =
+                        std::max(hydrology.distributaryCount,
+                                 canonicalHydrology[sampleIndex].distributaryCount);
+                }
+            } else {
+                hydrology.streamOrder = 0;
+                hydrology.distributaryCount = 0;
+            }
+            hydrology.waterSurface = canonical.waterSurface;
+            hydrology.terrainSlope = canonical.terrainSlope;
+            hydrology.groundwaterHead = canonical.groundwaterHead;
+            hydrology.hydroperiod = canonical.hydroperiod;
+            hydrology.groundwaterRechargeMm = canonical.groundwaterRechargeMm;
         }
-        hydrology.waterSurface = canonical.waterSurface;
 
         worldgen::SurfaceSample result = macroSamples[root.surface];
         result.hydrology = hydrology;
@@ -1524,6 +2692,15 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
         result.hydrology.lakeDepth =
             result.hydrology.lake ? result.hydrology.waterSurface - result.terrainHeight : 0.0;
         result.waterSurface = result.hydrology.waterSurface;
+        if (learnedAuthority_) {
+            // Canonicalization above deliberately restores the routed floor.
+            // Reapply the bounded dry residual before learned climate is
+            // reconstructed so exact columns, far geometry, and habitat
+            // placement observe one final physical surface.
+            macroSampler_.applyV4SurfaceDetail(static_cast<double>(position.x),
+                                               static_cast<double>(position.z),
+                                               worldgen::SurfaceFootprint::BLOCK_1, result);
+        }
         // ColumnPlan reconstructs continuous climate after replacing its
         // lattice hydrology with block authority. Repeat that ordering here
         // so a density-only root cannot cross a species temperature limit.
@@ -1536,20 +2713,21 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
         const ColumnPos position = positions[index];
         const RootDensityCorners& root = roots[index];
         worldgen::SurfaceSample result = habitatSurface(position, root);
-        const ColumnShape rootShape =
-            shapeFromSurface(result, climate_.shapeColumn(static_cast<double>(position.x),
-                                                          static_cast<double>(position.z)));
+        const ColumnShape rootShape = shapeFromSurface(
+            result,
+            climate_.caveEntrance(static_cast<double>(position.x), static_cast<double>(position.z)),
+            learnedAuthority_);
         const int start =
             std::clamp(static_cast<int>(std::ceil(rootShape.height + rootShape.detailAmp + 8.0)),
                        WORLD_MIN_Y + 2, WORLD_MAX_Y);
         const double fx = static_cast<double>(position.x - latticeFloor(position.x)) / LATTICE_XZ;
         const double fz = static_cast<double>(position.z - latticeFloor(position.z)) / LATTICE_XZ;
         int surfaceY = WORLD_MIN_Y + 1;
-        const int startLevel = (start - WORLD_MIN_Y) / LATTICE_Y;
+        const int startLevel = (start - WORLD_MIN_Y) / verticalDensitySpacing;
         for (int level = startLevel; level >= 0; --level) {
-            const int levelBaseY = WORLD_MIN_Y + level * LATTICE_Y;
+            const int levelBaseY = WORLD_MIN_Y + level * verticalDensitySpacing;
             const int minimumY = std::max(WORLD_MIN_Y + 2, levelBaseY);
-            const int maximumY = std::min(start, levelBaseY + LATTICE_Y - 1);
+            const int maximumY = std::min(start, levelBaseY + verticalDensitySpacing - 1);
             if (minimumY > maximumY) continue;
             const double below = bilerpDensity(
                 densityValue(root.lattice[0], level), densityValue(root.lattice[1], level),
@@ -1559,7 +2737,7 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
                                                densityValue(root.lattice[2], level + 1),
                                                densityValue(root.lattice[3], level + 1), fx, fz);
             const auto interpolatedDensity = [&](int y) {
-                const double fy = static_cast<double>(y - levelBaseY) / LATTICE_Y;
+                const double fy = static_cast<double>(y - levelBaseY) / verticalDensitySpacing;
                 return lerpDensity(below, above, fy);
             };
             if (interpolatedDensity(maximumY) > 0.0) {
@@ -1581,35 +2759,15 @@ void ChunkGenerator::sampleFarHabitatPoints(std::span<const ColumnPos> positions
 
         const VolcanicColumnSample& volcanism =
             volcanismAt(position.x, position.z, result.geology, scratch);
-        if (volcanism.craterLake && volcanism.craterProfileInfluence > 1.0e-4) {
+        surfaceY = boundedLearnedSurfaceY(result, surfaceY, learnedAuthority_);
+        if (!learnedAuthority_ && volcanism.craterLake &&
+            volcanism.craterProfileInfluence > 1.0e-4) {
             surfaceY = std::clamp(static_cast<int>(std::ceil(result.terrainHeight)) - 1,
                                   WORLD_MIN_Y, WORLD_MAX_Y);
         }
-        if (hasSurfaceWater(result.hydrology)) {
-            const int waterTopY =
-                std::clamp(static_cast<int>(std::ceil(result.hydrology.waterSurface)) - 1,
-                           WORLD_MIN_Y, WORLD_MAX_Y);
-            const int plannedFloorY =
-                std::clamp(static_cast<int>(std::ceil(result.hydrology.surfaceElevation)) - 1,
-                           WORLD_MIN_Y, WORLD_MAX_Y);
-            surfaceY = std::min(plannedFloorY, std::max(WORLD_MIN_Y, waterTopY - 1));
-        } else if (result.hydrology.channelBank || result.hydrology.lakeBank) {
-            const int plannedBankY =
-                std::clamp(static_cast<int>(std::ceil(result.hydrology.surfaceElevation)) - 1,
-                           WORLD_MIN_Y, WORLD_MAX_Y);
-            surfaceY = std::max(surfaceY, plannedBankY);
-        } else if (result.hydrology.surfaceElevation >= SEA_LEVEL && surfaceY < SEA_LEVEL - 1) {
-            surfaceY = SEA_LEVEL - 1;
-        }
-        if (result.hydrology.waterfall &&
-            result.hydrology.waterfallTop >= result.hydrology.waterfallBottom + 0.5) {
-            const int receivingWaterY =
-                std::clamp(static_cast<int>(std::ceil(result.hydrology.waterfallBottom)) - 1,
-                           WORLD_MIN_Y, WORLD_MAX_Y);
-            surfaceY = std::min(surfaceY, std::max(WORLD_MIN_Y, receivingWaterY - 1));
-        }
+        reconcileEmittedSurfaceY(result.hydrology, surfaceY, learnedAuthority_);
 
-        applyEmittedSurfaceTopology(result, static_cast<double>(surfaceY + 1));
+        applyEmittedSurfaceTopology(result, static_cast<double>(surfaceY + 1), learnedAuthority_);
         output[index] =
             refreshDependentSurface(position.x, position.z, std::move(result), volcanism);
     }
@@ -1632,6 +2790,12 @@ void ChunkGenerator::sampleFarSurfaceGrid(int64_t originX, int64_t originZ, int 
             output[index] = applyVolcanism(worldX, worldZ, std::move(output[index]), scratch);
         }
     }
+}
+
+void ChunkGenerator::sampleWeatherClimateGrid(int64_t originX, int64_t originZ, int spacing,
+                                              int sampleEdge,
+                                              std::span<worldgen::SurfaceSample> output) const {
+    macroSampler_.sampleClimateGrid(originX, originZ, spacing, sampleEdge, output);
 }
 
 BlockType ChunkGenerator::surfaceMaterialAt(int64_t x, int64_t z) const {
@@ -1722,6 +2886,12 @@ double ChunkGenerator::farSurfaceMaterialRankAt(int64_t x, int64_t z) const {
 }
 
 double ChunkGenerator::sampleFarTerrainHeight(int64_t x, int64_t z) const {
+    if (learnedAuthority_) {
+        return macroSampler_
+            .sampleSurface(static_cast<double>(x), static_cast<double>(z),
+                           worldgen::SurfaceFootprint::BLOCK_16)
+            .terrainHeight;
+    }
     worldgen::SurfaceSample macroSurface;
     macroSurface.geology =
         macroSampler_.sampleGeology(static_cast<double>(x), static_cast<double>(z));
@@ -1735,8 +2905,13 @@ double ChunkGenerator::sampleFarTerrainHeight(int64_t x, int64_t z) const {
 
 std::vector<VolcanoPrimitive> ChunkGenerator::hotspotVolcanoesForCell(int64_t cellX,
                                                                       int64_t cellZ) const {
-    const auto& volcanoes = volcanoesForCell(cellX, cellZ, threadScratch());
-    return {volcanoes.begin(), volcanoes.end()};
+    GenScratch& scratch = threadScratch();
+    const auto& volcanoes = volcanoesForCell(cellX, cellZ, scratch);
+    std::vector<VolcanoPrimitive> resolved;
+    resolved.reserve(volcanoes.size());
+    for (const VolcanoPrimitive& volcano : volcanoes)
+        resolved.push_back(resolvedVolcano(volcano, scratch));
+    return resolved;
 }
 
 std::vector<FarCanopy> ChunkGenerator::collectFarCanopies(int64_t minimumX, int64_t minimumZ,
@@ -1751,17 +2926,25 @@ std::vector<FarCanopy> ChunkGenerator::collectFarCanopies(int64_t minimumX, int6
 std::vector<FarCanopy> ChunkGenerator::collectFarCanopiesForLod(int64_t minimumX, int64_t minimumZ,
                                                                 int64_t maximumX, int64_t maximumZ,
                                                                 int lodStep) const {
-    if (lodStep <= 1) {
-        return collectFarCanopies(minimumX, minimumZ, maximumX, maximumZ);
-    }
-    if (lodStep == 2) {
+    if (lodStep <= 2) {
         GenScratch& scratch = threadScratch();
         prepareScratch(scratch);
+        // Far attachments always re-ground every accepted root against the
+        // displayed terrain cell. The batched anchor sampler already resolves
+        // the exact habitat surface, so rebuilding a complete ColumnPlan for
+        // every step-one tree only changes an absolute Y value that the
+        // mesher immediately discards.
         return features_.collectFarCanopyAnchors(minimumX, minimumZ, maximumX, maximumZ, *this,
                                                  structures_, scratch);
     }
     return features_.collectFarCanopyClusters(minimumX, minimumZ, maximumX, maximumZ, lodStep,
                                               *this);
+}
+
+std::vector<FarFlora> ChunkGenerator::collectFarFloraForLod(int64_t minimumX, int64_t minimumZ,
+                                                            int64_t maximumX, int64_t maximumZ,
+                                                            int lodStep) const {
+    return features_.collectFarFlora(minimumX, minimumZ, maximumX, maximumZ, lodStep, *this);
 }
 
 const std::vector<VolcanoPrimitive>& ChunkGenerator::volcanoesForCell(int64_t cellX, int64_t cellZ,
@@ -1814,7 +2997,13 @@ const std::vector<VolcanoPrimitive>& ChunkGenerator::volcanoesForCell(int64_t ce
             // rim, so this deepens coherent basins without affecting marshes
             // or ordinary hydrology depressions.
             const double craterDepth = shield ? 30.0 + sizeRoll * 22.0 : 12.0 + sizeRoll * 10.0;
-            const double centerElevation = macroSampler_.preliminaryElevation(centerX, centerZ);
+            // Legacy worlds retain their historical eager datum. V4 learns
+            // it only after the primitive passes the bounded influence test
+            // in volcanismAt, so an irrelevant hotspot chain cannot expand a
+            // far-horizon authority request by kilometers.
+            const bool resolveDatumNow = !learnedAuthority_;
+            const double centerElevation =
+                resolveDatumNow ? macroSampler_.preliminaryElevation(centerX, centerZ) : 0.0;
             const bool craterLake = random_.uniform01(HOTSPOT_PROPERTIES_STREAM, cellX, 0, cellZ,
                                                       propertyIndex + 4) < 0.48;
             const uint64_t id =
@@ -1827,6 +3016,7 @@ const std::vector<VolcanoPrimitive>& ChunkGenerator::volcanoesForCell(int64_t ce
                 .craterRadius = craterRadius,
                 .craterDepth = craterDepth,
                 .craterDatumElevation = centerElevation,
+                .craterDatumResolved = resolveDatumNow,
                 .tubePhase = random_.uniform01(HOTSPOT_PROPERTIES_STREAM, cellX, 0, cellZ,
                                                propertyIndex + 6) *
                              2.0 * std::numbers::pi,
@@ -1839,7 +3029,7 @@ const std::vector<VolcanoPrimitive>& ChunkGenerator::volcanoesForCell(int64_t ce
                 .lavaBearing = random_.uniform01(HOTSPOT_PROPERTIES_STREAM, cellX, 0, cellZ,
                                                  propertyIndex + 8) < 0.58,
             };
-            configureCraterLake(volcano);
+            if (resolveDatumNow) configureCraterLake(volcano);
             volcanoes.push_back(volcano);
         }
     }
@@ -1874,7 +3064,9 @@ ChunkGenerator::volcanicArcForCell(int64_t cellX, int64_t cellZ, GenScratch& scr
         const double sizeRoll = random_.uniform01(VOLCANIC_ARC_STREAM, cellX, 0, cellZ, 3);
         const double coneHeight = 12.0 + sizeRoll * 6.0;
         const double craterDepth = 8.0 + sizeRoll * 7.0;
-        const double centerElevation = macroSampler_.preliminaryElevation(centerX, centerZ);
+        const bool resolveDatumNow = !learnedAuthority_;
+        const double centerElevation =
+            resolveDatumNow ? macroSampler_.preliminaryElevation(centerX, centerZ) : 0.0;
         VolcanoPrimitive volcano{
             .centerX = centerX,
             .centerZ = centerZ,
@@ -1883,6 +3075,7 @@ ChunkGenerator::volcanicArcForCell(int64_t cellX, int64_t cellZ, GenScratch& scr
             .craterRadius = 21.0 + sizeRoll * 26.0,
             .craterDepth = craterDepth,
             .craterDatumElevation = centerElevation,
+            .craterDatumResolved = resolveDatumNow,
             .tubePhase =
                 random_.uniform01(VOLCANIC_ARC_STREAM, cellX, 0, cellZ, 4) * 2.0 * std::numbers::pi,
             .conduitRadius = 2.3 + random_.uniform01(VOLCANIC_ARC_STREAM, cellX, 0, cellZ, 5) * 1.7,
@@ -1891,12 +3084,31 @@ ChunkGenerator::volcanicArcForCell(int64_t cellX, int64_t cellZ, GenScratch& scr
             .craterLake = random_.uniform01(VOLCANIC_ARC_STREAM, cellX, 0, cellZ, 7) < 0.28,
             .lavaBearing = random_.uniform01(VOLCANIC_ARC_STREAM, cellX, 0, cellZ, 8) < 0.72,
         };
-        configureCraterLake(volcano);
+        if (resolveDatumNow) configureCraterLake(volcano);
         volcanoes.push_back(volcano);
     }
     if (cache.arcCells.size() >= ARC_PRIMITIVE_CACHE_CAPACITY) cache.arcCells.clear();
     cache.arcCells.emplace(key, volcanoes);
     return scratch.volcanicArcCells.emplace(key, std::move(volcanoes)).first->second;
+}
+
+const VolcanoPrimitive& ChunkGenerator::resolvedVolcano(const VolcanoPrimitive& volcano,
+                                                        GenScratch& scratch) const {
+    if (volcano.craterDatumResolved) return volcano;
+    const auto found = scratch.resolvedVolcanoes.try_emplace(&volcano, volcano).first;
+    VolcanoPrimitive& resolved = found->second;
+    if (!resolved.craterDatumResolved) {
+        // Learned authority can defer while the datum page is prepared. Do
+        // not treat the cache entry created before that exception as a fully
+        // resolved volcano on the retry. Keeping the fallible query before
+        // any state mutation also leaves the entry safe for an identical
+        // later attempt.
+        const double datum = macroSampler_.preliminaryElevation(resolved.centerX, resolved.centerZ);
+        resolved.craterDatumElevation = datum;
+        resolved.craterDatumResolved = true;
+        configureCraterLake(resolved);
+    }
+    return resolved;
 }
 
 const VolcanicColumnSample& ChunkGenerator::volcanismAt(int64_t x, int64_t z,
@@ -1910,11 +3122,18 @@ const VolcanicColumnSample& ChunkGenerator::volcanismAt(int64_t x, int64_t z,
     double strongestProfile = 0.0;
     double selectedCraterScore = std::numeric_limits<double>::infinity();
     bool selectedCraterWet = false;
-    auto accumulate = [&](const VolcanoPrimitive& volcano) {
-        const double offsetX = static_cast<double>(x) + 0.5 - volcano.centerX;
-        const double offsetZ = static_cast<double>(z) + 0.5 - volcano.centerZ;
+    auto accumulate = [&](const VolcanoPrimitive& primitive) {
+        const double offsetX = static_cast<double>(x) + 0.5 - primitive.centerX;
+        const double offsetZ = static_cast<double>(z) + 0.5 - primitive.centerZ;
         const double distance = std::hypot(offsetX, offsetZ);
-        if (distance > volcano.radius * 1.20) return;
+        if (distance > primitive.radius * 1.20) return;
+        // V4 consumes the same primitive as a bounded material and cubic
+        // geology signal only. Its terrain profile already entered native
+        // routing, and no production v4 consumer needs the legacy analytical
+        // lake datum. Avoid a second learned-authority query at the cone
+        // center while sampling a nearby column.
+        const VolcanoPrimitive& volcano =
+            learnedAuthority_ ? primitive : resolvedVolcano(primitive, scratch);
 
         auto radialShape = [&](double radialDistance) {
             const double profile = volcanoProfile(volcano, radialDistance);
@@ -1939,33 +3158,35 @@ const VolcanicColumnSample& ChunkGenerator::volcanismAt(int64_t x, int64_t z,
             result.conduitLavaBearing = volcano.lavaBearing;
         }
 
-        const double craterScore = profileDistance / std::max(1.0, volcano.craterRadius);
-        // The absolute crater datum must taper back to the ordinary volcanic
-        // surface over the complete edifice. Ending that authority at the
-        // narrow rim apron drops the datum in one column and creates a cliff
-        // around an otherwise continuous caldera.
-        const double craterAuthorityLimit = volcano.radius;
-        const bool candidateCraterWet = profileDistance < volcano.craterLakeRadius;
-        if (volcano.craterLake && profileDistance <= craterAuthorityLimit &&
-            ((candidateCraterWet && !selectedCraterWet) ||
-             (candidateCraterWet == selectedCraterWet && craterScore < selectedCraterScore))) {
-            selectedCraterScore = craterScore;
-            selectedCraterWet = candidateCraterWet;
-            result.craterFactor = crater;
-            result.craterRadius = volcano.craterRadius;
-            result.craterProfileDistance = profileDistance;
-            result.craterTerrainTarget = craterProfileHeight(volcano, profileDistance);
-            result.craterProfileInfluence =
-                1.0 - smootherstep(volcano.craterRadius, craterAuthorityLimit, profileDistance);
-            result.craterLakeRadius = volcano.craterLakeRadius;
-            result.craterLakeSurface = volcano.craterLakeSurface;
-            result.craterWaterBodyId = hash64(volcano.id ^ CRATER_WATER_BODY_SALT);
-            if (result.craterWaterBodyId == worldgen::NO_WATER_BODY) {
-                result.craterWaterBodyId = 1;
+        if (!learnedAuthority_) {
+            const double craterScore = profileDistance / std::max(1.0, volcano.craterRadius);
+            // The absolute crater datum must taper back to the ordinary volcanic
+            // surface over the complete edifice. Ending that authority at the
+            // narrow rim apron drops the datum in one column and creates a cliff
+            // around an otherwise continuous caldera.
+            const double craterAuthorityLimit = volcano.radius;
+            const bool candidateCraterWet = profileDistance < volcano.craterLakeRadius;
+            if (volcano.craterLake && profileDistance <= craterAuthorityLimit &&
+                ((candidateCraterWet && !selectedCraterWet) ||
+                 (candidateCraterWet == selectedCraterWet && craterScore < selectedCraterScore))) {
+                selectedCraterScore = craterScore;
+                selectedCraterWet = candidateCraterWet;
+                result.craterFactor = crater;
+                result.craterRadius = volcano.craterRadius;
+                result.craterProfileDistance = profileDistance;
+                result.craterTerrainTarget = craterProfileHeight(volcano, profileDistance);
+                result.craterProfileInfluence =
+                    1.0 - smootherstep(volcano.craterRadius, craterAuthorityLimit, profileDistance);
+                result.craterLakeRadius = volcano.craterLakeRadius;
+                result.craterLakeSurface = volcano.craterLakeSurface;
+                result.craterWaterBodyId = hash64(volcano.id ^ CRATER_WATER_BODY_SALT);
+                if (result.craterWaterBodyId == worldgen::NO_WATER_BODY) {
+                    result.craterWaterBodyId = 1;
+                }
+                result.craterRimElevation = volcano.craterRimElevation;
+                result.craterRimWidth = volcano.craterRimWidth;
+                result.craterLake = true;
             }
-            result.craterRimElevation = volcano.craterRimElevation;
-            result.craterRimWidth = volcano.craterRimWidth;
-            result.craterLake = true;
         }
 
         const double angle = std::atan2(offsetZ, offsetX);
@@ -2029,12 +3250,18 @@ const VolcanicColumnSample& ChunkGenerator::volcanismAt(int64_t x, int64_t z,
 worldgen::SurfaceSample
 ChunkGenerator::refreshDependentSurface(int64_t x, int64_t z, worldgen::SurfaceSample result,
                                         const VolcanicColumnSample& volcanism) const {
-    const double windSpeed = std::hypot(result.climate.wind.x, result.climate.wind.z);
-    result.climate.potentialEvapotranspirationMm =
-        std::clamp(300.0 + std::max(-8.0, result.climate.temperatureC) * 31.0 + windSpeed * 170.0,
-                   120.0, 1800.0);
-    result.climate.aridity = result.climate.potentialEvapotranspirationMm /
-                             std::max(1.0, result.climate.annualPrecipitationMm);
+    result.hydrology.lakeDepth =
+        result.hydrology.lake ? std::max(0.0, result.hydrology.waterSurface - result.terrainHeight)
+                              : 0.0;
+    result.waterSurface = result.hydrology.waterSurface;
+    if (!learnedAuthority_) {
+        const double windSpeed = std::hypot(result.climate.wind.x, result.climate.wind.z);
+        result.climate.potentialEvapotranspirationMm = std::clamp(
+            300.0 + std::max(-8.0, result.climate.temperatureC) * 31.0 + windSpeed * 170.0, 120.0,
+            1800.0);
+        result.climate.aridity = result.climate.potentialEvapotranspirationMm /
+                                 std::max(1.0, result.climate.annualPrecipitationMm);
+    }
     result.soil = macroSampler_.sampleSoil(static_cast<double>(x), static_cast<double>(z),
                                            result.geology, result.hydrology, result.climate);
     result.suitability =
@@ -2052,12 +3279,26 @@ ChunkGenerator::refreshDependentSurface(int64_t x, int64_t z, worldgen::SurfaceS
 
 void ChunkGenerator::applyVolcanicGeometry(worldgen::SurfaceSample& result,
                                            const VolcanicColumnSample& volcanism) const {
+    if (learnedAuthority_) {
+        // V4 cones and calderas already entered the native routing elevation.
+        // Applying the legacy deformation here would double their relief and
+        // move beds after canonical water was solved.
+        return;
+    }
     const double solvedTerrain = result.terrainHeight;
     const bool solvedOcean = result.hydrology.ocean;
+    const bool preserveCanonicalWater =
+        learnedAuthority_ && hasCanonicalWaterFeature(result.hydrology);
     const bool canonicalRoutedWater =
         result.hydrology.river && result.hydrology.transitionOwnerId != 0;
-    double deformedTerrain = emittedVolcanicHeight(result, volcanism);
-    if (canonicalRoutedWater || result.hydrology.lake) {
+    double deformedTerrain = emittedVolcanicHeight(result, volcanism, learnedAuthority_);
+    if (preserveCanonicalWater) {
+        // V4 hydrology is solved from immutable learned terrain pages. Until
+        // volcanic primitives are included by that pre-hydrology authority,
+        // postprocessing may describe volcanic materials but cannot deform a
+        // canonical wet column or replace any of its topology.
+        deformedTerrain = solvedTerrain;
+    } else if (canonicalRoutedWater || result.hydrology.lake) {
         deformedTerrain = std::min(deformedTerrain, solvedTerrain);
     } else if (result.hydrology.channelBank || result.hydrology.lakeBank) {
         deformedTerrain = std::max(deformedTerrain, solvedTerrain);
@@ -2065,8 +3306,13 @@ void ChunkGenerator::applyVolcanicGeometry(worldgen::SurfaceSample& result,
     result.terrainHeight = deformedTerrain;
     result.hydrology.surfaceElevation = result.terrainHeight;
 
-    if (applyCraterLake(result, volcanism, true)) {
-        // The crater water is emitted at its analytical spill surface.
+    if (preserveCanonicalWater) {
+        // Preserve every canonical water field exactly. This covers oceans,
+        // rivers, lakes, wetlands, deltas, estuaries represented by combined
+        // coastal flags, and explicit transition ownership.
+    } else if (!learnedAuthority_ && applyCraterLake(result, volcanism, true, false)) {
+        // The context-free v3 path retains its analytical crater-lake overlay.
+        // V4 exposes water only through canonical native hydrology.
     } else if (solvedOcean && result.terrainHeight < SEA_LEVEL && !result.hydrology.lake &&
                !canonicalRoutedWater) {
         const bool coastalDelta = result.hydrology.delta;
@@ -2114,6 +3360,18 @@ void ChunkGenerator::applyVolcanicGeometry(worldgen::SurfaceSample& result,
 worldgen::SurfaceSample ChunkGenerator::applyVolcanism(int64_t x, int64_t z,
                                                        worldgen::SurfaceSample result,
                                                        GenScratch& scratch) const {
+    if (learnedAuthority_) {
+        const VolcanicColumnSample& volcanism = volcanismAt(x, z, result.geology, scratch);
+        // Material and habitat signals remain bounded consumers of the same
+        // pre-routed primitive field. They do not mutate terrain or stage a
+        // second time after hydrology.
+        if (volcanism.basaltField > 0.18) result.ecotopes |= worldgen::Ecotope::GEOTHERMAL;
+        if (density_.supportsCaveEcotope(static_cast<double>(x), static_cast<double>(z),
+                                         result.terrainHeight, result.geology)) {
+            result.ecotopes |= worldgen::Ecotope::CAVE;
+        }
+        return result;
+    }
     const double macroHeight = result.terrainHeight;
     const worldgen::HydrologySample macroHydrology = result.hydrology;
     const VolcanicColumnSample& volcanism = volcanismAt(x, z, result.geology, scratch);
@@ -2127,7 +3385,17 @@ worldgen::SurfaceSample ChunkGenerator::applyVolcanism(int64_t x, int64_t z,
 
     const double oldClimateHeight = std::max(0.0, macroHeight - SEA_LEVEL);
     const double newClimateHeight = std::max(0.0, result.terrainHeight - SEA_LEVEL);
-    result.climate.temperatureC -= (newClimateHeight - oldClimateHeight) * 8.0 * 0.0065;
+    const double climateHeightDelta = newClimateHeight - oldClimateHeight;
+    if (learnedAuthority_) {
+        result.climate.temperatureC += climateHeightDelta *
+                                       worldgen::learned::WORLD_METERS_PER_BLOCK *
+                                       result.climate.lapseRateCPerMeter;
+    } else {
+        // Legacy v3 retains its established eight-meter lapse conversion.
+        result.climate.temperatureC += climateHeightDelta *
+                                       worldgen::LEGACY_WORLD_METERS_PER_BLOCK *
+                                       worldgen::LEGACY_LAPSE_RATE_C_PER_METER;
+    }
 
     // The macro climate already integrated the bounded upwind path. Apply the
     // exact local water change introduced by the discrete cone, then refresh
@@ -2160,9 +3428,14 @@ worldgen::SurfaceSample ChunkGenerator::emittedSurfaceAt(int64_t x, int64_t z,
 }
 
 ColumnPlanSurfaceGrid ChunkGenerator::exactSurfaceGrid(const ColumnPlan& plan) const {
-    using DensityColumn = std::array<double, LATTICE_LEVELS>;
+    struct DensityColumn {
+        DensityColumnContext context;
+        std::vector<double> values;
+    };
     const int64_t baseX = plan.chunkColumn().x * CHUNK_EDGE;
     const int64_t baseZ = plan.chunkColumn().z * CHUNK_EDGE;
+    const int verticalDensitySpacing = densityLatticeVerticalSpacing();
+    const int densityLatticeLevels = densityLatticeLevelCount();
     GenScratch scratch;
     scratch.reset(this, scratchToken_.load(std::memory_order_relaxed));
     std::unordered_map<ColumnPos, ColumnShape> shapes;
@@ -2175,11 +3448,12 @@ ColumnPlanSurfaceGrid ChunkGenerator::exactSurfaceGrid(const ColumnPlan& plan) c
         auto found = shapes.find(key);
         if (found != shapes.end()) return found->second;
         const worldgen::SurfaceSample surface = surfaceSampleFromPlan(x, z, plan, scratch);
-        const ColumnShape legacy =
-            climate_.shapeColumn(static_cast<double>(x), static_cast<double>(z));
-        return shapes.emplace(key, shapeFromSurface(surface, legacy)).first->second;
+        const double caveEntrance =
+            climate_.caveEntrance(static_cast<double>(x), static_cast<double>(z));
+        return shapes.emplace(key, shapeFromSurface(surface, caveEntrance, learnedAuthority_))
+            .first->second;
     };
-    auto densityColumnAt = [&](int64_t x, int64_t z) -> const DensityColumn& {
+    auto densityColumnAt = [&](int64_t x, int64_t z) -> DensityColumn& {
         const ColumnPos key{x, z};
         auto found = densityColumns.find(key);
         if (found != densityColumns.end()) return found->second;
@@ -2187,34 +3461,47 @@ ColumnPlanSurfaceGrid ChunkGenerator::exactSurfaceGrid(const ColumnPlan& plan) c
         const ColumnShape& shape = shapeAt(x, z);
         const DensityColumnContext context =
             density_.columnContext(static_cast<double>(x), static_cast<double>(z), surface.geology);
-        DensityColumn column{};
         const double yCap = shape.height + shape.detailAmp + 5.0;
-        for (int level = 0; level < LATTICE_LEVELS; ++level) {
-            const double y = static_cast<double>(WORLD_MIN_Y + level * LATTICE_Y);
-            column[static_cast<size_t>(level)] =
-                y > yCap ? -DENSITY_CAP
-                         : density_.density(static_cast<double>(x), y, static_cast<double>(z),
-                                            shape, context);
-        }
+        const int maximumEvaluatedLevel =
+            maximumEvaluatedDensityLevel(yCap, verticalDensitySpacing);
+        DensityColumn column{
+            .context = context,
+            .values = std::vector<double>(static_cast<size_t>(maximumEvaluatedLevel + 1),
+                                          std::numeric_limits<double>::quiet_NaN()),
+        };
         return densityColumns.emplace(key, std::move(column)).first->second;
+    };
+    auto densityValueAt = [&](int64_t x, int64_t z, int level) {
+        DensityColumn& column = densityColumnAt(x, z);
+        const size_t boundedLevel =
+            static_cast<size_t>(std::clamp(level, 0, densityLatticeLevels - 1));
+        if (boundedLevel >= column.values.size()) return -DENSITY_CAP;
+        double& value = column.values[boundedLevel];
+        if (std::isnan(value)) {
+            const double y = static_cast<double>(WORLD_MIN_Y + static_cast<int>(boundedLevel) *
+                                                                   verticalDensitySpacing);
+            value = evaluateDensity(static_cast<double>(x), y, static_cast<double>(z),
+                                    shapeAt(x, z), column.context);
+        }
+        return value;
     };
     auto densityAt = [&](int64_t x, int y, int64_t z) {
         const int64_t x0 = latticeFloor(x);
         const int64_t z0 = latticeFloor(z);
-        const DensityColumn& c00 = densityColumnAt(x0, z0);
-        const DensityColumn& c10 = densityColumnAt(x0 + LATTICE_XZ, z0);
-        const DensityColumn& c01 = densityColumnAt(x0, z0 + LATTICE_XZ);
-        const DensityColumn& c11 = densityColumnAt(x0 + LATTICE_XZ, z0 + LATTICE_XZ);
         const double fx = static_cast<double>(x - x0) / LATTICE_XZ;
         const double fz = static_cast<double>(z - z0) / LATTICE_XZ;
-        const int level = (y - WORLD_MIN_Y) / LATTICE_Y;
-        const double fy = static_cast<double>(y - (WORLD_MIN_Y + level * LATTICE_Y)) / LATTICE_Y;
+        const int level =
+            std::clamp((y - WORLD_MIN_Y) / verticalDensitySpacing, 0, densityLatticeLevels - 2);
+        const double fy = static_cast<double>(y - (WORLD_MIN_Y + level * verticalDensitySpacing)) /
+                          verticalDensitySpacing;
         const double below =
-            bilerpDensity(c00[static_cast<size_t>(level)], c10[static_cast<size_t>(level)],
-                          c01[static_cast<size_t>(level)], c11[static_cast<size_t>(level)], fx, fz);
+            bilerpDensity(densityValueAt(x0, z0, level), densityValueAt(x0 + LATTICE_XZ, z0, level),
+                          densityValueAt(x0, z0 + LATTICE_XZ, level),
+                          densityValueAt(x0 + LATTICE_XZ, z0 + LATTICE_XZ, level), fx, fz);
         const double above = bilerpDensity(
-            c00[static_cast<size_t>(level + 1)], c10[static_cast<size_t>(level + 1)],
-            c01[static_cast<size_t>(level + 1)], c11[static_cast<size_t>(level + 1)], fx, fz);
+            densityValueAt(x0, z0, level + 1), densityValueAt(x0 + LATTICE_XZ, z0, level + 1),
+            densityValueAt(x0, z0 + LATTICE_XZ, level + 1),
+            densityValueAt(x0 + LATTICE_XZ, z0 + LATTICE_XZ, level + 1), fx, fz);
         return lerpDensity(below, above, fy);
     };
 
@@ -2234,45 +3521,15 @@ ColumnPlanSurfaceGrid ChunkGenerator::exactSurfaceGrid(const ColumnPlan& plan) c
                     break;
                 }
             }
-            const worldgen::SurfaceSample surface = surfaceSampleFromPlan(x, z, plan, scratch);
+            worldgen::SurfaceSample surface = surfaceSampleFromPlan(x, z, plan, scratch);
             const VolcanicColumnSample& volcanism = volcanismAt(x, z, surface.geology, scratch);
-            if (volcanism.craterLake && volcanism.craterProfileInfluence > 1.0e-4) {
+            surfaceY = boundedLearnedSurfaceY(surface, surfaceY, learnedAuthority_);
+            if (!learnedAuthority_ && volcanism.craterLake &&
+                volcanism.craterProfileInfluence > 1.0e-4) {
                 surfaceY = std::clamp(static_cast<int>(std::ceil(surface.terrainHeight)) - 1,
                                       WORLD_MIN_Y, WORLD_MAX_Y);
             }
-            if (hasSurfaceWater(surface.hydrology)) {
-                const int waterTopY =
-                    std::clamp(static_cast<int>(std::ceil(surface.hydrology.waterSurface)) - 1,
-                               WORLD_MIN_Y, WORLD_MAX_Y);
-                const int plannedFloorY =
-                    std::clamp(static_cast<int>(std::ceil(surface.hydrology.surfaceElevation)) - 1,
-                               WORLD_MIN_Y, WORLD_MAX_Y);
-                // A wet column's exposed top is the solved channel, lake, or
-                // ocean floor. Retaining a higher unrelated density crossing
-                // here turns a smooth analytical bed into long submerged
-                // voxel walls and can leave the sampled source volume above
-                // an uncarved shelf.
-                surfaceY = std::min(plannedFloorY, std::max(WORLD_MIN_Y, waterTopY - 1));
-            } else if (surface.hydrology.channelBank || surface.hydrology.lakeBank) {
-                const int plannedBankY =
-                    std::clamp(static_cast<int>(std::ceil(surface.hydrology.surfaceElevation)) - 1,
-                               WORLD_MIN_Y, WORLD_MAX_Y);
-                surfaceY = std::max(surfaceY, plannedBankY);
-            } else if (surface.hydrology.surfaceElevation >= SEA_LEVEL &&
-                       surfaceY < SEA_LEVEL - 1) {
-                // Sub-footprint density remains free to erode a dry coast,
-                // but not below the shared hydrological shoreline. Without
-                // this floor, exact cubes create disconnected ocean pockets
-                // that no coarser footprint can own deterministically.
-                surfaceY = SEA_LEVEL - 1;
-            }
-            if (surface.hydrology.waterfall &&
-                surface.hydrology.waterfallTop >= surface.hydrology.waterfallBottom + 0.5) {
-                const int receivingWaterY =
-                    std::clamp(static_cast<int>(std::ceil(surface.hydrology.waterfallBottom)) - 1,
-                               WORLD_MIN_Y, WORLD_MAX_Y);
-                surfaceY = std::min(surfaceY, std::max(WORLD_MIN_Y, receivingWaterY - 1));
-            }
+            reconcileEmittedSurfaceY(surface.hydrology, surfaceY, learnedAuthority_);
             result[static_cast<size_t>(localZ * CHUNK_EDGE + localX)] =
                 static_cast<int16_t>(surfaceY);
         }
@@ -2280,54 +3537,81 @@ ColumnPlanSurfaceGrid ChunkGenerator::exactSurfaceGrid(const ColumnPlan& plan) c
     return result;
 }
 
-const std::vector<double>& ChunkGenerator::latticeDensityColumn(int64_t lx, int64_t lz,
-                                                                GenScratch& scratch) const {
+double ChunkGenerator::evaluateDensity(double x, double y, double z, const ColumnShape& shape,
+                                       const DensityColumnContext& context) const {
+    densityEvaluationCount_.fetch_add(1, std::memory_order_relaxed);
+    return density_.density(x, y, z, shape, context);
+}
+
+double ChunkGenerator::latticeDensityAt(int64_t lx, int64_t lz, int level,
+                                        GenScratch& scratch) const {
+    const int verticalDensitySpacing = densityLatticeVerticalSpacing();
+    const int densityLatticeLevels = densityLatticeLevelCount();
     const ColumnPos key{lx, lz};
     auto it = scratch.densityColumns.find(key);
-    if (it != scratch.densityColumns.end()) return it->second;
-
-    const ColumnShape& shape = latticeShape(lx, lz, scratch);
-    const worldgen::GeologySample geology = surfaceSampleAt(lx, lz, scratch).geology;
-    const DensityColumnContext densityContext =
-        density_.columnContext(static_cast<double>(lx), static_cast<double>(lz), geology);
-    std::vector<double> column(LATTICE_LEVELS);
-    const double yCap = shape.height + shape.detailAmp + 5.0;
-    for (int level = 0; level < LATTICE_LEVELS; ++level) {
-        const double y = static_cast<double>(WORLD_MIN_Y + level * LATTICE_Y);
-        column[level] = y > yCap ? -DENSITY_CAP
-                                 : density_.density(static_cast<double>(lx), y,
-                                                    static_cast<double>(lz), shape, densityContext);
+    if (it == scratch.densityColumns.end()) {
+        const ColumnShape& shape = latticeShape(lx, lz, scratch);
+        const worldgen::GeologySample geology = surfaceSampleAt(lx, lz, scratch).geology;
+        const double yCap = shape.height + shape.detailAmp + 5.0;
+        const int maximumEvaluatedLevel =
+            maximumEvaluatedDensityLevel(yCap, verticalDensitySpacing);
+        LazyDensityColumn column{
+            .context =
+                density_.columnContext(static_cast<double>(lx), static_cast<double>(lz), geology),
+            .values = std::vector<double>(static_cast<size_t>(maximumEvaluatedLevel + 1),
+                                          std::numeric_limits<double>::quiet_NaN()),
+        };
+        it = scratch.densityColumns.emplace(key, std::move(column)).first;
     }
-    return scratch.densityColumns.emplace(key, std::move(column)).first->second;
+    LazyDensityColumn& column = it->second;
+    const size_t boundedLevel = static_cast<size_t>(std::clamp(level, 0, densityLatticeLevels - 1));
+    if (boundedLevel >= column.values.size()) return -DENSITY_CAP;
+    double& value = column.values[boundedLevel];
+    if (std::isnan(value)) {
+        const double y = static_cast<double>(WORLD_MIN_Y + static_cast<int>(boundedLevel) *
+                                                               verticalDensitySpacing);
+        value = evaluateDensity(static_cast<double>(lx), y, static_cast<double>(lz),
+                                latticeShape(lx, lz, scratch), column.context);
+    }
+    return value;
 }
 
 ColumnShape ChunkGenerator::columnShapeAt(int64_t x, int64_t z, GenScratch& scratch) const {
     prepareScratch(scratch);
     const worldgen::SurfaceSample surface = surfaceSampleAt(x, z, scratch);
-    const ColumnShape legacy = climate_.shapeColumn(static_cast<double>(x), static_cast<double>(z));
-    return shapeFromSurface(surface, legacy);
+    const double caveEntrance =
+        climate_.caveEntrance(static_cast<double>(x), static_cast<double>(z));
+    return shapeFromSurface(surface, caveEntrance, learnedAuthority_);
 }
 
 double ChunkGenerator::interpolatedDensity(int64_t x, int y, int64_t z, GenScratch& scratch) const {
+    const int verticalDensitySpacing = densityLatticeVerticalSpacing();
+    const int densityLatticeLevels = densityLatticeLevelCount();
     const int64_t lx0 = latticeFloor(x);
     const int64_t lz0 = latticeFloor(z);
-    const auto& c00 = latticeDensityColumn(lx0, lz0, scratch);
-    const auto& c10 = latticeDensityColumn(lx0 + LATTICE_XZ, lz0, scratch);
-    const auto& c01 = latticeDensityColumn(lx0, lz0 + LATTICE_XZ, scratch);
-    const auto& c11 = latticeDensityColumn(lx0 + LATTICE_XZ, lz0 + LATTICE_XZ, scratch);
     const double fx = static_cast<double>(x - lx0) / LATTICE_XZ;
     const double fz = static_cast<double>(z - lz0) / LATTICE_XZ;
-    const int level = (y - WORLD_MIN_Y) / LATTICE_Y;
-    const double fy = static_cast<double>(y - (WORLD_MIN_Y + level * LATTICE_Y)) / LATTICE_Y;
-    const double below = bilerpDensity(c00[level], c10[level], c01[level], c11[level], fx, fz);
-    const double above =
-        bilerpDensity(c00[level + 1], c10[level + 1], c01[level + 1], c11[level + 1], fx, fz);
+    const int level =
+        std::clamp((y - WORLD_MIN_Y) / verticalDensitySpacing, 0, densityLatticeLevels - 2);
+    const double fy = static_cast<double>(y - (WORLD_MIN_Y + level * verticalDensitySpacing)) /
+                      verticalDensitySpacing;
+    const double below =
+        bilerpDensity(latticeDensityAt(lx0, lz0, level, scratch),
+                      latticeDensityAt(lx0 + LATTICE_XZ, lz0, level, scratch),
+                      latticeDensityAt(lx0, lz0 + LATTICE_XZ, level, scratch),
+                      latticeDensityAt(lx0 + LATTICE_XZ, lz0 + LATTICE_XZ, level, scratch), fx, fz);
+    const double above = bilerpDensity(
+        latticeDensityAt(lx0, lz0, level + 1, scratch),
+        latticeDensityAt(lx0 + LATTICE_XZ, lz0, level + 1, scratch),
+        latticeDensityAt(lx0, lz0 + LATTICE_XZ, level + 1, scratch),
+        latticeDensityAt(lx0 + LATTICE_XZ, lz0 + LATTICE_XZ, level + 1, scratch), fx, fz);
     return lerpDensity(below, above, fy);
 }
 
 double ChunkGenerator::baseHeightAt(int64_t x, int64_t z, GenScratch& scratch) const {
     prepareScratch(scratch);
-    return emittedSurfaceAt(x, z, scratch).terrainHeight;
+    const worldgen::SurfaceSample surface = emittedSurfaceAt(x, z, scratch);
+    return learnedAuthority_ ? worldgen::geometryTerrainHeight(surface) : surface.terrainHeight;
 }
 
 Biome ChunkGenerator::biomeAt(int64_t x, int64_t z, GenScratch& scratch) const {
@@ -2355,8 +3639,14 @@ GenScratch& ChunkGenerator::threadScratch() const {
         if (scratch.densityColumns.size() > 4096) scratch.densityColumns.clear();
         if (scratch.columnPlans.size() > 128) scratch.columnPlans.clear();
         if (scratch.volcanicColumns.size() > 4096) scratch.volcanicColumns.clear();
-        if (scratch.volcanoCells.size() > 1024) scratch.volcanoCells.clear();
-        if (scratch.volcanicArcCells.size() > 2048) scratch.volcanicArcCells.clear();
+        if (scratch.volcanoCells.size() > 1024) {
+            scratch.volcanoCells.clear();
+            scratch.resolvedVolcanoes.clear();
+        }
+        if (scratch.volcanicArcCells.size() > 2048) {
+            scratch.volcanicArcCells.clear();
+            scratch.resolvedVolcanoes.clear();
+        }
         if (scratch.structurePlacements.size() > 4096) scratch.structurePlacements.clear();
     }
     return scratch;
@@ -2400,11 +3690,15 @@ void ChunkGenerator::fillColumn(Chunk& chunk, int lx, int lz,
     const worldgen::GeneratedFluidColumn fluidColumn =
         worldgen::generatedFluidColumn(emittedFluidSurface);
     const bool surfaceWater = fluidColumn.wet;
-    const bool supportedRapidSill = surface.hydrology.generatedFluidLevel > 0;
-    const bool sealedHydrologySupport =
-        surface.hydrology.channelBank || surface.hydrology.lakeBank || surface.hydrology.waterfall;
-    const bool coherentCraterProfile =
-        volcanism.craterLake && volcanism.craterProfileInfluence > 1.0e-4;
+    const bool supportedRapidSill = !learnedAuthority_ && surface.hydrology.generatedFluidLevel > 0;
+    const bool preserveCanonicalWater =
+        learnedAuthority_ && hasCanonicalWaterFeature(surface.hydrology);
+    const bool legacySealedHydrologySupport =
+        !learnedAuthority_ && (surface.hydrology.channelBank || surface.hydrology.lakeBank ||
+                               surface.hydrology.waterfall);
+    const bool coherentCraterProfile = !learnedAuthority_ && !preserveCanonicalWater &&
+                                       volcanism.craterLake &&
+                                       volcanism.craterProfileInfluence > 1.0e-4;
     double waterSurface = hasSurfaceWater(surface.hydrology)
                               ? surface.waterSurface
                               : -std::numeric_limits<double>::infinity();
@@ -2468,8 +3762,8 @@ void ChunkGenerator::fillColumn(Chunk& chunk, int lx, int lz,
         } else if (submerged && wy == surfaceY) {
             block = surfaceBlock();
         } else if (wy == surfaceY ||
-                   (wy < surfaceY &&
-                    (sealedHydrologySupport || interpolatedDensity(wx, wy, wz, scratch) > 0.0))) {
+                   (wy < surfaceY && (legacySealedHydrologySupport ||
+                                      interpolatedDensity(wx, wy, wz, scratch) > 0.0))) {
             const int depth = surfaceY - wy;
             if (depth == 0) {
                 block = surfaceBlock();
@@ -2486,7 +3780,7 @@ void ChunkGenerator::fillColumn(Chunk& chunk, int lx, int lz,
             block = BlockType::LAVA;
         }
 
-        if (!sealedHydrologySupport && block != BlockType::BEDROCK && wy < surfaceY - 8) {
+        if (!legacySealedHydrologySupport && block != BlockType::BEDROCK && wy < surfaceY - 8) {
             switch (aquiferVoxelAt(random_, wx, wy, wz, surface)) {
                 case AquiferVoxel::NONE:
                     break;
@@ -2501,8 +3795,9 @@ void ChunkGenerator::fillColumn(Chunk& chunk, int lx, int lz,
             }
         }
 
-        if (!sealedHydrologySupport && block != BlockType::BEDROCK &&
-            volcanism.tubeDistance < volcanism.tubeRadius && wy < surfaceY - 5) {
+        if (!legacySealedHydrologySupport && !preserveCanonicalWater &&
+            block != BlockType::BEDROCK && volcanism.tubeDistance < volcanism.tubeRadius &&
+            wy < surfaceY - 5) {
             const double tubeCenterY = surface.terrainHeight + volcanism.tubeCenterOffset;
             const double verticalDistance = std::abs((static_cast<double>(wy) + 0.5) - tubeCenterY);
             const double tubeCrossSection =
@@ -2521,8 +3816,8 @@ void ChunkGenerator::fillColumn(Chunk& chunk, int lx, int lz,
         }
 
         const double conduitBottom = surface.terrainHeight - volcanism.conduitDepth;
-        if (!sealedHydrologySupport && block != BlockType::BEDROCK &&
-            volcanism.centerDistance <= volcanism.conduitRadius &&
+        if (!legacySealedHydrologySupport && !preserveCanonicalWater &&
+            block != BlockType::BEDROCK && volcanism.centerDistance <= volcanism.conduitRadius &&
             wy >= static_cast<int>(std::floor(conduitBottom)) && wy < surfaceY - 4) {
             const double innerRadius = volcanism.conduitRadius * 0.58;
             block = volcanism.centerDistance <= innerRadius && volcanism.conduitLavaBearing
@@ -2544,6 +3839,7 @@ void ChunkGenerator::fillColumn(Chunk& chunk, int lx, int lz,
 }
 
 void ChunkGenerator::generate(Chunk& chunk) const {
+    lastCubeDensityEvaluationCount_.store(0, std::memory_order_relaxed);
     chunk.replaceFluidStates({});
     if (chunk.chunkY < WORLD_MIN_CHUNK_Y || chunk.chunkY > WORLD_MAX_CHUNK_Y) {
         chunk.fill(chunk.chunkY < WORLD_MIN_CHUNK_Y ? BlockType::BEDROCK : BlockType::AIR);
@@ -2568,6 +3864,7 @@ void ChunkGenerator::generate(Chunk& chunk) const {
     GenScratch scratch;
     scratch.reset(this, scratchToken_.load(std::memory_order_relaxed));
     scratch.columnPlans.emplace(chunkColumn, plan);
+    const uint64_t densityBeforeCube = densityEvaluationCount();
 
     for (int lz = 0; lz < CHUNK_EDGE; ++lz) {
         for (int lx = 0; lx < CHUNK_EDGE; ++lx) {
@@ -2577,8 +3874,11 @@ void ChunkGenerator::generate(Chunk& chunk) const {
             fillColumn(chunk, lx, lz, surface, plan->surfaceY(lx, lz), scratch);
         }
     }
+    lastCubeDensityEvaluationCount_.store(densityEvaluationCount() - densityBeforeCube,
+                                          std::memory_order_relaxed);
 
-    ores_.place(chunk);
+    ores_.place(chunk, learnedAuthority_ ? OrePlacer::HostPolicy::NATURAL_ROCK
+                                         : OrePlacer::HostPolicy::LEGACY_STONE_ONLY);
     if (plan->exposesSection(chunk.chunkY)) {
         structures_.place(chunk, *this, scratch);
         features_.placeTrees(chunk, *this, structures_, scratch);

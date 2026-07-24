@@ -1,8 +1,9 @@
 #include "render/entity_renderer.hpp"
 
 #include "common/error.hpp"
+#include "render/dynamic_object_lighting.hpp"
+#include "render/metal_ownership.hpp"
 #include "render/pixel_formats.hpp"
-#include "world/chunk.hpp"
 
 #include <array>
 
@@ -45,6 +46,15 @@ static void appendBox(std::vector<EntityVertex>& vertices, std::vector<uint16_t>
     }
 }
 
+static EntityModel modelForEntity(const Entity& entity) {
+    EntityModel model{};
+    model.model = matrix_identity_float4x4;
+    model.model.columns[3] =
+        simd_make_float4(entity.position.x, entity.position.y, entity.position.z, 1.0f);
+    model.lighting = dynamicObjectLighting(entity.renderPackedLight);
+    return model;
+}
+
 EntityRenderer::Mesh EntityRenderer::buildMesh(id<MTLDevice> device, EntityType type, bool isBaby) {
     std::vector<EntityVertex> vertices;
     std::vector<uint16_t> indices;
@@ -82,6 +92,9 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
     NSError* error = nil;
     _pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    resetMetalObject(pipelineDesc);
+    resetMetalObject(vertexFunc);
+    resetMetalObject(fragmentFunc);
     if (!_pipelineState) {
         RY_LOG_FATAL("Failed to create entity pipeline state");
     }
@@ -95,6 +108,8 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     shadowDescriptor.depthAttachmentPixelFormat = PixelFormats::SCENE_DEPTH;
     _shadowPipelineState = [device newRenderPipelineStateWithDescriptor:shadowDescriptor
                                                                   error:&error];
+    resetMetalObject(shadowDescriptor);
+    resetMetalObject(shadowVertex);
     if (!_shadowPipelineState) {
         RY_LOG_FATAL("Failed to create entity shadow pipeline state");
     }
@@ -103,6 +118,17 @@ EntityRenderer::EntityRenderer(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
         _meshes[type][0] = buildMesh(device, static_cast<EntityType>(type), false);
         _meshes[type][1] = buildMesh(device, static_cast<EntityType>(type), true);
     }
+}
+
+EntityRenderer::~EntityRenderer() {
+    for (auto& variants : _meshes) {
+        for (Mesh& mesh : variants) {
+            resetMetalObject(mesh.vertexBuffer);
+            resetMetalObject(mesh.indexBuffer);
+        }
+    }
+    resetMetalObject(_pipelineState);
+    resetMetalObject(_shadowPipelineState);
 }
 
 void EntityRenderer::renderShadows(id<MTLRenderCommandEncoder> encoder,
@@ -142,8 +168,7 @@ void EntityRenderer::renderShadows(id<MTLRenderCommandEncoder> encoder,
 void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> uniformsBuffer,
                             uint64_t uniformsOffset,
                             const std::vector<std::shared_ptr<Entity>>& entities,
-                            const std::function<bool(const AABB&)>& isVisible,
-                            const std::function<uint8_t(const Vec3&)>& packedLightAt) {
+                            const std::function<bool(const AABB&)>& isVisible) {
     if (entities.empty())
         return;
 
@@ -162,17 +187,7 @@ void EntityRenderer::render(id<MTLRenderCommandEncoder> encoder, id<MTLBuffer> u
             continue;
         const Mesh& mesh = _meshes[type][entity->isBaby ? 1 : 0];
 
-        EntityModel model;
-        model.model = matrix_identity_float4x4;
-        model.model.columns[3] =
-            simd_make_float4(entity->position.x, entity->position.y, entity->position.z, 1.0f);
-        const Vec3 lightPosition{entity->position.x,
-                                 (entity->aabb.min.y + entity->aabb.max.y) * 0.5F,
-                                 entity->position.z};
-        const uint8_t packedLight = packedLightAt ? packedLightAt(lightPosition) : 0;
-        model.lighting = simd_make_float4(
-            static_cast<float>(derivedSkyLight(packedLight)) / 15.0F,
-            static_cast<float>(derivedBlockLight(packedLight)) / 15.0F, 0.0F, 0.0F);
+        const EntityModel model = modelForEntity(*entity);
         [encoder setVertexBytes:&model length:sizeof(model) atIndex:2];
 
         [encoder setVertexBuffer:mesh.vertexBuffer offset:0 atIndex:0];

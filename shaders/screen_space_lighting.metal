@@ -160,6 +160,7 @@ kernel void screenSpaceTraceKernel(texture2d<float, access::sample> linearDepth 
                                    texture2d<float, access::sample> radiance [[texture(1)]],
                                    texture2d<half, access::sample> normalGuide [[texture(2)]],
                                    texture2d<float, access::write> output [[texture(3)]],
+                                   texture2d<float, access::sample> surface [[texture(4)]],
                                    constant IndirectLightingUniforms& uniforms [[buffer(0)]],
                                    uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
@@ -296,7 +297,11 @@ kernel void screenSpaceTraceKernel(texture2d<float, access::sample> linearDepth 
             // HDR radiance already contains the source surface's baked
             // ambient response. Applying accessibility here a second time
             // would erase emissive bounce and double-darken AO.
-            bounce += radiance.sample(pointSampler, hitUv, level(0.0f)).rgb * sourceWeight;
+            const float sourceScale = screenSpaceBounceSourceScale(
+                screenSpaceSurfaceHasNightPersistentLight(surface.sample(pointSampler, hitUv).a),
+                uniforms.filterParams.w);
+            bounce += radiance.sample(pointSampler, hitUv, level(0.0f)).rgb *
+                      (sourceWeight * sourceScale);
         }
     }
     // Normalize against the fixed ray budget, not only successful hits. The
@@ -308,19 +313,40 @@ kernel void screenSpaceTraceKernel(texture2d<float, access::sample> linearDepth 
     output.write(float4(max(bounce, 0.0f), ao), gid);
 }
 
-kernel void screenSpaceTemporalKernel(texture2d<float, access::read> current [[texture(0)]],
-                                      texture2d<float, access::sample> linearDepth [[texture(1)]],
-                                      texture2d<float, access::sample> previousHistory
-                                      [[texture(2)]],
-                                      texture2d<float, access::sample> previousDepth [[texture(3)]],
-                                      texture2d<float, access::write> output [[texture(4)]],
-                                      depth2d<float> sceneDepth [[texture(5)]],
-                                      texture2d<half, access::sample> normalGuide [[texture(6)]],
-                                      texture2d<float, access::sample> previousMoments
-                                      [[texture(7)]],
-                                      texture2d<float, access::write> outputMoments [[texture(8)]],
-                                      constant IndirectLightingUniforms& uniforms [[buffer(0)]],
-                                      uint2 gid [[thread_position_in_grid]]) {
+kernel void screenSpaceReactiveHistoryKernel(texture2d<half, access::read> fullResolution
+                                             [[texture(0)]],
+                                             texture2d<half, access::write> reduced [[texture(1)]],
+                                             uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= reduced.get_width() || gid.y >= reduced.get_height()) {
+        return;
+    }
+    const uint2 sourceSize = uint2(fullResolution.get_width(), fullResolution.get_height());
+    const uint2 destinationSize = uint2(reduced.get_width(), reduced.get_height());
+    const uint2 begin = gid * sourceSize / destinationSize;
+    const uint2 end = min(max((gid + 1u) * sourceSize / destinationSize, begin + 1u), sourceSize);
+    half reactive = 0.0h;
+    for (uint y = begin.y; y < end.y; ++y) {
+        for (uint x = begin.x; x < end.x; ++x) {
+            reactive = max(reactive, fullResolution.read(uint2(x, y)).r);
+        }
+    }
+    reduced.write(half4(reactive), gid);
+}
+
+kernel void
+screenSpaceTemporalKernel(texture2d<float, access::read> current [[texture(0)]],
+                          texture2d<float, access::sample> linearDepth [[texture(1)]],
+                          texture2d<float, access::sample> previousHistory [[texture(2)]],
+                          texture2d<float, access::sample> previousDepth [[texture(3)]],
+                          texture2d<float, access::write> output [[texture(4)]],
+                          depth2d<float> sceneDepth [[texture(5)]],
+                          texture2d<half, access::sample> normalGuide [[texture(6)]],
+                          texture2d<float, access::sample> previousMoments [[texture(7)]],
+                          texture2d<float, access::write> outputMoments [[texture(8)]],
+                          texture2d<half, access::read> currentReactive [[texture(9)]],
+                          texture2d<half, access::sample> previousReactive [[texture(10)]],
+                          constant IndirectLightingUniforms& uniforms [[buffer(0)]],
+                          uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= output.get_width() || gid.y >= output.get_height()) {
         return;
     }
@@ -386,7 +412,13 @@ kernel void screenSpaceTemporalKernel(texture2d<float, access::read> current [[t
     const bool inside = previousClip.w > 0.0f && all(previousUv >= 0.0f) &&
                         all(previousUv <= 1.0f) && previousDeviceDepth >= 0.0f &&
                         previousDeviceDepth <= 1.0f;
-    bool valid = uniforms.resolutionAndQuality.w > 0.5f && inside;
+    // Moving geometry has no motion vectors. Reject history at both its
+    // current pixels and the pixels it occupied in the previous frame.
+    bool valid =
+        uniforms.resolutionAndQuality.w > 0.5f && inside && currentReactive.read(gid).r < 0.5h;
+    if (valid) {
+        valid = previousReactive.sample(pointSampler, previousUv).r < 0.5h;
+    }
     if (valid) {
         const float oldDepth = previousDepth.sample(pointSampler, previousUv).r;
         const float expectedDepth = abs(viewPosition(previousUv, previousDeviceDepth, uniforms).z);
@@ -628,17 +660,17 @@ fragment float4 screenSpaceApplyFragment(FullscreenVertex in [[stage_in]],
         }
     }
     const float3 ambient = uniforms.ambientAndFrame.xyz;
-    const float3 ambientCorrection =
-        ambient * surfaceSample.rgb * surfaceSample.a * (indirectSample.a - 1.0f);
+    const float3 ambientCorrection = ambient * surfaceSample.rgb *
+                                     screenSpaceSurfaceAmbientAccess(surfaceSample.a) *
+                                     (indirectSample.a - 1.0f);
     // The one-bounce is intentionally NOT gated by the receiver's sky access:
     // filling caves and tunnels from their genuinely lit spots (a sunbeam at a
     // shaft base, a torch pool) is the point of indirect light. The bright
     // camera-following artifacts came from direct sun leaking through the
     // shadow map, which the terrain pass now caps by sky access at the source.
-    // Only the day-night level scales the bounce, so night auto-exposure
-    // cannot amplify the near-field bounce on open ground; the small floor
-    // keeps HDR emissive (lava) spill readable.
-    const float bounceScale = mix(SSGI_BOUNCE_NIGHT_FLOOR, 1.0f, saturate(uniforms.filterParams.w));
-    const float3 bounce = indirectSample.rgb * surfaceSample.rgb * bounceScale;
+    // Direct and sky-lit radiance was day-gated at the source during the
+    // trace. Emissive sources remain unscaled, so this receiver tint applies
+    // one coherent bounce without suppressing night fixtures.
+    const float3 bounce = indirectSample.rgb * surfaceSample.rgb;
     return float4(ambientCorrection + bounce, 0.0f);
 }

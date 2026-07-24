@@ -21,11 +21,11 @@
 // ---------------------------------------------------------------------------
 
 struct ClimateSample {
-    double continentalness; // [-1,1] ocean floor → continent interior
-    double erosion;         // [-1,1] mountainous → worn flat
-    double ridges;          // [-1,1] folded into peaks/valleys and rivers
-    double temperature;     // [-1,1] frozen → hot
-    double humidity;        // [-1,1] arid → wet
+    double continentalness = 0.0; // [-1,1] ocean floor → continent interior
+    double erosion = 0.0;         // [-1,1] mountainous → worn flat
+    double ridges = 0.0;          // [-1,1] folded into peaks/valleys and rivers
+    double temperature = 0.0;     // [-1,1] frozen → hot
+    double humidity = 0.0;        // [-1,1] arid → wet
 };
 
 // Everything the density function and surface pass need to know about one
@@ -47,6 +47,11 @@ public:
 
     // Full column shape at any world column (pure).
     ColumnShape shapeColumn(double x, double z) const;
+
+    // Bounded cubic generation needs only this mask. Exact v4 density must
+    // not evaluate the legacy continent, erosion, climate, river, and ravine
+    // fields merely to retain coordinate-pure cave entrances.
+    double caveEntrance(double x, double z) const;
 
     // Biome from an (interpolated) column shape (pure). The rules read the
     // climate fields plus the resulting height, never a neighbor.

@@ -133,6 +133,7 @@ void requireHabitatCandidateInputs(const worldgen::SurfaceSample& actual,
 
     REQUIRE(actual.hydrology.waterSurface == expected.hydrology.waterSurface);
     REQUIRE(actual.hydrology.surfaceElevation == expected.hydrology.surfaceElevation);
+    REQUIRE(actual.hydrology.terrainSlope == expected.hydrology.terrainSlope);
     REQUIRE(actual.hydrology.channelDistance == expected.hydrology.channelDistance);
     REQUIRE(actual.hydrology.channelWidth == expected.hydrology.channelWidth);
     REQUIRE(actual.hydrology.channelGradient == expected.hydrology.channelGradient);
@@ -144,6 +145,8 @@ void requireHabitatCandidateInputs(const worldgen::SurfaceSample& actual,
     REQUIRE(actual.hydrology.lake == expected.hydrology.lake);
     REQUIRE(actual.hydrology.waterfall == expected.hydrology.waterfall);
     REQUIRE(actual.hydrology.delta == expected.hydrology.delta);
+    REQUIRE(actual.hydrology.estuary == expected.hydrology.estuary);
+    REQUIRE(actual.hydrology.brackish == expected.hydrology.brackish);
 
     REQUIRE(actual.climate.temperatureC == expected.climate.temperatureC);
     REQUIRE(actual.climate.annualPrecipitationMm == expected.climate.annualPrecipitationMm);
@@ -161,8 +164,10 @@ void requireHabitatCandidateInputs(const worldgen::SurfaceSample& actual,
     REQUIRE(actual.waterSurface == expected.waterSurface);
     REQUIRE(actual.slope == expected.slope);
 
-    const int actualGroundY = static_cast<int>(std::ceil(actual.terrainHeight)) - 1;
-    const int expectedGroundY = static_cast<int>(std::ceil(expected.terrainHeight)) - 1;
+    const int actualGroundY =
+        static_cast<int>(std::ceil(worldgen::geometryTerrainHeight(actual))) - 1;
+    const int expectedGroundY =
+        static_cast<int>(std::ceil(worldgen::geometryTerrainHeight(expected))) - 1;
     REQUIRE(actualGroundY == expectedGroundY);
     REQUIRE(feature_generation::treeCoverDensity(actual) ==
             feature_generation::treeCoverDensity(expected));
@@ -407,8 +412,9 @@ TEST_CASE("Batched far habitat inputs match scalar exact canopy authority",
                 case FixtureKind::SHALLOW_WATER: {
                     REQUIRE((expected[index].hydrology.ocean || expected[index].hydrology.river ||
                              expected[index].hydrology.lake));
-                    const int groundY =
-                        static_cast<int>(std::ceil(expected[index].terrainHeight)) - 1;
+                    const int groundY = static_cast<int>(std::ceil(
+                                            worldgen::geometryTerrainHeight(expected[index]))) -
+                                        1;
                     const int waterY =
                         static_cast<int>(std::ceil(expected[index].waterSurface)) - 1;
                     REQUIRE(waterY > groundY);
@@ -444,6 +450,43 @@ TEST_CASE("Batched far habitat inputs match scalar exact canopy authority",
 
     exercise(42, SEED_42_FIXTURES);
     exercise(764891, SEED_764891_FIXTURES);
+}
+
+TEST_CASE("Legacy profile excludes v4 wetland habitat",
+          "[worldgen][ecology][tree][habitat][water][regression]") {
+    constexpr ColumnPos POSITION{-9'690, 5'288};
+    ChunkGenerator generator(42);
+
+    const worldgen::HydrologySample raw =
+        generator.sampleGeneratedWaterAuthority(POSITION.x, POSITION.z);
+    // V3 deliberately retains its prior hydrology contract. Static wetlands
+    // are v4 authority, so a legacy query must never leak a new wetland flag
+    // into far habitat or canopy placement.
+    REQUIRE_FALSE(raw.wetland);
+
+    const worldgen::SurfaceSample exact =
+        generator.sampleFarSurface(POSITION.x, POSITION.z, worldgen::SurfaceFootprint::BLOCK_1);
+    const std::array<ColumnPos, 1> positions{POSITION};
+    std::array<worldgen::SurfaceSample, 1> sparse{};
+    generator.sampleFarHabitatPoints(positions, sparse);
+
+    const int exactGroundY =
+        static_cast<int>(std::ceil(worldgen::geometryTerrainHeight(exact))) - 1;
+    const int sparseGroundY =
+        static_cast<int>(std::ceil(worldgen::geometryTerrainHeight(sparse.front()))) - 1;
+    const auto exactHabitat = feature_generation::evaluateTreeHabitat(
+        feature_generation::TreeSpecies::WILLOW, exact, exactGroundY);
+    const auto sparseHabitat = feature_generation::evaluateTreeHabitat(
+        feature_generation::TreeSpecies::WILLOW, sparse.front(), sparseGroundY);
+    CAPTURE(raw.surfaceElevation, raw.waterSurface, exact.terrainHeight,
+            sparse.front().terrainHeight, exactGroundY, sparseGroundY);
+
+    REQUIRE_FALSE(exact.hydrology.wetland);
+    REQUIRE_FALSE(sparse.front().hydrology.wetland);
+    REQUIRE(sparse.front().terrainHeight == exact.terrainHeight);
+    REQUIRE(sparse.front().waterSurface == exact.waterSurface);
+    REQUIRE_FALSE(exactHabitat.allowed);
+    REQUIRE(sparseHabitat.allowed == exactHabitat.allowed);
 }
 
 TEST_CASE("Bent acacia trunks remain face connected in the seed forty two scene",

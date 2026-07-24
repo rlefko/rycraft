@@ -59,6 +59,26 @@ void loadFixtureCubes(World& world, int64_t minX, int minY, int64_t minZ, int64_
             }
         }
     }
+
+    // Physics fixtures edit exact blocks directly, so publish their loaded
+    // sections through the same epoch-qualified handoff used by the renderer.
+    // Repeated fixture loads retain prior sections.
+    const std::shared_ptr<const ExactSurfaceCoverageSnapshot> coverage =
+        world.getExactSurfaceCoverageSnapshot();
+    const std::shared_ptr<const ExactCollisionOwnershipSnapshot> previous =
+        world.getExactCollisionOwnershipSnapshot();
+    std::unordered_set<ChunkPos> sections;
+    if (previous && coverage && previous->coverageEpoch == coverage->epoch)
+        sections = previous->sections;
+    for (int32_t chunkY = minChunkY; chunkY <= maxChunkY; ++chunkY) {
+        for (int64_t chunkZ = minChunkZ; chunkZ <= maxChunkZ; ++chunkZ) {
+            for (int64_t chunkX = minChunkX; chunkX <= maxChunkX; ++chunkX)
+                sections.insert({chunkX, chunkY, chunkZ});
+        }
+    }
+    const std::vector<ChunkPos> publication(sections.begin(), sections.end());
+    REQUIRE(coverage);
+    REQUIRE(world.publishExactCollisionOwnership(coverage->epoch, publication));
 }
 
 } // namespace
@@ -190,6 +210,18 @@ TEST_CASE("isSolid: solid for STONE and GLASS, passable for AIR/WATER", "[physic
     REQUIRE(PhysicsEngine::isSolid(*world, 6, 200, 6) == true); // BEDROCK
 }
 
+TEST_CASE("isSolid preserves full-width horizontal coordinates", "[physics][coordinates]") {
+    constexpr int64_t FAR_X = 3'000'000'000LL;
+    constexpr int64_t FAR_Z = -3'000'000'000LL;
+    auto world = std::make_shared<World>(42);
+    loadFixtureCubes(*world, FAR_X, 199, FAR_Z, FAR_X + 1, 201, FAR_Z);
+    world->setBlock(FAR_X, 200, FAR_Z, BlockType::STONE);
+    world->setBlock(FAR_X + 1, 200, FAR_Z, BlockType::AIR);
+
+    REQUIRE(PhysicsEngine::isSolid(*world, FAR_X, 200, FAR_Z));
+    REQUIRE_FALSE(PhysicsEngine::isSolid(*world, FAR_X + 1, 200, FAR_Z));
+}
+
 TEST_CASE("Block properties: the three predicates agree on every type", "[physics][world]") {
     for (int t = 0; t < static_cast<int>(BlockType::COUNT); ++t) {
         BlockType bt = static_cast<BlockType>(t);
@@ -199,10 +231,32 @@ TEST_CASE("Block properties: the three predicates agree on every type", "[physic
         if (isOpaque(bt)) {
             REQUIRE(rendersAsCube(bt));
         }
-        // Non-solid = air, liquids, and walk-through flora — nothing else
-        bool expectedSolid = bt != BlockType::AIR && !isLiquid(bt) && !isFlora(bt);
+        // Non-solid = air, liquids, walk-through flora, and authored floor
+        // torches. Torches deliberately do not share flora replacement rules.
+        bool expectedSolid =
+            bt != BlockType::AIR && !isLiquid(bt) && !isFlora(bt) && !isFloorTorch(bt);
         REQUIRE(isSolid(bt) == expectedSolid);
     }
+}
+
+TEST_CASE("Bed collision stops at the authored low-box surface",
+          "[physics][bed][collision][regression]") {
+    auto world = std::make_shared<World>(42);
+    loadFixtureCubes(*world, 3, 198, 3, 7, 204, 7);
+    world->setBlock(5, 200, 5, BlockType::BED);
+
+    const AABB query{Vec3{4.5F, 199.5F, 4.5F}, Vec3{6.5F, 202.0F, 6.5F}};
+    const std::vector<AABB> obstacles = PhysicsEngine::collectObstacles(query, *world);
+    const auto bed = std::find_if(obstacles.begin(), obstacles.end(), [](const AABB& obstacle) {
+        return obstacle.min == Vec3{5.0F, 200.0F, 5.0F};
+    });
+    REQUIRE(bed != obstacles.end());
+    REQUIRE(bed->max.y == Catch::Approx(200.0F + BED_COLLISION_HEIGHT));
+
+    PhysicsEngine physics;
+    const AABB descending{Vec3{5.1F, 201.0F, 5.1F}, Vec3{5.7F, 202.8F, 5.7F}};
+    const Vec3 resolved = physics.sweepCollision(descending, Vec3{0.0F, -1.0F, 0.0F}, *world);
+    REQUIRE(resolved.y == Catch::Approx(-1.0F + BED_COLLISION_HEIGHT).margin(0.001F));
 }
 
 TEST_CASE("isInWater: returns true when entity AABB overlaps water block", "[physics]") {
@@ -256,6 +310,123 @@ TEST_CASE("isInWater and buoyancy honor the flowing water surface", "[physics][f
     submerged.tick(*world);
     dry.tick(*world);
     REQUIRE(submerged.velocity.y > dry.velocity.y);
+}
+
+TEST_CASE("Unowned canonical water supplies collision-authority swim depth",
+          "[physics][fluid][streaming][exact-ownership][regression]") {
+    constexpr int64_t WORLD_X = -8'348;
+    constexpr int64_t WORLD_Z = 2'281;
+    World world(42, 4);
+    const ColumnPos column{Chunk::worldToChunk(WORLD_X), Chunk::worldToChunk(WORLD_Z)};
+    const auto plan = world.generator().getColumnPlan(column);
+    REQUIRE(plan);
+    const int localX = Chunk::worldToLocal(WORLD_X);
+    const int localZ = Chunk::worldToLocal(WORLD_Z);
+    const worldgen::SurfaceSample surface = plan->sample(localX, localZ);
+    REQUIRE((surface.hydrology.ocean || surface.hydrology.river || surface.hydrology.lake ||
+             surface.hydrology.wetland));
+    const worldgen::GeneratedFluidColumn fluid = worldgen::generatedFluidColumn(surface);
+    REQUIRE(fluid.wet);
+    REQUIRE(fluid.topState.isSource());
+    const int32_t waterY = fluid.topY;
+    REQUIRE(waterY > plan->surfaceY(localX, localZ));
+    const ChunkPos waterSection{column.x, Chunk::worldToChunkY(waterY), column.z};
+    REQUIRE_FALSE(world.isChunkLoaded(waterSection));
+
+    const float expectedHeight = fluidSurfaceHeight(fluid.topState);
+    REQUIRE(expectedHeight > 0.0F);
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, waterY, WORLD_Z) == BlockType::WATER);
+    REQUIRE(world.getCollisionFluidHeightIfLoaded(WORLD_X, waterY, WORLD_Z) ==
+            Catch::Approx(expectedHeight));
+
+    const float waterTop = static_cast<float>(waterY) + expectedHeight;
+    const AABB submerged{Vec3{static_cast<float>(WORLD_X) + 0.2F, waterTop - 0.2F,
+                              static_cast<float>(WORLD_Z) + 0.2F},
+                         Vec3{static_cast<float>(WORLD_X) + 0.8F, waterTop + 0.2F,
+                              static_cast<float>(WORLD_Z) + 0.8F}};
+    const AABB dry{Vec3{static_cast<float>(WORLD_X) + 0.2F, waterTop + 0.01F,
+                        static_cast<float>(WORLD_Z) + 0.2F},
+                   Vec3{static_cast<float>(WORLD_X) + 0.8F, waterTop + 0.4F,
+                        static_cast<float>(WORLD_Z) + 0.8F}};
+    REQUIRE(PhysicsEngine::isInWater(world, submerged));
+    REQUIRE_FALSE(PhysicsEngine::isInWater(world, dry));
+    REQUIRE_FALSE(world.isChunkLoaded(waterSection));
+}
+
+TEST_CASE("Unowned flowing river top uses the canonical quantized fluid state",
+          "[physics][fluid][streaming][river][exact-ownership][regression]") {
+    constexpr uint64_t SEED = 764'891;
+    constexpr int64_t WORLD_X = 24'882;
+    constexpr int64_t WORLD_Z = -109'733;
+    World world(SEED, 4);
+    const ColumnPos column{Chunk::worldToChunk(WORLD_X), Chunk::worldToChunk(WORLD_Z)};
+    const auto plan = world.generator().getColumnPlan(column);
+    REQUIRE(plan);
+    const worldgen::SurfaceSample surface =
+        plan->sample(Chunk::worldToLocal(WORLD_X), Chunk::worldToLocal(WORLD_Z));
+    const worldgen::GeneratedFluidColumn fluid = worldgen::generatedFluidColumn(surface);
+    REQUIRE(fluid.wet);
+    REQUIRE(surface.hydrology.river);
+    REQUIRE_FALSE(surface.hydrology.waterfall);
+    REQUIRE(surface.hydrology.generatedFluidLevel == 4);
+    REQUIRE_FALSE(fluid.topState.isSource());
+    REQUIRE(fluid.topState.level() == surface.hydrology.generatedFluidLevel);
+    REQUIRE(fluid.topY == 111);
+    REQUIRE(Chunk::worldToLocalY(fluid.topY) == CHUNK_EDGE - 1);
+
+    const ChunkPos topSection{column.x, Chunk::worldToChunkY(fluid.topY), column.z};
+    const ChunkPos aboveSection{column.x, Chunk::worldToChunkY(fluid.topY + 1), column.z};
+    REQUIRE_FALSE(world.isChunkLoaded(topSection));
+    REQUIRE_FALSE(world.isChunkLoaded(aboveSection));
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, fluid.topY, WORLD_Z) == BlockType::WATER);
+    REQUIRE(world.getCollisionFluidHeightIfLoaded(WORLD_X, fluid.topY, WORLD_Z) ==
+            Catch::Approx(fluidSurfaceHeight(fluid.topState)));
+    REQUIRE(static_cast<double>(fluid.topY) +
+                world.getCollisionFluidHeightIfLoaded(WORLD_X, fluid.topY, WORLD_Z) ==
+            Catch::Approx(fluid.visibleSurface));
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, fluid.topY + 1, WORLD_Z) == BlockType::AIR);
+    REQUIRE_FALSE(world.isChunkLoaded(topSection));
+    REQUIRE_FALSE(world.isChunkLoaded(aboveSection));
+}
+
+TEST_CASE("Unowned legal waterfall exposes the canonical falling column",
+          "[physics][fluid][streaming][waterfall][exact-ownership][regression]") {
+    constexpr int64_t WORLD_X = -8'241;
+    constexpr int64_t WORLD_Z = 3'078;
+    World world(42, 4);
+    const ColumnPos column{Chunk::worldToChunk(WORLD_X), Chunk::worldToChunk(WORLD_Z)};
+    const auto plan = world.generator().getColumnPlan(column);
+    REQUIRE(plan);
+    const worldgen::SurfaceSample surface =
+        plan->sample(Chunk::worldToLocal(WORLD_X), Chunk::worldToLocal(WORLD_Z));
+    const worldgen::GeneratedFluidColumn fluid = worldgen::generatedFluidColumn(surface);
+    REQUIRE(fluid.wet);
+    REQUIRE(surface.hydrology.waterfall);
+    REQUIRE(surface.hydrology.transitionOwnerKind == worldgen::WaterTransitionKind::EXPLICIT_FALL);
+    REQUIRE(surface.hydrology.transitionOwnerId != 0);
+    REQUIRE(surface.hydrology.generatedFluidLevel == 7);
+    const int32_t waterfallTopY =
+        static_cast<int32_t>(std::ceil(surface.hydrology.waterfallTop)) - 1;
+    REQUIRE(waterfallTopY == fluid.topY);
+    REQUIRE(fluid.fallingStartY < waterfallTopY);
+    const int32_t fallingY = fluid.fallingStartY;
+    const int32_t receiverY = fallingY - 1;
+
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, receiverY, WORLD_Z) == BlockType::WATER);
+    REQUIRE(world.getCollisionFluidHeightIfLoaded(WORLD_X, receiverY, WORLD_Z) ==
+            Catch::Approx(1.0F));
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, fallingY, WORLD_Z) == BlockType::WATER);
+    REQUIRE(world.getCollisionFluidHeightIfLoaded(WORLD_X, fallingY, WORLD_Z) ==
+            Catch::Approx(1.0F));
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, waterfallTopY, WORLD_Z) == BlockType::WATER);
+    REQUIRE(world.getCollisionFluidHeightIfLoaded(WORLD_X, waterfallTopY, WORLD_Z) ==
+            Catch::Approx(fluidSurfaceHeight(FluidState::flowing(7))));
+    REQUIRE(world.getCollisionBlockIfLoaded(WORLD_X, waterfallTopY + 1, WORLD_Z) == BlockType::AIR);
+
+    const ChunkPos fallingSection{column.x, Chunk::worldToChunkY(fallingY), column.z};
+    const ChunkPos topSection{column.x, Chunk::worldToChunkY(waterfallTopY), column.z};
+    REQUIRE_FALSE(world.isChunkLoaded(fallingSection));
+    REQUIRE_FALSE(world.isChunkLoaded(topSection));
 }
 
 // ============================================================================
@@ -465,6 +636,29 @@ TEST_CASE("Player resetFallDistance clears fall tracking", "[player]") {
     player.fallDistance = 10;
     player.resetFallDistance();
     REQUIRE(player.fallDistance == 0);
+}
+
+TEST_CASE("Creative flight remains inside the expanded world ceiling",
+          "[player][physics][height]") {
+    auto world = std::make_shared<World>(42);
+    loadFixtureCubes(*world, -1, WORLD_MAX_Y - 2, -1, 1, WORLD_MAX_Y, 1);
+    for (int32_t y = WORLD_MAX_Y - 2; y <= WORLD_MAX_Y; ++y) {
+        world->setBlock(0, y, 0, BlockType::AIR);
+    }
+
+    Player player;
+    player.position = Vec3{0.5f, Player::MAX_FEET_Y - 0.1f, 0.5f};
+    player.flying = true;
+    PlayerInput input;
+    input.jumpHeld = true;
+    input.allowFlight = true;
+
+    player.tick(*world, input);
+
+    REQUIRE(player.position.y == Catch::Approx(Player::MAX_FEET_Y));
+    REQUIRE(player.position.y <= static_cast<float>(WORLD_MAX_Y));
+    REQUIRE(player.velocity.y == Catch::Approx(0.f));
+    REQUIRE(player.flying);
 }
 
 // Helper: a flat stone platform whose top surface is y = groundTopY.
@@ -998,7 +1192,7 @@ TEST_CASE("Fly: a jump double-tap toggles a gravity-free hover", "[player][modes
     toggle.doubleTapJump = true;
     player.tick(*world, toggle);
     REQUIRE(player.flying);
-    REQUIRE(player.velocity.y == 0.f); // the fall is cancelled, not carried
+    REQUIRE(player.velocity.y == 0.f); // the fall is canceled, not carried
     REQUIRE(player.fallDistance == 0.f);
 
     float hoverY = player.position.y;
@@ -1257,12 +1451,21 @@ TEST_CASE("DDA traversal stops at an unloaded cube without generating it", "[vox
     REQUIRE_FALSE(world.isChunkLoaded(missing));
 }
 
-TEST_CASE("Flying collision treats an unloaded cube as closed", "[physics][player][streaming]") {
+TEST_CASE("Flying collision does not close an unowned partially loaded column",
+          "[physics][player][streaming][exact-ownership][regression]") {
     World world(42, 4);
-    constexpr ChunkPos loaded{0, 12, 0};
-    constexpr ChunkPos missing{1, 12, 0};
+    constexpr ColumnPos loadedColumn{0, 0};
+    constexpr ColumnPos missingColumn{1, 0};
+    const auto loadedPlan = world.generator().getColumnPlan(loadedColumn);
+    const auto missingPlan = world.generator().getColumnPlan(missingColumn);
+    REQUIRE(loadedPlan);
+    REQUIRE(missingPlan);
+    const int32_t flightY = std::max(loadedPlan->surfaceY(15, 8), missingPlan->surfaceY(0, 8)) + 12;
+    const ChunkPos loaded{loadedColumn.x, Chunk::worldToChunkY(flightY), loadedColumn.z};
+    const ChunkPos missing{missingColumn.x, Chunk::worldToChunkY(flightY), missingColumn.z};
     REQUIRE(world.getChunk(loaded));
-    for (int y = 199; y <= 203; ++y) {
+    REQUIRE_FALSE(world.isChunkLoaded(missing));
+    for (int y = flightY - 1; y <= flightY + 3; ++y) {
         for (int z = 7; z <= 9; ++z) {
             world.setBlock(14, y, z, BlockType::AIR);
             world.setBlock(15, y, z, BlockType::AIR);
@@ -1270,15 +1473,17 @@ TEST_CASE("Flying collision treats an unloaded cube as closed", "[physics][playe
     }
 
     Player player;
-    player.position = Vec3{15.5f, 200.0f, 8.0f};
+    player.position = Vec3{15.5f, static_cast<float>(flightY), 8.0f};
     player.yaw = static_cast<float>(M_PI_2);
     player.flying = true;
     PlayerInput input;
     input.forward = true;
     player.tick(world, input);
 
-    REQUIRE(player.blockedHorizontally);
-    REQUIRE(player.position.x < 15.71f);
+    REQUIRE_FALSE(player.blockedHorizontally);
+    REQUIRE(player.flying);
+    REQUIRE_FALSE(player.onGround);
+    REQUIRE(player.position.x > 15.71f);
     REQUIRE_FALSE(world.isChunkLoaded(missing));
 }
 
@@ -1304,6 +1509,75 @@ TEST_CASE("DDA traversal: face normal computation", "[voxel]") {
     REQUIRE(hit->second.x == Catch::Approx(-1.f));
     REQUIRE(hit->second.y == Catch::Approx(0.f));
     REQUIRE(hit->second.z == Catch::Approx(0.f));
+}
+
+TEST_CASE("DDA traversal respects the occupied height of beds", "[voxel][authored-shape]") {
+    auto world = std::make_shared<World>(42);
+    loadFixtureCubes(*world, 0, 199, 0, 8, 202, 0);
+    for (int x = 0; x <= 8; ++x) {
+        world->setBlock(x, 200, 0, BlockType::AIR);
+    }
+    world->setBlock(5, 199, 0, BlockType::AIR);
+    world->setBlock(5, 201, 0, BlockType::AIR);
+    world->setBlock(5, 200, 0, BlockType::BED);
+    world->setBlock(7, 200, 0, BlockType::STONE);
+
+    const auto above = VoxelTraversal::traceRayDetailed(Vec3{0.5F, 200.75F, 0.5F},
+                                                        Vec3{1.0F, 0.0F, 0.0F}, *world, 10.0F);
+    REQUIRE(above);
+    REQUIRE(above->block == BlockType::STONE);
+    REQUIRE(above->blockPosition.x == Catch::Approx(7.0F));
+
+    const auto lower = VoxelTraversal::traceRayDetailed(Vec3{0.5F, 200.25F, 0.5F},
+                                                        Vec3{1.0F, 0.0F, 0.0F}, *world, 10.0F);
+    REQUIRE(lower);
+    REQUIRE(lower->block == BlockType::BED);
+    REQUIRE(lower->blockPosition.x == Catch::Approx(5.0F));
+    REQUIRE(lower->normal.x == Catch::Approx(-1.0F));
+    REQUIRE(lower->localBounds.max.y == Catch::Approx(BED_COLLISION_HEIGHT));
+    REQUIRE(lower->distance == Catch::Approx(4.5F));
+
+    const auto fromAbove = VoxelTraversal::traceRayDetailed(Vec3{5.5F, 201.5F, 0.5F},
+                                                            Vec3{0.0F, -1.0F, 0.0F}, *world, 3.0F);
+    REQUIRE(fromAbove);
+    REQUIRE(fromAbove->block == BlockType::BED);
+    REQUIRE(fromAbove->normal.y == Catch::Approx(1.0F));
+    REQUIRE(fromAbove->distance == Catch::Approx(1.5F - BED_COLLISION_HEIGHT));
+
+    const auto fromBelow = VoxelTraversal::traceRayDetailed(Vec3{5.5F, 199.5F, 0.5F},
+                                                            Vec3{0.0F, 1.0F, 0.0F}, *world, 3.0F);
+    REQUIRE(fromBelow);
+    REQUIRE(fromBelow->block == BlockType::BED);
+    REQUIRE(fromBelow->normal.y == Catch::Approx(-1.0F));
+    REQUIRE(fromBelow->distance == Catch::Approx(0.5F));
+}
+
+TEST_CASE("DDA traversal respects the tight authored torch bounds", "[voxel][authored-shape]") {
+    auto world = std::make_shared<World>(42);
+    loadFixtureCubes(*world, 0, 199, 0, 8, 202, 0);
+    for (int x = 0; x <= 8; ++x) {
+        world->setBlock(x, 200, 0, BlockType::AIR);
+    }
+    world->setBlock(5, 200, 0, BlockType::TORCH);
+    world->setBlock(7, 200, 0, BlockType::STONE);
+
+    const auto beside = VoxelTraversal::traceRayDetailed(Vec3{0.5F, 200.5F, 0.05F},
+                                                         Vec3{1.0F, 0.0F, 0.0F}, *world, 10.0F);
+    REQUIRE(beside);
+    REQUIRE(beside->block == BlockType::STONE);
+    REQUIRE(beside->blockPosition.x == Catch::Approx(7.0F));
+
+    const auto centered = VoxelTraversal::traceRayDetailed(Vec3{0.5F, 200.5F, 0.5F},
+                                                           Vec3{1.0F, 0.0F, 0.0F}, *world, 10.0F);
+    REQUIRE(centered);
+    REQUIRE(centered->block == BlockType::TORCH);
+    REQUIRE(centered->blockPosition.x == Catch::Approx(5.0F));
+    REQUIRE(centered->normal.x == Catch::Approx(-1.0F));
+    REQUIRE(centered->localBounds.min.x == Catch::Approx(TORCH_SELECTION_MIN));
+    REQUIRE(centered->localBounds.max.x == Catch::Approx(TORCH_SELECTION_MAX));
+    REQUIRE(centered->localBounds.min.z == Catch::Approx(TORCH_SELECTION_MIN));
+    REQUIRE(centered->localBounds.max.z == Catch::Approx(TORCH_SELECTION_MAX));
+    REQUIRE(centered->distance == Catch::Approx(4.5F + TORCH_SELECTION_MIN));
 }
 
 TEST_CASE("DDA traversal: ray along diagonal hits block", "[voxel]") {
@@ -1514,6 +1788,25 @@ TEST_CASE("Entity vertical velocity does not saturate on the ground", "[entity][
         REQUIRE(std::abs(sheep->velocity.y) < 0.2f);
     }
     REQUIRE(sheep->onGround);
+}
+
+TEST_CASE("Entity grounds on the authored top of a floating bed",
+          "[entity][physics][bed][regression]") {
+    auto world = std::make_shared<World>(42);
+    loadFixtureCubes(*world, -2, 198, -2, 2, 204, 2);
+    world->setBlock(0, 199, 0, BlockType::AIR);
+    world->setBlock(0, 200, 0, BlockType::BED);
+    REQUIRE(world->getBlockIfLoaded(0, 199, 0) == BlockType::AIR);
+    REQUIRE(world->getBlockIfLoaded(0, 200, 0) == BlockType::BED);
+
+    const float bedTop = 200.0F + BED_COLLISION_HEIGHT;
+    auto sheep = std::make_shared<Entity>(203, EntityType::SHEEP, Vec3{0.5F, bedTop, 0.5F});
+    for (int tick = 0; tick < 60; ++tick) {
+        sheep->tick(*world);
+        REQUIRE(sheep->onGround);
+        REQUIRE(sheep->position.y == Catch::Approx(bedTop).margin(0.001F));
+        REQUIRE(sheep->velocity.y == Catch::Approx(0.0F));
+    }
 }
 
 TEST_CASE("Entity physics: step assist climbs 1-block gap", "[entity][physics]") {
@@ -2723,6 +3016,77 @@ TEST_CASE("Aged-out items despawn", "[item-entity]") {
 // Boats
 // ============================================================================
 
+TEST_CASE("Boat placement accepts only exposed water surfaces approached from above",
+          "[boat][placement][water][regression]") {
+    const FluidCell standing{
+        .loaded = true,
+        .block = BlockType::WATER,
+        .state = FluidState::source(),
+    };
+    const Vec3 origin{4.5F, 67.0F, 6.5F};
+    const Vec3 downward{0.0F, -2.0F, 0.0F};
+    const std::optional<float> standingSurface =
+        boatPlacementSurfaceY(4, 64, 6, standing, BlockType::AIR, origin, downward, 5.0F);
+    REQUIRE(standingSurface);
+    REQUIRE(*standingSurface == Catch::Approx(65.0F));
+
+    FluidCell partial = standing;
+    partial.state = FluidState::flowing(4);
+    const std::optional<float> partialSurface =
+        boatPlacementSurfaceY(4, 64, 6, partial, BlockType::AIR, origin, downward, 5.0F);
+    REQUIRE(partialSurface);
+    REQUIRE(*partialSurface == Catch::Approx(64.5F));
+
+    FluidCell falling = standing;
+    falling.state = FluidState::falling(4);
+    REQUIRE_FALSE(boatPlacementSurfaceY(4, 64, 6, falling, BlockType::AIR, origin, downward, 5.0F));
+    REQUIRE_FALSE(
+        boatPlacementSurfaceY(4, 64, 6, standing, BlockType::WATER, origin, downward, 5.0F));
+    REQUIRE_FALSE(
+        boatPlacementSurfaceY(4, 64, 6, standing, BlockType::STONE, origin, downward, 5.0F));
+    REQUIRE_FALSE(boatPlacementSurfaceY(4, 64, 6, standing, std::nullopt, origin, downward, 5.0F));
+
+    const Vec3 submerged{4.5F, 64.75F, 6.5F};
+    REQUIRE_FALSE(
+        boatPlacementSurfaceY(4, 64, 6, standing, BlockType::AIR, submerged, downward, 5.0F));
+    REQUIRE_FALSE(boatPlacementSurfaceY(4, 64, 6, standing, BlockType::AIR, origin,
+                                        Vec3{0.0F, 0.0F, 1.0F}, 5.0F));
+    REQUIRE_FALSE(boatPlacementSurfaceY(4, 64, 6, standing, BlockType::AIR, Vec3{5.5F, 67.0F, 6.5F},
+                                        downward, 5.0F));
+    REQUIRE_FALSE(
+        boatPlacementSurfaceY(4, 64, 6, standing, BlockType::AIR, origin, downward, 1.0F));
+}
+
+TEST_CASE("Boat buoyancy accepts only overlapping nonfalling water",
+          "[boat][physics][water][regression]") {
+    const AABB sourceOverlap{Vec3{4.0F, 64.75F, 6.0F}, Vec3{5.0F, 65.30F, 7.0F}};
+    const FluidCell source{
+        .loaded = true,
+        .block = BlockType::WATER,
+        .state = FluidState::source(),
+    };
+    REQUIRE(boatFluidCellProvidesBuoyancy(source, 64, sourceOverlap));
+
+    FluidCell partial = source;
+    partial.state = FluidState::flowing(4); // surface Y = 64.5
+    const AABB partialOverlap{Vec3{4.0F, 64.40F, 6.0F}, Vec3{5.0F, 64.80F, 7.0F}};
+    const AABB abovePartial{Vec3{4.0F, 64.51F, 6.0F}, Vec3{5.0F, 65.06F, 7.0F}};
+    REQUIRE(boatFluidCellProvidesBuoyancy(partial, 64, partialOverlap));
+    REQUIRE_FALSE(boatFluidCellProvidesBuoyancy(partial, 64, abovePartial));
+
+    FluidCell falling = source;
+    falling.state = FluidState::falling(4);
+    REQUIRE_FALSE(boatFluidCellProvidesBuoyancy(falling, 64, sourceOverlap));
+
+    FluidCell lava = source;
+    lava.block = BlockType::LAVA;
+    REQUIRE_FALSE(boatFluidCellProvidesBuoyancy(lava, 64, sourceOverlap));
+
+    FluidCell unavailable = source;
+    unavailable.loaded = false;
+    REQUIRE_FALSE(boatFluidCellProvidesBuoyancy(unavailable, 64, sourceOverlap));
+}
+
 TEST_CASE("Boat sinks under gravity and grounds on solid land", "[boat][physics]") {
     auto world = makePlatform(101); // stone surface top at y = 101
     BoatManager boats;
@@ -2752,11 +3116,15 @@ TEST_CASE("Boat picking hits an aimed hull and misses otherwise", "[boat]") {
 TEST_CASE("Boat spawns respect the cap and removal is bounds-checked", "[boat]") {
     BoatManager boats;
     for (size_t i = 0; i < BoatManager::MAX_BOATS; ++i) {
-        boats.spawn(Vec3{static_cast<float>(i), 64.f, 0.f}, 0.f);
+        const BoatSpawnResult spawned = boats.spawn(Vec3{static_cast<float>(i), 64.f, 0.f}, 0.f);
+        REQUIRE_FALSE(spawned.evictedOldest);
+        REQUIRE(spawned.index == i);
     }
     REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS);
     // One more evicts the oldest; the fresh spawn survives at the cap.
-    boats.spawn(Vec3{999.f, 64.f, 0.f}, 0.f);
+    const BoatSpawnResult replacement = boats.spawn(Vec3{999.f, 64.f, 0.f}, 0.f);
+    REQUIRE(replacement.evictedOldest);
+    REQUIRE(replacement.index == BoatManager::MAX_BOATS - 1);
     REQUIRE(boats.boats().size() == BoatManager::MAX_BOATS);
     REQUIRE(boats.boats().back().position.x == Catch::Approx(999.f));
 

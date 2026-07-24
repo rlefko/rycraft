@@ -12,7 +12,7 @@ using namespace metal;
 // circles with alpha falloff. Uses point_coord for per-pixel position
 // within the point sprite.
 //
-// Uniforms (buffer 1): ParticleUniforms (viewMatrix, projectionMatrix, cameraPosition)
+// Uniforms (buffer 1): ParticleUniforms (camera transforms, extinction, physical scale)
 // Vertices (buffer 0): GPUParticle array (position, velocity, lifetime, type)
 // ---------------------------------------------------------------------------
 
@@ -20,7 +20,7 @@ struct ParticleVertexOutput {
     float4 clipPosition [[position]];
     float pointSize [[point_size]];
     float particleType;
-    float viewDistance;
+    float viewDistanceMeters;
     float atmosphericExtinction;
 };
 
@@ -40,12 +40,14 @@ vertex ParticleVertexOutput particleVertexMain(device const GPUParticle* particl
     ParticleVertexOutput out;
     out.clipPosition = clipPos;
     out.particleType = particle.type;
-    out.viewDistance = length(viewPos.xyz);
+    const float viewDistanceBlocks = length(viewPos.xyz);
+    out.viewDistanceMeters =
+        particleOpticalDistanceMeters(viewDistanceBlocks, uniforms.metersPerBlock);
     out.atmosphericExtinction = uniforms.atmosphericExtinction;
 
-    // Point sprite size shrinks with distance (clamped so far particles stay visible)
-    float dist = max(length(viewPos.xyz), 1.0f);
-    out.pointSize = clamp(160.0f / dist, 2.0f, 12.0f);
+    // Billboard sizing remains in block space. Physical scale changes only
+    // the Beer-Lambert path used by the fragment stage.
+    out.pointSize = particleBillboardPointSize(viewDistanceBlocks);
 
     return out;
 }
@@ -74,7 +76,7 @@ fragment float4 particleFragmentMain(ParticleVertexOutput in [[stage_in]],
         float alpha = lineAlpha * vertAlpha * 0.6;
 
         const float transmittance =
-            exp(-max(in.atmosphericExtinction, 0.0f) * max(in.viewDistance, 0.0f));
+            beerLambertTransmittance(in.atmosphericExtinction, in.viewDistanceMeters);
         // Straight-alpha blending applies alpha to RGB once. Attenuate alpha
         // only so atmospheric transmittance is not squared by the blend unit.
         return float4(rainColor, alpha * transmittance);
@@ -90,6 +92,6 @@ fragment float4 particleFragmentMain(ParticleVertexOutput in [[stage_in]],
     float alpha = snowAlpha * 0.8;
 
     const float transmittance =
-        exp(-max(in.atmosphericExtinction, 0.0f) * max(in.viewDistance, 0.0f));
+        beerLambertTransmittance(in.atmosphericExtinction, in.viewDistanceMeters);
     return float4(snowColor, alpha * transmittance);
 }

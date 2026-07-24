@@ -65,6 +65,7 @@ public:
     // Player dimensions: 0.6 wide, 1.8 tall
     static constexpr float WIDTH = 0.6f;
     static constexpr float HEIGHT = 1.8f;
+    static constexpr float MAX_FEET_Y = static_cast<float>(WORLD_MAX_Y + 1) - HEIGHT;
 
     // Physics constants — authentic vanilla Minecraft: gravity -0.08 blocks/tick²,
     // vertical drag 0.98, terminal velocity -3.92 blocks/tick (= 49 × gravity),

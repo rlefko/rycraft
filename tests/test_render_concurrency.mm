@@ -39,6 +39,67 @@ TEST_CASE("Exact mesh scheduling shares one bounded result budget",
     REQUIRE(scheduler.stats().schedulerOwned == 0);
 }
 
+TEST_CASE("Nearby exact meshes displace saturated distant and stale queued work",
+          "[render][scheduler][concurrency][priority][camera-jump][regression]") {
+    World world(42, 4);
+    MeshScheduler scheduler(world, 0);
+
+    for (size_t index = 0; index < EXACT_MESH_MAX_INFLIGHT / 2; ++index) {
+        REQUIRE(scheduler.enqueue({static_cast<int64_t>(index), 0, 100}, 1,
+                                  MeshPriorityLane::BROAD_SURFACE, index));
+    }
+    for (size_t index = 0; index < EXACT_MESH_MAX_INFLIGHT / 2; ++index) {
+        REQUIRE(scheduler.enqueue({static_cast<int64_t>(index), 0, 10}, 1,
+                                  MeshPriorityLane::CAMERA_BAND, index));
+    }
+    REQUIRE(scheduler.stats().schedulerOwned == EXACT_MESH_MAX_INFLIGHT);
+
+    std::optional<MeshCanceledRequest> displaced;
+    constexpr ChunkPos NEW_CAMERA{900, 5, -900};
+    REQUIRE(scheduler.enqueue(NEW_CAMERA, 7, MeshPriorityLane::CAMERA_COLUMN, 0, &displaced));
+    REQUIRE(displaced);
+    REQUIRE(displaced->pos == ChunkPos{31, 0, 100});
+    REQUIRE(displaced->requestedVersion == 1);
+    REQUIRE(scheduler.stats().schedulerOwned == EXACT_MESH_MAX_INFLIGHT);
+    REQUIRE(scheduler.stats().displaced == 1);
+
+    const std::unordered_set<ChunkPos> currentCandidates{NEW_CAMERA};
+    const std::vector<MeshCanceledRequest> canceled =
+        scheduler.cancelQueuedOutside(currentCandidates);
+    REQUIRE(canceled.size() == EXACT_MESH_MAX_INFLIGHT - 1);
+    REQUIRE(scheduler.stats().schedulerOwned == 1);
+    REQUIRE(scheduler.stats().canceledQueued == EXACT_MESH_MAX_INFLIGHT - 1);
+
+    scheduler.shutdown();
+}
+
+TEST_CASE("Queued exact mesh work follows a moving camera without duplicate builds",
+          "[render][scheduler][concurrency][priority][movement][regression]") {
+    World world(42, 4);
+    MeshScheduler scheduler(world, 0);
+    constexpr ChunkPos MOVED_NEAR{24, 4, -10};
+    constexpr ChunkPos STILL_DISTANT{-24, 4, 10};
+    REQUIRE(scheduler.enqueue(MOVED_NEAR, 11, MeshPriorityLane::BROAD_SURFACE, 900));
+    REQUIRE(scheduler.enqueue(STILL_DISTANT, 12, MeshPriorityLane::BROAD_SURFACE, 800));
+
+    const size_t changed = scheduler.reprioritizeQueued([=](ChunkPos position) {
+        if (position == MOVED_NEAR)
+            return MeshRequestPriority{MeshPriorityLane::CAMERA_COLUMN, 0};
+        return MeshRequestPriority{MeshPriorityLane::BROAD_SURFACE, 800};
+    });
+    REQUIRE(changed == 1);
+    REQUIRE(scheduler.stats().schedulerOwned == 2);
+
+    const std::optional<MeshCanceledRequest> canceled = scheduler.cancelQueued(MOVED_NEAR);
+    REQUIRE(canceled);
+    REQUIRE(canceled->requestedVersion == 11);
+    REQUIRE(scheduler.stats().schedulerOwned == 1);
+    REQUIRE(scheduler.stats().canceledQueued == 1);
+    REQUIRE_FALSE(scheduler.cancelQueued(MOVED_NEAR));
+
+    scheduler.shutdown();
+}
+
 TEST_CASE("Exact mesh completion coalesces duplicate cube revisions",
           "[render][scheduler][concurrency]") {
     World world(42, 4);
@@ -119,6 +180,13 @@ TEST_CASE("Mesh snapshots preserve planned and exact cutoffs across negative chu
           "[world][render][snapshot][coordinates]") {
     World world(4242, 4);
     constexpr ChunkPos center{-1, 4, -1};
+    for (int offsetZ = -EXACT_STREAMING_PLAN_DEPENDENCY_APRON_CHUNKS;
+         offsetZ <= EXACT_STREAMING_PLAN_DEPENDENCY_APRON_CHUNKS; ++offsetZ) {
+        for (int offsetX = -EXACT_STREAMING_PLAN_DEPENDENCY_APRON_CHUNKS;
+             offsetX <= EXACT_STREAMING_PLAN_DEPENDENCY_APRON_CHUNKS; ++offsetX) {
+            REQUIRE(world.generator().getColumnPlan({center.x + offsetX, center.z + offsetZ}));
+        }
+    }
     for (int offsetY = -1; offsetY <= 1; ++offsetY) {
         for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
             for (int offsetX = -1; offsetX <= 1; ++offsetX) {
@@ -126,6 +194,24 @@ TEST_CASE("Mesh snapshots preserve planned and exact cutoffs across negative chu
             }
         }
     }
+    for (int offsetZ = -1; offsetZ <= 1; ++offsetZ) {
+        for (int offsetX = -1; offsetX <= 1; ++offsetX) {
+            const auto plan =
+                world.generator().getColumnPlan({center.x + offsetX, center.z + offsetZ});
+            REQUIRE(plan);
+            for (const int32_t section : plan->exposedSections()) {
+                if (section >= center.y) {
+                    REQUIRE(world.getChunk({center.x + offsetX, section, center.z + offsetZ}));
+                }
+            }
+        }
+    }
+    for (int pass = 0;
+         pass < 64 && world.getStreamingWorkStats().publicationLightDeferredQueue != 0; ++pass) {
+        world.reconcileLight(1'024);
+    }
+    REQUIRE(world.getStreamingWorkStats().publicationLightDeferredQueue == 0);
+    REQUIRE(world.getStreamingWorkStats().publicationLightMaxSyncFloods <= 32);
 
     MeshSnapshot snapshot;
     REQUIRE(world.snapshotForMeshing(center, snapshot));
@@ -149,6 +235,12 @@ TEST_CASE("Mesh snapshots preserve planned and exact cutoffs across negative chu
             REQUIRE(snapshot.skyCutoffAt(x, z) >= plannedCutoff);
         }
     }
+    const auto firstVisibleLight = snapshot.packedLight;
+    for (int pass = 0; pass < 4; ++pass)
+        world.reconcileLight(64);
+    MeshSnapshot settled;
+    REQUIRE(world.snapshotForMeshing(center, settled));
+    REQUIRE(settled.packedLight == firstVisibleLight);
 }
 
 TEST_CASE("World publishes mesh candidates with the loaded cube snapshot",
@@ -169,6 +261,38 @@ TEST_CASE("World publishes mesh candidates with the loaded cube snapshot",
         REQUIRE(world.shouldMeshChunk(pos));
 }
 
+TEST_CASE("V4 preparation publishes exact candidates without a gameplay tick",
+          "[world][render][snapshot][v4][startup][regression]") {
+    World world(42, MIN_RENDER_DISTANCE_CHUNKS);
+    const auto initialLoaded = world.getLoadedSnapshot();
+    const auto initialCandidates = world.getMeshCandidateSnapshot();
+    REQUIRE(initialLoaded);
+    REQUIRE(initialLoaded->empty());
+    REQUIRE(initialCandidates);
+    REQUIRE(initialCandidates->empty());
+
+    REQUIRE(world.generator().getColumnPlan({0, 0}));
+    world.generateAroundPlayer(0, SEA_LEVEL, 0);
+    const auto coverage = world.getExactSurfaceCoverageSnapshot();
+    REQUIRE(coverage);
+    REQUIRE_FALSE(coverage->requiredSections.empty());
+
+    size_t internallySelectedRequirements = 0;
+    for (const ChunkPos section : coverage->requiredSections)
+        internallySelectedRequirements += world.shouldMeshChunk(section) ? 1U : 0U;
+    REQUIRE(internallySelectedRequirements > 0);
+    REQUIRE(world.getMeshCandidateSnapshot() == initialCandidates);
+
+    publishV4PreparationWorldSnapshot(world);
+
+    const auto publishedCandidates = world.getMeshCandidateSnapshot();
+    REQUIRE(publishedCandidates != initialCandidates);
+    size_t publishedRequirements = 0;
+    for (const ChunkPos section : coverage->requiredSections)
+        publishedRequirements += publishedCandidates->contains(section) ? 1U : 0U;
+    REQUIRE(publishedRequirements == internallySelectedRequirements);
+}
+
 TEST_CASE("World publishes pre-cap exact surface coverage requirements",
           "[world][render][coverage][snapshot]") {
     World world(42, MIN_RENDER_DISTANCE_CHUNKS);
@@ -176,25 +300,42 @@ TEST_CASE("World publishes pre-cap exact surface coverage requirements",
     REQUIRE(initial);
     REQUIRE(initial->epoch == 0);
     REQUIRE(initial->requiredSections.empty());
+    REQUIRE(initial->floraRequiredSections.empty());
 
+    // Seed one completed plan so the snapshot exercises the broad tree
+    // interval instead of containing only unresolved-column fallbacks.
+    REQUIRE(world.generator().getColumnPlan({0, 0}));
     world.generateAroundPlayer(0, SEA_LEVEL, 0);
     const auto coverage = world.getExactSurfaceCoverageSnapshot();
     REQUIRE(coverage != initial);
     REQUIRE(coverage->epoch > 0);
     REQUIRE(coverage->nominalRadiusChunks == MIN_RENDER_DISTANCE_CHUNKS);
     REQUIRE_FALSE(coverage->requiredSections.empty());
+    REQUIRE_FALSE(coverage->floraRequiredSections.empty());
+    const auto sectionOrder = [](ChunkPos left, ChunkPos right) {
+        if (left.x != right.x)
+            return left.x < right.x;
+        if (left.z != right.z)
+            return left.z < right.z;
+        return left.y < right.y;
+    };
     REQUIRE(std::is_sorted(coverage->requiredSections.begin(), coverage->requiredSections.end(),
-                           [](ChunkPos left, ChunkPos right) {
-                               if (left.x != right.x)
-                                   return left.x < right.x;
-                               if (left.z != right.z)
-                                   return left.z < right.z;
-                               return left.y < right.y;
-                           }));
+                           sectionOrder));
+    REQUIRE(std::is_sorted(coverage->floraRequiredSections.begin(),
+                           coverage->floraRequiredSections.end(), sectionOrder));
     REQUIRE(
         std::adjacent_find(coverage->requiredSections.begin(), coverage->requiredSections.end()) ==
         coverage->requiredSections.end());
+    REQUIRE(std::adjacent_find(coverage->floraRequiredSections.begin(),
+                               coverage->floraRequiredSections.end()) ==
+            coverage->floraRequiredSections.end());
     for (ChunkPos required : coverage->requiredSections) {
+        const int64_t distanceSquared = required.x * required.x + required.z * required.z;
+        constexpr int EXPECTED_RADIUS =
+            std::max(MIN_RENDER_DISTANCE_CHUNKS + 1, EXPLORATION_RADIUS_CHUNKS);
+        REQUIRE(distanceSquared <= EXPECTED_RADIUS * EXPECTED_RADIUS);
+    }
+    for (ChunkPos required : coverage->floraRequiredSections) {
         const int64_t distanceSquared = required.x * required.x + required.z * required.z;
         constexpr int EXPECTED_RADIUS =
             std::max(MIN_RENDER_DISTANCE_CHUNKS + 1, EXPLORATION_RADIUS_CHUNKS);

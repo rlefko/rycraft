@@ -33,6 +33,13 @@ constexpr uint64_t ORE_WALK_AXIS_STREAM = 0x4F52455F57414C4BULL;
 constexpr uint64_t ORE_WALK_SIGN_STREAM = 0x4F52455F5349474EULL;
 constexpr uint32_t MAX_WALK_STEPS = 12;
 
+bool acceptsOre(BlockType block, OrePlacer::HostPolicy hostPolicy) {
+    if (block == BlockType::STONE) return true;
+    if (hostPolicy != OrePlacer::HostPolicy::NATURAL_ROCK) return false;
+    return block == BlockType::BASALT || block == BlockType::LIMESTONE ||
+           block == BlockType::SANDSTONE || block == BlockType::ANDESITE;
+}
+
 constexpr uint64_t oreStream(uint64_t stream, size_t oreIndex) {
     return stream ^ (0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(oreIndex + 1));
 }
@@ -45,7 +52,7 @@ constexpr uint32_t walkIndex(int attempt, int step) {
 
 OrePlacer::OrePlacer(uint32_t worldSeed) : random_(worldSeed) {}
 
-void OrePlacer::place(Chunk& chunk) const {
+void OrePlacer::place(Chunk& chunk, HostPolicy hostPolicy) const {
     const int64_t baseX = chunk.chunkX * CHUNK_WIDTH;
     const int baseY = chunk.chunkY * CHUNK_HEIGHT;
     const int64_t baseZ = chunk.chunkZ * CHUNK_DEPTH;
@@ -83,7 +90,7 @@ void OrePlacer::place(Chunk& chunk) const {
                         int lz = static_cast<int>(z - baseZ);
                         if (lx >= 0 && lx < CHUNK_WIDTH && ly >= 0 && ly < CHUNK_HEIGHT &&
                             lz >= 0 && lz < CHUNK_DEPTH &&
-                            chunk.getBlock(lx, ly, lz) == BlockType::STONE) {
+                            acceptsOre(chunk.getBlock(lx, ly, lz), hostPolicy)) {
                             chunk.setBlock(lx, ly, lz, ore.block);
                         }
                         // Random-walk one axis step; y stays inside the band

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <common/math.hpp>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -77,8 +79,10 @@ enum class BlockRenderShape : uint8_t {
     NONE,
     CUBE,
     CROSS,
+    TORCH_CROSS,
     FLAT,
     LIQUID,
+    LOW_BOX,
 };
 
 enum class BlockSound : uint8_t {
@@ -172,9 +176,14 @@ constexpr std::array<BlockDefinition, BLOCK_TYPE_COUNT> makeBlockDefinitions() {
     }
     definitions[static_cast<size_t>(BlockType::FURNACE_LIT)].lightEmission = 13;
     definitions[static_cast<size_t>(BlockType::FURNACE_LIT)].emissive = true;
-    definitions[static_cast<size_t>(BlockType::TORCH)] = {
-        BlockRenderShape::CROSS, false, false, true, false, false, BlockSound::WOOD,
-        BlockMaterial::WOOD};
+    definitions[static_cast<size_t>(BlockType::TORCH)] = {BlockRenderShape::TORCH_CROSS,
+                                                          false,
+                                                          false,
+                                                          true,
+                                                          false,
+                                                          false,
+                                                          BlockSound::WOOD,
+                                                          BlockMaterial::WOOD};
     definitions[static_cast<size_t>(BlockType::TORCH)].lightEmission = 14;
     definitions[static_cast<size_t>(BlockType::TORCH)].emissive = true;
     definitions[static_cast<size_t>(BlockType::CHEST)] = {
@@ -187,10 +196,10 @@ constexpr std::array<BlockDefinition, BLOCK_TYPE_COUNT> makeBlockDefinitions() {
         BlockRenderShape::CUBE, true, true, true, false, false, BlockSound::PLANT,
         BlockMaterial::LEAVES};
     definitions[static_cast<size_t>(BlockType::WOOL)].hardness = 0.8f;
-    // A single-block bed (the cube format has no facing metadata for a two-part
-    // bed): right-clicking it sleeps through the night and sets the spawn.
+    // A single-block low bed (the block format has no facing metadata for a
+    // two-part bed): right-clicking it sleeps through the night and sets the spawn.
     definitions[static_cast<size_t>(BlockType::BED)] = {
-        BlockRenderShape::CUBE, true, true, true, false, false, BlockSound::WOOD,
+        BlockRenderShape::LOW_BOX, true, false, true, false, false, BlockSound::WOOD,
         BlockMaterial::WOOD};
     definitions[static_cast<size_t>(BlockType::BED)].hardness = 0.2f;
 
@@ -361,6 +370,22 @@ constexpr bool isFlora(BlockType type) {
     return shape == BlockRenderShape::CROSS || shape == BlockRenderShape::FLAT;
 }
 
+// Floor torches deliberately do not share the flora classification. They use
+// the same crossed visual silhouette, but water cannot replace them as plants
+// and placement must prove a full solid floor directly below.
+constexpr bool isFloorTorch(BlockType type) {
+    return blockDefinition(type).renderShape == BlockRenderShape::TORCH_CROSS;
+}
+
+constexpr bool losesSupportWhenBlockBelowBreaks(BlockType type) {
+    return isFlora(type) || isFloorTorch(type);
+}
+
+constexpr bool rendersAsCross(BlockType type) {
+    const auto shape = blockDefinition(type).renderShape;
+    return shape == BlockRenderShape::CROSS || shape == BlockRenderShape::TORCH_CROSS;
+}
+
 constexpr bool isLiquid(BlockType type) {
     return blockDefinition(type).liquid;
 }
@@ -379,6 +404,46 @@ constexpr bool isOpaque(BlockType type) {
 
 constexpr bool rendersAsCube(BlockType type) {
     return blockDefinition(type).renderShape == BlockRenderShape::CUBE;
+}
+
+constexpr bool rendersAsLowBox(BlockType type) {
+    return blockDefinition(type).renderShape == BlockRenderShape::LOW_BOX;
+}
+
+inline constexpr float BED_COLLISION_HEIGHT = 9.0F / 16.0F;
+inline constexpr float TORCH_SELECTION_MIN = 3.0F / 16.0F;
+inline constexpr float TORCH_SELECTION_MAX = 13.0F / 16.0F;
+
+// Solid blocks may have a partial collision volume. The X/Z footprint remains
+// one block wide; this height is shared by entity sweeps and placement overlap.
+constexpr float blockCollisionHeight(BlockType type) {
+    if (!isSolid(type)) return 0.0F;
+    return rendersAsLowBox(type) ? BED_COLLISION_HEIGHT : 1.0F;
+}
+
+// The occupied local-space bounds used by targeting and selection outlines.
+// Authored fixtures do not claim the empty portion of their voxel: beds stop
+// at their rendered top, while a floor torch uses the tight bounds of its two
+// centered crossed quads. Other targetable blocks retain the full voxel until
+// they define a more specific authored selection volume.
+struct BlockSelectionBounds {
+    Vec3 min{0.0F, 0.0F, 0.0F};
+    Vec3 max{1.0F, 1.0F, 1.0F};
+};
+
+constexpr BlockSelectionBounds blockSelectionBounds(BlockType type) {
+    if (rendersAsLowBox(type)) {
+        return {.min = {0.0F, 0.0F, 0.0F}, .max = {1.0F, blockCollisionHeight(type), 1.0F}};
+    }
+    if (isFloorTorch(type)) {
+        return {.min = {TORCH_SELECTION_MIN, 0.0F, TORCH_SELECTION_MIN},
+                .max = {TORCH_SELECTION_MAX, 1.0F, TORCH_SELECTION_MAX}};
+    }
+    return {};
+}
+
+constexpr bool hasFullBlockCollision(BlockType type) {
+    return blockCollisionHeight(type) == 1.0F;
 }
 
 constexpr bool isTransparent(BlockType type) {

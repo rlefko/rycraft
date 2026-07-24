@@ -1,22 +1,47 @@
 #import "render/particles.hpp"
 
 #include "common/error.hpp"
+#include "render/metal_ownership.hpp"
 #include "render/pixel_formats.hpp"
 #include "world/world.hpp"
 
-#include "common/random.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+
+bool WeatherParticleSessionState::beginWorld(uint64_t instanceId, uint64_t seed) noexcept {
+    if (worldInstanceId_ && *worldInstanceId_ == instanceId && worldSeed_ == seed) {
+        return false;
+    }
+    clear();
+    worldInstanceId_ = instanceId;
+    worldSeed_ = seed;
+    random_ = SeededRng(weatherParticleRandomSeed(seed));
+    return true;
+}
+
+void WeatherParticleSessionState::endWorld() noexcept {
+    clear();
+    worldInstanceId_.reset();
+    worldSeed_ = 0;
+    random_ = SeededRng(weatherParticleRandomSeed(0));
+}
+
+void WeatherParticleSessionState::clear() noexcept {
+    particles_.fill(Particle{});
+}
+
+size_t WeatherParticleSessionState::activeCount() const noexcept {
+    return static_cast<size_t>(
+        std::count_if(particles_.begin(), particles_.end(),
+                      [](const Particle& particle) { return particle.active; }));
+}
 
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
 ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrary)
     : _device(device), _pipelineState(nil), _depthState(nil) {
-    // Zero-initialize all particles
-    std::memset(particles_, 0, sizeof(particles_));
-
     // ---- Load particle shader functions ----
     id<MTLFunction> vertexFunc = [shaderLibrary newFunctionWithName:@"particleVertexMain"];
     if (!vertexFunc) {
@@ -50,6 +75,9 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 
     NSError* error = nil;
     _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    resetMetalObject(pipelineDesc);
+    resetMetalObject(vertexFunc);
+    resetMetalObject(fragmentFunc);
     if (!_pipelineState) {
         NSString* msg = [NSString stringWithFormat:@"Failed to create particle pipeline state: %@",
                                                    error.localizedDescription];
@@ -61,6 +89,7 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
     depthDesc.depthCompareFunction = MTLCompareFunctionLess;
     depthDesc.depthWriteEnabled = false;
     _depthState = [_device newDepthStencilStateWithDescriptor:depthDesc];
+    resetMetalObject(depthDesc);
     if (!_depthState) {
         RY_LOG_FATAL("Failed to create particle depth stencil state");
     }
@@ -70,9 +99,16 @@ ParticleSystem::ParticleSystem(id<MTLDevice> device, id<MTLLibrary> shaderLibrar
 // Destructor
 // ---------------------------------------------------------------------------
 ParticleSystem::~ParticleSystem() {
-    // Metal objects released via ARC (nil assignment)
-    _pipelineState = nil;
-    _depthState = nil;
+    resetMetalObject(_pipelineState);
+    resetMetalObject(_depthState);
+}
+
+void ParticleSystem::beginWorld(uint64_t instanceId, uint64_t seed) {
+    session_.beginWorld(instanceId, seed);
+}
+
+void ParticleSystem::endWorld() {
+    session_.endWorld();
 }
 
 // ---------------------------------------------------------------------------
@@ -80,8 +116,11 @@ ParticleSystem::~ParticleSystem() {
 // ---------------------------------------------------------------------------
 void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPosition,
                           const WeatherSample& weather) {
+    beginWorld(world.instanceId(), world.getSeed());
     if (dt <= 0.f)
         return;
+
+    std::span<Particle> particles = session_.particles();
 
     // Clamp dt to prevent physics explosions after long pauses
     float clampedDt = std::min(dt, 0.1f);
@@ -92,7 +131,7 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
     // ---- Update existing particles and count survivors ----
     size_t activeCount = 0;
     for (size_t i = 0; i < MAX_PARTICLES; ++i) {
-        Particle& p = particles_[i];
+        Particle& p = particles[i];
         if (!p.active)
             continue;
 
@@ -119,7 +158,7 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
         // Count after deaths, including particles that crossed the lower
         // boundary this tick. The former pre-update count underfilled the pool
         // whenever a large cohort expired together.
-        if (p.lifetime >= p.maxLifetime || p.position[1] < 0.f) {
+        if (p.lifetime >= p.maxLifetime || weatherParticleBelowWorld(p.position[1])) {
             p.active = false;
             continue;
         }
@@ -143,12 +182,12 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
     for (size_t spawned = 0; spawned < toSpawn; ++spawned) {
         // Find a dead particle slot
         size_t slot = spawned % MAX_PARTICLES;
-        if (particles_[slot].active) {
+        if (particles[slot].active) {
             // Linear probe for next dead slot
             bool found = false;
             for (size_t probe = 1; probe < MAX_PARTICLES; ++probe) {
                 slot = (spawned + probe) % MAX_PARTICLES;
-                if (!particles_[slot].active) {
+                if (!particles[slot].active) {
                     found = true;
                     break;
                 }
@@ -156,7 +195,7 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
             if (!found)
                 continue; // Pool full, skip this spawn
         }
-        Particle& p = particles_[slot];
+        Particle& p = particles[slot];
 
         if (weather.precipitationKind == PrecipitationKind::SNOW) {
             spawnSnowParticle(p, world, playerPosition, SPAWN_RADIUS, weather);
@@ -171,32 +210,29 @@ void ParticleSystem::tick(float dt, const World& world, const Vec3& playerPositi
 // ---------------------------------------------------------------------------
 bool ParticleSystem::spawnRainParticle(Particle& p, const World& world, const Vec3& playerPos,
                                        float spawnRadius, const WeatherSample& weather) {
-    // Deterministic weather: the same seed always rains the same way
-    static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
-
-    float angle = rng.nextFloat() * 2.f * static_cast<float>(M_PI);
-    float radius = rng.nextFloat() * spawnRadius;
+    float angle = session_.nextRandomFloat() * 2.f * static_cast<float>(M_PI);
+    float radius = session_.nextRandomFloat() * spawnRadius;
 
     // Spawn in a band just above the camera: at 10 blocks/s a drop lives
     // long enough to fall PAST eye level and below the feet, the old
     // +128-block spawn with a 2 s lifetime died ~110 blocks up, so rain was
     // simulated but never once visible on screen.
     p.position[0] = playerPos.x + std::cos(angle) * radius;
-    p.position[1] = playerPos.y + 12.f + rng.nextFloat() * 32.f;
+    p.position[1] = playerPos.y + 12.f + session_.nextRandomFloat() * 32.f;
     p.position[2] = playerPos.z + std::sin(angle) * radius;
 
     // Only sky-exposed columns rain: a spawn point at or below the column's
     // surface is inside terrain (cave, overhang) and would rain indoors.
-    auto surface = world.surfaceHeightIfLoaded(static_cast<int64_t>(std::floor(p.position[0])),
-                                               static_cast<int64_t>(std::floor(p.position[2])));
+    auto surface = world.surfaceHeightIfLoaded(weatherBlockCoordinate(p.position[0]),
+                                               weatherBlockCoordinate(p.position[2]));
     if (!surface || p.position[1] <= static_cast<float>(*surface + 1)) {
         return false;
     }
 
     // Fall speed ~10 blocks/s with drift from the canonical weather wind.
-    p.velocity[0] = weather.windBlocksPerSecond.x * 0.65f + (rng.nextFloat() - 0.5f);
+    p.velocity[0] = weather.windBlocksPerSecond.x * 0.65f + (session_.nextRandomFloat() - 0.5f);
     p.velocity[1] = -10.f;
-    p.velocity[2] = weather.windBlocksPerSecond.y * 0.65f + (rng.nextFloat() - 0.5f);
+    p.velocity[2] = weather.windBlocksPerSecond.y * 0.65f + (session_.nextRandomFloat() - 0.5f);
 
     p.lifetime = 0.f;
     p.maxLifetime = 5.0f;
@@ -210,29 +246,28 @@ bool ParticleSystem::spawnRainParticle(Particle& p, const World& world, const Ve
 // ---------------------------------------------------------------------------
 bool ParticleSystem::spawnSnowParticle(Particle& p, const World& world, const Vec3& playerPos,
                                        float spawnRadius, const WeatherSample& weather) {
-    // Deterministic weather: the same seed always rains the same way
-    static thread_local SeededRng rng(0x52594352u /* 'RYCR' */);
-
-    float angle = rng.nextFloat() * 2.f * static_cast<float>(M_PI);
-    float radius = rng.nextFloat() * spawnRadius;
+    float angle = session_.nextRandomFloat() * 2.f * static_cast<float>(M_PI);
+    float radius = session_.nextRandomFloat() * spawnRadius;
 
     // Spawn just above the camera (see the rain comment: a high spawn band
     // with a short lifetime kept every flake far above the screen).
     p.position[0] = playerPos.x + std::cos(angle) * radius;
-    p.position[1] = playerPos.y + 8.f + rng.nextFloat() * 20.f;
+    p.position[1] = playerPos.y + 8.f + session_.nextRandomFloat() * 20.f;
     p.position[2] = playerPos.z + std::sin(angle) * radius;
 
     // Same sky-exposure gate as rain (see spawnRainParticle).
-    auto surface = world.surfaceHeightIfLoaded(static_cast<int64_t>(std::floor(p.position[0])),
-                                               static_cast<int64_t>(std::floor(p.position[2])));
+    auto surface = world.surfaceHeightIfLoaded(weatherBlockCoordinate(p.position[0]),
+                                               weatherBlockCoordinate(p.position[2]));
     if (!surface || p.position[1] <= static_cast<float>(*surface + 1)) {
         return false;
     }
 
     // Fall speed ~3 blocks/s with gentle drift around the shared weather wind.
-    p.velocity[0] = weather.windBlocksPerSecond.x * 0.82f + (rng.nextFloat() - 0.5f) * 0.5f;
+    p.velocity[0] =
+        weather.windBlocksPerSecond.x * 0.82f + (session_.nextRandomFloat() - 0.5f) * 0.5f;
     p.velocity[1] = -3.f;
-    p.velocity[2] = weather.windBlocksPerSecond.y * 0.82f + (rng.nextFloat() - 0.5f) * 0.5f;
+    p.velocity[2] =
+        weather.windBlocksPerSecond.y * 0.82f + (session_.nextRandomFloat() - 0.5f) * 0.5f;
 
     p.lifetime = 0.f;
     p.maxLifetime = 10.0f;
@@ -247,7 +282,7 @@ bool ParticleSystem::spawnSnowParticle(Particle& p, const World& world, const Ve
 void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, FrameRing& frameRing,
                             const Mat4& viewMatrix, const Mat4& projectionMatrix,
                             const Vec3& cameraPosition, const WeatherSample& weather,
-                            float baseExtinction) {
+                            float baseExtinction, WorldPhysicalScale physicalScale) {
     if (!encoder || !_pipelineState)
         return;
 
@@ -257,7 +292,7 @@ void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, FrameRing& fram
     size_t activeCount = 0;
 
     for (size_t i = 0; i < MAX_PARTICLES; ++i) {
-        const Particle& p = particles_[i];
+        const Particle& p = session_.particles()[i];
         if (!p.active)
             continue;
 
@@ -283,6 +318,8 @@ void ParticleSystem::render(id<MTLRenderCommandEncoder> encoder, FrameRing& fram
     uniforms.atmosphericExtinction =
         std::max(baseExtinction, 0.0F) * (0.35F + std::max(weather.aerosolDensity, 0.0F)) +
         std::max(weather.fogExtinction, 0.0F);
+    uniforms.metersPerBlock =
+        std::max(static_cast<float>(physicalScale.horizontalMetersPerBlock), 0.0F);
     FrameRing::Alloc uniformsAlloc = frameRing.push(&uniforms, sizeof(uniforms));
 
     // ---- Bind and draw ----

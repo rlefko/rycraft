@@ -26,13 +26,18 @@ rycraft_exe = executable('rycraft',
     libaudio,
   ],
   dependencies : [appleframeworks],
+  # A targeted `ninja src/rycraft` must refresh the runtime library beside
+  # the executable, not only relink C++. Otherwise a newly added Metal entry
+  # point can compile successfully while the launched binary sees a stale
+  # metallib and aborts during renderer construction.
+  link_depends : copy_metallib,
   build_by_default : true,
 )
 
 worldgen_inspect_exe = executable('rycraft_worldgen_inspect',
   'worldgen_inspect.cpp',
   include_directories : inc,
-  link_with : [libcommon, libworld, librender],
+  link_with : [libcommon, libengine, libworld, librender],
   dependencies : [appleframeworks, lz4_dep],
   build_by_default : true,
 )

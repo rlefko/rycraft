@@ -1,6 +1,7 @@
 #import "render/ui_overlay.hpp"
 
 #include "common/error.hpp"
+#include "render/metal_ownership.hpp"
 #include "world/weather.hpp"
 
 #include <algorithm>
@@ -60,6 +61,9 @@ UIOverlay::UIOverlay(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_
 
     NSError* error = nil;
     _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    resetMetalObject(pipelineDesc);
+    resetMetalObject(vertexFunc);
+    resetMetalObject(fragmentFunc);
     if (!_pipelineState) {
         NSString* msg =
             [NSString stringWithFormat:@"Failed to create UI overlay pipeline state: %@",
@@ -108,6 +112,9 @@ UIOverlay::UIOverlay(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_
 
     _iconPipelineState = [_device newRenderPipelineStateWithDescriptor:iconPipelineDesc
                                                                  error:&error];
+    resetMetalObject(iconPipelineDesc);
+    resetMetalObject(iconVertexFunc);
+    resetMetalObject(iconFragmentFunc);
     if (!_iconPipelineState) {
         RY_LOG_FATAL("Failed to create UI icon pipeline state");
     }
@@ -127,6 +134,16 @@ UIOverlay::UIOverlay(id<MTLDevice> device, id<MTLLibrary> shaderLibrary, uint32_
     _vertices.reserve(4096);
     _topVertices.reserve(512);
     _iconVertices.reserve(512);
+}
+
+UIOverlay::~UIOverlay() {
+    resetMetalObject(_pipelineState);
+    resetMetalObject(_iconPipelineState);
+    for (int slot = 0; slot < RING_SLOTS; ++slot) {
+        resetMetalObject(_vertexRing[slot]);
+        resetMetalObject(_iconRing[slot]);
+    }
+    resetMetalObject(_projectionBuffer);
 }
 
 void UIOverlay::setIconAtlas(id<MTLTexture> texture, id<MTLSamplerState> sampler) {
@@ -160,11 +177,14 @@ void UIOverlay::flush(id<MTLRenderCommandEncoder> encoder) {
         size_t capacity = 16384;
         while (capacity < byteCount)
             capacity *= 2;
-        slot = [_device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
-        if (!slot) {
+        id<MTLBuffer> replacement = [_device newBufferWithLength:capacity
+                                                         options:MTLResourceStorageModeShared];
+        if (!replacement) {
             RY_LOG_ERROR("Failed to allocate a UI overlay vertex buffer");
             return false;
         }
+        resetMetalObject(slot);
+        slot = replacement;
         return true;
     };
 
@@ -757,6 +777,64 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
     drawString(c, hudX + 360.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
     nextLine();
 
+    drawString("Far plan L/P/M", hudX, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    floatToString(stats.farPlannerMsLast, a, sizeof(a));
+    floatToString(stats.farPlannerMsP95, b, sizeof(b));
+    floatToString(stats.farPlannerMsMax, c, sizeof(c));
+    drawString(a, hudX + 120.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 168.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(b, hudX + 184.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("/", hudX + 232.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(c, hudX + 248.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString("Deny", hudX + 304.0f / _width, textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    drawString(unsignedText(stats.farArenaAdmissionDenials, a, sizeof(a)), hudX + 344.0f / _width,
+               textY, 1.0f, 0.7f, 0.8f, 1.0f);
+    nextLine();
+
+    drawString("Light Q/D/Max", hudX, textY, 1.0f, 1.0f, 0.85f, 0.35f);
+    drawString(integerText(stats.publicationLightDeferredQueue, a, sizeof(a)),
+               hudX + 112.0f / _width, textY, 1.0f, 1.0f, 0.85f, 0.35f);
+    drawString("/", hudX + 152.0f / _width, textY, 1.0f, 1.0f, 0.85f, 0.35f);
+    drawString(unsignedText(stats.publicationLightDeferredCubes, b, sizeof(b)),
+               hudX + 168.0f / _width, textY, 1.0f, 1.0f, 0.85f, 0.35f);
+    drawString("/", hudX + 240.0f / _width, textY, 1.0f, 1.0f, 0.85f, 0.35f);
+    drawString(integerText(stats.publicationLightMaxSyncFloods, c, sizeof(c)),
+               hudX + 256.0f / _width, textY, 1.0f, 1.0f, 0.85f, 0.35f);
+    nextLine();
+
+    drawString("Canopy I/A/Q/P/C", hudX, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(integerText(stats.farCanopyInFlight, a, sizeof(a)), hudX + 136.0f / _width, textY,
+               1.0f, 0.5f, 0.9f, 0.5f);
+    drawString("/", hudX + 176.0f / _width, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(integerText(stats.farActiveCanopyWorkers, b, sizeof(b)), hudX + 192.0f / _width,
+               textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString("/", hudX + 232.0f / _width, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(integerText(stats.farQueuedCanopies, c, sizeof(c)), hudX + 248.0f / _width, textY,
+               1.0f, 0.5f, 0.9f, 0.5f);
+    drawString("/", hudX + 288.0f / _width, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(integerText(stats.farParkedCanopies, a, sizeof(a)), hudX + 304.0f / _width, textY,
+               1.0f, 0.5f, 0.9f, 0.5f);
+    drawString("/", hudX + 344.0f / _width, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(integerText(stats.farCompletedCanopies, b, sizeof(b)), hudX + 360.0f / _width, textY,
+               1.0f, 0.5f, 0.9f, 0.5f);
+    nextLine();
+
+    drawString("Canopy cache", hudX, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(integerText(stats.farCanopyCacheEntries, a, sizeof(a)), hudX + 104.0f / _width,
+               textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    floatToString(stats.farCanopyCacheMB, b, sizeof(b));
+    drawString(b, hudX + 152.0f / _width, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString("MB F/D/R", hudX + 216.0f / _width, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(unsignedText(stats.farCanopyFailures, a, sizeof(a)), hudX + 288.0f / _width, textY,
+               1.0f, 0.5f, 0.9f, 0.5f);
+    drawString("/", hudX + 328.0f / _width, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(unsignedText(stats.farCanopyDeferrals, b, sizeof(b)), hudX + 344.0f / _width, textY,
+               1.0f, 0.5f, 0.9f, 0.5f);
+    drawString("/", hudX + 384.0f / _width, textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    drawString(unsignedText(stats.farCanopyAuthorityResumes, c, sizeof(c)), hudX + 400.0f / _width,
+               textY, 1.0f, 0.5f, 0.9f, 0.5f);
+    nextLine();
+
     drawString("Shadow mask", hudX, textY, 1.0f, 1.0f, 0.75f, 0.35f);
     drawString(integerText(stats.shadowRefreshMask, a, sizeof(a)), hudX + 104.0f / _width, textY,
                1.0f, 1.0f, 0.75f, 0.35f);
@@ -807,11 +885,13 @@ void UIOverlay::drawPerformanceHUD(const PerformanceStats& stats) {
     drawString(diagnostics, hudX + 152.0f / _width, textY, 1.0f, 0.65f, 0.85f, 1.0f);
     nextLine();
 
-    drawString("Weather jobs R/C/B/P", hudX, textY, 1.0f, 0.45f, 0.85f, 1.0f);
-    std::snprintf(diagnostics, sizeof(diagnostics), "%llu/%llu/%llu/%llu",
+    drawString("Weather R/C/B/D/F/P", hudX, textY, 1.0f, 0.45f, 0.85f, 1.0f);
+    std::snprintf(diagnostics, sizeof(diagnostics), "%llu/%llu/%llu/%llu/%llu/%llu",
                   static_cast<unsigned long long>(stats.weatherRequests),
                   static_cast<unsigned long long>(stats.weatherCoalescedRequests),
                   static_cast<unsigned long long>(stats.weatherBuildsStarted),
+                  static_cast<unsigned long long>(stats.weatherBuildsDeferred),
+                  static_cast<unsigned long long>(stats.weatherBuildsFailed),
                   static_cast<unsigned long long>(stats.weatherSnapshotsPublished));
     drawString(diagnostics, hudX + 168.0f / _width, textY, 1.0f, 0.45f, 0.85f, 1.0f);
     nextLine();

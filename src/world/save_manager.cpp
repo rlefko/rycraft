@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -77,29 +78,38 @@ bool parseLegacyInventory(const std::string& content,
     return true;
 }
 
-// Current 36-slot stack array ("inventorySlots": [[type,count,durability],...]).
-// Out-of-range item ids and zero counts read as empty slots so newer saves
-// stay loadable.
-bool parseInventorySlots(const std::string& content,
-                         std::array<ItemStack, SaveManager::PLAYER_INVENTORY_SLOTS>& inventory) {
-    std::array<unsigned long, SaveManager::PLAYER_INVENTORY_SLOTS * 3> values{};
-    if (!parseNumberList(content, "\"inventorySlots\"", values.data(), values.size())) {
-        return false;
-    }
-    for (size_t slot = 0; slot < inventory.size(); ++slot) {
+// Current stack arrays use [[type,count,durability],...]. Out-of-range item
+// ids and zero counts read as empty slots so newer saves stay loadable.
+template <size_t SlotCount>
+bool parseStackSlots(const std::string& content, const char* field,
+                     std::array<ItemStack, SlotCount>& slots) {
+    std::array<unsigned long, SlotCount * 3> values{};
+    if (!parseNumberList(content, field, values.data(), values.size())) return false;
+    for (size_t slot = 0; slot < slots.size(); ++slot) {
         const unsigned long type = values[slot * 3];
         const unsigned long count = values[slot * 3 + 1];
         const unsigned long durability = values[slot * 3 + 2];
-        if (type == 0 || !isValidItemId(static_cast<uint16_t>(type)) || count == 0) {
-            inventory[slot] = ItemStack{};
+        if (type == 0 || type > UINT16_MAX || !isValidItemId(static_cast<uint16_t>(type)) ||
+            count == 0) {
+            slots[slot] = ItemStack{};
             continue;
         }
         const auto item = static_cast<ItemType>(type);
         const auto capped =
             static_cast<uint8_t>(std::min(count, static_cast<unsigned long>(maxStackSize(item))));
-        inventory[slot] = ItemStack{item, capped, static_cast<uint16_t>(durability)};
+        slots[slot] = ItemStack{item, capped, static_cast<uint16_t>(durability)};
     }
     return true;
+}
+
+bool parseInventorySlots(const std::string& content,
+                         std::array<ItemStack, SaveManager::PLAYER_INVENTORY_SLOTS>& inventory) {
+    return parseStackSlots(content, "\"inventorySlots\"", inventory);
+}
+
+bool parseCarriedStacks(const std::string& content,
+                        std::array<ItemStack, SaveManager::PLAYER_CARRIED_SLOTS>& carriedStacks) {
+    return parseStackSlots(content, "\"carriedStacks\"", carriedStacks);
 }
 
 // One quoted string value; the world-name charset is restricted at input so
@@ -122,6 +132,95 @@ uint64_t wallClockMs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                      std::chrono::system_clock::now().time_since_epoch())
                                      .count());
+}
+
+bool parseBoolean(const std::string& content, const char* field, bool& value) {
+    size_t position = content.find(field);
+    if (position == std::string::npos) return false;
+    position += std::strlen(field);
+    while (position < content.size() && (content[position] == ' ' || content[position] == '\n')) {
+        ++position;
+    }
+    if (content.compare(position, 4, "true") == 0) {
+        value = true;
+        return true;
+    }
+    if (content.compare(position, 5, "false") == 0) {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+enum class Vec3FieldStatus : uint8_t {
+    Missing,
+    Null,
+    Value,
+    Invalid,
+};
+
+bool finiteVec3(const Vec3& value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+// The largest float below 2^63 still leaves more than 500 billion blocks
+// before either signed integer limit. Keeping metadata strictly within this
+// boundary makes floor-to-int64 conversion and nearby startup probes safe.
+constexpr float MAX_METADATA_HORIZONTAL_COORDINATE = 0x1.fffffcp+62F;
+
+bool validMetadataPosition(const Vec3& value) {
+    return finiteVec3(value) && value.y >= static_cast<float>(WORLD_MIN_Y) &&
+           value.y <= static_cast<float>(WORLD_MAX_Y) &&
+           value.x >= -MAX_METADATA_HORIZONTAL_COORDINATE &&
+           value.x <= MAX_METADATA_HORIZONTAL_COORDINATE &&
+           value.z >= -MAX_METADATA_HORIZONTAL_COORDINATE &&
+           value.z <= MAX_METADATA_HORIZONTAL_COORDINATE;
+}
+
+Vec3FieldStatus parseVec3Field(const std::string& content, const char* field, Vec3& value) {
+    size_t position = content.find(field);
+    if (position == std::string::npos) return Vec3FieldStatus::Missing;
+    position += std::strlen(field);
+    while (position < content.size() && (content[position] == ' ' || content[position] == '\n' ||
+                                         content[position] == '\r' || content[position] == '\t')) {
+        ++position;
+    }
+    if (content.compare(position, 4, "null") == 0) return Vec3FieldStatus::Null;
+    if (position >= content.size() || content[position] != '{') return Vec3FieldStatus::Invalid;
+    const size_t end = content.find('}', position + 1);
+    if (end == std::string::npos) return Vec3FieldStatus::Invalid;
+
+    const std::string object = content.substr(position, end - position + 1);
+    Vec3 parsed;
+    if (!parseNumber(object, "\"x\":", parsed.x,
+                     [](const std::string& text) { return std::stof(text); }) ||
+        !parseNumber(object, "\"y\":", parsed.y,
+                     [](const std::string& text) { return std::stof(text); }) ||
+        !parseNumber(object, "\"z\":", parsed.z,
+                     [](const std::string& text) { return std::stof(text); }) ||
+        !finiteVec3(parsed)) {
+        return Vec3FieldStatus::Invalid;
+    }
+    value = parsed;
+    return Vec3FieldStatus::Value;
+}
+
+bool validGenerationFingerprint(std::string_view fingerprint) {
+    return fingerprint.size() == 64 && std::ranges::all_of(fingerprint, [](char value) {
+               return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+           });
+}
+
+bool validPersistedStack(const ItemStack& stack) {
+    const uint16_t type = static_cast<uint16_t>(stack.type);
+    if (type == static_cast<uint16_t>(ItemType::NONE))
+        return stack.count == 0 && stack.durability == 0;
+    return isValidItemId(type) && stack.count > 0 && stack.count <= maxStackSize(stack.type);
+}
+
+template <size_t SlotCount>
+bool validPersistedStacks(const std::array<ItemStack, SlotCount>& stacks) {
+    return std::ranges::all_of(stacks, validPersistedStack);
 }
 
 bool blockPositionLess(const BlockPos& left, const BlockPos& right) {
@@ -194,13 +293,32 @@ bool parseCubeName(const std::string& name, ChunkPos& position) {
 } // namespace
 
 SaveManager::SaveManager(const std::string& worldPath, std::shared_ptr<TestHooks> testHooks)
-    : worldPath_(worldPath)
-    , regionsPath_(worldPath + "/" + CURRENT_REGIONS_DIRECTORY)
+    : SaveManager(worldPath, Profile::LegacyV3, std::move(testHooks)) {}
+
+SaveManager::SaveManager(const std::string& worldPath, Profile profile,
+                         std::shared_ptr<TestHooks> testHooks)
+    : profile_(profile)
+    , generatorVersion_(profile == Profile::GeneratorV4 ? GENERATOR_V4_VERSION
+                                                        : CURRENT_GENERATOR_VERSION)
+    , worldPath_(worldPath)
+    , regionsDirectory_(profile == Profile::GeneratorV4 ? V4_REGIONS_DIRECTORY
+                                                        : CURRENT_REGIONS_DIRECTORY)
+    , regionsPath_(worldPath + "/" + regionsDirectory_)
+    , terrainAuthorityPath_(profile == Profile::GeneratorV4
+                                ? worldPath + "/" + V4_TERRAIN_AUTHORITY_DIRECTORY
+                                : std::string{})
+    , hydrologyAuthorityPath_(profile == Profile::GeneratorV4
+                                  ? worldPath + "/" + V4_HYDROLOGY_AUTHORITY_DIRECTORY
+                                  : std::string{})
     , metadataPath_(worldPath + "/metadata.json")
     , blockEntitiesPath_(worldPath + "/block_entities.dat")
     , testHooks_(std::move(testHooks)) {
     ensureDirectory(worldPath_);
     ensureDirectory(regionsPath_);
+    if (profile_ == Profile::GeneratorV4) {
+        ensureDirectory(terrainAuthorityPath_);
+        ensureDirectory(hydrologyAuthorityPath_);
+    }
     loadManifestIndex();
     recoverOrphanedCubes();
     saveThread_ = std::thread(&SaveManager::saveLoop, this);
@@ -378,7 +496,81 @@ std::vector<FluidBoundaryFrontier> SaveManager::loadDeferredFluidFrontiers() con
     return result;
 }
 
+bool SaveManager::saveMetadata(uint32_t seed, Vec3 spawnPos, uint64_t worldTime) {
+    return saveMetadata(seed, spawnPos, worldTime, PlayerMetadata{});
+}
+
+bool SaveManager::saveMetadata(uint32_t seed, Vec3 spawnPos, uint64_t worldTime,
+                               const PlayerMetadata& player) {
+    if (profile_ != Profile::LegacyV3) return false;
+    WorldMetadata metadata;
+    metadata.seed = seed;
+    metadata.spawnPos = spawnPos;
+    metadata.playerPos = spawnPos;
+    metadata.worldTime = worldTime;
+    metadata.player = player;
+    return saveMetadata(metadata);
+}
+
+bool SaveManager::saveV4Metadata(uint64_t seed, std::string_view generationFingerprint,
+                                 Vec3 playerPos, std::optional<Vec3> safeSpawnPos,
+                                 uint64_t worldTime, bool spawnFinalized,
+                                 uint32_t spawnSafetyRevision) {
+    return saveV4Metadata(seed, generationFingerprint, playerPos, std::move(safeSpawnPos),
+                          worldTime, PlayerMetadata{}, spawnFinalized, spawnSafetyRevision);
+}
+
+bool SaveManager::saveV4Metadata(uint64_t seed, std::string_view generationFingerprint,
+                                 Vec3 playerPos, std::optional<Vec3> safeSpawnPos,
+                                 uint64_t worldTime, const PlayerMetadata& player,
+                                 bool spawnFinalized, uint32_t spawnSafetyRevision) {
+    WorldMetadata metadata;
+    metadata.seed = seed;
+    metadata.generationFingerprint = generationFingerprint;
+    metadata.spawnFinalized = spawnFinalized;
+    metadata.spawnSafetyRevision = spawnSafetyRevision;
+    metadata.playerPos = playerPos;
+    metadata.safeSpawnPos = std::move(safeSpawnPos);
+    metadata.spawnPos = metadata.safeSpawnPos.value_or(playerPos);
+    metadata.worldTime = worldTime;
+    metadata.generatorVersion = GENERATOR_V4_VERSION;
+    metadata.player = player;
+    return saveMetadata(metadata);
+}
+
 bool SaveManager::saveMetadata(const WorldMetadata& metadata) {
+    if (!validMetadataPosition(metadata.spawnPos) || !validMetadataPosition(metadata.playerPos) ||
+        (metadata.safeSpawnPos && !validMetadataPosition(*metadata.safeSpawnPos)) ||
+        !validPersistedStacks(metadata.player.inventory) ||
+        !validPersistedStacks(metadata.player.carriedStacks)) {
+        return false;
+    }
+    if (profile_ == Profile::GeneratorV4) {
+        if (!validGenerationFingerprint(metadata.generationFingerprint) ||
+            metadata.spawnFinalized != metadata.safeSpawnPos.has_value()) {
+            return false;
+        }
+        std::error_code error;
+        if (fs::exists(metadataPath_, error)) {
+            const std::optional<WorldMetadata> existing = readMetadataFile(metadataPath_);
+            if (!existing || existing->generatorVersion != GENERATOR_V4_VERSION ||
+                existing->seed != metadata.seed ||
+                existing->generationFingerprint != metadata.generationFingerprint ||
+                existing->generation.structures != metadata.generation.structures) {
+                return false;
+            }
+        }
+        if (error) return false;
+    } else if (metadata.seed > UINT32_MAX) {
+        return false;
+    }
+    return writeMetadata(metadata);
+}
+
+bool SaveManager::writeMetadata(const WorldMetadata& metadata) {
+    Vec3 playerPos = metadata.playerPos;
+    if (profile_ == Profile::LegacyV3 && playerPos == Vec3{}) playerPos = metadata.spawnPos;
+
     std::ostringstream json;
     json << "{\n"
          << "  \"name\": \"" << metadata.name << "\",\n"
@@ -391,16 +583,32 @@ bool SaveManager::saveMetadata(const WorldMetadata& metadata) {
          << "    \"dayCycle\": " << (metadata.generation.dayCycle ? 1 : 0) << "\n"
          << "  },\n"
          << "  \"createdMs\": " << metadata.createdMs << ",\n"
-         << "  \"lastPlayedMs\": " << wallClockMs() << ",\n"
-         << "  \"spawnPos\": {\n"
+         << "  \"lastPlayedMs\": " << wallClockMs() << ",\n";
+    if (profile_ == Profile::GeneratorV4) {
+        json << "  \"generationFingerprint\": \"" << metadata.generationFingerprint << "\",\n"
+             << "  \"spawnFinalized\": " << (metadata.spawnFinalized ? "true" : "false") << ",\n"
+             << "  \"spawnSafetyRevision\": " << metadata.spawnSafetyRevision << ",\n"
+             << "  \"safeSpawnPos\": ";
+        if (metadata.safeSpawnPos) {
+            json << "{\n"
+                 << "    \"x\": " << metadata.safeSpawnPos->x << ",\n"
+                 << "    \"y\": " << metadata.safeSpawnPos->y << ",\n"
+                 << "    \"z\": " << metadata.safeSpawnPos->z << "\n"
+                 << "  },\n";
+        } else {
+            json << "null,\n";
+        }
+    }
+    json << "  \"spawnPos\": {\n"
          << "    \"x\": " << metadata.spawnPos.x << ",\n"
          << "    \"y\": " << metadata.spawnPos.y << ",\n"
          << "    \"z\": " << metadata.spawnPos.z << "\n"
          << "  },\n"
+         << "  \"bedSpawnSet\": " << (metadata.bedSpawnSet ? "true" : "false") << ",\n"
          << "  \"playerPos\": {\n"
-         << "    \"px\": " << metadata.playerPos.x << ",\n"
-         << "    \"py\": " << metadata.playerPos.y << ",\n"
-         << "    \"pz\": " << metadata.playerPos.z << "\n"
+         << "    \"x\": " << playerPos.x << ",\n"
+         << "    \"y\": " << playerPos.y << ",\n"
+         << "    \"z\": " << playerPos.z << "\n"
          << "  },\n"
          << "  \"worldTime\": " << metadata.worldTime << ",\n"
          << "  \"player\": {\n"
@@ -416,17 +624,25 @@ bool SaveManager::saveMetadata(const WorldMetadata& metadata) {
         json << '[' << static_cast<unsigned>(stack.type) << ", "
              << static_cast<unsigned>(stack.count) << ", " << stack.durability << ']';
     }
+    json << "],\n"
+         << "    \"carriedStacks\": [";
+    for (size_t slot = 0; slot < metadata.player.carriedStacks.size(); ++slot) {
+        const ItemStack& stack = metadata.player.carriedStacks[slot];
+        if (slot != 0) json << ", ";
+        json << '[' << static_cast<unsigned>(stack.type) << ", "
+             << static_cast<unsigned>(stack.count) << ", " << stack.durability << ']';
+    }
     json << "]\n"
          << "  },\n"
          << "  \"chunkFormatVersion\": " << CHUNK_VERSION << ",\n"
-         << "  \"generatorVersion\": " << CURRENT_GENERATOR_VERSION << "\n"
+         << "  \"generatorVersion\": " << generatorVersion_ << "\n"
          << "}\n";
     const std::string text = json.str();
     return writeFileWithRetries(metadataPath_, std::vector<uint8_t>(text.begin(), text.end()));
 }
 
 std::optional<SaveManager::WorldMetadata> SaveManager::loadMetadata() const {
-    return readMetadataFile(metadataPath_);
+    return inspectMetadata(worldPath_, profile_);
 }
 
 std::optional<SaveManager::WorldMetadata> SaveManager::readMetadataFile(const std::string& path) {
@@ -436,13 +652,7 @@ std::optional<SaveManager::WorldMetadata> SaveManager::readMetadataFile(const st
                               std::istreambuf_iterator<char>());
     WorldMetadata metadata;
     if (!parseNumber(content, "\"seed\":", metadata.seed,
-                     [](const std::string& value) { return std::stoul(value); }) ||
-        !parseNumber(content, "\"x\":", metadata.spawnPos.x,
-                     [](const std::string& value) { return std::stof(value); }) ||
-        !parseNumber(content, "\"y\":", metadata.spawnPos.y,
-                     [](const std::string& value) { return std::stof(value); }) ||
-        !parseNumber(content, "\"z\":", metadata.spawnPos.z,
-                     [](const std::string& value) { return std::stof(value); }) ||
+                     [](const std::string& value) { return std::stoull(value); }) ||
         !parseNumber(content, "\"worldTime\":", metadata.worldTime,
                      [](const std::string& value) { return std::stoull(value); })) {
         return std::nullopt;
@@ -470,13 +680,79 @@ std::optional<SaveManager::WorldMetadata> SaveManager::readMetadataFile(const st
                 [](const std::string& value) { return std::stoull(value); });
     parseNumber(content, "\"lastPlayedMs\":", metadata.lastPlayedMs,
                 [](const std::string& value) { return std::stoull(value); });
-    metadata.playerPos = metadata.spawnPos;
-    parseNumber(content, "\"px\":", metadata.playerPos.x,
-                [](const std::string& value) { return std::stof(value); });
-    parseNumber(content, "\"py\":", metadata.playerPos.y,
-                [](const std::string& value) { return std::stof(value); });
-    parseNumber(content, "\"pz\":", metadata.playerPos.z,
-                [](const std::string& value) { return std::stof(value); });
+
+    const Vec3FieldStatus spawnStatus = parseVec3Field(content, "\"spawnPos\":", metadata.spawnPos);
+    Vec3FieldStatus playerStatus = parseVec3Field(content, "\"playerPos\":", metadata.playerPos);
+    if (playerStatus != Vec3FieldStatus::Value || !validMetadataPosition(metadata.playerPos)) {
+        Vec3 legacyPlayer{};
+        const bool parsedLegacy =
+            parseNumber(content, "\"px\":", legacyPlayer.x,
+                        [](const std::string& value) { return std::stof(value); }) &&
+            parseNumber(content, "\"py\":", legacyPlayer.y,
+                        [](const std::string& value) { return std::stof(value); }) &&
+            parseNumber(content, "\"pz\":", legacyPlayer.z,
+                        [](const std::string& value) { return std::stof(value); }) &&
+            validMetadataPosition(legacyPlayer);
+        if (parsedLegacy) {
+            metadata.playerPos = legacyPlayer;
+            playerStatus = Vec3FieldStatus::Value;
+        }
+    }
+    parseBoolean(content, "\"bedSpawnSet\":", metadata.bedSpawnSet);
+
+    bool spawnValid =
+        spawnStatus == Vec3FieldStatus::Value && validMetadataPosition(metadata.spawnPos);
+    bool playerValid =
+        playerStatus == Vec3FieldStatus::Value && validMetadataPosition(metadata.playerPos);
+
+    if (metadata.generatorVersion == GENERATOR_V4_VERSION) {
+        if (!parseString(content, "\"generationFingerprint\":", metadata.generationFingerprint) ||
+            !validGenerationFingerprint(metadata.generationFingerprint) ||
+            !parseBoolean(content, "\"spawnFinalized\":", metadata.spawnFinalized)) {
+            return std::nullopt;
+        }
+        parseNumber(content, "\"spawnSafetyRevision\":", metadata.spawnSafetyRevision,
+                    [](const std::string& value) { return std::stoul(value); });
+        Vec3 safeSpawn;
+        const Vec3FieldStatus safeSpawnStatus =
+            parseVec3Field(content, "\"safeSpawnPos\":", safeSpawn);
+        const bool safeSpawnValid =
+            safeSpawnStatus == Vec3FieldStatus::Value && validMetadataPosition(safeSpawn);
+        if (safeSpawnStatus == Vec3FieldStatus::Invalid ||
+            (safeSpawnStatus == Vec3FieldStatus::Value && !safeSpawnValid)) {
+            metadata.spawnFinalized = false;
+            metadata.spawnSafetyRevision = 0;
+        }
+        // A provisional record is never allowed to supply a recovery anchor.
+        // Current writers reject this combination, but treating an interrupted
+        // or hand-edited older record as unvalidated is safer than allowing a
+        // stale coordinate to steer dry-land recovery.
+        if (safeSpawnValid && metadata.spawnFinalized) metadata.safeSpawnPos = safeSpawn;
+        if (!spawnValid) {
+            if (metadata.safeSpawnPos) {
+                metadata.spawnPos = *metadata.safeSpawnPos;
+                spawnValid = true;
+            } else if (playerValid) {
+                metadata.spawnPos = metadata.playerPos;
+                spawnValid = true;
+            } else {
+                return std::nullopt;
+            }
+            // A repaired respawn location cannot retain bed provenance.
+            metadata.bedSpawnSet = false;
+        }
+        if (!playerValid) {
+            metadata.playerPos = metadata.safeSpawnPos.value_or(metadata.spawnPos);
+            playerValid = true;
+        }
+    } else {
+        if (!spawnValid) return std::nullopt;
+        if (!playerValid) {
+            metadata.playerPos = metadata.spawnPos;
+            playerValid = true;
+        }
+    }
+    if (!playerValid) return std::nullopt;
     parseNumber(content, "\"yaw\":", metadata.player.yaw,
                 [](const std::string& value) { return std::stof(value); });
     parseNumber(content, "\"pitch\":", metadata.player.pitch,
@@ -494,6 +770,21 @@ std::optional<SaveManager::WorldMetadata> SaveManager::readMetadataFile(const st
     if (!parseInventorySlots(content, metadata.player.inventory)) {
         parseLegacyInventory(content, metadata.player.inventory);
     }
+    parseCarriedStacks(content, metadata.player.carriedStacks);
+    return metadata;
+}
+
+std::optional<SaveManager::WorldMetadata> SaveManager::inspectMetadata(const std::string& worldPath,
+                                                                       Profile profile) {
+    const std::string path = worldPath + "/metadata.json";
+    std::optional<WorldMetadata> metadata = readMetadataFile(path);
+    if (!metadata) return std::nullopt;
+    if (profile == Profile::GeneratorV4 && metadata->generatorVersion != GENERATOR_V4_VERSION) {
+        return std::nullopt;
+    }
+    if (profile == Profile::LegacyV3 && metadata->generatorVersion == GENERATOR_V4_VERSION) {
+        return std::nullopt;
+    }
     return metadata;
 }
 
@@ -509,7 +800,9 @@ bool SaveManager::saveBlockEntities(const FurnaceMap& furnaces, const ChestMap& 
     std::vector<const FurnaceMap::value_type*> furnaceEntries;
     furnaceEntries.reserve(furnaces.size());
     for (const auto& entry : furnaces) {
-        furnaceEntries.push_back(&entry);
+        if (entry.first.y >= WORLD_MIN_Y && entry.first.y <= WORLD_MAX_Y) {
+            furnaceEntries.push_back(&entry);
+        }
     }
     std::sort(furnaceEntries.begin(), furnaceEntries.end(),
               [](const auto* left, const auto* right) {
@@ -530,7 +823,9 @@ bool SaveManager::saveBlockEntities(const FurnaceMap& furnaces, const ChestMap& 
     std::vector<const ChestMap::value_type*> chestEntries;
     chestEntries.reserve(chests.size());
     for (const auto& entry : chests) {
-        chestEntries.push_back(&entry);
+        if (entry.first.y >= WORLD_MIN_Y && entry.first.y <= WORLD_MAX_Y) {
+            chestEntries.push_back(&entry);
+        }
     }
     std::sort(chestEntries.begin(), chestEntries.end(), [](const auto* left, const auto* right) {
         return blockPositionLess(left->first, right->first);
@@ -595,7 +890,7 @@ SaveManager::BlockEntities SaveManager::loadBlockEntities() const {
             for (unsigned& value : stackValues) {
                 in >> value;
             }
-            if (in.fail()) {
+            if (in.fail() || y < WORLD_MIN_Y || y > WORLD_MAX_Y) {
                 reportMalformed();
                 continue;
             }
@@ -626,7 +921,7 @@ SaveManager::BlockEntities SaveManager::loadBlockEntities() const {
                 }
                 slot = decodeStack(type, count, durability);
             }
-            if (malformed) {
+            if (malformed || y < WORLD_MIN_Y || y > WORLD_MAX_Y) {
                 reportMalformed();
                 continue;
             }

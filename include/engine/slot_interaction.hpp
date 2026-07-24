@@ -58,5 +58,25 @@ SlotClickOutcome applyDoubleClick(const SlotAccess& access, ItemStack& cursor);
 ItemStack takeOutsideDrop(ItemStack& cursor, SlotClickKind kind);
 
 // Closing a container returns the craft grid and cursor to the inventory;
-// whatever cannot fit comes back for the engine to drop at the feet.
+// whatever cannot fit comes back for the engine to keep in its persisted
+// carried slots.
 std::vector<ItemStack> collectOnClose(const SlotAccess& access, ItemStack& cursor);
+
+// Rehome close overflow in the cursor and nine-cell crafting storage after
+// collectOnClose has cleared the visible inputs. A close can produce at most
+// one stack per visible crafting cell plus the cursor, so these ten persisted
+// slots are sufficient without converting inventory contents into transient
+// dropped entities.
+bool preserveCarriedOverflow(std::span<const ItemStack> overflow, ItemStack& cursor,
+                             std::span<ItemStack, 9> craftGrid);
+
+// Inventory exposes only the first four crafting cells. If a restored or
+// overflowed 3x3 input occupies a later cell, the engine opens the complete
+// crafting view so no persisted stack is hidden or cleared.
+bool hasExtendedCarriedCrafting(std::span<const ItemStack, 9> craftGrid);
+
+// Transfer every player-owned stack into the death-drop list and clear its
+// source. The persisted cursor and all nine crafting cells are inventory for
+// lifecycle purposes even when their container screen is closed.
+std::vector<ItemStack> collectDeathDrops(std::span<ItemStack> inventory, ItemStack& cursor,
+                                         std::span<ItemStack, 9> craftGrid);

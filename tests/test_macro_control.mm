@@ -43,6 +43,12 @@ void requireSurfaceSamplesEqual(const worldgen::SurfaceSample& actual,
     REQUIRE(actual.hydrology.surfaceElevation == expected.hydrology.surfaceElevation);
     REQUIRE(actual.hydrology.waterSurface == expected.hydrology.waterSurface);
     REQUIRE(actual.hydrology.discharge == expected.hydrology.discharge);
+    REQUIRE(actual.hydrology.baseflow == expected.hydrology.baseflow);
+    REQUIRE(actual.hydrology.precipitationSeasonality ==
+            expected.hydrology.precipitationSeasonality);
+    REQUIRE(actual.hydrology.groundwaterRechargeMm == expected.hydrology.groundwaterRechargeMm);
+    REQUIRE(actual.hydrology.groundwaterHead == expected.hydrology.groundwaterHead);
+    REQUIRE(actual.hydrology.hydroperiod == expected.hydrology.hydroperiod);
     REQUIRE(actual.hydrology.sediment == expected.hydrology.sediment);
     REQUIRE(actual.hydrology.channelDistance == expected.hydrology.channelDistance);
     REQUIRE(actual.hydrology.channelWidth == expected.hydrology.channelWidth);
@@ -67,6 +73,11 @@ void requireSurfaceSamplesEqual(const worldgen::SurfaceSample& actual,
     REQUIRE(actual.hydrology.waterfall == expected.hydrology.waterfall);
     REQUIRE(actual.hydrology.waterfallAnchor == expected.hydrology.waterfallAnchor);
     REQUIRE(actual.hydrology.delta == expected.hydrology.delta);
+    REQUIRE(actual.hydrology.estuary == expected.hydrology.estuary);
+    REQUIRE(actual.hydrology.brackish == expected.hydrology.brackish);
+    REQUIRE(actual.hydrology.perennial == expected.hydrology.perennial);
+    REQUIRE(actual.hydrology.ephemeral == expected.hydrology.ephemeral);
+    REQUIRE(actual.hydrology.wetland == expected.hydrology.wetland);
 
     REQUIRE(actual.climate.wind.x == expected.climate.wind.x);
     REQUIRE(actual.climate.wind.z == expected.climate.wind.z);
@@ -385,8 +396,8 @@ TEST_CASE("Far climate grids bound control and shoreline construction work",
     STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_TILE_EDGE == 256);
     STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_SPACING == 128);
     STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_SAMPLE_COUNT == 25);
-    STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_CACHE_CAPACITY == 1'024);
-    STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET == 8ull * 1024 * 1024);
+    STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_CACHE_CAPACITY == 4'096);
+    STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET == 32ull * 1024 * 1024);
 
     worldgen::MacroGenerationSampler sampler(764891);
     constexpr int SAMPLE_EDGE = 17;
@@ -451,8 +462,8 @@ TEST_CASE("Main macro control cache is single-flight bounded and clearable",
 
 TEST_CASE("Far climate control cache is single-flight bounded and clearable",
           "[worldgen][macro-control][far-climate][cache][single-flight][concurrency]") {
-    STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_CACHE_CAPACITY == 1'024);
-    STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET == 8ull * 1024 * 1024);
+    STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_CACHE_CAPACITY == 4'096);
+    STATIC_REQUIRE(worldgen::FAR_CLIMATE_CONTROL_CACHE_BYTE_BUDGET == 32ull * 1024 * 1024);
     requireSingleFlightCache(worldgen::SurfaceFootprint::BLOCK_16, true);
 }
 

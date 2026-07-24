@@ -23,8 +23,9 @@ struct MeshSnapshot {
     static constexpr int SKY_COLUMNS = PADDED_EDGE * PADDED_EDGE;
     static constexpr int32_t SKY_CUTOFF_UNKNOWN = std::numeric_limits<int32_t>::min();
     // A real opaque block at WORLD_MAX_Y has cutoff WORLD_MAX_Y + 1. Keep the
-    // conservative incomplete-load marker distinct so top-of-world roofs do
-    // not become indistinguishable from a missing vertical section.
+    // conservative incomplete-load marker distinct for standalone diagnostics
+    // and mesher fixtures. Production World snapshots fail closed before
+    // publishing a mesh with this marker.
     static constexpr int32_t SKY_CUTOFF_INCOMPLETE = INCOMPLETE_SKY_PATH_CUTOFF;
 
     enum MissingFace : uint8_t {
@@ -64,10 +65,11 @@ struct MeshSnapshot {
     // cubes. SKY_CUTOFF_UNKNOWN asks standalone tests/tools to derive a
     // bounded cutoff from the blocks available in this snapshot.
     std::array<int32_t, SKY_COLUMNS> skyCutoffY{};
-    // The unoccluded geometric cutoff before an incomplete vertical path
-    // turns skyCutoffY into SKY_CUTOFF_INCOMPLETE. Water uses this only to
-    // classify a visible exterior interface while keeping light propagation
-    // conservatively dark. Edited roofs remain part of this authority.
+    // The unoccluded geometric cutoff paired with skyCutoffY. Standalone
+    // diagnostics may use it to classify a visible water interface while an
+    // intentionally incomplete light path remains dark. Production snapshots
+    // contain only complete vertical authority. Edited roofs remain part of
+    // this authority.
     std::array<int32_t, SKY_COLUMNS> visualSkyCutoffY{};
 
     MeshSnapshot() { clear(); }
@@ -140,6 +142,9 @@ struct MeshSnapshot {
     uint8_t blockLightAt(int x, int y, int z) const {
         return derivedBlockLight(packedLightAt(x, y, z));
     }
+
+    // Compatibility for callers that requested the old block-only channel.
+    uint8_t lightAt(int x, int y, int z) const { return blockLightAt(x, y, z); }
 
     FluidState fluidAt(int x, int y, int z) const {
         if (x < -1 || x > CHUNK_EDGE || y < -1 || y > CHUNK_EDGE || z < -1 || z > CHUNK_EDGE) {

@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdio>
 
 // Font metrics mirrored from UIOverlay (8×8 glyphs, 1px advance gap)
 static constexpr float FONT_CELL = 9.0f;
@@ -67,6 +69,34 @@ MenuLayout buildTitleLayout(const LayoutContext& ctx) {
     addButton(layout, ctx, "PLAY", MenuAction::OPEN_WORLD_SELECT, 0.5f, 0.42f, 320.f, 48.f);
     addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, 0.42f - ctx.py(68.f), 320.f, 48.f);
     return layout;
+}
+
+std::string shortened(std::string value, size_t maximum) {
+    if (value.size() <= maximum) return value;
+    value.resize(maximum - 3);
+    value += "...";
+    return value;
+}
+
+const char* bootstrapStateName(worldgen::bootstrap::TerrainBootstrapState state) {
+    using worldgen::bootstrap::TerrainBootstrapState;
+    switch (state) {
+        case TerrainBootstrapState::ModelRequired:
+            return "MODEL REQUIRED";
+        case TerrainBootstrapState::Downloading:
+            return "DOWNLOADING";
+        case TerrainBootstrapState::Verifying:
+            return "VERIFYING";
+        case TerrainBootstrapState::Compiling:
+            return "COMPILING";
+        case TerrainBootstrapState::Loading:
+            return "LOADING";
+        case TerrainBootstrapState::Ready:
+            return "READY";
+        case TerrainBootstrapState::Failed:
+            return "FAILED";
+    }
+    return "FAILED";
 }
 
 MenuLayout buildPauseLayout(const LayoutContext& ctx, GameMode mode) {
@@ -205,12 +235,20 @@ MenuLayout buildWorldSelectLayout(const LayoutContext& ctx, const MenuContext& m
 
     float bottom = 0.5f - ctx.py(120.f);
     if (hasSelection) {
-        addButton(layout, ctx, "PLAY SELECTED", MenuAction::PLAY_SELECTED_WORLD, 0.5f, bottom,
-                  400.f, 44.f);
+        addButton(layout, ctx,
+                  menu.selectedWorldRequiresV4Successor ? "CREATE V4 SUCCESSOR" : "PLAY SELECTED",
+                  menu.selectedWorldRequiresV4Successor ? MenuAction::REQUEST_V4_SUCCESSOR
+                                                        : MenuAction::PLAY_SELECTED_WORLD,
+                  0.5f, bottom, 400.f, 44.f);
     }
     bottom -= ctx.py(52.f);
-    addButton(layout, ctx, "CREATE NEW WORLD", MenuAction::OPEN_WORLD_CREATE, 0.5f, bottom, 400.f,
-              44.f);
+    if (menu.allowWorldCreation) {
+        addButton(layout, ctx, "CREATE NEW WORLD", MenuAction::OPEN_WORLD_CREATE, 0.5f, bottom,
+                  400.f, 44.f);
+    } else if (!menu.worldCreationUnavailableReason.empty()) {
+        addCenteredText(layout, ctx, menu.worldCreationUnavailableReason, bottom, 1.25f, 0.8f, 0.8f,
+                        0.85f);
+    }
     bottom -= ctx.py(52.f);
     if (hasSelection) {
         addButton(layout, ctx, "DELETE", MenuAction::REQUEST_DELETE_WORLD, 0.5f - ctx.px(105.f),
@@ -230,6 +268,17 @@ MenuLayout buildWorldCreateLayout(const LayoutContext& ctx, const MenuContext& m
 
     const WorldCreateState& create = menu.worldCreate;
     addCenteredText(layout, ctx, "CREATE WORLD", 0.5f + ctx.py(250.f), 3.0f);
+
+    if (!menu.allowWorldCreation) {
+        addCenteredText(layout, ctx,
+                        menu.worldCreationUnavailableReason.empty()
+                            ? "WORLD CREATION IS UNAVAILABLE"
+                            : menu.worldCreationUnavailableReason,
+                        0.5f + ctx.py(30.f), 1.5f, 0.85f, 0.75f, 0.55f);
+        addButton(layout, ctx, "BACK", MenuAction::WORLD_BACK, 0.5f, 0.5f - ctx.py(220.f), 400.f,
+                  44.f);
+        return layout;
+    }
 
     addTextField(layout, ctx, "NAME", create.name, create.focusedField == 0, menu.caretVisible,
                  0.5f + ctx.py(170.f));
@@ -280,6 +329,24 @@ MenuLayout buildDeleteConfirmLayout(const LayoutContext& ctx, const MenuContext&
               0.5f - ctx.py(64.f), 200.f, 44.f);
     addButton(layout, ctx, "CANCEL", MenuAction::CANCEL_DELETE, 0.5f + ctx.px(110.f),
               0.5f - ctx.py(64.f), 200.f, 44.f);
+    return layout;
+}
+
+MenuLayout buildSuccessorConfirmLayout(const LayoutContext& ctx, const MenuContext& menu) {
+    MenuLayout layout;
+    layout.dimAlpha = 0.6f;
+    layout.panel = UIRect{0.5f - ctx.px(300.f), 0.5f - ctx.py(150.f), ctx.px(600.f), ctx.py(300.f)};
+
+    addCenteredText(layout, ctx, "CREATE V4 SUCCESSOR?", 0.5f + ctx.py(88.f), 3.0f);
+    addCenteredText(layout, ctx, menu.successorWorldName + " WILL REMAIN UNCHANGED",
+                    0.5f + ctx.py(30.f), 1.5f, 0.7f, 0.9f, 0.7f);
+    addCenteredText(layout, ctx, "A SEPARATE WORLD WILL BE CREATED", 0.5f - ctx.py(2.f), 1.25f,
+                    0.85f, 0.85f, 0.9f);
+
+    addButton(layout, ctx, "CREATE", MenuAction::CONFIRM_V4_SUCCESSOR, 0.5f - ctx.px(110.f),
+              0.5f - ctx.py(82.f), 200.f, 44.f);
+    addButton(layout, ctx, "CANCEL", MenuAction::CANCEL_V4_SUCCESSOR, 0.5f + ctx.px(110.f),
+              0.5f - ctx.py(82.f), 200.f, 44.f);
     return layout;
 }
 
@@ -456,6 +523,179 @@ MenuLayout buildChestLayout(const LayoutContext& ctx, const MenuContext& menu) {
 
 } // namespace
 
+MenuLayout
+buildTerrainBootstrapLayout(const worldgen::bootstrap::TerrainBootstrapSnapshot& snapshot,
+                            float pixelWidth, float pixelHeight, bool allowWorldSelection) {
+    using worldgen::bootstrap::TerrainBootstrapState;
+    if (pixelWidth <= 0.f || pixelHeight <= 0.f) return {};
+    const LayoutContext ctx{pixelWidth, pixelHeight, pixelHeight / 768.0f};
+
+    MenuLayout layout;
+    layout.dimAlpha = 0.72f;
+    layout.panel = UIRect{0.5f - ctx.px(300.f), 0.5f - ctx.py(210.f), ctx.px(600.f), ctx.py(420.f)};
+    addCenteredText(layout, ctx, "GENERATOR V4", 0.5f + ctx.py(158.f), 3.0f);
+    const bool failed = snapshot.state == TerrainBootstrapState::Failed;
+    addCenteredText(layout, ctx, bootstrapStateName(snapshot.state), 0.5f + ctx.py(105.f), 2.0f,
+                    failed ? 1.0f : 0.65f, failed ? 0.35f : 0.85f, failed ? 0.35f : 1.0f);
+
+    const float detailY = snapshot.reusingInstalledPack ? 0.5f + ctx.py(42.f) : 0.5f + ctx.py(60.f);
+    const float assetY = snapshot.reusingInstalledPack ? 0.5f + ctx.py(16.f) : 0.5f + ctx.py(32.f);
+    if (snapshot.reusingInstalledPack) {
+        addCenteredText(layout, ctx, "LOCAL PACK REUSED - NO DOWNLOAD", 0.5f + ctx.py(78.f), 1.15f,
+                        0.55f, 1.0f, 0.65f);
+    }
+    if (!snapshot.detail.empty()) {
+        addCenteredText(layout, ctx, shortened(snapshot.detail, 66), detailY, 1.25f, 0.85f, 0.85f,
+                        0.9f);
+    }
+    if (!snapshot.currentAsset.empty()) {
+        addCenteredText(layout, ctx, shortened(snapshot.currentAsset, 52), assetY, 1.25f, 1.0f,
+                        0.9f, 0.4f);
+    }
+
+    if (snapshot.totalBytes > 0 && snapshot.state != TerrainBootstrapState::ModelRequired &&
+        snapshot.state != TerrainBootstrapState::Failed) {
+        layout.progressTrack =
+            UIRect{0.5f - ctx.px(230.f), 0.5f - ctx.py(2.f), ctx.px(460.f), ctx.py(20.f)};
+        const long double fraction =
+            static_cast<long double>(snapshot.completedBytes) / snapshot.totalBytes;
+        layout.progressFraction = static_cast<float>(std::clamp(fraction, 0.0L, 1.0L));
+        char percent[32];
+        std::snprintf(percent, sizeof(percent), "%d%%",
+                      static_cast<int>(layout.progressFraction * 100.0f));
+        addCenteredText(layout, ctx, percent, 0.5f - ctx.py(22.f), 1.25f, 0.8f, 0.9f, 1.0f);
+    }
+
+    const float primaryY = 0.5f - ctx.py(82.f);
+    const float quitY = 0.5f - ctx.py(145.f);
+    switch (snapshot.state) {
+        case TerrainBootstrapState::ModelRequired:
+            addButton(layout, ctx, "DOWNLOAD", MenuAction::DOWNLOAD_MODEL, 0.5f, primaryY, 320.f,
+                      44.f);
+            addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, quitY, 320.f, 44.f);
+            break;
+        case TerrainBootstrapState::Downloading:
+        case TerrainBootstrapState::Verifying:
+        case TerrainBootstrapState::Compiling:
+        case TerrainBootstrapState::Loading:
+            addButton(layout, ctx, "CANCEL", MenuAction::CANCEL_MODEL, 0.5f, primaryY, 320.f, 44.f);
+            addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, quitY, 320.f, 44.f);
+            break;
+        case TerrainBootstrapState::Failed:
+            if (allowWorldSelection) {
+                addButton(layout, ctx, "WORLD SELECT", MenuAction::OPEN_WORLD_SELECT, 0.5f,
+                          primaryY, 320.f, 44.f);
+            } else if (!snapshot.failure || snapshot.failure->retryable) {
+                addButton(layout, ctx, "RETRY", MenuAction::RETRY_MODEL, 0.5f - ctx.px(92.f),
+                          primaryY, 160.f, 44.f);
+                addButton(layout, ctx, "REPAIR", MenuAction::REPAIR_MODEL, 0.5f + ctx.px(92.f),
+                          primaryY, 160.f, 44.f);
+            }
+            addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, quitY, 320.f, 44.f);
+            break;
+        case TerrainBootstrapState::Ready:
+            break;
+    }
+    return layout;
+}
+
+MenuLayout buildV4WorldPreparationLayout(const V4WorldPreparationSnapshot& snapshot,
+                                         float pixelWidth, float pixelHeight) {
+    if (pixelWidth <= 0.f || pixelHeight <= 0.f) return {};
+    const LayoutContext ctx{pixelWidth, pixelHeight, pixelHeight / 768.0f};
+
+    MenuLayout layout;
+    layout.dimAlpha = 0.72f;
+    layout.panel = UIRect{0.5f - ctx.px(300.f), 0.5f - ctx.py(210.f), ctx.px(600.f), ctx.py(420.f)};
+    addCenteredText(layout, ctx, "GENERATOR V4", 0.5f + ctx.py(158.f), 3.0f);
+    addCenteredText(layout, ctx, "PREPARING WORLD", 0.5f + ctx.py(105.f), 2.0f, 0.65f, 0.85f, 1.0f);
+
+    const char* const spawnStatus = !snapshot.drySpawnValidated        ? "LOCATING DRY LAND"
+                                    : !snapshot.finalSpawnTerrainReady ? "PREPARING FINAL TERRAIN"
+                                    : snapshot.safeSpawnReady          ? "SAFE SPAWN READY"
+                                                                       : "FINALIZING SAFE SPAWN";
+    addCenteredText(layout, ctx, spawnStatus, 0.5f + ctx.py(60.f), 1.25f,
+                    snapshot.safeSpawnReady ? 0.55f : 1.0f, snapshot.safeSpawnReady ? 1.0f : 0.9f,
+                    0.55f);
+    const float connectedParentRadiusChunks = std::isfinite(snapshot.connectedParentRadiusChunks) &&
+                                                      snapshot.connectedParentRadiusChunks > 0.0F
+                                                  ? snapshot.connectedParentRadiusChunks
+                                                  : 0.0F;
+    const bool completeConfiguredHorizon =
+        snapshot.farBaseRequired > 0 && snapshot.farBaseReady == snapshot.farBaseRequired;
+    const bool connectedEntryFrontierReady =
+        snapshot.entryHorizonRadiusChunks > 0 &&
+        (completeConfiguredHorizon ||
+         (snapshot.entryHorizonRadiusChunks < snapshot.configuredHorizonRadiusChunks &&
+          connectedParentRadiusChunks >= snapshot.entryHorizonRadiusChunks &&
+          connectedParentRadiusChunks < snapshot.configuredHorizonRadiusChunks));
+    const int connectedEntryChunks = static_cast<int>(
+        std::clamp(connectedParentRadiusChunks, 0.0F,
+                   static_cast<float>(std::max(0, snapshot.entryHorizonRadiusChunks))));
+    const std::string horizon =
+        !snapshot.drySpawnValidated        ? "HORIZON WAITS FOR DRY LAND"
+        : !snapshot.finalSpawnTerrainReady ? "HORIZON WAITS FOR FINAL TERRAIN"
+        : !snapshot.safeSpawnReady         ? "HORIZON WAITS FOR SAFE SPAWN"
+        : snapshot.farBaseRequired == 0    ? "INITIALIZING CONNECTED ENTRY FRONTIER"
+        : !connectedEntryFrontierReady
+            ? "CONNECTED ENTRY FRONTIER " + std::to_string(connectedEntryChunks) + "/" +
+                  std::to_string(snapshot.entryHorizonRadiusChunks) + " CHUNKS"
+            : "CONNECTED ENTRY FRONTIER READY";
+    addCenteredText(layout, ctx, horizon, 0.5f + ctx.py(30.f), 1.25f, 0.85f, 0.85f, 0.9f);
+
+    const bool showsNearDetail = snapshot.drySpawnValidated && snapshot.finalSpawnTerrainReady &&
+                                 snapshot.nearFinalRequired > 0;
+    if (showsNearDetail) {
+        const uint32_t ready = std::min(snapshot.nearFinalReady, snapshot.nearFinalRequired);
+        const std::string nearDetail = ready == snapshot.nearFinalRequired
+                                           ? "NEAR DETAIL READY"
+                                           : "NEAR DETAIL " + std::to_string(ready) + "/" +
+                                                 std::to_string(snapshot.nearFinalRequired);
+        addCenteredText(layout, ctx, nearDetail, 0.5f + ctx.py(5.f), 1.0f,
+                        ready == snapshot.nearFinalRequired ? 0.55f : 0.85f,
+                        ready == snapshot.nearFinalRequired ? 1.0f : 0.85f, 0.75f);
+    }
+
+    if (snapshot.entryHorizonRadiusChunks > 0 && snapshot.configuredHorizonRadiusChunks > 0) {
+        const std::string extent =
+            "ENTRY " + std::to_string(snapshot.entryHorizonRadiusChunks) + " CHUNKS / CONFIGURED " +
+            std::to_string(snapshot.configuredHorizonRadiusChunks) + " CHUNKS";
+        addCenteredText(layout, ctx, extent, 0.5f + ctx.py(showsNearDetail ? -15.f : 5.f), 1.0f,
+                        0.68f, 0.78f, 0.88f);
+    }
+
+    if (snapshot.finalSpawnTerrainReady && snapshot.safeSpawnReady &&
+        snapshot.farBaseRequired > 0 && snapshot.entryHorizonRadiusChunks > 0) {
+        layout.progressTrack =
+            UIRect{0.5f - ctx.px(230.f), 0.5f - ctx.py(showsNearDetail ? 38.f : 18.f),
+                   ctx.px(460.f), ctx.py(20.f)};
+        const float horizonFraction =
+            completeConfiguredHorizon
+                ? 1.0F
+                : std::clamp(connectedParentRadiusChunks /
+                                 static_cast<float>(snapshot.entryHorizonRadiusChunks),
+                             0.0F, 1.0F);
+        const float spawnFraction = snapshot.safeSpawnReady ? 1.0f : 0.0f;
+        if (snapshot.nearFinalRequired == 0) {
+            layout.progressFraction =
+                std::clamp(0.20f * spawnFraction + 0.80f * horizonFraction, 0.0f, 1.0f);
+        } else {
+            const float nearFraction =
+                static_cast<float>(std::min(snapshot.nearFinalReady, snapshot.nearFinalRequired)) /
+                static_cast<float>(snapshot.nearFinalRequired);
+            layout.progressFraction = std::clamp(
+                0.20f * spawnFraction + 0.40f * horizonFraction + 0.40f * nearFraction, 0.0f, 1.0f);
+        }
+    }
+
+    char elapsed[48];
+    std::snprintf(elapsed, sizeof(elapsed), "%.1f SECONDS", snapshot.elapsedSeconds);
+    addCenteredText(layout, ctx, elapsed, 0.5f - ctx.py(showsNearDetail ? 70.f : 50.f), 1.25f, 0.8f,
+                    0.9f, 1.0f);
+    addButton(layout, ctx, "QUIT", MenuAction::QUIT, 0.5f, 0.5f - ctx.py(145.f), 320.f, 44.f);
+    return layout;
+}
+
 MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeight,
                            const SettingsValues& values, const GraphicsSettings& gfx) {
     if (pixelWidth <= 0.f || pixelHeight <= 0.f) return {};
@@ -474,6 +714,7 @@ MenuLayout buildMenuLayout(GameScreen screen, float pixelWidth, float pixelHeigh
         case GameScreen::WORLD_SELECT:
         case GameScreen::WORLD_CREATE:
         case GameScreen::WORLD_DELETE_CONFIRM:
+        case GameScreen::WORLD_SUCCESSOR_CONFIRM:
         case GameScreen::INVENTORY:
         case GameScreen::CRAFTING:
         case GameScreen::FURNACE:
@@ -508,6 +749,8 @@ MenuLayout buildScreenLayout(GameScreen screen, float pixelWidth, float pixelHei
             return buildWorldCreateLayout(layoutCtx, ctx);
         case GameScreen::WORLD_DELETE_CONFIRM:
             return buildDeleteConfirmLayout(layoutCtx, ctx);
+        case GameScreen::WORLD_SUCCESSOR_CONFIRM:
+            return buildSuccessorConfirmLayout(layoutCtx, ctx);
         case GameScreen::INVENTORY:
             return buildInventoryLayout(layoutCtx, ctx);
         case GameScreen::CRAFTING:

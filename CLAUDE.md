@@ -53,7 +53,7 @@ Before committing any change:
 ## Error Handling Policy
 
 - **Metal device/queue/pipeline failures:** fatal — `RY_LOG_FATAL` logs and terminates
-- **Chunk generation:** `try/catch` with a blank-chunk fallback
+- **Generator v4 authority, cubes, and far terrain:** latch a typed, user-visible failure, preserve resident geometry, and keep missing collision closed. Never publish a blank cube or silently enter v3. The explicit diagnostic v3 path retains its separate legacy behavior. Why: blank fallback cubes created visible holes and allowed failed learned authority to become saved world state.
 - **File I/O:** `std::optional`/`bool` returns + `RY_LOG_*` — no exceptions for I/O, and no `Result` type
 - **Optional subsystems (audio):** initialize non-fatally; the game runs without them
 
@@ -63,4 +63,4 @@ Every PR must pass: **format** (clang-format check) → **lint** (clang-tidy) �
 
 ## Performance Targets
 
-60 FPS at native resolution and 4x MSAA on the documented Apple M4 Max route, a 20 Hz simulation, view distance 512, and at most 64 GB unified memory. Exact cubic simulation remains capped at radius 32. Cold far coverage begins with step-32 voxel parents, then each connected coordinate can refine directly to its distance-selected target before optional intermediate tiers and exact ownership. The budgets table in `docs/performance-conventions.md` is authoritative.
+60 FPS at native resolution and 4x MSAA on the documented Apple M4 Max route, a 20 Hz simulation, view distance 512, and at most 64 GB unified memory. Exact cubic simulation remains capped at radius 32. Cold far coverage begins with step-32 voxel parents, then each connected coordinate advances through adjacent tiers toward its absolute distance target before exact ownership. The budgets table in `docs/performance-conventions.md` is authoritative.

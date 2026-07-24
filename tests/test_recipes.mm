@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "world/chest.hpp"
+#include "world/chunk.hpp"
 #include "world/furnace.hpp"
 #include "world/recipes.hpp"
 
@@ -255,4 +257,41 @@ TEST_CASE("Furnace gauges expose cook and fuel fractions", "[recipes][furnace]")
     furnace.cookTicks = 100;
     REQUIRE(furnace.cookFraction() == 0.5f);
     REQUIRE(furnace.fuelFraction() == 0.25f);
+}
+
+TEST_CASE("Furnace sidecars survive missing cubes but not replaced blocks", "[recipes][furnace]") {
+    REQUIRE(furnaceSidecarMatchesLoadedBlock(std::nullopt));
+    REQUIRE(furnaceSidecarMatchesLoadedBlock(BlockType::FURNACE));
+    REQUIRE(furnaceSidecarMatchesLoadedBlock(BlockType::FURNACE_LIT));
+    REQUIRE_FALSE(furnaceSidecarMatchesLoadedBlock(BlockType::AIR));
+    REQUIRE_FALSE(furnaceSidecarMatchesLoadedBlock(BlockType::STONE));
+
+    FurnaceState furnace;
+    REQUIRE(furnaceBlockForState(furnace) == BlockType::FURNACE);
+    furnace.burnTicksRemaining = 1;
+    REQUIRE(furnaceBlockForState(furnace) == BlockType::FURNACE_LIT);
+}
+
+TEST_CASE("Chest sidecars survive missing cubes but not replaced blocks", "[recipes][chest]") {
+    REQUIRE(chestSidecarMatchesLoadedBlock(std::nullopt));
+    REQUIRE(chestSidecarMatchesLoadedBlock(BlockType::CHEST));
+    REQUIRE_FALSE(chestSidecarMatchesLoadedBlock(BlockType::AIR));
+    REQUIRE_FALSE(chestSidecarMatchesLoadedBlock(BlockType::FURNACE));
+    REQUIRE_FALSE(chestSidecarMatchesLoadedBlock(BlockType::STONE));
+}
+
+TEST_CASE("Saved lit furnace visuals require a live sidecar", "[recipes][furnace][save]") {
+    Chunk chunk(ChunkPos{2, 4, -3});
+    chunk.fill(BlockType::AIR);
+    chunk.setBlock(1, 2, 3, BlockType::FURNACE);
+    chunk.setBlock(4, 5, 6, BlockType::FURNACE_LIT);
+    const uint32_t version = chunk.version.load(std::memory_order_relaxed);
+
+    REQUIRE(normalizePersistedFurnaceVisuals(chunk));
+    REQUIRE(chunk.getBlock(1, 2, 3) == BlockType::FURNACE);
+    REQUIRE(chunk.getBlock(4, 5, 6) == BlockType::FURNACE);
+    REQUIRE(chunk.modifiedSinceSave);
+    REQUIRE(chunk.needsMeshUpdate);
+    REQUIRE(chunk.version.load(std::memory_order_relaxed) == version + 1);
+    REQUIRE_FALSE(normalizePersistedFurnaceVisuals(chunk));
 }

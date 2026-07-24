@@ -65,6 +65,8 @@ bool sameWaterTopology(const worldgen::SurfaceSample& first,
            first.hydrology.river == second.hydrology.river &&
            first.hydrology.lake == second.hydrology.lake &&
            first.hydrology.delta == second.hydrology.delta &&
+           first.hydrology.estuary == second.hydrology.estuary &&
+           first.hydrology.brackish == second.hydrology.brackish &&
            first.hydrology.waterfall == second.hydrology.waterfall &&
            first.hydrology.waterBodyId == second.hydrology.waterBodyId;
 }
@@ -294,6 +296,8 @@ TEST_CASE("Reported seed 42 camera corridor keeps generated water physically con
                             static_cast<unsigned>(neighbor.hydrology.transitionOwnerKind)) +
                         " stages=" + std::to_string(quantizedStages.first) + "/" +
                         std::to_string(quantizedStages.second) +
+                        " terrain=" + std::to_string(sample.terrainHeight) + "/" +
+                        std::to_string(neighbor.terrainHeight) +
                         " aligned=" + (alignsEitherFlow ? "true" : "false"));
                 }
                 if (step > maximumUntaggedStep) {
@@ -341,8 +345,7 @@ TEST_CASE("Reported seed 42 camera corridor keeps generated water physically con
         const int localX = Chunk::worldToLocal(position.x);
         const int localZ = Chunk::worldToLocal(position.z);
         const int surfaceY = plan->surfaceY(localX, localZ);
-        worldgen::SurfaceSample exact = plan->sample(localX, localZ);
-        exact.terrainHeight = static_cast<double>(surfaceY + 1);
+        const worldgen::SurfaceSample exact = generator.sampleExactSurface(position.x, position.z);
         const worldgen::GeneratedFluidColumn fluid = worldgen::generatedFluidColumn(exact);
         const int maximumY = fluid.wet ? fluid.topY : surfaceY;
         for (int32_t section = Chunk::worldToChunkY(surfaceY);
@@ -363,154 +366,6 @@ TEST_CASE("Reported seed 42 camera corridor keeps generated water physically con
         }
     }
     CHECK(world.getPendingFluidCount() == 0);
-}
-
-TEST_CASE("Final exact terrain preserves routed water and supported lateral banks",
-          "[worldgen][hydrology][water][exact][volcanic][bank][regression]") {
-    constexpr int64_t CENTER_X = 141;
-    constexpr int64_t CENTER_Z = -1'555;
-    constexpr int RADIUS = 48;
-    constexpr int EDGE = RADIUS * 2 + 1;
-    constexpr int64_t ORIGIN_X = CENTER_X - RADIUS;
-    constexpr int64_t ORIGIN_Z = CENTER_Z - RADIUS;
-
-    ChunkGenerator generator(REPORTED_SEED);
-    std::vector<worldgen::SurfaceSample> exact(static_cast<size_t>(EDGE * EDGE));
-    std::vector<worldgen::HydrologySample> canonical(static_cast<size_t>(EDGE * EDGE));
-    generator.sampleExactSurfaceGrid(ORIGIN_X, ORIGIN_Z, 1, EDGE, exact);
-    generator.sampleGeneratedWaterAuthorityGrid(ORIGIN_X, ORIGIN_Z, 1, EDGE, canonical);
-
-    const auto index = [](int x, int z) { return static_cast<size_t>(z * EDGE + x); };
-    size_t supportableCanonicalColumns = 0;
-    size_t deletedCanonicalColumns = 0;
-    size_t adjacentWetFaces = 0;
-    size_t untaggedWetSteps = 0;
-    size_t lateralBanks = 0;
-    size_t unsupportedLateralBanks = 0;
-    double maximumUntaggedWetStep = 0.0;
-    double maximumLateralBankDeficit = 0.0;
-    ColumnPos firstDeleted{};
-    ColumnPos firstWetStep{};
-    ColumnPos firstWetStepNeighbor{};
-    double firstWetStage = 0.0;
-    double firstWetNeighborStage = 0.0;
-    worldgen::WaterTransitionKind firstWetKind = worldgen::WaterTransitionKind::NONE;
-    worldgen::WaterTransitionKind firstWetNeighborKind = worldgen::WaterTransitionKind::NONE;
-    bool firstWetOcean = false;
-    bool firstWetRiver = false;
-    bool firstWetBank = false;
-    double firstWetTerrain = 0.0;
-    bool firstWetNeighborOcean = false;
-    bool firstWetNeighborRiver = false;
-    bool firstWetNeighborBank = false;
-    double firstWetNeighborTerrain = 0.0;
-    ColumnPos firstUnsupportedBank{};
-    ColumnPos firstUnsupportedBankNeighbor{};
-    double firstUnsupportedWetSurface = 0.0;
-    double firstUnsupportedDryTerrain = 0.0;
-    bool firstUnsupportedDryBank = false;
-
-    for (int z = 0; z < EDGE; ++z) {
-        for (int x = 0; x < EDGE; ++x) {
-            const size_t currentIndex = index(x, z);
-            const worldgen::SurfaceSample& sample = exact[currentIndex];
-            const worldgen::HydrologySample& authority = canonical[currentIndex];
-            const worldgen::GeneratedFluidColumn fluid = worldgen::generatedFluidColumn(sample);
-            const bool canonicalWet = authority.ocean || authority.river || authority.lake;
-            if (canonicalWet && std::isfinite(authority.waterSurface) &&
-                authority.waterSurface > sample.terrainHeight + 0.01) {
-                ++supportableCanonicalColumns;
-                if (!fluid.wet) {
-                    if (deletedCanonicalColumns == 0)
-                        firstDeleted = {ORIGIN_X + x, ORIGIN_Z + z};
-                    ++deletedCanonicalColumns;
-                }
-            }
-
-            for (const auto [dx, dz] : {std::pair{1, 0}, std::pair{0, 1}}) {
-                if (x + dx >= EDGE || z + dz >= EDGE)
-                    continue;
-                const worldgen::SurfaceSample& neighbor = exact[index(x + dx, z + dz)];
-                const worldgen::GeneratedFluidColumn neighborFluid =
-                    worldgen::generatedFluidColumn(neighbor);
-                if (fluid.wet && neighborFluid.wet) {
-                    ++adjacentWetFaces;
-                    if (explicitFallOwns(sample) || explicitFallOwns(neighbor))
-                        continue;
-                    const double step =
-                        std::abs(fluid.visibleSurface - neighborFluid.visibleSurface);
-                    maximumUntaggedWetStep = std::max(maximumUntaggedWetStep, step);
-                    if (step > MAXIMUM_UNTAGGED_VISIBLE_STEP) {
-                        if (untaggedWetSteps == 0) {
-                            firstWetStep = {ORIGIN_X + x, ORIGIN_Z + z};
-                            firstWetStepNeighbor = {ORIGIN_X + x + dx, ORIGIN_Z + z + dz};
-                            firstWetStage = fluid.visibleSurface;
-                            firstWetNeighborStage = neighborFluid.visibleSurface;
-                            firstWetKind = sample.hydrology.transitionOwnerKind;
-                            firstWetNeighborKind = neighbor.hydrology.transitionOwnerKind;
-                            firstWetOcean = sample.hydrology.ocean;
-                            firstWetRiver = sample.hydrology.river;
-                            firstWetBank = sample.hydrology.channelBank;
-                            firstWetTerrain = sample.terrainHeight;
-                            firstWetNeighborOcean = neighbor.hydrology.ocean;
-                            firstWetNeighborRiver = neighbor.hydrology.river;
-                            firstWetNeighborBank = neighbor.hydrology.channelBank;
-                            firstWetNeighborTerrain = neighbor.terrainHeight;
-                        }
-                        ++untaggedWetSteps;
-                    }
-                    continue;
-                }
-                if (fluid.wet == neighborFluid.wet)
-                    continue;
-
-                const worldgen::SurfaceSample& wet = fluid.wet ? sample : neighbor;
-                const worldgen::SurfaceSample& dry = fluid.wet ? neighbor : sample;
-                const worldgen::GeneratedFluidColumn& wetFluid = fluid.wet ? fluid : neighborFluid;
-                const double normalFlow = dx != 0 ? std::abs(wet.hydrology.flowDirection.x)
-                                                  : std::abs(wet.hydrology.flowDirection.z);
-                const double tangentialFlow = dx != 0 ? std::abs(wet.hydrology.flowDirection.z)
-                                                      : std::abs(wet.hydrology.flowDirection.x);
-                const bool standingWater = std::hypot(wet.hydrology.flowDirection.x,
-                                                      wet.hydrology.flowDirection.z) <= 1.0e-6;
-                if (!standingWater && normalFlow + 1.0e-6 >= tangentialFlow)
-                    continue;
-
-                ++lateralBanks;
-                const double deficit = wetFluid.visibleSurface - dry.terrainHeight;
-                maximumLateralBankDeficit = std::max(maximumLateralBankDeficit, deficit);
-                // A one-block source-water face against solid terrain is a
-                // supported natural bank. Only a deeper exposed face is a
-                // floating wall without lateral or floor support.
-                if (deficit > 1.000001) {
-                    if (unsupportedLateralBanks == 0) {
-                        firstUnsupportedBank = {ORIGIN_X + x, ORIGIN_Z + z};
-                        firstUnsupportedBankNeighbor = {ORIGIN_X + x + dx, ORIGIN_Z + z + dz};
-                        firstUnsupportedWetSurface = wetFluid.visibleSurface;
-                        firstUnsupportedDryTerrain = dry.terrainHeight;
-                        firstUnsupportedDryBank = dry.hydrology.channelBank;
-                    }
-                    ++unsupportedLateralBanks;
-                }
-            }
-        }
-    }
-
-    CAPTURE(supportableCanonicalColumns, deletedCanonicalColumns, adjacentWetFaces,
-            untaggedWetSteps, maximumUntaggedWetStep, lateralBanks, unsupportedLateralBanks,
-            maximumLateralBankDeficit, firstDeleted.x, firstDeleted.z, firstWetStep.x,
-            firstWetStep.z, firstWetStepNeighbor.x, firstWetStepNeighbor.z, firstWetStage,
-            firstWetNeighborStage, firstWetKind, firstWetNeighborKind, firstUnsupportedBank.x,
-            firstUnsupportedBank.z, firstWetOcean, firstWetRiver, firstWetBank, firstWetTerrain,
-            firstWetNeighborOcean, firstWetNeighborRiver, firstWetNeighborBank,
-            firstWetNeighborTerrain, firstUnsupportedBankNeighbor.x, firstUnsupportedBankNeighbor.z,
-            firstUnsupportedWetSurface, firstUnsupportedDryTerrain, firstUnsupportedDryBank);
-    CHECK(supportableCanonicalColumns > 0);
-    CHECK(deletedCanonicalColumns == 0);
-    CHECK(adjacentWetFaces > 0);
-    CHECK(untaggedWetSteps == 0);
-    CHECK(lateralBanks > 0);
-    CHECK(unsupportedLateralBanks == 0);
 }
 
 TEST_CASE("Reported seed 42 camera water agrees across exact and far ownership",

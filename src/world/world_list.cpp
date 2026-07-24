@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <iterator>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
@@ -13,7 +15,13 @@ namespace {
 bool looksLikeWorld(const fs::path& directory) {
     std::error_code ec;
     return fs::exists(directory / "metadata.json", ec) ||
-           fs::exists(directory / SaveManager::CURRENT_REGIONS_DIRECTORY, ec);
+           fs::exists(directory / SaveManager::CURRENT_REGIONS_DIRECTORY, ec) ||
+           fs::exists(directory / SaveManager::V4_REGIONS_DIRECTORY, ec);
+}
+
+bool isGeneratorV4ProfileName(std::string_view name) {
+    const std::string_view base = GENERATOR_V4_WORLD_DIRECTORY;
+    return name == base || name.starts_with(std::string(base) + "-seed-");
 }
 
 WorldSummary summarize(const fs::path& directory) {
@@ -26,6 +34,12 @@ WorldSummary summarize(const fs::path& directory) {
         summary.metadata.name = directory.filename().string();
     }
     return summary;
+}
+
+void sortWorlds(std::vector<WorldSummary>& worlds) {
+    std::stable_sort(worlds.begin(), worlds.end(), [](const auto& left, const auto& right) {
+        return left.metadata.lastPlayedMs > right.metadata.lastPlayedMs;
+    });
 }
 
 } // namespace
@@ -47,9 +61,38 @@ std::vector<WorldSummary> listWorlds(const std::string& root) {
         }
     }
 
-    std::stable_sort(worlds.begin(), worlds.end(), [](const auto& left, const auto& right) {
-        return left.metadata.lastPlayedMs > right.metadata.lastPlayedMs;
+    sortWorlds(worlds);
+    return worlds;
+}
+
+std::vector<WorldSummary> listGeneratorV4Worlds(const std::string& root) {
+    std::vector<WorldSummary> worlds;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(fs::path(root), ec)) {
+        if (ec) break;
+        if (!entry.is_directory(ec) || ec ||
+            !isGeneratorV4ProfileName(entry.path().filename().string()) ||
+            !looksLikeWorld(entry.path())) {
+            ec.clear();
+            continue;
+        }
+        WorldSummary summary = summarize(entry.path());
+        if (summary.metadata.generatorVersion == SaveManager::GENERATOR_V4_VERSION)
+            worlds.push_back(std::move(summary));
+    }
+    sortWorlds(worlds);
+    return worlds;
+}
+
+std::vector<WorldSummary> listWorldsForGeneratorV4(const std::string& root) {
+    std::vector<WorldSummary> worlds = listGeneratorV4Worlds(root);
+    std::vector<WorldSummary> legacy = listWorlds(root);
+    std::erase_if(legacy, [](const WorldSummary& world) {
+        return world.metadata.generatorVersion == SaveManager::GENERATOR_V4_VERSION;
     });
+    worlds.insert(worlds.end(), std::make_move_iterator(legacy.begin()),
+                  std::make_move_iterator(legacy.end()));
+    sortWorlds(worlds);
     return worlds;
 }
 
@@ -120,9 +163,11 @@ bool deleteWorld(const std::string& directory, const std::string& root) {
     // of <root>/saves whose name is free of traversal segments.
     const std::string leaf = path.filename().string();
     const bool isLegacy = path == fs::path(root) / LEGACY_WORLD_DIRECTORY;
+    const bool isGeneratorV4 =
+        path.parent_path() == fs::path(root) && isGeneratorV4ProfileName(leaf);
     const bool underSaves = path.parent_path() == fs::path(root) / SAVES_ROOT && !leaf.empty() &&
                             leaf != "." && leaf != ".." && leaf.find('/') == std::string::npos;
-    if (!isLegacy && !underSaves) {
+    if (!isLegacy && !isGeneratorV4 && !underSaves) {
         RY_LOG_ERROR("Refused to delete a path outside the world roots");
         return false;
     }

@@ -35,11 +35,11 @@ half2  UV
 | 24 through 26 | Water flow direction |
 | 27 | Falling water |
 | 28 | Far-canopy impostor marker |
-| 29 | Far-terrain boundary-skirt marker |
+| 29 | Legacy far-terrain boundary-skirt marker; production geometry leaves it clear |
 | 30 | Water exterior-sky authority |
 | 31 | Reserved |
 
-Renderer metadata must stay in the assigned high bits unless the vertex descriptor, shaders, tests, arena budgets, and every producer change together. Bit 28 identifies visual-only far canopy geometry so the fragment shader can suppress it in exact-owned columns. Bit 29 identifies far boundary skirts so displayed-neighbor state and paired emitting-and-receiving column ownership can suppress unnecessary walls. Bit 30 is a binary water-interface classification derived from propagated skylight or the complete edited column cutoff. It must not alter ambient skylight, and it prevents incomplete streaming authority from making exact water disagree with far water.
+Renderer metadata must stay in the assigned high bits unless the vertex descriptor, shaders, tests, arena budgets, and every producer change together. Bit 28 identifies visual-only far canopy geometry so the fragment shader can suppress it in exact-owned columns. Bit 29 remains reserved for compatibility with legacy far meshes, but production geometry must not emit boundary skirts or set the bit. Bit 30 is a binary water-interface classification derived from propagated skylight or the complete edited column cutoff. It must not alter ambient skylight, and it prevents incomplete streaming authority from making exact water disagree with far water.
 
 ## 2. Pipelines match their passes
 
@@ -57,20 +57,20 @@ Renderer metadata must stay in the assigned high bits unless the vertex descript
 - CPU-written buffers use `StorageModeShared` on Apple Silicon. Never call `contents` on a private buffer.
 - Per-frame constants use three frame-ring slots behind the three-frame semaphore.
 - Exact and far mega-buffer ranges enter deferred-free queues. A range cannot return to an allocator until the GPU completes the frame that last referenced it.
-- Exact mesh residency cannot exceed 16,384. The far CPU cache cannot exceed 9,280 entries or 3 GiB. The far GPU arena grows lazily in paired 256 MiB vertex and 128 MiB index slabs, up to 2 GiB of vertices and 1 GiB of indices.
-- All renderer targets, arenas, caches, world state, transient work, and Metal allocations together must remain below the 64 GB unified-memory acceptance ceiling.
-- Persistent High-tier allocations added for the integrated scene targets, shadows, indirect lighting, atmosphere, clouds, lightning, and froxels must remain at or below 768 MiB. At native 3456 by 2234, the byte-accounted High contract is 715,822,207 bytes, leaving 89,484,161 bytes below that ceiling. The accounting includes the water reflection's complete HDR mip pyramid, a full-resolution RG16F SSGI normal guide, the SSGI luminance-moments and age history pair, and R32 froxel linear-depth histories, but excludes memoryless MSAA attachments and device-specific page alignment. Report resized histories and shadow groups once, not once per frame.
+- Exact mesh residency cannot exceed 16,384. The far CPU terrain and canopy caches cannot exceed 24,576 entries each, 3 GiB for terrain, or 512 MiB for canopy. The far GPU arena grows lazily in paired 256 MiB vertex and 128 MiB index slabs, up to 2 GiB of vertices and 1 GiB of indices. Parent coverage reserves the last 64 MiB of vertices and 32 MiB of indices. Visible flora can use a separate 64 MiB and 32 MiB floor that broad refinements cannot consume. A role-selected requested protected FINAL refinement may reclaim optional distant non-displayed refinement or flora allocations and use the complete arena. Coverage, displayed surfaces, transition endpoints, exact fallbacks, active protected lineage, and the requested critical keys stay pinned.
+- All renderer targets, arenas, caches, world state, transient work, and Metal allocations together must remain below the 64 GiB unified-memory acceptance ceiling.
+- Persistent High-tier allocations added for integrated scene targets, shadows, indirect lighting, atmosphere, clouds, lightning, and froxels must remain at or below 768 MiB. Recalculate the payload for the exact drawable and settings under test, then record both the helper result and Metal's reported allocation. Include the complete HDR water-reflection mip pyramid, full-resolution SSGI guides, SSGI histories, and froxel histories. Exclude memoryless MSAA attachments from persistent payload and report resized histories and shadow groups once, not once per frame.
 - The procedural block-texture array has a complete five-level mip chain from 16 by 16 through 1 by 1. Alpha-aware downsampling preserves representable cutout coverage. Its sampler uses nearest magnification, linear minification, linear mip interpolation, repeat addressing, and 8x anisotropy.
 
 ## 4. Coordinate conventions and precision
 
 - Matrices are column-major with column vectors, a right-handed world, and Metal depth in [0, 1]. `perspective`, `lookAt`, frustum extraction, and CPU-to-MSL copies remain covered by tests.
-- Exact vertices are local to one 16 by 16 by 16 cube. Valid exact block geometry lies in 0 through 16 on X, Y, and Z. `ChunkOrigin` restores `chunkX * 16`, `chunkY * 16`, and `chunkZ * 16` in the vertex shader.
+- Exact vertices are local to one 16 by 16 by 16 cube. Valid exact block geometry lies in 0 through 16 on X, Y, and Z. `ChunkOrigin` restores `chunkX * 16`, `chunkY * 16`, and `chunkZ * 16` in the vertex shader. Generator v4 spans section Y=-8 through Y=87, or world Y=-128 through Y=1407, and every culling, shadow, fog, cloud, entity, and water path must accept that complete range. Atmosphere altitude, natural and forced cloud layers, cloud-march bounds, lightning, and thunder use the shared v4 datum at Y=64 and the 7.5-meter positive-elevation scale. High terrain may not clip clouds or place storm layers underground.
 - Far vertices are local to one 256 by 256-block tile in X and Z. Their Y remains relative to world Y=0. The far `ChunkOrigin` restores the tile's 64-bit CPU origin at draw time.
 - Never bake world X or Z directly into half-precision vertices. Exact local half values preserve partial-fluid geometry. Far geometry accepts the local half precision appropriate to its two-, four-, eight-, sixteen-, or thirty-two-block sample step.
 - Face planes sit on block boundaries. The negative X face of local block `x` is at `x`; its positive X face is at `x + 1`. The same rule applies on Y and Z.
 - Exact cube AABBs, frustum bounds, camera distance, candidate priority, opaque origins, entity relationships, and water sorting include Y.
-- Far tile AABBs use sampled surface minimum and maximum Y for visibility. The full tile bound remains available for skirt and allocation ownership.
+- Far tile AABBs use sampled surface minimum and maximum Y for visibility. The full tile bound remains available for transition and allocation ownership.
 - Water reconstructs resolved depth in a camera-relative world frame. Remove the camera translation before inverting view-projection, compare surface and floor positions in that frame, and add the absolute camera position only after depth math for world-anchored caustics. An absolute inverse view-projection loses visible precision at large coordinates and can reset absorption at cubic chunk faces.
 
 Exact sub-block geometry uses binary-exact fractions. Flora insets and lily-pad height use 0.125. Fluid cell heights use eighth blocks, and four-cell corner smoothing can produce multiples of 0.03125. Both remain exactly representable through the exact cube-local range.
@@ -81,6 +81,7 @@ The game meshes exact terrain from `MeshSnapshot`, not directly from a mutable c
 
 - Loaded cubes in the surrounding 3 by 3 by 3 neighborhood supply real face, edge, and corner samples. An unavailable in-range halo follows the immutable generated surface cutoff. Cells above the silhouette remain air and cells below it remain opaque. When a lateral cap candidate exists, a bounded six-connected flood marks transparent cells reachable from sky-exposed cells within the padded snapshot. A complete loaded cutoff honors added roofs and removed surfaces. An incomplete vertical path uses generated authority for this provisional classification while remaining fully occluded for ordinary skylight. Sky-connected lateral openings emit normally lit provisional faces using one representative arriving-surface material per missing face. Enclosed lateral openings emit unlit stone, and missing vertical openings emit bedrock. These faces are temporary boundaries, not generated world content.
 - Solid faces, transparent faces, packed skylight and block light, flora ownership, ambient occlusion, fluid corners, and explicit falling sides read real data whenever the corresponding neighbor is loaded. Loading or unloading any halo cube reconciles the affected light faces and dirties only neighboring meshes whose sampled halo or boundary light changed.
+- Cube publication initializes the arriving cube from every available face neighbor, compares vertical sky authority before and after insertion, and starts one bounded affected-light transaction while the world map is still locked. A transaction performs at most 32 floods. Overflow remains pending in the camera-ranked publication queue, and `snapshotForMeshing` rejects every pending cube. The arriving cube and any resident neighbor therefore expose one settled packed-light version to the first eligible mesh snapshot without turning generation into an unbounded light flood. Missing neighbors remain conservatively dark until their own publication.
 - Edits dirty the owning mesh and every face, edge, or corner neighbor mesh whose one-block halo intersects the changed block. A player edit also synchronously converges its whole affected light neighborhood, so any neighbor whose sampled halo light the edit changed is both relit and dirtied in the same tick rather than a tick later. Why: a placed or broken torch used to light adjacent cubes a tick or more late.
 - Water corner smoothing at an X/Z edge reads the diagonal cube when it is loaded. A missing diagonal is the same closed opaque boundary on both participating meshes.
 - Complete full-height column authority seeds level-15 skylight only where the path to the sky is unobstructed. `LightEngine::floodChunk` propagates both light nibbles through transparent cells across all six faces and loses one level at each non-seeded step. Generated cutoffs remain seed and provisional-boundary authority, not a final binary light value. An incomplete vertical path remains fully dark, so an unloaded section above an underground view cannot admit sunlight.
@@ -89,60 +90,116 @@ The game meshes exact terrain from `MeshSnapshot`, not directly from a mutable c
 
 Exact opaque cube faces use greedy merging with Minecraft-style smooth lighting: skylight and block light are averaged per vertex over the non-opaque cells touching each corner in the outward plane (the diagonal drops when both sides are opaque, matching the ambient-occlusion short-circuit), so light interpolates across a face instead of stepping per voxel. The 64-bit merge key includes block and texture identity, face direction, the four 4-bit skylight corners, the four 4-bit block-light corners, and the four 2-bit ambient-accessibility corners, so cells merge only where every per-vertex value matches and a light gradient keeps its per-vertex detail. A quad splits along its brighter diagonal when corners are not planar. The water surface's top face smooths skylight per corner the same way; its sides and bottom stay flat. Why: flat per-face block light stepped abruptly from voxel to voxel at night.
 
-## 6. Block shapes, winding, and back-face culling
+## 6. Block shapes, winding, and emissive materials
 
-`BlockDefinition::renderShape` is exhaustive:
+`BlockDefinition::renderShape` is exhaustive. Cubes participate in greedy opaque meshing, flora crosses emit two diagonal inset planes, the distinct floor-torch cross retains that silhouette without inheriting flora replacement rules, low boxes emit authored partial-height faces, flat shapes emit a horizontal two-sided plane, liquids enter the water path, and none emits no geometry. Exact opaque merge keys include block and texture identity, face direction, skylight, block light, emissive state, sway state, and baked-accessibility corners.
 
-- `CUBE` participates in greedy opaque meshing.
-- `CROSS` emits two diagonal, inset flora planes.
-- `FLAT` emits a horizontal plane, currently used by lily pads.
-- `LIQUID` enters the water section.
-- `NONE` emits no geometry.
+Torches use their authored centered noncube shape. Their dedicated cross vertex class remains double-sided without inheriting randomized flora poses, wind, plant-facing shading, or plant subsurface response. Floor placement requires a full solid support, support loss drops the torch, and fluid rules do not treat it as replaceable flora. Beds use a single-block 9/16-height box with the same partial collision volume and remain transparent to skylight. Furnaces use the inactive or active texture set that matches the persisted furnace state. Furnace and chest fronts face fixed world -Z until saves gain facing metadata. Lava, torches, and active furnaces set both light emission and emissive material state. Their light propagates through the same block-light field used by exact geometry, while their surface radiance stays in linear HDR for bloom and indirect-light consumers.
 
-Main-pass exact cube faces and far terrain use counterclockwise outward winding with back-face culling. Cross and flat flora emit both windings so they remain visible from either side. Water uses cull-none because surfaces are visible from below. Shadow casters also use cull-none because visible-face-only greedy meshes are not closed solids.
+The block-level emissive bit is only a fast shader gate. A five-level filtered `R8Unorm` array supplies the actual per-texel mask with the same layer and UV ownership as the color array. Lava is fully emissive. Only the painted flame of a torch and the one fixed front mouth of an active furnace emit. The torch stick, active-furnace side and top layers, inactive furnace, chest, and bed have a zero emission mask. Low beds stay in the opaque geometry and shadow index range while their block opacity remains false; their authored faces use ordinary culling, smooth packed light, and baked corner accessibility. The screen-space indirect path consumes resolved emissive radiance and may not maintain a separate CPU block scan or gameplay allowlist.
 
-Alpha-cutout leaves, glass, flora, and their shadow casters use texture alpha discard. The first two cascades refresh every frame and call the same shared wind-sway helper as the scene. Cascades two through four intentionally hold foliage casters static while their retained maps defer, preventing a visible 2/4/8-frame shadow-phase pop at distance.
+Main-pass cube faces and far terrain use counterclockwise outward winding with back-face culling. Cross and flat geometry emits both windings. Alpha-cutout blocks and their shadow casters use matching discard and wind-sway rules. Water and shadow casters retain their established culling rules.
 
-## 7. Far-terrain LOD and visibility
+## 7. Far-terrain LOD, water, and visibility
 
-The far renderer selects every immutable 256 by 256-block tile intersecting the visible radius-512 disk, including tiles wholly inside the nominal exact radius. Every coordinate requests a step-32 parent before optional refinement. Missing parents enter a broad nearest-first job and upload lane. Each connected nearby coordinate then gives its distance-selected step-16, step-8, step-4, or step-2 target one bounded lane before the complete parent disk is resident. While parents remain queued, eight-worker dispatch reserves four slots for coverage and admits at most four urgent connected refinements. Already running parent work is not preempted. A resident parent remains pinned while its coordinate is active. Cache pressure evicts the farthest refinement first.
+### Far base and canopy payloads
 
-Parent residency and drawable coverage use separate connected frontiers. The parent frontier tracks the nearest missing step-32 dependency. The drawable frontier also treats a protected exact-loading tile with only step 32 ready as missing. Tiles and fragments at or beyond the drawable frontier are suppressed, and the preceding 256 blocks fade into frame fog. A partially faded patch cannot become an occluder. Every far-owned fragment in the exact overlap remains protected, including a fully ready boundary tile whose exact requirements cover only part of the tile. The drawable frontier advances only after the camera exploration band has step 2 and every other protected overlap tile has step 8 or finer. This prevents out-of-order completion from exposing a disconnected distant island through a protected base-only tile.
+A far key has two independently published payloads:
 
-Exact ownership comes from `ExactSurfaceCoverageSnapshot`, not the configured radius alone. One 256-bit mask describes the 16 by 16 exact chunk columns overlapping each far tile. A bit is set only when all requirements currently published for that column are owned by exact meshes; empty completed meshes count as ready, while missing and unresolved requirements keep the column far-owned. A previously published exact mesh can retain ownership while an ordinary replacement is pending. Each far draw binds the center mask and all eight neighboring tile masks so a canopy crown or waterfall crossing a tile face queries its destination column. Exact opaque terrain draws first, and overlapping far terrain uses a small positive depth bias so resident exact surfaces win. Far ownership does not make step 32 displayable anywhere inside the exact overlap, even in a fully ready partial boundary tile. A partially masked patch cannot contribute to the terrain-horizon occluder. The nearest-gap handoff distance remains a conservative parent-selection fallback and diagnostic, not a radial fragment-ownership boundary.
+- Base mesh: terrain, standing water, and falls
+- Flora attachment: tree forms plus deterministic ground-flora clumps and impostors, or an explicit empty attachment
 
-Tile construction requests one-, two-, four-, eight-, sixteen-, or thirty-two-block `SurfaceFootprint` values through one `FarSurfaceSample` contract. The contract carries filtered terrain and water, conservative footprint bounds, and a compact material palette. Hydrology topology, water-body identity, water elevation, plate ownership, and feature anchors do not vary by footprint. Step-32 coverage geometry uses conservative minima so a parent cannot protrude through resident exact terrain. Material resolves once per active LOD cell, and greedy meshing joins only equal resolved materials. There is no aligned 32- or 64-block material cache.
+The base mesh is safe to draw immediately. Flora construction is lower priority and uploads into a separate allocation without replacing the base. Its worker budget remains zero during entry preparation and until the connected 96-chunk parent prefix is ready. Gameplay then guarantees exactly one low-priority flora worker even while exact or protected local terrain debt persists, which prevents continuously replenished terrain work from starving every far attachment. No second gameplay flora lane opens. Missing nearby flora publishes from PREVIEW ecology before any FINAL ecology promotion consumes the worker. The provisional attachment grounds against the displayed surface and remains resident until its FINAL ecology replacement uploads atomically. A delayed, blocked, canceled, or failed flora callback may not remove or delay terrain and water.
 
-Tile construction emits terrain tops, body-aware contour-clipped standing-water tops, explicit outlet-fall prisms, boundary skirts, and visual-only canopy impostors. Far water carries stable body identity and water kind. A coarse cell observing incompatible standing-water authorities refines from canonical samples rather than joining their levels. Bit 29 marks every boundary-skirt vertex. Per-draw metadata enables an edge only when its displayed neighbor is resident at a coarser step, and the fragment shader samples exact ownership on both sides of that far-LOD join. Far-LOD skirts are separate from exact missing-halo closure. Exact lateral openings already emit either a lit planned surface continuation or a dark inward cap, and exact vertical openings emit bedrock caps until the halo arrives. Partially wet cells use clipped shoreline triangles rather than rectangular sheets. The far mesh represents the visible top of a generated standing-water volume whose exact column is source-filled from its solid support through the surface, and it places that top on the exact full-block source plane.
+Presence of the render pipeline's flora-attachment entry is the sole completion state, including when the attachment has no allocation because it is empty. Refresh scans are bounded, rank missing drawable attachments before provisional FINAL promotions, and remain nearest-first within each class. Camera movement refreshes queued, parked, and follow-up priorities even when wanted membership is unchanged, and nearer work can replace the least-important queued or parked request at capacity.
 
-A lake outlet fall is not part of the receiving body's standing-water mesh. Its immutable sample carries top and bottom surfaces, width, normalized flow, and one receiver anchor. The half-open tile containing that anchor owns one complete narrow prism centered on the receiver, even if its footprint crosses a tile face. The prism has four vertical sides and one top, extends into the lower body's top source voxel so it overlaps the visible water plane, reaches the upper lip, and does not raise or cover the receiving surface. Neighbor tiles emit no duplicate prism.
+Exact surface and flora ownership use separate per-column readiness masks carried through the same center-plus-eight-neighbor uniform. Terrain, water, and falls retire against the surface mask. Far tree and ground-flora fragments retire only after the exact column's conservative flora section set is revision-ready. Every required exact surface section through 32 chunks receives generation, mesh, and upload priority before optional flora. The camera column and exploration band remain first. Nearby flora-bearing exact sections then run ahead of distant broad terrain after local terrain debt clears.
 
-Step-2 far canopies reuse accepted exact tree anchors, species, and dimensions without constructing ColumnPlans. Steps 4 through 32 use globally anchored 64-block aggregate forest cells with six fixed candidates and block-8 habitat and ground authority. One stable rank makes those aggregate tiers strict subsets. The collector's block-resolution habitat and root-water decision remains authoritative at step 32, so water elsewhere in the coarse 32 by 32 cell cannot suppress an accepted canopy. The trunk grounds on the displayed voxel. Half-open cells and tiles retain unique ownership. Bit 28 marks every impostor vertex for the shared vertex contract and diagnostics. The per-column exact mask clips each canopy fragment only when its destination exact column is owned. The 3 by 3 neighboring mask set covers crowns crossing tile faces. During a far topology transition, target canopies appear monotonically during the first half before source canopies retire monotonically during the second half. This overlap-safe exchange also handles the intentionally unrelated step-2 and aggregate anchor sets. Terrain, water, and canopy geometry currently share one cold-build and residency payload. Measured cold canopy work ranges from 250 to 1,165 milliseconds and can delay publication of an otherwise ready terrain and water parent. Staged canopy attachment remains a follow-up.
+The renderer publishes a separate exact collision-section snapshot after applying the same per-column
+handoff predicate, tagged with the active surface-coverage epoch. A stale epoch is rejected by
+`World`. A matching owned section uses loaded exact block and fluid data; an unowned planned section
+uses canonical generated terrain and fluid proxies, and an unresolved plan remains closed. Empty but
+revision-ready exact sections still publish exact air. Collision therefore changes authority with
+the visible handoff rather than when a partially loaded cube happens to arrive.
 
-Far tiles do not carry caves, structures, per-block flora, entities, collision, edits, runtime fluid state, save ownership, or exact biome transition detail. Canopy impostors are immutable visual summaries only.
+### Parent coverage and refinement
 
-Exact opaque terrain draws first and shares the HDR scene and depth attachments with far opaque terrain. Outside protected exact-loading tiles, biased parent tops remain behind exact depth and can fill cold-residency gaps after those parents are resident. Every far-owned overlap fragment is protected. It requires step 2 in the camera exploration band or step 8 or finer elsewhere in the exact overlap, including within a fully ready partial boundary tile. Water samples resolved opaque depth while hardware-testing and writing the nearest visible interface through media depth, so water and canopies use the same current per-column masks as opaque far terrain. Far water is appended to the same back-to-front water list as exact water. An ordinary far LOD replacement submits only the source water until completion, guaranteeing one refractive owner for every tile.
+Every selected 256 by 256-block coordinate needs a resident step-32 parent before refinement can display. A coarse parent remains drawable until a connected final replacement is resident. The drawable coverage frontier suppresses out-of-order islands beyond the nearest missing required tile.
 
-Known performance limitation: terrain, water, and canopy construction remains synchronous within one far-tile payload. Measured canopy work ranges from 250 to 1,165 milliseconds on cold tiles, delaying parent residency even when terrain and water are ready. Staged canopy attachment remains a follow-up, so do not describe the two-second cold-horizon target as accepted until that work and its reference-route validation are complete. Exact missing-halo faces already use explicit lit, dark, or bedrock closure caps and are invalidated when real halo data arrives.
+The runtime uses a hybrid spatial hierarchy. Mutable exact cubes remain sparse and hash-indexed because the near simulation region is dense and write-heavy. Distant terrain and water use the two-dimensional tile hierarchy because their drawable authority is a single-valued surface. Unified frame-level coverage publication applies the parent-retention and connected-child readiness principles used by Distant Horizons and Voxy. Rycraft does not implement a literal sparse voxel octree.
 
-Visibility is conservative and ordered:
+Final parents that protect the exact handoff use the learned authority's protected-handoff lane.
+Directly intersected native hydrology owners may share one lexicographically grouped FINAL
+rectangle of at most two by two owners. Each 517 by 517 owner crop must remain exactly equivalent
+to a separate FINAL request. Movement prefetch begins only after visible preview authority is ready,
+updates after one chunk of travel, and warms at most eight pages beyond the leading edge through the
+lowest-priority lane. A parked FINAL parent normally resumes when its learned completion becomes
+observable. If every learned, publication, hydrology, base, and mesh producer is idle, one bounded
+liveness probe resumes reconciliation without waiting for an impossible future completion.
+Exhausting the spill-summary bound latches generator recovery without removing the valid resident
+preview parent. The hydrology `deferredBuilds` metric counts completed typed deferrals, not parked or
+active work.
 
-1. Reject tiles outside the circular visible horizon.
-2. Require the coordinate's step-32 parent, apply the protected step-2 or step-8 display floor, and suppress coordinates beyond the drawable coverage gap.
-3. Select a displayed refinement from distance, retained immutable complexity, and the previous-tier hysteresis state.
-4. Reject the tile's sampled-surface AABB outside the view frustum.
-5. Sort survivors front to back.
-6. Reject a tile only when every fully covered bin in a 256-bin azimuth horizon has a nearer lower-bound horizon above that tile's maximum elevation angle.
+A same-key preview-to-final promotion retains two real GPU allocations until its bounded terrain and shadow transition completes. PREVIEW reconstructs the seeded Base latent's low-frequency terrain without a decoder residual, while FINAL adds that latent's decoded residual through the same cleanup path. Coarse conditioning is never rendered. PREVIEW water is temporary coarse coverage, while FINAL water is canonical. Preview and final meshes record water-body, transition, and connectivity signatures for diagnostics, and residual refinement may still change those signatures locally. Matching terrain, standing water, and falls switch authority together at the fog-covered midpoint. The CPU submits only the matching connected-water owner, and the shader enforces the same source-or-target cut. A topology-changing per-tile promotion is not accepted visual evidence until its complete 2,048-block hydrology owner and perimeter can publish together. A ready exact column may own its sections only when the displayed far surface is FINAL and no same-key authority transition remains active. Until then, the far parent retains the whole destination column. This prevents decoded FINAL exact geometry from cutting rectangular holes into a low-frequency PREVIEW surface.
 
-Each visible tile contributes sixteen 64 by 64-block terrain patches to the horizon. A patch uses its minimum sampled height, so it cannot claim coverage above any part of its continuous heightfield. Candidate maxima and occluder minima choose the near or far distance endpoint according to the sign of the vertical delta, which prevents false rejection from high viewpoints. The culler iterates only fully covered fixed bins and allocates no heap storage per tile.
+Cold entry uses the same base-parent ownership rule as gameplay. The preparation renderer publishes PREVIEW terrain and canonical water for the connected step-32 prefix through 96 chunks while also advancing exact spawn meshes. As soon as the connected frontier reaches the near band, it opens the camera-critical protected FINAL lane. The gate validates the selected radius, protected anchor, world epoch, view epoch, protected epoch, collision halo, and exact mesh revision, so it cannot declare entry ready from a smaller or stale selection after spawn relocation. The protected closure contains 4 targets at step 1, 8 at step 2, 12 at step 4, 16 at step 8, and 20 at step 16. All 60 publish only after their matching FINAL parents and every internal shared boundary are ready together. Adjacent PREVIEW bridges may refine those coordinates while the FINAL closure is incomplete. They never weaken the atomic FINAL publication rule, and the final commit retires them through the ordinary frame-safe path. The first gameplay frame opens ordinary refinement and the single low-priority canopy worker.
 
-An ordinary coordinate keeps its displayed tier until the next staged replacement is resident. Reentering a coordinate whose selected refinement and parent are already resident initializes directly to that refinement instead of displaying the parent again. Protected exact-loading requests lead urgent scheduling. Every far-owned camera-exploration-band fragment requires step 2, and every other far-owned fragment in the exact overlap requires step 8 or finer. Fully ready partial boundary tiles remain protected because their nonrequired fragments are still far-owned. Their step-32 parents remain resident but hidden. Protected results publish directly when ready and bypass ordinary grace and the 64-transition admission cap. A refinement still cannot display before its coordinate's parent is resident. Ordinary replacements perform the 0.65-second monotonic canopy exchange. Production fixtures prove that filtered terrain tiers can cross by as many as five blocks, so ordinary terrain does not use a partial source and target mix. A narrow terrain-only fog pulse hides each ordinary atomic topology swap, with normal far-tier terrain swapping at the temporal midpoint. Canopies use the full target-in, source-out two-phase exchange, and unswayed world coordinates keep wind from changing transition or coverage cells. Union bounds keep both ordinary topologies in the frustum, transition geometry does not become a horizon occluder, and a transition finishes before the desired tier is reevaluated. Skirts swap with the complete terrain topology that is actually visible, while source water remains the only water draw until completion. This preserves the voxel silhouette and 16-byte vertex ABI without a slope morph or extra vertex stream.
+Far terrain can refine through steps 16, 8, 4, 2, and 1. The bounded protected near closure requires FINAL step 1 beneath unresolved exact ownership, while ordinary visible terrain may also select FINAL step 1 when step 2 exceeds the screen-error target. A movement request retains its old published closure until the complete replacement closure is resident. Ordinary topology swaps may use the existing bounded fog transition, but fog may not cover a missing parent or a persistent crack.
 
-The steady-state render path reuses pre-reserved candidate, progressive-request, key, cache-result, upload, and 4,096-entry flat grace-record buffers. Tier promotion uses fixed counters, and draw culling uses fixed horizon storage. Far mesh construction, cache priority rebuilds, and cache retirement remain on utility workers. The connected refinement path adds no per-tile heap allocation to command encoding after renderer reset.
+The settled absolute bands are exact cubes through 32 chunks, step 2 through 64, step 4 through 128, step 8 through 256, and step 16 through 512. Step 32 is coverage-only. These bands are maximum-coarseness limits, not permission to discard visible detail. During gameplay, a conservative screen-space error estimate uses distance, viewport height, vertical FOV, and parent-tile relief to retain a finer tier while its projected geometric error exceeds 0.55 pixels. This refinement reaches step 1 wherever required. Step 1 is the irreducible voxel-grid floor, so its projected error may exceed 0.55 pixels immediately outside the exact handoff. Outward coarsening uses a 0.45-pixel threshold to avoid thrashing.
 
-The implementation is an adaptive tiled LOD inspired by [Geometry Clipmaps](https://hhoppe.com/geomclipmap.pdf) and [CDLOD](https://doi.org/10.1080/2151237X.2009.10129287). It is not a literal geometry clipmap. The angular test is informed by conservative front-to-back occlusion work such as [Hierarchical Z-Buffer Visibility](https://www.cs.cmu.edu/afs/cs/academic/class/15869-f11/www/readings/greene93_hierarchicalz.pdf), but it is not HZB and owns no depth pyramid. The renderer's only depth pyramid belongs to the screen-space indirect pass, which uses its min-depth hierarchy solely for ray traversal, never for visibility culling or draw submission.
+The bounded urgent lane orders the camera tile, protected handoff, exact fallback, and connected-wavefront classes before optional work. Within the nearby visible class, horizontal distance ranks before projected error. Screen-space error selects the desired tier but cannot let a farther tile delay closer missing detail. Camera-near critical work is a hard admission class, not a sorting hint. A missing protected PREVIEW step-32 parent may displace the worst queued or dependency-parked ordinary parent at the terrain cap. Current protected FINAL children and parents consume the first urgent capacity. At most one third of a cold frame's bounded submissions serve required PREVIEW bridge prerequisites, unused bridge capacity returns to current FINAL, and only remaining capacity may stage one predicted anchor. Prediction remains CPU-only and cannot enter GPU residency, display, or closure statistics before the canonical anchor changes. A camera move transfers protection instead of allowing work for the old anchor to retain it. CPU cache, upload, and GPU residency preserve the same class and may retire optional distant refinement or canopy to admit it. A requested protected FINAL role-selected key may use the complete GPU arena after that optional reclamation; alternate keys at the same coordinate do not inherit the exception. Distant work cannot evict a camera-critical job, cache entry, upload, or allocation. A camera-near PREVIEW bridge outranks distant FINAL refinement because it can reduce visible error immediately. The atomic 60-payload protected closure names its 4 step-1, 8 step-2, 12 step-4, 16 step-8, and 20 step-16 targets directly. Its 100 internal canonical boundaries must match before FINAL publication. Ordinary refinement retains adjacent bridge progression, including inside the pending protected closure and including a FINAL step-1 target when screen error requires it. Base-lineage PREVIEW steps 16, 8, 4, and 2 may temporarily reduce visible cell size while decoded authority is cold. Their displayed-error metric includes the measured revision-9 46-block maximum omitted residual, so visible FINAL replacements outrank flora and speculative work. A base promotion retains its PREVIEW source while a visible PREVIEW child depends on it, and a retired source routes the next bridge through FINAL authority. A coarse tier may preserve coverage while work is cold, but it cannot become the settled near surface after the required target and legal shell are resident.
 
-The renderer uses bounded direct indexed tile draws. It does not use the indirect command-buffer path described in Apple's [indirect command buffer documentation](https://developer.apple.com/documentation/metal/creating-an-indirect-command-buffer). Command-buffer and frame lifetime follow Apple's [Metal command-buffer best practices](https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/CommandBuffers.html).
+After the connected 96-chunk prefix is drawable, unfinished exact publication through 32 chunks or
+any connected visible desired-LOD miss pauses ordinary outer-parent submission and publication.
+Near jobs proceed nearest-first and may displace queued or dependency-parked outer parents.
+Displayed parents, the connected prefix, transition endpoints, exact fallbacks, and protected
+lineage remain pinned.
+
+Local far work admits 8 of the 16 workers alongside exact generation or meshing debt, 12 after exact
+debt clears, and all 16 only after both exact and local debt clear. Four admitted workers remain
+available to connected base coverage when it is queued. The single gameplay canopy worker remains
+lower priority and independently bounded.
+
+CPU-cache and GPU-arena pressure must not turn a ready camera-near refinement into a permanent coarse tile. Before rejecting that upload, residency maintenance reclaims the farthest optional non-displayed refinement or flora allocation. It never evicts a step-32 coverage parent, a displayed surface, either endpoint of an active transition, or the current protected replacement. The valid coarse parent remains drawable until the reclaimed space has accepted the replacement, so preemption cannot create a hole.
+
+`RYCRAFT_WORLDGEN_OVERLAY=lod` colors exact terrain cyan and far steps 1, 2, 4, 8, 16, and 32 blue, green, yellow, orange, red, and purple. `RYCRAFT_WORLDGEN_OVERLAY=authority` colors FINAL surfaces green and PREVIEW surfaces magenta. Capture both views when diagnosing a crack, rectangular hole, or unexpected coarse tile.
+
+### No skirts
+
+Production far meshes must emit zero downward skirt quads. A vertical panel is not terrain and must not hide an LOD mismatch. Tests assert `skirtQuadCount == 0`, including negative coordinates and the supplied seed-42 handoff.
+
+Every production far tile replaces its outer cell ring with a shared transition topology. Tile faces use the same canonical two-block boundary lattice, which contains every sample position used by the adjacent step-2 through step-32 tiers. The strip triangulates from those shared positions to each tile's coarse interior with positive winding. Positive-area terrain remains half-open to one tile, and no cross-tile vertical face is emitted. Interior closure geometry is legal only where two source terrain columns actually differ, never to bridge an LOD mismatch.
+
+Automated coverage exercises all four edges, all four corner pairs, steps 2 through 32, negative coordinates, fixed topology budgets, positive winding, exact projected area, duplicate-triangle rejection, and mixed step-16 to step-8 neighbors. These tests establish the topology contract, but accepted visual qualification still requires inspecting every adjacent join for cracks, ledges, or false faces.
+
+Legacy `skirtBottom`, bit-29, and skirt helper fields may remain in compatibility structures or tests, but production geometry may not create downward panels from them. Any future cleanup must preserve shader-layout compatibility deliberately.
+
+### Canonical water geometry
+
+Exact and far water consume one canonical hydrology authority. A render path may not infer a body only from terrain corners.
+
+Far cell bounds carry `waterTopologyPossible`. At step 32, a possible narrow route or contour triggers bounded interior probes and recursive or contour-based recovery. This prevents a river or lake inlet from disappearing between dry corners. Half-open tile ownership applies to standing-water contours, river ribbons, falls, and transition geometry.
+
+Water invariants:
+
+- A standing body has one `WaterBodyId` and stage.
+- Stable standing water emits planar top geometry.
+- Exact implicit sources and far water use the same visible plane.
+- Different body stages are not joined by one coarse polygon.
+- An abrupt stage change requires explicit rapid or waterfall ownership.
+- Vertical water faces are reserved for explicit falling columns.
+- A partially wet coarse cell follows the canonical shoreline rather than becoming a rectangular sheet.
+- Water must remain present at steps 2, 4, 8, 16, and 32 when topology crosses the cell.
+- A wetland is a shallow fringe owned by an existing ocean, lake, or river body. It may connect only to that exact body ID and stage, never to an unrelated standing surface.
+
+Analytic fragment normals, refraction, absorption, caustics, and reflections may animate appearance. They may not displace the ownership plane or fill a topology gap.
+
+### Culling and winding
+
+Exact and far opaque terrain uses outward counterclockwise winding and back-face culling. Water and shadow paths keep their established culling rules. Frustum culling runs before conservative front-to-back terrain-horizon culling.
+
+A partially owned, partially faded, or transitioning patch is not a conservative occluder. Canopy bounds are visual bounds and must not make absent terrain occlude a farther mountain.
 
 ## 8. Partial water geometry
 
@@ -176,7 +233,7 @@ Water renders after the opaque scene resolves into `_colorResolve`:
 - Anything that belongs behind water renders in the scene pass. Anything intentionally above water renders afterward.
 - **The wave field is one table.** `WATER_WAVES` in `shader_types.hpp` drives the filtered analytic fragment normal (`waterSurfaceNormal`), with the phase advected by the packed flow direction. Stable water geometry remains planar. Why: independent wave formulas once desynchronized the surface detail, and geometric displacement broke exact and far ownership boundaries.
 - **The SSR march starts at an angle-adaptive IGN-jittered stride.** Nearby and non-grazing rays retain the narrow original range; long grazing rays reduce that jitter, sample a bounded lower HDR mip, and fade only their unstable tail to the analytic sky reflection. When the camera is submerged, reflected hits attenuate per channel by `WATER_SIGMA_A` over the reflected path. On a thick-occluder reject the ray keeps marching instead of falling back. Why: a coherent stride turned the coarse march into stair bands, while full-resolution stochastic far hits alternated with sky misses into a black-and-bright checker pattern at grazing angles. The fallback is preferable once screen-space depth has no stable reflected surface.
-- **From below, the surface is physical.** Water-to-air Fresnel with total internal reflection past the critical angle (eased near it so per-quad wave normals do not flip whole cells into hard panels); SSR mirrors the underwater scene with the deep tint as fallback; foam, refraction distortion, and the floor-caustic add are above-water-only. Why: each of those painted above-water effects onto the from-below view, including white waterline streaks and mis-oriented caustic bands.
+- **From below, the surface is physical.** Water-to-air Fresnel uses total internal reflection past the critical angle, eased near it so per-quad wave normals do not flip whole cells into hard panels. SSR mirrors the underwater scene with the deep tint as fallback. Foam, refraction distortion, and the floor-caustic add are above-water-only. Why: each of those painted above-water effects onto the from-below view, including white waterline streaks and misoriented caustic bands.
 - **The Snell window transmits without absorption.** From below, the distance behind the surface is air (sky or shore), and the eye-to-surface water segment already belongs to the underwater overlay. Why: absorbing that air distance as if it were water saturated the whole window into opaque flat blue instead of a view of the world above.
 - **The interface side is a per-fragment geometric fact.** The water pass classifies each fragment by the sign of dot(V, N) (an elevated lake's underside seen from dry land is still the water-to-air interface; the camera flag only decides which medium rays travel through) and evaluates Schlick Fresnel against the transmitted angle on the water side, where cosT reaching zero at the critical angle rises continuously into total internal reflection with no hand-tuned ease. Why: branching on the camera flag saturated dot(V, N) to zero for every submerged pixel, which read as past-critical total internal reflection everywhere and turned the whole surface into a permanent mirror that never transmitted.
 - **The internal mirror reflects luminous water.** Where the underside SSR misses, the fallback is the shared water volume scatter terms (`WATER_SCATTER`, `WATER_AMBIENT`, the same constants the overlay inscatters with). Why: a near-black fallback read as flat dark panels, where a real internal mirror reflects the sunlit volume.
@@ -242,7 +299,7 @@ The UI overlay pass on the single-sample LDR drawable draws three fixed z-phases
 ### Physical atmosphere, clouds, and froxels
 
 - Daylight comes from an Earth-like LUT atmosphere, not a stylized daytime gradient. The renderer uses a 256 by 64 transmittance LUT, a 32 by 32 multiple-scattering LUT, and a 192 by 108 sky-view LUT with Rayleigh, Mie, ozone, altitude response, physical solar angular radius, and weather aerosols. Directional attenuation comes from the later volumetric cloud composite instead of a camera-local coverage scalar, so clear gaps remain physically bright and cloudy pixels are not darkened twice. Stars and the phase-shaped moon remain night overlays.
-- `CloudRenderer` owns deterministic 128-cubed Perlin-Worley base noise, 32-cubed erosion noise, and 2D curl noise. Weather blends stratus, cumulus, cumulonimbus, and cirrus profiles. Beer-Lambert extinction, dual-lobe phase scattering, ground and sky irradiance, short sun transmittance marches, erosion, and bounded multiple-scattering compensation define lighting.
+- `CloudRenderer` builds deterministic 128-cubed Perlin-Worley base noise, 32-cubed erosion noise, and 2D curl noise on one cancellable utility worker after world entry. The render thread uploads only a completed payload whose world instance and seed still match, and cloud quality Off starts no noise work or allocation. Cancellation is distinct from failure. A failed build retains its message, count, age, duration, and next retry time, retries after 100 and 500 milliseconds, then latches after the third failure until quality is re-enabled or a new world is bound. Each failed attempt is logged once. Weather blends stratus, cumulus, cumulonimbus, and cirrus profiles. Beer-Lambert extinction, dual-lobe phase scattering, ground and sky irradiance, short sun transmittance marches, erosion, and bounded multiple-scattering compensation define lighting.
 - Cloud motion uses weather wind in blocks per second with independent layer response and wrapped double-precision offsets. High and Medium both render true quarter-resolution volumetric clouds. High uses 48 view steps and 6 light steps; Medium uses 24 and 3.
 - Cloud color and hit depth use ping-pong temporal histories with invalid-sample rejection and neighborhood clamping, then upscale bilaterally against resolved depth. The snapped cloud-shadow map covers a 16,384-block footprint at 2,048 square on High and 1,024 square on Medium. Terrain, entities, volumetrics, the sun disc, and flare visibility consume the same transmittance authority.
 - The air medium uses a 160 by 104 by 64 frustum-aligned froxel grid with logarithmic depth slices. It injects aerosols, humidity, precipitation fog, atmospheric extinction, active directional scattering, blended terrain shadows, and cloud shadows. Half-resolution scattering and transmittance are temporally reprojected before composition.
@@ -250,8 +307,8 @@ The UI overlay pass on the single-sample LDR drawable draws three fixed z-phases
 
 ### Weather and storms
 
-- One immutable weather snapshot feeds terrain, entities, foliage, particles, clouds, atmosphere, froxels, wetness, lightning, and audio for the frame. Wind is expressed in blocks per second everywhere. Rain or snow follows temperature rather than biome.
-- Lightning IDs, positions, branches, and flashes derive from world seed, storm cell, and fixed time bucket. Lightning is depth-tested and cloud-aware, changes no blocks, and creates no fire. Thunder is procedural, bounded, de-duplicated, and delayed by strike distance at 343 blocks per second.
+- One immutable weather snapshot feeds terrain, entities, foliage, particles, clouds, atmosphere, froxels, wetness, lightning, and audio for the frame. Wind is expressed in blocks per second everywhere. Rain or snow follows temperature rather than biome. Particle billboard size remains in blocks, while its Beer-Lambert view distance converts to meters through the active world's physical scale.
+- Lightning IDs, positions, branches, and flashes derive from world seed, storm cell, and fixed time bucket. Lightning is depth-tested and cloud-aware, changes no blocks, and creates no fire. Thunder is procedural, bounded, de-duplicated, and delayed by physical strike distance at 343 meters per second.
 - `RYCRAFT_WEATHER` accepts stable `clear`, `overcast`, `rain`, `storm`, and `snow` presets. Forced time or weather invalidates every affected temporal history.
 - Lava remains emissive in linear HDR and seeds derived block light into neighboring transparent cells.
 
@@ -261,88 +318,85 @@ The celestial response follows production patterns documented by the [Sildur's V
 
 The orbital geometry follows [NASA's Moon phase explanation](https://science.nasa.gov/moon/moon-phases/) and uses the mean 29.53059-day synodic period published by the [U.S. Naval Observatory](https://aa.usno.navy.mil/faq/moon_phases), rounded to one deterministic world tick.
 
-## 12. Verification is part of rendering work
+## Verification is part of rendering work
 
-Run every rendering change with:
+Run Metal API and shader validation separately from performance:
 
 ```bash
-MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=nslog MTL_SHADER_VALIDATION=1
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ./build/src/rycraft
 ```
 
-Capture settled frames through `RYCRAFT_CAPTURE` and inspect the PNG, not only the exit status. Cubic and far-world work requires captures that exercise:
+Capture and open all of the following after queues settle:
 
-- high and low exact cube Y;
-- positive and negative X, Y, and Z seams;
-- partial water above and below the surface;
-- cold startup and a camera jump before all full-disk step-32 parents are resident, with no disconnected far island and with connected 16/8/4/2 refinement visible before full parent completion;
-- per-column exact ownership acquisition at missing, capped, and empty-completed requirements, plus ownership retention during stale halo remeshing, including a far tile with both owned and never-ready columns;
-- the 256-block drawable-coverage-frontier fade without a partially faded occluder, including a protected base-only tile that blocks farther islands;
-- direct seam agreement between exact emitted surfaces and every filtered footprint;
-- the visible distance taper across step-32, step-16, step-8, step-4, step-2, and exact voxel terrain, including step-2 fallback for every far-owned exploration-band fragment, step-8-or-finer fallback for every other far-owned exact-overlap fragment, a fully ready partial boundary tile, and flat and complex terrain at similar distances;
-- a forest spanning the exact overlap and all far tiers, with exact step-2 anchors, strict coarser aggregate subsets, two-phase canopy exchange, and no duplicate impostors in exact-owned columns or across tile faces;
-- a tier replacement while moving across both refine and coarsen hysteresis thresholds, with an atomic terrain swap beneath narrow fog and exactly one water owner;
-- a horizon-facing view at radius 512;
-- back-face culling from above, below, and inside overhangs;
-- conservative occlusion with a ridge in front of a taller distant peak;
-- mountains, cliffs, rivers, lakes, waterfalls, deltas, volcanoes, caves, aquifers, flora, land fauna, and underwater fish;
-- stable lake, river, ocean, and delta shorelines without vertical water walls or unrelated levels joined by coarse geometry, plus the seed-42 canonical source-volume regression at X=-557, Z=379, the supported seed-42 lake lip at X=-8235, Z=2976, the incised river across X=-12288 at Z=2653 and Z=2654, the canyon at X=-23904, Z=0, and the separate lake-to-river outlet fall at X=-8256, Z=3072;
-- the seed-764891 caldera at X=23029, Z=-111486 with a complete irregular dry rim, at least one block of freeboard, supported banks, and source water filling every voxel from the crater floor through its flat surface;
-- a receiver-centered outlet fall whose exact cells and half-open owned five-quad far prism join the upper lip to lower standing water without a long slab, duplicate tile ownership, a vertical gap, or a raised receiver;
-- active aboveground streaming with no full black loading panels and a lit generated terrain silhouette;
-- the seed-42 exact-to-far frontier near X=69.7936, Y=85.7918, Z=-1472.94, confirming protected fine fallback plus lit, dark, or bedrock exact closure caps while parent residency timing records the synchronous canopy cost;
-- underground travel across the hard-priority exploration band, including dark closed temporary openings, no skylight through missing vertical sections, and no block interaction through an unloaded cube;
-- crooked forests, isolated logs, broad overhangs, cave entrances, sealed caves, and lava-lit interiors at multiple light angles, verifying that direct shadows do not suppress ambient, block, or emissive light;
-- settled and moving views through every detailed cascade blend and into horizon coverage, with no ring, resolution jump, ownership double-cast, or stale projection;
-- SSGI history acceptance and rejection during ordinary motion, disocclusion, teleport, resize, FOV change, quality change, forced time, and forced weather;
-- `clear`, `overcast`, `rain`, `storm`, and `snow` at dawn, noon, dusk, and night, including rain-to-snow temperature selection, shared foliage and particle wind, wetness, cloud shadows, fog, and aerosol response;
-- views below, inside, and above stratus, cumulus, cumulonimbus, and cirrus layers, including mountain intersections and motion long enough to expose noise tiling or temporal trails;
-- lightning in front of and behind clouds, atmospheric flashes, repeatable event IDs, delayed thunder, and no world or fluid mutation;
-- sun and moon transition captures through civil twilight, every representative lunar phase, water reflections after sunset, phase-scaled moon brightness, and no competing directional lights;
-- physical atmosphere captures at dawn, noon, dusk, and night, with finite LUTs, stable horizon luminance, weather aerosol response, sun or moon occlusion, shafts, fog silhouettes, and no stylized daytime gradient authority;
-- clear daytime sky and terrain together, with frozen time, weather preset, cloud quality, and the relevant F3 weather and atmosphere diagnostics recorded. Reject a dark or night-like sky over terrain receiving daylight illumination, or a daylight sky paired with stale nighttime direct state;
-- distant textured slopes and alpha-cutout flora without shimmering, moire patterns, or disappearing coverage;
-- shadows, indirect lighting, atmosphere, clouds, froxels, weather particles, lightning, water, bloom, flare, tonemapping, and UI in the integrated frame.
+- Exact terrain at the v4 safe spawn
+- Exact-to-far handoff
+- Step 2, 4, 8, 16, and 32 terrain joins
+- A narrow river crossing a step-32 cell whose corners are dry
+- Lake, coast, waterfall, and elevated-to-lower transition views, plus delta views when an
+  implemented authority exposes them
+- A cold horizon before and after canopy enrichment
+- A blocked-canopy test scene with visible terrain and water
+- High terrain near the expanded ceiling and low terrain near Y=-128
+- A broad turn that exposes newly selected parent tiles
+- A supported floor torch in darkness, the single fixed front of an active and inactive furnace pair, the other nonemissive furnace faces, a chest front, lava, and a low bed from every exposed face, with indirect light both enabled and disabled. `RYCRAFT_SPAWN_MATERIALS=1` creates the block lineup only when `RYCRAFT_CAPTURE` also selects the disposable no-save path.
+- Rain and snow crossing an opaque silhouette and a reflective water surface
+- Settled and moving views through all four detailed shadow cascades and the horizon cascade, with no ownership double-cast, stale projection, or blend ring
+- Clear, overcast, rain, storm, and snow at dawn, noon, dusk, and night, including temperature-based rain-to-snow selection, shared foliage and particle wind, wetness, cloud shadows, fog, and aerosol response
+- Views below, inside, and above stratus, cumulus, cumulonimbus, and cirrus layers, including mountain intersections and motion long enough to expose noise tiling or temporal trails
+- Lightning in front of and behind clouds, repeatable event IDs, atmospheric flashes, delayed thunder, and no world or fluid mutation
+- Sun and moon transitions through civil twilight and representative lunar phases, with one exclusive direct-light source shared by terrain, water, clouds, froxels, and shadows
+- Physical atmosphere at dawn, noon, dusk, and night, with finite LUTs, stable horizon luminance, weather aerosol response, and no dark sky over daylight-lit terrain
+- A stable indirect-history view before and after a block-light edit, teleport, FOV change, sleep time jump, and far-only refinement
 
-Zero Metal validation messages is required. Log errors, successful capture, plausible frame, culling counts, and frame time are separate checks. Run the final 60 FPS view-distance-512 measurement without validation and verify total unified memory remains at or below 64 GB.
+Inspect for gaps, vertical panels, ledges, straight shoreline runs, cardinal sawteeth, missing narrow water, duplicate water surfaces, unrelated joined levels, canopy-triggered horizon holes, false occlusion, indirect-light leaks through closed walls, stale temporal ghosts, emission across a torch stick or furnace shell, emissive beds, and weather particles entering the opaque material history.
+
+Record exact model revision, generation fingerprint, seed, camera coordinates, LOD step, viewport, graphics settings, frame number, queue state, and validation-message count for each accepted capture.
 
 ## Review checklist
 
-For a diff touching rendering, shaders, meshing, fluid geometry, culling, LOD, or GPU-shared state:
-
-1. Is every GPU-shared structure defined once in `shader_types.hpp`, with size and offset assertions updated?
-2. Do sample count, color format, depth format, blending, and cull mode match every pass using each pipeline?
-3. Is each texture or buffer storage mode correct, and is size derived from the drawable, `sizeof`, or a bounded capacity?
-4. Does every fullscreen sampler flip V where required?
-5. Is dynamic per-frame data ring-buffered or otherwise safe from GPU overwrite, and are arena frees deferred until frame completion?
-6. Are matrices and depth conventions unchanged or covered by focused tests?
-7. Are exact mesh positions local in X, Y, and Z, with a full three-dimensional `ChunkOrigin`?
-8. Are far mesh positions tile-local, with the 64-bit CPU tile origin restored once per draw?
-9. Are exact cube AABBs, frustum tests, candidate distance, mesh keys, and water ordering three-dimensional?
-10. Does the snapshot contain every 18 by 18 by 18 block, fluid, packed voxel-light, and diagonal sample the exact mesher reads, plus separate 18 by 18 generated-surface and sky-cutoff authority?
-11. Do solid, transparent, packed lighting, changed-face reconciliation, edit invalidation, missing-neighbor caps, and water tests cover negative and positive X, Y, and Z faces, including cave mouths, isolated logs, broad roofs, sealed caves, overhangs, added and removed roofs, the real world-ceiling cutoff, and an incomplete sky path?
-12. Do loaded diagonal halo samples and conservative missing-halo fallbacks produce the same water corner on either side of a cube face?
-13. Are exact sub-block values binary-exact through the 0 through 16 local range?
-14. Does partial water honor levels, sources, stable top-only geometry, full-volume implicit generated sources, explicit falling sides, corners, flow bits, physics height, and water-to-water culling?
-15. Does the 16-byte vertex layout remain unchanged with fluid direction in bits 24 through 26, falling water in bit 27, far-canopy marking in bit 28, far-skirt marking in bit 29, water exterior-sky authority in bit 30, and bit 31 reserved?
-16. Do exact and far opaque faces use outward counterclockwise winding and back-face culling, while cross and flat flora emit both windings?
-17. Does every tile intersecting the visible disk request a step-32 parent before refinement, with a broad nearest-first base lane, a four-worker parent reservation, four urgent connected refinement slots spanning 16/8/4/2 tiers before full parent completion, and resident active parents pinned under pressure?
-18. Do separate parent and drawable frontiers suppress farther resident islands, does the drawable frontier treat protected base-only tiles as missing, does it fade the preceding 256 blocks, and are partially faded patches excluded from occluders?
-19. Does revision-aware readiness derive a 16 by 16 per-column ownership bit only from currently published requirements and exact meshes, count empty completed meshes as ready, protect every far-owned exact-overlap fragment from step-32 display including fully ready partial boundary tiles, bind eight neighboring masks for crossing geometry, and exclude partially masked patches from occluders? Separately, does every missing exact halo emit its explicit lit, dark, or bedrock closure cap and invalidate that mesh when the real halo arrives?
-20. Do filtered footprint samples preserve hydrology and feature ownership, use conservative parent minima, carry one weighted material palette, and avoid aligned material caches?
-21. Do refinements use 256-block alignment, distance-and-complexity selection, asymmetric hysteresis, step-2 protection for every far-owned exploration-band fragment, step-8 protection for every other far-owned exact-overlap fragment including fully ready partial boundary tiles, protected-job grace and transition-cap bypass, a narrow terrain-only swap pulse for ordinary replacements, monotonic two-phase canopy exchange, single-owner water, greedy merging, deterministic borders, and LOD skirts only on resident finer-to-coarser edges with displayed-neighbor and paired ownership checks?
-22. Do depth-biased opaque parents remain available behind exact terrain only outside protected exact-loading tiles, is synchronous canopy cost measured separately from terrain and water parent work, and do step 2 plus steps 4 through 32 retain their accepted anchors, deterministic aggregate subsets, species-shaped silhouettes, authoritative root-water placement, displayed-voxel grounding, and half-open ownership?
-23. Are frustum and 256-bin horizon culling conservative, front to back, and incapable of hiding a taller visible feature?
-24. Does documentation accurately avoid claiming HZB, literal geometry clipmaps, indirect command buffers, or GPU-driven submission, while crediting the screen-space indirect min-depth pyramid to ray traversal only?
-25. Are far shorelines contour-clipped and body-aware, with incompatible water authorities refined rather than joined, and do their source-water tops match the exact full-block plane without unsupported vertical walls?
-26. Does the block-texture array contain every 16-to-1 mip, preserve alpha-tested coverage, and use nearest magnification with trilinear 8x-anisotropic minification?
-27. Is translucent and post-resolve geometry ordered correctly across indirect light, clouds, lightning, water, froxels, weather particles, post effects, and UI?
-28. Do exact and far residency plus all post targets remain within the 64 GB unified-memory ceiling, and do the new persistent High-tier allocations remain within 768 MiB?
-29. Do missing boundaries use bounded exterior connectivity to keep sky-connected lateral caps lit, keep enclosed lateral and vertical openings dark and closed, honor complete edited roof cutoffs, seed skylight only from proven full-height paths, and prevent raycasts or edits from crossing unloaded cubes?
-30. Was the game run with Metal validation, were the required exact, far, surface, cave-GI, cascade-motion, weather, cloud-layer, atmosphere, lightning, celestial-transition, and underwater captures inspected, and was the final view-distance-512 performance run recorded separately?
-31. Does canonical ocean, river, lake, delta, waterfall, and bank authority produce supported full-depth implicit source water, preserve distinct lake levels behind a supported competitive watershed except at owned connectors, and keep each outlet fall separate from the receiving level?
-32. Do the five shadow records use view depth, exact Medium and High splits, 12.5 percent blend bands, per-cascade bias and filter scale, valid-coverage fallback, and refresh intervals of one, one, two, four, and eight frames?
-33. Do direct visibility, propagated skylight, baked accessibility, block light, emissive radiance, GTAO, and SSGI remain independent, with Off still applying ambient and with all temporal reset reasons covered?
-34. Do atmosphere LUT dimensions, optical coefficients, cloud-noise dimensions, step counts, physical wind units, cloud histories, shadow footprint, froxel dimensions, logarithmic slices, and underwater gating match the documented contracts?
-35. Does one immutable weather snapshot feed the frame, do stable presets cover every weather kind, and are lightning and thunder deterministic, bounded, delayed, non-destructive, and free of backlog replay?
-36. Is directional radiance exclusive across twilight, with below-horizon sun suppression, moon suppression through civil twilight, deterministic synodic phases, phase-scaled lunar light and shadows, and matching water glint, clouds, froxels, atmosphere, and flare?
-37. Does the physical sky use the same celestial time, true solar elevation, weather snapshot, and exposure path as the scene, so clear daylight cannot show a dark or night-like sky over a daylight-lit ground?
+- Does bootstrap UI render without constructing a world?
+- Do shared C++ and MSL layouts still match exactly?
+- Do all height paths accept Y=-128 through Y=1407?
+- Does exact ownership use the destination column for every fragment type?
+- Do generation, mesh admission, and upload prioritize every required surface section through the
+  full 32-chunk exact disk, with camera and exploration work first?
+- Does exact collision publish only from the matching coverage epoch and otherwise use canonical
+  generated terrain and fluid proxies?
+- Can any first-visible exact mesh bypass a pending bounded lighting transaction?
+- Can base terrain and water upload before canopy construction?
+- Can a canopy attachment invalidate, replace, or delay a resident parent?
+- Does canopy remain at zero during entry preparation and guarantee exactly one bounded gameplay
+  worker after the connected 96-chunk prefix is drawable, without a second lane?
+- Does step-32 water use topology probes when corners are dry?
+- Are water identities and stages preserved across every LOD?
+- Is every production `skirtQuadCount` zero?
+- Did any change reintroduce a downward panel under another name?
+- Do displayed neighbors, including active transition endpoints, stay within a 2:1 step ratio?
+- Do shared strips use identical boundary samples with half-open positive-area ownership?
+- Are parents retained until replacements are resident?
+- Can urgent protected PREVIEW coverage displace lower-ranked queued or parked ordinary coverage?
+- Does exact or connected desired-LOD debt pause ordinary outer submission and publication, and can
+  nearer work displace queued outer parents without evicting structural owners?
+- Does the pause cover both outer submission and outer publication, with nearby visible distance
+  ranked before projected error?
+- Do grouped protected FINAL owner crops exactly match independent owner requests, and does
+  `deferredBuilds` count completed typed deferrals rather than parked or active work?
+- Does current protected FINAL work precede bridge and predicted work?
+- Can only the requested protected FINAL key reclaim optional distant residency and use the complete
+  GPU arena while structural owners remain pinned?
+- Do every opaque terrain, entity, item, and boat pipeline declare the same HDR, surface, reactive, depth, and sample-count contract?
+- Does the 4x tile resolve average HDR and choose material and reactive data from the minimum-depth sample through a memoryless R32 key while resolved HDR alpha remains one? Does the single-sample contract bypass that tile work?
+- Do sky and highlight paths leave the surface and reactive attachments untouched?
+- Does the Hi-Z pass run after opaque resolve and before clouds, weather particles, water, volumetrics, exposure, and bloom?
+- Do clouds, rain, and snow use resolved-depth testing without a surface attachment?
+- Are emission masks filtered across all five mips and limited to lava, torch flames, and exactly one fixed -Z active furnace mouth?
+- Do low beds and inactive furnaces remain nonemissive receivers with authored culling and baked corner accessibility?
+- Do bed and torch raycasts ignore empty voxel space and draw selection outlines around the same authored bounds used for interaction?
+- Do every documented history discontinuity reset temporal state while far refinement and canopy arrival preserve it?
+- Do five shadow records retain their depth splits, blend bands, cached matrix and texture pairs, and one, one, two, four, and eight-frame maximum refresh intervals?
+- Do atmosphere LUT dimensions, cloud noise and march bounds, froxel dimensions, weather snapshot ownership, physical wind units, and underwater air-medium gating match their contracts?
+- Are lightning and thunder deterministic, bounded, delayed by distance, non-destructive, and free of file I/O on admission?
+- Does one active sun or moon authority prevent duplicate direct shading and below-horizon sunlight across shadows, water, clouds, and froxels while true solar state remains explicit for atmosphere and flare?
+- Do water-only edits preserve indirect history while opacity, lava, torch, and active-furnace changes reset it?
+- Do animals, dropped items, and boats use cached packed lighting, receive and cast cascaded shadows, and reject temporal history around motion?
+- Were Metal validation logs checked and captures opened?

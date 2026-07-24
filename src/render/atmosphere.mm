@@ -48,14 +48,20 @@ bool float4Changed(simd_float4 a, simd_float4 b, float epsilon) {
 
 } // namespace
 
-AtmosphereUniforms earthAtmosphereUniforms(float cameraWorldY, simd_float3 sunDirection,
-                                           simd_float3 sunRadiance, float aerosolDensity,
-                                           float humidity, uint32_t frameIndex) {
+AtmosphereUniforms earthAtmosphereUniforms(float cameraWorldY, WorldPhysicalScale physicalScale,
+                                           simd_float3 sunDirection, simd_float3 sunRadiance,
+                                           float aerosolDensity, float humidity,
+                                           uint32_t frameIndex) {
     AtmosphereUniforms result{};
     constexpr float GROUND_RADIUS_KM = 6360.0F;
     constexpr float TOP_RADIUS_KM = 6460.0F;
-    constexpr float BLOCK_TO_KM = 0.001F;
-    const float altitudeKm = std::max(cameraWorldY * BLOCK_TO_KM, 0.0F);
+    if (!physicalScale.valid()) {
+        physicalScale = LEGACY_WORLD_PHYSICAL_SCALE;
+    }
+    const float blockToKm =
+        static_cast<float>(physicalScale.positiveVerticalMetersPerBlock * 0.001);
+    const float altitudeKm =
+        static_cast<float>(altitudeMetersFromWorldY(cameraWorldY, physicalScale) * 0.001);
     result.cameraPositionKm = simd_make_float3(0.0F, GROUND_RADIUS_KM + altitudeKm, 0.0F);
     result.sunDirection = simd_normalize(sunDirection);
     result.sunRadiance = sunRadiance;
@@ -67,7 +73,7 @@ AtmosphereUniforms earthAtmosphereUniforms(float cameraWorldY, simd_float3 sunDi
     result.mieScatteringAndScaleHeight = simd_make_float4(mie, mie, mie, 1.2F);
     result.ozoneAbsorptionAndCenter = simd_make_float4(0.000650F, 0.001881F, 0.000085F, 25.0F);
     result.atmosphereRadii =
-        simd_make_float4(GROUND_RADIUS_KM, TOP_RADIUS_KM, 0.004675F, BLOCK_TO_KM);
+        simd_make_float4(GROUND_RADIUS_KM, TOP_RADIUS_KM, 0.004675F, blockToKm);
     result.weatherOptics = simd_make_float4(std::clamp(aerosolDensity, 0.0F, 4.0F),
                                             std::clamp(humidity, 0.0F, 1.0F), 0.0F, 0.8F);
     result.renderParams = simd_make_float4(static_cast<float>(frameIndex), 1.0F, 0.0F, 0.0F);

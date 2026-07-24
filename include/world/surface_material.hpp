@@ -87,8 +87,11 @@ inline bool frozen(const SurfaceSample& sample, Biome biome) {
 }
 
 inline bool submerged(const SurfaceSample& sample) {
-    if (!sample.hydrology.ocean && !sample.hydrology.river && !sample.hydrology.lake) return false;
-    const int terrainY = static_cast<int>(std::floor(sample.terrainHeight));
+    if (!sample.hydrology.ocean && !sample.hydrology.river && !sample.hydrology.lake &&
+        !sample.hydrology.wetland) {
+        return false;
+    }
+    const int terrainY = static_cast<int>(std::floor(geometryTerrainHeight(sample)));
     const int waterTopY = static_cast<int>(std::ceil(sample.waterSurface)) - 1;
     return terrainY < waterTopY;
 }
@@ -164,7 +167,7 @@ inline BlockType surface(const SurfaceSample& sample, Biome biome, const Volcani
         // crater or conduit remains exposed through the depositional cover.
         if (activeVent) return BlockType::BASALT;
         if (sample.hydrology.delta) return BlockType::SILT;
-        if (sample.hydrology.river || sample.hydrology.lake) {
+        if (sample.hydrology.river || sample.hydrology.lake || sample.hydrology.wetland) {
             return sample.soil.moisture > 0.62 ? BlockType::MUD : BlockType::CLAY;
         }
         if (sample.terrainHeight < SEA_LEVEL - 18.0 || sample.slope > 0.55) {
@@ -229,7 +232,8 @@ inline BlockType subsurface(const SurfaceSample& sample, Biome biome,
     if (isSubmerged) {
         if (activeVent) return outcrop(sample.geology);
         if (sample.hydrology.delta) return BlockType::SILT;
-        if (sample.hydrology.river || sample.hydrology.lake) return BlockType::CLAY;
+        if (sample.hydrology.river || sample.hydrology.lake || sample.hydrology.wetland)
+            return BlockType::CLAY;
         return sample.terrainHeight < SEA_LEVEL - 18.0 ? BlockType::GRAVEL : BlockType::SAND;
     }
     if (!activeVent && sample.hydrology.delta) return BlockType::SILT;

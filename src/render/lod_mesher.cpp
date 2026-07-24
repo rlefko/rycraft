@@ -31,7 +31,6 @@
 inline static int idx(int row, int col, int width) {
     return row * width + col;
 }
-
 // A face of `cur` toward `neighbor` renders when cur has cube geometry,
 // the neighbor doesn't fully hide it (isOpaque), and the two blocks differ,
 // interior faces between identical cutout blocks (leaf-leaf, glass-glass)
@@ -426,7 +425,11 @@ static void runGreedyPasses(int gridW, int gridH, int gridD, const Access& getBl
         for (int z = 0; z < gridD; ++z) {
             for (int x = 0; x < gridW; ++x) {
                 BlockType cur = getBlock(x, ly, z);
-                if (visible(cur, getBlock(x, ly + 1, z))) {
+                const BlockType above = getBlock(x, ly + 1, z);
+                // A low box covers the complete horizontal footprint at its
+                // base. Cull the supporting cube's top face without treating
+                // the low box as a full opacity barrier on its other sides.
+                if (visible(cur, above) && !(rendersAsCube(cur) && rendersAsLowBox(above))) {
                     faceKeys[idx(z, x, gridW)] =
                         packFaceKey(cur, cornersPlusY(x, ly + 1, z, bakeAO));
                     anyExposed = true;
@@ -691,10 +694,18 @@ static FloraPose floraPose(int x, int z, int64_t worldX, int64_t worldZ, BlockTy
 
 // Two perpendicular vertical quads share one coordinate-hashed pose. Explicit
 // reverse winding keeps every plant visible with back-face culling enabled.
-static void emitFloraCross(int x, int y, int z, int64_t worldX, int64_t worldZ, BlockType bt,
-                           uint8_t skyLight, uint8_t blockLight, std::vector<Vertex>& verts,
-                           std::vector<uint32_t>& idxs) {
-    const FloraPose pose = floraPose(x, z, worldX, worldZ, bt);
+static void emitAuthoredCross(int x, int y, int z, int64_t worldX, int64_t worldZ, BlockType bt,
+                              uint8_t skyLight, uint8_t blockLight, std::vector<Vertex>& verts,
+                              std::vector<uint32_t>& idxs) {
+    // A floor torch is an authored fixture, not vegetation. Keep it centered
+    // on its supporting block instead of inheriting the coordinate-jittered
+    // plant pose. Its dedicated face class also keeps plant SSS out of the
+    // torch stick and flame in the fragment shader.
+    const bool torch = isFloorTorch(bt);
+    const FloraPose pose = torch ? FloraPose{static_cast<float>(x) + 0.5F,
+                                             static_cast<float>(z) + 0.5F, 5.0F / 16.0F, 0.0F}
+                                 : floraPose(x, z, worldX, worldZ, bt);
+    const FaceNormal face = torch ? FaceNormal::TORCH_CROSS : FaceNormal::CROSS;
     const float y0 = static_cast<float>(y);
     const float y1 = static_cast<float>(y + 1);
 
@@ -714,10 +725,8 @@ static void emitFloraCross(int x, int y, int z, int64_t worldX, int64_t worldZ, 
     // Flora is unshaded by AO (cross-quads have no face plane to occlude, and
     // the shader gives CROSS a fixed light); pass fully-open corners. Block
     // light still tints it so grass near lava glows.
-    pushDoubleSidedQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalA, AO_ALL_OPEN,
-                        blockLight);
-    pushDoubleSidedQuad(verts, idxs, FaceNormal::CROSS, bt, skyLight, diagonalB, AO_ALL_OPEN,
-                        blockLight);
+    pushDoubleSidedQuad(verts, idxs, face, bt, skyLight, diagonalA, AO_ALL_OPEN, blockLight);
+    pushDoubleSidedQuad(verts, idxs, face, bt, skyLight, diagonalB, AO_ALL_OPEN, blockLight);
 }
 
 static void emitFlatFlora(int x, int y, int z, BlockType bt, uint8_t skyLight, uint8_t blockLight,
@@ -731,6 +740,123 @@ static void emitFlatFlora(int x, int y, int z, BlockType bt, uint8_t skyLight, u
     };
     pushDoubleSidedQuad(verts, idxs, FaceNormal::PLUS_Y, bt, skyLight, corners, AO_ALL_OPEN,
                         blockLight);
+}
+
+template <typename Access, typename LightAccess, typename SkyLightAccess>
+static FaceCorners authoredFaceCorners(int x, int y, int z, FaceNormal face, const Access& getBlock,
+                                       const LightAccess& getBlockLight,
+                                       const SkyLightAccess& getSkyLight) {
+    const auto cell = [&](int cx, int cy, int cz) -> CellLight {
+        return {getSkyLight(cx, cy, cz), getBlockLight(cx, cy, cz), isOpaque(getBlock(cx, cy, cz))};
+    };
+    const CellLight center = cell(x, y, z);
+    if (face == FaceNormal::PLUS_Y || face == FaceNormal::MINUS_Y) {
+        const CellLight xm = cell(x - 1, y, z), xp = cell(x + 1, y, z);
+        const CellLight zm = cell(x, y, z - 1), zp = cell(x, y, z + 1);
+        const CellLight mm = cell(x - 1, y, z - 1), pm = cell(x + 1, y, z - 1);
+        const CellLight pp = cell(x + 1, y, z + 1), mp = cell(x - 1, y, z + 1);
+        if (face == FaceNormal::PLUS_Y) {
+            return packFaceCorners(cornerTerms(center, xm, zm, mm), cornerTerms(center, xm, zp, mp),
+                                   cornerTerms(center, xp, zp, pp),
+                                   cornerTerms(center, xp, zm, pm));
+        }
+        return packFaceCorners(cornerTerms(center, xm, zm, mm), cornerTerms(center, xp, zm, pm),
+                               cornerTerms(center, xp, zp, pp), cornerTerms(center, xm, zp, mp));
+    }
+    if (face == FaceNormal::PLUS_X || face == FaceNormal::MINUS_X) {
+        const CellLight ym = cell(x, y - 1, z), yp = cell(x, y + 1, z);
+        const CellLight zm = cell(x, y, z - 1), zp = cell(x, y, z + 1);
+        const CellLight mm = cell(x, y - 1, z - 1), pm = cell(x, y + 1, z - 1);
+        const CellLight pp = cell(x, y + 1, z + 1), mp = cell(x, y - 1, z + 1);
+        if (face == FaceNormal::PLUS_X) {
+            return packFaceCorners(cornerTerms(center, ym, zm, mm), cornerTerms(center, yp, zm, pm),
+                                   cornerTerms(center, yp, zp, pp),
+                                   cornerTerms(center, ym, zp, mp));
+        }
+        return packFaceCorners(cornerTerms(center, ym, zm, mm), cornerTerms(center, ym, zp, mp),
+                               cornerTerms(center, yp, zp, pp), cornerTerms(center, yp, zm, pm));
+    }
+
+    const CellLight xm = cell(x - 1, y, z), xp = cell(x + 1, y, z);
+    const CellLight ym = cell(x, y - 1, z), yp = cell(x, y + 1, z);
+    const CellLight mm = cell(x - 1, y - 1, z), pm = cell(x + 1, y - 1, z);
+    const CellLight pp = cell(x + 1, y + 1, z), mp = cell(x - 1, y + 1, z);
+    if (face == FaceNormal::PLUS_Z) {
+        return packFaceCorners(cornerTerms(center, xm, ym, mm), cornerTerms(center, xp, ym, pm),
+                               cornerTerms(center, xp, yp, pp), cornerTerms(center, xm, yp, mp));
+    }
+    return packFaceCorners(cornerTerms(center, xm, ym, mm), cornerTerms(center, xm, yp, mp),
+                           cornerTerms(center, xp, yp, pp), cornerTerms(center, xp, ym, pm));
+}
+
+// Beds occupy one block horizontally but stop at 9/16 height. They stay in
+// the opaque draw section so their authored surfaces cast normal shadows and
+// receive the same smooth skylight, block light, and baked corner accessibility
+// as greedy cube faces.
+template <typename Access, typename LightAccess, typename SkyLightAccess>
+static void emitLowBox(int x, int y, int z, BlockType block, const Access& getBlock,
+                       const LightAccess& getBlockLight, const SkyLightAccess& getSkyLight,
+                       std::vector<Vertex>& vertices, std::vector<uint32_t>& indices) {
+    const float x0 = static_cast<float>(x);
+    const float x1 = static_cast<float>(x + 1);
+    const float y0 = static_cast<float>(y);
+    const float y1 = y0 + blockCollisionHeight(block);
+    const float z0 = static_cast<float>(z);
+    const float z1 = static_cast<float>(z + 1);
+
+    const auto push = [&](FaceNormal face, int lightX, int lightY, int lightZ,
+                          const QuadCorner(&corners)[4]) {
+        const FaceCorners lighting =
+            authoredFaceCorners(lightX, lightY, lightZ, face, getBlock, getBlockLight, getSkyLight);
+        pushQuad(vertices, indices, face, block, lighting.packedSky, corners, lighting.packedAO,
+                 lighting.packedBlock);
+    };
+
+    const QuadCorner top[4] = {{x0, y1, z0, 0.0F, 0.0F},
+                               {x0, y1, z1, 0.0F, 1.0F},
+                               {x1, y1, z1, 1.0F, 1.0F},
+                               {x1, y1, z0, 1.0F, 0.0F}};
+    push(FaceNormal::PLUS_Y, x, y, z, top);
+
+    if (!isOpaque(getBlock(x, y - 1, z))) {
+        const QuadCorner bottom[4] = {{x0, y0, z0, 0.0F, 0.0F},
+                                      {x1, y0, z0, 1.0F, 0.0F},
+                                      {x1, y0, z1, 1.0F, 1.0F},
+                                      {x0, y0, z1, 0.0F, 1.0F}};
+        push(FaceNormal::MINUS_Y, x, y - 1, z, bottom);
+    }
+
+    const auto sideVisible = [block](BlockType neighbor) {
+        return !isOpaque(neighbor) && neighbor != block;
+    };
+    if (sideVisible(getBlock(x + 1, y, z))) {
+        const QuadCorner side[4] = {{x1, y0, z0, 0.0F, 1.0F},
+                                    {x1, y1, z0, 0.0F, 0.0F},
+                                    {x1, y1, z1, 1.0F, 0.0F},
+                                    {x1, y0, z1, 1.0F, 1.0F}};
+        push(FaceNormal::PLUS_X, x + 1, y, z, side);
+    }
+    if (sideVisible(getBlock(x - 1, y, z))) {
+        const QuadCorner side[4] = {{x0, y0, z0, 0.0F, 1.0F},
+                                    {x0, y0, z1, 1.0F, 1.0F},
+                                    {x0, y1, z1, 1.0F, 0.0F},
+                                    {x0, y1, z0, 0.0F, 0.0F}};
+        push(FaceNormal::MINUS_X, x - 1, y, z, side);
+    }
+    if (sideVisible(getBlock(x, y, z + 1))) {
+        const QuadCorner side[4] = {{x0, y0, z1, 0.0F, 1.0F},
+                                    {x1, y0, z1, 1.0F, 1.0F},
+                                    {x1, y1, z1, 1.0F, 0.0F},
+                                    {x0, y1, z1, 0.0F, 0.0F}};
+        push(FaceNormal::PLUS_Z, x, y, z + 1, side);
+    }
+    if (sideVisible(getBlock(x, y, z - 1))) {
+        const QuadCorner side[4] = {{x0, y0, z0, 0.0F, 1.0F},
+                                    {x0, y1, z0, 0.0F, 0.0F},
+                                    {x1, y1, z0, 1.0F, 0.0F},
+                                    {x1, y0, z0, 1.0F, 1.0F}};
+        push(FaceNormal::MINUS_Z, x, y, z - 1, side);
+    }
 }
 
 static void markExteriorAir(const MeshSnapshot& snapshot, MeshScratch& scratch) {
@@ -1181,7 +1307,7 @@ buildGenericMesh(int gridW, int gridH, int gridD, const Access& getBlock,
         return depth <= 0 ? 15 : 0;
     };
 
-    // ---- Opaque section: cubes (with baked corner AO), then flora crosses ----
+    // ---- Opaque section: cubes, authored block shapes, then flora crosses ----
     runGreedyPasses(gridW, gridH, gridD, getBlock, getBlockLight, cubeFaceVisible, lightAt, 0.f,
                     /*bakeAO=*/true, scratch, output.vertices, output.indices);
 
@@ -1190,13 +1316,16 @@ buildGenericMesh(int gridW, int gridH, int gridD, const Access& getBlock,
             for (int x = 0; x < gridW; ++x) {
                 for (int y = 0; y < gridH; ++y) {
                     BlockType bt = getBlock(x, y, z);
-                    if (blockDefinition(bt).renderShape == BlockRenderShape::CROSS) {
-                        emitFloraCross(x, y, z, worldBaseX + x, worldBaseZ + z, bt,
-                                       lightAt(x, y, z), getBlockLight(x, y, z), output.vertices,
-                                       output.indices);
+                    if (rendersAsCross(bt)) {
+                        emitAuthoredCross(x, y, z, worldBaseX + x, worldBaseZ + z, bt,
+                                          lightAt(x, y, z), getBlockLight(x, y, z), output.vertices,
+                                          output.indices);
                     } else if (blockDefinition(bt).renderShape == BlockRenderShape::FLAT) {
                         emitFlatFlora(x, y, z, bt, lightAt(x, y, z), getBlockLight(x, y, z),
                                       output.vertices, output.indices);
+                    } else if (rendersAsLowBox(bt)) {
+                        emitLowBox(x, y, z, bt, getBlock, getBlockLight, lightAt, output.vertices,
+                                   output.indices);
                     }
                 }
             }

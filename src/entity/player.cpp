@@ -141,12 +141,19 @@ void Player::tick(World& world, const PlayerInput& in) {
     position.y += resolvedMovement.y;
     position.z += resolvedMovement.z;
 
+    // Keep the complete player volume inside the expanded cubic world. This
+    // also keeps creative flight positions within the persisted metadata
+    // contract instead of allowing an unsavable position above the top cube.
+    const bool aboveWorldCeiling = position.y > MAX_FEET_Y;
+    const bool worldCeilingBlocked = aboveWorldCeiling && velocity.y > 0.0F;
+    if (aboveWorldCeiling) position.y = MAX_FEET_Y;
+
     // 4. Vertical collision response: when the sweep clips the intended Y move
     // (floor or ceiling), zero velocity.y. Without this reset velocity.y kept
     // integrating downward while merely standing, saturating toward terminal
     // velocity; the instant the player stepped off a ledge that stored speed
     // dropped them a whole block in a single tick ("instantaneous fall").
-    bool yBlocked = std::abs(resolvedMovement.y - velocity.y) > 1e-6f;
+    bool yBlocked = worldCeilingBlocked || std::abs(resolvedMovement.y - velocity.y) > 1e-6f;
     onGround = yBlocked && velocity.y < 0.f;
     if (yBlocked) {
         velocity.y = 0.f;

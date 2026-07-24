@@ -2,6 +2,7 @@
 
 #include "common/counter_rng.hpp"
 #include "world/chunk.hpp"
+#include "world/learned_terrain.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,7 @@
 #include <numbers>
 #include <queue>
 #include <ranges>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
@@ -451,6 +453,7 @@ enum CellFlags : uint8_t {
 
 struct BasinSolution {
     BasinKey key;
+    bool physicalClimateAuthority = false;
     uint64_t erosionEpochs = 0;
     uint64_t erosionReroutes = 0;
     uint64_t erosionReceiverChanges = 0;
@@ -459,6 +462,11 @@ struct BasinSolution {
     std::vector<float> surface;
     std::vector<float> waterSurface;
     std::vector<float> discharge;
+    std::vector<float> baseflow;
+    std::vector<float> precipitationSeasonality;
+    std::vector<float> groundwaterRecharge;
+    std::vector<float> groundwaterHead;
+    std::vector<float> hydroperiod;
     std::vector<float> sediment;
     std::vector<float> channelDistance;
     std::vector<float> channelWidth;
@@ -519,6 +527,11 @@ struct BasinSolution {
         total += surface.capacity() * sizeof(float);
         total += waterSurface.capacity() * sizeof(float);
         total += discharge.capacity() * sizeof(float);
+        total += baseflow.capacity() * sizeof(float);
+        total += precipitationSeasonality.capacity() * sizeof(float);
+        total += groundwaterRecharge.capacity() * sizeof(float);
+        total += groundwaterHead.capacity() * sizeof(float);
+        total += hydroperiod.capacity() * sizeof(float);
         total += sediment.capacity() * sizeof(float);
         total += channelDistance.capacity() * sizeof(float);
         total += channelWidth.capacity() * sizeof(float);
@@ -789,6 +802,39 @@ float reconstruct(const std::vector<float>& field, double gridX, double gridZ) {
         result += field[weights.indices[index]] * weights.values[index];
     }
     return static_cast<float>(result);
+}
+
+double monotoneCubicSegment(double previous, double first, double second, double following,
+                            double amount) {
+    const double centralDelta = second - first;
+    const auto monotoneSlope = [](double before, double after) {
+        if (before * after <= 0.0) return 0.0;
+        return 2.0 * before * after / (before + after);
+    };
+    const double firstSlope = monotoneSlope(first - previous, centralDelta);
+    const double secondSlope = monotoneSlope(centralDelta, following - second);
+    const double t = clamp01(amount);
+    const double t2 = t * t;
+    const double t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * first + (t3 - 2.0 * t2 + t) * firstSlope +
+           (-2.0 * t3 + 3.0 * t2) * second + (t3 - t2) * secondSlope;
+}
+
+float reconstructSlopePreserving(const std::vector<float>& field, double gridX, double gridZ) {
+    const int x0 = std::clamp(static_cast<int>(std::floor(gridX)), 0, RASTER_EDGE - 2);
+    const int z0 = std::clamp(static_cast<int>(std::floor(gridZ)), 0, RASTER_EDGE - 2);
+    const double fx = clamp01(gridX - x0);
+    const double fz = clamp01(gridZ - z0);
+    std::array<double, 4> rows{};
+    for (int row = -1; row <= 2; ++row) {
+        const int sampleZ = std::clamp(z0 + row, 0, RASTER_EDGE - 1);
+        const auto at = [&](int offset) {
+            const int sampleX = std::clamp(x0 + offset, 0, RASTER_EDGE - 1);
+            return static_cast<double>(field[indexOf(sampleX, sampleZ)]);
+        };
+        rows[static_cast<size_t>(row + 1)] = monotoneCubicSegment(at(-1), at(0), at(1), at(2), fx);
+    }
+    return static_cast<float>(monotoneCubicSegment(rows[0], rows[1], rows[2], rows[3], fz));
 }
 
 double reconstructChannelDistance(const BasinSolution& solution, double gridX, double gridZ) {
@@ -1314,13 +1360,88 @@ private:
     std::unordered_map<BasinKey, double, BasinKeyHash> junctionWaters;
 };
 
+struct HydrologicFlux {
+    float runoffMm = 0.0F;
+    float baseflowMm = 0.0F;
+    float rechargeMm = 0.0F;
+    float seasonality = 0.0F;
+};
+
+HydrologicFlux deriveHydrologicFlux(const BasinHydroclimateSample& input, double resistance,
+                                    bool physicalClimate) {
+    const double precipitation =
+        std::clamp(std::isfinite(input.annualPrecipitationMm) ? input.annualPrecipitationMm : 0.0,
+                   0.0, 10'000.0);
+    const double normalizedResistance = clamp01((std::clamp(resistance, 0.15, 1.75) - 0.15) / 1.60);
+    if (!physicalClimate) {
+        const double recharge = precipitation * (0.24 - normalizedResistance * 0.10);
+        return {
+            .runoffMm = static_cast<float>(precipitation),
+            .baseflowMm = static_cast<float>(recharge * 0.45),
+            .rechargeMm = static_cast<float>(recharge),
+            .seasonality = 0.25F,
+        };
+    }
+
+    const double temperature = std::clamp(
+        std::isfinite(input.meanTemperatureC) ? input.meanTemperatureC : 15.0, -90.0, 70.0);
+    const double temperatureVariability = std::clamp(
+        std::isfinite(input.temperatureVariabilityC) ? input.temperatureVariabilityC : 10.0, 0.0,
+        100.0);
+    const double precipitationVariability =
+        std::clamp(std::isfinite(input.precipitationCoefficientOfVariation)
+                       ? input.precipitationCoefficientOfVariation
+                       : 0.25,
+                   0.0, 2.0);
+    const double potentialEvapotranspiration = std::clamp(
+        std::isfinite(input.potentialEvapotranspirationMm) ? input.potentialEvapotranspirationMm
+                                                           : 900.0,
+        0.0, 5'000.0);
+    const double lapseRatio = std::clamp(
+        std::abs(std::isfinite(input.lapseRateCPerMeter) ? input.lapseRateCPerMeter : -0.0065) /
+            0.0065,
+        0.5, 1.5);
+    const double seasonality =
+        clamp01(precipitationVariability * 0.42 + temperatureVariability / 100.0 * 0.38);
+    const double thawFraction =
+        temperatureVariability <= 1.0e-6
+            ? (temperature > 0.0 ? 1.0 : 0.0)
+            : clamp01(0.5 * (1.0 + std::erf(temperature /
+                                            (temperatureVariability * std::numbers::sqrt2))));
+
+    // Fu's Budyko relationship bounds long-term evapotranspiration by both
+    // available water and energy without inventing a monthly climate phase.
+    constexpr double BUDYKO_SHAPE = 2.0;
+    const double aridity = potentialEvapotranspiration / std::max(1.0, precipitation);
+    const double evapotranspirationFraction = clamp01(
+        1.0 + aridity - std::pow(1.0 + std::pow(aridity, BUDYKO_SHAPE), 1.0 / BUDYKO_SHAPE));
+    const double waterSurplus = precipitation * (1.0 - evapotranspirationFraction);
+    const double infiltrationFraction =
+        std::clamp(0.68 - normalizedResistance * 0.30 - seasonality * 0.22 -
+                       (1.0 - thawFraction) * 0.14 + (lapseRatio - 1.0) * 0.06,
+                   0.10, 0.82);
+    const double recharge = waterSurplus * infiltrationFraction;
+    const double baseflowFraction =
+        std::clamp(0.90 - seasonality * 0.55 - (1.0 - thawFraction) * 0.22, 0.18, 0.90);
+    const double baseflow = recharge * baseflowFraction;
+    const double quickflow = waterSurplus - recharge;
+    return {
+        .runoffMm = static_cast<float>(std::max(0.0, quickflow + baseflow)),
+        .baseflowMm = static_cast<float>(std::max(0.0, baseflow)),
+        .rechargeMm = static_cast<float>(std::max(0.0, recharge)),
+        .seasonality = static_cast<float>(seasonality),
+    };
+}
+
 void sampleInputs(
     const BasinSolution& solution, const BasinSolver::ElevationFunction& elevation,
     const BasinSolver::RainfallFunction& rainfall,
     const BasinSolver::RockResistanceFunction& rockResistance,
     const BasinSolver::PotentialEvapotranspirationFunction& potentialEvapotranspiration,
-    std::vector<float>& raw, std::vector<float>& rain, std::vector<float>& pet,
-    std::vector<float>& resistance) {
+    const BasinSolver::HydroclimateFunction& hydroclimate, std::vector<float>& raw,
+    std::vector<float>& rain, std::vector<float>& pet, std::vector<float>& runoff,
+    std::vector<float>& baseflow, std::vector<float>& seasonality,
+    std::vector<float>& groundwaterRecharge, std::vector<float>& resistance) {
     std::vector<int> coarseCoordinates;
     for (int coordinate = 0; coordinate < RASTER_EDGE - 1; coordinate += INPUT_SAMPLE_STRIDE) {
         coarseCoordinates.push_back(coordinate);
@@ -1332,6 +1453,10 @@ void sampleInputs(
     std::vector<float> coarseRaw(static_cast<size_t>(coarseEdge * coarseEdge));
     std::vector<float> coarseRain(static_cast<size_t>(coarseEdge * coarseEdge));
     std::vector<float> coarsePet(static_cast<size_t>(coarseEdge * coarseEdge));
+    std::vector<float> coarseRunoff(static_cast<size_t>(coarseEdge * coarseEdge));
+    std::vector<float> coarseBaseflow(static_cast<size_t>(coarseEdge * coarseEdge));
+    std::vector<float> coarseSeasonality(static_cast<size_t>(coarseEdge * coarseEdge));
+    std::vector<float> coarseGroundwaterRecharge(static_cast<size_t>(coarseEdge * coarseEdge));
     std::vector<float> coarseResistance(static_cast<size_t>(coarseEdge * coarseEdge));
     for (int cz = 0; cz < coarseEdge; ++cz) {
         for (int cx = 0; cx < coarseEdge; ++cx) {
@@ -1342,15 +1467,37 @@ void sampleInputs(
             const double height = elevation(worldX, worldZ);
             const size_t index = static_cast<size_t>(cz * coarseEdge + cx);
             coarseRaw[index] = static_cast<float>(height);
-            coarseRain[index] = static_cast<float>(rainfall(worldX, worldZ, height));
-            coarsePet[index] =
-                static_cast<float>(potentialEvapotranspiration
-                                       ? potentialEvapotranspiration(worldX, worldZ, height)
-                                       : std::clamp(1450.0 - coarseRain[index] * 0.35 +
-                                                        std::max(0.0, height - SEA_LEVEL) * 1.2,
-                                                    220.0, 1800.0));
             coarseResistance[index] =
                 static_cast<float>(std::clamp(rockResistance(worldX, worldZ), 0.15, 1.75));
+            BasinHydroclimateSample climate;
+            if (hydroclimate) {
+                climate = hydroclimate(worldX, worldZ, height);
+                coarseRain[index] = static_cast<float>(std::clamp(
+                    std::isfinite(climate.annualPrecipitationMm) ? climate.annualPrecipitationMm
+                                                                 : 0.0,
+                    0.0, 10'000.0));
+                coarsePet[index] = static_cast<float>(
+                    std::clamp(std::isfinite(climate.potentialEvapotranspirationMm)
+                                   ? climate.potentialEvapotranspirationMm
+                                   : 900.0,
+                               0.0, 5'000.0));
+            } else {
+                coarseRain[index] = static_cast<float>(rainfall(worldX, worldZ, height));
+                coarsePet[index] =
+                    static_cast<float>(potentialEvapotranspiration
+                                           ? potentialEvapotranspiration(worldX, worldZ, height)
+                                           : std::clamp(1450.0 - coarseRain[index] * 0.35 +
+                                                            std::max(0.0, height - SEA_LEVEL) * 1.2,
+                                                        220.0, 1800.0));
+                climate.annualPrecipitationMm = coarseRain[index];
+                climate.potentialEvapotranspirationMm = coarsePet[index];
+            }
+            const HydrologicFlux flux = deriveHydrologicFlux(climate, coarseResistance[index],
+                                                             static_cast<bool>(hydroclimate));
+            coarseRunoff[index] = flux.runoffMm;
+            coarseBaseflow[index] = flux.baseflowMm;
+            coarseSeasonality[index] = flux.seasonality;
+            coarseGroundwaterRecharge[index] = flux.rechargeMm;
         }
     }
 
@@ -1379,6 +1526,10 @@ void sampleInputs(
     raw.resize(RASTER_CELLS);
     rain.resize(RASTER_CELLS);
     pet.resize(RASTER_CELLS);
+    runoff.resize(RASTER_CELLS);
+    baseflow.resize(RASTER_CELLS);
+    seasonality.resize(RASTER_CELLS);
+    groundwaterRecharge.resize(RASTER_CELLS);
     resistance.resize(RASTER_CELLS);
     // Inclusive catchment-edge derivatives read one neighbor from the apron.
     // Initialize the complete raster even though routing ownership itself is
@@ -1389,6 +1540,10 @@ void sampleInputs(
             raw[index] = interpolate(coarseRaw, x, z);
             rain[index] = interpolate(coarseRain, x, z);
             pet[index] = interpolate(coarsePet, x, z);
+            runoff[index] = interpolate(coarseRunoff, x, z);
+            baseflow[index] = interpolate(coarseBaseflow, x, z);
+            seasonality[index] = interpolate(coarseSeasonality, x, z);
+            groundwaterRecharge[index] = interpolate(coarseGroundwaterRecharge, x, z);
             resistance[index] = interpolate(coarseResistance, x, z);
         }
     }
@@ -1769,7 +1924,8 @@ std::vector<uint8_t> resolveOutletTypes(const std::vector<uint8_t>& terminals,
 }
 
 void injectGuideDischarge(const BasinSolution& solution, const std::vector<ChannelGuide>& guides,
-                          std::vector<float>& accumulation) {
+                          std::vector<float>& accumulation,
+                          const std::vector<float>* guideFractions = nullptr) {
     for (const ChannelGuide& guide : guides) {
         const double anchorX = guide.startX;
         const double anchorZ = guide.startZ;
@@ -1781,21 +1937,27 @@ void injectGuideDischarge(const BasinSolution& solution, const std::vector<Chann
             static_cast<int>(std::lround((anchorZ - solution.originZ) / BASIN_RASTER_SPACING)) +
                 RASTER_APRON,
             1, RASTER_EDGE - 2);
-        accumulation[indexOf(gridX, gridZ)] += static_cast<float>(guide.discharge * 0.32);
+        const int anchor = indexOf(gridX, gridZ);
+        const double fraction =
+            guideFractions != nullptr
+                ? std::clamp(static_cast<double>((*guideFractions)[anchor]), 0.0, 1.0)
+                : 1.0;
+        accumulation[anchor] += static_cast<float>(guide.discharge * 0.32 * fraction);
     }
 }
 
-void accumulateFlow(const std::vector<float>& rain, const std::vector<Receiver>& receivers,
+void accumulateFlow(const std::vector<float>& localFlux, const std::vector<Receiver>& receivers,
                     const std::vector<int32_t>& upstreamOrder, std::vector<float>& accumulation,
-                    const BasinSolution& solution, const std::vector<ChannelGuide>& guides) {
+                    const BasinSolution& solution, const std::vector<ChannelGuide>& guides,
+                    const std::vector<float>* guideFractions = nullptr) {
     accumulation.resize(RASTER_CELLS);
     constexpr double CELL_SQUARE_KILOMETERS =
         BASIN_RASTER_SPACING * BASIN_RASTER_SPACING / 1'000'000.0;
     for (int index = 0; index < RASTER_CELLS; ++index) {
         accumulation[index] =
-            static_cast<float>(std::max(0.001, rain[index] * CELL_SQUARE_KILOMETERS));
+            static_cast<float>(std::max(0.001, localFlux[index] * CELL_SQUARE_KILOMETERS));
     }
-    injectGuideDischarge(solution, guides, accumulation);
+    injectGuideDischarge(solution, guides, accumulation, guideFractions);
     for (int index : upstreamOrder) {
         const Receiver& receiver = receivers[index];
         if (receiver.first >= 0) {
@@ -3346,6 +3508,12 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
                                    second.kind == WaterTransitionKind::RASTER_CHANNEL);
     };
 
+    // The v3 BasinSolver remains a self-contained legacy authority. Learned
+    // v4 worlds bypass it for NativeHydrologyRouter, so v4 never inherits the
+    // legacy conflict-bank policy below. Keep the policy local to the old
+    // raster authority instead of changing its established water outcomes.
+    const bool legacyBankAuthority = !solution.physicalClimateAuthority;
+
     std::vector<int16_t> stages(LOCAL_CELLS, UNSET);
     std::vector<int16_t> beds(LOCAL_CELLS, UNSET);
     std::vector<int16_t> conflictBankTargets(LOCAL_CELLS, UNSET);
@@ -3361,6 +3529,17 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
     };
     const auto retainCell = [&](uint32_t packed, int16_t candidateStage, int16_t candidateBed,
                                 RapidOwnerKind ownerKind, int32_t ownerIndex) {
+        if (!legacyBankAuthority && candidateBed <= SEA_LEVEL * 8 &&
+            ownerKind != RapidOwnerKind::EXPLICIT_FALL) {
+            // Every submerged routed bed is part of the same ocean
+            // backwater, regardless of which representation sampled it.
+            // Letting a raster reach retain a higher stage beside source sea
+            // water produced untagged vertical faces at river mouths.
+            candidateStage = static_cast<int16_t>(SEA_LEVEL * 8);
+            candidateBed = std::min<int16_t>(candidateBed, candidateStage - 1);
+            ownerKind = RapidOwnerKind::NONE;
+            ownerIndex = -1;
+        }
         if (ownerKind == RapidOwnerKind::CHANNEL_GUIDE && ownerIndex >= 0 &&
             static_cast<size_t>(ownerIndex) < solution.guides.size()) {
             const ChannelGuide& guide = solution.guides[static_cast<size_t>(ownerIndex)];
@@ -3380,7 +3559,7 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
         }
         const SettledOwner candidateOwner{.index = ownerIndex, .kind = ownerKind};
         int16_t& retained = stages[packed];
-        if (conflictBankTargets[packed] != UNSET) {
+        if (legacyBankAuthority && conflictBankTargets[packed] != UNSET) {
             conflictBankTargets[packed] = std::max<int16_t>(
                 conflictBankTargets[packed], static_cast<int16_t>(candidateStage + 4));
             return;
@@ -3447,11 +3626,29 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
             }
             return;
         }
-        conflictBankTargets[packed] =
-            static_cast<int16_t>(std::max<int>(retained, candidateStage) + 4);
-        retained = UNSET;
-        beds[packed] = UNSET;
-        owners[packed] = {};
+        if (legacyBankAuthority) {
+            conflictBankTargets[packed] =
+                static_cast<int16_t>(std::max<int>(retained, candidateStage) + 4);
+            retained = UNSET;
+            beds[packed] = UNSET;
+            owners[packed] = {};
+            return;
+        }
+
+        // Distinct routed representations can overlap at portals and
+        // confluences. Keep the lower natural stage and the deeper bed so a
+        // disagreement remains wet and can be reconciled by the canonical
+        // gradient pass. This path is reserved for physical-climate callers;
+        // learned v4 routes through NativeHydrologyRouter instead.
+        if (candidateStage < retained ||
+            (candidateStage == retained &&
+             std::pair{candidateOwner.kind, candidateOwner.index} <
+                 std::pair{owners[packed].kind, owners[packed].index})) {
+            retained = candidateStage;
+            owners[packed] = candidateOwner;
+        }
+        beds[packed] =
+            std::min<int16_t>({beds[packed], candidateBed, static_cast<int16_t>(retained - 1)});
     };
 
     for (int source = 0; source < RASTER_CELLS; ++source) {
@@ -3759,11 +3956,9 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
         }
     }
 
-    // Routed cells may touch but cannot occupy adjacent cells at incompatible
-    // elevations, even when two overlapping segments belong to the same
-    // corridor. Retain the higher water and turn the lower contact into a
-    // solid retaining bank. Equal and one-eighth handoffs are already valid
-    // shared transitions and remain wet.
+    // The v3 raster authority publishes a dry bank at an incompatible wet
+    // contact. Native v4 uses its independent D-infinity route and never
+    // reaches this legacy branch.
     for (const uint32_t packed : touched) {
         if (stages[packed] == UNSET) continue;
         const int localX = static_cast<int>(packed % LOCAL_EDGE) + TRANSITION_MIN_LOCAL;
@@ -3780,20 +3975,27 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
                 std::abs(static_cast<int>(stages[neighbor]) - stages[packed]) <= 1) {
                 continue;
             }
-            const uint32_t lower = stages[packed] < stages[neighbor] ? packed : neighbor;
-            const int16_t upperStage = std::max(stages[packed], stages[neighbor]);
-            int16_t& bankTarget = conflictBankTargets[lower];
-            const int16_t requiredTarget = static_cast<int16_t>(upperStage + 4);
-            bankTarget = bankTarget == UNSET ? requiredTarget
-                                             : std::max<int16_t>(bankTarget, requiredTarget);
-            stages[lower] = UNSET;
-            beds[lower] = UNSET;
-            owners[lower] = {};
-            if (lower == packed) break;
+            if (legacyBankAuthority) {
+                const uint32_t lower = stages[packed] < stages[neighbor] ? packed : neighbor;
+                const int16_t upperStage = std::max(stages[packed], stages[neighbor]);
+                int16_t& bankTarget = conflictBankTargets[lower];
+                const int16_t requiredTarget = static_cast<int16_t>(upperStage + 4);
+                bankTarget = bankTarget == UNSET ? requiredTarget
+                                                 : std::max<int16_t>(bankTarget, requiredTarget);
+                stages[lower] = UNSET;
+                beds[lower] = UNSET;
+                owners[lower] = {};
+                if (lower == packed) break;
+            } else {
+                const uint32_t higher = stages[packed] > stages[neighbor] ? packed : neighbor;
+                const int16_t lowerStage = std::min(stages[packed], stages[neighbor]);
+                stages[higher] = static_cast<int16_t>(lowerStage + 1);
+                beds[higher] = std::min<int16_t>(beds[higher], stages[higher] - 1);
+            }
         }
     }
 
-    std::array<std::vector<uint32_t>, STAGE_BUCKETS> buckets;
+    std::vector<std::vector<uint32_t>> buckets(static_cast<size_t>(STAGE_BUCKETS));
     for (const uint32_t packed : touched) {
         if (stages[packed] == UNSET) continue;
         buckets[static_cast<size_t>(stages[packed] - MINIMUM_STAGE_EIGHTHS)].push_back(packed);
@@ -3813,7 +4015,12 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
                     continue;
                 }
                 const uint32_t neighbor = packedIndex(neighborX, neighborZ);
-                if (stages[neighbor] == UNSET || owners[neighbor] != owners[packed] ||
+                const bool incompatibleOwner =
+                    legacyBankAuthority
+                        ? owners[neighbor] != owners[packed]
+                        : owners[neighbor].kind == WaterTransitionKind::EXPLICIT_FALL ||
+                              owners[packed].kind == WaterTransitionKind::EXPLICIT_FALL;
+                if (stages[neighbor] == UNSET || incompatibleOwner ||
                     stages[neighbor] <= surface + 1) {
                     continue;
                 }
@@ -3912,7 +4119,7 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
                     continue;
                 }
                 const uint32_t candidate = packedIndex(candidateX, candidateZ);
-                if (conflictBankTargets[candidate] != UNSET ||
+                if ((legacyBankAuthority && conflictBankTargets[candidate] != UNSET) ||
                     (stages[candidate] != UNSET && owners[candidate] != owner) ||
                     (stages[candidate] != UNSET && stages[candidate] < predecessorStage)) {
                     continue;
@@ -3950,10 +4157,19 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
                 break;
             }
             if (!placed) {
-                conflictBankTargets[packed] = static_cast<int16_t>(stage + 4);
-                stages[packed] = UNSET;
-                beds[packed] = UNSET;
-                owners[packed] = {};
+                if (legacyBankAuthority) {
+                    conflictBankTargets[packed] = static_cast<int16_t>(stage + 4);
+                    stages[packed] = UNSET;
+                    beds[packed] = UNSET;
+                    owners[packed] = {};
+                } else {
+                    // An incomplete partial state degrades to its lower source
+                    // plane. It must never be replaced by a raised dry guard.
+                    const int16_t sourceStage =
+                        static_cast<int16_t>(std::floor(static_cast<double>(stage) / 8.0) * 8.0);
+                    stages[packed] = sourceStage;
+                    beds[packed] = std::min<int16_t>(beds[packed], sourceStage - 1);
+                }
                 break;
             }
         }
@@ -4187,7 +4403,7 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
     // multi-level step beside the next cell. Compute the least one-eighth
     // majorant of the retained stages, propagating higher physical boundary
     // conditions down instead of lowering their source predecessors.
-    std::array<std::vector<uint32_t>, STAGE_BUCKETS> connectedStageBuckets;
+    std::vector<std::vector<uint32_t>> connectedStageBuckets(static_cast<size_t>(STAGE_BUCKETS));
     for (const uint32_t packed : touched) {
         if (stages[packed] == UNSET) continue;
         connectedStageBuckets[static_cast<size_t>(stages[packed] - MINIMUM_STAGE_EIGHTHS)]
@@ -4256,7 +4472,7 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
         if (hasPredecessor) continue;
         if (touchesLowerSource) {
             stages[packed] = lowerSourceStage;
-        } else {
+        } else if (legacyBankAuthority) {
             int16_t& bankTarget = conflictBankTargets[packed];
             const int16_t requiredTarget = static_cast<int16_t>(stages[packed] + 4);
             bankTarget = bankTarget == UNSET ? requiredTarget
@@ -4264,6 +4480,9 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
             stages[packed] = UNSET;
             beds[packed] = UNSET;
             owners[packed] = {};
+        } else {
+            stages[packed] = lowerSourceStage;
+            beds[packed] = std::min<int16_t>(beds[packed], lowerSourceStage - 1);
         }
         for (const auto [offsetX, offsetZ] : CARDINAL) {
             const int neighborX = localX + offsetX;
@@ -4277,9 +4496,10 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
     }
 
     // Deepen abrupt same-owner bed contacts until every cardinal floor step
-    // is at most one block. This retains the deeper physical bed while
-    // removing storage-cell cliffs beneath otherwise continuous water.
-    std::array<std::vector<uint32_t>, STAGE_BUCKETS> bedBuckets;
+    // is at most one block. Adjacent raster segments belong to one drainage
+    // owner even when their local edge indices differ. This retains the
+    // deeper physical bed while removing storage-cell cliffs.
+    std::vector<std::vector<uint32_t>> bedBuckets(static_cast<size_t>(STAGE_BUCKETS));
     for (const uint32_t packed : touched) {
         if (stages[packed] == UNSET) continue;
         bedBuckets[static_cast<size_t>(beds[packed] - MINIMUM_STAGE_EIGHTHS)].push_back(packed);
@@ -4299,8 +4519,10 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
                     continue;
                 }
                 const uint32_t neighbor = packedIndex(neighborX, neighborZ);
-                if (stages[neighbor] == UNSET || owners[neighbor] != owners[packed] ||
-                    beds[neighbor] <= bed + 8) {
+                const bool sameOwner = legacyBankAuthority
+                                           ? owners[neighbor] == owners[packed]
+                                           : connectedOwner(owners[neighbor], owners[packed]);
+                if (stages[neighbor] == UNSET || !sameOwner || beds[neighbor] <= bed + 8) {
                     continue;
                 }
                 beds[neighbor] = static_cast<int16_t>(bed + 8);
@@ -4310,109 +4532,113 @@ void buildSettledRasterWater(BasinSolution& solution, const std::vector<Receiver
         }
     }
 
-    std::vector<SettledBankCell> bankCandidates;
-    bankCandidates.reserve(touched.size() / 3);
-    for (const uint32_t packed : touched) {
-        if (stages[packed] == UNSET) {
-            if (conflictBankTargets[packed] != UNSET) {
+    solution.settledBankCells.clear();
+    solution.settledBankRowOffsets.resize(TRANSITION_ROW_COUNT + 1);
+    if (legacyBankAuthority) {
+        std::vector<SettledBankCell> bankCandidates;
+        bankCandidates.reserve(touched.size() / 3);
+        for (const uint32_t packed : touched) {
+            if (stages[packed] == UNSET) {
+                if (conflictBankTargets[packed] != UNSET) {
+                    bankCandidates.push_back({
+                        .localX = static_cast<int16_t>(packed % LOCAL_EDGE + TRANSITION_MIN_LOCAL),
+                        .localZ = static_cast<int16_t>(packed / LOCAL_EDGE + TRANSITION_MIN_LOCAL),
+                        .targetEighths = conflictBankTargets[packed],
+                    });
+                }
+                continue;
+            }
+            const int localX = static_cast<int>(packed % LOCAL_EDGE) + TRANSITION_MIN_LOCAL;
+            const int localZ = static_cast<int>(packed / LOCAL_EDGE) + TRANSITION_MIN_LOCAL;
+            const double gridX = static_cast<double>(localX) / BASIN_RASTER_SPACING + RASTER_APRON;
+            const double gridZ = static_cast<double>(localZ) / BASIN_RASTER_SPACING + RASTER_APRON;
+            double flowX = reconstruct(solution.flowX, gridX, gridZ);
+            double flowZ = reconstruct(solution.flowZ, gridX, gridZ);
+            const double flowLength = std::hypot(flowX, flowZ);
+            if (flowLength > 1.0e-6) {
+                flowX /= flowLength;
+                flowZ /= flowLength;
+            }
+            for (const auto [offsetX, offsetZ] : CARDINAL) {
+                const int neighborX = localX + offsetX;
+                const int neighborZ = localZ + offsetZ;
+                if (neighborX < TRANSITION_MIN_LOCAL || neighborX > TRANSITION_MAX_LOCAL ||
+                    neighborZ < TRANSITION_MIN_LOCAL || neighborZ > TRANSITION_MAX_LOCAL) {
+                    continue;
+                }
+                const uint32_t neighbor = packedIndex(neighborX, neighborZ);
+                if (stages[neighbor] != UNSET) continue;
+                const double downstreamAlignment = flowX * offsetX + flowZ * offsetZ;
+                const double neighborGridX =
+                    static_cast<double>(neighborX) / BASIN_RASTER_SPACING + RASTER_APRON;
+                const double neighborGridZ =
+                    static_cast<double>(neighborZ) / BASIN_RASTER_SPACING + RASTER_APRON;
+                const double neighborTerrain =
+                    reconstruct(solution.surface, neighborGridX, neighborGridZ);
+                const double neighborWater =
+                    reconstruct(solution.waterSurface, neighborGridX, neighborGridZ);
+                const double neighborShoreWater =
+                    reconstruct(solution.shoreWaterSurface, neighborGridX, neighborGridZ);
+                const double stage = static_cast<double>(stages[packed]) / 8.0;
+                const double neighborChannelWidth =
+                    reconstruct(solution.channelWidth, neighborGridX, neighborGridZ);
+                const bool neighborRoutedWater =
+                    reconstruct(solution.discharge, neighborGridX, neighborGridZ) >=
+                        MIN_CHANNEL_DISCHARGE &&
+                    reconstructChannelDistance(solution, neighborGridX, neighborGridZ) <=
+                        neighborChannelWidth * 0.55;
+                const bool neighborStandingWater =
+                    flagWeight(solution, neighborGridX, neighborGridZ, CELL_OCEAN) >= 0.5 ||
+                    (reconstruct(solution.lakeDepth, neighborGridX, neighborGridZ) > 0.05 &&
+                     reconstruct(solution.lakeShoreDistance, neighborGridX, neighborGridZ) > 0.0);
+                const bool compatibleStandingWater =
+                    (neighborRoutedWater || neighborStandingWater) &&
+                    neighborWater > neighborTerrain + 0.05 &&
+                    std::abs((neighborStandingWater && neighborShoreWater > 0.0 ? neighborShoreWater
+                                                                                : neighborWater) -
+                             stage) <= 0.125;
+                const bool opensIntoOcean = stages[packed] <= SEA_LEVEL * 8 + 1 &&
+                                            neighborTerrain < SEA_LEVEL &&
+                                            downstreamAlignment > 0.55;
+                if (compatibleStandingWater || opensIntoOcean) continue;
                 bankCandidates.push_back({
-                    .localX = static_cast<int16_t>(packed % LOCAL_EDGE + TRANSITION_MIN_LOCAL),
-                    .localZ = static_cast<int16_t>(packed / LOCAL_EDGE + TRANSITION_MIN_LOCAL),
-                    .targetEighths = conflictBankTargets[packed],
+                    .localX = static_cast<int16_t>(neighborX),
+                    .localZ = static_cast<int16_t>(neighborZ),
+                    .targetEighths = static_cast<int16_t>(
+                        std::clamp(static_cast<int>(stages[packed]) + 4, MINIMUM_STAGE_EIGHTHS,
+                                   MAXIMUM_STAGE_EIGHTHS)),
                 });
             }
-            continue;
         }
-        const int localX = static_cast<int>(packed % LOCAL_EDGE) + TRANSITION_MIN_LOCAL;
-        const int localZ = static_cast<int>(packed / LOCAL_EDGE) + TRANSITION_MIN_LOCAL;
-        const double gridX = static_cast<double>(localX) / BASIN_RASTER_SPACING + RASTER_APRON;
-        const double gridZ = static_cast<double>(localZ) / BASIN_RASTER_SPACING + RASTER_APRON;
-        double flowX = reconstruct(solution.flowX, gridX, gridZ);
-        double flowZ = reconstruct(solution.flowZ, gridX, gridZ);
-        const double flowLength = std::hypot(flowX, flowZ);
-        if (flowLength > 1.0e-6) {
-            flowX /= flowLength;
-            flowZ /= flowLength;
-        }
-        for (const auto [offsetX, offsetZ] : CARDINAL) {
-            const int neighborX = localX + offsetX;
-            const int neighborZ = localZ + offsetZ;
-            if (neighborX < TRANSITION_MIN_LOCAL || neighborX > TRANSITION_MAX_LOCAL ||
-                neighborZ < TRANSITION_MIN_LOCAL || neighborZ > TRANSITION_MAX_LOCAL) {
-                continue;
-            }
-            const uint32_t neighbor = packedIndex(neighborX, neighborZ);
-            if (stages[neighbor] != UNSET) continue;
-            const double downstreamAlignment = flowX * offsetX + flowZ * offsetZ;
-            const double neighborGridX =
-                static_cast<double>(neighborX) / BASIN_RASTER_SPACING + RASTER_APRON;
-            const double neighborGridZ =
-                static_cast<double>(neighborZ) / BASIN_RASTER_SPACING + RASTER_APRON;
-            const double neighborTerrain =
-                reconstruct(solution.surface, neighborGridX, neighborGridZ);
-            const double neighborWater =
-                reconstruct(solution.waterSurface, neighborGridX, neighborGridZ);
-            const double neighborShoreWater =
-                reconstruct(solution.shoreWaterSurface, neighborGridX, neighborGridZ);
-            const double stage = static_cast<double>(stages[packed]) / 8.0;
-            const double neighborChannelWidth =
-                reconstruct(solution.channelWidth, neighborGridX, neighborGridZ);
-            const bool neighborRoutedWater =
-                reconstruct(solution.discharge, neighborGridX, neighborGridZ) >=
-                    MIN_CHANNEL_DISCHARGE &&
-                reconstructChannelDistance(solution, neighborGridX, neighborGridZ) <=
-                    neighborChannelWidth * 0.55;
-            const bool neighborStandingWater =
-                flagWeight(solution, neighborGridX, neighborGridZ, CELL_OCEAN) >= 0.5 ||
-                (reconstruct(solution.lakeDepth, neighborGridX, neighborGridZ) > 0.05 &&
-                 reconstruct(solution.lakeShoreDistance, neighborGridX, neighborGridZ) > 0.0);
-            const bool compatibleStandingWater =
-                (neighborRoutedWater || neighborStandingWater) &&
-                neighborWater > neighborTerrain + 0.05 &&
-                std::abs((neighborStandingWater && neighborShoreWater > 0.0 ? neighborShoreWater
-                                                                            : neighborWater) -
-                         stage) <= 0.125;
-            const bool opensIntoOcean = stages[packed] <= SEA_LEVEL * 8 + 1 &&
-                                        neighborTerrain < SEA_LEVEL && downstreamAlignment > 0.55;
-            if (compatibleStandingWater || opensIntoOcean) {
-                continue;
-            }
-            bankCandidates.push_back({
-                .localX = static_cast<int16_t>(neighborX),
-                .localZ = static_cast<int16_t>(neighborZ),
-                .targetEighths =
-                    static_cast<int16_t>(std::clamp(static_cast<int>(stages[packed]) + 4,
-                                                    MINIMUM_STAGE_EIGHTHS, MAXIMUM_STAGE_EIGHTHS)),
-            });
-        }
-    }
-    std::ranges::sort(
-        bankCandidates, [](const SettledBankCell& first, const SettledBankCell& second) {
+        std::ranges::sort(bankCandidates, [](const SettledBankCell& first,
+                                             const SettledBankCell& second) {
             return std::pair{first.localZ, first.localX} < std::pair{second.localZ, second.localX};
         });
-    solution.settledBankCells.clear();
-    solution.settledBankCells.reserve(bankCandidates.size());
-    for (const SettledBankCell& candidate : bankCandidates) {
-        if (!solution.settledBankCells.empty() &&
-            solution.settledBankCells.back().localX == candidate.localX &&
-            solution.settledBankCells.back().localZ == candidate.localZ) {
-            solution.settledBankCells.back().targetEighths =
-                std::max(solution.settledBankCells.back().targetEighths, candidate.targetEighths);
-            continue;
+        solution.settledBankCells.reserve(bankCandidates.size());
+        for (const SettledBankCell& candidate : bankCandidates) {
+            if (!solution.settledBankCells.empty() &&
+                solution.settledBankCells.back().localX == candidate.localX &&
+                solution.settledBankCells.back().localZ == candidate.localZ) {
+                solution.settledBankCells.back().targetEighths = std::max(
+                    solution.settledBankCells.back().targetEighths, candidate.targetEighths);
+                continue;
+            }
+            solution.settledBankCells.push_back(candidate);
         }
-        solution.settledBankCells.push_back(candidate);
-    }
-    solution.settledBankRowOffsets.resize(TRANSITION_ROW_COUNT + 1);
-    size_t bankCursor = 0;
-    for (size_t row = 0; row < TRANSITION_ROW_COUNT; ++row) {
-        solution.settledBankRowOffsets[row] = static_cast<uint32_t>(bankCursor);
-        const int16_t localZ = static_cast<int16_t>(TRANSITION_MIN_LOCAL + static_cast<int>(row));
-        while (bankCursor < solution.settledBankCells.size() &&
-               solution.settledBankCells[bankCursor].localZ == localZ) {
-            ++bankCursor;
+        size_t bankCursor = 0;
+        for (size_t row = 0; row < TRANSITION_ROW_COUNT; ++row) {
+            solution.settledBankRowOffsets[row] = static_cast<uint32_t>(bankCursor);
+            const int16_t localZ =
+                static_cast<int16_t>(TRANSITION_MIN_LOCAL + static_cast<int>(row));
+            while (bankCursor < solution.settledBankCells.size() &&
+                   solution.settledBankCells[bankCursor].localZ == localZ) {
+                ++bankCursor;
+            }
         }
+        solution.settledBankRowOffsets.back() = static_cast<uint32_t>(bankCursor);
+    } else {
+        std::ranges::fill(solution.settledBankRowOffsets, 0U);
     }
-    solution.settledBankRowOffsets.back() = static_cast<uint32_t>(bankCursor);
 
     std::ranges::sort(touched);
     solution.settledWaterCells.clear();
@@ -4504,7 +4730,8 @@ void buildRapidPatches(BasinSolution& solution, const std::vector<Receiver>& rec
         // preceding eight cardinal layers remain horizontal flow, which gives
         // the lip one level-seven predecessor instead of replacing the end of
         // the gradient with a second falling column.
-        const int margin = static_cast<int>(std::ceil(fall.halfWidth)) + 2;
+        constexpr int APPROACH_LENGTH = 8;
+        const int margin = static_cast<int>(std::ceil(fall.halfWidth)) + APPROACH_LENGTH + 2;
         const int64_t minimumX =
             static_cast<int64_t>(std::floor(std::min(fall.startX, fall.endX))) - margin;
         const int64_t maximumX =
@@ -4516,41 +4743,78 @@ void buildRapidPatches(BasinSolution& solution, const std::vector<Receiver>& rec
         const int width = static_cast<int>(maximumX - minimumX + 1);
         const int height = static_cast<int>(maximumZ - minimumZ + 1);
         if (width <= 0 || height <= 0 || width > 64 || height > 64) return;
-        const auto insideStrip = [&](int64_t x, int64_t z) {
+        std::vector<uint8_t> candidate(static_cast<size_t>(width * height), 0);
+        std::vector<uint8_t> distance(static_cast<size_t>(width * height), 0);
+        const auto localIndex = [=](int64_t x, int64_t z) {
+            return static_cast<size_t>((z - minimumZ) * width + x - minimumX);
+        };
+        const auto projection = [&](int64_t x, int64_t z) {
             const double fromStartX = static_cast<double>(x) - fall.startX;
             const double fromStartZ = static_cast<double>(z) - fall.startZ;
-            const double along = (fromStartX * flowX + fromStartZ * flowZ) / run;
+            const double along = fromStartX * flowX + fromStartZ * flowZ;
             const double cross = std::abs(-fromStartX * flowZ + fromStartZ * flowX);
-            return along >= -1.0e-6 && along <= 1.0 + 1.0e-6 &&
-                   cross <= static_cast<double>(fall.halfWidth) + 1.0e-6;
+            return std::pair{along, cross};
         };
-        const auto remaining = [&](int64_t x, int64_t z) {
-            return (fall.endX - static_cast<double>(x)) * flowX +
-                   (fall.endZ - static_cast<double>(z)) * flowZ;
-        };
-        const double dominantCardinalComponent = std::max(std::abs(flowX), std::abs(flowZ));
         for (int64_t z = minimumZ; z <= maximumZ; ++z) {
             for (int64_t x = minimumX; x <= maximumX; ++x) {
-                if (!insideStrip(x, z)) continue;
-                const double remainingDistance = remaining(x, z);
-                if (remainingDistance <= 1.0e-6) continue;
-                const int reverseDistance = static_cast<int>(
-                    std::ceil(remainingDistance / dominantCardinalComponent - 1.0e-6));
-                if (reverseDistance <= 0 || reverseDistance > 8) continue;
+                const auto [along, cross] = projection(x, z);
+                const double remaining = run - along;
+                if (along < -1.0e-6 || remaining <= 1.0e-6 || remaining > APPROACH_LENGTH + 0.5 ||
+                    cross > static_cast<double>(fall.halfWidth) + 1.0e-6) {
+                    continue;
+                }
+                candidate[localIndex(x, z)] = 1;
+            }
+        }
+        std::vector<std::pair<int64_t, int64_t>> queue;
+        for (int64_t z = minimumZ; z <= maximumZ; ++z) {
+            for (int64_t x = minimumX; x <= maximumX; ++x) {
+                if (candidate[localIndex(x, z)] == 0) continue;
+                const bool touchesCurtain = std::ranges::any_of(CARDINAL, [&](const auto offset) {
+                    const auto [along, cross] = projection(x + offset.first, z + offset.second);
+                    return along >= run - 1.0e-6 &&
+                           cross <= static_cast<double>(fall.halfWidth) + 1.0e-6;
+                });
+                if (!touchesCurtain) continue;
+                distance[localIndex(x, z)] = 1;
+                queue.emplace_back(x, z);
+            }
+        }
+        for (size_t cursor = 0; cursor < queue.size(); ++cursor) {
+            const auto [x, z] = queue[cursor];
+            const uint8_t current = distance[localIndex(x, z)];
+            if (current >= APPROACH_LENGTH) continue;
+            for (const auto [offsetX, offsetZ] : CARDINAL) {
+                const int64_t neighborX = x + offsetX;
+                const int64_t neighborZ = z + offsetZ;
+                if (neighborX < minimumX || neighborX > maximumX || neighborZ < minimumZ ||
+                    neighborZ > maximumZ) {
+                    continue;
+                }
+                const size_t neighbor = localIndex(neighborX, neighborZ);
+                if (candidate[neighbor] == 0 || distance[neighbor] != 0) continue;
+                distance[neighbor] = static_cast<uint8_t>(current + 1);
+                queue.emplace_back(neighborX, neighborZ);
+            }
+        }
+        const uint64_t ownerId =
+            transitionIdentity(0x46414C4C5F454447ULL, fall.endX, fall.endZ, fall.endX - fall.startX,
+                               fall.endZ - fall.startZ);
+        for (int64_t z = minimumZ; z <= maximumZ; ++z) {
+            for (int64_t x = minimumX; x <= maximumX; ++x) {
+                const uint8_t receiverDistance = distance[localIndex(x, z)];
+                if (receiverDistance == 0 || receiverDistance > APPROACH_LENGTH) continue;
                 solution.rapidCells.push_back({
                     .x = x,
                     .z = z,
                     .topY = static_cast<int32_t>(std::ceil(fall.topSurface)) - 1,
                     .ownerIndex = static_cast<int32_t>(fallIndex),
-                    .ownerId = transitionIdentity(0x46414C4C5F454447ULL, fall.endX, fall.endZ,
-                                                  fall.endX - fall.startX, fall.endZ - fall.startZ),
+                    .ownerId = ownerId,
                     .flowX = static_cast<float>(flowX),
                     .flowZ = static_cast<float>(flowZ),
-                    .channelDistance = static_cast<float>(
-                        std::abs(-(static_cast<double>(x) - fall.startX) * flowZ +
-                                 (static_cast<double>(z) - fall.startZ) * flowX)),
+                    .channelDistance = static_cast<float>(projection(x, z).second),
                     .channelWidth = fall.halfWidth / 0.55F,
-                    .level = static_cast<uint8_t>(8 - reverseDistance),
+                    .level = static_cast<uint8_t>(APPROACH_LENGTH - receiverDistance),
                     .ownerKind = RapidOwnerKind::EXPLICIT_FALL,
                 });
             }
@@ -5550,7 +5814,10 @@ bool validateSolution(const BasinSolution& solution, const std::vector<float>& r
                            [](float value) { return std::isfinite(value); });
     };
     if (!finiteField(solution.surface) || !finiteField(solution.waterSurface) ||
-        !finiteField(solution.discharge) || !finiteField(solution.sediment) ||
+        !finiteField(solution.discharge) || !finiteField(solution.baseflow) ||
+        !finiteField(solution.precipitationSeasonality) ||
+        !finiteField(solution.groundwaterRecharge) || !finiteField(solution.groundwaterHead) ||
+        !finiteField(solution.hydroperiod) || !finiteField(solution.sediment) ||
         !finiteField(solution.channelDistance) || !finiteField(solution.channelWidth) ||
         !finiteField(solution.channelDepth) || !finiteField(solution.channelGradient) ||
         !finiteField(solution.erosionDepth) || !finiteField(solution.lakeDepth) ||
@@ -5566,6 +5833,11 @@ bool validateSolution(const BasinSolution& solution, const std::vector<float>& r
         solution.waterBodyIds.size() != RASTER_CELLS ||
         solution.shoreWaterBodyIds.size() != RASTER_CELLS ||
         solution.shoreWaterEndorheic.size() != RASTER_CELLS ||
+        solution.baseflow.size() != RASTER_CELLS ||
+        solution.precipitationSeasonality.size() != RASTER_CELLS ||
+        solution.groundwaterRecharge.size() != RASTER_CELLS ||
+        solution.groundwaterHead.size() != RASTER_CELLS ||
+        solution.hydroperiod.size() != RASTER_CELLS ||
         solution.rasterReceivers.size() != RASTER_CELLS ||
         solution.rasterSeaBackwaterDistance.size() != RASTER_CELLS ||
         solution.lakeEquilibriumByCell.size() != RASTER_CELLS) {
@@ -5651,6 +5923,14 @@ bool validateSolution(const BasinSolution& solution, const std::vector<float>& r
 
     for (int index = 0; index < RASTER_CELLS; ++index) {
         const Receiver& receiver = receivers[index];
+        if (solution.baseflow[index] < 0.0F ||
+            solution.baseflow[index] > solution.discharge[index] + 0.01F ||
+            solution.precipitationSeasonality[index] < 0.0F ||
+            solution.precipitationSeasonality[index] > 1.0F ||
+            solution.groundwaterRecharge[index] < 0.0F || solution.hydroperiod[index] < 0.0F ||
+            solution.hydroperiod[index] > 1.0F) {
+            return false;
+        }
         const int x = index % RASTER_EDGE;
         const int z = index / RASTER_EDGE;
         const bool sampled = x >= RASTER_APRON && x <= RASTER_APRON + INTERIOR_INTERVALS &&
@@ -5841,13 +6121,23 @@ buildSolution(const CounterRng& random, BasinKey key,
               const BasinSolver::ElevationFunction& elevation,
               const BasinSolver::RainfallFunction& rainfall,
               const BasinSolver::RockResistanceFunction& rockResistance,
-              const BasinSolver::PotentialEvapotranspirationFunction& potentialEvapotranspiration) {
+              const BasinSolver::PotentialEvapotranspirationFunction& potentialEvapotranspiration,
+              const BasinSolver::HydroclimateFunction& hydroclimate) {
     auto solution = std::make_shared<BasinSolution>();
     solution->key = key;
+    solution->physicalClimateAuthority = static_cast<bool>(hydroclimate);
     solution->originX = static_cast<double>(key.x) * BASIN_CATCHMENT_EDGE;
     solution->originZ = static_cast<double>(key.z) * BASIN_CATCHMENT_EDGE;
 
-    MacroContext macro(random, elevation, rainfall);
+    BasinSolver::RainfallFunction routedRunoff = rainfall;
+    if (hydroclimate) {
+        routedRunoff = [&](double worldX, double worldZ, double height) {
+            return static_cast<double>(deriveHydrologicFlux(hydroclimate(worldX, worldZ, height),
+                                                            rockResistance(worldX, worldZ), true)
+                                           .runoffMm);
+        };
+    }
+    MacroContext macro(random, elevation, routedRunoff);
     const Site center = macro.site(key);
     const Site downstream = macro.downstream(center);
     const TerminalLake terminalLake =
@@ -5858,9 +6148,14 @@ buildSolution(const CounterRng& random, BasinKey key,
     std::vector<float> raw;
     std::vector<float> rain;
     std::vector<float> pet;
+    std::vector<float> runoff;
+    std::vector<float> baseflow;
+    std::vector<float> seasonality;
+    std::vector<float> groundwaterRecharge;
     std::vector<float> resistance;
-    sampleInputs(*solution, elevation, rainfall, rockResistance, potentialEvapotranspiration, raw,
-                 rain, pet, resistance);
+    sampleInputs(*solution, elevation, rainfall, rockResistance, potentialEvapotranspiration,
+                 hydroclimate, raw, rain, pet, runoff, baseflow, seasonality, groundwaterRecharge,
+                 resistance);
     carveChannelGuides(*solution, guides, raw);
     std::vector<float> terminalFloor;
     const std::vector<uint8_t> terminals =
@@ -5876,7 +6171,7 @@ buildSolution(const CounterRng& random, BasinKey key,
     buildDInfinityRouting(filled, floodOrder, terminals, receivers, routingFlowX, routingFlowZ,
                           upstreamOrder);
     std::vector<float> accumulation;
-    accumulateFlow(rain, receivers, upstreamOrder, accumulation, *solution, guides);
+    accumulateFlow(runoff, receivers, upstreamOrder, accumulation, *solution, guides);
 
     std::vector<float> eroded = raw;
     std::vector<float> transportedSediment(RASTER_CELLS, 0.0F);
@@ -5890,7 +6185,7 @@ buildSolution(const CounterRng& random, BasinKey key,
                               routingFlowZ, upstreamOrder);
         solution->erosionReceiverChanges += changedReceiverCount(receivers, reroutedReceivers);
         receivers.swap(reroutedReceivers);
-        accumulateFlow(rain, receivers, upstreamOrder, accumulation, *solution, guides);
+        accumulateFlow(runoff, receivers, upstreamOrder, accumulation, *solution, guides);
         if (!validateErosionEpoch(raw, eroded, transportedSediment, filled, floodOrder, terminals,
                                   receivers, upstreamOrder, erosionScratch.orderPosition)) {
             throw std::runtime_error("invalid staged basin erosion");
@@ -5905,7 +6200,16 @@ buildSolution(const CounterRng& random, BasinKey key,
         buildDInfinityRouting(filled, floodOrder, terminals, receivers, routingFlowX, routingFlowZ,
                               upstreamOrder);
     }
-    accumulateFlow(rain, receivers, upstreamOrder, accumulation, *solution, guides);
+    accumulateFlow(runoff, receivers, upstreamOrder, accumulation, *solution, guides);
+    std::vector<float> guideBaseflowFractions(RASTER_CELLS, 0.0F);
+    for (int index = 0; index < RASTER_CELLS; ++index) {
+        guideBaseflowFractions[index] =
+            runoff[index] > 1.0e-6F ? std::clamp(baseflow[index] / runoff[index], 0.0F, 1.0F)
+                                    : 0.0F;
+    }
+    std::vector<float> baseflowAccumulation;
+    accumulateFlow(baseflow, receivers, upstreamOrder, baseflowAccumulation, *solution, guides,
+                   &guideBaseflowFractions);
     std::vector<uint8_t> strahler;
     computeStrahler(receivers, upstreamOrder, accumulation, strahler);
 
@@ -6009,6 +6313,11 @@ buildSolution(const CounterRng& random, BasinKey key,
     solution->surface.resize(RASTER_CELLS);
     solution->waterSurface.resize(RASTER_CELLS);
     solution->discharge.resize(RASTER_CELLS);
+    solution->baseflow.resize(RASTER_CELLS);
+    solution->precipitationSeasonality.resize(RASTER_CELLS);
+    solution->groundwaterRecharge.resize(RASTER_CELLS);
+    solution->groundwaterHead.resize(RASTER_CELLS);
+    solution->hydroperiod.resize(RASTER_CELLS);
     solution->sediment.resize(RASTER_CELLS);
     solution->channelDistance.resize(RASTER_CELLS);
     solution->channelWidth.resize(RASTER_CELLS);
@@ -6026,6 +6335,9 @@ buildSolution(const CounterRng& random, BasinKey key,
     solution->outletTypes = resolveOutletTypes(terminals, receivers, upstreamOrder);
     for (int index = 0; index < RASTER_CELLS; ++index) {
         solution->discharge[index] = accumulation[index];
+        solution->baseflow[index] = baseflowAccumulation[index];
+        solution->precipitationSeasonality[index] = seasonality[index];
+        solution->groundwaterRecharge[index] = groundwaterRecharge[index];
         solution->sediment[index] =
             transportedSediment[index] + accumulation[index] * localGradient[index] * 0.025F;
         solution->channelDistance[index] = channelDistance[index];
@@ -6054,6 +6366,9 @@ buildSolution(const CounterRng& random, BasinKey key,
         solution->channelGradient[index] = localGradient[source];
         solution->waterSurface[index] = channelWater[source];
         solution->discharge[index] = accumulation[source];
+        solution->baseflow[index] = baseflowAccumulation[source];
+        solution->precipitationSeasonality[index] = seasonality[source];
+        solution->groundwaterRecharge[index] = groundwaterRecharge[source];
         solution->sediment[index] =
             transportedSediment[source] + accumulation[source] * localGradient[source] * 0.025F;
         solution->streamOrder[index] = strahler[source];
@@ -6100,6 +6415,42 @@ buildSolution(const CounterRng& random, BasinKey key,
     solution->rapidCells.clear();
     solution->rapidCells.shrink_to_fit();
 
+    for (int index = 0; index < RASTER_CELLS; ++index) {
+        solution->baseflow[index] =
+            std::clamp(solution->baseflow[index], 0.0F, solution->discharge[index]);
+        const bool standingWater = (solution->flags[index] & (CELL_OCEAN | CELL_LAKE)) != 0;
+        if (standingWater) {
+            solution->groundwaterHead[index] = solution->waterSurface[index];
+            solution->hydroperiod[index] = 1.0F;
+            continue;
+        }
+        const double rechargeCapacity =
+            clamp01(static_cast<double>(solution->groundwaterRecharge[index]) / 600.0);
+        const double groundwaterDepth = std::clamp(
+            18.0 - rechargeCapacity * 14.0 + solution->precipitationSeasonality[index] * 10.0, 1.0,
+            48.0);
+        const double dryHead = solution->surface[index] - groundwaterDepth;
+        const double influenceEnd =
+            std::max(128.0, static_cast<double>(solution->channelWidth[index]) * 4.0);
+        const double channelInfluence =
+            solution->channelWidth[index] > 0.0F
+                ? 1.0 - smoothstep(solution->channelWidth[index] * 0.55, influenceEnd,
+                                   solution->channelDistance[index])
+                : 0.0;
+        solution->groundwaterHead[index] = static_cast<float>(std::lerp(
+            dryHead, static_cast<double>(solution->waterSurface[index]) - 0.25, channelInfluence));
+        const double baseflowFraction =
+            clamp01(solution->baseflow[index] / std::max(0.001F, solution->discharge[index]));
+        const double channelHydroperiod =
+            clamp01(0.12 + baseflowFraction * 0.78 +
+                    (1.0 - solution->precipitationSeasonality[index]) * 0.18);
+        const double saturatedHydroperiod =
+            clamp01((solution->groundwaterHead[index] - (solution->surface[index] - 2.0)) / 2.0) *
+            (1.0 - solution->precipitationSeasonality[index] * 0.45);
+        solution->hydroperiod[index] = static_cast<float>(
+            std::lerp(saturatedHydroperiod, channelHydroperiod, channelInfluence));
+    }
+
     if (!validateSolution(*solution, raw, filled, floodOrder, receivers, terminals, accumulation)) {
         throw std::runtime_error("invalid bounded basin solution");
     }
@@ -6118,6 +6469,11 @@ buildFallbackSolution(const CounterRng& random, BasinKey key,
     solution->surface = floats(SEA_LEVEL + 8.0F);
     solution->waterSurface = floats(SEA_LEVEL);
     solution->discharge = floats(0.0F);
+    solution->baseflow = floats(0.0F);
+    solution->precipitationSeasonality = floats(0.25F);
+    solution->groundwaterRecharge = floats(0.0F);
+    solution->groundwaterHead = floats(SEA_LEVEL - 8.0F);
+    solution->hydroperiod = floats(0.0F);
     solution->sediment = floats(0.0F);
     solution->channelDistance = floats(std::numeric_limits<float>::max());
     solution->channelWidth = floats(0.0F);
@@ -6175,9 +6531,15 @@ buildFallbackSolution(const CounterRng& random, BasinKey key,
             solution->discharge[index] = static_cast<float>(
                 (std::isfinite(sampledRainfall) ? std::max(0.0, sampledRainfall) : 0.0) *
                 CELL_SQUARE_KILOMETERS);
+            solution->baseflow[index] = solution->discharge[index] * 0.08F;
+            solution->groundwaterRecharge[index] = static_cast<float>(
+                (std::isfinite(sampledRainfall) ? std::max(0.0, sampledRainfall) : 0.0) * 0.18);
+            solution->groundwaterHead[index] = base - 12.0F;
             if (base < SEA_LEVEL) {
                 solution->flags[index] |= CELL_OCEAN;
                 solution->outletTypes[index] = static_cast<uint8_t>(BasinOutlet::OCEAN);
+                solution->groundwaterHead[index] = SEA_LEVEL;
+                solution->hydroperiod[index] = 1.0F;
             }
         }
     }
@@ -6195,6 +6557,10 @@ BasinSample fallbackSample(const CounterRng& random, double x, double z,
     result.surfaceElevation = base;
     result.waterSurface = SEA_LEVEL;
     result.ocean = base < SEA_LEVEL;
+    result.precipitationSeasonality = 0.25;
+    result.groundwaterHead = result.ocean ? static_cast<double>(SEA_LEVEL) : base - 12.0;
+    result.hydroperiod = result.ocean ? 1.0 : 0.0;
+    result.perennial = result.ocean;
     result.outlet = result.ocean ? BasinOutlet::OCEAN : BasinOutlet::NONE;
     result.valid = true;
     if (!sameCell(center, downstream)) {
@@ -6876,8 +7242,15 @@ void quantizeGeneratedRiverSurface(BasinSample& sample, bool allowLakeBackwater)
 
 BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
                            const ShorelineContourSample* shoreline = nullptr) {
+    const bool legacyBankAuthority = !solution.physicalClimateAuthority;
     const double gridX = (x - solution.originX) / BASIN_RASTER_SPACING + RASTER_APRON;
     const double gridZ = (z - solution.originZ) / BASIN_RASTER_SPACING + RASTER_APRON;
+    const int64_t blockX = static_cast<int64_t>(std::llround(x));
+    const int64_t blockZ = static_cast<int64_t>(std::llround(z));
+    const bool exactBlockSample = std::abs(x - static_cast<double>(blockX)) <= 1.0e-6 &&
+                                  std::abs(z - static_cast<double>(blockZ)) <= 1.0e-6;
+    const SettledWaterCell* initialSettledWater =
+        exactBlockSample ? settledWaterAt(solution, blockX, blockZ) : nullptr;
     BasinSample result;
     result.flowX = reconstruct(solution.flowX, gridX, gridZ);
     result.flowZ = reconstruct(solution.flowZ, gridX, gridZ);
@@ -6889,15 +7262,25 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
         result.flowX = 1.0;
         result.flowZ = 0.0;
     }
+    result.erosionDepth =
+        std::max(0.0F, solution.physicalClimateAuthority
+                           ? reconstructSlopePreserving(solution.erosionDepth, gridX, gridZ)
+                           : reconstruct(solution.erosionDepth, gridX, gridZ));
     result.surfaceElevation = reconstruct(solution.surface, gridX, gridZ);
     result.waterSurface = reconstruct(solution.waterSurface, gridX, gridZ);
     result.discharge = reconstruct(solution.discharge, gridX, gridZ);
+    result.baseflow = reconstruct(solution.baseflow, gridX, gridZ);
+    result.precipitationSeasonality = reconstruct(solution.precipitationSeasonality, gridX, gridZ);
+    result.groundwaterRechargeMm = reconstruct(solution.groundwaterRecharge, gridX, gridZ);
+    result.groundwaterHead = reconstruct(solution.groundwaterHead, gridX, gridZ);
+    result.hydroperiod = reconstruct(solution.hydroperiod, gridX, gridZ);
+    const double reconstructedBaseflowFraction =
+        clamp01(result.baseflow / std::max(0.001, result.discharge));
     result.sediment = reconstruct(solution.sediment, gridX, gridZ);
     result.channelDistance = reconstructChannelDistance(solution, gridX, gridZ);
     result.channelWidth = reconstruct(solution.channelWidth, gridX, gridZ);
     result.channelDepth = reconstruct(solution.channelDepth, gridX, gridZ);
     result.channelGradient = reconstruct(solution.channelGradient, gridX, gridZ);
-    result.erosionDepth = reconstruct(solution.erosionDepth, gridX, gridZ);
     result.lakeDepth = reconstruct(solution.lakeDepth, gridX, gridZ);
     result.lakeShoreDistance = reconstruct(solution.lakeShoreDistance, gridX, gridZ);
     result.shoreWaterSurface = dominantPositiveLevel(solution, gridX, gridZ);
@@ -7107,10 +7490,24 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
                 solution.channelDepth[static_cast<size_t>(authority.source)];
             const double halfWidth = authority.width * 0.55;
             const bool submergedMouth = hydraulicStage <= SEA_LEVEL + 1.0 + 1.0e-6;
-            const double emittedChannelDepth =
-                submergedMouth ? std::min(fullChannelDepth,
-                                          std::max(0.125, (halfWidth - authority.distance) * 0.75))
-                               : fullChannelDepth;
+            double emittedChannelDepth = fullChannelDepth;
+            if (initialSettledWater != nullptr) {
+                // The settled field supplies the continuous outer bed
+                // envelope. Feather deeper centerline incision into that
+                // envelope at a natural side slope so the analytical core
+                // cannot terminate in a cardinal underwater ledge.
+                const double settledBed =
+                    static_cast<double>(initialSettledWater->bedEighths) / 8.0;
+                const double fullBed = hydraulicStage - fullChannelDepth;
+                const double availableIncision = std::max(0.0, settledBed - fullBed);
+                const double distanceInside = std::max(0.0, halfWidth + 0.125 - authority.distance);
+                const double retainedIncision = std::min(availableIncision, distanceInside * 0.75);
+                emittedChannelDepth = std::clamp(hydraulicStage - (settledBed - retainedIncision),
+                                                 0.125, fullChannelDepth);
+            } else if (submergedMouth) {
+                emittedChannelDepth = std::min(
+                    fullChannelDepth, std::max(0.125, (halfWidth - authority.distance) * 0.75));
+            }
             selectedRasterSource = authority.source;
             selectedRasterOwnerId = authority.ownerId;
             rasterChannelWater = hydraulicStage;
@@ -7204,8 +7601,10 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
         const double floodplainWidth = guideWidth * (2.4 + guideOrder * 0.28);
         const double influenceWidth = floodplainWidth * (analyticalGuide->backwater ? 2.0 : 1.0);
         const double guideWater = guideWaterAt(*analyticalGuide, analyticalProjection);
+        const double guideDepth = channelGuideDepth(analyticalGuide->discharge);
         const double guideInfluence =
-            1.0 - smoothstep(guideWidth * 0.45, influenceWidth, analyticalProjection.distance);
+            1.0 - smoothstep(guideWidth * (legacyBankAuthority ? 0.45 : 0.55), influenceWidth,
+                             analyticalProjection.distance);
         const bool sharedBackwater = analyticalGuide->backwater && guideInfluence > 1.0e-6;
         const bool compatibleSharedBackwater = sharedBackwater && !rasterChannelCore;
         const bool confluenceBackwater =
@@ -7223,18 +7622,34 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
             result.surfaceElevation =
                 std::min(result.surfaceElevation, result.waterSurface - result.channelDepth);
         }
-        if (analyticalProjection.distance <= influenceWidth &&
-            (analyticalGuideCore || compatibleSharedBackwater || result.channelWidth <= 0.0 ||
-             analyticalProjection.distance < result.channelDistance)) {
-            // Every half edge owns a continuous junction-to-portal profile.
-            // Incoming and outgoing curves share the same junction level,
-            // while both catchments share the immutable portal level.
-            const double guideDepth = channelGuideDepth(analyticalGuide->discharge);
+        const bool guideBedContact =
+            !legacyBankAuthority && analyticalProjection.distance <= influenceWidth &&
+            (initialSettledWater != nullptr || possibleRasterChannel || analyticalGuideCore ||
+             compatibleSharedBackwater || result.channelWidth <= 0.0 ||
+             analyticalProjection.distance < result.channelDistance);
+        if (guideBedContact) {
+            // The guide and raster route are two views of one channel bed.
+            // Feather the deeper guide bed across their full wet overlap so
+            // the categorical core owner cannot expose a cardinal ledge.
             result.surfaceElevation =
                 std::min(result.surfaceElevation,
                          result.surfaceElevation +
                              std::min(0.0, guideWater - guideDepth - result.surfaceElevation) *
                                  guideInfluence);
+        }
+        if (analyticalProjection.distance <= influenceWidth &&
+            (analyticalGuideCore || compatibleSharedBackwater || result.channelWidth <= 0.0 ||
+             analyticalProjection.distance < result.channelDistance)) {
+            if (legacyBankAuthority) {
+                result.surfaceElevation =
+                    std::min(result.surfaceElevation,
+                             result.surfaceElevation +
+                                 std::min(0.0, guideWater - guideDepth - result.surfaceElevation) *
+                                     guideInfluence);
+            }
+            // Every half edge owns a continuous junction-to-portal profile.
+            // Incoming and outgoing curves share the same junction level,
+            // while both catchments share the immutable portal level.
             result.flowX = analyticalProjection.tangentX;
             result.flowZ = analyticalProjection.tangentZ;
             result.discharge = std::max(result.discharge, analyticalGuide->discharge);
@@ -7276,16 +7691,17 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
     }
     const double unbankedChannelSurface = result.surfaceElevation;
     if (rasterBankInfluence > 1.0e-6 && !protectedLakeFloor && !analyticalGuideCore) {
-        result.surfaceElevation =
-            std::lerp(result.surfaceElevation, std::max(result.surfaceElevation, rasterBankWater),
-                      rasterBankInfluence);
+        if (legacyBankAuthority) {
+            result.surfaceElevation =
+                std::lerp(result.surfaceElevation,
+                          std::max(result.surfaceElevation, rasterBankWater), rasterBankInfluence);
+        }
         if (!rasterChannelCore) {
-            // Preserve the dry lateral ownership through exact density
-            // emission. Without this flag a sub-block detail trough can be
-            // reclassified as ocean after the routed bank has already been
-            // solved, creating an ownerless sea cell beside an elevated
-            // channel.
-            result.channelBank = true;
+            // v3 raster banks are part of the old generated terrain
+            // authority. They remain isolated here so learned v4 water never
+            // reintroduces dry support walls around its canonical routes.
+            result.channelBank =
+                legacyBankAuthority || result.surfaceElevation + 0.05 >= rasterBankWater;
             result.channelBankSubstrate = unbankedChannelSurface;
             result.channelBankSubstrateValid = true;
         }
@@ -7495,27 +7911,30 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
             }
         }
     }
-    const double localWetSurface =
-        result.ocean || result.river || result.lake ? result.waterSurface : result.surfaceElevation;
-    if (corridorBackwater && !outletConnector && !result.ocean && !result.lake &&
-        corridorBackwaterDistance <= 1.5 && corridorBackwaterSurface >= localWetSurface + 2.5) {
-        // A steep corridor retains its upstream stage until the explicit
-        // curtain. Its immediately adjacent dry cells are the physical lip;
-        // without this freeboard the source-filled approach can spill into
-        // unrelated low relief before it reaches the owned fall.
-        result.surfaceElevation = std::max(result.surfaceElevation, corridorBackwaterSurface + 0.5);
-        result.waterSurface = 0.0;
-        result.ocean = false;
-        result.river = false;
-        result.lake = false;
-        result.lakeBank = false;
-        result.channelBank = true;
-        result.endorheic = false;
-        result.lakeDepth = 0.0;
-        result.waterBodyId = NO_WATER_BODY;
-        result.generatedFluidLevel = 0;
-        result.transitionOwnerKind = WaterTransitionKind::NONE;
-        result.transitionOwnerId = 0;
+    if (legacyBankAuthority) {
+        const double localWetSurface = result.ocean || result.river || result.lake
+                                           ? result.waterSurface
+                                           : result.surfaceElevation;
+        if (corridorBackwater && !outletConnector && !result.ocean && !result.lake &&
+            corridorBackwaterDistance <= 1.5 && corridorBackwaterSurface >= localWetSurface + 2.5) {
+            // v3 represents a steep raster corridor with a dry lip beside its
+            // explicit fall. v4 has a separate native hydrology authority and
+            // never enters this path.
+            result.surfaceElevation =
+                std::max(result.surfaceElevation, corridorBackwaterSurface + 0.5);
+            result.waterSurface = 0.0;
+            result.ocean = false;
+            result.river = false;
+            result.lake = false;
+            result.lakeBank = false;
+            result.channelBank = true;
+            result.endorheic = false;
+            result.lakeDepth = 0.0;
+            result.waterBodyId = NO_WATER_BODY;
+            result.generatedFluidLevel = 0;
+            result.transitionOwnerKind = WaterTransitionKind::NONE;
+            result.transitionOwnerId = 0;
+        }
     }
     for (const DeltaBranch& branch : solution.deltaBranches) {
         double along = 0.0;
@@ -7742,10 +8161,6 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
     const bool protectedRoutedChannel = finalRoutedChannel && finalChannelAuthority &&
                                         (connectedLakeOutlet || stageCompatibleWithNearbyLake);
 
-    const int64_t blockX = static_cast<int64_t>(std::llround(x));
-    const int64_t blockZ = static_cast<int64_t>(std::llround(z));
-    const bool exactBlockSample = std::abs(x - static_cast<double>(blockX)) <= 1.0e-6 &&
-                                  std::abs(z - static_cast<double>(blockZ)) <= 1.0e-6;
     const SettledBankCell* settledBank =
         exactBlockSample ? settledBankAt(solution, blockX, blockZ) : nullptr;
     if (settledBank != nullptr &&
@@ -7788,12 +8203,10 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
         // the analytical continuation selected by the shared contour.
         settledBank = nullptr;
     }
-    const SettledWaterCell* settledWater = exactBlockSample && settledBank == nullptr
-                                               ? settledWaterAt(solution, blockX, blockZ)
-                                               : nullptr;
-    const bool implicitOceanSourceAuthority = exactBlockSample && settledBank == nullptr &&
-                                              settledWater == nullptr && result.ocean &&
-                                              result.waterSurface <= SEA_LEVEL + 1.0e-6;
+    const SettledWaterCell* settledWater = settledBank == nullptr ? initialSettledWater : nullptr;
+    const bool implicitOceanSourceAuthority =
+        legacyBankAuthority && exactBlockSample && settledBank == nullptr &&
+        settledWater == nullptr && result.ocean && result.waterSurface <= SEA_LEVEL + 1.0e-6;
     const bool settledOutletAuthority =
         settledWater != nullptr &&
         (settledWater->ownerKind == WaterTransitionKind::OUTLET_CORRIDOR ||
@@ -7860,21 +8273,18 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
         settledWater = nullptr;
     }
     double settledConflictBankTarget = 0.0;
-    if (settledWater != nullptr && settledWater->ownerKind == WaterTransitionKind::RASTER_CHANNEL &&
-        !finalRoutedChannel && !ownedOutletContinuation && result.shoreWaterSurface > 0.0 &&
+    if (legacyBankAuthority && settledWater != nullptr &&
+        settledWater->ownerKind == WaterTransitionKind::RASTER_CHANNEL && !finalRoutedChannel &&
+        !ownedOutletContinuation && result.shoreWaterSurface > 0.0 &&
         result.lakeShoreDistance <= 0.0 && result.lakeShoreDistance > -(LAKE_BANK_WIDTH + 8.0)) {
-        // A settled rapid may extend laterally beyond its analytical channel
-        // core to complete a predecessor chain. Keep that halo dry where it
-        // meets a standing shoreline so it cannot expose a side wall between
-        // incompatible water stages.
         settledConflictBankTarget =
             std::max(result.shoreWaterSurface,
                      static_cast<double>(settledWater->surfaceEighths) / 8.0) +
             0.5;
         settledWater = nullptr;
     }
-    if ((settledWater != nullptr || implicitOceanSourceAuthority) && shoreline != nullptr &&
-        shoreline->valid && !ownedOutletContinuation &&
+    if (legacyBankAuthority && (settledWater != nullptr || implicitOceanSourceAuthority) &&
+        shoreline != nullptr && shoreline->valid && !ownedOutletContinuation &&
         (settledWater == nullptr ||
          settledWater->ownerKind != WaterTransitionKind::OUTLET_CORRIDOR) &&
         result.transitionOwnerKind != WaterTransitionKind::OUTLET_CORRIDOR &&
@@ -7884,42 +8294,38 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
                                           ? static_cast<double>(settledWater->surfaceEighths) / 8.0
                                           : static_cast<double>(SEA_LEVEL);
         if (result.shoreWaterSurface >= settledSurface + 2.5) {
-            // A distinct high standing lake cannot overlap a lower settled
-            // route or ocean cell. Publish the lake's existing rim freeboard
-            // at only this narrow contour conflict; its owned outlet remains
-            // wet and explicit falls retain their sharp transition.
             settledConflictBankTarget = result.shoreWaterSurface + 0.5;
             settledWater = nullptr;
         }
     }
-    double routedContactLakeStage = std::numeric_limits<double>::infinity();
-    if (shoreline != nullptr && shoreline->valid) {
-        routedContactLakeStage = shoreline->waterLevel;
-    }
-    if (lakeBody.found) {
-        routedContactLakeStage = std::min(routedContactLakeStage, lakeBody.waterLevel);
-    }
-    const bool settledRasterContact =
-        settledWater != nullptr && settledWater->ownerKind == WaterTransitionKind::RASTER_CHANNEL;
-    const double routedContactStage = settledRasterContact
-                                          ? static_cast<double>(settledWater->surfaceEighths) / 8.0
-                                          : result.waterSurface;
-    if (std::isfinite(routedContactLakeStage) && !ownedOutletContinuation &&
-        (settledRasterContact ||
-         (result.transitionOwnerKind == WaterTransitionKind::RASTER_CHANNEL && result.river)) &&
-        !result.waterfall && result.lakeShoreDistance <= 0.0 &&
-        result.lakeShoreDistance > -(LAKE_BANK_WIDTH + 8.0) &&
-        routedContactStage > routedContactLakeStage + 0.125001) {
-        // A raster reach that merely overlaps a different lake contour is not
-        // that lake's outlet. Preserve a dry bank at the high route's edge;
-        // only the globally owned corridor or explicit fall may connect the
-        // two stages. This keeps both water bodies while preventing a lateral
-        // wall of unsupported water at the signed shoreline.
-        settledConflictBankTarget = std::max(settledConflictBankTarget, routedContactStage + 0.5);
-        settledWater = nullptr;
+    if (legacyBankAuthority) {
+        double routedContactLakeStage = std::numeric_limits<double>::infinity();
+        if (shoreline != nullptr && shoreline->valid) {
+            routedContactLakeStage = shoreline->waterLevel;
+        }
+        if (lakeBody.found) {
+            routedContactLakeStage = std::min(routedContactLakeStage, lakeBody.waterLevel);
+        }
+        const bool settledRasterContact =
+            settledWater != nullptr &&
+            settledWater->ownerKind == WaterTransitionKind::RASTER_CHANNEL;
+        const double routedContactStage =
+            settledRasterContact ? static_cast<double>(settledWater->surfaceEighths) / 8.0
+                                 : result.waterSurface;
+        if (std::isfinite(routedContactLakeStage) && !ownedOutletContinuation &&
+            (settledRasterContact ||
+             (result.transitionOwnerKind == WaterTransitionKind::RASTER_CHANNEL && result.river)) &&
+            !result.waterfall && result.lakeShoreDistance <= 0.0 &&
+            result.lakeShoreDistance > -(LAKE_BANK_WIDTH + 8.0) &&
+            routedContactStage > routedContactLakeStage + 0.125001) {
+            settledConflictBankTarget =
+                std::max(settledConflictBankTarget, routedContactStage + 0.5);
+            settledWater = nullptr;
+        }
     }
     const bool settledFieldAuthority =
-        settledBank != nullptr || settledWater != nullptr || settledConflictBankTarget > SEA_LEVEL;
+        settledBank != nullptr || settledWater != nullptr ||
+        (legacyBankAuthority && settledConflictBankTarget > SEA_LEVEL);
     if (protectedRoutedChannel && !result.lakeBank && !result.channelBank && !result.ocean &&
         !result.lake && !result.waterfall) {
         // Late analytical corridors and receiving aprons refine channel
@@ -7941,6 +8347,19 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
         result.generatedFluidLevel = 0;
         result.transitionOwnerKind = WaterTransitionKind::NONE;
         result.transitionOwnerId = 0;
+    };
+    const auto connectLakeBackwater = [&] {
+        // A routed contact remains wet. The standing stage supplies a local
+        // backwater and the terrain is lowered only when a supported bed is
+        // needed. Canonical outlets and explicit falls still own true drops.
+        result.waterSurface = std::max(result.waterSurface, result.shoreWaterSurface);
+        result.surfaceElevation = std::min(result.surfaceElevation, result.waterSurface - 0.125);
+        result.river = true;
+        result.lakeBank = false;
+        result.channelBank = false;
+        result.generatedFluidLevel = 0;
+        result.lakeBankTarget = 0.0;
+        result.lakeBankInfluence = 0.0;
     };
     const double nearbyLakeStageDifference =
         result.shoreWaterSurface > 0.0 ? result.shoreWaterSurface - result.waterSurface : 0.0;
@@ -7967,13 +8386,19 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
                 // An unrelated routed owner cannot cut a vertical water face
                 // through a standing lake contour. Only the lake's shared
                 // outlet continuation or tagged fall may own that opening.
-                closeIncompatibleLakeBank();
+                if (legacyBankAuthority) {
+                    closeIncompatibleLakeBank();
+                } else {
+                    connectLakeBackwater();
+                }
             }
         } else {
-            const double rimTarget = result.shoreWaterSurface + 0.5;
-            result.surfaceElevation =
-                std::lerp(result.surfaceElevation, std::max(result.surfaceElevation, rimTarget),
-                          result.lakeBankInfluence);
+            if (legacyBankAuthority) {
+                const double rimTarget = result.shoreWaterSurface + 0.5;
+                result.surfaceElevation =
+                    std::lerp(result.surfaceElevation, std::max(result.surfaceElevation, rimTarget),
+                              result.lakeBankInfluence);
+            }
             result.lakeBankTarget = result.surfaceElevation;
             result.lakeBank = result.lakeBankInfluence > 1.0e-4 &&
                               result.surfaceElevation + 0.05 >= result.shoreWaterSurface;
@@ -8119,11 +8544,11 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
         }
     }
     if (!explicitRapidAuthority && !result.waterfall && exactBlockSample) {
-        // The immutable settled field is the block-resolution authority. A
-        // conflict bank wins first; otherwise the settled water cell owns its
-        // exact stage, bed, state, and routed identity. Legacy analytical
-        // lake and bank classifications only survive where neither exists.
-        if (!result.lake && (settledBank != nullptr || settledConflictBankTarget > SEA_LEVEL)) {
+        // The legacy raster field retains its own block-resolution bank
+        // contract. Learned v4 does not enter BasinSolver and therefore keeps
+        // its separate canonical wet topology.
+        if (legacyBankAuthority && !result.lake &&
+            (settledBank != nullptr || settledConflictBankTarget > SEA_LEVEL)) {
             double bankTarget = settledBank != nullptr
                                     ? static_cast<double>(settledBank->targetEighths) / 8.0
                                     : settledConflictBankTarget;
@@ -8166,14 +8591,15 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
             if (!settledState.isSource()) {
                 constexpr std::array<std::pair<int64_t, int64_t>, 4> CARDINAL_BLOCKS = {
                     std::pair{-1, 0}, std::pair{1, 0}, std::pair{0, -1}, std::pair{0, 1}};
-                const auto hasCompletePredecessorChain = [&](auto&& self, int64_t x, int64_t z,
+                const auto hasCompletePredecessorChain = [&](auto&& self, int64_t predecessorX,
+                                                             int64_t predecessorZ,
                                                              int16_t stage) -> bool {
                     const int16_t predecessorStage = static_cast<int16_t>(stage + 1);
                     for (const auto [offsetX, offsetZ] : CARDINAL_BLOCKS) {
-                        const int64_t predecessorX = x + offsetX;
-                        const int64_t predecessorZ = z + offsetZ;
+                        const int64_t candidateX = predecessorX + offsetX;
+                        const int64_t candidateZ = predecessorZ + offsetZ;
                         const SettledWaterCell* predecessor =
-                            settledWaterAt(solution, predecessorX, predecessorZ);
+                            settledWaterAt(solution, candidateX, candidateZ);
                         if (predecessor == nullptr ||
                             predecessor->surfaceEighths != predecessorStage ||
                             predecessor->ownerKind != settledWater->ownerKind ||
@@ -8181,41 +8607,15 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
                              settledWater->ownerKind != WaterTransitionKind::RASTER_CHANNEL)) {
                             continue;
                         }
-                        const SettledBankCell* predecessorBank =
-                            settledBankAt(solution, predecessorX, predecessorZ);
-                        if (predecessorBank != nullptr &&
-                            static_cast<double>(predecessorBank->targetEighths) / 8.0 > SEA_LEVEL) {
-                            continue;
-                        }
-                        const double predecessorGridX =
-                            (static_cast<double>(predecessorX) - solution.originX) /
-                                BASIN_RASTER_SPACING +
-                            RASTER_APRON;
-                        const double predecessorGridZ =
-                            (static_cast<double>(predecessorZ) - solution.originZ) /
-                                BASIN_RASTER_SPACING +
-                            RASTER_APRON;
-                        const double predecessorShore =
-                            dominantPositiveLevel(solution, predecessorGridX, predecessorGridZ);
-                        const double predecessorShoreDistance = reconstruct(
-                            solution.lakeShoreDistance, predecessorGridX, predecessorGridZ);
-                        const bool incompatibleRasterLakeContact =
-                            predecessor->ownerKind == WaterTransitionKind::RASTER_CHANNEL &&
-                            predecessorShore >
-                                static_cast<double>(predecessor->surfaceEighths) / 8.0 + 2.5 &&
-                            predecessorShoreDistance <= 0.0 &&
-                            predecessorShoreDistance > -(LAKE_BANK_WIDTH + 8.0);
-                        if (incompatibleRasterLakeContact) continue;
                         if (predecessorStage % 8 == 0 ||
-                            self(self, predecessorX, predecessorZ, predecessorStage)) {
+                            self(self, candidateX, candidateZ, predecessorStage)) {
                             return true;
                         }
                     }
                     return false;
                 };
-                const bool completeChain = hasCompletePredecessorChain(
-                    hasCompletePredecessorChain, blockX, blockZ, settledWater->surfaceEighths);
-                if (!completeChain) {
+                if (!hasCompletePredecessorChain(hasCompletePredecessorChain, blockX, blockZ,
+                                                 settledWater->surfaceEighths)) {
                     surfaceEighths = static_cast<int32_t>(
                         std::floor(static_cast<double>(surfaceEighths) / 8.0) * 8.0);
                     settledState = FluidState::source();
@@ -8388,20 +8788,29 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
                     std::min(result.channelBankSubstrate, lowlandChannelFloor);
             }
             result.channelBankSubstrateValid = true;
-            result.surfaceElevation = std::max(result.surfaceElevation, explicitApproachBankTarget);
-            result.waterSurface = 0.0;
-            result.ocean = false;
-            result.river = false;
-            result.lake = false;
-            result.waterfall = false;
-            result.lakeBank = false;
-            result.channelBank = true;
-            result.endorheic = false;
-            result.lakeDepth = 0.0;
-            result.waterBodyId = NO_WATER_BODY;
-            result.generatedFluidLevel = 0;
-            result.transitionOwnerKind = WaterTransitionKind::NONE;
-            result.transitionOwnerId = 0;
+            if (legacyBankAuthority) {
+                result.surfaceElevation =
+                    std::max(result.surfaceElevation, explicitApproachBankTarget);
+                result.waterSurface = 0.0;
+                result.ocean = false;
+                result.river = false;
+                result.lake = false;
+                result.waterfall = false;
+                result.lakeBank = false;
+                result.channelBank = true;
+                result.endorheic = false;
+                result.lakeDepth = 0.0;
+                result.waterBodyId = NO_WATER_BODY;
+                result.generatedFluidLevel = 0;
+                result.transitionOwnerKind = WaterTransitionKind::NONE;
+                result.transitionOwnerId = 0;
+            } else {
+                // Keep only descriptive metadata when the existing terrain is
+                // a natural side support. Never raise or dry a v4 water
+                // column to construct an approach wall.
+                result.channelBank = !(result.ocean || result.river || result.lake) &&
+                                     result.surfaceElevation + 1.5 >= explicitApproachBankTarget;
+            }
         }
     }
     if (exactBlockSample && result.waterfall &&
@@ -8424,18 +8833,21 @@ BasinSample sampleSolution(const BasinSolution& solution, double x, double z,
         result.channelDistance = 0.0;
     }
     quantizeGeneratedRiverSurface(result, !immutableSettledWaterAuthority);
-    result.valid = std::isfinite(result.surfaceElevation) && std::isfinite(result.waterSurface) &&
-                   std::isfinite(result.discharge) && std::isfinite(result.erosionDepth) &&
-                   std::isfinite(result.lakeShoreDistance) &&
-                   std::isfinite(result.shoreWaterSurface) &&
-                   std::isfinite(result.lakeBankTarget) && std::isfinite(result.waterfallTop) &&
-                   std::isfinite(result.waterfallBottom);
+    result.baseflow = std::max(result.baseflow, result.discharge * reconstructedBaseflowFraction);
+    result.valid =
+        std::isfinite(result.surfaceElevation) && std::isfinite(result.waterSurface) &&
+        std::isfinite(result.discharge) && std::isfinite(result.erosionDepth) &&
+        std::isfinite(result.baseflow) && std::isfinite(result.precipitationSeasonality) &&
+        std::isfinite(result.groundwaterRechargeMm) && std::isfinite(result.groundwaterHead) &&
+        std::isfinite(result.hydroperiod) && std::isfinite(result.lakeShoreDistance) &&
+        std::isfinite(result.shoreWaterSurface) && std::isfinite(result.lakeBankTarget) &&
+        std::isfinite(result.waterfallTop) && std::isfinite(result.waterfallBottom);
     return result;
 }
 
 BasinSample finalizeGeneratedWaterContact(
-    BasinSample result,
-    double unbankedSurfaceElevation = std::numeric_limits<double>::quiet_NaN()) {
+    BasinSample result, double unbankedSurfaceElevation = std::numeric_limits<double>::quiet_NaN(),
+    bool legacyBankAuthority = false) {
     if (!result.valid) return result;
 
     const bool hasUnbankedSurface = std::isfinite(unbankedSurfaceElevation);
@@ -8453,19 +8865,35 @@ BasinSample finalizeGeneratedWaterContact(
         result.transitionOwnerKind != WaterTransitionKind::CHANNEL_GUIDE &&
         result.shoreWaterSurface > result.waterSurface + 2.5 && result.lakeShoreDistance <= 0.0 &&
         result.lakeShoreDistance > -incompatibleLakeBankReach) {
-        // A catchment handoff cannot reopen an unrelated low corridor through
-        // the side of a standing lake. The exact shared fall remains wet;
-        // every other incompatible contact publishes supported rim terrain.
-        result.lakeBankTarget = result.shoreWaterSurface + 0.5;
-        result.surfaceElevation = std::max(result.surfaceElevation, result.lakeBankTarget);
-        result.waterSurface = 0.0;
-        result.ocean = false;
-        result.river = false;
-        result.lakeBank = true;
-        result.channelBank = false;
-        result.generatedFluidLevel = 0;
-        result.transitionOwnerKind = WaterTransitionKind::NONE;
-        result.transitionOwnerId = 0;
+        if (legacyBankAuthority) {
+            // Preserve the existing v3 raster handoff contract. v4 uses the
+            // wet reconciliation below through NativeHydrologyRouter instead.
+            result.lakeBankTarget = result.shoreWaterSurface + 0.5;
+            result.surfaceElevation = std::max(result.surfaceElevation, result.lakeBankTarget);
+            result.waterSurface = 0.0;
+            result.ocean = false;
+            result.river = false;
+            result.lakeBank = true;
+            result.channelBank = false;
+            result.endorheic = false;
+            result.lakeDepth = 0.0;
+            result.waterBodyId = NO_WATER_BODY;
+            result.generatedFluidLevel = 0;
+            result.transitionOwnerKind = WaterTransitionKind::NONE;
+            result.transitionOwnerId = 0;
+        } else {
+            // Preserve wet topology at an unresolved catchment handoff. A
+            // local backwater is preferable to inventing raised terrain,
+            // while explicit outlet and fall owners retain their sharper
+            // stage contracts.
+            result.waterSurface = std::max(result.waterSurface, result.shoreWaterSurface);
+            result.surfaceElevation = std::min(physicalBed, result.waterSurface - 0.125);
+            result.lakeBankTarget = 0.0;
+            result.lakeBankInfluence = 0.0;
+            result.lakeBank = false;
+            result.channelBank = false;
+            result.generatedFluidLevel = 0;
+        }
     }
     const bool submergedLegacyChannelGuard =
         result.channelBank && !result.lakeBank && hasUnbankedSurface &&
@@ -8514,6 +8942,22 @@ BasinSample finalizeGeneratedWaterContact(
         result.lakeBank = false;
         result.channelBank = false;
     }
+    result.precipitationSeasonality = clamp01(result.precipitationSeasonality);
+    result.hydroperiod = clamp01(result.hydroperiod);
+    result.baseflow = std::clamp(result.baseflow, 0.0, std::max(0.0, result.discharge));
+    result.groundwaterRechargeMm = std::max(0.0, result.groundwaterRechargeMm);
+    if (result.ocean || result.lake) {
+        result.groundwaterHead = result.waterSurface;
+        result.hydroperiod = 1.0;
+    } else {
+        result.groundwaterHead = std::min(result.groundwaterHead, result.surfaceElevation);
+    }
+    const double baseflowFraction = clamp01(result.baseflow / std::max(0.001, result.discharge));
+    result.perennial = result.ocean || result.lake ||
+                       (result.river && result.hydroperiod >= 0.55 && baseflowFraction >= 0.18);
+    result.ephemeral = result.river && !result.perennial;
+    result.wetland = !result.ocean && !result.lake && !result.river && result.hydroperiod >= 0.45 &&
+                     result.groundwaterHead >= result.surfaceElevation - 2.0;
     return result;
 }
 
@@ -8552,17 +8996,22 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
         (1.0 - xBlend.amount) * (1.0 - zBlend.amount), xBlend.amount * (1.0 - zBlend.amount),
         (1.0 - xBlend.amount) * zBlend.amount, xBlend.amount * zBlend.amount};
 
-    BasinSample result = sampleSolution(solutionAt(primary), x, z, shoreline);
-    if (xBlend.low == xBlend.high && zBlend.low == zBlend.high) {
-        return finalizeGeneratedWaterContact(result);
-    }
+    const BasinSolution& primarySolution = solutionAt(primary);
+    const bool legacyBankAuthority = !primarySolution.physicalClimateAuthority;
+    const auto finalize = [&](BasinSample sample, double unbankedSurfaceElevation =
+                                                      std::numeric_limits<double>::quiet_NaN()) {
+        return finalizeGeneratedWaterContact(std::move(sample), unbankedSurfaceElevation,
+                                             legacyBankAuthority);
+    };
+    BasinSample result = sampleSolution(primarySolution, x, z, shoreline);
+    if (xBlend.low == xBlend.high && zBlend.low == zBlend.high) return finalize(std::move(result));
 
     std::array<BasinSample, 4> samples;
     for (size_t index = 0; index < samples.size(); ++index) {
         samples[index] = keys[index] == primary
                              ? result
                              : sampleSolution(solutionAt(keys[index]), x, z, shoreline);
-        if (!samples[index].valid) return finalizeGeneratedWaterContact(result);
+        if (!samples[index].valid) return finalize(std::move(result));
     }
     const bool anyLake =
         std::ranges::any_of(samples, [](const BasinSample& sample) { return sample.lake; });
@@ -8614,8 +9063,8 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
                     }
                 }
             }
-            if (authority != nullptr) return finalizeGeneratedWaterContact(*authority);
-            return finalizeGeneratedWaterContact(result);
+            if (authority != nullptr) return finalize(*authority);
+            return finalize(std::move(result));
         }
     }
     if (anyWaterfall &&
@@ -8632,8 +9081,8 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
                 authority = &candidate;
             }
         }
-        if (authority != nullptr) return finalizeGeneratedWaterContact(*authority);
-        return finalizeGeneratedWaterContact(result);
+        if (authority != nullptr) return finalize(*authority);
+        return finalize(std::move(result));
     }
 
     bool canonicalTopologySelected = false;
@@ -8668,16 +9117,26 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
         }
         if (topologyAuthority != nullptr) {
             canonicalTopologySelected = true;
-            const size_t topologyIndex = static_cast<size_t>(topologyAuthority - samples.data());
-            canonicalBodyConnectorSelected =
-                shoreline != nullptr && shoreline->valid && shoreline->outletContinuation &&
-                topologyAuthority->transitionOwnerKind == WaterTransitionKind::OUTLET_CORRIDOR &&
-                ownedLakeConnectorAt(solutionAt(keys[topologyIndex]), shoreline->identity, x, z);
+            if (legacyBankAuthority) {
+                const size_t topologyIndex =
+                    static_cast<size_t>(topologyAuthority - samples.data());
+                canonicalBodyConnectorSelected =
+                    shoreline != nullptr && shoreline->valid && shoreline->outletContinuation &&
+                    topologyAuthority->transitionOwnerKind ==
+                        WaterTransitionKind::OUTLET_CORRIDOR &&
+                    ownedLakeConnectorAt(solutionAt(keys[topologyIndex]), shoreline->identity, x,
+                                         z);
+            }
             canonicalBedElevation = topologyAuthority->surfaceElevation;
             result.waterSurface = topologyAuthority->waterSurface;
             result.flowX = topologyAuthority->flowX;
             result.flowZ = topologyAuthority->flowZ;
             result.discharge = topologyAuthority->discharge;
+            result.baseflow = topologyAuthority->baseflow;
+            result.precipitationSeasonality = topologyAuthority->precipitationSeasonality;
+            result.groundwaterRechargeMm = topologyAuthority->groundwaterRechargeMm;
+            result.groundwaterHead = topologyAuthority->groundwaterHead;
+            result.hydroperiod = topologyAuthority->hydroperiod;
             result.sediment = topologyAuthority->sediment;
             result.channelDistance = topologyAuthority->channelDistance;
             result.channelWidth = topologyAuthority->channelWidth;
@@ -8705,12 +9164,15 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
         return value;
     };
     double exactChannelBankTarget = -std::numeric_limits<double>::infinity();
-    for (size_t index = 0; index < samples.size(); ++index) {
-        if (weights[index] <= 0.0 || !samples[index].channelBank ||
-            !samples[index].channelBankSubstrateValid) {
-            continue;
+    if (legacyBankAuthority) {
+        for (size_t index = 0; index < samples.size(); ++index) {
+            if (weights[index] <= 0.0 || !samples[index].channelBank ||
+                !samples[index].channelBankSubstrateValid) {
+                continue;
+            }
+            exactChannelBankTarget =
+                std::max(exactChannelBankTarget, samples[index].surfaceElevation);
         }
-        exactChannelBankTarget = std::max(exactChannelBankTarget, samples[index].surfaceElevation);
     }
     result.surfaceElevation =
         blend([](const BasinSample& sample) { return sample.surfaceElevation; });
@@ -8737,13 +9199,11 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
         result.channelDepth =
             std::max(result.channelDepth, result.waterSurface - result.surfaceElevation);
     }
-    if (canonicalTopologySelected && !canonicalBodyConnectorSelected &&
+    if (legacyBankAuthority && canonicalTopologySelected && !canonicalBodyConnectorSelected &&
         std::isfinite(exactChannelBankTarget) &&
         exactChannelBankTarget > result.waterSurface + 0.05) {
-        // A settled bank is exact block authority at a cross-catchment
-        // contact. The lower canonical water stage must not overwrite that
-        // retaining wall merely because the neighboring solution reports an
-        // ocean or routed channel at the same coordinate.
+        // An exact v3 bank owns this cross-catchment contact. Its dry
+        // freeboard cannot be replaced by a neighboring water sample.
         result.surfaceElevation = std::max(result.surfaceElevation, exactChannelBankTarget);
         result.waterSurface = 0.0;
         result.ocean = false;
@@ -8780,11 +9240,8 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
             result.lakeBankTarget = 0.0;
         } else {
             result.generatedFluidLevel = 0;
-            if (result.channelBank && std::isfinite(exactChannelBankTarget)) {
-                // Exact settled banks are physical boundary authority, not a
-                // scalar terrain field. Blending their freeboard down toward
-                // another catchment's substrate opens a cave-backed drain
-                // beside deep routed water.
+            if (legacyBankAuthority && result.channelBank &&
+                std::isfinite(exactChannelBankTarget)) {
                 result.surfaceElevation = std::max(result.surfaceElevation, exactChannelBankTarget);
             }
         }
@@ -8793,6 +9250,14 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
     }
     if (!canonicalTopologySelected) {
         result.discharge = blend([](const BasinSample& sample) { return sample.discharge; });
+        result.baseflow = blend([](const BasinSample& sample) { return sample.baseflow; });
+        result.precipitationSeasonality =
+            blend([](const BasinSample& sample) { return sample.precipitationSeasonality; });
+        result.groundwaterRechargeMm =
+            blend([](const BasinSample& sample) { return sample.groundwaterRechargeMm; });
+        result.groundwaterHead =
+            blend([](const BasinSample& sample) { return sample.groundwaterHead; });
+        result.hydroperiod = blend([](const BasinSample& sample) { return sample.hydroperiod; });
         result.sediment = blend([](const BasinSample& sample) { return sample.sediment; });
         result.channelDistance =
             blend([](const BasinSample& sample) { return sample.channelDistance; });
@@ -8823,9 +9288,88 @@ BasinSample sampleAcrossCatchmentFaces(BasinKey primary, double x, double z,
         result.lakeOverflowMmSquareKilometers = samples[authority].lakeOverflowMmSquareKilometers;
         result.lakeSpillSurface = samples[authority].lakeSpillSurface;
     }
-    return finalizeGeneratedWaterContact(result, unbankedWeight > 1.0e-9
-                                                     ? unbankedSurfaceElevation
-                                                     : std::numeric_limits<double>::quiet_NaN());
+    return finalize(std::move(result), unbankedWeight > 1.0e-9
+                                           ? unbankedSurfaceElevation
+                                           : std::numeric_limits<double>::quiet_NaN());
+}
+
+bool emittedWater(const BasinSample& sample) {
+    return sample.valid && (sample.ocean || sample.river || sample.lake) &&
+           std::isfinite(sample.waterSurface) &&
+           sample.waterSurface > sample.surfaceElevation + 0.05;
+}
+
+bool legalExplicitFall(const BasinSample& sample) {
+    return sample.waterfall && sample.transitionOwnerKind == WaterTransitionKind::EXPLICIT_FALL &&
+           sample.transitionOwnerId != 0 && sample.waterfallTop >= sample.waterfallBottom + 0.5;
+}
+
+uint8_t emittedFluidLevel(const BasinSample& sample) {
+    return sample.river && sample.generatedFluidLevel > 0 ? sample.generatedFluidLevel : 0;
+}
+
+int emittedFluidTopY(const BasinSample& sample) {
+    return static_cast<int>(std::ceil(sample.waterSurface)) - 1;
+}
+
+template <typename RawSampleAt>
+BasinSample finalizeCoordinateWater(double x, double z, BasinSample result,
+                                    RawSampleAt&& rawSampleAt) {
+    constexpr std::array<std::pair<int64_t, int64_t>, 4> CARDINAL = {
+        std::pair{-1, 0}, std::pair{1, 0}, std::pair{0, -1}, std::pair{0, 1}};
+    const auto normalizePartialState = [&](double sampleX, double sampleZ, BasinSample sample) {
+        if (!emittedWater(sample) || emittedFluidLevel(sample) == 0 || legalExplicitFall(sample) ||
+            (sample.transitionOwnerKind == WaterTransitionKind::EXPLICIT_FALL &&
+             sample.transitionOwnerId != 0)) {
+            return sample;
+        }
+
+        struct SearchNode {
+            double x = 0.0;
+            double z = 0.0;
+            unsigned distance = 0;
+        };
+        const int topY = emittedFluidTopY(sample);
+        std::vector<SearchNode> frontier = {{sampleX, sampleZ, 0}};
+        std::set<std::pair<double, double>> visited = {{sampleX, sampleZ}};
+        std::optional<unsigned> sourceDistance;
+        for (size_t cursor = 0; cursor < frontier.size() && !sourceDistance.has_value(); ++cursor) {
+            const SearchNode current = frontier[cursor];
+            if (current.distance >= 7) continue;
+            for (const auto [offsetX, offsetZ] : CARDINAL) {
+                const double predecessorX = current.x + static_cast<double>(offsetX);
+                const double predecessorZ = current.z + static_cast<double>(offsetZ);
+                if (!visited.emplace(predecessorX, predecessorZ).second) continue;
+                const BasinSample predecessor = rawSampleAt(predecessorX, predecessorZ);
+                if (!emittedWater(predecessor) || emittedFluidTopY(predecessor) < topY) continue;
+                const unsigned distance = current.distance + 1;
+                if (emittedFluidTopY(predecessor) > topY || emittedFluidLevel(predecessor) == 0) {
+                    sourceDistance = distance;
+                    break;
+                }
+                frontier.push_back({predecessorX, predecessorZ, distance});
+            }
+        }
+
+        if (sourceDistance.has_value()) {
+            sample.generatedFluidLevel = static_cast<uint8_t>(*sourceDistance);
+            sample.waterSurface =
+                static_cast<double>(topY) +
+                fluidSurfaceHeight(FluidState::flowing(sample.generatedFluidLevel));
+        } else {
+            // Keep the same occupied top voxel when promoting an unanchored
+            // flowing state to a source. Dropping it to the plane below creates
+            // an empty notch that immediately refills during the first tick.
+            sample.waterSurface = static_cast<double>(topY + 1);
+            sample.generatedFluidLevel = 0;
+        }
+        sample.surfaceElevation = std::min(sample.surfaceElevation, sample.waterSurface - 0.125);
+        sample.channelDepth =
+            std::max(sample.channelDepth, sample.waterSurface - sample.surfaceElevation);
+        return sample;
+    };
+
+    return normalizePartialState(x, z, std::move(result));
 }
 
 } // namespace
@@ -8857,7 +9401,8 @@ public:
     SolutionPointer
     getOrCreate(BasinKey key, const ElevationFunction& elevation, const RainfallFunction& rainfall,
                 const RockResistanceFunction& rockResistance,
-                const PotentialEvapotranspirationFunction& potentialEvapotranspiration) const {
+                const PotentialEvapotranspirationFunction& potentialEvapotranspiration,
+                const HydroclimateFunction& hydroclimate) const {
         struct LocalBasin {
             const Impl* owner = nullptr;
             uint64_t instance = 0;
@@ -8968,9 +9513,20 @@ public:
             {
                 ColdBasinBuildPermit permit;
                 solution = buildSolution(random, key, elevation, rainfall, rockResistance,
-                                         potentialEvapotranspiration);
+                                         potentialEvapotranspiration, hydroclimate);
             }
             return publish(solution, false);
+        } catch (const learned::GenerationFailureException&) {
+            // A missing or failed learned-authority page is scheduling state,
+            // not a numerical basin failure. Publishing the synthetic repair
+            // path here would permanently mix v3 hydrology with a v4 world
+            // whenever a page happened to be deferred during the first solve.
+            producer->set_exception(std::current_exception());
+            std::lock_guard lock(mutex);
+            auto found = entries.find(key);
+            if (found != entries.end() && found->second.token == token) entries.erase(found);
+            metrics.entries = entries.size();
+            throw;
         } catch (const std::exception&) {
             try {
                 const SolutionPointer fallback =
@@ -8988,11 +9544,12 @@ public:
         }
     }
 
-    ShorelinePointer getOrCreateShoreline(
-        double x, double z, WaterBodyId body, double waterLevel, bool endorheic,
-        const ElevationFunction& elevation, const RainfallFunction& rainfall,
-        const RockResistanceFunction& rockResistance,
-        const PotentialEvapotranspirationFunction& potentialEvapotranspiration) const {
+    ShorelinePointer
+    getOrCreateShoreline(double x, double z, WaterBodyId body, double waterLevel, bool endorheic,
+                         const ElevationFunction& elevation, const RainfallFunction& rainfall,
+                         const RockResistanceFunction& rockResistance,
+                         const PotentialEvapotranspirationFunction& potentialEvapotranspiration,
+                         const HydroclimateFunction& hydroclimate) const {
         const auto pageCoordinate = [](double coordinate) {
             return world_coord::floorToNeighborSafeInt64(coordinate / SHORELINE_PAGE_EDGE);
         };
@@ -9056,7 +9613,7 @@ public:
                         found = localSolutions
                                     .emplace(basin,
                                              getOrCreate(basin, elevation, rainfall, rockResistance,
-                                                         potentialEvapotranspiration))
+                                                         potentialEvapotranspiration, hydroclimate))
                                     .first;
                     }
                     return *found->second;
@@ -9139,7 +9696,8 @@ BasinSolver& BasinSolver::operator=(BasinSolver&&) noexcept = default;
 BasinSample
 BasinSolver::sample(double x, double z, const ElevationFunction& elevation,
                     const RainfallFunction& rainfall, const RockResistanceFunction& rockResistance,
-                    const PotentialEvapotranspirationFunction& potentialEvapotranspiration) const {
+                    const PotentialEvapotranspirationFunction& potentialEvapotranspiration,
+                    const HydroclimateFunction& hydroclimate) const {
     impl_->scalarSampleCalls.fetch_add(1, std::memory_order_relaxed);
     try {
         std::unordered_map<BasinKey, Impl::SolutionPointer, BasinKeyHash> retainedSolutions;
@@ -9148,8 +9706,9 @@ BasinSolver::sample(double x, double z, const ElevationFunction& elevation,
             auto [entry, inserted] = retainedSolutions.try_emplace(candidateKey);
             if (inserted) {
                 try {
-                    entry->second = impl_->getOrCreate(candidateKey, elevation, rainfall,
-                                                       rockResistance, potentialEvapotranspiration);
+                    entry->second =
+                        impl_->getOrCreate(candidateKey, elevation, rainfall, rockResistance,
+                                           potentialEvapotranspiration, hydroclimate);
                 } catch (...) {
                     retainedSolutions.erase(entry);
                     throw;
@@ -9172,7 +9731,7 @@ BasinSolver::sample(double x, double z, const ElevationFunction& elevation,
                 const auto page = impl_->getOrCreateShoreline(
                     sampleX, sampleZ, authority.sample.identity, authority.sample.waterLevel,
                     authority.sample.endorheic, elevation, rainfall, rockResistance,
-                    potentialEvapotranspiration);
+                    potentialEvapotranspiration, hydroclimate);
                 contour = sampleShorelinePage(*page, sampleX, sampleZ);
             } else {
                 contour = exteriorLakeContour(authority, sampleKey);
@@ -9182,17 +9741,27 @@ BasinSolver::sample(double x, double z, const ElevationFunction& elevation,
                                               contour.valid ? &contour : nullptr, solutionAt);
         };
         BasinSample result = sampleRaw(x, z);
-        if (result.valid) return result;
+        if (result.valid) {
+            // The legacy v3 profile owns its settled raster water states
+            // directly. Coordinate-level repair belongs only to explicit
+            // physical-climate callers; production v4 uses NativeHydrologyRouter.
+            if (!hydroclimate) return result;
+            return finalizeCoordinateWater(x, z, std::move(result), sampleRaw);
+        }
+    } catch (const learned::GenerationFailureException&) {
+        throw;
     } catch (const std::exception&) {
     }
     return fallbackSample(impl_->random, x, z, elevation, rainfall);
 }
 
-void BasinSolver::sampleGrid(
-    int64_t originX, int64_t originZ, int spacingX, int spacingZ, int sampleWidth, int sampleHeight,
-    const ElevationFunction& elevation, const RainfallFunction& rainfall,
-    const RockResistanceFunction& rockResistance, std::span<BasinSample> output,
-    const PotentialEvapotranspirationFunction& potentialEvapotranspiration) const {
+void BasinSolver::sampleGrid(int64_t originX, int64_t originZ, int spacingX, int spacingZ,
+                             int sampleWidth, int sampleHeight, const ElevationFunction& elevation,
+                             const RainfallFunction& rainfall,
+                             const RockResistanceFunction& rockResistance,
+                             std::span<BasinSample> output,
+                             const PotentialEvapotranspirationFunction& potentialEvapotranspiration,
+                             const HydroclimateFunction& hydroclimate) const {
     if (spacingX <= 0 || spacingZ <= 0 || sampleWidth <= 0 || sampleHeight <= 0 ||
         output.size() != static_cast<size_t>(sampleWidth * sampleHeight)) {
         throw std::invalid_argument("invalid basin sample grid");
@@ -9207,7 +9776,7 @@ void BasinSolver::sampleGrid(
         if (inserted) {
             try {
                 entry->second = impl_->getOrCreate(key, elevation, rainfall, rockResistance,
-                                                   potentialEvapotranspiration);
+                                                   potentialEvapotranspiration, hydroclimate);
             } catch (...) {
                 retainedSolutions.erase(entry);
                 throw;
@@ -9251,6 +9820,8 @@ void BasinSolver::sampleGrid(
             const BasinSample result = sampleAcrossCatchmentFaces(
                 key, x, z, contour.valid ? &contour : nullptr, solutionAt);
             if (result.valid) return result;
+        } catch (const learned::GenerationFailureException&) {
+            throw;
         } catch (const std::exception&) {
         }
         return fallbackSample(impl_->random, x, z, elevation, rainfall);
@@ -9264,13 +9835,44 @@ void BasinSolver::sampleGrid(
             output[static_cast<size_t>(sampleZ * sampleWidth + sampleX)] = sampleRaw(x, z);
         }
     }
+
+    if (!hydroclimate) return;
+
+    const auto rawSampleAt = [&](double x, double z) {
+        if (std::trunc(x) == x && std::trunc(z) == z) {
+            const int64_t offsetX = static_cast<int64_t>(x) - originX;
+            const int64_t offsetZ = static_cast<int64_t>(z) - originZ;
+            if (offsetX >= 0 && offsetZ >= 0 && offsetX % spacingX == 0 &&
+                offsetZ % spacingZ == 0) {
+                const int64_t sampleX = offsetX / spacingX;
+                const int64_t sampleZ = offsetZ / spacingZ;
+                if (sampleX < sampleWidth && sampleZ < sampleHeight) {
+                    return output[static_cast<size_t>(sampleZ * sampleWidth + sampleX)];
+                }
+            }
+        }
+        return sampleRaw(x, z);
+    };
+    std::vector<BasinSample> finalized(output.size());
+    for (int sampleZ = 0; sampleZ < sampleHeight; ++sampleZ) {
+        for (int sampleX = 0; sampleX < sampleWidth; ++sampleX) {
+            const size_t index = static_cast<size_t>(sampleZ * sampleWidth + sampleX);
+            const double x =
+                static_cast<double>(originX + static_cast<int64_t>(sampleX) * spacingX);
+            const double z =
+                static_cast<double>(originZ + static_cast<int64_t>(sampleZ) * spacingZ);
+            finalized[index] = finalizeCoordinateWater(x, z, output[index], rawSampleAt);
+        }
+    }
+    std::ranges::copy(finalized, output.begin());
 }
 
 void BasinSolver::samplePoints(
     std::span<const BasinSamplePosition> positions, const ElevationFunction& elevation,
     const RainfallFunction& rainfall, const RockResistanceFunction& rockResistance,
     std::span<BasinSample> output,
-    const PotentialEvapotranspirationFunction& potentialEvapotranspiration) const {
+    const PotentialEvapotranspirationFunction& potentialEvapotranspiration,
+    const HydroclimateFunction& hydroclimate) const {
     if (positions.size() != output.size()) {
         throw std::invalid_argument("invalid basin sample points");
     }
@@ -9284,7 +9886,7 @@ void BasinSolver::samplePoints(
         if (inserted) {
             try {
                 entry->second = impl_->getOrCreate(key, elevation, rainfall, rockResistance,
-                                                   potentialEvapotranspiration);
+                                                   potentialEvapotranspiration, hydroclimate);
             } catch (...) {
                 retainedSolutions.erase(entry);
                 throw;
@@ -9328,12 +9930,18 @@ void BasinSolver::samplePoints(
             const BasinSample result = sampleAcrossCatchmentFaces(
                 key, x, z, contour.valid ? &contour : nullptr, solutionAt);
             if (result.valid) return result;
+        } catch (const learned::GenerationFailureException&) {
+            throw;
         } catch (const std::exception&) {
         }
         return fallbackSample(impl_->random, x, z, elevation, rainfall);
     };
     for (size_t index = 0; index < positions.size(); ++index) {
-        output[index] = sampleRaw(positions[index].x, positions[index].z);
+        BasinSample sample = sampleRaw(positions[index].x, positions[index].z);
+        output[index] = hydroclimate
+                            ? finalizeCoordinateWater(positions[index].x, positions[index].z,
+                                                      std::move(sample), sampleRaw)
+                            : std::move(sample);
     }
 }
 
