@@ -3464,12 +3464,21 @@ void RenderPipeline::renderFarTerrain(
     if (protectedClosureAnchor) {
         buildFarTerrainProtectedNearTargets(*protectedClosureAnchor, _farTerrainCandidates,
                                             _farTerrainConnectedNearPatchTargets);
-        if (protectedHandoffChanged || selectionChanged ||
-            _farTerrainProtectedFinalTerrainRegions.empty()) {
+        const bool protectedRegionsChanged = protectedHandoffChanged || selectionChanged ||
+                                             _farTerrainProtectedFinalTerrainRegions.empty();
+        if (protectedRegionsChanged) {
             _farTerrainProtectedFinalTerrainRegions =
                 farTerrainProtectedFinalTerrainRegions(_farTerrainConnectedNearPatchTargets);
         }
         if (const auto generationContext = world.generationContext()) {
+            if (protectedRegionsChanged) {
+                // Pin the protected FINAL window closure so its coarse, Base,
+                // and decoder windows are computed once and never evicted while
+                // this closure is active (issue #16).
+                _farTerrainProtectedWindowRetention =
+                    generationContext->retainProtectedAuthorityWindows(
+                        _farTerrainProtectedFinalTerrainRegions);
+            }
             const worldgen::learned::ProtectedHandoffEpoch epoch{protectedClosureEpoch};
             for (const worldgen::learned::NativeRect region :
                  _farTerrainProtectedFinalTerrainRegions) {
@@ -3491,6 +3500,7 @@ void RenderPipeline::renderFarTerrain(
         }
     } else {
         _farTerrainProtectedFinalTerrainRegions.clear();
+        _farTerrainProtectedWindowRetention.reset();
     }
     const auto predictedOnlyTarget = [&](FarTerrainKey key) {
         const bool predicted = std::ranges::find(_farTerrainPredictedNearPatchTargets, key) !=

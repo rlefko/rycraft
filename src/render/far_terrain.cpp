@@ -7,6 +7,7 @@
 #include "render/shader_types.hpp"
 #include "world/chunk.hpp"
 #include "world/chunk_generator.hpp"
+#include "world/learned_authority_graph.hpp"
 #include "world/learned_terrain.hpp"
 #include "world/native_hydrology.hpp"
 #include "world/surface_material.hpp"
@@ -2441,21 +2442,33 @@ farTerrainProtectedFinalTerrainRegions(std::span<const FarTerrainKey> targets) {
             group.push_back(diagonal);
         }
 
-        NativeRect combined = worldgen::nativeHydrologyFinalTerrainRegion(originX, originZ);
-        for (size_t index = 1; index < group.size(); ++index) {
-            const auto [ownerZ, ownerX] = group[index];
-            const NativeRect member = worldgen::nativeHydrologyFinalTerrainRegion(ownerX, ownerZ);
-            combined.rowBegin = std::min(combined.rowBegin, member.rowBegin);
-            combined.columnBegin = std::min(combined.columnBegin, member.columnBegin);
-            combined.rowEnd = std::max(combined.rowEnd, member.rowEnd);
-            combined.columnEnd = std::max(combined.columnEnd, member.columnEnd);
+        std::vector<NativeRect> memberRects;
+        memberRects.reserve(group.size());
+        for (const auto [ownerZ, ownerX] : group)
+            memberRects.push_back(worldgen::nativeHydrologyFinalTerrainRegion(ownerX, ownerZ));
+        NativeRect combined = memberRects.front();
+        for (size_t index = 1; index < memberRects.size(); ++index) {
+            combined.rowBegin = std::min(combined.rowBegin, memberRects[index].rowBegin);
+            combined.columnBegin = std::min(combined.columnBegin, memberRects[index].columnBegin);
+            combined.rowEnd = std::max(combined.rowEnd, memberRects[index].rowEnd);
+            combined.columnEnd = std::max(combined.columnEnd, memberRects[index].columnEnd);
         }
-        const uint64_t samples = combined.height() * combined.width();
-        if (!combined.valid() || samples > worldgen::learned::MAXIMUM_AUTHORITY_QUERY_SAMPLES) {
-            throw std::logic_error(
-                "Protected FINAL terrain grouping exceeds the bounded native query");
+        // Group only when the combined rectangle costs fewer unique model
+        // windows than preparing the owners independently. Union by bounding box
+        // alone is not sufficient, and a union that would exceed the sample
+        // bound falls back to independent owners rather than failing.
+        if (group.size() > 1 &&
+            !worldgen::learned::learnedPreferGroupedRegion(combined, memberRects)) {
+            for (const NativeRect& member : memberRects)
+                regions.push_back(member);
+        } else {
+            const uint64_t samples = combined.height() * combined.width();
+            if (!combined.valid() || samples > worldgen::learned::MAXIMUM_AUTHORITY_QUERY_SAMPLES) {
+                throw std::logic_error(
+                    "Protected FINAL terrain grouping exceeds the bounded native query");
+            }
+            regions.push_back(combined);
         }
-        regions.push_back(combined);
         for (const auto owner : group)
             owners.erase(owner);
     }
