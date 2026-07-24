@@ -16,6 +16,8 @@ A concept gets exactly one definition, in one header, and everyone imports it. C
 | Model and runtime asset pins | `resources/config/terrain_model_manifest.json` and `world/terrain_bootstrap.hpp` |
 | Production runtime version and qualification | `world/terrain_runtime.hpp` |
 | Production InfiniteDiffusion page backend | `world/infinite_diffusion_backend.hpp` |
+| Learned-authority window planning and pinning | `world/learned_authority_graph.hpp` |
+| Critical-path trace records, tracks, and enable switch | `common/trace.hpp` |
 | Native hydrology page admission budget | `world/native_hydrology.hpp` |
 | V4 startup, dry-land spawn selection, and entry gate | `engine/v4_world_startup.hpp` |
 | V4 entry preparation renderer | `render/render_pipeline.hpp` (`RenderPipeline::renderV4Preparation`) |

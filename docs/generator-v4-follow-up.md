@@ -117,6 +117,11 @@ These packages are the review and merge boundaries for Programs 0 through 4:
 
 ## Program 0: baseline and trace contract
 
+Implemented by the generator v4 preparation PR: `common/trace.hpp` plus the checked-in
+`rycraft_trace_summary` tool. Tracing is disabled by default with a single-atomic emit guard, no
+per-frame allocation, and a bounded buffer; enabling it writes a Chrome Trace Event JSON and a
+binary trace. See [architecture.md](architecture.md) for the record layout and controls.
+
 Optimization begins with one trace format shared by startup, authority, hydrology, exact streaming,
 far streaming, upload, and rendering. Each work item records its generation fingerprint, immutable
 spatial key, camera epoch, requested quality, dependency reason, queue timestamps, execution time,
@@ -201,6 +206,12 @@ owner, and no axis-aligned color or depth line in the resolved image.
 
 ### Learned-authority request planner
 
+Implemented by the generator v4 preparation PR. `world/learned_authority_graph.hpp` plans the unique
+coarse, Base, and Decoder windows once, computes the working-set bound before inference, pins the
+protected closure so no referenced window is recomputed or evicted, and cost-gates 2x2 owner
+grouping by unique-window count. The enumeration is cross-checked against the windows the backend
+actually computes, and authority bytes and qualification hashes are unchanged.
+
 Replace independent rectangular requests with an immutable request graph before inference begins.
 The planner unions overlapping native rectangles, enumerates their exact coarse, latent, and decoder
 window dependencies, and schedules each unique window once. Consumers receive views into the
@@ -242,6 +253,14 @@ Acceptance requires:
   request larger than every configured bound.
 
 ### Hydrology hierarchy and scheduling
+
+Partially implemented. The generator v4 preparation PR adds camera-aware admission: the process-wide
+build gate ranks waiters by the shared `AuthorityRequestPriority` and reserves lanes so a distant
+owner cannot occupy every hydrology lane while the player's exact band is unresolved. The two-level
+owner-summary and on-demand-detail split, the structure-of-arrays scratch layout, the benchmarked
+radix or bucket Priority-Flood, and the vectorized local kernels remain deferred, together with
+their 2x cold-CPU and 50-percent repeated-read gates, which require the retained reference path and
+real-model benchmarking.
 
 Canonical hydrology should become a two-level immutable product:
 
