@@ -5,11 +5,12 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// common/trace — one machine-readable critical-path trace for generator v4.
+// common/trace: one machine-readable critical-path trace for generator v4.
 //
 // This is the single source of truth for the trace record layout, the span
 // enable switch, and the summary computation. Every subsystem (bootstrap,
@@ -117,6 +118,9 @@ enum class Name : uint32_t {
 const char* nameString(uint32_t nameId) noexcept;
 const char* trackString(Track track) noexcept;
 const char* routeString(RouteTag route) noexcept;
+// One mapping from a route token (cold/warm/move/hover/reversal/lod/settle) to
+// its tag, shared by the enable switch and the summarizer tool.
+RouteTag routeFromName(std::string_view name) noexcept;
 
 // Fixed 64-byte trivially copyable record. Every field is a scalar already in
 // scope at the emit site; nothing owns heap.
@@ -179,6 +183,7 @@ void reset() noexcept;   // clear the buffer without disabling; for tests
 void setRoute(RouteTag route) noexcept;
 RouteTag route() noexcept;
 void setFingerprintLow(uint64_t fingerprintLow) noexcept;
+[[nodiscard]] uint64_t fingerprintLow() noexcept;
 
 size_t capacity() noexcept;
 size_t recorded() noexcept;               // events retained (min(cursor, capacity))
@@ -194,7 +199,7 @@ inline Event makeEvent(Track track, EventKind kind, Name name, const Context& c)
     Event e;
     e.timestampNs = nowNs();
     e.spatialKey = c.spatialKey;
-    e.fingerprintLow = c.fingerprintLow;
+    e.fingerprintLow = c.fingerprintLow != 0 ? c.fingerprintLow : fingerprintLow();
     e.bytesRetained = c.bytesRetained;
     e.cameraEpoch = c.cameraEpoch;
     e.nameId = static_cast<uint32_t>(name);

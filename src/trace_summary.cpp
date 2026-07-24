@@ -6,7 +6,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// rycraft_trace_summary — the checked-in Program 0 trace summarizer.
+// rycraft_trace_summary: the checked-in Program 0 trace summarizer.
 //
 // It reads one binary trace written by trace::writeBinary (RYCRAFT_TRACE) and
 // reports p50/p95/max, queue depth, cache reuse, cancellation, critical-path
@@ -20,17 +20,6 @@ namespace {
 void usage() {
     std::fprintf(stderr, "usage: rycraft_trace_summary <trace.rytrace> [--json] [--route NAME]\n"
                          "  NAME is one of cold warm move hover reversal lod settle\n");
-}
-
-trace::RouteTag routeFromName(const std::string& value) {
-    if (value == "cold") return trace::RouteTag::ColdEntry;
-    if (value == "warm") return trace::RouteTag::WarmEntry;
-    if (value == "move") return trace::RouteTag::Movement;
-    if (value == "hover") return trace::RouteTag::Hover;
-    if (value == "reversal") return trace::RouteTag::Reversal;
-    if (value == "lod") return trace::RouteTag::LodFlight;
-    if (value == "settle") return trace::RouteTag::Settlement;
-    return trace::RouteTag::Unknown;
 }
 
 double ms(uint64_t ns) {
@@ -125,7 +114,7 @@ int main(int argc, char** argv) {
             json = true;
         } else if (arg == "--route" && i + 1 < argc) {
             filterRoute = true;
-            route = routeFromName(argv[++i]);
+            route = trace::routeFromName(argv[++i]);
         } else if (!arg.empty() && arg[0] != '-') {
             path = arg;
         } else {

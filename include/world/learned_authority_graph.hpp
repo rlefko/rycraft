@@ -10,7 +10,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// world/learned_authority_graph — one immutable dependency graph for learned
+// world/learned_authority_graph: one immutable dependency graph for learned
 // authority (generator v4, issue #16).
 //
 // The planner replaces independent, overlapping page and protected-owner

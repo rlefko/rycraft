@@ -35,35 +35,6 @@ std::chrono::steady_clock::time_point traceEpoch() {
     return epoch;
 }
 
-RouteTag routeFromName(const char* name) {
-    if (name == nullptr) {
-        return RouteTag::Unknown;
-    }
-    const std::string value(name);
-    if (value == "cold") {
-        return RouteTag::ColdEntry;
-    }
-    if (value == "warm") {
-        return RouteTag::WarmEntry;
-    }
-    if (value == "move") {
-        return RouteTag::Movement;
-    }
-    if (value == "hover") {
-        return RouteTag::Hover;
-    }
-    if (value == "reversal") {
-        return RouteTag::Reversal;
-    }
-    if (value == "lod") {
-        return RouteTag::LodFlight;
-    }
-    if (value == "settle") {
-        return RouteTag::Settlement;
-    }
-    return RouteTag::Unknown;
-}
-
 constexpr const char* kNames[] = {
     "bootstrap.download",
     "bootstrap.verify",
@@ -152,6 +123,15 @@ const char* routeString(RouteTag route) noexcept {
     return kRoutes[static_cast<size_t>(route)];
 }
 
+RouteTag routeFromName(std::string_view name) noexcept {
+    for (size_t index = 0; index < static_cast<size_t>(RouteTag::Count); ++index) {
+        if (name == kRoutes[index]) {
+            return static_cast<RouteTag>(index);
+        }
+    }
+    return RouteTag::Unknown;
+}
+
 uint64_t nowNs() noexcept {
     const auto delta = std::chrono::steady_clock::now() - traceEpoch();
     return static_cast<uint64_t>(
@@ -205,7 +185,9 @@ void enableFromEnvironment() {
     }
     const char* ring = std::getenv("RYCRAFT_TRACE_RING");
     const bool ringMode = ring != nullptr && ring[0] == '1';
-    setRoute(routeFromName(std::getenv("RYCRAFT_TRACE_ROUTE")));
+    if (const char* routeName = std::getenv("RYCRAFT_TRACE_ROUTE")) {
+        setRoute(routeFromName(routeName));
+    }
     enable(path, capacity, ringMode);
 }
 
@@ -225,8 +207,12 @@ RouteTag route() noexcept {
     return static_cast<RouteTag>(g_route.load(std::memory_order_relaxed));
 }
 
-void setFingerprintLow(uint64_t fingerprintLow) noexcept {
-    g_fingerprintLow.store(fingerprintLow, std::memory_order_relaxed);
+void setFingerprintLow(uint64_t value) noexcept {
+    g_fingerprintLow.store(value, std::memory_order_relaxed);
+}
+
+uint64_t fingerprintLow() noexcept {
+    return g_fingerprintLow.load(std::memory_order_relaxed);
 }
 
 size_t capacity() noexcept {
@@ -301,7 +287,6 @@ Summary summarize(std::span<const Event> events) {
                     e.priority <= 2) { // SPAWN/EXPLORATION_EXACT/PROTECTED_HANDOFF
                     protectedWaits.emplace_back(it->second, start);
                     summary.protectedWaitNs += start - it->second;
-                    summary.tracks[track].canceled += 0; // no-op, keeps track index warm
                 }
                 enqueueTimes.erase(it);
             }
@@ -367,10 +352,6 @@ Summary summarize(std::span<const Event> events) {
             peak = std::max(peak, running);
         }
         ts.maxQueueDepth = static_cast<uint64_t>(std::max<int64_t>(peak, 0));
-
-        if (ts.totalNs > summary.topProtectedWaitOwnerNs && ts.count > 0) {
-            // Fallback owner attribution when explicit protected waits are sparse.
-        }
     }
 
     // Merge protected-wait intervals, then attribute optional execution overlap.
