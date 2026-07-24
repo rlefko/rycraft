@@ -268,17 +268,22 @@ Summary summarize(std::span<const Event> events) {
             continue;
         }
 
+        // insertWindow emits one instant per actual window computation, keyed by
+        // the window's lattice index and stage. A window that reappears here
+        // after eviction is a recompute, which the cross-check test confirms is
+        // the real per-window record (model-call Complete spans carry no window
+        // key and are excluded).
+        if (e.track == Track::ModelWindow && e.kind == EventKind::Instant) {
+            const auto key = std::make_pair(e.nameId, e.spatialKey);
+            if (modelWindowExecutions[key]++ > 0) {
+                ++summary.duplicateModelWindows;
+            }
+        }
+
         if (e.kind == EventKind::Complete) {
             durations[track].push_back(e.durationNs);
             summary.tracks[track].totalNs += e.durationNs;
             depthEvents[track].emplace_back(e.timestampNs, -1);
-
-            if (e.track == Track::ModelWindow) {
-                const auto key = std::make_pair(e.nameId, e.spatialKey);
-                if (modelWindowExecutions[key]++ > 0) {
-                    ++summary.duplicateModelWindows;
-                }
-            }
 
             auto it = enqueueTimes.find(pairKey);
             if (it != enqueueTimes.end()) {

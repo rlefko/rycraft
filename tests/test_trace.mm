@@ -194,12 +194,14 @@ trace::Event makeSpan(trace::Track track, trace::Name name, uint64_t ts, uint64_
     return e;
 }
 
-trace::Event makeInstant(trace::Track track, trace::Name name, uint64_t bytes = 0) {
+trace::Event makeInstant(trace::Track track, trace::Name name, uint64_t bytes = 0,
+                         uint64_t spatialKey = 0) {
     trace::Event e;
     e.track = track;
     e.kind = trace::EventKind::Instant;
     e.nameId = static_cast<uint32_t>(name);
     e.bytesRetained = bytes;
+    e.spatialKey = spatialKey;
     return e;
 }
 
@@ -225,9 +227,10 @@ TEST_CASE("summarize computes deterministic critical-path statistics", "[trace]"
     events.push_back(makeSpan(trace::Track::LearnedAuthority, trace::Name::AuthorityEnqueue,
                               /*ts=*/250, /*dur=*/5, /*priority=*/2, /*spatialKey=*/7,
                               /*epoch=*/1));
-    // Duplicate model window (same name + spatial key executed twice).
-    events.push_back(makeSpan(trace::Track::ModelWindow, trace::Name::ModelDecoder, 5, 3, 0, 99));
-    events.push_back(makeSpan(trace::Track::ModelWindow, trace::Name::ModelDecoder, 20, 3, 0, 99));
+    // Duplicate model window: the same window (name + lattice key) computed
+    // twice is recorded by two insertWindow instants, not the model-call spans.
+    events.push_back(makeInstant(trace::Track::ModelWindow, trace::Name::ModelDecoder, 0, 99));
+    events.push_back(makeInstant(trace::Track::ModelWindow, trace::Name::ModelDecoder, 0, 99));
     // Cache and omission instants.
     events.push_back(makeInstant(trace::Track::LearnedAuthority, trace::Name::AuthorityCacheHit));
     events.push_back(makeInstant(trace::Track::LearnedAuthority, trace::Name::AuthorityCacheHit));
