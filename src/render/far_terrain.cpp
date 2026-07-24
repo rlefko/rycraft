@@ -2,6 +2,7 @@
 
 #include "common/error.hpp"
 #include "common/thread_priority.hpp"
+#include "common/trace.hpp"
 #include "render/block_textures.hpp"
 #include "render/shader_types.hpp"
 #include "world/chunk.hpp"
@@ -3513,6 +3514,10 @@ size_t FarCanopyAttachment::byteSize() const {
 std::shared_ptr<const FarTerrainMesh>
 FarTerrainMesher::build(FarTerrainKey key, const FarTerrainSource& source,
                         FarTerrainAuthorityQuality authorityQuality) {
+    trace::Scope span(
+        trace::Track::FarGeneration, trace::Name::FarTileBuild,
+        {.spatialKey = trace::packCoord(key.tileX, key.tileZ, static_cast<uint8_t>(key.step)),
+         .quality = static_cast<uint8_t>(authorityQuality)});
     return buildInternal(key, source, authorityQuality);
 }
 

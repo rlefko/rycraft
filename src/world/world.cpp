@@ -2,6 +2,7 @@
 
 #include "common/error.hpp"
 #include "common/thread_priority.hpp"
+#include "common/trace.hpp"
 #include "world/furnace.hpp"
 #include "world/learned_terrain.hpp"
 #include "world/light_engine.hpp"
@@ -575,6 +576,10 @@ void World::latchGenerationFailure(worldgen::learned::GenerationFailure failure)
 }
 
 void World::generateChunk(const std::shared_ptr<Chunk>& chunk) {
+    const ChunkPos pos = chunk->pos();
+    trace::Scope span(
+        trace::Track::ExactGeneration, trace::Name::ExactChunkGenerate,
+        {.spatialKey = trace::packCoord(pos.x, pos.z, static_cast<uint8_t>(pos.y & 0xFF))});
     generator_.generateCube(*chunk);
 }
 

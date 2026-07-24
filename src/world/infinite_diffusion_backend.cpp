@@ -1,5 +1,7 @@
 #include "world/infinite_diffusion_backend.hpp"
 
+#include "common/trace.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -1981,6 +1983,16 @@ private:
     const std::vector<float>& insertWindow(WindowKey key, std::vector<float> values) {
         auto existing = windows_.find(key);
         if (existing != windows_.end()) return existing->second.values;
+        // Observability only: one instant per actual window computation. A
+        // window that reappears here after eviction is a recompute, which the
+        // summarizer counts as a duplicate model window (see common/trace.hpp).
+        const trace::Name windowName =
+            key.stage == WindowKey::Stage::Coarse    ? trace::Name::ModelCoarse
+            : key.stage == WindowKey::Stage::Decoder ? trace::Name::ModelDecoder
+                                                     : trace::Name::ModelBase;
+        trace::instant(
+            trace::Track::ModelWindow, windowName,
+            {.spatialKey = trace::packCoord(key.row, key.column, static_cast<uint8_t>(key.stage))});
         cacheBytes_ += values.size() * sizeof(float);
         auto [inserted, didInsert] = windows_.emplace(
             key, CachedWindow{.values = std::move(values), .lastAccess = ++cacheClock_});

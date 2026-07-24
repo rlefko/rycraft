@@ -1,5 +1,6 @@
 #include "world/native_hydrology.hpp"
 
+#include "common/trace.hpp"
 #include "world/chunk.hpp"
 #include "world/learned_terrain.hpp"
 
@@ -5898,6 +5899,9 @@ public:
                 recency.splice(recency.begin(), recency, found->second.recency);
                 found->second.priority = std::min(found->second.priority, priority);
                 ++metrics.hits;
+                trace::instant(trace::Track::Hydrology, trace::Name::HydrologyHit,
+                               {.spatialKey = trace::packCoord(key.x, key.z),
+                                .priority = static_cast<uint8_t>(priority)});
                 return found->second.page;
             }
             if (auto active = flights.find(key); active != flights.end()) {
@@ -5919,6 +5923,12 @@ public:
             }
         }
 
+        // Observability only: one span per owner build attempt on the builder
+        // path, carrying retained bytes and the typed disposition at the end
+        // (see common/trace.hpp).
+        trace::Scope hydroSpan(trace::Track::Hydrology, trace::Name::HydrologyBuild,
+                               {.spatialKey = trace::packCoord(key.x, key.z),
+                                .priority = static_cast<uint8_t>(priority)});
         std::shared_ptr<const NativePage> page;
         std::exception_ptr failure;
         size_t peakBuildBytes = 0;
@@ -6006,6 +6016,11 @@ public:
         } catch (...) {
             failure = std::current_exception();
         }
+
+        hydroSpan.setBytesRetained(peakBuildBytes);
+        hydroSpan.setCancellation(
+            failure ? (deferredBuild ? trace::Cancellation::Deferred : trace::Cancellation::Failed)
+                    : trace::Cancellation::Completed);
 
         {
             std::lock_guard lock(mutex);

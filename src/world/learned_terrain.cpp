@@ -1,5 +1,6 @@
 #include "world/learned_terrain.hpp"
 
+#include "common/trace.hpp"
 #include "world/chunk_pos.hpp"
 #include "world/native_hydrology.hpp"
 
@@ -2394,6 +2395,17 @@ public:
 
     std::vector<PageBuildResult> inferOrLoadBatch(std::span<const TerrainPageKey> keys,
                                                   AuthorityRequestPriority priority) {
+        // Observability only: one authority build span per batch, keyed by the
+        // batch's lead page (see common/trace.hpp).
+        trace::Scope span(
+            trace::Track::LearnedAuthority, trace::Name::AuthorityPageBuild,
+            {.spatialKey =
+                 keys.empty()
+                     ? 0
+                     : trace::packCoord(keys.front().coordinate.row, keys.front().coordinate.column,
+                                        static_cast<uint8_t>(keys.front().quality)),
+             .quality = keys.empty() ? uint8_t{0} : static_cast<uint8_t>(keys.front().quality),
+             .priority = static_cast<uint8_t>(priority)});
         std::vector<PageBuildResult> results;
         results.reserve(keys.size());
         std::vector<size_t> missing;

@@ -2,6 +2,7 @@
 
 #include "common/error.hpp"
 #include "common/random.hpp"
+#include "common/trace.hpp"
 #include "render/atmosphere.hpp"
 #include "render/atmospheric_memory.hpp"
 #include "render/block_textures.hpp"
@@ -6286,6 +6287,31 @@ void RenderPipeline::renderFarTerrain(
     _chunkStats.farPendingTileCount =
         static_cast<uint32_t>(schedulerStats.inFlight + schedulerStats.completed);
     _chunkStats.farUploadsLastFrame = static_cast<uint32_t>(uploads);
+    // Observability only: the worst visible projected-error violation, far
+    // uploads, and GPU-resident tile count for the trace (common/trace.hpp).
+    if (trace::enabled()) {
+        if (worstVisibleProjectedError > 0.0F) {
+            trace::instant(
+                trace::Track::ScreenErrorDebt, trace::Name::ScreenErrorWorst,
+                {.spatialKey = trace::packCoord(
+                     worstVisibleCoordinate.x, worstVisibleCoordinate.z,
+                     static_cast<uint8_t>(farTerrainStepSize(worstVisibleDesired))),
+                 .bytesRetained = static_cast<uint64_t>(worstVisibleProjectedError * 256.0F),
+                 .priority = static_cast<uint8_t>(
+                     std::min<uint32_t>(visibleProjectedErrorViolations, 255))});
+        }
+        if (uploads > 0) {
+            trace::instant(trace::Track::Upload, trace::Name::FarMeshUpload,
+                           {.bytesRetained = static_cast<uint64_t>(uploads)});
+            trace::instant(trace::Track::GpuResidency, trace::Name::GpuResident,
+                           {.bytesRetained = static_cast<uint64_t>(drawn)});
+        }
+        const uint64_t omittedFlora = schedulerStats.queuedCanopy + schedulerStats.parkedCanopy;
+        if (omittedFlora > 0) {
+            trace::instant(trace::Track::ScreenErrorDebt, trace::Name::OmittedFlora,
+                           {.bytesRetained = omittedFlora});
+        }
+    }
     _chunkStats.farQueuedBaseTileCount = static_cast<uint32_t>(schedulerStats.queuedBase);
     _chunkStats.farQueuedRefinementTileCount =
         static_cast<uint32_t>(schedulerStats.queuedRefinement);
