@@ -824,6 +824,47 @@ TEST_CASE("V4 native wetlands inherit connected groundwater authority across pag
         REQUIRE(nativeWaterHash(restored[index]) == nativeWaterHash(persisted[index]));
 }
 
+TEST_CASE("V4 native hydrology output is independent of build concurrency",
+          "[worldgen][hydrology][native-4][v4][concurrency]") {
+    constexpr uint64_t SEED = 0x5745'544C'414E'4405ULL;
+    constexpr std::array<BasinSamplePosition, 5> positions{{
+        {2'002.0, 1'026.0},
+        {2'026.0, 1'026.0},
+        {2'046.0, 1'026.0},
+        {2'054.0, 1'026.0},
+        {2'086.0, 1'026.0},
+    }};
+    const NativeHydrologyInputFunction input = connectedCoastalWetlandInput();
+
+    std::array<BasinSample, positions.size()> baseline{};
+    {
+        NativeHydrologyRouter router(SEED);
+        router.samplePoints(positions, input, baseline);
+    }
+
+    // Many workers share one router so concurrent page builds pass through the
+    // camera-aware admission gate. Per-page single flight and the reservation
+    // gate must still yield output identical to the serial baseline.
+    NativeHydrologyRouter shared(SEED);
+    std::atomic<bool> mismatch{false};
+    std::vector<std::thread> workers;
+    for (int worker = 0; worker < 8; ++worker) {
+        workers.emplace_back([&]() {
+            for (int repeat = 0; repeat < 4; ++repeat) {
+                std::array<BasinSample, positions.size()> observed{};
+                shared.samplePoints(positions, input, observed);
+                for (size_t index = 0; index < observed.size(); ++index) {
+                    if (nativeWaterHash(observed[index]) != nativeWaterHash(baseline[index]))
+                        mismatch.store(true, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (std::thread& worker : workers)
+        worker.join();
+    CHECK_FALSE(mismatch.load());
+}
+
 TEST_CASE("V4 low-gradient mouths retain sea backwater and deterministic distributaries",
           "[worldgen][hydrology][native-4][v4][estuary][delta][brackish][page-edge][negative]") {
     constexpr uint64_t SEED = 0x4553'5455'4152'5901ULL;
@@ -1658,7 +1699,7 @@ TEST_CASE("V4 native horizon pages use bounded parallel CPU builds",
     REQUIRE(metrics.peakConcurrentBuilds <= admissionLimit);
 }
 
-TEST_CASE("V4 exact hydrology takes the next build slot ahead of distant waiters",
+TEST_CASE("V4 distant hydrology cannot occupy every build lane ahead of the exact band",
           "[worldgen][hydrology][native-4][v4][performance][concurrency][priority]"
           "[regression]") {
     const size_t reported = std::thread::hardware_concurrency() == 0
@@ -1669,7 +1710,6 @@ TEST_CASE("V4 exact hydrology takes the next build slot ahead of distant waiters
                                       NATIVE_HYDROLOGY_PARALLEL_BUILD_MEMORY_BUDGET /
                                           NATIVE_HYDROLOGY_MAX_BUILD_BYTES}));
     constexpr size_t BLOCKER_COUNT = NATIVE_HYDROLOGY_MAX_PARALLEL_BUILDS;
-    constexpr int64_t LOW_OWNER = 100;
     constexpr int64_t EXACT_OWNER = 101;
 
     std::mutex inputMutex;
@@ -1697,6 +1737,9 @@ TEST_CASE("V4 exact hydrology takes the next build slot ahead of distant waiters
         };
 
     NativeHydrologyRouter router(0x16C0'BE50'0005ULL);
+    // The low reservation caps distant SPECULATIVE builds at half the lanes so
+    // the exact band always retains reserved build capacity (issue #17).
+    const size_t lowCap = std::max<size_t>(1, expectedActive / 2);
     std::vector<std::future<BasinSample>> blockers;
     blockers.reserve(BLOCKER_COUNT);
     for (size_t index = 0; index < BLOCKER_COUNT; ++index) {
@@ -1721,51 +1764,48 @@ TEST_CASE("V4 exact hydrology takes the next build slot ahead of distant waiters
         }
     } releaseAllOnExit{inputMutex, inputReady, releaseAll};
 
+    // At most lowCap distant builds run concurrently; the reservation keeps the
+    // remaining SPECULATIVE requests waiting so exact lanes stay free.
     {
         std::unique_lock lock(inputMutex);
         REQUIRE(inputReady.wait_for(lock, std::chrono::seconds(5),
-                                    [&] { return enteredOwners.size() == expectedActive; }));
+                                    [&] { return enteredOwners.size() >= lowCap; }));
     }
 
-    std::promise<void> lowStarted;
-    std::future<BasinSample> low = std::async(std::launch::async, [&] {
-        lowStarted.set_value();
-        return router.sample(static_cast<double>(LOW_OWNER * NATIVE_HYDROLOGY_PAGE_EDGE + 1'024),
-                             1'024.0, heldInput, nullptr,
-                             learned::AuthorityRequestPriority::SPECULATIVE_PREFETCH);
-    });
-    lowStarted.get_future().wait();
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    std::promise<void> exactStarted;
-    std::future<BasinSample> exact = std::async(std::launch::async, [&] {
-        exactStarted.set_value();
-        return router.sample(static_cast<double>(EXACT_OWNER * NATIVE_HYDROLOGY_PAGE_EDGE + 1'024),
-                             1'024.0, heldInput, nullptr,
-                             learned::AuthorityRequestPriority::EXPLORATION_EXACT);
-    });
-    exactStarted.get_future().wait();
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-
-    {
+    if (lowCap < expectedActive) {
+        // A reserved lane exists: distant work never exceeds its cap, and an
+        // exact request enters immediately without releasing any distant build.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        {
+            std::lock_guard lock(inputMutex);
+            CHECK(enteredOwners.size() == lowCap);
+        }
+        std::future<BasinSample> exact = std::async(std::launch::async, [&] {
+            return router.sample(
+                static_cast<double>(EXACT_OWNER * NATIVE_HYDROLOGY_PAGE_EDGE + 1'024), 1'024.0,
+                heldInput, nullptr, learned::AuthorityRequestPriority::EXPLORATION_EXACT);
+        });
+        {
+            std::unique_lock lock(inputMutex);
+            REQUIRE(inputReady.wait_for(lock, std::chrono::seconds(10), [&] {
+                return std::ranges::find(enteredOwners, EXACT_OWNER) != enteredOwners.end();
+            }));
+        }
+        {
+            std::lock_guard lock(inputMutex);
+            releaseAll = true;
+        }
+        inputReady.notify_all();
+        REQUIRE(exact.get().valid);
+    } else {
         std::lock_guard lock(inputMutex);
-        REQUIRE_FALSE(enteredOwners.empty());
-        releasedOwners.insert(enteredOwners.front());
-    }
-    inputReady.notify_all();
-    {
-        std::unique_lock lock(inputMutex);
-        REQUIRE(inputReady.wait_for(lock, std::chrono::seconds(10),
-                                    [&] { return enteredOwners.size() > expectedActive; }));
-        CHECK(enteredOwners[expectedActive] == EXACT_OWNER);
         releaseAll = true;
+        inputReady.notify_all();
     }
-    inputReady.notify_all();
 
     for (std::future<BasinSample>& blocker : blockers)
         REQUIRE(blocker.get().valid);
-    REQUIRE(low.get().valid);
-    REQUIRE(exact.get().valid);
-    CHECK(router.cacheMetrics().buildAdmissionWaits >= 2);
+    CHECK(router.cacheMetrics().buildAdmissionWaits >= 1);
 }
 
 TEST_CASE("V4 distant hydrology pages cannot evict exact cached owners",
